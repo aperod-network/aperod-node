@@ -1,0 +1,22 @@
+chain_id: "aperod-testnet-1"
+timestamp: 0                    # 0 = use current time on first start
+
+initial_supply: 21000000        # 21 million APR total
+block_time_ms: 1000             # 1 second blocks
+ring_size: 11                   # 1 real + 10 decoys per ring signature
+min_validators: 1               # testnet can run with 1 validator
+bft_threshold: 0.667            # need 2/3 of validators to finalize
+
+checkpoint_every: 1000          # create checkpoint block every 1000 blocks
+
+# Validator public keys (ED25519, hex-encoded).
+# Generate with: aperod wallet create (for now, placeholder).
+# For a real testnet, replace with actual validator keys.
+validators:
+  - "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Pre-mine allocations (optional).
+# In testnet these are for development and testing.
+allocations:
+  - address: ""                 # fill in with a real address
+    amount: 1000000000000       # 10,000 APR in base units
