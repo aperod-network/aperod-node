@@ -289,3 +289,16 @@ func (e *Engine) IsFinalized(height uint64) bool {
         defer e.mu.Unlock()
         return e.finalized[height]
 }
+
+// Chain returns the engine's chain (for testing and API use).
+func (e *Engine) Chain() *core.Chain { return e.chain }
+
+// ProposerAt returns the validator that should propose at round r (exported for testing).
+func (e *Engine) ProposerAt(round uint32) crypto.ValidatorPubKey {
+        return e.proposerAt(round)
+}
+
+// HandleVote processes a finalization vote (exported for testing and P2P).
+func (e *Engine) HandleVote(vote FinalizeMsg) error {
+        return e.handleVote(vote)
+}

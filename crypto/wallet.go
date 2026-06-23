@@ -103,6 +103,23 @@ func ScalarMulBase(s Scalar32) (Point32, error) {
         return scalarMulBase(s)
 }
 
+// AddScalars returns (a + b) mod group order.
+// Used to derive one-time spend private keys: one_time_priv = Hs + spend_priv.
+func AddScalars(a, b Scalar32) (Scalar32, error) {
+        sa, err := ScalarFromBytes(a[:])
+        if err != nil {
+                return Scalar32{}, fmt.Errorf("AddScalars a: %w", err)
+        }
+        sb, err := ScalarFromBytes(b[:])
+        if err != nil {
+                return Scalar32{}, fmt.Errorf("AddScalars b: %w", err)
+        }
+        sum := edwards25519.NewScalar().Add(sa, sb)
+        var out Scalar32
+        copy(out[:], sum.Bytes())
+        return out, nil
+}
+
 // PointFromBytes decodes a compressed Ed25519 point. Returns error if invalid.
 func PointFromBytes(b []byte) (*edwards25519.Point, error) {
         if len(b) != 32 {
