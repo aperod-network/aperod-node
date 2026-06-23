@@ -43,11 +43,13 @@ type Engine struct {
         votes     map[crypto.Hash32]map[string][]byte
         // finalized tracks which heights have been finalized
         finalized map[uint64]bool
+        // slashing detector for double-sign evidence
+        slashing  *slashingDetector
 
         // Channels for external events
-        newBlockCh chan *core.Block        // incoming blocks from P2P
-        newVoteCh  chan FinalizeMsg        // incoming finalization votes
-        producedCh chan *core.Block        // blocks produced by this node (for broadcast)
+        newBlockCh chan *core.Block  // incoming blocks from P2P
+        newVoteCh  chan FinalizeMsg  // incoming finalization votes
+        producedCh chan *core.Block  // blocks produced by this node (for broadcast)
 }
 
 // NewEngine creates a new PoA consensus engine.
@@ -59,6 +61,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 log:        log,
                 votes:      make(map[crypto.Hash32]map[string][]byte),
                 finalized:  make(map[uint64]bool),
+                slashing:   newSlashingDetector(),
                 newBlockCh: make(chan *core.Block, 64),
                 newVoteCh:  make(chan FinalizeMsg, 256),
                 producedCh: make(chan *core.Block, 64),
@@ -172,6 +175,16 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("block from unknown validator %s", block.Header.ValidatorPub.ID())
         }
 
+        // Double-sign detection
+        hash := block.Hash()
+        if ev := e.slashing.CheckBlock(
+                block.Header.Height, block.Header.Round,
+                block.Header.ValidatorPub, hash, block.Header.Signature,
+        ); ev != nil {
+                e.log.Error("SLASHING: double-sign detected", "evidence", ev.String())
+                return fmt.Errorf("double-sign: %s", ev.String())
+        }
+
         // Check it extends our current tip
         tip := e.chain.Tip()
         if block.Header.Height != tip.Header.Height+1 {
@@ -181,6 +194,11 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add block: %w", err)
+        }
+
+        // Log checkpoint blocks
+        if IsCheckpoint(block.Header.Height) {
+                e.log.Info("CHECKPOINT reached", "height", block.Header.Height)
         }
 
         e.log.Info("accepted block",

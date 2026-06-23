@@ -108,19 +108,18 @@ func NewBlindFactor() (BlindFactor, error) {
 
 // BlindSum computes the sum of blinding factors (for change output calculation).
 // change_blind = Σin_blind - Σout_blind (mod order)
+// All BlindFactor values must be canonical scalars (as produced by NewBlindFactor).
 func BlindSum(in []BlindFactor, out []BlindFactor) (BlindFactor, error) {
         acc := edwards25519.NewScalar()
         for _, b := range in {
-                clamped := clampScalar(b)
-                s, err := ScalarFromBytes(clamped[:])
+                s, err := ScalarFromBytes(b[:])
                 if err != nil {
                         return BlindFactor{}, err
                 }
                 acc.Add(acc, s)
         }
         for _, b := range out {
-                clamped := clampScalar(b)
-                s, err := ScalarFromBytes(clamped[:])
+                s, err := ScalarFromBytes(b[:])
                 if err != nil {
                         return BlindFactor{}, err
                 }
