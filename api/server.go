@@ -22,6 +22,7 @@ type Server struct {
         utxos   *core.UTXOSet
         log     *slog.Logger
         mux     *http.ServeMux
+        hub     *Hub
 }
 
 // NewServer creates a new API server.
@@ -33,14 +34,20 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
                 utxos:   utxos,
                 log:     log,
                 mux:     http.NewServeMux(),
+                hub:     NewHub(log),
         }
         s.registerRoutes()
         return s
 }
 
+// Hub returns the WebSocket hub (for node to push events).
+func (s *Server) Hub() *Hub { return s.hub }
+
 func (s *Server) registerRoutes() {
         s.mux.HandleFunc("/", s.handleRPC)
         s.mux.HandleFunc("/health", s.handleHealth)
+        s.mux.Handle("/ws", s.hub.Handler())
+        s.registerRESTRoutes()
 }
 
 // ServeHTTP implements http.Handler so Server can be used with httptest.
@@ -144,6 +151,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, e
                 return s.aprGetBlockByHeight(params)
         case "apr_getBlockByHash":
                 return s.aprGetBlockByHash(params)
+        case "apr_getTransaction":
+                return s.aprGetTransaction(params)
         case "apr_getMempoolInfo":
                 return s.aprGetMempoolInfo()
         case "apr_getMempoolTxs":
@@ -154,6 +163,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, e
                 return s.aprGetBalance(params)
         case "apr_validateAddress":
                 return s.aprValidateAddress(params)
+        case "apr_estimateFee":
+                return s.aprEstimateFee(params)
         default:
                 return nil, fmt.Errorf("method not found: %s", method)
         }
@@ -327,6 +338,106 @@ func (s *Server) aprValidateAddress(params json.RawMessage) (interface{}, error)
                 result["error"] = err.Error()
         }
         return result, nil
+}
+
+// ─── apr_getTransaction (2.1.4) ───────────────────────────────────────────────
+
+// TxResponse is returned by apr_getTransaction.
+type TxResponse struct {
+        Hash        string `json:"hash"`
+        BlockHash   string `json:"block_hash"`
+        BlockHeight uint64 `json:"block_height"`
+        TxIndex     int    `json:"tx_index"`
+        IsCoinbase  bool   `json:"is_coinbase"`
+        Inputs      int    `json:"inputs"`
+        Outputs     int    `json:"outputs"`
+        Fee         uint64 `json:"fee"`
+        Size        int    `json:"size"`
+        Version     uint8  `json:"version"`
+        // Pending is true when the tx is in the mempool but not yet confirmed.
+        Pending bool `json:"pending,omitempty"`
+}
+
+func (s *Server) aprGetTransaction(params json.RawMessage) (interface{}, error) {
+        var args struct {
+                Hash string `json:"hash"`
+        }
+        if err := json.Unmarshal(params, &args); err != nil {
+                return nil, fmt.Errorf("invalid params: %w", err)
+        }
+        b, err := hex.DecodeString(args.Hash)
+        if err != nil || len(b) != 32 {
+                return nil, fmt.Errorf("invalid hash: must be 64 hex chars")
+        }
+        var hash crypto.Hash32
+        copy(hash[:], b)
+
+        // Search confirmed chain first
+        tx, loc, ok := s.chain.GetTransaction(hash)
+        if ok {
+                bHash := loc.Block.Hash()
+                return TxResponse{
+                        Hash:        args.Hash,
+                        BlockHash:   fmt.Sprintf("%x", bHash[:]),
+                        BlockHeight: loc.Block.Header.Height,
+                        TxIndex:     loc.TxIndex,
+                        IsCoinbase:  tx.IsCoinbase(),
+                        Inputs:      len(tx.Inputs),
+                        Outputs:     len(tx.Outputs),
+                        Fee:         tx.Fee,
+                        Size:        tx.Size(),
+                        Version:     uint8(tx.Version),
+                }, nil
+        }
+
+        // Check mempool for unconfirmed tx
+        if mp, found := s.mempool.Get(hash); found {
+                return TxResponse{
+                        Hash:       args.Hash,
+                        IsCoinbase: mp.IsCoinbase(),
+                        Inputs:     len(mp.Inputs),
+                        Outputs:    len(mp.Outputs),
+                        Fee:        mp.Fee,
+                        Size:       mp.Size(),
+                        Version:    uint8(mp.Version),
+                        Pending:    true,
+                }, nil
+        }
+
+        return nil, fmt.Errorf("transaction not found: %s", args.Hash[:16])
+}
+
+// ─── apr_estimateFee (2.1.9) ─────────────────────────────────────────────────
+
+func (s *Server) aprEstimateFee(params json.RawMessage) (interface{}, error) {
+        var args struct {
+                // SizeBytes is the estimated serialized transaction size.
+                // If omitted, returns the minimum fee for a typical RingCT tx.
+                SizeBytes int `json:"size_bytes"`
+        }
+        // params may be null — tolerate unmarshal failure
+        _ = json.Unmarshal(params, &args)
+
+        const (
+                baseFeePerByte = uint64(10)  // 10 nAPR per byte
+                minFee         = uint64(100) // absolute minimum
+                // Typical RingCT tx: ~6KB for 11-ring inputs, 2 outputs, bulletproof
+                defaultSizeBytes = 6000
+        )
+        size := args.SizeBytes
+        if size <= 0 {
+                size = defaultSizeBytes
+        }
+        fee := uint64(size) * baseFeePerByte
+        if fee < minFee {
+                fee = minFee
+        }
+        return map[string]interface{}{
+                "fee":       fee,
+                "unit":      "nAPR",
+                "size_bytes": size,
+                "rate":      baseFeePerByte,
+        }, nil
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
