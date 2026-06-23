@@ -3,6 +3,9 @@ package wallet
 import (
         "strings"
         "testing"
+
+        "github.com/aperod/aperod/core"
+        "github.com/aperod/aperod/crypto"
 )
 
 // ─── BIP39 wordlist sanity ─────────────────────────────────────────────────
@@ -242,5 +245,145 @@ func TestKeystoreMarshalUnmarshal(t *testing.T) {
         }
         if decrypted != mnemonic {
                 t.Errorf("mnemonic mismatch after JSON round-trip")
+        }
+}
+
+// ─── wallet.Scanner (task 3.1.4) ──────────────────────────────────────────
+
+// buildTestBlock creates a block where tx outputs are sent to recipient keys.
+func buildTestBlock(t *testing.T, spendPub, viewPub crypto.Point32, amount uint64, height uint64) *core.Block {
+        t.Helper()
+        so, err := crypto.CreateStealthOutput(spendPub, viewPub)
+        if err != nil {
+                t.Fatalf("CreateStealthOutput: %v", err)
+        }
+        blind, err := crypto.NewBlindFactor()
+        if err != nil {
+                t.Fatalf("NewBlindFactor: %v", err)
+        }
+        commit, err := crypto.Commit(amount, blind)
+        if err != nil {
+                t.Fatalf("Commit: %v", err)
+        }
+        encAmt := core.EncryptAmount(amount, &so.HsScalar)
+
+        tx := core.Transaction{
+                Version: core.TxVersionBase,
+                Outputs: []core.Output{
+                        {
+                                OneTimePub:   so.OneTimePub,
+                                TxPubKey:     so.TxPubKey,
+                                AmountCommit: commit,
+                                EncAmount:    encAmt,
+                        },
+                },
+        }
+
+        hdr := core.BlockHeader{Height: height}
+        return &core.Block{Header: hdr, Txs: []core.Transaction{tx}}
+}
+
+func TestScanner_NewScannerFromDerived(t *testing.T) {
+        mnemonic := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        dk, err := DeriveFromMnemonic(mnemonic, "", 0, 0)
+        if err != nil {
+                t.Fatalf("DeriveFromMnemonic: %v", err)
+        }
+
+        sc := NewScannerFromDerived(dk)
+        if sc == nil {
+                t.Fatal("NewScannerFromDerived returned nil")
+        }
+        if sc.Address() == "" {
+                t.Error("Address() is empty")
+        }
+        if sc.Address() != dk.Address {
+                t.Errorf("Address mismatch: scanner=%q dk=%q", sc.Address(), dk.Address)
+        }
+}
+
+func TestScanner_ScanBlock_FindsOwnOutput(t *testing.T) {
+        mnemonic, _ := GenerateMnemonic(Strength128)
+        dk, err := DeriveFromMnemonic(mnemonic, "", 0, 0)
+        if err != nil {
+                t.Fatalf("DeriveFromMnemonic: %v", err)
+        }
+
+        const amount uint64 = 50_000_000 // 0.5 APR
+        block := buildTestBlock(t, dk.Keys.Spend.Public, dk.Keys.View.Public, amount, 1)
+
+        sc := NewScannerFromDerived(dk)
+        owned := sc.ScanBlock(block)
+
+        if len(owned) != 1 {
+                t.Fatalf("expected 1 owned UTXO, got %d", len(owned))
+        }
+        if owned[0].Amount != amount {
+                t.Errorf("amount mismatch: want %d, got %d", amount, owned[0].Amount)
+        }
+        if owned[0].BlockHeight != 1 {
+                t.Errorf("BlockHeight mismatch: want 1, got %d", owned[0].BlockHeight)
+        }
+}
+
+func TestScanner_ScanBlock_MissesOtherOutput(t *testing.T) {
+        mnemonic, _ := GenerateMnemonic(Strength128)
+        dk, err := DeriveFromMnemonic(mnemonic, "", 0, 0)
+        if err != nil {
+                t.Fatalf("DeriveFromMnemonic: %v", err)
+        }
+
+        // Block sends to a different random wallet
+        otherKP, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        block := buildTestBlock(t, otherKP.Spend.Public, otherKP.View.Public, 100, 2)
+
+        sc := NewScannerFromDerived(dk)
+        owned := sc.ScanBlock(block)
+        if len(owned) != 0 {
+                t.Errorf("expected 0 owned UTXOs for unrelated block, got %d", len(owned))
+        }
+}
+
+func TestScanner_SpendableUTXOs(t *testing.T) {
+        mnemonic, _ := GenerateMnemonic(Strength128)
+        dk, _ := DeriveFromMnemonic(mnemonic, "", 0, 0)
+        sc := NewScannerFromDerived(dk)
+
+        block := buildTestBlock(t, dk.Keys.Spend.Public, dk.Keys.View.Public, 1_000_000, 5)
+        owned := sc.ScanBlock(block)
+
+        spendable := SpendableUTXOs(owned)
+        if len(spendable) != len(owned) {
+                t.Errorf("expected all %d UTXOs to be spendable, got %d", len(owned), len(spendable))
+        }
+
+        // Add a zero-amount UTXO manually — should be filtered out
+        owned = append(owned, core.OwnedUTXO{Amount: 0})
+        spendable = SpendableUTXOs(owned)
+        if len(spendable) != 1 {
+                t.Errorf("expected 1 spendable UTXO (zero filtered), got %d", len(spendable))
+        }
+}
+
+func TestScanner_NewScannerFromKeys(t *testing.T) {
+        kp, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        sc := NewScannerFromKeys(kp.View.Private, kp.Spend.Public, kp.View.Public, crypto.TestnetByte)
+        if sc == nil {
+                t.Fatal("NewScannerFromKeys returned nil")
+        }
+
+        block := buildTestBlock(t, kp.Spend.Public, kp.View.Public, 2_500_000, 10)
+        owned := sc.ScanBlock(block)
+        if len(owned) != 1 {
+                t.Fatalf("expected 1 owned UTXO, got %d", len(owned))
+        }
+        if owned[0].Amount != 2_500_000 {
+                t.Errorf("amount: want 2500000, got %d", owned[0].Amount)
         }
 }
