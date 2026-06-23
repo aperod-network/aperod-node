@@ -16,29 +16,41 @@ import (
 
 // Server is the JSON-RPC 2.0 HTTP server.
 type Server struct {
-        addr    string
-        chain   *core.Chain
-        mempool *core.Mempool
-        utxos   *core.UTXOSet
-        log     *slog.Logger
-        mux     *http.ServeMux
-        hub     *Hub
+        addr        string
+        chain       *core.Chain
+        mempool     *core.Mempool
+        utxos       *core.UTXOSet
+        log         *slog.Logger
+        mux         *http.ServeMux
+        hub         *Hub
+        apiKey      string   // optional; empty = dev mode (no auth)
+        corsOrigins []string // empty = allow all ("*")
+        rateLimiter *RateLimiter
 }
 
 // NewServer creates a new API server.
 func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *core.UTXOSet, log *slog.Logger) *Server {
         s := &Server{
-                addr:    addr,
-                chain:   chain,
-                mempool: mempool,
-                utxos:   utxos,
-                log:     log,
-                mux:     http.NewServeMux(),
-                hub:     NewHub(log),
+                addr:        addr,
+                chain:       chain,
+                mempool:     mempool,
+                utxos:       utxos,
+                log:         log,
+                mux:         http.NewServeMux(),
+                hub:         NewHub(log),
+                rateLimiter: NewRateLimiter(),
         }
         s.registerRoutes()
         return s
 }
+
+// APIKeyConfig optionally sets the required API key for write operations.
+// Call before Start(). Empty string disables key enforcement (dev mode).
+func (s *Server) SetAPIKey(key string) { s.apiKey = key }
+
+// SetAllowedOrigins configures the CORS origin whitelist.
+// Empty slice allows all origins ("*").
+func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 
 // Hub returns the WebSocket hub (for node to push events).
 func (s *Server) Hub() *Hub { return s.hub }
@@ -56,10 +68,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // Start binds and serves. Blocks until server returns.
+// The full middleware chain is: CORS → RateLimit → routes.
 func (s *Server) Start() error {
+        cors := CORSConfig{AllowedOrigins: s.corsOrigins}
+        handler := cors.Middleware(s.rateLimiter.Middleware(s.mux))
         srv := &http.Server{
                 Addr:         s.addr,
-                Handler:      s.mux,
+                Handler:      handler,
                 ReadTimeout:  10 * time.Second,
                 WriteTimeout: 10 * time.Second,
                 IdleTimeout:  60 * time.Second,
@@ -278,10 +293,15 @@ func (s *Server) aprGetMempoolTxs() (interface{}, error) {
 
 func (s *Server) aprSendRawTransaction(params json.RawMessage) (interface{}, error) {
         var args struct {
-                Tx json.RawMessage `json:"tx"`
+                Tx     json.RawMessage `json:"tx"`
+                APIKey string          `json:"api_key"` // alternative to X-API-Key header
         }
         if err := json.Unmarshal(params, &args); err != nil {
                 return nil, fmt.Errorf("invalid params: %w", err)
+        }
+        // Check API key when one is configured
+        if s.apiKey != "" && args.APIKey != s.apiKey {
+                return nil, fmt.Errorf("unauthorized: missing or invalid api_key")
         }
         var tx core.Transaction
         if err := json.Unmarshal(args.Tx, &tx); err != nil {

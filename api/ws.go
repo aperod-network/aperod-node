@@ -133,6 +133,12 @@ func (h *Hub) unregister(c *wsClient) {
 // Handler returns an http.Handler that upgrades HTTP to WebSocket.
 func (h *Hub) Handler() http.Handler {
         return websocket.Handler(func(conn *websocket.Conn) {
+                // Enforce max concurrent WS clients (2.2.5)
+                if !h.CanAcceptClient() {
+                        h.log.Warn("ws client rejected: max clients reached", "max", MaxWSClients)
+                        conn.Close()
+                        return
+                }
                 c := &wsClient{
                         conn:   conn,
                         send:   make(chan WSEvent, 64),
