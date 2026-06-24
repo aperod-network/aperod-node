@@ -61,6 +61,10 @@ type Host struct {
 
         listener net.Listener
         done     chan struct{}
+
+        mgr     *PeerMgr       // ban list
+        gossip  *GossipFilter  // dedup filter for relay
+        headers HeaderProvider // optional: serves headers for sync
 }
 
 // NewHost creates a new p2p host.
@@ -71,7 +75,29 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 log:     log,
                 peers:   make(map[string]*Peer),
                 done:    make(chan struct{}),
+                mgr:     newPeerMgr(),
+                gossip:  NewGossipFilter(),
         }
+}
+
+// SetHeaderProvider attaches a header provider used to serve GetHeaders requests.
+// Call this before Start() when the host is embedded in a full node.
+func (h *Host) SetHeaderProvider(hp HeaderProvider) {
+        h.headers = hp
+}
+
+// BanPeer bans the peer at addr for duration d.  The connection (if any) is
+// closed immediately and future dial/accept attempts from that address are
+// rejected.
+func (h *Host) BanPeer(addr, reason string, d time.Duration) {
+        h.mgr.Ban(addr, reason, d)
+        h.mu.Lock()
+        if p, ok := h.peers[addr]; ok {
+                p.conn.Close()
+                delete(h.peers, addr)
+        }
+        h.mu.Unlock()
+        h.log.Info("peer banned", "addr", addr, "reason", reason, "duration", d)
 }
 
 // Start binds the listener and begins accepting connections.
@@ -189,7 +215,7 @@ func (h *Host) acceptLoop() {
         }
 }
 
-// maintainLoop periodically dials new peers if below MinPeers.
+// maintainLoop periodically dials new peers if below MinPeers and prunes ban entries.
 func (h *Host) maintainLoop() {
         ticker := time.NewTicker(10 * time.Second)
         defer ticker.Stop()
@@ -198,6 +224,9 @@ func (h *Host) maintainLoop() {
                 case <-h.done:
                         return
                 case <-ticker.C:
+                        // Prune expired bans
+                        h.mgr.Prune()
+
                         h.mu.RLock()
                         count := len(h.peers)
                         known := make([]string, len(h.peerList))
@@ -227,6 +256,10 @@ func (h *Host) dialPeer(addr string) {
         if already || count >= h.cfg.MaxPeers {
                 return
         }
+        if h.mgr.IsBanned(addr) {
+                h.log.Debug("dialPeer: addr is banned", "addr", addr)
+                return
+        }
 
         h.log.Debug("dialing peer", "addr", addr)
         conn, err := net.DialTimeout("tcp", addr, DialTimeout)
@@ -239,6 +272,14 @@ func (h *Host) dialPeer(addr string) {
 
 func (h *Host) handleConn(conn net.Conn, outbound bool) {
         addr := conn.RemoteAddr().String()
+
+        // Reject banned peers immediately
+        if h.mgr.IsBanned(addr) {
+                h.log.Debug("handleConn: banned peer rejected", "addr", addr)
+                conn.Close()
+                return
+        }
+
         peer := &Peer{conn: conn, addr: addr, outbound: outbound}
 
         // Handshake: send ping
@@ -359,7 +400,27 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 }
                 block := msgToBlock(msg)
                 if block != nil {
+                        // Gossip relay: forward to all other peers the first time we see this block.
+                        blockHash := block.Hash()
+                        isNew := h.gossip.MarkAndCheck(blockHash)
                         h.handler.OnBlock(block)
+                        if isNew {
+                                sb := blockToMsg(block)
+                                fromAddr := peer.addr
+                                h.mu.RLock()
+                                relayPeers := make([]*Peer, 0, len(h.peers))
+                                for addr, rp := range h.peers {
+                                        if addr != fromAddr {
+                                                relayPeers = append(relayPeers, rp)
+                                        }
+                                }
+                                h.mu.RUnlock()
+                                for _, rp := range relayPeers {
+                                        if err := rp.Send(MsgBlock, sb); err != nil {
+                                                h.log.Debug("gossip relay block failed", "peer", rp.addr, "err", err)
+                                        }
+                                }
+                        }
                 }
                 return nil
 
@@ -368,7 +429,26 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 if err := unmarshal(data, &tx); err != nil {
                         return err
                 }
+                // Gossip relay: forward to all other peers the first time we see this tx.
+                txHash := tx.Hash()
+                isNew := h.gossip.MarkAndCheck(txHash)
                 h.handler.OnTransaction(&tx)
+                if isNew {
+                        fromAddr := peer.addr
+                        h.mu.RLock()
+                        relayPeers := make([]*Peer, 0, len(h.peers))
+                        for addr, rp := range h.peers {
+                                if addr != fromAddr {
+                                        relayPeers = append(relayPeers, rp)
+                                }
+                        }
+                        h.mu.RUnlock()
+                        for _, rp := range relayPeers {
+                                if err := rp.Send(MsgTx, &tx); err != nil {
+                                        h.log.Debug("gossip relay tx failed", "peer", rp.addr, "err", err)
+                                }
+                        }
+                }
                 return nil
 
         case MsgVote:
@@ -404,8 +484,27 @@ func (h *Host) requestHeaders(peer *Peer) {
 }
 
 func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
-        // TODO Phase 2: serve headers from chain store
-        return peer.Send(MsgHeaders, HeadersMsg{})
+        var headers []SerializedHeader
+        if h.headers != nil {
+                limit := msg.Limit
+                if limit <= 0 || limit > 500 {
+                        limit = 500
+                }
+                coreHeaders := h.headers.HeadersFrom(msg.KnownHashes, limit)
+                headers = make([]SerializedHeader, 0, len(coreHeaders))
+                for _, ch := range coreHeaders {
+                        headers = append(headers, SerializedHeader{
+                                Height:       ch.Height,
+                                PrevHash:     ch.PrevHash,
+                                MerkleRoot:   ch.MerkleRoot,
+                                Timestamp:    ch.Timestamp,
+                                Round:        ch.Round,
+                                ValidatorPub: ch.ValidatorPub,
+                                Signature:    ch.Signature,
+                        })
+                }
+        }
+        return peer.Send(MsgHeaders, HeadersMsg{Headers: headers})
 }
 
 func (h *Host) handleHeaders(peer *Peer, msg HeadersMsg) {
