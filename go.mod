@@ -14,6 +14,7 @@ require (
 require (
 	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/lib/pq v1.12.3 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
