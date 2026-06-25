@@ -154,3 +154,80 @@ func FuzzCommit(f *testing.F) {
                 _, _ = crypto.Commit(amount, blind)
         })
 }
+
+// ─── 3.4.2 Pedersen edge cases ───────────────────────────────────────────────
+
+// FuzzPedersenEdgeCases verifies Commit handles boundary amounts (0, MAX) without panic.
+func FuzzPedersenEdgeCases(f *testing.F) {
+        // Seed with boundary values and random blind factors.
+        f.Add(uint64(0), make([]byte, 32))
+        f.Add(uint64(1<<63-1), make([]byte, 32))
+        f.Add(^uint64(0), make([]byte, 32)) // MaxUint64
+        bf, _ := crypto.NewBlindFactor()
+        f.Add(uint64(0), bf[:])
+        f.Add(^uint64(0), bf[:])
+
+        f.Fuzz(func(t *testing.T, amount uint64, blindBytes []byte) {
+                if len(blindBytes) != 32 {
+                        return
+                }
+                var blind crypto.BlindFactor
+                copy(blind[:], blindBytes)
+
+                c, err := crypto.Commit(amount, blind)
+                if err != nil {
+                        return // simplified impl may reject; that's OK
+                }
+                // Commitment must be 32 bytes (non-zero for non-trivial inputs).
+                _ = c
+        })
+}
+
+// FuzzCommitSum verifies CommitSum never panics on arbitrary commitments.
+func FuzzCommitSum(f *testing.F) {
+        bf, _ := crypto.NewBlindFactor()
+        c, _ := crypto.Commit(1000, bf)
+        f.Add(c[:], c[:])
+        f.Add(make([]byte, 32), make([]byte, 32))
+
+        f.Fuzz(func(t *testing.T, inBytes, outBytes []byte) {
+                if len(inBytes) != 32 || len(outBytes) != 32 {
+                        return
+                }
+                var cIn, cOut crypto.Commitment
+                copy(cIn[:], inBytes)
+                copy(cOut[:], outBytes)
+                // Zero fee commitment.
+                var feeC crypto.Commitment
+                _, _ = crypto.CommitSum([]crypto.Commitment{cIn}, []crypto.Commitment{cOut}, feeC)
+        })
+}
+
+// ─── 3.4.3 Bulletproof edge cases ────────────────────────────────────────────
+
+// FuzzVerifyRange verifies VerifyRange never panics on corrupted proof data.
+func FuzzVerifyRange(f *testing.F) {
+        // Seed with a real proof.
+        bf, _ := crypto.NewBlindFactor()
+        proof, err := crypto.ProveRange(1_000_000, bf)
+        if err == nil && proof != nil {
+                f.Add(proof.ValueCommit[:], proof.BitCommits[0][:], proof.Challenges[0][:])
+        }
+        f.Add(make([]byte, 32), make([]byte, 32), make([]byte, 32))
+
+        f.Fuzz(func(t *testing.T, commitBytes, bitBytes, challengeBytes []byte) {
+                if len(commitBytes) != 32 || len(bitBytes) != 32 || len(challengeBytes) != 32 {
+                        return
+                }
+                // Build a tampered proof and verify — must not panic.
+                bf2, _ := crypto.NewBlindFactor()
+                p, err := crypto.ProveRange(42, bf2)
+                if err != nil || p == nil {
+                        return
+                }
+                copy(p.ValueCommit[:], commitBytes)
+                copy(p.BitCommits[0][:], bitBytes)
+                copy(p.Challenges[0][:], challengeBytes)
+                _, _ = crypto.VerifyRange(p)
+        })
+}

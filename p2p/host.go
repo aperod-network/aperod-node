@@ -211,6 +211,22 @@ func (h *Host) acceptLoop() {
                                 continue
                         }
                 }
+
+                // Eclipse-attack mitigation (3.5.1): reject inbound connections
+                // when the peer table is already full.
+                if h.cfg.MaxPeers > 0 {
+                        h.mu.RLock()
+                        count := len(h.peers)
+                        h.mu.RUnlock()
+                        if count >= h.cfg.MaxPeers {
+                                h.log.Debug("inbound connection rejected: MaxPeers reached",
+                                        "addr", conn.RemoteAddr().String(),
+                                        "max", h.cfg.MaxPeers)
+                                conn.Close()
+                                continue
+                        }
+                }
+
                 go h.handleConn(conn, false)
         }
 }
