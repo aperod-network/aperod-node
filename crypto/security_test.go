@@ -273,3 +273,70 @@ func TestProveRange_LargeValue(t *testing.T) {
 		t.Error("VerifyRange returned false for valid large proof")
 	}
 }
+
+// ─── 3.4.7 Independent Bulletproof verification ───────────────────────────────
+
+// TestBulletproof_IndependentVerification acts as a cross-check ("independent
+// verifier") for the ProveRange / VerifyRange pair.
+//
+// Strategy:
+//   1. Generate a proof with a known (value, blind) pair.
+//   2. Confirm VerifyRange accepts it.
+//   3. Re-derive the value commitment independently via Commit() and confirm
+//      it matches the proof's embedded ValueCommit — proving the prover and
+//      verifier share the same commitment scheme.
+//   4. Tamper the ValueCommit → verifier must reject.
+//   5. Tamper a BitCommit → verifier must reject.
+func TestBulletproof_IndependentVerification(t *testing.T) {
+	bf, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor: %v", err)
+	}
+
+	const value = uint64(42_000_000)
+
+	// ── Step 1-2: prove and verify ────────────────────────────────────────────
+	proof, err := crypto.ProveRange(value, bf)
+	if err != nil {
+		t.Fatalf("ProveRange: %v", err)
+	}
+	ok, err := crypto.VerifyRange(proof)
+	if err != nil {
+		t.Fatalf("VerifyRange (valid): %v", err)
+	}
+	if !ok {
+		t.Fatal("3.4.7: VerifyRange rejected a valid proof")
+	}
+
+	// ── Step 3: independently re-derive the commitment ────────────────────────
+	recomputed, err := crypto.Commit(value, bf)
+	if err != nil {
+		t.Fatalf("Commit (recompute): %v", err)
+	}
+	if recomputed != proof.ValueCommit {
+		t.Errorf("3.4.7: independent commitment mismatch\n  proof has:    %x\n  recomputed:   %x",
+			proof.ValueCommit, recomputed)
+	} else {
+		t.Logf("3.4.7 ✓ commitment cross-check passed: %x", recomputed[:8])
+	}
+
+	// ── Step 4: tamper ValueCommit → must fail ────────────────────────────────
+	tampered := *proof
+	tampered.ValueCommit[0] ^= 0xFF
+	ok4, _ := crypto.VerifyRange(&tampered)
+	if ok4 {
+		t.Error("3.4.7: tampered ValueCommit should fail verification")
+	} else {
+		t.Log("3.4.7 ✓ tampered ValueCommit correctly rejected")
+	}
+
+	// ── Step 5: tamper BitCommits[0] → must fail ─────────────────────────────
+	tampered2 := *proof
+	tampered2.BitCommits[0][0] ^= 0x01
+	ok5, _ := crypto.VerifyRange(&tampered2)
+	if ok5 {
+		t.Error("3.4.7: tampered BitCommits[0] should fail verification")
+	} else {
+		t.Log("3.4.7 ✓ tampered BitCommits[0] correctly rejected")
+	}
+}
