@@ -2,11 +2,12 @@ package api
 
 // REST API handlers for Phase 2 (blocks 2.1.10-2.1.13).
 // Routes:
-//   GET /api/v1/blocks                        — paginated block list
-//   GET /api/v1/blocks/{id}                   — block by height or hash
-//   GET /api/v1/transactions/{hash}           — tx by hash
-//   GET /api/v1/address/{addr}/transactions   — incoming tx for address
-//   GET /api/v1/network/stats                 — network statistics
+//   GET  /api/v1/blocks                        — paginated block list
+//   GET  /api/v1/blocks/{id}                   — block by height or hash
+//   GET  /api/v1/transactions/{hash}           — tx by hash
+//   GET  /api/v1/address/{addr}/transactions   — incoming tx for address
+//   GET  /api/v1/network/stats                 — network statistics
+//   POST /api/v1/admin/mint                    — admin-only: mint APR to address
 
 import (
         "encoding/hex"
@@ -17,6 +18,7 @@ import (
         "strings"
         "time"
 
+        "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
 )
 
@@ -27,6 +29,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/transactions/", s.restTransaction)
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
+        s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -339,5 +342,78 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 "total_txs":     0,
                 "mempool_count": s.mempool.Count(),
                 "tps_last_10":   0,
+        })
+}
+
+// ─── POST /api/v1/admin/mint ──────────────────────────────────────────────────
+
+// mintRequest is the JSON body for the admin mint endpoint.
+type mintRequest struct {
+        Address   string `json:"address"`   // Aperod wallet address
+        AmountAPR uint64 `json:"amount_apr"` // amount in whole APR (converted to nAPR internally)
+}
+
+// mintResponse is returned on success.
+type mintResponse struct {
+        TxHash    string `json:"tx_hash"`
+        AmountAPR uint64 `json:"amount_apr"`
+        Address   string `json:"address"`
+}
+
+// restAdminMint creates a coinbase-style mint transaction and adds it to the mempool.
+// Called by the Node.js API server after it records the mint in PostgreSQL.
+// This endpoint is only reachable from localhost (127.0.0.1:8545 is not exposed
+// to the internet), so no additional auth is required.
+func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+                writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+                return
+        }
+
+        var req mintRequest
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+                return
+        }
+
+        if req.Address == "" {
+                writeJSONError(w, http.StatusBadRequest, "address required")
+                return
+        }
+        if err := crypto.Validate(crypto.Address(req.Address)); err != nil {
+                writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
+                return
+        }
+        if req.AmountAPR == 0 || req.AmountAPR > 100_000_000 {
+                writeJSONError(w, http.StatusBadRequest, "amount_apr must be 1–100000000")
+                return
+        }
+
+        // Convert APR → nAPR (1 APR = 10^8 nAPR).
+        const nAPRPerAPR uint64 = 100_000_000
+        amountNAPR := req.AmountAPR * nAPRPerAPR
+
+        tx, err := core.BuildMintTx(crypto.Address(req.Address), amountNAPR)
+        if err != nil {
+                s.log.Error("admin mint: build tx failed", "err", err)
+                writeJSONError(w, http.StatusInternalServerError, "build mint tx: "+err.Error())
+                return
+        }
+
+        if err := s.mempool.Add(*tx); err != nil {
+                s.log.Error("admin mint: mempool add failed", "err", err)
+                writeJSONError(w, http.StatusInternalServerError, "mempool: "+err.Error())
+                return
+        }
+
+        hash := tx.Hash()
+        txHashHex := fmt.Sprintf("%x", hash[:])
+
+        s.log.Info("admin mint submitted", "address", req.Address, "amount_apr", req.AmountAPR, "tx_hash", txHashHex)
+
+        writeJSON(w, http.StatusCreated, mintResponse{
+                TxHash:    txHashHex,
+                AmountAPR: req.AmountAPR,
+                Address:   req.Address,
         })
 }

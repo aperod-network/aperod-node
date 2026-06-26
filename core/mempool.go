@@ -65,7 +65,9 @@ func (m *Mempool) Add(tx Transaction) error {
                 return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
         }
 
-        if tx.Fee < m.cfg.MinFee {
+        // Coinbase transactions (no inputs) are fee-exempt: admin mints and block
+        // rewards carry Fee=0 by design; ring-sig fee rules do not apply.
+        if !tx.IsCoinbase() && tx.Fee < m.cfg.MinFee {
                 return fmt.Errorf("mempool: fee too low: %d < %d nAPR (minimum flat fee)", tx.Fee, m.cfg.MinFee)
         }
 
