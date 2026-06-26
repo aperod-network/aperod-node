@@ -21,6 +21,9 @@ type Config struct {
         Validators []crypto.ValidatorPubKey
         // MyKey is this node's validator key (nil if not a validator).
         MyKey *crypto.ValidatorPrivKey
+        // OnBlockProduced is an optional callback called after each block is added
+        // to the chain. Use it to persist blocks to durable storage.
+        OnBlockProduced func(block *core.Block)
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -128,6 +131,11 @@ func (e *Engine) tick() error {
         // Add to our own chain
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add produced block: %w", err)
+        }
+
+        // Persist block to durable storage (if callback configured)
+        if e.cfg.OnBlockProduced != nil {
+                e.cfg.OnBlockProduced(block)
         }
 
         // Broadcast to P2P
