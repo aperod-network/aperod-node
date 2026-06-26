@@ -4,7 +4,6 @@ import (
         "fmt"
 
         "filippo.io/edwards25519"
-        "golang.org/x/crypto/sha3"
 )
 
 // Commitment is a Pedersen commitment C = r·G + v·H.
@@ -15,22 +14,17 @@ type Commitment [32]byte
 // BlindFactor is the 32-byte blinding scalar used to open a commitment.
 type BlindFactor [32]byte
 
-// hGenerator is the second generator H derived from hashing the base point G.
-// SECURITY NOTE: In production, H must be derived via a verifiable hash-to-curve
-// algorithm (e.g., Elligator2 or hash-to-ristretto255) so that log_G(H) is unknown.
-// This implementation uses H = SHA3("Aperod/commitment/H") expanded to a scalar
-// then multiplied by G, which is NOT secure (DLOG is known).
-// Replace with a proper hash-to-curve before mainnet.
+// hGenerator is the second Pedersen generator H: C = r·G + v·H.
+// It is set to BpH (defined in bulletproof.go) so that Pedersen output
+// commitments and Bulletproof range-proof commitments use the same H —
+// which is required for the range proof to cover the actual transaction amount.
+// BpH is derived via hash-to-point so log_G(H) is unknown (binding commitment).
 var hGenerator *edwards25519.Point
 
 func init() {
-        // Derive H deterministically from a domain-separated hash.
-        h := sha3.New512()
-        h.Write([]byte("Aperod/commitment/generator/H/v1"))
-        var wide [64]byte
-        copy(wide[:], h.Sum(nil))
-        hs, _ := edwards25519.NewScalar().SetUniformBytes(wide[:])
-        hGenerator = (&edwards25519.Point{}).ScalarBaseMult(hs)
+        // BpH is initialised by bulletproof.go's init() which runs first
+        // (files are processed in alphabetical order: bulletproof.go < pedersen.go).
+        hGenerator = BpH
 }
 
 // Commit creates a Pedersen commitment to value v with blinding factor r.

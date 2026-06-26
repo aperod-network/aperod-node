@@ -211,12 +211,12 @@ func FuzzVerifyRange(f *testing.F) {
         bf, _ := crypto.NewBlindFactor()
         proof, err := crypto.ProveRange(1_000_000, bf)
         if err == nil && proof != nil {
-                f.Add(proof.ValueCommit[:], proof.BitCommits[0][:], proof.Challenges[0][:])
+                f.Add(proof.ValueCommit[:], proof.Ls[0][:], proof.Rs[0][:])
         }
         f.Add(make([]byte, 32), make([]byte, 32), make([]byte, 32))
 
-        f.Fuzz(func(t *testing.T, commitBytes, bitBytes, challengeBytes []byte) {
-                if len(commitBytes) != 32 || len(bitBytes) != 32 || len(challengeBytes) != 32 {
+        f.Fuzz(func(t *testing.T, commitBytes, lBytes, rBytes []byte) {
+                if len(commitBytes) != 32 || len(lBytes) != 32 || len(rBytes) != 32 {
                         return
                 }
                 // Build a tampered proof and verify — must not panic.
@@ -226,8 +226,8 @@ func FuzzVerifyRange(f *testing.F) {
                         return
                 }
                 copy(p.ValueCommit[:], commitBytes)
-                copy(p.BitCommits[0][:], bitBytes)
-                copy(p.Challenges[0][:], challengeBytes)
+                copy(p.Ls[0][:], lBytes)
+                copy(p.Rs[0][:], rBytes)
                 _, _ = crypto.VerifyRange(p)
         })
 }

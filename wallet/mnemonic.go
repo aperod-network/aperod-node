@@ -5,12 +5,9 @@ package wallet
 import (
         "crypto/rand"
         "crypto/sha256"
-        "crypto/sha512"
         "errors"
         "fmt"
         "strings"
-
-        "golang.org/x/crypto/pbkdf2"
 )
 
 // Strength in bits for mnemonic entropy. 128 = 12 words, 256 = 24 words.
@@ -109,11 +106,11 @@ func MnemonicToEntropy(mnemonic string) ([]byte, error) {
 }
 
 // MnemonicToSeed converts a BIP39 mnemonic + optional passphrase to a 64-byte
-// BIP39 seed using PBKDF2-HMAC-SHA512 with 2048 iterations.
+// BIP39 seed using PBKDF2-HMAC-SHA512 with 2048 iterations (BIP39 standard).
 func MnemonicToSeed(mnemonic, passphrase string) []byte {
         mnemonic = strings.TrimSpace(mnemonic)
         salt := "mnemonic" + passphrase
-        return pbkdf2.Key([]byte(mnemonic), []byte(salt), 2048, 64, sha512.New)
+        return pbkdf2SHA512([]byte(mnemonic), []byte(salt), 2048, 64)
 }
 
 // ValidateMnemonic returns nil if the mnemonic is a valid BIP39 phrase

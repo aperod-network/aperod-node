@@ -1,11 +1,11 @@
 package crypto
 
 import (
+        "crypto/sha512"
         "crypto/subtle"
         "fmt"
 
         "filippo.io/edwards25519"
-        "golang.org/x/crypto/sha3"
 )
 
 // RingSize is the number of public keys in a ring (1 real + N-1 decoys).
@@ -176,9 +176,9 @@ func ringR(s, c *edwards25519.Scalar, Hp, I *edwards25519.Point) *edwards25519.P
         return (&edwards25519.Point{}).Add(sHp, cI)
 }
 
-// ringChallenge computes SHA3-256(message || L || R) as a scalar.
+// ringChallenge computes SHA-512(message || L || R) as a scalar.
 func ringChallenge(msg Hash32, L, R *edwards25519.Point) *edwards25519.Scalar {
-        h := sha3.New512()
+        h := sha512.New()
         h.Write([]byte("Aperod/MLSAG/v1"))
         h.Write(msg[:])
         h.Write(L.Bytes())

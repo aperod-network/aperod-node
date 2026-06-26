@@ -1,10 +1,10 @@
 package crypto
 
 import (
+        "crypto/sha512"
         "fmt"
 
         "filippo.io/edwards25519"
-        "golang.org/x/crypto/sha3"
 )
 
 // StealthAddress is a one-time address computed per transaction output.
@@ -152,23 +152,14 @@ func ScanForOutput(viewPriv Scalar32, spendPub Point32, txPubKey, oneTimePub Poi
         return &hs, nil
 }
 
-// hashToScalar computes SHA3-256(data || tag) and reduces it modulo the group order.
+// hashToScalar computes SHA-512(data || tag) and reduces it modulo the group order.
 func hashToScalar(data []byte, tag string) *edwards25519.Scalar {
-        h := sha3.New256()
+        h := sha512.New()
         h.Write(data)
         h.Write([]byte(tag))
-        raw := h.Sum(nil)
-
-        // Use wide-form reduction (64 bytes) for uniform distribution.
-        // Pad to 64 bytes by repeating.
-        wide := make([]byte, 64)
-        copy(wide, raw)
-        h.Reset()
-        h.Write(raw)
-        h.Write([]byte("aperod-extend"))
-        copy(wide[32:], h.Sum(nil))
-
-        s, _ := edwards25519.NewScalar().SetUniformBytes(wide)
+        var wide [64]byte
+        copy(wide[:], h.Sum(nil))
+        s, _ := edwards25519.NewScalar().SetUniformBytes(wide[:])
         return s
 }
 

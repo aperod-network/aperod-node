@@ -2,10 +2,10 @@ package crypto
 
 import (
         "crypto/rand"
+        "crypto/sha512"
         "fmt"
 
         "filippo.io/edwards25519"
-        "golang.org/x/crypto/sha3"
 )
 
 // Scalar32 is a 32-byte Edwards25519 scalar.
@@ -71,11 +71,11 @@ func WalletKeysFromSeed(seed []byte) (*WalletKeyPair, error) {
         }, nil
 }
 
-// deriveScalar computes a valid Ed25519 scalar via SHA3-512 → SetUniformBytes.
+// deriveScalar computes a valid Ed25519 scalar via SHA-512 → SetUniformBytes.
 // This guarantees the result is a canonical scalar in [0, l) (group order),
 // suitable for both ScalarBaseMult and ScalarFromBytes.
 func deriveScalar(data []byte, tag string) Scalar32 {
-        h := sha3.New512()
+        h := sha512.New()
         h.Write(data)
         h.Write([]byte(tag))
         var wide [64]byte

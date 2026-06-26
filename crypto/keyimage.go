@@ -1,8 +1,9 @@
 package crypto
 
 import (
-	"filippo.io/edwards25519"
-	"golang.org/x/crypto/sha3"
+        "crypto/sha512"
+
+        "filippo.io/edwards25519"
 )
 
 // KeyImage is the unique "fingerprint" of a spent UTXO.
@@ -15,45 +16,42 @@ type KeyImage [32]byte
 // x is the one-time private scalar for this UTXO.
 // P is the corresponding one-time public key (oneTimePub from StealthAddress).
 func ComputeKeyImage(x Scalar32, P Point32) (KeyImage, error) {
-	xScalar, err := ScalarFromBytes(x[:])
-	if err != nil {
-		return KeyImage{}, err
-	}
+        xScalar, err := ScalarFromBytes(x[:])
+        if err != nil {
+                return KeyImage{}, err
+        }
 
-	// Hp(P): hash P to a curve point
-	hpP := hashToCurvePoint(P[:])
+        // Hp(P): hash P to a curve point
+        hpP := hashToCurvePoint(P[:])
 
-	// I = x · Hp(P)
-	I := (&edwards25519.Point{}).ScalarMult(xScalar, hpP)
+        // I = x · Hp(P)
+        I := (&edwards25519.Point{}).ScalarMult(xScalar, hpP)
 
-	var ki KeyImage
-	copy(ki[:], I.Bytes())
-	return ki, nil
+        var ki KeyImage
+        copy(ki[:], I.Bytes())
+        return ki, nil
 }
 
 // hashToCurvePoint maps arbitrary bytes to an Edwards25519 curve point using
-// the try-and-increment method seeded by SHA3-512.
-//
-// SECURITY NOTE: For production use, replace with a proper hash-to-curve
-// implementation per RFC 9380 (hash_to_ristretto255 or hash_to_edwards25519).
+// the try-and-increment method seeded by SHA-512.
 func hashToCurvePoint(data []byte) *edwards25519.Point {
-	h := sha3.New512()
-	h.Write([]byte("Aperod/hash-to-curve/v1"))
-	h.Write(data)
-	var wide [64]byte
-	copy(wide[:], h.Sum(nil))
-	s, _ := edwards25519.NewScalar().SetUniformBytes(wide[:])
-	return (&edwards25519.Point{}).ScalarBaseMult(s)
+        h := sha512.New()
+        h.Write([]byte("Aperod/hash-to-curve/v1"))
+        h.Write(data)
+        var wide [64]byte
+        copy(wide[:], h.Sum(nil))
+        s, _ := edwards25519.NewScalar().SetUniformBytes(wide[:])
+        return (&edwards25519.Point{}).ScalarBaseMult(s)
 }
 
 // HashToCurvePoint is exported for use in RingCT.
 func HashToCurvePoint(data []byte) *edwards25519.Point {
-	return hashToCurvePoint(data)
+        return hashToCurvePoint(data)
 }
 
 // Equal returns true if two Key Images are identical (detects double-spends).
 func (ki KeyImage) Equal(other KeyImage) bool {
-	return ki == other
+        return ki == other
 }
 
 // KeyImageSet is a thread-unsafe set of used Key Images.
@@ -68,6 +66,6 @@ func (s KeyImageSet) Add(ki KeyImage) { s[ki] = struct{}{} }
 
 // Contains returns true if the Key Image has already been spent.
 func (s KeyImageSet) Contains(ki KeyImage) bool {
-	_, ok := s[ki]
-	return ok
+        _, ok := s[ki]
+        return ok
 }
