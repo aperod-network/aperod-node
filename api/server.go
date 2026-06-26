@@ -438,25 +438,12 @@ func (s *Server) aprEstimateFee(params json.RawMessage) (interface{}, error) {
         // params may be null — tolerate unmarshal failure
         _ = json.Unmarshal(params, &args)
 
-        const (
-                baseFeePerByte = uint64(10)  // 10 nAPR per byte
-                minFee         = uint64(100) // absolute minimum
-                // Typical RingCT tx: ~6KB for 11-ring inputs, 2 outputs, bulletproof
-                defaultSizeBytes = 6000
-        )
-        size := args.SizeBytes
-        if size <= 0 {
-                size = defaultSizeBytes
-        }
-        fee := uint64(size) * baseFeePerByte
-        if fee < minFee {
-                fee = minFee
-        }
+        // Flat fee: 0.5 APR = 500_000_000 nAPR, size-independent.
+        const flatFee = core.FlatFee
         return map[string]interface{}{
-                "fee":       fee,
-                "unit":      "nAPR",
-                "size_bytes": size,
-                "rate":      baseFeePerByte,
+                "fee":  flatFee,
+                "unit": "nAPR",
+                "flat": true,
         }, nil
 }
 

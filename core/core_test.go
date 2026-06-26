@@ -221,9 +221,9 @@ func TestMempool_Remove(t *testing.T) {
 
 func TestMempool_SelectByFeeRate(t *testing.T) {
         mp := core.NewMempool(core.DefaultMempoolConfig())
-        // Add two txs with different fee rates (higher fee wins)
-        tx1 := makeValidTxWithFee(t, 100)
-        tx2 := makeValidTxWithFee(t, 1000)
+        // Add two txs with different fees (higher fee wins); both must meet MinFee.
+        tx1 := makeValidTxWithFee(t, core.FlatFee)
+        tx2 := makeValidTxWithFee(t, core.FlatFee*2)
         mp.Add(tx1)
         mp.Add(tx2)
 
@@ -501,10 +501,11 @@ func makeCoinbaseTx() core.Transaction {
 
 func makeValidTx(t *testing.T) core.Transaction {
         t.Helper()
-        return makeValidTxWithFee(t, 100)
+        return makeValidTxWithFee(t, core.FlatFee)
 }
 
-func makeValidTxWithFee(t *testing.T, feeMultiplier uint64) core.Transaction {
+// makeValidTxWithFee creates a synthetic RingCT transaction with the given absolute fee.
+func makeValidTxWithFee(t *testing.T, fee uint64) core.Transaction {
         t.Helper()
         kp, _ := crypto.GenerateWalletKeys()
         ki, _ := crypto.ComputeKeyImage(kp.Spend.Private, kp.Spend.Public)
@@ -527,7 +528,7 @@ func makeValidTxWithFee(t *testing.T, feeMultiplier uint64) core.Transaction {
         blind2, _ := crypto.NewBlindFactor()
         proof, _ := crypto.ProveRange(99_000, blind2)
 
-        // Build tx first to get its real size, then set fee = feeMultiplier * size
+        // Build tx and apply the provided absolute fee.
         tx := core.Transaction{
                 Version: 1,
                 Inputs: []core.RingInput{{
@@ -542,8 +543,6 @@ func makeValidTxWithFee(t *testing.T, feeMultiplier uint64) core.Transaction {
                 RangeProofs: []*crypto.RangeProof{proof},
                 Signatures:  []*crypto.MLSAGSignature{sig},
         }
-        // Set fee = feeMultiplier nAPR/byte so fee rate check passes
-        fee := uint64(tx.Size()) * feeMultiplier
         commitFee, _ := crypto.Commit(fee, blindFee)
         tx.Fee = fee
         tx.FeeCommit = commitFee

@@ -18,26 +18,23 @@ type TxBuilder struct {
         viewPriv   crypto.Scalar32
         spendPub   crypto.Point32
         ownedUTXOs []OwnedUTXO
-        feePerByte uint64
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
 // ownedUTXOs must come from WalletScanner.ScanChain — amounts must be decrypted.
+// The fee is always FlatFee (0.5 APR); the feePerByte parameter is kept for
+// backwards-compatibility but ignored.
 func NewTxBuilder(
         spendPriv, viewPriv crypto.Scalar32,
         spendPub crypto.Point32,
         ownedUTXOs []OwnedUTXO,
-        feePerByte uint64,
+        _ uint64, // feePerByte — deprecated, flat fee is used instead
 ) *TxBuilder {
-        if feePerByte == 0 {
-                feePerByte = 1
-        }
         return &TxBuilder{
                 spendPriv:  spendPriv,
                 viewPriv:   viewPriv,
                 spendPub:   spendPub,
                 ownedUTXOs: ownedUTXOs,
-                feePerByte: feePerByte,
         }
 }
 
@@ -80,35 +77,23 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 totalIn      uint64
                 estimatedFee uint64
         )
-        for range 3 { // converges in ≤3 passes
-                nIn := len(selected)
-                if nIn == 0 {
-                        nIn = 1
-                }
-                estimatedFee = txEstimateFee(nIn, 2, b.feePerByte)
-                needed := amount + estimatedFee
+        // Flat fee is fixed regardless of transaction size.
+        estimatedFee = FlatFee
+        needed := amount + estimatedFee
 
-                selected = nil
-                totalIn = 0
-                for _, u := range available {
-                        if totalIn >= needed {
-                                break
-                        }
-                        selected = append(selected, u)
-                        totalIn += u.Amount
-                        if len(selected) >= maxInputs {
-                                break
-                        }
-                }
-                if totalIn < needed {
-                        return nil, fmt.Errorf("insufficient funds: have %d, need %d (amount %d + fee %d)",
-                                totalIn, needed, amount, estimatedFee)
-                }
-                newFee := txEstimateFee(len(selected), 2, b.feePerByte)
-                if newFee == estimatedFee {
+        for _, u := range available {
+                if totalIn >= needed {
                         break
                 }
-                estimatedFee = newFee
+                selected = append(selected, u)
+                totalIn += u.Amount
+                if len(selected) >= maxInputs {
+                        break
+                }
+        }
+        if totalIn < needed {
+                return nil, fmt.Errorf("insufficient funds: have %d, need %d (amount %d + fee %d)",
+                        totalIn, needed, amount, estimatedFee)
         }
 
         changeAmount := totalIn - amount - estimatedFee
@@ -272,21 +257,15 @@ func txBuildRing(realPub crypto.Point32) ([]crypto.RingMember, int, error) {
         return ring, realIdx, nil
 }
 
-// ExportedEstimateFee is the public wrapper for fee estimation used by the
-// wallet package and external callers.
-func ExportedEstimateFee(nIn, nOut int, feePerByte uint64) uint64 {
-        return txEstimateFee(nIn, nOut, feePerByte)
+// ExportedEstimateFee returns the flat fee for any transaction.
+// The nIn, nOut, and feePerByte parameters are kept for backwards-compatibility
+// but ignored — the fee is always FlatFee (0.5 APR).
+func ExportedEstimateFee(_, _ int, _ uint64) uint64 {
+        return FlatFee
 }
 
-// txEstimateFee estimates the fee for a transaction with nIn inputs and nOut outputs.
-func txEstimateFee(nIn, nOut int, feePerByte uint64) uint64 {
-        const (
-                inputBytes     = 416  // keyimage(32) + ring(11×32) + commit(32)
-                sigBytes       = 384  // C0(32) + SS(11×32)
-                outputBytes    = 104  // oneTimePub(32) + txPub(32) + commit(32) + enc(8)
-                rangeProofBytes = 6144 // 3 × 64 × 32
-                headerBytes    = 100
-        )
-        total := headerBytes + nIn*(inputBytes+sigBytes) + nOut*(outputBytes+rangeProofBytes)
-        return uint64(total) * feePerByte
+// txEstimateFee returns the flat fee for any transaction.
+// nIn, nOut, and feePerByte are ignored — the fee is always FlatFee.
+func txEstimateFee(_, _ int, _ uint64) uint64 {
+        return FlatFee
 }

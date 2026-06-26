@@ -146,9 +146,12 @@ func (tx *Transaction) Size() int {
         return size
 }
 
-// MinFee returns the minimum fee for a transaction of this size (1 nAPR per byte).
+// FlatFee is the fixed transaction fee: 0.5 APR = 500_000_000 nAPR.
+const FlatFee uint64 = 500_000_000
+
+// MinFee returns the minimum fee for any transaction (flat rate, size-independent).
 func (tx *Transaction) MinFee() uint64 {
-        return uint64(tx.Size())
+        return FlatFee
 }
 
 // KeyImages returns all key images from inputs (for double-spend checking).

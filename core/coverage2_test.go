@@ -17,10 +17,10 @@ import (
 // on an aged-out pool works without panicking.
 func TestMempool_Evict_Ages(t *testing.T) {
         cfg := core.MempoolConfig{
-                MaxSize:    5_000,
-                MaxTxSize:  100_000,
-                TTL:        time.Millisecond, // very short TTL
-                MinFeeRate: 1,
+                MaxSize:   5_000,
+                MaxTxSize: 100_000,
+                TTL:       time.Millisecond, // very short TTL
+                MinFee:    500_000_000,
         }
         mp := core.NewMempool(cfg)
         time.Sleep(5 * time.Millisecond)
