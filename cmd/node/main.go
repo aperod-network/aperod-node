@@ -10,6 +10,7 @@ import (
         "os/signal"
         "syscall"
 
+        "github.com/aperod/aperod/api"
         "github.com/aperod/aperod/config"
         "github.com/aperod/aperod/consensus"
         "github.com/aperod/aperod/core"
@@ -150,6 +151,18 @@ func run() error {
 
         // Consensus loop
         go engine.Run(stop)
+
+        // API server (JSON-RPC + REST + WebSocket)
+        utxos := core.NewUTXOSet()
+        if cfg.API.Enabled && cfg.API.ListenAddr != "" {
+                apiSrv := api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
+                apiSrv.SetAllowedOrigins(cfg.API.CORS)
+                go func() {
+                        if err := apiSrv.Start(); err != nil {
+                                log.Error("API server stopped", "err", err)
+                        }
+                }()
+        }
 
         log.Info("node is running",
                 "validators", len(validators),
