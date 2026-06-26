@@ -133,6 +133,10 @@ func (e *Engine) tick() error {
                 return fmt.Errorf("add produced block: %w", err)
         }
 
+        // Remove included transactions from mempool (same as acceptBlock does for
+        // incoming blocks — without this, txs would be re-included every block).
+        e.pool.RemoveBlock(block)
+
         // Persist block to durable storage (if callback configured)
         if e.cfg.OnBlockProduced != nil {
                 e.cfg.OnBlockProduced(block)
