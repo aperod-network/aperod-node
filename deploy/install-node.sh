@@ -89,7 +89,7 @@ ok "Исходный код получен в ${INSTALL_DIR}"
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
-cd "${INSTALL_DIR}/blockchain"
+cd "${INSTALL_DIR}"
 export GOPATH="/root/go"
 
 make deps 2>&1 | tail -3
