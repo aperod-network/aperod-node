@@ -25,10 +25,10 @@ P2P_PORT=30303
 RPC_PORT=8545
 
 echo -e "
-${BOLD}╔══════════════════════════════════════════╗
-║   Aperod APR Full Node — Installer       ║
-║   github.com/aperod/aperod               ║
-╚══════════════════════════════════════════╝${NC}
+${BOLD}╔════════════════════════════════════════════╗
+║   Aperod APR Full Node — Installer         ║
+║   github.com/aperod-network/aperod-node    ║
+╚════════════════════════════════════════════╝${NC}
 "
 
 # ── Проверка root ─────────────────────────────────────────
