@@ -78,15 +78,14 @@ fi
 
 # ── 3. Клонирование репозитория ───────────────────────────
 info "Получаем исходный код Aperod…"
-export GIT_TERMINAL_PROMPT=0
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  git -c credential.helper= -C "${INSTALL_DIR}" pull --ff-only
-  ok "Репозиторий обновлён"
-else
-  git -c credential.helper= clone --depth=1 "${REPO_URL}" "${INSTALL_DIR}" \
-    || die "Не удалось клонировать ${REPO_URL} — убедитесь что репозиторий публичный"
-  ok "Репозиторий клонирован в ${INSTALL_DIR}"
-fi
+TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
+mkdir -p "${INSTALL_DIR}"
+info "Скачиваем архив исходного кода…"
+wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
+  || die "Не удалось скачать ${TARBALL_URL}"
+tar -xzf /tmp/aperod-src.tar.gz -C "${INSTALL_DIR}" --strip-components=1
+rm -f /tmp/aperod-src.tar.gz
+ok "Исходный код получен в ${INSTALL_DIR}"
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
