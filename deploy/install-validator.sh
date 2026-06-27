@@ -238,7 +238,7 @@ ok "Firewall настроен (открыты: 22, ${P2P_PORT}/tcp, ${P2P_PORT}/
 cat > /etc/systemd/system/aperod-node.service <<EOF
 [Unit]
 Description=Aperod Validator Node (${MY_IP})
-Documentation=https://github.com/aperod/aperod
+Documentation=https://github.com/aperod-network/aperod-node
 After=network-online.target
 Wants=network-online.target
 
