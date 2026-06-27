@@ -164,19 +164,21 @@ if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
       die "Неверный формат ключа. Ожидается 64 hex-символа (32 байта)."
     fi
     mkdir -p "${CONFIG_DIR}"
-    echo -n "${PRIVKEY_HEX}" > "${CONFIG_DIR}/validator.key"
-    PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "[ошибка получения pubkey]")
+    echo -n "${PRIVKEY_HEX}" | xxd -r -p > "${CONFIG_DIR}/validator.key"
+    PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "")
+    [[ -z "${PUBKEY_HEX}" ]] && PUBKEY_HEX="(запустите: aperod wallet pubkey ${PRIVKEY_HEX})"
     ok "Ключ сохранён"
   else
-    info "Генерируем новый ключ Ed25519 (openssl)…"
-    PRIVKEY_HEX=$(openssl rand -hex 32)
-    mkdir -p "${CONFIG_DIR}"
-    echo -n "${PRIVKEY_HEX}" > "${CONFIG_DIR}/validator.key"
-    PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "")
-    if [[ -z "${PUBKEY_HEX}" ]]; then
-      warn "aperod wallet pubkey недоступен. Публичный ключ будет вычислен при старте ноды."
-      PUBKEY_HEX="(запустите: aperod wallet pubkey \$(cat ${CONFIG_DIR}/validator.key))"
+    info "Генерируем новый ключ Ed25519…"
+    KEYGEN_OUT=$(aperod wallet keygen 2>&1)
+    PRIVKEY_HEX=$(echo "${KEYGEN_OUT}" | grep -oP "Private:\s+\K[0-9a-f]+" | head -1 || true)
+    PUBKEY_HEX=$(echo "${KEYGEN_OUT}"  | grep -oP "Public:\s+\K[0-9a-f]+"  | head -1 || true)
+    if [[ -z "${PRIVKEY_HEX}" ]]; then
+      die "Не удалось сгенерировать ключ. Вывод aperod: ${KEYGEN_OUT}"
     fi
+    mkdir -p "${CONFIG_DIR}"
+    # Сохраняем сырые байты (не hex-строку)
+    echo -n "${PRIVKEY_HEX}" | xxd -r -p > "${CONFIG_DIR}/validator.key"
     ok "Новый ключ сгенерирован и сохранён"
   fi
 fi
@@ -209,7 +211,16 @@ if [[ "${MY_IP}" == "0.0.0.0" ]]; then
 fi
 info "Внешний IP: ${MY_IP}"
 
-# ── 9. Конфигурация ноды ──────────────────────────────────
+# ── 9. Копируем genesis конфиг ────────────────────────────
+mkdir -p "${CONFIG_DIR}"
+if [[ -f "${INSTALL_DIR}/config/genesis-testnet.yaml" ]]; then
+  cp "${INSTALL_DIR}/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
+  ok "Genesis конфиг скопирован: ${CONFIG_DIR}/genesis-testnet.yaml"
+else
+  warn "Файл genesis не найден в ${INSTALL_DIR}/config/. Нода не запустится без него."
+fi
+
+# ── 10. Конфигурация ноды ─────────────────────────────────
 cat > "${CONFIG_DIR}/node.yaml" <<EOF
 # Aperod Node Configuration
 # Автоматически создан install-validator.sh $(date -u +"%Y-%m-%d %H:%M UTC")
@@ -219,26 +230,22 @@ data_dir: ${DATA_DIR}
 log_level: info
 
 p2p:
-  listen: /ip4/0.0.0.0/tcp/${P2P_PORT}
-  external: /ip4/${MY_IP}/tcp/${P2P_PORT}
+  listen_addr: /ip4/0.0.0.0/tcp/${P2P_PORT}
+  bootnodes:
+    - /ip4/172.28.0.11/tcp/30303
+    - /ip4/172.28.0.12/tcp/30303
+    - /ip4/172.28.0.13/tcp/30303
   max_peers: 50
 
-rpc:
-  listen: 127.0.0.1:${RPC_PORT}
-  cors_origins: []
+consensus:
+  validator_key: ${CONFIG_DIR}/validator.key
 
-validator:
+api:
   enabled: true
-  key_file: ${CONFIG_DIR}/validator.key
+  listen_addr: 127.0.0.1:${RPC_PORT}
 
-bootnodes:
-  - /ip4/172.28.0.11/tcp/30303
-  - /ip4/172.28.0.12/tcp/30303
-  - /ip4/172.28.0.13/tcp/30303
-
-metrics:
-  enabled: true
-  listen: 127.0.0.1:9090
+genesis:
+  file: ${CONFIG_DIR}/genesis-testnet.yaml
 EOF
 
 ok "Конфигурация сохранена: ${CONFIG_DIR}/node.yaml"
