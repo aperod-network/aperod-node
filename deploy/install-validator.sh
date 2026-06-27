@@ -121,47 +121,62 @@ echo -e "${BOLD}═════════════════════�
 echo -e "  Настройка ключа валидатора"
 echo -e "═══════════════════════════════════════════════${NC}"
 
+# Определяем интерактивный режим (curl|bash → не терминал)
+IS_TTY=false
+if [[ -t 0 ]]; then IS_TTY=true; fi
+
 if [[ -f "${CONFIG_DIR}/validator.key" ]]; then
   warn "Файл ключа уже существует: ${CONFIG_DIR}/validator.key"
-  read -rp "Перезаписать? [y/N]: " OVERWRITE_KEY
+  if [[ "${IS_TTY}" == "true" ]]; then
+    read -rp "Перезаписать? [y/N]: " OVERWRITE_KEY
+  else
+    OVERWRITE_KEY="n"
+    info "Неинтерактивный режим — используем существующий ключ"
+  fi
   if [[ "${OVERWRITE_KEY,,}" != "y" ]]; then
     info "Используем существующий ключ"
-    PUBKEY_HEX=$(aperod wallet pubkey "$(cat "${CONFIG_DIR}/validator.key")" 2>/dev/null || echo "")
+    PRIVKEY_HEX=$(cat "${CONFIG_DIR}/validator.key")
+    PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "")
     KEY_CHOICE="keep"
   fi
 fi
 
 if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
-  echo
-  echo "  1) Сгенерировать новый ключ валидатора"
-  echo "  2) Ввести существующий приватный ключ (hex, 64 символа)"
-  echo
-  read -rp "Выбор [1/2]: " KEY_CHOICE
+  if [[ "${IS_TTY}" == "true" ]]; then
+    echo
+    echo "  1) Сгенерировать новый ключ валидатора"
+    echo "  2) Ввести существующий приватный ключ (hex, 64 символа)"
+    echo
+    read -rp "Выбор [1/2]: " KEY_CHOICE
+  else
+    KEY_CHOICE="1"
+    info "Неинтерактивный режим — генерируем новый ключ"
+  fi
 
   if [[ "${KEY_CHOICE}" == "2" ]]; then
     echo
+    if [[ "${IS_TTY}" != "true" ]]; then
+      die "Режим ввода существующего ключа требует интерактивного терминала. Запустите: sudo bash install-validator.sh"
+    fi
     read -rsp "  Введите приватный ключ (64 hex-символа, ввод скрыт): " PRIVKEY_HEX
     echo
-    if [[ ! "${PRIVKEY_HEX}" =~ ^[0-9a-fA-Fa-f]{64}$ ]]; then
+    if [[ ! "${PRIVKEY_HEX}" =~ ^[0-9a-fA-F]{64}$ ]]; then
       die "Неверный формат ключа. Ожидается 64 hex-символа (32 байта)."
     fi
+    mkdir -p "${CONFIG_DIR}"
     echo -n "${PRIVKEY_HEX}" > "${CONFIG_DIR}/validator.key"
     PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "[ошибка получения pubkey]")
     ok "Ключ сохранён"
   else
-    info "Генерируем новый ключ Ed25519…"
-    KEY_OUTPUT=$(aperod wallet create --validator 2>&1)
-    PRIVKEY_HEX=$(echo "${KEY_OUTPUT}" | grep -oP "Private Key:\s+\K[0-9a-f]{64}" || true)
-    PUBKEY_HEX=$(echo "${KEY_OUTPUT}"  | grep -oP "Public Key:\s+\K[0-9a-f]{64}"  || true)
-
-    if [[ -z "${PRIVKEY_HEX}" ]]; then
-      # Fallback: использовать openssl для генерации ключа
-      warn "Не удалось распарсить вывод 'aperod wallet create'. Генерируем через openssl…"
-      PRIVKEY_HEX=$(openssl rand -hex 32)
-      PUBKEY_HEX="[вычислите через: aperod wallet pubkey ${PRIVKEY_HEX}]"
-    fi
-
+    info "Генерируем новый ключ Ed25519 (openssl)…"
+    PRIVKEY_HEX=$(openssl rand -hex 32)
+    mkdir -p "${CONFIG_DIR}"
     echo -n "${PRIVKEY_HEX}" > "${CONFIG_DIR}/validator.key"
+    PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "")
+    if [[ -z "${PUBKEY_HEX}" ]]; then
+      warn "aperod wallet pubkey недоступен. Публичный ключ будет вычислен при старте ноды."
+      PUBKEY_HEX="(запустите: aperod wallet pubkey \$(cat ${CONFIG_DIR}/validator.key))"
+    fi
     ok "Новый ключ сгенерирован и сохранён"
   fi
 fi
@@ -185,7 +200,12 @@ MY_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null \
 
 if [[ "${MY_IP}" == "0.0.0.0" ]]; then
   warn "Не удалось определить внешний IP автоматически."
-  read -rp "Введите публичный IP этого сервера: " MY_IP
+  if [[ "${IS_TTY}" == "true" ]]; then
+    read -rp "Введите публичный IP этого сервера: " MY_IP
+  else
+    MY_IP="0.0.0.0"
+    warn "Неинтерактивный режим — укажите IP вручную в ${CONFIG_DIR}/node.yaml после установки"
+  fi
 fi
 info "Внешний IP: ${MY_IP}"
 
