@@ -96,7 +96,7 @@ ok "Исходный код получен в ${INSTALL_DIR}"
 
 # ── 5. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node (может занять 1–3 минуты)…"
-cd "${INSTALL_DIR}/blockchain"
+cd "${INSTALL_DIR}"
 export GOPATH="/root/go"
 export PATH="$PATH:/usr/local/go/bin"
 
