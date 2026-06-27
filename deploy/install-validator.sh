@@ -183,8 +183,8 @@ if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
   fi
 fi
 
-chmod 600 "${CONFIG_DIR}/validator.key"
-chown root:root "${CONFIG_DIR}/validator.key"
+chmod 640 "${CONFIG_DIR}/validator.key"
+chown root:"${APEROD_USER}" "${CONFIG_DIR}/validator.key"
 
 echo
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗"
@@ -322,29 +322,19 @@ echo -e "  ${BOLD}Данные:${NC}          ${DATA_DIR}"
 echo -e "  ${BOLD}P2P эндпоинт:${NC}   /ip4/${MY_IP}/tcp/${P2P_PORT}"
 echo
 echo -e "${YELLOW}${BOLD}  Следующий шаг — зарегистрируйте вашу ноду:${NC}"
-echo -e "  ┌──────────────────────────────────────────────────────────"
-echo -e "  │"
-echo -e "  │  1) Убедитесь, что нода запущена и синхронизируется:"
-echo -e "  │     journalctl -u aperod-node -f"
-echo -e "  │"
-echo -e "  │  2) Отправьте администратору сети заявку на регистрацию."
-echo -e "  │     Для этого выполните команду на вашем сервере:"
-echo -e "  │"
-echo -e "  │     curl -s https://aperod.net/api/v1/validators/apply \\"
-echo -e "  │       -H 'Content-Type: application/json' \\"
-echo -e "  │       -d '{"
-echo -e "  │         \"pubKey\": \"${PUBKEY_HEX}\","
-echo -e "  │         \"alias\": \"my-validator\","
-echo -e "  │         \"endpoint\": \"/ip4/${MY_IP}/tcp/${P2P_PORT}\""
-echo -e "  │       }'"
-echo -e "  │"
-echo -e "  │  3) После одобрения администратором переведите стейк"
-echo -e "  │     минимум 100 000 APR на адрес вашего валидатора."
-echo -e "  │     Получить адрес: aperod wallet address --key ${CONFIG_DIR}/validator.key"
-echo -e "  │"
-echo -e "  │  Ваш публичный ключ: ${PUBKEY_HEX}"
-echo -e "  │  P2P-эндпоинт:       /ip4/${MY_IP}/tcp/${P2P_PORT}"
-echo -e "  │"
-echo -e "  │  Документация: https://aperod.net/docs"
-echo -e "  └──────────────────────────────────────────────────────────"
+echo
+echo -e "  1) Убедитесь, что нода запущена:"
+echo -e "     ${CYAN}journalctl -u aperod-node -f${NC}"
+echo
+echo -e "  2) Скопируйте и выполните команду регистрации:"
+echo
+APPLY_CMD="curl -s -X POST https://aperod.net/api/v1/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\"}'"
+echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
+echo
+echo -e "  3) После одобрения администратором переведите стейк"
+echo -e "     минимум 100 000 APR на адрес вашего валидатора."
+echo
+echo -e "  Ваш публичный ключ : ${BOLD}${PUBKEY_HEX}${NC}"
+echo -e "  P2P-эндпоинт       : /ip4/${MY_IP}/tcp/${P2P_PORT}"
+echo -e "  Документация        : https://aperod.net/docs"
 echo
