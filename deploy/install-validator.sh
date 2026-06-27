@@ -323,7 +323,7 @@ echo -e "  ${BOLD}P2P эндпоинт:${NC}   /ip4/${MY_IP}/tcp/${P2P_PORT}"
 echo
 # ── Генерируем кошелёк для стейка ────────────────────────
 WALLET_OUT=$(aperod wallet create 2>&1)
-WALLET_ADDR=$(echo "${WALLET_OUT}" | grep -oP "Address:\s+\K\S+" | head -1 || true)
+WALLET_ADDR=$(echo "${WALLET_OUT}" | grep -oP "Address:\s+\K[A-Za-z0-9]+" | head -1 || true)
 if [[ -z "${WALLET_ADDR}" ]]; then
   WALLET_ADDR="(адрес недоступен — запустите: aperod wallet create)"
 fi
