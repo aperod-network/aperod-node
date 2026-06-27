@@ -20,7 +20,7 @@ DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
 WALLET_DIR="/etc/aperod/wallet"
 GO_VERSION="1.23.4"
-REPO_URL="https://github.com/aperod/aperod.git"
+REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
 
