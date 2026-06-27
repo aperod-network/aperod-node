@@ -321,6 +321,18 @@ echo -e "  ${BOLD}Конфиг:${NC}          ${CONFIG_DIR}/node.yaml"
 echo -e "  ${BOLD}Данные:${NC}          ${DATA_DIR}"
 echo -e "  ${BOLD}P2P эндпоинт:${NC}   /ip4/${MY_IP}/tcp/${P2P_PORT}"
 echo
+# ── Генерируем кошелёк для стейка ────────────────────────
+WALLET_OUT=$(aperod wallet create 2>&1)
+WALLET_ADDR=$(echo "${WALLET_OUT}" | grep -oP "Address:\s+\K\S+" | head -1 || true)
+if [[ -z "${WALLET_ADDR}" ]]; then
+  WALLET_ADDR="(адрес недоступен — запустите: aperod wallet create)"
+fi
+
+echo -e "${GREEN}${BOLD}  ✓  Адрес кошелька валидатора:${NC}"
+echo -e "     ${BOLD}${WALLET_ADDR}${NC}"
+echo -e "  Переведите на него минимум 100 000 APR для стейка."
+echo
+
 echo -e "${YELLOW}${BOLD}  Следующий шаг — зарегистрируйте вашу ноду:${NC}"
 echo
 echo -e "  1) Убедитесь, что нода запущена:"
@@ -328,13 +340,20 @@ echo -e "     ${CYAN}journalctl -u aperod-node -f${NC}"
 echo
 echo -e "  2) Скопируйте и выполните команду регистрации:"
 echo
-APPLY_CMD="curl -s -X POST https://aperod.net/api/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\"}'"
+APPLY_CMD="curl -s -X POST https://aperod.com/api/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\",\"address\":\"${WALLET_ADDR}\"}'"
 echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
 echo
-echo -e "  3) После одобрения администратором переведите стейк"
-echo -e "     минимум 100 000 APR на адрес вашего валидатора."
+echo -e "  3) Переведите стейк (минимум 100 000 APR) на адрес:"
+echo -e "     ${BOLD}${WALLET_ADDR}${NC}"
+echo -e "  Нода войдёт в активный набор валидаторов автоматически."
+echo
+echo -e "  ${BOLD}Параметры сети:${NC}"
+echo -e "    Мин. стейк      : 100 000 APR"
+echo -e "    Макс. валидаторов: 21"
+echo -e "    Эпоха           : каждые 100 блоков (~1.7 мин)"
+echo -e "    Анбондинг       : 7 200 блоков (~2 часа)"
 echo
 echo -e "  Ваш публичный ключ : ${BOLD}${PUBKEY_HEX}${NC}"
 echo -e "  P2P-эндпоинт       : /ip4/${MY_IP}/tcp/${P2P_PORT}"
-echo -e "  Документация        : https://aperod.net/docs"
+echo -e "  Документация        : https://aperod.com/docs"
 echo
