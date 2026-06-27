@@ -80,10 +80,11 @@ fi
 info "Получаем исходный код Aperod…"
 export GIT_TERMINAL_PROMPT=0
 if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  git -C "${INSTALL_DIR}" pull --ff-only
+  git -c credential.helper= -C "${INSTALL_DIR}" pull --ff-only
   ok "Репозиторий обновлён"
 else
-  git clone --depth=1 "${REPO_URL}" "${INSTALL_DIR}" || die "Не удалось клонировать ${REPO_URL}"
+  git -c credential.helper= clone --depth=1 "${REPO_URL}" "${INSTALL_DIR}" \
+    || die "Не удалось клонировать ${REPO_URL} — убедитесь что репозиторий публичный"
   ok "Репозиторий клонирован в ${INSTALL_DIR}"
 fi
 
