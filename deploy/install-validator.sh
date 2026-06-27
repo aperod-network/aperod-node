@@ -328,7 +328,7 @@ echo -e "     ${CYAN}journalctl -u aperod-node -f${NC}"
 echo
 echo -e "  2) Скопируйте и выполните команду регистрации:"
 echo
-APPLY_CMD="curl -s -X POST https://aperod.net/api/v1/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\"}'"
+APPLY_CMD="curl -s -X POST https://aperod.net/api/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\"}'"
 echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
 echo
 echo -e "  3) После одобрения администратором переведите стейк"
