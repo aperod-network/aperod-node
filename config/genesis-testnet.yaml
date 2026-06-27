@@ -9,14 +9,25 @@ bft_threshold: 0.667            # need 2/3 of validators to finalize
 
 checkpoint_every: 1000          # create checkpoint block every 1000 blocks
 
-# Validator public keys (ED25519, hex-encoded).
-# Generate with: aperod wallet create (for now, placeholder).
-# For a real testnet, replace with actual validator keys.
+# ─── Staking parameters ───────────────────────────────────────────────────────
+# Validators self-register WITHOUT admin approval (permissionless).
+# The network automatically selects top-staked nodes as active validators.
+staking:
+  max_validators: 21            # hard cap on active validators (BNB Chain model)
+  min_stake_apr: 100000         # minimum deposit to enter queue: 100,000 APR
+  epoch_length: 100             # validator-set updates every 100 blocks (~1.7 min)
+  churn_limit: 3                # max new activations per epoch (ETH-style anti-flood)
+  unbonding_blocks: 7200        # stake locked for 7,200 blocks (~2 hours) on exit
+  slash_percent: 10             # % slashed for proven double-signing
+  genesis_stake_apr: 1000000    # stake credited to each genesis validator (1 M APR)
+
+# Genesis validator public keys (ED25519, hex-encoded).
+# These start Active immediately — no queue needed.
+# Generate with:  ./build/aperod validator keygen
 validators:
   - "0000000000000000000000000000000000000000000000000000000000000000"
 
-# Pre-mine allocations (optional).
-# In testnet these are for development and testing.
+# Pre-mine allocations (dev / faucet seeding).
 allocations:
-  - address: ""                 # fill in with a real address
-    amount: 1000000000000       # 10,000 APR in base units
+  - address: ""                 # replace with a real address after keygen
+    amount: 1000000000000       # 10,000 APR in base units (APR × 10^8)

@@ -11,8 +11,9 @@ import (
 type TxVersion uint8
 
 const (
-        TxVersionBase    TxVersion = 1 // Standard RingCT transaction
+        TxVersionBase      TxVersion = 1 // Standard RingCT transaction
         TxVersionGameAsset TxVersion = 2 // Transaction with game asset data in Extra
+        TxVersionStake     TxVersion = 3 // Validator stake deposit / withdrawal
 )
 
 // Transaction is the core unit of value transfer in Aperod.
@@ -88,12 +89,32 @@ func (tx *Transaction) IsCoinbase() bool {
         return len(tx.Inputs) == 0
 }
 
+// IsStake returns true if this is a validator stake deposit or withdrawal.
+// Stake transactions carry their payload in Extra and skip RingCT validation.
+func (tx *Transaction) IsStake() bool {
+        return tx.Version == TxVersionStake
+}
+
 // Validate checks structural validity of the transaction.
 // Cryptographic validity (ring sigs, range proofs) is checked separately in tx_verifier.go.
 func (tx *Transaction) Validate() error {
         if tx.Version == 0 {
                 return fmt.Errorf("tx version 0 is invalid")
         }
+
+        // Stake transactions carry payload only in Extra; no RingCT fields required.
+        if tx.IsStake() {
+                if len(tx.Extra) != StakePayloadSize {
+                        return fmt.Errorf("stake tx: extra must be exactly %d bytes, got %d",
+                                StakePayloadSize, len(tx.Extra))
+                }
+                action := StakeAction(tx.Extra[0])
+                if action != StakeDeposit && action != StakeWithdraw {
+                        return fmt.Errorf("stake tx: unknown action %d", action)
+                }
+                return nil
+        }
+
         if len(tx.Outputs) == 0 {
                 return fmt.Errorf("tx has no outputs")
         }

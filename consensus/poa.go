@@ -17,8 +17,12 @@ import (
 type Config struct {
         BlockTime    time.Duration
         BFTThreshold float64 // fraction of validators needed to finalize (e.g. 0.667)
-        // Validators is the ordered list of validator public keys from genesis.
+        // Validators is the bootstrap list from genesis (used to seed the Registry).
+        // After startup the active set is managed by Registry.
         Validators []crypto.ValidatorPubKey
+        // Registry is the live stake-based validator registry.
+        // If nil the engine falls back to the static Validators list.
+        Registry *core.ValidatorRegistry
         // MyKey is this node's validator key (nil if not a validator).
         MyKey *crypto.ValidatorPrivKey
         // OnBlockProduced is an optional callback called after each block is added
@@ -57,7 +61,7 @@ type Engine struct {
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
-        return &Engine{
+        e := &Engine{
                 cfg:        cfg,
                 chain:      chain,
                 pool:       pool,
@@ -69,6 +73,24 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 newVoteCh:  make(chan FinalizeMsg, 256),
                 producedCh: make(chan *core.Block, 64),
         }
+        // Seed the registry with genesis validators so they start Active.
+        if cfg.Registry != nil && len(cfg.Validators) > 0 {
+                genesisStake := core.MinStakeNAPR * 10 // genesis validators credited 10× min
+                cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
+        }
+        return e
+}
+
+// activeValidators returns the current active validator set.
+// Reads from the Registry if available; falls back to the static genesis list.
+func (e *Engine) activeValidators() []crypto.ValidatorPubKey {
+        if e.cfg.Registry != nil {
+                vs := e.cfg.Registry.GetActiveValidators()
+                if len(vs) > 0 {
+                        return vs
+                }
+        }
+        return e.cfg.Validators
 }
 
 // Run starts the consensus loop. Blocks until ctx is done.
@@ -131,6 +153,17 @@ func (e *Engine) tick() error {
         // Add to our own chain
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add produced block: %w", err)
+        }
+
+        // Process stake txs and epoch updates for self-produced blocks
+        e.processStakeTxs(block)
+        if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
+                newSet := e.cfg.Registry.UpdateEpoch(block.Header.Height)
+                e.log.Info("epoch updated (self-produced)",
+                        "height", block.Header.Height,
+                        "epoch", block.Header.Height/core.EpochLength,
+                        "active_validators", len(newSet),
+                )
         }
 
         // Remove included transactions from mempool (same as acceptBlock does for
@@ -208,6 +241,22 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("add block: %w", err)
         }
 
+        // Process any stake transactions included in the block
+        e.processStakeTxs(block)
+
+        // At epoch boundaries, recompute the active validator set
+        if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
+                newSet := e.cfg.Registry.UpdateEpoch(block.Header.Height)
+                active, total := e.cfg.Registry.Count()
+                e.log.Info("epoch updated",
+                        "height", block.Header.Height,
+                        "epoch", block.Header.Height/core.EpochLength,
+                        "active_validators", active,
+                        "total_registered", total,
+                        "new_set_size", len(newSet),
+                )
+        }
+
         // Log checkpoint blocks
         if IsCheckpoint(block.Header.Height) {
                 e.log.Info("CHECKPOINT reached", "height", block.Header.Height)
@@ -272,8 +321,8 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
         }
         e.votes[vote.BlockHash][vote.ValidatorPub.Hex()] = vote.Signature
 
-        // Check if we've reached BFT threshold (2/3 of validators)
-        needed := int(float64(len(e.cfg.Validators))*e.cfg.BFTThreshold) + 1
+        // Check if we've reached BFT threshold (2/3 of active validators)
+        needed := int(float64(len(e.activeValidators()))*e.cfg.BFTThreshold) + 1
         if len(e.votes[vote.BlockHash]) >= needed {
                 e.finalized[vote.Height] = true
                 e.log.Info("block finalized",
@@ -290,13 +339,16 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 
 // proposerAt returns the validator that should propose at round r (round-robin).
 func (e *Engine) proposerAt(round uint32) crypto.ValidatorPubKey {
-        idx := int(round) % len(e.cfg.Validators)
-        return e.cfg.Validators[idx]
+        vs := e.activeValidators()
+        if len(vs) == 0 {
+                return nil
+        }
+        return vs[int(round)%len(vs)]
 }
 
-// isKnownValidator returns true if pub is in the validator set.
+// isKnownValidator returns true if pub is in the current active validator set.
 func (e *Engine) isKnownValidator(pub crypto.ValidatorPubKey) bool {
-        for _, v := range e.cfg.Validators {
+        for _, v := range e.activeValidators() {
                 if v.Equals(pub) {
                         return true
                 }
@@ -326,6 +378,28 @@ func (e *Engine) Chain() *core.Chain { return e.chain }
 // ProposerAt returns the validator that should propose at round r (exported for testing).
 func (e *Engine) ProposerAt(round uint32) crypto.ValidatorPubKey {
         return e.proposerAt(round)
+}
+
+// Registry returns the validator registry (may be nil for legacy static config).
+func (e *Engine) Registry() *core.ValidatorRegistry { return e.cfg.Registry }
+
+// processStakeTxs scans a block for stake transactions and applies them to the registry.
+func (e *Engine) processStakeTxs(block *core.Block) {
+        if e.cfg.Registry == nil {
+                return
+        }
+        for _, tx := range block.Txs {
+                if !tx.IsStake() {
+                        continue
+                }
+                if err := e.cfg.Registry.ProcessStakeTx(tx, block.Header.Height); err != nil {
+                        e.log.Warn("stake tx rejected",
+                                "height", block.Header.Height,
+                                "tx", tx.Hash(),
+                                "err", err,
+                        )
+                }
+        }
 }
 
 // HandleVote processes a finalization vote (exported for testing and P2P).
