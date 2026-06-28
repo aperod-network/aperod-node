@@ -142,6 +142,13 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
                 BFTThreshold: genesisCfg.BFTThreshold,
                 Validators:   validators,
                 MyKey:        myKey,
+                // Persist every self-produced block synchronously inside tick()
+                // so the produced-block channel is only used for P2P broadcast.
+                OnBlockProduced: func(b *core.Block) {
+                        if err := persistBlockToDB(db, b, utxos); err != nil {
+                                log.Error("persist produced block failed", "height", b.Header.Height, "err", err)
+                        }
+                },
         }, chain, mempool, log)
 
         // ── P2P host ──────────────────────────────────────────────────────────────
@@ -218,16 +225,15 @@ func (n *Node) Stop() error {
         return nil
 }
 
-// broadcastLoop reads produced blocks and votes from consensus and broadcasts them.
+// broadcastLoop reads produced blocks from consensus and broadcasts them to peers.
+// Block persistence is handled synchronously in the OnBlockProduced callback
+// inside tick(), so this loop is solely responsible for P2P propagation.
 func (n *Node) broadcastLoop() {
         for {
                 select {
                 case <-n.stop:
                         return
                 case block := <-n.engine.ProducedCh():
-                        // Persist block
-                        n.persistBlock(block)
-                        // Broadcast to peers
                         n.host.BroadcastBlock(block)
                 }
         }
