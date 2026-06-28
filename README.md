@@ -33,42 +33,58 @@ Supported: **Ubuntu 22.04 / 24.04 / Debian 12** (x86_64 and ARM64)
 
 ## Becoming a Validator
 
-Aperod uses **permissionless stake-based validator selection** — no admin approval needed.  
-The top **21 nodes by staked APR** are automatically selected as active validators.
+  Aperod selects the top **21 nodes by staked APR** as active validators.
+  Block rewards go directly to your **Telegram wallet** — no admin approval needed.
 
-### Steps
+  ### ⚠️ Before installing — get your APR wallet address
 
-**1. Install and sync the node** (run `install-validator.sh` above)
+  All block rewards go to your Aperod Telegram wallet. Create one first:
 
-**2. Get at least 100,000 APR** — minimum stake requirement
+  1. Open **https://t.me/aperod_bot**
+  2. Tap **"Create wallet"**
+  3. Copy your **APR address** (~95 characters)
 
-**3. Send a stake deposit transaction:**
-```bash
-aperod validator stake \
-  --key /etc/aperod/validator.key \
-  --amount 100000 \
-  --node http://127.0.0.1:8545
-```
+  You'll enter this address during node installation. Every block reward triggers a Telegram notification.
 
-**4. Wait for the next epoch** (~100 blocks, ≈1.7 minutes)  
-Your node will be activated automatically if it's in the top 21 by stake.
+  ### Steps
 
-**5. Check your status:**
-```bash
-aperod validator status \
-  --pubkey <your-hex-pubkey> \
-  --node http://127.0.0.1:8545
-```
+  **1. Install the validator node** (the script will ask for your APR address):
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
+  ```
 
-### Validator Parameters
+  Non-interactive (CI/automated):
+  ```bash
+  APEROD_REWARD_ADDRESS=<your-apr-address> sudo bash install-validator.sh
+  ```
 
-| Parameter | Value |
-|-----------|-------|
-| Minimum stake | 100,000 APR |
-| Maximum active validators | 21 |
-| Epoch length | 100 blocks (~1.7 min) |
-| Withdrawal lock | 7,200 blocks (~2 hours) |
-| Slashing (double-sign) | 10% of stake |
+  **2. Register your node** (the installer prints the exact command at the end):
+  ```bash
+  curl -s -X POST https://aperod.com/api/validators/apply \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "pubKey":   "<consensus-pubkey-from-installer>",
+      "alias":    "my-validator",
+      "endpoint": "/ip4/<your-ip>/tcp/30303",
+      "address":  "<your-apr-address>"
+    }'
+  ```
+
+  **3. Send the minimum stake** — transfer at least **100,000 APR** to your wallet address.
+  Your node activates automatically at the next epoch (~100 blocks, ≈1.7 min).
+
+  ### Validator Parameters
+
+  | Parameter | Value |
+  |-----------|-------|
+  | Minimum stake | 100,000 APR |
+  | Maximum active validators | 21 |
+  | Epoch length | 100 blocks (~1.7 min) |
+  | Withdrawal lock | 7,200 blocks (~2 hours) |
+  | Slashing (double-sign) | 10% of stake |
+
+---
+
 
 ---
 
@@ -162,6 +178,25 @@ aperod-node/
 - RPC port 8545 binds to localhost only — never expose externally
 - Validator key stored with `chmod 600` permissions
 - Double-signing protection with automatic slashing
+
+---
+
+## Uninstall
+
+  To completely remove the validator node from a server:
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/uninstall-validator.sh | sudo bash
+  ```
+
+  The script stops and removes: systemd service, binaries, config and keys (`/etc/aperod/`), blockchain data (`/var/lib/aperod/`), source files, system user `aperod`, and ufw rules for port 30303.
+
+  > Your **Telegram wallet** and APR balance are **not affected** — they live on the blockchain, not on your server.
+
+  Non-interactive:
+  ```bash
+  APEROD_UNINSTALL_CONFIRM=YES sudo bash uninstall-validator.sh
+  ```
 
 ---
 
