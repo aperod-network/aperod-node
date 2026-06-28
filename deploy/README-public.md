@@ -177,6 +177,37 @@ aperod/blockchain/
 
 ---
 
+## Uninstall
+
+To completely remove the validator node from a server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/uninstall-validator.sh | sudo bash
+```
+
+Or if you already have the file locally:
+```bash
+sudo bash uninstall-validator.sh
+```
+
+The script stops and removes:
+- `aperod-node` systemd service
+- Binaries (`/usr/local/bin/aperod-node`, `/usr/local/bin/aperod`)
+- Config and keys (`/etc/aperod/`)
+- Blockchain data (`/var/lib/aperod/`)
+- Source files (`/opt/aperod/`)
+- System user `aperod`
+- ufw rules for port 30303
+
+> Your **Telegram wallet** (`t.me/aperod_bot`) and APR balance are **not affected** — they live on the blockchain, not on your server.
+
+Non-interactive (automated):
+```bash
+APEROD_UNINSTALL_CONFIRM=YES sudo bash uninstall-validator.sh
+```
+
+---
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE)
