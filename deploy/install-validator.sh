@@ -57,14 +57,14 @@ echo
 
 # Определяем доступность интерактивного ввода.
 # curl|bash делает stdin пайпом, но /dev/tty доступен если есть реальный терминал.
-HAS_TTY=false
+IS_TTY=false
 if { : </dev/tty; } 2>/dev/null; then
-  HAS_TTY=true
+  IS_TTY=true
 fi
 
 REWARD_ADDRESS=""
 
-if [[ "${HAS_TTY}" == "true" ]]; then
+if [[ "${IS_TTY}" == "true" ]]; then
   while true; do
     echo -e "${BOLD}Введите ваш APR-адрес из Telegram-кошелька:${NC}"
     read -rp "  > " REWARD_ADDRESS </dev/tty
