@@ -6,10 +6,6 @@
 # ============================================================
 set -euo pipefail
 
-# Re-open stdin from /dev/tty when piped (e.g. curl | bash)
-# This allows interactive prompts to work even in piped mode.
-[[ -t 0 ]] || exec 0</dev/tty
-
 # ── Цвета вывода ──────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 CYAN='\033[0;36m';  BOLD='\033[1m';  NC='\033[0m'
@@ -42,7 +38,7 @@ fi
 # ── Проверка ОС ───────────────────────────────────────────
 if ! grep -qE "(Ubuntu|Debian)" /etc/os-release 2>/dev/null; then
   warn "Скрипт тестировался на Ubuntu 22.04/24.04 и Debian 12. Продолжить? [y/N]"
-  read -rp "" CONFIRM
+  read -rp "" CONFIRM </dev/tty
   [[ "${CONFIRM,,}" == "y" ]] || die "Установка отменена"
 fi
 
@@ -59,15 +55,19 @@ echo -e "  ${BOLD}2. Нажмите «Создать кошелёк»${NC}"
 echo -e "  ${BOLD}3. Скопируйте ваш APR-адрес${NC}"
 echo
 
-IS_TTY=false
-if [[ -t 0 ]]; then IS_TTY=true; fi
+# Определяем доступность интерактивного ввода.
+# curl|bash делает stdin пайпом, но /dev/tty доступен если есть реальный терминал.
+HAS_TTY=false
+if { : </dev/tty; } 2>/dev/null; then
+  HAS_TTY=true
+fi
 
 REWARD_ADDRESS=""
 
-if [[ "${IS_TTY}" == "true" ]]; then
+if [[ "${HAS_TTY}" == "true" ]]; then
   while true; do
     echo -e "${BOLD}Введите ваш APR-адрес из Telegram-кошелька:${NC}"
-    read -rp "  > " REWARD_ADDRESS
+    read -rp "  > " REWARD_ADDRESS </dev/tty
     REWARD_ADDRESS="${REWARD_ADDRESS// /}"  # убираем пробелы
     if [[ ${#REWARD_ADDRESS} -ge 80 ]]; then
       ok "Адрес принят: ${REWARD_ADDRESS:0:20}…${REWARD_ADDRESS: -8}"
