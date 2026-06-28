@@ -41,7 +41,7 @@ echo
 # Подтверждение
 if [[ -t 0 ]]; then
   read -rp "Введите YES для подтверждения: " CONFIRM
-  if [[ "${CONFIRM}" != "YES" ]]; then
+  if [[ "${CONFIRM^^}" != "YES" ]]; then
     echo "Отменено."
     exit 0
   fi
