@@ -110,6 +110,29 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
                                                 u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
                                 }
+                                // Diagnostic: verify recomputed commitment matches on-chain commitment.
+                                // If these differ, spendPub or amountNAPR mismatches the original mint.
+                                recomputedCommit, commitErr := crypto.Commit(u.AmountNAPR, blind)
+                                if commitErr != nil {
+                                        s.log.Error("DIAG: Commit recompute failed",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "err", commitErr)
+                                } else if recomputedCommit != out.AmountCommit {
+                                        s.log.Error("DIAG: MINT BLIND MISMATCH — recomputed commit != on-chain commit",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "out_idx", u.OutIdx,
+                                                "amount_napr", u.AmountNAPR,
+                                                "spend_pub_hex", fmt.Sprintf("%x", spendPub[:]),
+                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
+                                                "recomputed_commit", fmt.Sprintf("%x", recomputedCommit[:]),
+                                        )
+                                } else {
+                                        s.log.Info("DIAG: mint blind OK",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "amount_napr", u.AmountNAPR,
+                                                "commit_prefix", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                                        )
+                                }
                         } else {
                                 blind, err = blindFactorFromHex(u.BlindHex)
                                 if err != nil {

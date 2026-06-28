@@ -358,6 +358,7 @@ type mintResponse struct {
         TxHash    string `json:"tx_hash"`
         AmountAPR uint64 `json:"amount_apr"`
         Address   string `json:"address"`
+        BlindHex  string `json:"blind_hex"` // hex-encoded blind factor used for the commitment
 }
 
 // restAdminMint creates a coinbase-style mint transaction and adds it to the mempool.
@@ -409,11 +410,27 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
         hash := tx.Hash()
         txHashHex := fmt.Sprintf("%x", hash[:])
 
+        // Compute the deterministic blind used in the commitment so the caller
+        // can store it and always recover the spend path without relying on the
+        // blind being re-derived from a potentially different algorithm later.
+        _, spendPub, _, err := crypto.DecodeAddress(crypto.Address(req.Address))
+        if err != nil {
+                writeJSONError(w, http.StatusInternalServerError, "decode address for blind: "+err.Error())
+                return
+        }
+        mintBlind, err := crypto.DeterministicMintBlind(spendPub, amountNAPR)
+        if err != nil {
+                writeJSONError(w, http.StatusInternalServerError, "compute mint blind: "+err.Error())
+                return
+        }
+        blindHex := fmt.Sprintf("%x", mintBlind[:])
+
         s.log.Info("admin mint submitted", "address", req.Address, "amount_apr", req.AmountAPR, "tx_hash", txHashHex)
 
         writeJSON(w, http.StatusCreated, mintResponse{
                 TxHash:    txHashHex,
                 AmountAPR: req.AmountAPR,
                 Address:   req.Address,
+                BlindHex:  blindHex,
         })
 }
