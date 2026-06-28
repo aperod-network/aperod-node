@@ -6,15 +6,78 @@
 
 ### Full Node (non-validator)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-node.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/install-node.sh | sudo bash
 ```
 
 ### Validator Node
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/install-validator.sh | sudo bash
 ```
 
 Supported: **Ubuntu 22.04 / 24.04 / Debian 12** (x86_64 and ARM64)
+
+---
+
+## Becoming a Validator
+
+Aperod uses **stake-based validator selection** — the top 21 nodes by staked APR are active validators.
+
+### ⚠️ Before installing the node — get your wallet
+
+All block rewards go directly to your **Aperod Telegram wallet**.  
+You must have an APR address before installing the node.
+
+**Step 1 — Create your wallet:**
+1. Open the bot: **https://t.me/aperod_bot**
+2. Tap **"Create wallet"**
+3. Copy your **APR address** (~95 characters)
+
+You'll use this address during node installation. Rewards will arrive in your Telegram wallet and you'll receive a **Telegram notification** for each payment.
+
+---
+
+### Installation steps
+
+**Step 2 — Install the validator node:**
+```bash
+sudo bash install-validator.sh
+```
+
+The script will:
+- Ask for your APR address (from Telegram wallet above)
+- Generate a **consensus key** for block signing (separate from your wallet)
+- Configure the node with your reward address
+- Start the node as a systemd service
+
+Non-interactive install (CI/server):
+```bash
+APEROD_REWARD_ADDRESS=<your-apr-address> sudo bash install-validator.sh
+```
+
+**Step 3 — Register your node:**
+
+After installation the script prints the registration command. Run it:
+```bash
+curl -s -X POST https://aperod.com/api/validators/apply \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pubKey":   "<your-consensus-pubkey>",
+    "alias":    "my-validator",
+    "endpoint": "/ip4/<your-ip>/tcp/30303",
+    "address":  "<your-apr-address>"
+  }'
+```
+
+**Step 4 — Send the stake:**
+
+Transfer at least **100,000 APR** to your wallet address from your Telegram wallet.  
+The node will activate automatically in the next epoch (~100 blocks, ≈1.7 min).
+
+**Step 5 — Done!**
+
+- Rewards accumulate in your Telegram wallet
+- You receive a Telegram notification for every block reward
+- Check balance anytime in the bot
 
 ---
 
@@ -31,59 +94,15 @@ Supported: **Ubuntu 22.04 / 24.04 / Debian 12** (x86_64 and ARM64)
 
 ---
 
-## Becoming a Validator
+## How rewards work
 
-Aperod uses **permissionless stake-based validator selection** — no admin approval needed.  
-The top **21 nodes by staked APR** are automatically selected as active validators.
-
-### Steps
-
-**1. Install and sync the node** (run `install-validator.sh` above)
-
-**2. Get at least 100,000 APR** — minimum stake requirement
-
-**3. Send a stake deposit transaction:**
-```bash
-aperod validator stake \
-  --key /etc/aperod/validator.key \
-  --amount 100000 \
-  --node http://127.0.0.1:8545
-```
-
-**4. Wait for the next epoch** (~100 blocks, ≈1.7 minutes)  
-Your node will be activated automatically if it's in the top 21 by stake.
-
-**5. Check your status:**
-```bash
-aperod validator status \
-  --pubkey <your-hex-pubkey> \
-  --node http://127.0.0.1:8545
-```
-
-### Validator Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| Minimum stake | 100,000 APR |
-| Maximum active validators | 21 |
-| Epoch length | 100 blocks (~1.7 min) |
-| Withdrawal lock | 7,200 blocks (~2 hours) |
-| Slashing (double-sign) | 10% of stake |
-
----
-
-## Manual Build
-
-```bash
-# Requirements: Go 1.22+
-git clone https://github.com/aperod-network/aperod-node.git
-cd aperod-node
-make deps
-make build
-
-./build/aperod-node --help
-./build/aperod wallet create
-```
+| Action | Where it goes |
+|--------|--------------|
+| Block reward | Your Telegram wallet (APR address in config) |
+| Telegram notification | Sent to you on every reward |
+| Stake lock | 100,000 APR locked while you validate |
+| Withdrawal | Any time from Telegram wallet |
+| Slashing (double-sign) | 10% of stake deducted |
 
 ---
 
@@ -95,16 +114,41 @@ systemctl status aperod-node          # node status
 journalctl -u aperod-node -f          # live logs
 systemctl restart aperod-node         # restart
 
-# Wallet
-aperod wallet create                  # create new wallet
-aperod wallet balance                 # check balance
-aperod wallet send --to <addr> --amount <n>  # send APR
+# Check reward address in config
+grep reward_address /etc/aperod/node.yaml
 
-# Validator
-aperod validator keygen --out ./validator.key   # generate key
-aperod validator stake --key ./validator.key --amount 100000
-aperod validator status --pubkey <hex>
-aperod validator unstake --key ./validator.key
+# Update reward address (then restart node)
+# Edit /etc/aperod/node.yaml → reward_address: <new-address>
+systemctl restart aperod-node
+```
+
+---
+
+## Validator Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Minimum stake | 100,000 APR |
+| Maximum active validators | 21 |
+| Epoch length | 100 blocks (~1.7 min) |
+| Withdrawal lock | 7,200 blocks (~2 hours) |
+| Slashing (double-sign) | 10% of stake |
+
+---
+
+## Architecture
+
+```
+aperod/blockchain/
+├── crypto/      — Ed25519, SHA3, RingCT, Pedersen commitments, Bulletproofs
+├── core/        — Block, Transaction, UTXO, Mempool, Chain
+├── consensus/   — PoA engine (round-robin proposer + BFT 2/3 threshold)
+├── store/       — LevelDB storage
+├── p2p/         — Peer-to-peer networking
+├── cmd/node/    — aperod-node binary
+├── cmd/cli/     — aperod CLI
+├── config/      — testnet.yaml, genesis-testnet.yaml
+└── deploy/      — install-node.sh, install-validator.sh
 ```
 
 ---
@@ -123,45 +167,13 @@ aperod validator unstake --key ./validator.key
 
 ---
 
-## Exchange / DEX Integration
-
-REST API for exchanges, OTC desks, and swap services:
-
-```
-GET  /api/v1/chain/info
-GET  /api/v1/chain/blocks
-GET  /api/v1/wallet/balance/:address
-POST /api/v1/wallet/send
-GET  /api/v1/validators
-```
-
-Full API documentation: https://aperod.com/exchange/docs
-
----
-
-## Architecture
-
-```
-aperod-node/
-├── crypto/      — Ed25519, SHA3, RingCT, Pedersen commitments, Bulletproofs
-├── core/        — Block, Transaction, UTXO, Mempool, Chain, Staking
-├── consensus/   — PoA engine (round-robin proposer + BFT 2/3 threshold)
-├── store/       — LevelDB storage
-├── p2p/         — Peer-to-peer networking
-├── cmd/node/    — aperod-node binary
-├── cmd/cli/     — aperod CLI (wallet + chain inspection)
-├── config/      — testnet.yaml, genesis-testnet.yaml
-└── deploy/      — install-node.sh, install-validator.sh
-```
-
----
-
 ## Security
 
-- View key can be shared without spending ability (Monero-style dual-key)
+- Block rewards go to your Telegram wallet — consensus key has no spending ability
 - RPC port 8545 binds to localhost only — never expose externally
-- Validator key stored with `chmod 600` permissions
-- Double-signing protection with automatic slashing
+- Validator consensus key stored with `chmod 640` permissions
+- Double-signing protection with automatic slashing (10% of stake)
+- View key can be shared without spending ability (Monero-style dual-key)
 
 ---
 

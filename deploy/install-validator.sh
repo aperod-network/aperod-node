@@ -20,15 +20,14 @@ INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
 GO_VERSION="1.23.4"
-REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
 
 echo -e "
-${BOLD}╔════════════════════════════════════════════╗
-║   Aperod Validator Node — Installer        ║
-║   github.com/aperod-network/aperod-node    ║
-╚════════════════════════════════════════════╝${NC}
+${BOLD}╔════════════════════════════════════════════════════════════╗
+║        Aperod Validator Node — Installer                   ║
+║        aperod.com  |  t.me/aperod_bot                      ║
+╚════════════════════════════════════════════════════════════╝${NC}
 "
 
 # ── Проверка root ─────────────────────────────────────────
@@ -43,10 +42,53 @@ if ! grep -qE "(Ubuntu|Debian)" /etc/os-release 2>/dev/null; then
   [[ "${CONFIRM,,}" == "y" ]] || die "Установка отменена"
 fi
 
+# ── Шаг 0: Получите кошелёк ДО установки ─────────────────
+echo -e "${YELLOW}${BOLD}══════════════════════════════════════════════════════════════"
+echo -e "  ВАЖНО: перед установкой ноды нужен APR-адрес кошелька"
+echo -e "══════════════════════════════════════════════════════════════${NC}"
+echo
+echo -e "  Все вознаграждения за блоки будут поступать на ваш кошелёк"
+echo -e "  в Telegram. Если кошелька ещё нет — создайте его:"
+echo
+echo -e "  ${BOLD}1. Откройте бот: https://t.me/aperod_bot${NC}"
+echo -e "  ${BOLD}2. Нажмите «Создать кошелёк»${NC}"
+echo -e "  ${BOLD}3. Скопируйте ваш APR-адрес${NC}"
+echo
+
+IS_TTY=false
+if [[ -t 0 ]]; then IS_TTY=true; fi
+
+REWARD_ADDRESS=""
+
+if [[ "${IS_TTY}" == "true" ]]; then
+  while true; do
+    echo -e "${BOLD}Введите ваш APR-адрес из Telegram-кошелька:${NC}"
+    read -rp "  > " REWARD_ADDRESS
+    REWARD_ADDRESS="${REWARD_ADDRESS// /}"  # убираем пробелы
+    if [[ ${#REWARD_ADDRESS} -ge 80 ]]; then
+      ok "Адрес принят: ${REWARD_ADDRESS:0:20}…${REWARD_ADDRESS: -8}"
+      break
+    else
+      warn "Адрес слишком короткий (${#REWARD_ADDRESS} символов). APR-адрес содержит ~95 символов. Попробуйте ещё раз."
+    fi
+  done
+else
+  # Неинтерактивный режим — адрес через переменную окружения
+  if [[ -n "${APEROD_REWARD_ADDRESS:-}" ]]; then
+    REWARD_ADDRESS="${APEROD_REWARD_ADDRESS}"
+    ok "Адрес из переменной окружения: ${REWARD_ADDRESS:0:20}…"
+  else
+    die "Неинтерактивный режим: передайте адрес кошелька через:
+    APEROD_REWARD_ADDRESS=<ваш-apr-адрес> bash install-validator.sh"
+  fi
+fi
+
+echo
+
 # ── 1. Зависимости ────────────────────────────────────────
 info "Обновляем пакеты и устанавливаем зависимости…"
 apt-get update -q
-apt-get install -y -q git curl wget build-essential ufw jq
+apt-get install -y -q git curl wget build-essential ufw jq xxd
 ok "Зависимости установлены"
 
 # ── 2. Go ─────────────────────────────────────────────────
@@ -85,7 +127,7 @@ fi
 
 # ── 4. Клонирование репозитория ───────────────────────────
 info "Получаем исходный код Aperod…"
-TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
+TARBALL_URL="https://github.com/germanjemson-byte/aperod/archive/refs/heads/main.tar.gz"
 mkdir -p "${INSTALL_DIR}"
 info "Скачиваем архив исходного кода…"
 wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
@@ -96,7 +138,7 @@ ok "Исходный код получен в ${INSTALL_DIR}"
 
 # ── 5. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node (может занять 1–3 минуты)…"
-cd "${INSTALL_DIR}"
+cd "${INSTALL_DIR}/blockchain"
 export GOPATH="/root/go"
 export PATH="$PATH:/usr/local/go/bin"
 
@@ -115,16 +157,16 @@ ok "Бинарники установлены: /usr/local/bin/aperod-node, /usr/
 # ── 6. Директории ─────────────────────────────────────────
 mkdir -p "${CONFIG_DIR}" "${DATA_DIR}"
 
-# ── 7. Ключи валидатора ───────────────────────────────────
+# ── 7. Ключ консенсуса валидатора ─────────────────────────
 echo
 echo -e "${BOLD}═══════════════════════════════════════════════"
-echo -e "  Настройка ключа валидатора"
+echo -e "  Настройка ключа консенсуса валидатора"
 echo -e "═══════════════════════════════════════════════${NC}"
+echo -e "  (Этот ключ используется только для подписи блоков."
+echo -e "   Средства хранятся в вашем Telegram-кошельке.)"
+echo
 
-# Определяем интерактивный режим (curl|bash → не терминал)
-IS_TTY=false
-if [[ -t 0 ]]; then IS_TTY=true; fi
-
+KEY_CHOICE="new"
 if [[ -f "${CONFIG_DIR}/validator.key" ]]; then
   warn "Файл ключа уже существует: ${CONFIG_DIR}/validator.key"
   if [[ "${IS_TTY}" == "true" ]]; then
@@ -135,16 +177,16 @@ if [[ -f "${CONFIG_DIR}/validator.key" ]]; then
   fi
   if [[ "${OVERWRITE_KEY,,}" != "y" ]]; then
     info "Используем существующий ключ"
-    PRIVKEY_HEX=$(cat "${CONFIG_DIR}/validator.key")
+    PRIVKEY_HEX=$(xxd -p -c 256 "${CONFIG_DIR}/validator.key" | tr -d '\n' || cat "${CONFIG_DIR}/validator.key")
     PUBKEY_HEX=$(aperod wallet pubkey "${PRIVKEY_HEX}" 2>/dev/null || echo "")
     KEY_CHOICE="keep"
   fi
 fi
 
-if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
+if [[ "${KEY_CHOICE}" != "keep" ]]; then
   if [[ "${IS_TTY}" == "true" ]]; then
     echo
-    echo "  1) Сгенерировать новый ключ валидатора"
+    echo "  1) Сгенерировать новый ключ (рекомендуется)"
     echo "  2) Ввести существующий приватный ключ (hex, 64 символа)"
     echo
     read -rp "Выбор [1/2]: " KEY_CHOICE
@@ -154,9 +196,8 @@ if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
   fi
 
   if [[ "${KEY_CHOICE}" == "2" ]]; then
-    echo
     if [[ "${IS_TTY}" != "true" ]]; then
-      die "Режим ввода существующего ключа требует интерактивного терминала. Запустите: sudo bash install-validator.sh"
+      die "Режим ввода существующего ключа требует интерактивного терминала."
     fi
     read -rsp "  Введите приватный ключ (64 hex-символа, ввод скрыт): " PRIVKEY_HEX
     echo
@@ -177,9 +218,8 @@ if [[ "${KEY_CHOICE:-}" != "keep" ]]; then
       die "Не удалось сгенерировать ключ. Вывод aperod: ${KEYGEN_OUT}"
     fi
     mkdir -p "${CONFIG_DIR}"
-    # Сохраняем сырые байты (не hex-строку)
     echo -n "${PRIVKEY_HEX}" | xxd -r -p > "${CONFIG_DIR}/validator.key"
-    ok "Новый ключ сгенерирован и сохранён"
+    ok "Новый ключ консенсуса сгенерирован и сохранён"
   fi
 fi
 
@@ -187,11 +227,10 @@ chmod 640 "${CONFIG_DIR}/validator.key"
 chown root:"${APEROD_USER}" "${CONFIG_DIR}/validator.key"
 
 echo
-echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗"
-echo -e "  ✓  Публичный ключ вашего валидатора:"
+echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
+echo -e "  ✓  Публичный ключ валидатора (для регистрации ноды):"
 echo -e "     ${PUBKEY_HEX}"
-echo -e "  Сохраните его — потребуется для отправки стейка"
-echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
+echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
 echo
 
 # ── 8. Определяем внешний IP ─────────────────────────────
@@ -206,18 +245,18 @@ if [[ "${MY_IP}" == "0.0.0.0" ]]; then
     read -rp "Введите публичный IP этого сервера: " MY_IP
   else
     MY_IP="0.0.0.0"
-    warn "Неинтерактивный режим — укажите IP вручную в ${CONFIG_DIR}/node.yaml после установки"
+    warn "Укажите IP вручную в ${CONFIG_DIR}/node.yaml после установки"
   fi
 fi
 info "Внешний IP: ${MY_IP}"
 
 # ── 9. Копируем genesis конфиг ────────────────────────────
 mkdir -p "${CONFIG_DIR}"
-if [[ -f "${INSTALL_DIR}/config/genesis-testnet.yaml" ]]; then
-  cp "${INSTALL_DIR}/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
+if [[ -f "${INSTALL_DIR}/blockchain/config/genesis-testnet.yaml" ]]; then
+  cp "${INSTALL_DIR}/blockchain/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
   ok "Genesis конфиг скопирован: ${CONFIG_DIR}/genesis-testnet.yaml"
 else
-  warn "Файл genesis не найден в ${INSTALL_DIR}/config/. Нода не запустится без него."
+  warn "Файл genesis не найден. Нода не запустится без него."
 fi
 
 # ── 10. Конфигурация ноды ─────────────────────────────────
@@ -232,13 +271,12 @@ log_level: info
 p2p:
   listen_addr: /ip4/0.0.0.0/tcp/${P2P_PORT}
   bootnodes:
-    - /ip4/172.28.0.11/tcp/30303
-    - /ip4/172.28.0.12/tcp/30303
-    - /ip4/172.28.0.13/tcp/30303
+    - /ip4/77.221.153.86/tcp/30303
   max_peers: 50
 
 consensus:
   validator_key: ${CONFIG_DIR}/validator.key
+  reward_address: ${REWARD_ADDRESS}
 
 api:
   enabled: true
@@ -250,22 +288,22 @@ EOF
 
 ok "Конфигурация сохранена: ${CONFIG_DIR}/node.yaml"
 
-# ── 10. Firewall ──────────────────────────────────────────
+# ── 11. Firewall ──────────────────────────────────────────
 info "Настраиваем ufw…"
 ufw --force reset >/dev/null 2>&1
 ufw default deny incoming  >/dev/null 2>&1
 ufw default allow outgoing >/dev/null 2>&1
-ufw allow 22/tcp    comment "SSH"             >/dev/null 2>&1
-ufw allow ${P2P_PORT}/tcp comment "Aperod P2P"          >/dev/null 2>&1
+ufw allow 22/tcp    comment "SSH"              >/dev/null 2>&1
+ufw allow ${P2P_PORT}/tcp comment "Aperod P2P"           >/dev/null 2>&1
 ufw allow ${P2P_PORT}/udp comment "Aperod P2P discovery" >/dev/null 2>&1
 ufw --force enable          >/dev/null 2>&1
 ok "Firewall настроен (открыты: 22, ${P2P_PORT}/tcp, ${P2P_PORT}/udp)"
 
-# ── 11. systemd сервис ────────────────────────────────────
+# ── 12. systemd сервис ────────────────────────────────────
 cat > /etc/systemd/system/aperod-node.service <<EOF
 [Unit]
 Description=Aperod Validator Node (${MY_IP})
-Documentation=https://github.com/aperod-network/aperod-node
+Documentation=https://aperod.com/docs
 After=network-online.target
 Wants=network-online.target
 
@@ -301,7 +339,6 @@ systemctl enable aperod-node
 systemctl start  aperod-node
 ok "Сервис aperod-node запущен"
 
-# Ждём 3 секунды и проверяем
 sleep 3
 if systemctl is-active --quiet aperod-node; then
   ok "Нода работает нормально"
@@ -311,49 +348,55 @@ fi
 
 # ── Итог ──────────────────────────────────────────────────
 echo
-echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}${BOLD}  ✓  Установка завершена успешно!${NC}"
-echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
 echo
-echo -e "  ${BOLD}Статус ноды:${NC}     systemctl status aperod-node"
-echo -e "  ${BOLD}Логи:${NC}            journalctl -u aperod-node -f"
-echo -e "  ${BOLD}Конфиг:${NC}          ${CONFIG_DIR}/node.yaml"
-echo -e "  ${BOLD}Данные:${NC}          ${DATA_DIR}"
-echo -e "  ${BOLD}P2P эндпоинт:${NC}   /ip4/${MY_IP}/tcp/${P2P_PORT}"
+echo -e "  ${BOLD}Статус ноды:${NC}      systemctl status aperod-node"
+echo -e "  ${BOLD}Логи:${NC}             journalctl -u aperod-node -f"
+echo -e "  ${BOLD}Конфиг:${NC}           ${CONFIG_DIR}/node.yaml"
+echo -e "  ${BOLD}Данные:${NC}           ${DATA_DIR}"
+echo -e "  ${BOLD}P2P эндпоинт:${NC}    /ip4/${MY_IP}/tcp/${P2P_PORT}"
 echo
-# ── Генерируем кошелёк для стейка ────────────────────────
-WALLET_OUT=$(aperod wallet create 2>&1)
-WALLET_ADDR=$(echo "${WALLET_OUT}" | grep -oP "Address:\s+\K[A-Za-z0-9]+" | head -1 || true)
-if [[ -z "${WALLET_ADDR}" ]]; then
-  WALLET_ADDR="(адрес недоступен — запустите: aperod wallet create)"
-fi
-
-echo -e "${GREEN}${BOLD}  ✓  Адрес кошелька валидатора:${NC}"
-echo -e "     ${BOLD}${WALLET_ADDR}${NC}"
-echo -e "  Переведите на него минимум 100 000 APR для стейка."
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}  Адрес для получения вознаграждений:${NC}"
+echo -e "  ${BOLD}${REWARD_ADDRESS}${NC}"
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
+echo
+echo -e "  Все начисления за блоки будут поступать на этот адрес"
+echo -e "  в ваш Telegram-кошелёк (${CYAN}https://t.me/aperod_bot${NC})"
+echo -e "  и вы получите уведомление в Telegram при каждом начислении."
 echo
 
-echo -e "${YELLOW}${BOLD}  Следующий шаг — зарегистрируйте вашу ноду:${NC}"
+echo -e "${YELLOW}${BOLD}  Следующий шаг — зарегистрируйте ноду и сделайте стейк:${NC}"
 echo
-echo -e "  1) Убедитесь, что нода запущена:"
+echo -e "  1) Убедитесь, что нода работает:"
 echo -e "     ${CYAN}journalctl -u aperod-node -f${NC}"
 echo
-echo -e "  2) Скопируйте и выполните команду регистрации:"
+echo -e "  2) Зарегистрируйте ноду (выполните команду ниже):"
 echo
-APPLY_CMD="curl -s -X POST https://aperod.com/api/validators/apply -H 'Content-Type: application/json' -d '{\"pubKey\":\"${PUBKEY_HEX}\",\"alias\":\"my-validator\",\"endpoint\":\"/ip4/${MY_IP}/tcp/${P2P_PORT}\",\"address\":\"${WALLET_ADDR}\"}'"
+APPLY_CMD="curl -s -X POST https://aperod.com/api/validators/apply \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    \"pubKey\":   \"${PUBKEY_HEX}\",
+    \"alias\":    \"my-validator\",
+    \"endpoint\": \"/ip4/${MY_IP}/tcp/${P2P_PORT}\",
+    \"address\":  \"${REWARD_ADDRESS}\"
+  }'"
 echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
 echo
-echo -e "  3) Переведите стейк (минимум 100 000 APR) на адрес:"
-echo -e "     ${BOLD}${WALLET_ADDR}${NC}"
-echo -e "  Нода войдёт в активный набор валидаторов автоматически."
+echo -e "  3) Переведите минимум ${BOLD}100 000 APR${NC} на адрес вашего кошелька:"
+echo -e "     ${BOLD}${REWARD_ADDRESS}${NC}"
+echo -e "     Нода войдёт в активный набор валидаторов автоматически."
 echo
 echo -e "  ${BOLD}Параметры сети:${NC}"
-echo -e "    Мин. стейк      : 100 000 APR"
-echo -e "    Макс. валидаторов: 21"
-echo -e "    Эпоха           : каждые 100 блоков (~1.7 мин)"
-echo -e "    Анбондинг       : 7 200 блоков (~2 часа)"
+echo -e "    Мин. стейк          : 100 000 APR"
+echo -e "    Макс. валидаторов   : 21"
+echo -e "    Эпоха               : каждые 100 блоков (~1.7 мин)"
+echo -e "    Анбондинг           : 7 200 блоков (~2 часа)"
+echo -e "    Штраф за двойную подпись: 10% стейка"
 echo
-echo -e "  Ваш публичный ключ : ${BOLD}${PUBKEY_HEX}${NC}"
-echo -e "  P2P-эндпоинт       : /ip4/${MY_IP}/tcp/${P2P_PORT}"
-echo -e "  Документация        : https://aperod.com/docs"
+echo -e "  Ваш публичный ключ  : ${BOLD}${PUBKEY_HEX}${NC}"
+echo -e "  P2P-эндпоинт        : /ip4/${MY_IP}/tcp/${P2P_PORT}"
+echo -e "  Документация        : ${CYAN}https://aperod.com/docs${NC}"
 echo
