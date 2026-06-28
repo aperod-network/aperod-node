@@ -37,10 +37,11 @@ type P2PConfig struct {
 }
 
 // ConsensusConfig holds PoA settings.
-type ConsensusConfig struct {
-	ValidatorKey string        `yaml:"validator_key"` // path to ED25519 key file
-	BlockTime    time.Duration `yaml:"block_time"`
-}
+  type ConsensusConfig struct {
+  	ValidatorKey  string        `yaml:"validator_key"`  // path to ED25519 key file
+  	RewardAddress string        `yaml:"reward_address"` // APR address for block rewards (from Telegram wallet)
+  	BlockTime     time.Duration `yaml:"block_time"`
+  }
 
 // APIConfig holds RPC/REST settings.
 type APIConfig struct {
@@ -102,6 +103,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("APEROD_VALIDATOR_KEY"); v != "" {
 		cfg.Consensus.ValidatorKey = v
+	}
+	if v := os.Getenv("APEROD_REWARD_ADDRESS"); v != "" {
+		cfg.Consensus.RewardAddress = v
 	}
 
 	return cfg, nil
