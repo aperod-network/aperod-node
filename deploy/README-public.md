@@ -6,12 +6,12 @@
 
 ### Full Node (non-validator)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/install-node.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-node.sh | sudo bash
 ```
 
 ### Validator Node
 ```bash
-curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/install-validator.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
 ```
 
 Supported: **Ubuntu 22.04 / 24.04 / Debian 12** (x86_64 and ARM64)
@@ -182,7 +182,7 @@ aperod/blockchain/
 To completely remove the validator node from a server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/germanjemson-byte/aperod/main/blockchain/deploy/uninstall-validator.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/uninstall-validator.sh | sudo bash
 ```
 
 Or if you already have the file locally:

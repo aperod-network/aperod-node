@@ -131,7 +131,7 @@ fi
 
 # ── 4. Клонирование репозитория ───────────────────────────
 info "Получаем исходный код Aperod…"
-TARBALL_URL="https://github.com/germanjemson-byte/aperod/archive/refs/heads/main.tar.gz"
+TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
 mkdir -p "${INSTALL_DIR}"
 info "Скачиваем архив исходного кода…"
 wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
@@ -142,7 +142,7 @@ ok "Исходный код получен в ${INSTALL_DIR}"
 
 # ── 5. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node (может занять 1–3 минуты)…"
-cd "${INSTALL_DIR}/blockchain"
+cd "${INSTALL_DIR}"
 export GOPATH="/root/go"
 export PATH="$PATH:/usr/local/go/bin"
 
@@ -256,8 +256,8 @@ info "Внешний IP: ${MY_IP}"
 
 # ── 9. Копируем genesis конфиг ────────────────────────────
 mkdir -p "${CONFIG_DIR}"
-if [[ -f "${INSTALL_DIR}/blockchain/config/genesis-testnet.yaml" ]]; then
-  cp "${INSTALL_DIR}/blockchain/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
+if [[ -f "${INSTALL_DIR}/config/genesis-testnet.yaml" ]]; then
+  cp "${INSTALL_DIR}/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
   ok "Genesis конфиг скопирован: ${CONFIG_DIR}/genesis-testnet.yaml"
 else
   warn "Файл genesis не найден. Нода не запустится без него."
