@@ -180,6 +180,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, e
                 return s.aprValidateAddress(params)
         case "apr_estimateFee":
                 return s.aprEstimateFee(params)
+        case "apr_walletSend":
+                return s.aprWalletSend(params)
         default:
                 return nil, fmt.Errorf("method not found: %s", method)
         }

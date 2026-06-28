@@ -98,6 +98,12 @@ func scalarMulBase(s Scalar32) (Point32, error) {
         return out, nil
 }
 
+// PublicKeyFromPrivate derives the Ed25519 public key from a private scalar.
+// Used by the API server when it receives a spend/view private key from the wallet.
+func PublicKeyFromPrivate(priv Scalar32) (Point32, error) {
+        return scalarMulBase(priv)
+}
+
 // ScalarMulBase is exported for use in other crypto sub-packages.
 func ScalarMulBase(s Scalar32) (Point32, error) {
         return scalarMulBase(s)

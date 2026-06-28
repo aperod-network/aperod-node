@@ -1,6 +1,8 @@
 package crypto
 
 import (
+        "crypto/sha512"
+        "encoding/binary"
         "fmt"
 
         "filippo.io/edwards25519"
@@ -83,6 +85,28 @@ func CommitSum(inputs []Commitment, outputs []Commitment, feeCommit Commitment) 
         sumOut.Add(sumOut, feePt)
 
         return sumIn.Equal(sumOut) == 1, nil
+}
+
+// DeterministicMintBlind derives a stable blinding factor for transparent mint outputs.
+// Uses SHA-512("aperod-mint-blind-v1" || spendPub || amount_LE) → SetUniformBytes.
+// This lets the wallet spend a mint UTXO without storing the blind externally —
+// it can always be recomputed from the recipient's spend public key and amount.
+func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error) {
+        h := sha512.New()
+        h.Write([]byte("aperod-mint-blind-v1"))
+        h.Write(spendPub[:])
+        var ab [8]byte
+        binary.LittleEndian.PutUint64(ab[:], amount)
+        h.Write(ab[:])
+        var wide [64]byte
+        copy(wide[:], h.Sum(nil))
+        s, err := edwards25519.NewScalar().SetUniformBytes(wide[:])
+        if err != nil {
+                return BlindFactor{}, fmt.Errorf("deterministic mint blind: %w", err)
+        }
+        var bf BlindFactor
+        copy(bf[:], s.Bytes())
+        return bf, nil
 }
 
 // NewBlindFactor generates a random blinding factor.
