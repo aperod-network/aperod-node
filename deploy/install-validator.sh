@@ -132,6 +132,7 @@ fi
 # ── 4. Клонирование репозитория ───────────────────────────
 info "Получаем исходный код Aperod…"
 TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
+rm -rf "${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 info "Скачиваем архив исходного кода…"
 wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
