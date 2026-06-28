@@ -64,7 +64,7 @@ fi
 
 REWARD_ADDRESS=""
 
-if [[ "${IS_TTY}" == "true" ]]; then
+if [[ "${IS_TTY:-false}" == "true" ]]; then
   while true; do
     echo -e "${BOLD}Введите ваш APR-адрес из Telegram-кошелька:${NC}"
     read -rp "  > " REWARD_ADDRESS </dev/tty
@@ -174,7 +174,7 @@ echo
 KEY_CHOICE="new"
 if [[ -f "${CONFIG_DIR}/validator.key" ]]; then
   warn "Файл ключа уже существует: ${CONFIG_DIR}/validator.key"
-  if [[ "${IS_TTY}" == "true" ]]; then
+  if [[ "${IS_TTY:-false}" == "true" ]]; then
     read -rp "Перезаписать? [y/N]: " OVERWRITE_KEY
   else
     OVERWRITE_KEY="n"
@@ -189,7 +189,7 @@ if [[ -f "${CONFIG_DIR}/validator.key" ]]; then
 fi
 
 if [[ "${KEY_CHOICE}" != "keep" ]]; then
-  if [[ "${IS_TTY}" == "true" ]]; then
+  if [[ "${IS_TTY:-false}" == "true" ]]; then
     echo
     echo "  1) Сгенерировать новый ключ (рекомендуется)"
     echo "  2) Ввести существующий приватный ключ (hex, 64 символа)"
@@ -201,7 +201,7 @@ if [[ "${KEY_CHOICE}" != "keep" ]]; then
   fi
 
   if [[ "${KEY_CHOICE}" == "2" ]]; then
-    if [[ "${IS_TTY}" != "true" ]]; then
+    if [[ "${IS_TTY:-false}" != "true" ]]; then
       die "Режим ввода существующего ключа требует интерактивного терминала."
     fi
     read -rsp "  Введите приватный ключ (64 hex-символа, ввод скрыт): " PRIVKEY_HEX
@@ -246,7 +246,7 @@ MY_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null \
 
 if [[ "${MY_IP}" == "0.0.0.0" ]]; then
   warn "Не удалось определить внешний IP автоматически."
-  if [[ "${IS_TTY}" == "true" ]]; then
+  if [[ "${IS_TTY:-false}" == "true" ]]; then
     read -rp "Введите публичный IP этого сервера: " MY_IP
   else
     MY_IP="0.0.0.0"
