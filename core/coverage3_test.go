@@ -134,6 +134,19 @@ func TestTransactionValidate_ZeroKeyImage(t *testing.T) {
 
 func TestCreateGenesisBlock_WithAllocations(t *testing.T) {
         priv, pub, _ := crypto.GenerateValidatorKey()
+
+        // Generate two real wallet key pairs so we can build valid Aperod addresses.
+        wk1, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        wk2, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        addr1 := string(crypto.AddressFromKeys(crypto.TestnetByte, wk1))
+        addr2 := string(crypto.AddressFromKeys(crypto.TestnetByte, wk2))
+
         gc := &core.GenesisConfig{
                 ChainID:       "testnet-cov",
                 InitialSupply: 21_000_000_000_000,
@@ -143,8 +156,9 @@ func TestCreateGenesisBlock_WithAllocations(t *testing.T) {
                 RingSize:      11,
                 Validators:    []string{pub.Hex()},
                 Allocations: []core.GenesisAlloc{
-                        {Address: "addr1", Amount: 1_000_000},
-                        {Address: "addr2", Amount: 500_000},
+                        {Address: addr1, Amount: 1_000_000},
+                        {Address: addr2, Amount: 500_000},
+                        {Address: "", Amount: 999}, // placeholder — must be silently skipped
                 },
         }
         block, err := core.CreateGenesisBlock(gc, priv)
@@ -156,5 +170,12 @@ func TestCreateGenesisBlock_WithAllocations(t *testing.T) {
         }
         if block.Header.Height != 0 {
                 t.Errorf("genesis height = %d, want 0", block.Header.Height)
+        }
+        // Two valid allocations → two transactions → non-zero, non-empty Merkle root.
+        if len(block.Txs) != 2 {
+                t.Errorf("genesis tx count = %d, want 2", len(block.Txs))
+        }
+        if block.Header.MerkleRoot == (crypto.Hash32{}) {
+                t.Error("genesis MerkleRoot must not be the zero hash")
         }
 }
