@@ -27,7 +27,61 @@ staking:
 validators:
   - "0000000000000000000000000000000000000000000000000000000000000000"
 
-# Pre-mine allocations (dev / faucet seeding).
+# ─── Pre-mine tokenomics allocations ─────────────────────────────────────────
+#
+# Total supply: 21,000,000 APR
+#
+#  Category             | Share |  Amount (APR)  | Vesting
+#  ---------------------|-------|----------------|------------------------------
+#  Public Sale          |  40%  |   8,400,000    | immediate
+#  Team & Advisors      |  20%  |   4,200,000    | 12m cliff -> 24m linear
+#  Ecosystem/Community  |  15%  |   3,150,000    | 36m linear
+#  Reserve Fund         |  15%  |   3,150,000    | 18m cliff -> 24m linear
+#  Staking Rewards Pool |  10%  |   2,100,000    | 48m linear
+#
+# Amounts are in base units (1 APR = 100,000,000 base units).
+# Vesting durations in seconds; 1 month = 2,592,000 s (30 x 86400).
+# Replace address fields with real addresses: ./build/aperod wallet create --network mainnet
+#
 allocations:
-  - address: ""                 # replace with a real address after keygen
-    amount: 1000000000000       # 10,000 APR in base units (APR × 10^8)
+
+  # 40% - Public Sale (immediate)
+  - address: ""
+    amount: 840000000000000
+    label: "Public Sale"
+    vesting:
+      type: immediate
+
+  # 20% - Team & Advisors (12m cliff + 24m linear)
+  - address: ""
+    amount: 420000000000000
+    label: "Team & Advisors"
+    vesting:
+      type: cliff_linear
+      cliff_seconds: 31104000
+      vest_seconds: 62208000
+
+  # 15% - Ecosystem & Community (36m linear, no cliff)
+  - address: ""
+    amount: 315000000000000
+    label: "Ecosystem & Community"
+    vesting:
+      type: linear
+      vest_seconds: 93312000
+
+  # 15% - Reserve Fund (18m cliff + 24m linear)
+  - address: ""
+    amount: 315000000000000
+    label: "Reserve Fund"
+    vesting:
+      type: cliff_linear
+      cliff_seconds: 46656000
+      vest_seconds: 62208000
+
+  # 10% - Staking Rewards Pool (48m linear, no cliff)
+  - address: ""
+    amount: 210000000000000
+    label: "Staking Rewards Pool"
+    vesting:
+      type: linear
+      vest_seconds: 124416000

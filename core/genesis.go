@@ -37,10 +37,30 @@ type GenesisConfig struct {
         Allocations []GenesisAlloc `yaml:"allocations"`
 }
 
-// GenesisAlloc is a pre-mine allocation.
+// GenesisAlloc is a pre-mine allocation with optional vesting schedule.
 type GenesisAlloc struct {
-        Address string `yaml:"address"` // Aperod address
-        Amount  uint64 `yaml:"amount"`  // in base units (APR × 10^8)
+        Address string           `yaml:"address"`           // Aperod address
+        Amount  uint64           `yaml:"amount"`            // in base units (APR × 10^8)
+        Label   string           `yaml:"label,omitempty"`   // human-readable name, e.g. "Team & Advisors"
+        Vesting *VestingSchedule `yaml:"vesting,omitempty"` // nil means immediate unlock
+}
+
+// VestedAmount returns how many base units of this allocation are unlocked at
+// `now` (Unix seconds), given the genesis timestamp.
+// If Vesting is nil the entire amount is immediately available.
+func (a *GenesisAlloc) VestedAmount(now, genesisTime int64) uint64 {
+        if a.Vesting == nil {
+                return a.Amount
+        }
+        return a.Vesting.VestedAmount(a.Amount, genesisTime, now)
+}
+
+// LockedAmount returns how many base units are still vesting at `now`.
+func (a *GenesisAlloc) LockedAmount(now, genesisTime int64) uint64 {
+        if a.Vesting == nil {
+                return 0
+        }
+        return a.Vesting.LockedAmount(a.Amount, genesisTime, now)
 }
 
 // BaseUnitsPerAPR is the number of base units in one APR (like satoshi in Bitcoin).
