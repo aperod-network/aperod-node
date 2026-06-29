@@ -94,12 +94,18 @@ func CreateGenesisBlock(g *GenesisConfig, validatorPriv crypto.ValidatorPrivKey)
                 ts = time.Now().UTC().Unix()
         }
 
-        // Build coinbase-like allocations as outputs (simplified: no ring signatures)
+        // Build coinbase-like allocations as outputs (simplified: no ring signatures).
+        // Each allocation with a valid, non-empty address becomes a genesis output.
+        // Entries with an empty address are silently skipped (placeholder config).
         var txs []Transaction
         for _, alloc := range g.Allocations {
-                // For genesis, we use a placeholder public key derived from the address.
-                // In production: decode the address to get spend pub key.
-                var pubKey crypto.Point32
+                if alloc.Address == "" {
+                        continue // placeholder — skip until a real address is configured
+                }
+                _, spendPub, _, decErr := crypto.DecodeAddress(crypto.Address(alloc.Address))
+                if decErr != nil {
+                        return nil, fmt.Errorf("genesis: invalid allocation address %q: %w", alloc.Address, decErr)
+                }
                 blind, err := crypto.NewBlindFactor()
                 if err != nil {
                         return nil, err
@@ -111,7 +117,7 @@ func CreateGenesisBlock(g *GenesisConfig, validatorPriv crypto.ValidatorPrivKey)
                 txs = append(txs, Transaction{
                         Version: TxVersionBase,
                         Outputs: []Output{{
-                                OneTimePub:   pubKey,
+                                OneTimePub:   spendPub,
                                 AmountCommit: commit,
                         }},
                 })
