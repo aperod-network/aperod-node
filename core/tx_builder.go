@@ -45,6 +45,13 @@ type BuildResult struct {
         TotalFee     uint64
         InputCount   int
         OutputCount  int
+        // ChangeBlind is the Pedersen blinding factor of the change output.
+        // Callers must store this in utxo_blinds to be able to spend the change later.
+        // Zero if there is no change output.
+        ChangeBlind  crypto.BlindFactor
+        // ChangeOutIdx is the index of the change output within Tx.Outputs.
+        // -1 if there is no change output.
+        ChangeOutIdx int
 }
 
 // Build constructs a signed RingCT transaction.
@@ -99,29 +106,6 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         changeAmount := totalIn - amount - estimatedFee
         hasChange := changeAmount > 0
 
-        // ── Build outputs ─────────────────────────────────────────────────────────
-        type outEntry struct {
-                output Output
-                blind  crypto.BlindFactor
-                amount uint64
-        }
-
-        outEntries := []outEntry{}
-
-        payOut, payBlind, err := txBuildOutput(recipient, amount)
-        if err != nil {
-                return nil, fmt.Errorf("build payment output: %w", err)
-        }
-        outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
-
-        if hasChange {
-                chOut, chBlind, err := txBuildOutput(changeAddr, changeAmount)
-                if err != nil {
-                        return nil, fmt.Errorf("build change output: %w", err)
-                }
-                outEntries = append(outEntries, outEntry{chOut, chBlind, changeAmount})
-        }
-
         // ── Fee commitment ────────────────────────────────────────────────────────
         feeBlind, err := crypto.NewBlindFactor()
         if err != nil {
@@ -130,6 +114,65 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         feeCommit, err := crypto.Commit(estimatedFee, feeBlind)
         if err != nil {
                 return nil, fmt.Errorf("fee commit: %w", err)
+        }
+
+        // ── Pedersen blind balancing ──────────────────────────────────────────────
+        // Commitment balance constraint: ΣC_in = ΣC_out + C_fee
+        // Blind constraint:              Σr_in = Σr_out + r_fee
+        //
+        // Strategy (Monero-style):
+        //   • If hasChange: pay blind is random, change blind balances.
+        //     change_blind = Σr_in - r_pay - r_fee
+        //   • If !hasChange: pay blind balances directly.
+        //     pay_blind = Σr_in - r_fee
+        inBlinds := make([]crypto.BlindFactor, len(selected))
+        for i, u := range selected {
+                inBlinds[i] = u.Blind
+        }
+
+        // ── Build outputs ─────────────────────────────────────────────────────────
+        type outEntry struct {
+                output Output
+                blind  crypto.BlindFactor
+                amount uint64
+        }
+
+        var outEntries []outEntry
+        var changeBlindResult crypto.BlindFactor
+        changeOutIdx := -1
+
+        if hasChange {
+                // Payment blind: random (recipient cannot see our change balance)
+                payOut, payBlind, err := txBuildOutput(recipient, amount)
+                if err != nil {
+                        return nil, fmt.Errorf("build payment output: %w", err)
+                }
+                outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
+
+                // Change blind: computed so that ΣC_in == C_pay + C_change + C_fee
+                changeBlind, err := crypto.BlindSum(inBlinds, []crypto.BlindFactor{payBlind, feeBlind})
+                if err != nil {
+                        return nil, fmt.Errorf("change blind sum: %w", err)
+                }
+                chOut, err := txBuildOutputWithBlind(changeAddr, changeAmount, changeBlind)
+                if err != nil {
+                        return nil, fmt.Errorf("build change output: %w", err)
+                }
+                outEntries = append(outEntries, outEntry{chOut, changeBlind, changeAmount})
+                changeBlindResult = changeBlind
+                changeOutIdx = 1
+        } else {
+                // No change: payment blind balances the equation directly
+                // pay_blind = Σr_in - r_fee
+                payBlind, err := crypto.BlindSum(inBlinds, []crypto.BlindFactor{feeBlind})
+                if err != nil {
+                        return nil, fmt.Errorf("pay blind sum: %w", err)
+                }
+                payOut, err := txBuildOutputWithBlind(recipient, amount, payBlind)
+                if err != nil {
+                        return nil, fmt.Errorf("build payment output: %w", err)
+                }
+                outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
         }
 
         // ── Build ring inputs and derive one-time spend keys ─────────────────────
@@ -204,6 +247,37 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 TotalFee:     estimatedFee,
                 InputCount:   len(inputs),
                 OutputCount:  len(outputs),
+                ChangeBlind:  changeBlindResult,
+                ChangeOutIdx: changeOutIdx,
+        }, nil
+}
+
+// txBuildOutputWithBlind creates an Output using a specified blind factor.
+// Used for the change output and the "no change" payment path where the blind
+// is computed to satisfy the Pedersen commitment balance constraint.
+func txBuildOutputWithBlind(addr crypto.Address, amount uint64, blind crypto.BlindFactor) (Output, error) {
+        _, spendPub, viewPub, err := crypto.DecodeAddress(addr)
+        if err != nil {
+                return Output{}, fmt.Errorf("decode address: %w", err)
+        }
+
+        so, err := crypto.CreateStealthOutput(spendPub, viewPub)
+        if err != nil {
+                return Output{}, fmt.Errorf("stealth output: %w", err)
+        }
+
+        commit, err := crypto.Commit(amount, blind)
+        if err != nil {
+                return Output{}, err
+        }
+
+        encAmount := EncryptAmount(amount, &so.HsScalar)
+
+        return Output{
+                OneTimePub:   so.OneTimePub,
+                TxPubKey:     so.TxPubKey,
+                AmountCommit: commit,
+                EncAmount:    encAmount,
         }, nil
 }
 
@@ -257,15 +331,32 @@ func txBuildRing(realPub crypto.Point32) ([]crypto.RingMember, int, error) {
         return ring, realIdx, nil
 }
 
-// ExportedEstimateFee returns the flat fee for any transaction.
-// The nIn, nOut, and feePerByte parameters are kept for backwards-compatibility
-// but ignored — the fee is always FlatFee (0.5 APR).
-func ExportedEstimateFee(_, _ int, _ uint64) uint64 {
-        return FlatFee
+// Estimated serialized byte sizes used for fee calculation.
+// These mirror the formula in Transaction.Size() (transaction.go).
+const (
+        // txOverheadBytes: version(1) + fee(8) + feeCommit(32).
+        txOverheadBytes = 41
+        // txBytesPerInput: keyImage(32) + ring(11×32) + amountCommit(32)
+        //                  + MLSAG c0(32) + MLSAG ss(11×32) + MLSAG keyImage(32).
+        txBytesPerInput = 832
+        // txBytesPerOutput: oneTimePub(32) + txPubKey(32) + amountCommit(32)
+        //                   + encAmount(8) + rangeProof(675).
+        txBytesPerOutput = 779
+)
+
+// ExportedEstimateFee returns the estimated fee in base units for a transaction
+// with nInputs inputs and nOutputs outputs at the given feePerByte rate.
+// The estimate scales linearly with the number of inputs/outputs and with the
+// fee rate, making it suitable for fee-bumping and wallet UI display.
+func ExportedEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
+        if feePerByte == 0 {
+                feePerByte = 1
+        }
+        size := uint64(txOverheadBytes + nInputs*txBytesPerInput + nOutputs*txBytesPerOutput)
+        return size * feePerByte
 }
 
-// txEstimateFee returns the flat fee for any transaction.
-// nIn, nOut, and feePerByte are ignored — the fee is always FlatFee.
-func txEstimateFee(_, _ int, _ uint64) uint64 {
-        return FlatFee
+// txEstimateFee is the internal variant used during transaction construction.
+func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
+        return ExportedEstimateFee(nInputs, nOutputs, feePerByte)
 }
