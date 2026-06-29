@@ -331,15 +331,32 @@ func txBuildRing(realPub crypto.Point32) ([]crypto.RingMember, int, error) {
         return ring, realIdx, nil
 }
 
-// ExportedEstimateFee returns the flat fee for any transaction.
-// The nIn, nOut, and feePerByte parameters are kept for backwards-compatibility
-// but ignored — the fee is always FlatFee (0.5 APR).
-func ExportedEstimateFee(_, _ int, _ uint64) uint64 {
-        return FlatFee
+// Estimated serialized byte sizes used for fee calculation.
+// These mirror the formula in Transaction.Size() (transaction.go).
+const (
+        // txOverheadBytes: version(1) + fee(8) + feeCommit(32).
+        txOverheadBytes = 41
+        // txBytesPerInput: keyImage(32) + ring(11×32) + amountCommit(32)
+        //                  + MLSAG c0(32) + MLSAG ss(11×32) + MLSAG keyImage(32).
+        txBytesPerInput = 832
+        // txBytesPerOutput: oneTimePub(32) + txPubKey(32) + amountCommit(32)
+        //                   + encAmount(8) + rangeProof(675).
+        txBytesPerOutput = 779
+)
+
+// ExportedEstimateFee returns the estimated fee in base units for a transaction
+// with nInputs inputs and nOutputs outputs at the given feePerByte rate.
+// The estimate scales linearly with the number of inputs/outputs and with the
+// fee rate, making it suitable for fee-bumping and wallet UI display.
+func ExportedEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
+        if feePerByte == 0 {
+                feePerByte = 1
+        }
+        size := uint64(txOverheadBytes + nInputs*txBytesPerInput + nOutputs*txBytesPerOutput)
+        return size * feePerByte
 }
 
-// txEstimateFee returns the flat fee for any transaction.
-// nIn, nOut, and feePerByte are ignored — the fee is always FlatFee.
-func txEstimateFee(_, _ int, _ uint64) uint64 {
-        return FlatFee
+// txEstimateFee is the internal variant used during transaction construction.
+func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
+        return ExportedEstimateFee(nInputs, nOutputs, feePerByte)
 }

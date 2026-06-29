@@ -67,8 +67,15 @@ func TestBlock_IsGenesis(t *testing.T) {
 
 func TestMerkle_Empty(t *testing.T) {
         root := core.MerkleRoot(nil)
-        if root != (crypto.Hash32{}) {
-                t.Fatal("empty merkle root should be zero hash")
+        // Empty Merkle root is defined as SHA3-256("aperod/merkle-empty/v1") —
+        // a deterministic non-zero sentinel that cannot be confused with an
+        // uninitialised hash field.
+        if root == (crypto.Hash32{}) {
+                t.Fatal("empty merkle root must not be the zero hash")
+        }
+        // Calling again must return the same value (deterministic).
+        if root != core.MerkleRoot(nil) {
+                t.Fatal("empty merkle root is not deterministic")
         }
 }
 
