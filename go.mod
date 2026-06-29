@@ -3,7 +3,7 @@ module github.com/aperod/aperod
 go 1.25.0
 
 require (
-	filippo.io/edwards25519 v1.1.0
+	filippo.io/edwards25519 v1.1.1
 	github.com/btcsuite/btcutil v1.0.2
 	github.com/lib/pq v1.12.3
 	github.com/spf13/cobra v1.8.1
