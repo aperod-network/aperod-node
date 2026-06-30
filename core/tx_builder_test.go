@@ -84,7 +84,7 @@ func makeGenesisWithCoinbase(t *testing.T, aliceKeys *crypto.WalletKeyPair, supp
 
 // TestTxBuilder_AliceToBob exercises the full RingCT transaction lifecycle.
 func TestTxBuilder_AliceToBob(t *testing.T) {
-        const supply = 1_000_000_000 // 1 APR = 1_000_000_000 nAPR
+        const supply = 1_000_000_000 // 1 APRO = 1_000_000_000 nAPR
 
         // Generate Alice and Bob wallets
         aliceKeys, err := crypto.GenerateWalletKeys()

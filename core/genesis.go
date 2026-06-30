@@ -13,7 +13,7 @@ import (
 // read from the genesis YAML staking: section.
 type StakingGenesisConfig struct {
         MaxValidators   int    `yaml:"max_validators"`    // hard cap (default 21)
-        MinStakeAPR     uint64 `yaml:"min_stake_apr"`     // minimum deposit in whole APR
+        MinStakeAPR     uint64 `yaml:"min_stake_apr"`     // minimum deposit in whole APRO
         EpochLength     uint64 `yaml:"epoch_length"`      // blocks between set updates
         ChurnLimit      int    `yaml:"churn_limit"`       // max new activations per epoch
         UnbondingBlocks uint64 `yaml:"unbonding_blocks"`  // withdrawal lock duration in blocks
@@ -25,7 +25,7 @@ type StakingGenesisConfig struct {
 type GenesisConfig struct {
         ChainID         string               `yaml:"chain_id"`
         Timestamp       int64                `yaml:"timestamp"`        // Unix seconds; 0 = use current time
-        InitialSupply   uint64               `yaml:"initial_supply"`   // total APR (in APR, not base units)
+        InitialSupply   uint64               `yaml:"initial_supply"`   // total APRO (in APRO, not base units)
         BlockTimeMs     int64                `yaml:"block_time_ms"`
         RingSize        int                  `yaml:"ring_size"`
         MinValidators   int                  `yaml:"min_validators"`
@@ -40,7 +40,7 @@ type GenesisConfig struct {
 // GenesisAlloc is a pre-mine allocation with optional vesting schedule.
 type GenesisAlloc struct {
         Address string           `yaml:"address"`           // Aperod address
-        Amount  uint64           `yaml:"amount"`            // in base units (APR × 10^8)
+        Amount  uint64           `yaml:"amount"`            // in base units (APRO × 10^8)
         Label   string           `yaml:"label,omitempty"`   // human-readable name, e.g. "Team & Advisors"
         Vesting *VestingSchedule `yaml:"vesting,omitempty"` // nil means immediate unlock
 }
@@ -63,7 +63,7 @@ func (a *GenesisAlloc) LockedAmount(now, genesisTime int64) uint64 {
         return a.Vesting.LockedAmount(a.Amount, genesisTime, now)
 }
 
-// BaseUnitsPerAPR is the number of base units in one APR (like satoshi in Bitcoin).
+// BaseUnitsPerAPR is the number of base units in one APRO (like satoshi in Bitcoin).
 const BaseUnitsPerAPR = 100_000_000
 
 // LoadGenesis reads a genesis YAML file.

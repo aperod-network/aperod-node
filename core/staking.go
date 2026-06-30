@@ -28,7 +28,7 @@ const (
 	MaxValidators = 21
 
 	// MinStakeNAPR is the minimum stake to enter the activation queue.
-	// 100 000 APR × 10^8 = 10 000 000 000 000 nAPR.
+	// 100 000 APRO × 10^8 = 10 000 000 000 000 nAPRO.
 	MinStakeNAPR uint64 = 10_000_000_000_000
 
 	// EpochLength is the number of blocks per epoch.
@@ -53,7 +53,7 @@ const (
 type StakeAction uint8
 
 const (
-	StakeDeposit  StakeAction = 1 // Lock APR to enter validator queue
+	StakeDeposit  StakeAction = 1 // Lock APRO to enter validator queue
 	StakeWithdraw StakeAction = 2 // Initiate unbonding period
 )
 
@@ -141,7 +141,7 @@ type ValidatorEntry struct {
 	UnbondEndBlock  uint64 // block height after which stake is released (Unbonding only)
 }
 
-// APRStake returns the stake in whole APR (for display).
+// APRStake returns the stake in whole APRO (for display).
 func (e *ValidatorEntry) APRStake() float64 {
 	return float64(e.StakeNAPR) / float64(BaseUnitsPerAPR)
 }
@@ -213,7 +213,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 
 func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey, amount, height uint64) error {
 	if amount < MinStakeNAPR {
-		return fmt.Errorf("deposit too low: %.0f APR < minimum %.0f APR",
+		return fmt.Errorf("deposit too low: %.0f APRO < minimum %.0f APRO",
 			float64(amount)/float64(BaseUnitsPerAPR),
 			float64(MinStakeNAPR)/float64(BaseUnitsPerAPR))
 	}

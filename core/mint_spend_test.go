@@ -8,12 +8,12 @@ import (
 )
 
 // TestMintAndSpend replicates the exact real-world flow:
-// 1. Admin mints APR via BuildMintTx
+// 1. Admin mints APRO via BuildMintTx
 // 2. User spends it via TxBuilder (using DeterministicMintBlind)
 // This catches the "commitment balance check failed" bug.
 func TestMintAndSpend(t *testing.T) {
-	const mintAmount = uint64(200_000_000_000_000) // 2,000,000 APR
-	const sendAmount = uint64(20_000_000_000_000)  // 200,000 APR
+	const mintAmount = uint64(200_000_000_000_000) // 2,000,000 APRO
+	const sendAmount = uint64(20_000_000_000_000)  // 200,000 APRO
 
 	// 1. Generate Alice wallet keys
 	aliceKeys, err := crypto.GenerateWalletKeys()
@@ -23,7 +23,7 @@ func TestMintAndSpend(t *testing.T) {
 	aliceAddr := crypto.AddressFromKeys(crypto.MainnetByte, aliceKeys)
 	t.Logf("Alice address: %s", aliceAddr)
 
-	// 2. Admin mints APR to Alice (same as restAdminMint → BuildMintTx)
+	// 2. Admin mints APRO to Alice (same as restAdminMint → BuildMintTx)
 	mintTx, err := core.BuildMintTx(aliceAddr, mintAmount)
 	if err != nil {
 		t.Fatalf("BuildMintTx: %v", err)

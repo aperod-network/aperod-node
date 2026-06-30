@@ -23,9 +23,9 @@ type walletUTXOInput struct {
 type walletSendParams struct {
         SpendKeyHex   string            `json:"spend_key_hex"`   // 32-byte spend scalar (hex)
         ViewKeyHex    string            `json:"view_key_hex"`    // 32-byte view scalar (hex)
-        ToAddress     string            `json:"to_address"`      // recipient APR address
+        ToAddress     string            `json:"to_address"`      // recipient APRO address
         ChangeAddress string            `json:"change_address"`  // change address (empty = derive from keys)
-        AmountNAPR    uint64            `json:"amount_napr"`     // payment amount in nAPR
+        AmountNAPR    uint64            `json:"amount_napr"`     // payment amount in nAPRO
         UTXOs         []walletUTXOInput `json:"utxos"`           // caller-provided spendable UTXOs
 }
 

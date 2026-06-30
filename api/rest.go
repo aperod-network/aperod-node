@@ -7,7 +7,7 @@ package api
 //   GET  /api/v1/transactions/{hash}           — tx by hash
 //   GET  /api/v1/address/{addr}/transactions   — incoming tx for address
 //   GET  /api/v1/network/stats                 — network statistics
-//   POST /api/v1/admin/mint                    — admin-only: mint APR to address
+//   POST /api/v1/admin/mint                    — admin-only: mint APRO to address
 
 import (
         "encoding/hex"
@@ -350,7 +350,7 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 // mintRequest is the JSON body for the admin mint endpoint.
 type mintRequest struct {
         Address   string `json:"address"`   // Aperod wallet address
-        AmountAPR uint64 `json:"amount_apr"` // amount in whole APR (converted to nAPR internally)
+        AmountAPR uint64 `json:"amount_apr"` // amount in whole APRO (converted to nAPRO internally)
 }
 
 // mintResponse is returned on success.
@@ -390,7 +390,7 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        // Convert APR → nAPR (1 APR = 10^8 nAPR).
+        // Convert APRO → nAPRO (1 APRO = 10^8 nAPRO).
         const nAPRPerAPR uint64 = 100_000_000
         amountNAPR := req.AmountAPR * nAPRPerAPR
 

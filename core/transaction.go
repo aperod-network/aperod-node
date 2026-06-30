@@ -25,7 +25,7 @@ type Transaction struct {
         Inputs []RingInput
         // Outputs are the new UTXOs created by this transaction.
         Outputs []Output
-        // Fee is the miner fee in base units (APR × 10^8). NOT hidden (required for block validity).
+        // Fee is the miner fee in base units (APRO × 10^8). NOT hidden (required for block validity).
         Fee uint64
         // FeeCommit is a Pedersen commitment to Fee for the balance equation.
         FeeCommit crypto.Commitment
@@ -167,7 +167,7 @@ func (tx *Transaction) Size() int {
         return size
 }
 
-// FlatFee is the fixed transaction fee: 0.5 APR = 500_000_000 nAPR.
+// FlatFee is the fixed transaction fee: 0.5 APRO = 500_000_000 nAPRO.
 const FlatFee uint64 = 500_000_000
 
 // MinFee returns the minimum fee for any transaction (flat rate, size-independent).

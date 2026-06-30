@@ -2,7 +2,7 @@ package wallet
 
 // HD wallet — BIP44 hierarchical deterministic key derivation.
 // Path: m/44'/7777'/account'/0'/index'
-// 7777 = Aperod coin type (APR)
+// 7777 = Aperod coin type (APRO)
 // Derivation follows SLIP-0010 (Ed25519): all levels are hardened.
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	// AperodCoinType is the BIP44 coin type for APR.
+	// AperodCoinType is the BIP44 coin type for APRO.
 	AperodCoinType uint32 = 7777
 
 	// hardenedOffset is added to hardened child indices.

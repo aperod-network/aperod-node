@@ -24,7 +24,7 @@ func FuzzDecodeAddress(f *testing.F) {
         // Seed with some invalid inputs
         f.Add([]byte(""))
         f.Add([]byte("not-an-address"))
-        f.Add([]byte("APR" + string(make([]byte, 100))))
+        f.Add([]byte("APRO" + string(make([]byte, 100))))
 
         f.Fuzz(func(t *testing.T, data []byte) {
                 a := crypto.Address(data)

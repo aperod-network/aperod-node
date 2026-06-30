@@ -78,7 +78,7 @@ func TestBlockData_TypeContracts(t *testing.T) {
 
 func TestAddrTxData_TypeContracts(t *testing.T) {
         a := explorer.AddrTxData{
-                Address:     "APR" + "x" + "y" + "z",
+                Address:     "APRO" + "x" + "y" + "z",
                 TxHash:      "ab" + "cd",
                 BlockHeight: 5,
                 TxIndex:     0,

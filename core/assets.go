@@ -41,7 +41,7 @@ const maxNameBytes = 64
 // maxSymbolBytes is the maximum byte length of an asset symbol.
 const maxSymbolBytes = 12
 
-// maxAddrBytes is the maximum byte length of an encoded APR address.
+// maxAddrBytes is the maximum byte length of an encoded APRO address.
 const maxAddrBytes = 120
 
 // AssetPayload is the structured representation of a game-asset operation.

@@ -158,7 +158,7 @@ func TestAsset_Decode_WrongMagic(t *testing.T) {
 }
 
 func TestAsset_Decode_TooShort(t *testing.T) {
-	_, err := DecodeAssetPayload([]byte("APR"))
+	_, err := DecodeAssetPayload([]byte("APRO"))
 	if err != ErrNotAssetPayload {
 		t.Fatalf("expected ErrNotAssetPayload for 3-byte input, got %v", err)
 	}

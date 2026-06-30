@@ -1,7 +1,7 @@
 package wallet
 
 // Keystore — AES-256-GCM encrypted wallet storage with scrypt key derivation.
-// Compatible with the Web3/Ethereum keystore v3 spirit but APR-specific format.
+// Compatible with the Web3/Ethereum keystore v3 spirit but APRO-specific format.
 // Task 3.1.3.
 
 import (

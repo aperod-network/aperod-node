@@ -34,7 +34,7 @@ func TestVesting_EmptyTypeIsImmediate(t *testing.T) {
 func TestVesting_Linear(t *testing.T) {
 	const month = int64(SecondsPerMonth)
 	v := &VestingSchedule{Type: VestingLinear, VestSeconds: 12 * month}
-	total := uint64(1_000_000_000_000) // 10 000 APR
+	total := uint64(1_000_000_000_000) // 10 000 APRO
 	genesis := int64(1_700_000_000)
 
 	tests := []struct {
@@ -68,7 +68,7 @@ func TestVesting_CliffLinear(t *testing.T) {
 	cliff := 12 * month
 	vest := 24 * month
 	v := &VestingSchedule{Type: VestingCliffLinear, CliffSeconds: cliff, VestSeconds: vest}
-	total := uint64(4_200_000_000_000_000) // 42 M APR worth in base units
+	total := uint64(4_200_000_000_000_000) // 42 M APRO worth in base units
 	genesis := int64(1_700_000_000)
 
 	// Before cliff: nothing unlocked

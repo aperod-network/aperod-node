@@ -14,7 +14,7 @@ type MempoolConfig struct {
         MaxSize   int           // maximum number of transactions
         MaxTxSize int           // maximum size of a single transaction in bytes
         TTL       time.Duration // evict transactions older than this
-        MinFee    uint64        // minimum flat fee in nAPR (0.5 APR = 500_000_000 nAPR)
+        MinFee    uint64        // minimum flat fee in nAPRO (0.5 APRO = 500_000_000 nAPRO)
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -23,7 +23,7 @@ func DefaultMempoolConfig() MempoolConfig {
                 MaxSize:   5_000,
                 MaxTxSize: 100_000,
                 TTL:       2 * time.Hour,
-                MinFee:    500_000_000, // 0.5 APR
+                MinFee:    500_000_000, // 0.5 APRO
         }
 }
 
@@ -69,7 +69,7 @@ func (m *Mempool) Add(tx Transaction) error {
         // coinbase = block reward / admin mint (Fee=0 by design)
         // stake    = validator deposit/withdrawal (protocol-level, not ring-sig tx)
         if !tx.IsCoinbase() && !tx.IsStake() && tx.Fee < m.cfg.MinFee {
-                return fmt.Errorf("mempool: fee too low: %d < %d nAPR (minimum flat fee)", tx.Fee, m.cfg.MinFee)
+                return fmt.Errorf("mempool: fee too low: %d < %d nAPRO (minimum flat fee)", tx.Fee, m.cfg.MinFee)
         }
 
         hash := tx.Hash()

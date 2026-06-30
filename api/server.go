@@ -338,7 +338,7 @@ func (s *Server) aprGetBalance(params json.RawMessage) (interface{}, error) {
         return map[string]interface{}{
                 "address": args.Address,
                 "balance": balance,
-                "unit":    "nAPR",
+                "unit":    "nAPRO",
         }, nil
 }
 
@@ -440,11 +440,11 @@ func (s *Server) aprEstimateFee(params json.RawMessage) (interface{}, error) {
         // params may be null — tolerate unmarshal failure
         _ = json.Unmarshal(params, &args)
 
-        // Flat fee: 0.5 APR = 500_000_000 nAPR, size-independent.
+        // Flat fee: 0.5 APRO = 500_000_000 nAPRO, size-independent.
         const flatFee = core.FlatFee
         return map[string]interface{}{
                 "fee":  flatFee,
-                "unit": "nAPR",
+                "unit": "nAPRO",
                 "flat": true,
         }, nil
 }

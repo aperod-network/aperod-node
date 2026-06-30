@@ -39,7 +39,7 @@ type P2PConfig struct {
 // ConsensusConfig holds PoA settings.
 type ConsensusConfig struct {
         ValidatorKey  string        `yaml:"validator_key"`  // path to ED25519 key file
-        RewardAddress string        `yaml:"reward_address"` // APR wallet address for block rewards (from Telegram wallet)
+        RewardAddress string        `yaml:"reward_address"` // APRO wallet address for block rewards (from Telegram wallet)
         BlockTime     time.Duration `yaml:"block_time"`
 }
 

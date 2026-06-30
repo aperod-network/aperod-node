@@ -22,7 +22,7 @@ type TxBuilder struct {
 
 // NewTxBuilder creates a transaction builder for a wallet.
 // ownedUTXOs must come from WalletScanner.ScanChain — amounts must be decrypted.
-// The fee is always FlatFee (0.5 APR); the feePerByte parameter is kept for
+// The fee is always FlatFee (0.5 APRO); the feePerByte parameter is kept for
 // backwards-compatibility but ignored.
 func NewTxBuilder(
         spendPriv, viewPriv crypto.Scalar32,
@@ -56,7 +56,7 @@ type BuildResult struct {
 
 // Build constructs a signed RingCT transaction.
 //
-// amount — payment in base units (1 APR = 100_000_000).
+// amount — payment in base units (1 APRO = 100_000_000).
 // recipient — Aperod address of the payment recipient.
 // changeAddr — sender's own address for the change output.
 func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (*BuildResult, error) {

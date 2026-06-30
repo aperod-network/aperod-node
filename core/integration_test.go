@@ -32,7 +32,7 @@ func TestIntegration_CoinbaseToMempool(t *testing.T) {
         // ── Block 0: coinbase + stealth output to Alice ───────────────────────────
         // CoinbaseTx uses the spend pub key directly (no ECDH), so for wallet
         // scanner detection we also add a stealth-addressed output in a second tx.
-        reward := uint64(50_000_000) // 0.5 APR
+        reward := uint64(50_000_000) // 0.5 APRO
         cb := core.CoinbaseTx(aliceKeys.Spend.Public, reward)
 
         // Build a stealth output tx so Alice can detect it with ScanBlock.

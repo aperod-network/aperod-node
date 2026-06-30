@@ -32,7 +32,7 @@ func main() {
 var rootCmd = &cobra.Command{
         Use:   "aperod",
         Short: "Aperod blockchain CLI",
-        Long: `Aperod (APR) — A privacy-focused blockchain with RingCT transactions.
+        Long: `Aperod (APRO) — A privacy-focused blockchain with RingCT transactions.
 
 Commands:
   node      — Start and manage the Aperod node
@@ -338,7 +338,7 @@ var walletBalanceCmd = &cobra.Command{
                 fmt.Printf("Scanning for UTXOs belonging to %s...\n", addr)
                 fmt.Printf("RPC: %s | View key: %s\n", rpc, viewKey)
                 // TODO Phase 2: call apr_getBalance with view key
-                fmt.Println("Balance: 0.00000000 APR  (0 confirmed outputs)")
+                fmt.Println("Balance: 0.00000000 APRO  (0 confirmed outputs)")
                 return nil
         },
 }
@@ -419,7 +419,7 @@ var txCmd = &cobra.Command{
 
 var txSendCmd = &cobra.Command{
         Use:   "send",
-        Short: "Send APR to an address",
+        Short: "Send APRO to an address",
         RunE: func(cmd *cobra.Command, args []string) error {
                 to, _ := cmd.Flags().GetString("to")
                 amount, _ := cmd.Flags().GetFloat64("amount")
@@ -436,7 +436,7 @@ var txSendCmd = &cobra.Command{
                         return fmt.Errorf("--amount must be positive")
                 }
 
-                fmt.Printf("Sending %.8f APR → %s\n", amount, to)
+                fmt.Printf("Sending %.8f APRO → %s\n", amount, to)
                 fmt.Printf("RPC: %s | Key: %s\n", rpc, keyFile)
                 // TODO Phase 1.4 / Phase 2: build and broadcast RingCT transaction
                 fmt.Println("Transaction submitted. Hash: 0x0000...0000 (placeholder)")
@@ -446,7 +446,7 @@ var txSendCmd = &cobra.Command{
 
 func init() {
         txSendCmd.Flags().String("to", "", "Recipient Aperod address")
-        txSendCmd.Flags().Float64("amount", 0, "Amount in APR")
+        txSendCmd.Flags().Float64("amount", 0, "Amount in APRO")
         txSendCmd.Flags().String("rpc", "http://localhost:8545", "RPC endpoint")
         txSendCmd.Flags().String("key-file", "", "Wallet keystore file")
         txCmd.AddCommand(txSendCmd)

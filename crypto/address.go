@@ -21,7 +21,7 @@ const (
 // Mainnet addresses look like:  apr<base58...>
 // Testnet addresses look like: tapr<base58...>
 const (
-	mainnetHRPrefix = "apr"
+	mainnetHRPrefix = "apro"
 	testnetHRPrefix = "tapr"
 	devnetHRPrefix  = "dapr"
 )

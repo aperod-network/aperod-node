@@ -12,7 +12,7 @@ import (
 
 func TestWordlistCount(t *testing.T) {
         // Require at least 1024 entries (minimum for 10-bit safety).
-        // The APR wordlist may have fewer than 2048 entries; GenerateMnemonic uses
+        // The APRO wordlist may have fewer than 2048 entries; GenerateMnemonic uses
         // rejection sampling to avoid invalid indices.
         n := len(bip39WordList)
         if n < 1024 {
@@ -309,7 +309,7 @@ func TestScanner_ScanBlock_FindsOwnOutput(t *testing.T) {
                 t.Fatalf("DeriveFromMnemonic: %v", err)
         }
 
-        const amount uint64 = 50_000_000 // 0.5 APR
+        const amount uint64 = 50_000_000 // 0.5 APRO
         block := buildTestBlock(t, dk.Keys.Spend.Public, dk.Keys.View.Public, amount, 1)
 
         sc := NewScannerFromDerived(dk)
