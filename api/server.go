@@ -20,6 +20,7 @@ type Server struct {
         chain       *core.Chain
         mempool     *core.Mempool
         utxos       *core.UTXOSet
+        registry    *core.ValidatorRegistry // live PoS validator registry (optional)
         log         *slog.Logger
         mux         *http.ServeMux
         hub         *Hub
@@ -43,6 +44,10 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
         s.registerRoutes()
         return s
 }
+
+// SetRegistry wires the live PoS validator registry so the API can serve
+// /api/v1/validators and include validator_count in network stats.
+func (s *Server) SetRegistry(r *core.ValidatorRegistry) { s.registry = r }
 
 // APIKeyConfig optionally sets the required API key for write operations.
 // Call before Start(). Empty string disables key enforcement (dev mode).
