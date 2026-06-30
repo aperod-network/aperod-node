@@ -8,6 +8,7 @@ import (
         "os"
         "os/signal"
         "path/filepath"
+        "regexp"
         "syscall"
 
         "github.com/aperod/aperod/api"
@@ -15,6 +16,7 @@ import (
         "github.com/aperod/aperod/consensus"
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/p2p"
         "github.com/aperod/aperod/store"
 )
 
@@ -22,6 +24,72 @@ func main() {
         if err := run(); err != nil {
                 fmt.Fprintf(os.Stderr, "aperod-node: %v\n", err)
                 os.Exit(1)
+        }
+}
+
+// multiaddrRe matches /ip4/<host>/tcp/<port> and extracts host and port.
+var multiaddrRe = regexp.MustCompile(`/ip4/([\d.]+)/tcp/(\d+)`)
+
+// parseP2PAddr converts a multiaddr like "/ip4/0.0.0.0/tcp/30303" to "0.0.0.0:30303".
+// Falls back to addr as-is if it doesn't match (allows plain "host:port" too).
+func parseP2PAddr(addr string) string {
+        if m := multiaddrRe.FindStringSubmatch(addr); len(m) == 3 {
+                return m[1] + ":" + m[2]
+        }
+        return addr
+}
+
+// nodeHandler implements p2p.Handler using the consensus engine and in-memory chain.
+type nodeHandler struct {
+        engine *consensus.Engine
+        chain  *core.Chain
+        pool   *core.Mempool
+        db     *store.DB
+        log    *slog.Logger
+}
+
+func (h *nodeHandler) CurrentHeight() uint64 {
+        return h.chain.Height()
+}
+
+func (h *nodeHandler) CurrentTailHashes(n int) []crypto.Hash32 {
+        return h.chain.TailHashes(n)
+}
+
+func (h *nodeHandler) GetBlock(hash crypto.Hash32) *core.Block {
+        return h.chain.GetByHash(hash)
+}
+
+// OnBlock forwards an externally received block to the consensus engine.
+func (h *nodeHandler) OnBlock(block *core.Block) {
+        select {
+        case h.engine.NewBlockCh() <- block:
+        default:
+                h.log.Warn("p2p: incoming block channel full — dropped", "height", block.Header.Height)
+        }
+}
+
+// OnTransaction adds an externally received transaction to the mempool.
+func (h *nodeHandler) OnTransaction(tx *core.Transaction) {
+        if err := h.pool.Add(*tx); err != nil {
+                h.log.Debug("p2p: mempool rejected tx", "err", err)
+        }
+}
+
+// OnVote forwards a p2p vote to the consensus engine.
+func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
+        var pub crypto.ValidatorPubKey
+        copy(pub[:], vote.ValidatorPub)
+        fm := consensus.FinalizeMsg{
+                BlockHash:    vote.BlockHash,
+                Height:       vote.Height,
+                ValidatorPub: pub,
+                Signature:    vote.Signature,
+        }
+        select {
+        case h.engine.NewVoteCh() <- fm:
+        default:
+                h.log.Warn("p2p: vote channel full — dropped")
         }
 }
 
@@ -66,8 +134,6 @@ func run() error {
         defer db.Close()
 
         // ── 4. Load or generate a persistent validator key ────────────────────────
-        // If no key path is configured, auto-generate one and persist it so the
-        // same key (and thus the same genesis) is reused across restarts.
         myKey, err := loadOrGenerateValidatorKey(cfg, log)
         if err != nil {
                 return fmt.Errorf("validator key: %w", err)
@@ -80,7 +146,6 @@ func run() error {
         }
 
         // Override validator set with our own key so the node can always propose.
-        // This makes the testnet work out of the box without manual key config.
         validators := []crypto.ValidatorPubKey{myKey.Public()}
 
         // ── 6. Initialize chain ───────────────────────────────────────────────────
@@ -93,7 +158,6 @@ func run() error {
         }
 
         if tipHash == (crypto.Hash32{}) {
-                // Fresh node: create and persist genesis block
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, *myKey)
                 if err != nil {
@@ -111,7 +175,6 @@ func run() error {
                 h := genesis.Hash()
                 log.Info("genesis block created", "hash", fmt.Sprintf("%x", h[:8]))
         } else {
-                // Resume: load blocks from DB
                 log.Info("resuming from stored chain", "height", tipHeight, "tip", fmt.Sprintf("%x", tipHash[:8]))
                 loaded := uint64(0)
                 for h := uint64(0); h <= tipHeight; h++ {
@@ -141,6 +204,9 @@ func run() error {
         }
 
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
+        // host is declared here so OnBlockProduced can reference it (set after Start).
+        var host *p2p.Host
+
         engine := consensus.NewEngine(consensus.Config{
                 BlockTime:    cfg.Consensus.BlockTime,
                 BFTThreshold: genesisConfig.BFTThreshold,
@@ -155,12 +221,28 @@ func run() error {
                                         log.Error("failed to update tip", "height", block.Header.Height, "err", err)
                                 }
                         }
+                        // Broadcast newly produced block to P2P peers (non-blocking).
+                        if host != nil {
+                                host.BroadcastBlock(block)
+                        }
                 },
         }, chain, mempool, log)
 
         // ── 8. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
         go engine.Run(stop)
+
+        // Drain ProducedCh so the consensus engine never blocks on a full channel.
+        go func() {
+                for {
+                        select {
+                        case <-stop:
+                                return
+                        case <-engine.ProducedCh():
+                                // Consumed; broadcasting is handled in OnBlockProduced above.
+                        }
+                }
+        }()
 
         utxos := core.NewUTXOSet()
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
@@ -173,13 +255,53 @@ func run() error {
                 }()
         }
 
+        // ── 9. Start P2P networking ───────────────────────────────────────────────
+        if cfg.P2P.ListenAddr != "" {
+                tcpAddr := parseP2PAddr(cfg.P2P.ListenAddr)
+
+                // Convert bootnode multiaddrs to plain TCP addrs.
+                bootnodes := make([]string, 0, len(cfg.P2P.Bootnodes))
+                for _, bn := range cfg.P2P.Bootnodes {
+                        parsed := parseP2PAddr(bn)
+                        // Skip self-connections (same port as our listener).
+                        if parsed != tcpAddr {
+                                bootnodes = append(bootnodes, parsed)
+                        }
+                }
+
+                handler := &nodeHandler{
+                        engine: engine,
+                        chain:  chain,
+                        pool:   mempool,
+                        db:     db,
+                        log:    log,
+                }
+                host = p2p.NewHost(p2p.Config{
+                        ListenAddr: tcpAddr,
+                        Bootnodes:  bootnodes,
+                        MaxPeers:   cfg.P2P.MaxPeers,
+                        MinPeers:   cfg.P2P.MinPeers,
+                        NodeID:     myKey.Public().ID(),
+                        UserAgent:  "aperod-node/1.0",
+                }, handler, log)
+
+                if err := host.Start(); err != nil {
+                        log.Error("p2p failed to start", "err", err)
+                        // Non-fatal: node runs standalone if P2P fails.
+                } else {
+                        log.Info("p2p started", "listen", tcpAddr, "bootnodes", len(bootnodes))
+                        defer host.Stop()
+                }
+        }
+
         log.Info("node is running",
                 "validators", len(validators),
                 "my_pub", myKey.Public().ID(),
                 "api", cfg.API.ListenAddr,
+                "p2p", cfg.P2P.ListenAddr,
         )
 
-        // ── 9. Wait for signal ────────────────────────────────────────────────────
+        // ── 10. Wait for signal ───────────────────────────────────────────────────
         sig := make(chan os.Signal, 1)
         signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
         <-sig
@@ -190,9 +312,7 @@ func run() error {
 }
 
 // loadOrGenerateValidatorKey returns the node's validator private key.
-// Priority: config file → auto-generated persistent key at data_dir/validator.key.
 func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.ValidatorPrivKey, error) {
-        // 1. Explicit key file from config
         if cfg.Consensus.ValidatorKey != "" {
                 privBytes, err := os.ReadFile(cfg.Consensus.ValidatorKey)
                 if err != nil {
@@ -206,7 +326,6 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 return &priv, nil
         }
 
-        // 2. Auto-persistent key at data_dir/validator.key
         keyPath := filepath.Join(cfg.DataDir, "validator.key")
         if data, err := os.ReadFile(keyPath); err == nil {
                 priv, err := crypto.ValidatorPrivKeyFromBytes(data)
@@ -217,7 +336,6 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 return &priv, nil
         }
 
-        // 3. Generate a new key and persist it
         priv, _, err := crypto.GenerateValidatorKey()
         if err != nil {
                 return nil, fmt.Errorf("generate validator key: %w", err)
