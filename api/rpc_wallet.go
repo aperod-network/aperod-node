@@ -30,10 +30,13 @@ type walletSendParams struct {
 }
 
 type walletSendResult struct {
-        TxHash         string `json:"tx_hash"`
-        ChangeAmtNAPR  uint64 `json:"change_amount_napr"`
-        ChangeOutIdx   int    `json:"change_out_idx"`
-        ChangeBlindHex string `json:"change_blind_hex"`
+        TxHash          string `json:"tx_hash"`
+        ChangeAmtNAPR   uint64 `json:"change_amount_napr"`
+        ChangeOutIdx    int    `json:"change_out_idx"`
+        ChangeBlindHex  string `json:"change_blind_hex"`
+        PayBlindHex     string `json:"payment_blind_hex"`
+        PayOutIdx       int    `json:"payment_out_idx"`
+        PayAmtNAPR      uint64 `json:"payment_amount_napr"`
 }
 
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
@@ -210,7 +213,7 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 return nil, fmt.Errorf("mempool: %w", err)
         }
 
-        // ── 8. Return tx hash + change metadata ──────────────────────────────────
+        // ── 8. Return tx hash + change + payment metadata ────────────────────────
         txHash := result.Tx.Hash()
         changeBlindHex := ""
         if result.ChangeAmount > 0 {
@@ -222,6 +225,9 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 ChangeAmtNAPR:  result.ChangeAmount,
                 ChangeOutIdx:   result.ChangeOutIdx,
                 ChangeBlindHex: changeBlindHex,
+                PayBlindHex:    hex.EncodeToString(result.PayBlind[:]),
+                PayOutIdx:      result.PayOutIdx,
+                PayAmtNAPR:     p.AmountNAPR,
         }, nil
 }
 

@@ -52,6 +52,11 @@ type BuildResult struct {
         // ChangeOutIdx is the index of the change output within Tx.Outputs.
         // -1 if there is no change output.
         ChangeOutIdx int
+        // PayBlind is the Pedersen blinding factor of the payment output.
+        // Must be stored in utxo_blinds for the recipient so they can spend received funds.
+        PayBlind  crypto.BlindFactor
+        // PayOutIdx is the index of the payment output within Tx.Outputs (always 0).
+        PayOutIdx int
 }
 
 // Build constructs a signed RingCT transaction.
@@ -139,6 +144,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 
         var outEntries []outEntry
         var changeBlindResult crypto.BlindFactor
+        var payBlindResult crypto.BlindFactor
         changeOutIdx := -1
 
         if hasChange {
@@ -148,6 +154,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                         return nil, fmt.Errorf("build payment output: %w", err)
                 }
                 outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
+                payBlindResult = payBlind
 
                 // Change blind: computed so that ΣC_in == C_pay + C_change + C_fee
                 changeBlind, err := crypto.BlindSum(inBlinds, []crypto.BlindFactor{payBlind, feeBlind})
@@ -173,6 +180,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                         return nil, fmt.Errorf("build payment output: %w", err)
                 }
                 outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
+                payBlindResult = payBlind
         }
 
         // ── Build ring inputs and derive one-time spend keys ─────────────────────
@@ -249,6 +257,8 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 OutputCount:  len(outputs),
                 ChangeBlind:  changeBlindResult,
                 ChangeOutIdx: changeOutIdx,
+                PayBlind:     payBlindResult,
+                PayOutIdx:    0,
         }, nil
 }
 
