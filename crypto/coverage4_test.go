@@ -42,7 +42,7 @@ func TestScalarFromBytes_WrongLength(t *testing.T) {
 
 func TestMLSAGSign_WrongRingSize(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
-	ring := make([]crypto.RingMember, 3) // wrong, needs RingSize (11)
+	ring := make([]crypto.RingMember, 3) // wrong, needs RingSize (16)
 	ring[0] = wk.Spend.Public
 	msg := crypto.Hash32{}
 	_, err := crypto.MLSAGSign(msg, ring, 0, wk.Spend.Private)

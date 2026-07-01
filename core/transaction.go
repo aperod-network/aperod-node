@@ -154,7 +154,7 @@ func (tx *Transaction) Validate() error {
 func (tx *Transaction) Size() int {
         // Header: version(1) + fee(8) + feeCommit(32)
         size := 1 + 8 + 32
-        // Each input: keyImage(32) + ring(11×32) + amountCommit(32)
+        // Each input: keyImage(32) + ring(16×32) + amountCommit(32)
         size += len(tx.Inputs) * (32 + crypto.RingSize*32 + 32)
         // Each output: oneTimePub(32) + txPubKey(32) + amountCommit(32) + encAmount(8)
         size += len(tx.Outputs) * (32 + 32 + 32 + 8)

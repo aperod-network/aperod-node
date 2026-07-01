@@ -9,8 +9,8 @@ import (
 )
 
 // RingSize is the number of public keys in a ring (1 real + N-1 decoys).
-// Minimum 11 for meaningful anonymity set.
-const RingSize = 11
+// 16 members: 1 real + 15 decoys for a strong anonymity set.
+const RingSize = 16
 
 // MLSAGSignature is a Multi-Layered Linkable Spontaneous Anonymous Group signature.
 // It proves that the signer holds the private key for one of the ring members

@@ -218,7 +218,7 @@ func writeTempGenesis(t *testing.T) string {
                 "timestamp: 1000000\n" +
                 "initial_supply: 21000000\n" +
                 "block_time_ms: 5000\n" +
-                "ring_size: 11\n" +
+                "ring_size: 16\n" +
                 "min_validators: 1\n" +
                 "bft_threshold: 0.667\n" +
                 "validators:\n" +

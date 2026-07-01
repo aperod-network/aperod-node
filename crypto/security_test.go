@@ -3,7 +3,7 @@ package crypto_test
 // security_test.go — Phase 3.4 security audit tests.
 //
 // Covers:
-//   3.4.1 Fuzz: ring signatures with ring sizes 1, 2, 11 (via parameter errors)
+//   3.4.1 Fuzz: ring signatures with ring sizes 1, 2, 16 (via parameter errors)
 //   3.4.5 Transaction malleability: altered tx data fails signature verification
 //   3.4.6 Ring with duplicate public keys: detected or verification fails
 
@@ -26,7 +26,7 @@ func TestMLSAGSign_RingSize1(t *testing.T) {
         }
 }
 
-// TestMLSAGSign_RingSize2 verifies that ring size 2 (< RingSize=11) is rejected.
+// TestMLSAGSign_RingSize2 verifies that ring size 2 (< RingSize=16) is rejected.
 func TestMLSAGSign_RingSize2(t *testing.T) {
         wk1, _ := crypto.GenerateWalletKeys()
         wk2, _ := crypto.GenerateWalletKeys()
@@ -38,8 +38,8 @@ func TestMLSAGSign_RingSize2(t *testing.T) {
         }
 }
 
-// TestMLSAGSign_RingSize11_Valid verifies that the canonical ring size (11) works.
-func TestMLSAGSign_RingSize11_Valid(t *testing.T) {
+// TestMLSAGSign_RingSize16_Valid verifies that the canonical ring size (16) works.
+func TestMLSAGSign_RingSize16_Valid(t *testing.T) {
         wk, _ := crypto.GenerateWalletKeys()
         ring := make([]crypto.RingMember, crypto.RingSize)
         ring[0] = crypto.RingMember(wk.Spend.Public)

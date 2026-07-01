@@ -93,7 +93,7 @@ func TestTransactionValidate_RangeProofCountMismatch(t *testing.T) {
 func TestTransactionValidate_WrongRingSize(t *testing.T) {
         var ki crypto.KeyImage
         ki[0] = 1
-        ring := make([]crypto.RingMember, 3) // wrong (need 11)
+        ring := make([]crypto.RingMember, 3) // wrong (need 16)
         sig := &crypto.MLSAGSignature{}
         proof := &crypto.RangeProof{}
         tx := core.Transaction{
@@ -153,7 +153,7 @@ func TestCreateGenesisBlock_WithAllocations(t *testing.T) {
                 BlockTimeMs:   2000,
                 MinValidators: 1,
                 BFTThreshold:  0.667,
-                RingSize:      11,
+                RingSize:      16,
                 Validators:    []string{pub.Hex()},
                 Allocations: []core.GenesisAlloc{
                         {Address: addr1, Amount: 1_000_000},

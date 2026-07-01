@@ -163,7 +163,7 @@ aperod/blockchain/
 | Block time | 1 second |
 | P2P port | 30303 |
 | RPC port | 8545 (localhost only) |
-| Privacy | MLSAG Ring Signatures (ring size 11) |
+| Privacy | MLSAG Ring Signatures (ring size 16) |
 
 ---
 

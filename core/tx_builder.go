@@ -336,7 +336,7 @@ func txBuildRing(realPub crypto.Point32) ([]crypto.RingMember, int, error) {
 const (
         // txOverheadBytes: version(1) + fee(8) + feeCommit(32).
         txOverheadBytes = 41
-        // txBytesPerInput: keyImage(32) + ring(11×32) + amountCommit(32)
+        // txBytesPerInput: keyImage(32) + ring(16×32) + amountCommit(32)
         //                  + MLSAG c0(32) + MLSAG ss(11×32) + MLSAG keyImage(32).
         txBytesPerInput = 832
         // txBytesPerOutput: oneTimePub(32) + txPubKey(32) + amountCommit(32)
