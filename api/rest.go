@@ -306,15 +306,23 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 for h2 := windowStart; h2 <= int64(height); h2++ {
                         b := s.chain.GetByHeight(uint64(h2))
                         if b != nil {
-                                windowTxs += len(b.Txs)
+                                for _, tx := range b.Txs {
+                                        if !tx.IsCoinbase() {
+                                                windowTxs++
+                                        }
+                                }
                                 windowBlocks++
                         }
                 }
-                // Also sum all txs for total
+                // Also sum all non-coinbase txs for total
                 for h2 := int64(0); h2 <= int64(height); h2++ {
                         b := s.chain.GetByHeight(uint64(h2))
                         if b != nil {
-                                totalTxs += len(b.Txs)
+                                for _, tx := range b.Txs {
+                                        if !tx.IsCoinbase() {
+                                                totalTxs++
+                                        }
+                                }
                         }
                 }
 
