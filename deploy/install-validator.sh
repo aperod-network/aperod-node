@@ -44,7 +44,7 @@ fi
 
 # ── Шаг 0: Получите кошелёк ДО установки ─────────────────
 echo -e "${YELLOW}${BOLD}══════════════════════════════════════════════════════════════"
-echo -e "  ВАЖНО: перед установкой ноды нужен APR-адрес кошелька"
+echo -e "  ВАЖНО: перед установкой ноды нужен APRO-адрес кошелька"
 echo -e "══════════════════════════════════════════════════════════════${NC}"
 echo
 echo -e "  Все вознаграждения за блоки будут поступать на ваш кошелёк"
@@ -52,7 +52,7 @@ echo -e "  в Telegram. Если кошелька ещё нет — создай
 echo
 echo -e "  ${BOLD}1. Откройте бот: https://t.me/aperod_bot${NC}"
 echo -e "  ${BOLD}2. Нажмите «Создать кошелёк»${NC}"
-echo -e "  ${BOLD}3. Скопируйте ваш APR-адрес${NC}"
+echo -e "  ${BOLD}3. Скопируйте ваш APRO-адрес${NC}"
 echo
 
 # Определяем доступность интерактивного ввода.
@@ -66,14 +66,14 @@ REWARD_ADDRESS=""
 
 if [[ "${IS_TTY:-false}" == "true" ]]; then
   while true; do
-    echo -e "${BOLD}Введите ваш APR-адрес из Telegram-кошелька:${NC}"
+    echo -e "${BOLD}Введите ваш APRO-адрес из Telegram-кошелька:${NC}"
     read -rp "  > " REWARD_ADDRESS </dev/tty
     REWARD_ADDRESS="${REWARD_ADDRESS// /}"  # убираем пробелы
     if [[ ${#REWARD_ADDRESS} -ge 80 ]]; then
       ok "Адрес принят: ${REWARD_ADDRESS:0:20}…${REWARD_ADDRESS: -8}"
       break
     else
-      warn "Адрес слишком короткий (${#REWARD_ADDRESS} символов). APR-адрес содержит ~95 символов. Попробуйте ещё раз."
+      warn "Адрес слишком короткий (${#REWARD_ADDRESS} символов). APRO-адрес содержит ~95 символов. Попробуйте ещё раз."
     fi
   done
 else
@@ -83,7 +83,7 @@ else
     ok "Адрес из переменной окружения: ${REWARD_ADDRESS:0:20}…"
   else
     die "Неинтерактивный режим: передайте адрес кошелька через:
-    APEROD_REWARD_ADDRESS=<ваш-apr-адрес> bash install-validator.sh"
+    APEROD_REWARD_ADDRESS=<ваш-apro-адрес> bash install-validator.sh"
   fi
 fi
 
@@ -390,12 +390,12 @@ APPLY_CMD="curl -s -X POST https://aperod.com/api/validators/apply \\
   }'"
 echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
 echo
-echo -e "  3) Переведите минимум ${BOLD}100 000 APR${NC} на адрес вашего кошелька:"
+echo -e "  3) Переведите минимум ${BOLD}100 000 APRO${NC} на адрес вашего кошелька:"
 echo -e "     ${BOLD}${REWARD_ADDRESS}${NC}"
 echo -e "     Нода войдёт в активный набор валидаторов автоматически."
 echo
 echo -e "  ${BOLD}Параметры сети:${NC}"
-echo -e "    Мин. стейк          : 100 000 APR"
+echo -e "    Мин. стейк          : 100 000 APRO"
 echo -e "    Макс. валидаторов   : 21"
 echo -e "    Эпоха               : каждые 100 блоков (~1.7 мин)"
 echo -e "    Анбондинг           : 7 200 блоков (~2 часа)"

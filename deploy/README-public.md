@@ -1,4 +1,4 @@
-# Aperod Node (APR)
+# Aperod Node (APRO)
 
 > Privacy-focused blockchain with RingCT transactions, stake-based validator selection, and game integration.
 
@@ -20,17 +20,17 @@ Supported: **Ubuntu 22.04 / 24.04 / Debian 12** (x86_64 and ARM64)
 
 ## Becoming a Validator
 
-Aperod uses **stake-based validator selection** — the top 21 nodes by staked APR are active validators.
+Aperod uses **stake-based validator selection** — the top 21 nodes by staked APRO are active validators.
 
 ### ⚠️ Before installing the node — get your wallet
 
 All block rewards go directly to your **Aperod Telegram wallet**.  
-You must have an APR address before installing the node.
+You must have an APRO address before installing the node.
 
 **Step 1 — Create your wallet:**
 1. Open the bot: **https://t.me/aperod_bot**
 2. Tap **"Create wallet"**
-3. Copy your **APR address** (~95 characters)
+3. Copy your **APRO address** (~95 characters)
 
 You'll use this address during node installation. Rewards will arrive in your Telegram wallet and you'll receive a **Telegram notification** for each payment.
 
@@ -44,14 +44,14 @@ sudo bash install-validator.sh
 ```
 
 The script will:
-- Ask for your APR address (from Telegram wallet above)
+- Ask for your APRO address (from Telegram wallet above)
 - Generate a **consensus key** for block signing (separate from your wallet)
 - Configure the node with your reward address
 - Start the node as a systemd service
 
 Non-interactive install (CI/server):
 ```bash
-APEROD_REWARD_ADDRESS=<your-apr-address> sudo bash install-validator.sh
+APEROD_REWARD_ADDRESS=<your-apro-address> sudo bash install-validator.sh
 ```
 
 **Step 3 — Register your node:**
@@ -64,13 +64,13 @@ curl -s -X POST https://aperod.com/api/validators/apply \
     "pubKey":   "<your-consensus-pubkey>",
     "alias":    "my-validator",
     "endpoint": "/ip4/<your-ip>/tcp/30303",
-    "address":  "<your-apr-address>"
+    "address":  "<your-apro-address>"
   }'
 ```
 
 **Step 4 — Send the stake:**
 
-Transfer at least **100,000 APR** to your wallet address from your Telegram wallet.  
+Transfer at least **100,000 APRO** to your wallet address from your Telegram wallet.  
 The node will activate automatically in the next epoch (~100 blocks, ≈1.7 min).
 
 **Step 5 — Done!**
@@ -98,9 +98,9 @@ The node will activate automatically in the next epoch (~100 blocks, ≈1.7 min)
 
 | Action | Where it goes |
 |--------|--------------|
-| Block reward | Your Telegram wallet (APR address in config) |
+| Block reward | Your Telegram wallet (APRO address in config) |
 | Telegram notification | Sent to you on every reward |
-| Stake lock | 100,000 APR locked while you validate |
+| Stake lock | 100,000 APRO locked while you validate |
 | Withdrawal | Any time from Telegram wallet |
 | Slashing (double-sign) | 10% of stake deducted |
 
@@ -128,7 +128,7 @@ systemctl restart aperod-node
 
 | Parameter | Value |
 |-----------|-------|
-| Minimum stake | 100,000 APR |
+| Minimum stake | 100,000 APRO |
 | Maximum active validators | 21 |
 | Epoch length | 100 blocks (~1.7 min) |
 | Withdrawal lock | 7,200 blocks (~2 hours) |
@@ -199,7 +199,7 @@ The script stops and removes:
 - System user `aperod`
 - ufw rules for port 30303
 
-> Your **Telegram wallet** (`t.me/aperod_bot`) and APR balance are **not affected** — they live on the blockchain, not on your server.
+> Your **Telegram wallet** (`t.me/aperod_bot`) and APRO balance are **not affected** — they live on the blockchain, not on your server.
 
 Non-interactive (automated):
 ```bash

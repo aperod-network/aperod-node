@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Aperod APR Full Node — Automatic Installer (Non-Validator)
+#  Aperod APRO Full Node — Automatic Installer (Non-Validator)
 #  Поддерживается: Ubuntu 22.04 / 24.04 / Debian 12
 #  Использование:  sudo bash install-node.sh
 # ============================================================
@@ -26,7 +26,7 @@ RPC_PORT=8545
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════╗
-║   Aperod APR Full Node — Installer         ║
+║   Aperod APRO Full Node — Installer        ║
 ║   github.com/aperod-network/aperod-node    ║
 ╚════════════════════════════════════════════╝${NC}
 "
