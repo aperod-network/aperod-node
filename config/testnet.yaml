@@ -9,9 +9,10 @@ p2p:
   min_peers: 4
 
 consensus:
-  validator_key: ""         # path to ED25519 private key file (leave empty for non-validator)
-  reward_address: ""        # APR wallet address for block rewards — get yours at https://t.me/aperod_bot
-  block_time: "1s"
+  validator_key: ""          # path to ED25519 private key file (leave empty for non-validator)
+  reward_address: ""         # APRO wallet address for block rewards — get yours at https://t.me/aperod_bot
+  block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
+  block_time: "3s"
 
 api:
   enabled: true

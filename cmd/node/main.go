@@ -208,10 +208,12 @@ func run() error {
         var host *p2p.Host
 
         engine := consensus.NewEngine(consensus.Config{
-                BlockTime:    cfg.Consensus.BlockTime,
-                BFTThreshold: genesisConfig.BFTThreshold,
-                Validators:   validators,
-                MyKey:        myKey,
+                BlockTime:       cfg.Consensus.BlockTime,
+                BFTThreshold:    genesisConfig.BFTThreshold,
+                Validators:      validators,
+                MyKey:           myKey,
+                RewardAddress:   cfg.Consensus.RewardAddress,
+                BlockRewardNAPR: cfg.Consensus.BlockRewardNAPR,
                 OnBlockProduced: func(block *core.Block) {
                         if err := storeBlock(db, block); err != nil {
                                 log.Error("failed to persist block", "height", block.Header.Height, "err", err)

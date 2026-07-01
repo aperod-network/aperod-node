@@ -38,9 +38,10 @@ type P2PConfig struct {
 
 // ConsensusConfig holds PoA settings.
 type ConsensusConfig struct {
-        ValidatorKey  string        `yaml:"validator_key"`  // path to ED25519 key file
-        RewardAddress string        `yaml:"reward_address"` // APRO wallet address for block rewards (from Telegram wallet)
-        BlockTime     time.Duration `yaml:"block_time"`
+        ValidatorKey    string        `yaml:"validator_key"`     // path to ED25519 key file
+        RewardAddress   string        `yaml:"reward_address"`    // APRO wallet address for block rewards
+        BlockRewardNAPR uint64        `yaml:"block_reward_napro"` // reward in nAPRO (0 = default 10_000_000 = 0.1 APRO)
+        BlockTime       time.Duration `yaml:"block_time"`
 }
 
 // APIConfig holds RPC/REST settings.

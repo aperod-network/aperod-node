@@ -28,6 +28,12 @@ type Config struct {
         // OnBlockProduced is an optional callback called after each block is added
         // to the chain. Use it to persist blocks to durable storage.
         OnBlockProduced func(block *core.Block)
+        // RewardAddress is the APRO wallet address that receives block rewards.
+        // If empty, no coinbase transaction is added to produced blocks.
+        RewardAddress string
+        // BlockRewardNAPR is the block reward in base units (nAPRO).
+        // 0 uses the default: 10_000_000 nAPRO = 0.1 APRO.
+        BlockRewardNAPR uint64
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -190,9 +196,26 @@ func (e *Engine) tick() error {
         return nil
 }
 
+// defaultBlockRewardNAPR is 0.1 APRO in base units (100_000_000 nAPRO = 1 APRO).
+const defaultBlockRewardNAPR uint64 = 10_000_000
+
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
         txs := e.pool.SelectTxs(500) // up to 500 txs per block
+
+        // Prepend coinbase block reward transaction when reward_address is configured.
+        if e.cfg.RewardAddress != "" {
+                rewardNAPR := e.cfg.BlockRewardNAPR
+                if rewardNAPR == 0 {
+                        rewardNAPR = defaultBlockRewardNAPR
+                }
+                mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), rewardNAPR)
+                if err != nil {
+                        e.log.Warn("failed to build coinbase reward tx", "err", err)
+                } else {
+                        txs = append([]core.Transaction{*mintTx}, txs...)
+                }
+        }
 
         header := core.BlockHeader{
                 Height:       height,
