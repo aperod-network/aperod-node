@@ -80,9 +80,9 @@ func (s *Server) Start() error {
         srv := &http.Server{
                 Addr:         s.addr,
                 Handler:      handler,
-                ReadTimeout:  10 * time.Second,
-                WriteTimeout: 10 * time.Second,
-                IdleTimeout:  60 * time.Second,
+                ReadTimeout:  15 * time.Second,
+                WriteTimeout: 120 * time.Second,
+                IdleTimeout:  120 * time.Second,
         }
         s.log.Info("API server listening", "addr", s.addr)
         return srv.ListenAndServe()
