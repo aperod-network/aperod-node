@@ -306,22 +306,26 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 for h2 := windowStart; h2 <= int64(height); h2++ {
                         b := s.chain.GetByHeight(uint64(h2))
                         if b != nil {
-                                for _, tx := range b.Txs {
-                                        if !tx.IsCoinbase() {
-                                                windowTxs++
+                                for txIdx, tx := range b.Txs {
+                                        // Skip block-reward coinbase (always index 0, no inputs).
+                                        // Admin mints (index > 0) are counted as user activity.
+                                        if txIdx == 0 && tx.IsCoinbase() {
+                                                continue
                                         }
+                                        windowTxs++
                                 }
                                 windowBlocks++
                         }
                 }
-                // Also sum all non-coinbase txs for total
+                // Sum all user txs (skip block-reward coinbase at index 0)
                 for h2 := int64(0); h2 <= int64(height); h2++ {
                         b := s.chain.GetByHeight(uint64(h2))
                         if b != nil {
-                                for _, tx := range b.Txs {
-                                        if !tx.IsCoinbase() {
-                                                totalTxs++
+                                for txIdx, tx := range b.Txs {
+                                        if txIdx == 0 && tx.IsCoinbase() {
+                                                continue
                                         }
+                                        totalTxs++
                                 }
                         }
                 }
