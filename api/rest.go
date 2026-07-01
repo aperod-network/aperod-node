@@ -167,7 +167,7 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
                         BlockHash:   fmt.Sprintf("%x", bHash[:]),
                         BlockHeight: loc.Block.Header.Height,
                         TxIndex:     loc.TxIndex,
-                        IsCoinbase:  tx.IsCoinbase(),
+                        IsCoinbase:  loc.TxIndex == 0 && tx.IsCoinbase(),
                         Inputs:      len(tx.Inputs),
                         Outputs:     len(tx.Outputs),
                         Fee:         tx.Fee,
