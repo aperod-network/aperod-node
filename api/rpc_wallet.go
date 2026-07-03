@@ -106,6 +106,7 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 isMintOut := out.TxPubKey == zeroPub && out.OneTimePub == spendPub
 
                 var blind crypto.BlindFactor
+                var hsScalar crypto.Scalar32
                 if isMintOut {
                         if u.BlindHex == "" {
                                 blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
@@ -144,29 +145,39 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                 }
                         }
                 } else {
-                        // Stealth output: blind MUST be provided (from utxo_blinds DB)
-                        if u.BlindHex == "" {
-                                return nil, fmt.Errorf("blind_hex required for stealth output %s[%d]",
-                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
-                        }
-                        blind, err = blindFactorFromHex(u.BlindHex)
-                        if err != nil {
-                                return nil, fmt.Errorf("blind_hex for %s[%d]: %w",
-                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                        }
-                }
-
-                // HsScalar: zero for mint outputs (one_time_priv == spendPriv directly).
-                // For stealth outputs we recover it via ScanForOutput so TxBuilder can sign.
-                var hsScalar crypto.Scalar32
-                if !isMintOut {
-                        hs, err := crypto.ScanForOutput(viewPriv, spendPub, out.TxPubKey, out.OneTimePub)
-                        if err != nil || hs == nil {
+                        // Stealth output: compute hs FIRST (needed for both signing and blind derivation).
+                        hs, scanErr := crypto.ScanForOutput(viewPriv, spendPub, out.TxPubKey, out.OneTimePub)
+                        if scanErr != nil || hs == nil {
                                 return nil, fmt.Errorf("output %s[%d] does not belong to wallet (view scan failed)",
                                         u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
                         }
                         hsScalar = *hs
+
+                        if u.BlindHex == "" {
+                                // Derive deterministic blind from ECDH shared secret.
+                                // Requires UTXO built after the deterministic blind migration (v2+).
+                                blind, err = crypto.DeterministicPaymentBlind(hsScalar, u.AmountNAPR)
+                                if err != nil {
+                                        return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                                }
+                                // Verify the commitment to catch pre-migration UTXOs (random blind).
+                                recomputed, cErr := crypto.Commit(u.AmountNAPR, blind)
+                                if cErr != nil || recomputed != out.AmountCommit {
+                                        return nil, fmt.Errorf(
+                                                "stealth output %s[%d]: commitment mismatch — "+
+                                                        "UTXO predates deterministic blind migration, admin re-mint required",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+                                }
+                        } else {
+                                blind, err = blindFactorFromHex(u.BlindHex)
+                                if err != nil {
+                                        return nil, fmt.Errorf("blind_hex for %s[%d]: %w",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                                }
+                        }
                 }
+                // hsScalar is set above for stealth; zero (default) for mint outputs.
 
                 ownedUTXOs = append(ownedUTXOs, core.OwnedUTXO{
                         UTXO: core.UTXO{

@@ -305,7 +305,9 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
                 return Output{}, crypto.BlindFactor{}, fmt.Errorf("stealth output: %w", err)
         }
 
-        blind, err := crypto.NewBlindFactor()
+        // Deterministic blind derived from shared ECDH secret so the recipient
+        // can always recover it with their view key (no external storage needed).
+        blind, err := crypto.DeterministicPaymentBlind(so.HsScalar, amount)
         if err != nil {
                 return Output{}, crypto.BlindFactor{}, err
         }

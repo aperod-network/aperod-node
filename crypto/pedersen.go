@@ -109,6 +109,32 @@ func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error
         return bf, nil
 }
 
+// DeterministicPaymentBlind derives a stable blinding factor for stealth payment
+// outputs using the shared ECDH secret (HsScalar) and amount.
+// blind = SHA-512("aperod-pay-blind-v1" || hs_bytes || amount_LE) → SetUniformBytes.
+//
+// Because both sender and recipient can compute HsScalar (sender via r·V, recipient
+// via v·R), the blind can always be recovered without external storage.
+// This replaces the previous random blind scheme and makes stealth UTXOs
+// self-recoverable from the view key alone.
+func DeterministicPaymentBlind(hs Scalar32, amount uint64) (BlindFactor, error) {
+        h := sha512.New()
+        h.Write([]byte("aperod-pay-blind-v1"))
+        h.Write(hs[:])
+        var ab [8]byte
+        binary.LittleEndian.PutUint64(ab[:], amount)
+        h.Write(ab[:])
+        var wide [64]byte
+        copy(wide[:], h.Sum(nil))
+        s, err := edwards25519.NewScalar().SetUniformBytes(wide[:])
+        if err != nil {
+                return BlindFactor{}, fmt.Errorf("deterministic payment blind: %w", err)
+        }
+        var bf BlindFactor
+        copy(bf[:], s.Bytes())
+        return bf, nil
+}
+
 // NewBlindFactor generates a random blinding factor.
 func NewBlindFactor() (BlindFactor, error) {
         var buf [64]byte
