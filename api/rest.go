@@ -25,7 +25,7 @@ import (
 // registerRESTRoutes adds all REST routes to the server mux.
 func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/blocks", s.restBlocks)
-        s.mux.HandleFunc("/api/v1/blocks/", s.restBlockByID)
+        s.mux.HandleFunc("/api/v1/blocks/", s.restBlockByIDOrTxs)
         s.mux.HandleFunc("/api/v1/transactions/", s.restTransaction)
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
@@ -103,44 +103,98 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
         })
 }
 
-// ─── GET /api/v1/blocks/{id} (2.1.10 / 2.1.11) ───────────────────────────────
+// ─── GET /api/v1/blocks/{id} and /api/v1/blocks/{id}/transactions ────────────
 
-func (s *Server) restBlockByID(w http.ResponseWriter, r *http.Request) {
+// restBlockByIDOrTxs dispatches:
+//   GET /api/v1/blocks/{id}              → block detail
+//   GET /api/v1/blocks/{id}/transactions → transactions in block
+func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet {
                 writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
                 return
         }
-        id := pathSuffix("/api/v1/blocks/", r.URL.Path)
-        if id == "" {
+        tail := pathSuffix("/api/v1/blocks/", r.URL.Path)
+        if tail == "" {
                 s.restBlocks(w, r)
                 return
         }
 
-        // Try height first
+        // Check for /transactions suffix
+        const txsSuffix = "/transactions"
+        if strings.HasSuffix(tail, txsSuffix) {
+                id := strings.TrimSuffix(tail, txsSuffix)
+                b := s.resolveBlock(w, id)
+                if b == nil {
+                        return
+                }
+                s.writeBlockTransactions(w, b)
+                return
+        }
+
+        b := s.resolveBlock(w, tail)
+        if b == nil {
+                return
+        }
+        writeJSON(w, http.StatusOK, blockToResponse(b))
+}
+
+// resolveBlock looks up a block by height or hash; writes error and returns nil on failure.
+func (s *Server) resolveBlock(w http.ResponseWriter, id string) *core.Block {
         if height, err := strconv.ParseUint(id, 10, 64); err == nil {
                 b := s.chain.GetByHeight(height)
                 if b == nil {
                         writeJSONError(w, http.StatusNotFound, fmt.Sprintf("block not found at height %d", height))
-                        return
+                        return nil
                 }
-                writeJSON(w, http.StatusOK, blockToResponse(b))
-                return
+                return b
         }
-
-        // Try as hash
         raw, err := hex.DecodeString(id)
         if err != nil || len(raw) != 32 {
                 writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
-                return
+                return nil
         }
         var hash crypto.Hash32
         copy(hash[:], raw)
         b := s.chain.GetByHash(hash)
         if b == nil {
                 writeJSONError(w, http.StatusNotFound, "block not found")
-                return
+                return nil
         }
-        writeJSON(w, http.StatusOK, blockToResponse(b))
+        return b
+}
+
+// BlockTxItem is one transaction summary inside a block.
+type BlockTxItem struct {
+        Hash       string `json:"hash"`
+        TxIndex    int    `json:"tx_index"`
+        IsCoinbase bool   `json:"is_coinbase"`
+        Inputs     int    `json:"inputs"`
+        Outputs    int    `json:"outputs"`
+        Fee        uint64 `json:"fee"`
+        Size       int    `json:"size"`
+}
+
+// writeBlockTransactions writes the transactions of a block as JSON.
+func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
+        txs := make([]BlockTxItem, 0, len(b.Txs))
+        for i, tx := range b.Txs {
+                h := tx.Hash()
+                txs = append(txs, BlockTxItem{
+                        Hash:       fmt.Sprintf("%x", h[:]),
+                        TxIndex:    i,
+                        IsCoinbase: i == 0 && tx.IsCoinbase(),
+                        Inputs:     len(tx.Inputs),
+                        Outputs:    len(tx.Outputs),
+                        Fee:        tx.Fee,
+                        Size:       tx.Size(),
+                })
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "block_hash":   fmt.Sprintf("%x", func() [32]byte { h := b.Hash(); return h }()),
+                "block_height": b.Header.Height,
+                "tx_count":     len(txs),
+                "transactions": txs,
+        })
 }
 
 // ─── GET /api/v1/transactions/{hash} (2.1.11) ────────────────────────────────
