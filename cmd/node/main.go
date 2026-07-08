@@ -207,10 +207,13 @@ func run() error {
         // host is declared here so OnBlockProduced can reference it (set after Start).
         var host *p2p.Host
 
+        registry := core.NewValidatorRegistry()
+
         engine := consensus.NewEngine(consensus.Config{
                 BlockTime:       cfg.Consensus.BlockTime,
                 BFTThreshold:    genesisConfig.BFTThreshold,
                 Validators:      validators,
+                Registry:        registry,
                 MyKey:           myKey,
                 RewardAddress:   cfg.Consensus.RewardAddress,
                 BlockRewardNAPR: cfg.Consensus.BlockRewardNAPR,
@@ -251,6 +254,7 @@ func run() error {
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
                 apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
+                apiSrv.SetRegistry(engine.Registry())
                 go func() {
                         if err := apiSrv.Start(); err != nil {
                                 log.Error("API server stopped", "err", err)
