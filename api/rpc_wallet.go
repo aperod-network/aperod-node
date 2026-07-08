@@ -102,20 +102,29 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 out := tx.Outputs[u.OutIdx]
 
                 // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
+                // either the legacy literal spend_pub (all mints minted before the
+                // per-height uniqueness fix — regardless of their actual block height,
+                // since the old BuildMintTx never used height) or the new
                 // spend_pub + height*G for the height this output was actually mined at
-                // (see core.BuildMintTx; height=0 covers legacy/admin mints where
-                // mint_pub == spend_pub directly).
+                // (see core.BuildMintTx). The legacy check MUST be tried first and
+                // independently of height — old on-chain mints must remain spendable
+                // forever, or wallet balance scanning breaks for every legacy reward.
                 var zeroPub crypto.Point32
                 var mintHeightScalar crypto.Scalar32
                 isMintOut := false
                 if out.TxPubKey == zeroPub {
-                        h := loc.Block.Header.Height
-                        heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
-                        if hErr == nil {
-                                expectedMintPub, aErr := crypto.AddPoints(spendPub, heightPub)
-                                if aErr == nil && out.OneTimePub == expectedMintPub {
-                                        isMintOut = true
-                                        mintHeightScalar = crypto.ScalarFromUint64(h)
+                        if out.OneTimePub == spendPub {
+                                isMintOut = true
+                                mintHeightScalar = crypto.ScalarFromUint64(0)
+                        } else {
+                                h := loc.Block.Header.Height
+                                heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
+                                if hErr == nil {
+                                        expectedMintPub, aErr := crypto.AddPoints(spendPub, heightPub)
+                                        if aErr == nil && out.OneTimePub == expectedMintPub {
+                                                isMintOut = true
+                                                mintHeightScalar = crypto.ScalarFromUint64(h)
+                                        }
                                 }
                         }
                 }
