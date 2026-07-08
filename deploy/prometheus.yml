@@ -28,3 +28,20 @@ scrape_configs:
       - targets: ["127.0.0.1:3001"]
         labels:
           service: aperod-api-server
+
+  # System metrics — CPU, RAM, disk, network (prometheus-node-exporter on :9100).
+  # Installed automatically as a dependency of prometheus on Ubuntu.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels:
+          service: server
+
+  # Nginx traffic — requests/sec, connections, active workers.
+  # Requires: nginx stub_status + nginx-prometheus-exporter on :9113.
+  # Setup: see deploy README or follow the instructions provided with the dashboard.
+  - job_name: nginx
+    static_configs:
+      - targets: ["127.0.0.1:9113"]
+        labels:
+          service: nginx
