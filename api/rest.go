@@ -13,6 +13,7 @@ import (
         "encoding/hex"
         "encoding/json"
         "fmt"
+        "math"
         "net/http"
         "strconv"
         "strings"
@@ -424,16 +425,16 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 
 // mintRequest is the JSON body for the admin mint endpoint.
 type mintRequest struct {
-        Address   string `json:"address"`   // Aperod wallet address
-        AmountAPR uint64 `json:"amount_apr"` // amount in whole APRO (converted to nAPRO internally)
+        Address   string  `json:"address"`    // Aperod wallet address
+        AmountAPR float64 `json:"amount_apr"` // amount in APRO, fractional allowed (converted to nAPRO internally)
 }
 
 // mintResponse is returned on success.
 type mintResponse struct {
-        TxHash    string `json:"tx_hash"`
-        AmountAPR uint64 `json:"amount_apr"`
-        Address   string `json:"address"`
-        BlindHex  string `json:"blind_hex"` // hex-encoded blind factor used for the commitment
+        TxHash    string  `json:"tx_hash"`
+        AmountAPR float64 `json:"amount_apr"`
+        Address   string  `json:"address"`
+        BlindHex  string  `json:"blind_hex"` // hex-encoded blind factor used for the commitment
 }
 
 // restAdminMint creates a coinbase-style mint transaction and adds it to the mempool.
@@ -460,14 +461,20 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
                 return
         }
-        if req.AmountAPR == 0 || req.AmountAPR > 100_000_000 {
-                writeJSONError(w, http.StatusBadRequest, "amount_apr must be 1–100000000")
+        if math.IsNaN(req.AmountAPR) || math.IsInf(req.AmountAPR, 0) || req.AmountAPR <= 0 || req.AmountAPR > 100_000_000 {
+                writeJSONError(w, http.StatusBadRequest, "amount_apr must be > 0 and <= 100000000")
                 return
         }
 
-        // Convert APRO → nAPRO (1 APRO = 10^8 nAPRO).
-        const nAPRPerAPR uint64 = 100_000_000
-        amountNAPR := req.AmountAPR * nAPRPerAPR
+        // Convert APRO → nAPRO (1 APRO = 10^8 nAPRO). Round to the nearest nAPRO
+        // to absorb float64 rounding error; amounts are validated above to be
+        // well within uint64 range so the conversion cannot overflow.
+        const nAPRPerAPR float64 = 100_000_000
+        amountNAPR := uint64(math.Round(req.AmountAPR * nAPRPerAPR))
+        if amountNAPR == 0 {
+                writeJSONError(w, http.StatusBadRequest, "amount_apr too small: rounds to 0 nAPRO")
+                return
+        }
 
         // height=0 is intentional for one-off admin mints: their future block
         // inclusion height isn't known at submission time (they sit in the

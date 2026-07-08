@@ -3,6 +3,7 @@ package api_test
 // Tests for Phase 2 REST endpoints and new JSON-RPC methods (apr_getTransaction, apr_estimateFee).
 
 import (
+        "bytes"
         "encoding/hex"
         "encoding/json"
         "log/slog"
@@ -444,6 +445,50 @@ func TestHub_BroadcastConfirmed_NoPeers(t *testing.T) {
         srv, _ := newTestServer(t)
         tx := &core.Transaction{Version: core.TxVersionBase}
         srv.Hub().BroadcastConfirmed(tx, 5) // must not panic
+}
+
+// ─── /api/v1/admin/mint ────────────────────────────────────────────────────
+
+func restPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int, map[string]interface{}) {
+        t.Helper()
+        req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+        req.Header.Set("Content-Type", "application/json")
+        rr := httptest.NewRecorder()
+        srv.ServeHTTP(rr, req)
+        var resp map[string]interface{}
+        _ = json.NewDecoder(rr.Body).Decode(&resp)
+        return rr.Code, resp
+}
+
+func TestREST_AdminMint_FractionalAmount(t *testing.T) {
+        srv, _ := newTestServer(t)
+        wk, _ := crypto.GenerateWalletKeys()
+        addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+        body := []byte(`{"address":"` + string(addr) + `","amount_apr":5909.5}`)
+        code, resp := restPostJSON(t, srv, "/api/v1/admin/mint", body)
+        if code != http.StatusCreated {
+                t.Fatalf("expected 201, got %d: %v", code, resp)
+        }
+        amt, ok := resp["amount_apr"].(float64)
+        if !ok || amt != 5909.5 {
+                t.Fatalf("expected amount_apr=5909.5, got %v", resp["amount_apr"])
+        }
+        if resp["tx_hash"] == "" {
+                t.Fatal("expected non-empty tx_hash")
+        }
+}
+
+func TestREST_AdminMint_ZeroAmount(t *testing.T) {
+        srv, _ := newTestServer(t)
+        wk, _ := crypto.GenerateWalletKeys()
+        addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+        body := []byte(`{"address":"` + string(addr) + `","amount_apr":0}`)
+        code, _ := restPostJSON(t, srv, "/api/v1/admin/mint", body)
+        if code != http.StatusBadRequest {
+                t.Fatalf("expected 400 for zero amount, got %d", code)
+        }
 }
 
 func TestWS_Endpoint_Registered(t *testing.T) {
