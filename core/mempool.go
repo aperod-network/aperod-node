@@ -14,7 +14,7 @@ type MempoolConfig struct {
         MaxSize   int           // maximum number of transactions
         MaxTxSize int           // maximum size of a single transaction in bytes
         TTL       time.Duration // evict transactions older than this
-        MinFee    uint64        // minimum flat fee in nAPRO (0.5 APRO = 500_000_000 nAPRO)
+        MinFee    uint64        // minimum flat fee in nAPRO (0.5 APRO = 50_000_000 nAPRO)
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -23,7 +23,7 @@ func DefaultMempoolConfig() MempoolConfig {
                 MaxSize:   5_000,
                 MaxTxSize: 100_000,
                 TTL:       2 * time.Hour,
-                MinFee:    500_000_000, // 0.5 APRO
+                MinFee:    50_000_000, // 0.5 APRO
         }
 }
 

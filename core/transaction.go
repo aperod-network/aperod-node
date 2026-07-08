@@ -167,8 +167,8 @@ func (tx *Transaction) Size() int {
         return size
 }
 
-// FlatFee is the fixed transaction fee: 0.5 APRO = 500_000_000 nAPRO.
-const FlatFee uint64 = 500_000_000
+// FlatFee is the fixed transaction fee: 0.5 APRO = 50_000_000 nAPRO (1 APRO = 100_000_000 nAPRO).
+const FlatFee uint64 = 50_000_000
 
 // MinFee returns the minimum fee for any transaction (flat rate, size-independent).
 func (tx *Transaction) MinFee() uint64 {

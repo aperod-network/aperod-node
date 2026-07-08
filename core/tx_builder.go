@@ -22,7 +22,7 @@ type TxBuilder struct {
 
 // NewTxBuilder creates a transaction builder for a wallet.
 // ownedUTXOs must come from WalletScanner.ScanChain — amounts must be decrypted.
-// The fee is always FlatFee (0.5 APRO); the feePerByte parameter is kept for
+// The fee is always FlatFee (0.5 APRO = 50_000_000 nAPRO); the feePerByte parameter is kept for
 // backwards-compatibility but ignored.
 func NewTxBuilder(
         spendPriv, viewPriv crypto.Scalar32,
