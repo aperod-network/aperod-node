@@ -3,6 +3,7 @@ package crypto
 import (
         "crypto/rand"
         "crypto/sha512"
+        "encoding/binary"
         "fmt"
 
         "filippo.io/edwards25519"
@@ -124,6 +125,35 @@ func AddScalars(a, b Scalar32) (Scalar32, error) {
         var out Scalar32
         copy(out[:], sum.Bytes())
         return out, nil
+}
+
+// AddPoints returns a + b on the Edwards25519 curve as a compressed point.
+// Used to derive per-block coinbase one-time keys: mint_pub = spend_pub + height*G.
+func AddPoints(a, b Point32) (Point32, error) {
+        pa, err := PointFromBytes(a[:])
+        if err != nil {
+                return Point32{}, fmt.Errorf("AddPoints a: %w", err)
+        }
+        pb, err := PointFromBytes(b[:])
+        if err != nil {
+                return Point32{}, fmt.Errorf("AddPoints b: %w", err)
+        }
+        sum := (&edwards25519.Point{}).Add(pa, pb)
+        var out Point32
+        copy(out[:], sum.Bytes())
+        return out, nil
+}
+
+// ScalarFromUint64 encodes a small non-negative integer as a canonical
+// Edwards25519 scalar (little-endian, zero-padded). Safe for any uint64
+// value since 2^64 is far smaller than the group order L (~2^252).
+// Used to make each block's coinbase reward output cryptographically unique
+// (mint_pub = spend_pub + height*G) so identical reward amounts to the same
+// validator address no longer collide on tx hash / key image across blocks.
+func ScalarFromUint64(n uint64) Scalar32 {
+        var s Scalar32
+        binary.LittleEndian.PutUint64(s[:8], n)
+        return s
 }
 
 // PointFromBytes decodes a compressed Ed25519 point. Returns error if invalid.

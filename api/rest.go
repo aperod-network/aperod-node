@@ -308,9 +308,18 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
                         hh := b.Txs[i].Hash()
                         return fmt.Sprintf("%x", hh[:])
                 }
+                // Mint outputs at this height use mint_pub = spend_pub + height*G
+                // (see core.BuildMintTx). Recompute the expected key for this height
+                // so per-block coinbase rewards are still discoverable by address scan.
+                expectedMintPub := spendPub
+                if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(uint64(h))); hErr == nil {
+                        if shifted, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
+                                expectedMintPub = shifted
+                        }
+                }
                 for i, tx := range b.Txs {
                         for j, out := range tx.Outputs {
-                                if out.OneTimePub == spendPub {
+                                if out.OneTimePub == spendPub || out.OneTimePub == expectedMintPub {
                                         results = append(results, AddressTx{
                                                 TxHash:      txHash(i),
                                                 BlockHeight: uint64(h),
@@ -460,7 +469,12 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
         const nAPRPerAPR uint64 = 100_000_000
         amountNAPR := req.AmountAPR * nAPRPerAPR
 
-        tx, err := core.BuildMintTx(crypto.Address(req.Address), amountNAPR)
+        // height=0 is intentional for one-off admin mints: their future block
+        // inclusion height isn't known at submission time (they sit in the
+        // mempool like any other tx). This reproduces the legacy transparent
+        // behavior (mint_pub == spend_pub) and is only unsafe if the exact same
+        // address+amount is minted more than once — see BuildMintTx doc comment.
+        tx, err := core.BuildMintTx(crypto.Address(req.Address), amountNAPR, 0)
         if err != nil {
                 s.log.Error("admin mint: build tx failed", "err", err)
                 writeJSONError(w, http.StatusInternalServerError, "build mint tx: "+err.Error())

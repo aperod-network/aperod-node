@@ -8,12 +8,21 @@ import (
 
 // BuildMintTx creates a transparent coinbase-style transaction that mints amount to addr.
 //
-// Unlike regular RingCT transfers, mint outputs use the spend public key directly as
-// OneTimePub (same as CoinbaseTx).  This "transparent" output is visible to the
-// block explorer via the simple out.OneTimePub == spendPub scan without needing
-// the recipient's view key.  Admin mints are already non-private by nature
-// (the operator knows who receives what), so privacy-via-stealth adds no value here.
-func BuildMintTx(addr crypto.Address, amount uint64) (*Transaction, error) {
+// Unlike regular RingCT transfers, mint outputs use a deterministic shift of the
+// spend public key as OneTimePub: mint_pub = spend_pub + height*G. This keeps the
+// output "transparent" — the block explorer can recompute the expected key for any
+// height it is scanning, without needing the recipient's view key — while making
+// every mint output cryptographically unique per height. Passing height=0 exactly
+// reproduces the legacy behavior (mint_pub == spend_pub), which is intentionally
+// used for one-off admin mints where a future inclusion height isn't known in
+// advance (see restAdminMint); those are far less likely to collide since they
+// require the exact same address+amount to be minted more than once.
+//
+// height must be the exact height the transaction will be included at (as it is
+// for the PoA per-block coinbase reward, which is called from produceBlock with
+// the block's own height) — otherwise the output will not be recognized by
+// scanning/spending code, which recomputes mint_pub from the actual block height.
+func BuildMintTx(addr crypto.Address, amount uint64, height uint64) (*Transaction, error) {
         if amount == 0 {
                 return nil, fmt.Errorf("mint amount must be > 0")
         }
@@ -35,11 +44,20 @@ func BuildMintTx(addr crypto.Address, amount uint64) (*Transaction, error) {
                 return nil, fmt.Errorf("pedersen commit: %w", err)
         }
 
+        heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(height))
+        if err != nil {
+                return nil, fmt.Errorf("derive height pub: %w", err)
+        }
+        oneTimePub, err := crypto.AddPoints(spendPub, heightPub)
+        if err != nil {
+                return nil, fmt.Errorf("derive mint one-time pub: %w", err)
+        }
+
         tx := &Transaction{
                 Version: TxVersionBase,
                 Inputs:  nil, // coinbase — no ring inputs
                 Outputs: []Output{{
-                        OneTimePub:   spendPub, // transparent: spend pub used directly (like CoinbaseTx)
+                        OneTimePub:   oneTimePub, // transparent: spend_pub + height*G
                         AmountCommit: commit,
                 }},
                 Fee: 0, // mints are fee-exempt (coinbase exemption in mempool)

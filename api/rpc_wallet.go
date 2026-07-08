@@ -101,13 +101,29 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 }
                 out := tx.Outputs[u.OutIdx]
 
-                // Detect transparent mint output: TxPubKey == zero AND OneTimePub == spendPub
+                // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
+                // spend_pub + height*G for the height this output was actually mined at
+                // (see core.BuildMintTx; height=0 covers legacy/admin mints where
+                // mint_pub == spend_pub directly).
                 var zeroPub crypto.Point32
-                isMintOut := out.TxPubKey == zeroPub && out.OneTimePub == spendPub
+                var mintHeightScalar crypto.Scalar32
+                isMintOut := false
+                if out.TxPubKey == zeroPub {
+                        h := loc.Block.Header.Height
+                        heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
+                        if hErr == nil {
+                                expectedMintPub, aErr := crypto.AddPoints(spendPub, heightPub)
+                                if aErr == nil && out.OneTimePub == expectedMintPub {
+                                        isMintOut = true
+                                        mintHeightScalar = crypto.ScalarFromUint64(h)
+                                }
+                        }
+                }
 
                 var blind crypto.BlindFactor
                 var hsScalar crypto.Scalar32
                 if isMintOut {
+                        hsScalar = mintHeightScalar
                         if u.BlindHex == "" {
                                 blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
                                 if err != nil {
@@ -177,7 +193,9 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                 }
                         }
                 }
-                // hsScalar is set above for stealth; zero (default) for mint outputs.
+                // hsScalar is set above for stealth outputs (ECDH shared secret) and for
+                // mint outputs (the block height scalar); zero only for legacy/admin mints
+                // where mint_pub == spend_pub directly (height=0).
 
                 ownedUTXOs = append(ownedUTXOs, core.OwnedUTXO{
                         UTXO: core.UTXO{

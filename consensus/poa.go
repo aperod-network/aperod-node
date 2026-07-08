@@ -209,7 +209,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 if rewardNAPR == 0 {
                         rewardNAPR = defaultBlockRewardNAPR
                 }
-                mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), rewardNAPR)
+                mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), rewardNAPR, height)
                 if err != nil {
                         e.log.Warn("failed to build coinbase reward tx", "err", err)
                 } else {
