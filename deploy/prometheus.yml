@@ -1,10 +1,8 @@
 # Prometheus scrape config for Aperod production monitoring.
 #
-# Usage on the server (outside this repo's docker-compose, since Prometheus/
-# Grafana are optional and shouldn't force a rebuild of the node stack):
-#   docker run -d --name aperod-prometheus --network host \
-#     -v /opt/aperod/blockchain/deploy/prometheus.yml:/etc/prometheus/prometheus.yml \
-#     prom/prometheus
+# Usage on the server (systemd service installed via apt-get install prometheus):
+#   cp /opt/aperod/blockchain/deploy/prometheus.yml /etc/prometheus/prometheus.yml
+#   systemctl restart prometheus
 #
 # Then point Grafana at http://localhost:9090 as a Prometheus data source
 # and import grafana-dashboard.json.
@@ -22,11 +20,11 @@ scrape_configs:
           service: aperod-node
 
   # Node.js API server — HTTP request counters + daily payout job outcomes
-  # (artifacts/api-server/src/routes/metrics.ts). Scraped through the shared
-  # proxy path since the service itself isn't exposed on a dedicated port.
+  # (artifacts/api-server/src/routes/metrics.ts).
+  # Scraped directly on port 3001 (nginx on :80 does 301→HTTPS so Prometheus can't follow it).
   - job_name: aperod-api-server
     metrics_path: /api/metrics
     static_configs:
-      - targets: ["127.0.0.1:80"]
+      - targets: ["127.0.0.1:3001"]
         labels:
           service: aperod-api-server
