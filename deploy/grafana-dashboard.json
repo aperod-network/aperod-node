@@ -1,0 +1,70 @@
+{
+  "title": "Aperod (APRO) — Node Overview",
+  "uid": "aperod-node-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Chain Height",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "aperod_chain_height", "legendFormat": "height" }]
+    },
+    {
+      "id": 2,
+      "title": "Mempool Size",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "aperod_mempool_size", "legendFormat": "mempool" }]
+    },
+    {
+      "id": 3,
+      "title": "Connected Peers",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "aperod_peer_count", "legendFormat": "peers" }]
+    },
+    {
+      "id": 4,
+      "title": "Node Up",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "aperod_up", "legendFormat": "up" }]
+    },
+    {
+      "id": 5,
+      "title": "Chain Height Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [{ "expr": "aperod_chain_height", "legendFormat": "height" }]
+    },
+    {
+      "id": 6,
+      "title": "Active vs Total Validators",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "aperod_validator_count_active", "legendFormat": "active" },
+        { "expr": "aperod_validator_count_total", "legendFormat": "total" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "API Server — Requests/sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [{ "expr": "rate(aperod_api_http_requests_total[5m])", "legendFormat": "{{route}} {{status}}" }]
+    },
+    {
+      "id": 8,
+      "title": "Daily Payout Job Outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [{ "expr": "aperod_daily_payout_last_run_success", "legendFormat": "last run success (1/0)" }]
+    }
+  ]
+}

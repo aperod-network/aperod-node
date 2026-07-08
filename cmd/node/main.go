@@ -247,8 +247,9 @@ func run() error {
         }()
 
         utxos := core.NewUTXOSet()
+        var apiSrv *api.Server
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
-                apiSrv := api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
+                apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 go func() {
                         if err := apiSrv.Start(); err != nil {
@@ -293,6 +294,9 @@ func run() error {
                 } else {
                         log.Info("p2p started", "listen", tcpAddr, "bootnodes", len(bootnodes))
                         defer host.Stop()
+                        if apiSrv != nil {
+                                apiSrv.SetPeerCounter(host.PeerCount)
+                        }
                 }
         }
 

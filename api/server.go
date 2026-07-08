@@ -27,6 +27,7 @@ type Server struct {
         apiKey      string   // optional; empty = dev mode (no auth)
         corsOrigins []string // empty = allow all ("*")
         rateLimiter *RateLimiter
+        peerCounter func() int // optional; wired to p2p.Host.PeerCount by cmd/node
 }
 
 // NewServer creates a new API server.
@@ -57,12 +58,17 @@ func (s *Server) SetAPIKey(key string) { s.apiKey = key }
 // Empty slice allows all origins ("*").
 func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 
+// SetPeerCounter wires a function returning the live P2P peer count so
+// /metrics can report it. Optional — /metrics reports 0 peers if unset.
+func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
+
 // Hub returns the WebSocket hub (for node to push events).
 func (s *Server) Hub() *Hub { return s.hub }
 
 func (s *Server) registerRoutes() {
         s.mux.HandleFunc("/", s.handleRPC)
         s.mux.HandleFunc("/health", s.handleHealth)
+        s.mux.HandleFunc("/metrics", s.handleMetrics)
         s.mux.Handle("/ws", s.hub.Handler())
         s.registerRESTRoutes()
 }
@@ -124,6 +130,50 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
                 "height": s.chain.Height(),
                 "time":   time.Now().UTC().Format(time.RFC3339),
         })
+}
+
+// handleMetrics exposes a minimal Prometheus text-format snapshot of node
+// health for scraping. No external client library is used — the format is
+// simple enough to hand-write and keeps the Go module dependency-free.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+        peers := 0
+        if s.peerCounter != nil {
+                peers = s.peerCounter()
+        }
+        activeValidators, totalValidators := 0, 0
+        if s.registry != nil {
+                activeValidators, totalValidators = s.registry.Count()
+        }
+
+        w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+        fmt.Fprintf(w, "# HELP aperod_chain_height Current chain tip height.\n")
+        fmt.Fprintf(w, "# TYPE aperod_chain_height gauge\n")
+        fmt.Fprintf(w, "aperod_chain_height %d\n", s.chain.Height())
+
+        fmt.Fprintf(w, "# HELP aperod_mempool_size Number of transactions currently in the mempool.\n")
+        fmt.Fprintf(w, "# TYPE aperod_mempool_size gauge\n")
+        fmt.Fprintf(w, "aperod_mempool_size %d\n", s.mempool.Count())
+
+        fmt.Fprintf(w, "# HELP aperod_utxo_count Number of unspent outputs tracked in memory.\n")
+        fmt.Fprintf(w, "# TYPE aperod_utxo_count gauge\n")
+        fmt.Fprintf(w, "aperod_utxo_count %d\n", s.utxos.Count())
+
+        fmt.Fprintf(w, "# HELP aperod_peer_count Number of connected P2P peers.\n")
+        fmt.Fprintf(w, "# TYPE aperod_peer_count gauge\n")
+        fmt.Fprintf(w, "aperod_peer_count %d\n", peers)
+
+        fmt.Fprintf(w, "# HELP aperod_validator_count_active Number of currently active PoA/PoS validators.\n")
+        fmt.Fprintf(w, "# TYPE aperod_validator_count_active gauge\n")
+        fmt.Fprintf(w, "aperod_validator_count_active %d\n", activeValidators)
+
+        fmt.Fprintf(w, "# HELP aperod_validator_count_total Total number of registered PoA/PoS validators.\n")
+        fmt.Fprintf(w, "# TYPE aperod_validator_count_total gauge\n")
+        fmt.Fprintf(w, "aperod_validator_count_total %d\n", totalValidators)
+
+        fmt.Fprintf(w, "# HELP aperod_up Whether the API server is reachable (always 1 when scraped successfully).\n")
+        fmt.Fprintf(w, "# TYPE aperod_up gauge\n")
+        fmt.Fprintf(w, "aperod_up 1\n")
 }
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
