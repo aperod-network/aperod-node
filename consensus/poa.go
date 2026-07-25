@@ -196,8 +196,10 @@ func (e *Engine) tick() error {
         return nil
 }
 
-// defaultBlockRewardNAPR is 0.1 APRO in base units (100_000_000 nAPRO = 1 APRO).
-const defaultBlockRewardNAPR uint64 = 10_000_000
+// defaultBlockRewardNAPR is 5 APRO in base units (TZ §1.2 Tail Emission).
+// 1 APRO = 100_000_000 nAPRO, so 5 APRO = 500_000_000 nAPRO.
+// At 1 block/second this yields 157,680,000 APRO/year across all 21 validators.
+const defaultBlockRewardNAPR uint64 = 500_000_000
 
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
