@@ -176,11 +176,32 @@ func run() error {
                 log.Info("genesis block created", "hash", fmt.Sprintf("%x", h[:8]))
         } else {
                 log.Info("resuming from stored chain", "height", tipHeight, "tip", fmt.Sprintf("%x", tipHash[:8]))
-                loaded := uint64(0)
-                for h := uint64(0); h <= tipHeight; h++ {
+
+                // Always load genesis (height 0).
+                genesisRaw, err := db.GetRawBlockByHeight(0)
+                if err != nil || genesisRaw == nil {
+                        return fmt.Errorf("genesis block missing in store")
+                }
+                var genesisBlk core.Block
+                if err := json.Unmarshal(genesisRaw, &genesisBlk); err != nil {
+                        return fmt.Errorf("unmarshal genesis: %w", err)
+                }
+                if err := chain.SetGenesis(&genesisBlk); err != nil {
+                        return fmt.Errorf("restore genesis: %w", err)
+                }
+
+                // Load only the most recent maxInMemoryBlocks blocks.
+                // Older blocks are kept in SQLite; the in-memory window is bounded.
+                const maxLoad = core.MaxInMemoryBlocks
+                startLoad := uint64(1)
+                if tipHeight >= maxLoad {
+                        startLoad = tipHeight - maxLoad + 1
+                }
+                recentBlocks := make([]*core.Block, 0, maxLoad)
+                for h := startLoad; h <= tipHeight; h++ {
                         raw, err := db.GetRawBlockByHeight(h)
                         if err != nil || raw == nil {
-                                log.Warn("block missing in store, stopping resume", "height", h)
+                                log.Warn("block missing in store during resume", "height", h)
                                 break
                         }
                         var b core.Block
@@ -188,43 +209,18 @@ func run() error {
                                 log.Warn("block unmarshal failed", "height", h, "err", err)
                                 break
                         }
-                        if h == 0 {
-                                if err := chain.SetGenesis(&b); err != nil {
-                                        return fmt.Errorf("restore genesis: %w", err)
-                                }
-                        } else {
-                                if err := chain.AddBlock(&b); err != nil {
-                                        log.Warn("resume: add block failed", "height", h, "err", err)
-                                        break
-                                }
-                        }
-                        loaded++
+                        recentBlocks = append(recentBlocks, &b)
                 }
-                log.Info("chain restored from storage", "blocks_loaded", loaded)
+                chain.FastForward(recentBlocks)
+                log.Info("chain restored from storage",
+                        "tip_height", tipHeight,
+                        "blocks_loaded_in_memory", len(recentBlocks),
+                )
         }
 
-        // Pre-compute total non-coinbase tx count once after loading.
-        // This is O(n) but runs only at startup — stored in a cached counter
-        // so /api/v1/network/stats can answer in O(1) while the node runs.
-        var initialTxTotal int64
-        {
-                tip := chain.Tip()
-                if tip != nil {
-                        for h := uint64(0); h <= tip.Header.Height; h++ {
-                                b := chain.GetByHeight(h)
-                                if b == nil {
-                                        continue
-                                }
-                                for txIdx, tx := range b.Txs {
-                                        if txIdx == 0 && tx.IsCoinbase() {
-                                                continue
-                                        }
-                                        initialTxTotal++
-                                }
-                        }
-                }
-        }
-        log.Info("initial tx count computed", "total_txs", initialTxTotal)
+        // initialTxTotal starts at 0; the counter accumulates from this run forward.
+        // Historical total is not critical — the value is only shown in /network/stats.
+        var initialTxTotal int64 = 0
 
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
         // host and apiSrv are declared here so OnBlockProduced can reference them

@@ -7,6 +7,11 @@ import (
         "github.com/aperod/aperod/crypto"
 )
 
+// MaxInMemoryBlocks is the sliding-window size of blocks kept in RAM.
+// Older blocks are evicted to keep memory usage bounded.
+// ~10 000 blocks at 3 s/block ≈ 8 hours of history in memory.
+const MaxInMemoryBlocks = 10_000
+
 // TxLocation records where a transaction lives in the chain.
 type TxLocation struct {
         Block    *Block
@@ -17,8 +22,8 @@ type TxLocation struct {
 // known blocks. Reorganizations are handled via Reorg().
 type Chain struct {
         mu       sync.RWMutex
-        blocks   map[crypto.Hash32]*Block   // all known blocks by hash
-        byHeight map[uint64]*Block          // canonical chain: height → block
+        blocks   map[crypto.Hash32]*Block     // recent blocks by hash
+        byHeight map[uint64]*Block            // canonical chain: height → block
         txIndex  map[crypto.Hash32]TxLocation // tx hash → location
         tip      *Block
         genesis  *Block
@@ -117,7 +122,39 @@ func (c *Chain) AddBlock(b *Block) error {
         c.byHeight[b.Header.Height] = b
         c.tip = b
         c.indexTxs(b)
+
+        // Evict the block that has fallen outside the sliding window.
+        if b.Header.Height >= MaxInMemoryBlocks {
+                evictH := b.Header.Height - MaxInMemoryBlocks
+                if old, ok := c.byHeight[evictH]; ok {
+                        delete(c.byHeight, evictH)
+                        delete(c.blocks, old.Hash())
+                        for _, tx := range old.Txs {
+                                delete(c.txIndex, tx.Hash())
+                        }
+                }
+        }
+
         return nil
+}
+
+// FastForward installs a slice of pre-validated blocks into the chain without
+// checking parent-hash contiguity. Used during startup to restore only the
+// recent window of blocks from the store, skipping the full historical replay.
+// Blocks must be sorted by ascending height; the last block becomes the tip.
+func (c *Chain) FastForward(blocks []*Block) {
+        if len(blocks) == 0 {
+                return
+        }
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        for _, b := range blocks {
+                h := b.Hash()
+                c.blocks[h] = b
+                c.byHeight[b.Header.Height] = b
+                c.tip = b
+                c.indexTxs(b)
+        }
 }
 
 // indexTxs adds all transactions in b to the tx index. Caller must hold mu.
