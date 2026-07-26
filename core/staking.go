@@ -260,10 +260,16 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 }
 
 func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey, amount, height uint64) error {
-	if amount < MinStakeNAPR {
-		return fmt.Errorf("deposit too low: %.0f APRO < minimum %.0f APRO",
+	// Use dynamic minimum stake (DST) if oracle price has been set, otherwise
+	// fall back to the static MinStakeNAPR constant.
+	effectiveMin := r.dynamicMinNAPR
+	if effectiveMin == 0 {
+		effectiveMin = MinStakeNAPR
+	}
+	if amount < effectiveMin {
+		return fmt.Errorf("deposit too low: %.4f APRO < minimum %.4f APRO",
 			float64(amount)/float64(BaseUnitsPerAPR),
-			float64(MinStakeNAPR)/float64(BaseUnitsPerAPR))
+			float64(effectiveMin)/float64(BaseUnitsPerAPR))
 	}
 
 	if existing, ok := r.validators[key]; ok {
