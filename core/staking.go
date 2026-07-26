@@ -146,20 +146,68 @@ func (e *ValidatorEntry) APRStake() float64 {
 	return float64(e.StakeNAPR) / float64(BaseUnitsPerAPR)
 }
 
+// ─── Dynamic Stake Threshold ──────────────────────────────────────────────────
+
+// DSTTargetUSD is the USD value a validator must stake after Phase 2 begins.
+// Formula: minStakeNAPR = DSTTargetUSD / currentAPROPriceUSD * BaseUnitsPerAPR
+// Before Phase 2 the static MinStakeNAPR constant takes precedence.
+const DSTTargetUSD float64 = 10_000 // $10,000 per validator seat
+
+// Phase2StartYear is the calendar year when DST becomes active (post-devfund).
+const Phase2StartYear = 2031
+
 // ─── ValidatorRegistry ────────────────────────────────────────────────────────
 
 // ValidatorRegistry tracks all validator stakes and drives automatic set
 // selection.  It is thread-safe and is updated as blocks are processed.
 type ValidatorRegistry struct {
-	mu         sync.RWMutex
-	validators map[string]*ValidatorEntry // hex(pubkey) → entry
+	mu             sync.RWMutex
+	validators     map[string]*ValidatorEntry // hex(pubkey) → entry
+	dynamicMinNAPR uint64                     // 0 = use static MinStakeNAPR constant
 }
 
 // NewValidatorRegistry creates an empty registry.
 func NewValidatorRegistry() *ValidatorRegistry {
 	return &ValidatorRegistry{
-		validators: make(map[string]*ValidatorEntry),
+		validators:     make(map[string]*ValidatorEntry),
+		dynamicMinNAPR: 0,
 	}
+}
+
+// UpdateMinStake recalculates the minimum stake from the current APRO market
+// price (in USD).  Called by the oracle price-update path on each new price.
+//
+//   minStakeNAPR = ⌈DSTTargetUSD / priceUSD × BaseUnitsPerAPR⌉
+//
+// If priceUSD ≤ 0 the dynamic threshold is cleared and the static constant
+// MinStakeNAPR is used instead (prevents division-by-zero and protects
+// Phase 1 where price is not yet reliable).
+//
+// Thread-safe; can be called concurrently with block processing.
+func (r *ValidatorRegistry) UpdateMinStake(priceUSD float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if priceUSD <= 0 {
+		r.dynamicMinNAPR = 0
+		return
+	}
+	napro := (DSTTargetUSD / priceUSD) * float64(BaseUnitsPerAPR)
+	// Never go below 1 APRO (sanity floor for extremely high prices)
+	if napro < float64(BaseUnitsPerAPR) {
+		napro = float64(BaseUnitsPerAPR)
+	}
+	r.dynamicMinNAPR = uint64(napro + 0.5) // round to nearest nAPRO
+}
+
+// CurrentMinStake returns the effective minimum stake in nAPRO.
+// Returns the static constant when no oracle price has been set yet.
+func (r *ValidatorRegistry) CurrentMinStake() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.dynamicMinNAPR > 0 {
+		return r.dynamicMinNAPR
+	}
+	return MinStakeNAPR
 }
 
 // InitFromGenesis pre-seeds genesis validators as Active, bypassing the queue.
