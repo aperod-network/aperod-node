@@ -381,18 +381,9 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                                 windowBlocks++
                         }
                 }
-                // Sum all user txs (skip block-reward coinbase at index 0)
-                for h2 := int64(0); h2 <= int64(height); h2++ {
-                        b := s.chain.GetByHeight(uint64(h2))
-                        if b != nil {
-                                for txIdx, tx := range b.Txs {
-                                        if txIdx == 0 && tx.IsCoinbase() {
-                                                continue
-                                        }
-                                        totalTxs++
-                                }
-                        }
-                }
+                // Use cached counter — maintained atomically as blocks arrive.
+                // Avoids O(chain-length) scan on every stats call.
+                totalTxs = int(s.TxTotal())
 
                 // TPS estimate: assume ~3s block time
                 tps := float64(0)

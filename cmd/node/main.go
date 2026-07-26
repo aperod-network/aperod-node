@@ -203,9 +203,34 @@ func run() error {
                 log.Info("chain restored from storage", "blocks_loaded", loaded)
         }
 
+        // Pre-compute total non-coinbase tx count once after loading.
+        // This is O(n) but runs only at startup — stored in a cached counter
+        // so /api/v1/network/stats can answer in O(1) while the node runs.
+        var initialTxTotal int64
+        {
+                tip := chain.Tip()
+                if tip != nil {
+                        for h := uint64(0); h <= tip.Header.Height; h++ {
+                                b := chain.GetByHeight(h)
+                                if b == nil {
+                                        continue
+                                }
+                                for txIdx, tx := range b.Txs {
+                                        if txIdx == 0 && tx.IsCoinbase() {
+                                                continue
+                                        }
+                                        initialTxTotal++
+                                }
+                        }
+                }
+        }
+        log.Info("initial tx count computed", "total_txs", initialTxTotal)
+
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
-        // host is declared here so OnBlockProduced can reference it (set after Start).
+        // host and apiSrv are declared here so OnBlockProduced can reference them
+        // (both are assigned after engine creation, but closures capture by reference).
         var host *p2p.Host
+        var apiSrv *api.Server
 
         registry := core.NewValidatorRegistry()
 
@@ -224,6 +249,19 @@ func run() error {
                                 hash := block.Hash()
                                 if err := db.PutTip(hash, block.Header.Height); err != nil {
                                         log.Error("failed to update tip", "height", block.Header.Height, "err", err)
+                                }
+                        }
+                        // Increment cached tx counter (skip index-0 coinbase reward).
+                        if apiSrv != nil {
+                                var delta int64
+                                for txIdx, tx := range block.Txs {
+                                        if txIdx == 0 && tx.IsCoinbase() {
+                                                continue
+                                        }
+                                        delta++
+                                }
+                                if delta > 0 {
+                                        apiSrv.AddTxCount(delta)
                                 }
                         }
                         // Broadcast newly produced block to P2P peers (non-blocking).
@@ -250,11 +288,11 @@ func run() error {
         }()
 
         utxos := core.NewUTXOSet()
-        var apiSrv *api.Server
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
                 apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 apiSrv.SetRegistry(engine.Registry())
+                apiSrv.SetTxTotal(initialTxTotal)
                 go func() {
                         if err := apiSrv.Start(); err != nil {
                                 log.Error("API server stopped", "err", err)

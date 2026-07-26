@@ -8,6 +8,7 @@ import (
         "fmt"
         "log/slog"
         "net/http"
+        "sync/atomic"
         "time"
 
         "github.com/aperod/aperod/core"
@@ -28,6 +29,10 @@ type Server struct {
         corsOrigins []string // empty = allow all ("*")
         rateLimiter *RateLimiter
         peerCounter func() int // optional; wired to p2p.Host.PeerCount by cmd/node
+
+        // txTotal is an O(1) cached total non-coinbase tx count.
+        // Updated atomically so no lock is needed in hot paths.
+        txTotal int64
 }
 
 // NewServer creates a new API server.
@@ -61,6 +66,16 @@ func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
 func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
+
+// SetTxTotal sets the initial total non-coinbase tx count (call once after
+// loading the chain from disk to avoid an O(n) scan on every stats request).
+func (s *Server) SetTxTotal(n int64) { atomic.StoreInt64(&s.txTotal, n) }
+
+// AddTxCount increments the cached tx counter by delta (call from OnBlockProduced).
+func (s *Server) AddTxCount(delta int64) { atomic.AddInt64(&s.txTotal, delta) }
+
+// TxTotal returns the current cached total non-coinbase tx count.
+func (s *Server) TxTotal() int64 { return atomic.LoadInt64(&s.txTotal) }
 
 // Hub returns the WebSocket hub (for node to push events).
 func (s *Server) Hub() *Hub { return s.hub }
