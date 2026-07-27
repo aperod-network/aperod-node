@@ -201,16 +201,34 @@ else
   # Satoshi Nakamoto genesis block address — всегда есть история
   TEST_BTC_ADDR="1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna"
   echo "  Тестовый BTC адрес: ${TEST_BTC_ADDR}"
-  NN_RESP=$(curl -sf --max-time 10 \
+  # Показываем и HTTP-код, и тело ответа для диагностики
+  NN_HTTP=$(curl -s -o /tmp/nn_resp.json -w "%{http_code}" --max-time 10 \
     "https://btcbook.nownodes.io/api/v2/address/${TEST_BTC_ADDR}" \
     -H "api-key: ${NN_APIKEY}" 2>/dev/null)
-  if [ -n "$NN_RESP" ]; then
+  NN_RESP=$(cat /tmp/nn_resp.json 2>/dev/null)
+  if [ "$NN_HTTP" = "200" ]; then
     BTC_BAL=$(echo "$NN_RESP" | python3 -c \
       "import json,sys; d=json.load(sys.stdin); print(d.get('balance','?'), 'satoshi')" 2>/dev/null)
-    ok "NowNodes доступен: баланс генезис-адреса = ${BTC_BAL}"
+    ok "NowNodes доступен (HTTP 200): баланс генезис-адреса = ${BTC_BAL}"
   else
-    err "NowNodes недоступен или ключ неверный"
-    echo "     curl -H 'api-key: ВАШ_КЛЮЧ' https://btcbook.nownodes.io/api/v2/address/${TEST_BTC_ADDR}"
+    err "NowNodes ответил HTTP ${NN_HTTP:-timeout}"
+    echo "     Ответ сервера: $(echo "$NN_RESP" | head -c 300)"
+    echo ""
+    echo "     Диагностика:"
+    if [ "$NN_HTTP" = "401" ] || [ "$NN_HTTP" = "403" ]; then
+      echo "     • Ключ неверный или просрочен"
+      echo "     → Зайдите на nownodes.io → Dashboard → скопируйте API Key заново"
+      echo "     → Вставьте в /admin-panel/integrations → NowNodes → Сохранить"
+    elif [ "$NN_HTTP" = "429" ]; then
+      echo "     • Превышен лимит запросов"
+    elif [ -z "$NN_HTTP" ]; then
+      echo "     • Timeout: сервер не отвечает за 10 секунд"
+      echo "     → Проверьте сеть: curl -v https://btcbook.nownodes.io/"
+    fi
+    echo ""
+    echo "     Ручная проверка (выполните отдельно):"
+    echo "     NN_KEY=\$(python3 -c \"import json; d=json.load(open('${SETTINGS}')); print(d['nownodes']['apiKey'])\")"
+    echo "     curl -v -H \"api-key: \$NN_KEY\" https://btcbook.nownodes.io/api/v2/address/${TEST_BTC_ADDR}"
   fi
 fi
 
@@ -249,10 +267,39 @@ else
         err "S3 подключение НЕ работает (rclone exit ${RC}):"
         echo "$LS_OUT" | sed 's/^/     /'
         echo ""
-        echo "     Возможные причины:"
-        echo "     • Неверный Access Key ID или Secret Access Key"
-        echo "     • Endpoint URL не совпадает с регионом bucket"
-        echo "     • Bucket '${S3_BK}' не существует в Backblaze"
+        echo "     ── Диагностика по типу ошибки ──────────────────────────"
+        if echo "$LS_OUT" | grep -q "Malformed Access Key"; then
+          echo "     ОШИБКА: InvalidAccessKeyId — Malformed Access Key Id"
+          echo ""
+          echo "     Backblaze B2 использует ДВА разных значения:"
+          echo "       1. keyID  (Application Key ID)  — начинается с «004» или «00»"
+          echo "          Вставляется в поле «Access Key ID» в admin-panel"
+          echo "       2. applicationKey  — длинная строка, показывается ОДИН РАЗ"
+          echo "          Вставляется в поле «Secret Access Key» в admin-panel"
+          echo ""
+          echo "     Частая ошибка: оба поля заполнены одинаковым значением,"
+          echo "     или keyID и applicationKey перепутаны местами."
+          echo ""
+          echo "     Как исправить:"
+          echo "       1. Зайдите на backblaze.com → My Account → App Keys"
+          echo "       2. Создайте новый ключ (старый applicationKey уже не вернуть)"
+          echo "       3. Скопируйте keyID в «Access Key ID»"
+          echo "       4. Скопируйте applicationKey в «Secret Access Key»"
+          echo "       5. Сохраните в /admin-panel/integrations → S3"
+        elif echo "$LS_OUT" | grep -q "403\|AccessDenied"; then
+          echo "     ОШИБКА 403 — ключ верный, но нет доступа к bucket '${S3_BK}'"
+          echo "     • Убедитесь что ключ создан с доступом к bucket '${S3_BK}'"
+          echo "     • Или создайте ключ с типом «All Buckets» в Backblaze"
+        elif echo "$LS_OUT" | grep -q "NoSuchBucket\|does not exist"; then
+          echo "     ОШИБКА — bucket '${S3_BK}' не существует"
+          echo "     • Создайте bucket в Backblaze B2 с именем '${S3_BK}'"
+          echo "     • Или измените «Имя bucket» в /admin-panel/integrations"
+        elif echo "$LS_OUT" | grep -q "connection\|network\|timeout"; then
+          echo "     ОШИБКА СЕТИ — не удалось подключиться к ${S3_EP}"
+          echo "     • Проверьте endpoint URL в /admin-panel/integrations"
+          echo "     • Для Backblaze us-west-004: https://s3.us-west-004.backblazeb2.com"
+        fi
+        echo "     ────────────────────────────────────────────────────────"
       fi
     else
       warn "S3 ключи не заданы в ${SETTINGS} — пропускаем проверку rclone"
