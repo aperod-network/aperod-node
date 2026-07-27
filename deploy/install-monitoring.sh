@@ -138,16 +138,24 @@ ok "Prometheus запущен на :9090"
 # ── 6. Grafana — конфиг ──────────────────────────────────
 info "Настраиваем Grafana…"
 GRAFANA_INI="/etc/grafana/grafana.ini"
-if grep -q "root_url" "$GRAFANA_INI" 2>/dev/null; then
-  sed -i 's|.*root_url.*|root_url = https://aperod.com/grafana/|' "$GRAFANA_INI"
+
+# Удаляем старые вхождения (включая закомментированные) — чтобы не дублировать
+sed -i '/^\s*;*\s*root_url\s*=/d'            "$GRAFANA_INI"
+sed -i '/^\s*;*\s*serve_from_sub_path\s*=/d' "$GRAFANA_INI"
+
+# Добавляем оба параметра сразу после [server]
+if grep -q '^\[server\]' "$GRAFANA_INI"; then
+  sed -i '/^\[server\]/a serve_from_sub_path = true\nroot_url = https://aperod.com/grafana/' "$GRAFANA_INI"
 else
-  cat >> "$GRAFANA_INI" <<'EOF'
+  # Секции [server] нет вообще — дописываем в конец
+  cat >> "$GRAFANA_INI" <<'GEOF'
 
 [server]
 root_url = https://aperod.com/grafana/
 serve_from_sub_path = true
-EOF
+GEOF
 fi
+
 systemctl enable --now grafana-server
 systemctl restart grafana-server
 ok "Grafana запущена на :3000 (путь /grafana/)"
