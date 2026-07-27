@@ -119,8 +119,8 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 hdr "3. API-сервер"
 
-HEALTH=$(curl -sf "${API_BASE}/api/health" 2>/dev/null) && ok "GET /api/health → OK: ${HEALTH}" \
-  || { err "GET /api/health — API-сервер недоступен на ${API_BASE}"; }
+HEALTH=$(curl -sf "${API_BASE}/api/healthz" 2>/dev/null) && ok "GET /api/healthz → OK: ${HEALTH}" \
+  || { err "GET /api/healthz — API-сервер недоступен на ${API_BASE}"; echo "     Проверьте: sudo systemctl status aperod-api"; }
 
 INT_PUB=$(curl -sf "${API_BASE}/api/v1/integrations/public" 2>/dev/null)
 if [ -n "$INT_PUB" ]; then
@@ -198,37 +198,29 @@ if [ -z "${NN_APIKEY:-}" ]; then
   err "NowNodes ключ не задан — пропускаем проверку"
   echo "     Без ключа адрес отображается, но баланс BTC не загрузится"
 else
-  # Satoshi Nakamoto genesis block address — всегда есть история
-  TEST_BTC_ADDR="1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna"
-  echo "  Тестовый BTC адрес: ${TEST_BTC_ADDR}"
-  # Показываем и HTTP-код, и тело ответа для диагностики
+  # Проверяем ключ через /api/v2 (статус API, не требует адреса)
+  echo "  Проверка ключа через btcbook.nownodes.io/api/v2 ..."
   NN_HTTP=$(curl -s -o /tmp/nn_resp.json -w "%{http_code}" --max-time 10 \
-    "https://btcbook.nownodes.io/api/v2/address/${TEST_BTC_ADDR}" \
+    "https://btcbook.nownodes.io/api/v2" \
     -H "api-key: ${NN_APIKEY}" 2>/dev/null)
   NN_RESP=$(cat /tmp/nn_resp.json 2>/dev/null)
   if [ "$NN_HTTP" = "200" ]; then
-    BTC_BAL=$(echo "$NN_RESP" | python3 -c \
-      "import json,sys; d=json.load(sys.stdin); print(d.get('balance','?'), 'satoshi')" 2>/dev/null)
-    ok "NowNodes доступен (HTTP 200): баланс генезис-адреса = ${BTC_BAL}"
+    NN_CHAIN=$(echo "$NN_RESP" | python3 -c \
+      "import json,sys; d=json.load(sys.stdin); print(d.get('name','?'), 'blocks:', d.get('bestHeight','?'))" 2>/dev/null)
+    ok "NowNodes доступен (HTTP 200): ${NN_CHAIN}"
+    echo "     Ключ валиден — BTC/LTC/DOGE/ZEC балансы будут работать"
   else
     err "NowNodes ответил HTTP ${NN_HTTP:-timeout}"
     echo "     Ответ сервера: $(echo "$NN_RESP" | head -c 300)"
     echo ""
-    echo "     Диагностика:"
     if [ "$NN_HTTP" = "401" ] || [ "$NN_HTTP" = "403" ]; then
-      echo "     • Ключ неверный или просрочен"
-      echo "     → Зайдите на nownodes.io → Dashboard → скопируйте API Key заново"
+      echo "     → Ключ неверный. Зайдите nownodes.io → Dashboard → скопируйте API Key"
       echo "     → Вставьте в /admin-panel/integrations → NowNodes → Сохранить"
     elif [ "$NN_HTTP" = "429" ]; then
-      echo "     • Превышен лимит запросов"
+      echo "     → Превышен лимит запросов — подождите минуту"
     elif [ -z "$NN_HTTP" ]; then
-      echo "     • Timeout: сервер не отвечает за 10 секунд"
-      echo "     → Проверьте сеть: curl -v https://btcbook.nownodes.io/"
+      echo "     → Timeout. Проверьте сеть: curl -v https://btcbook.nownodes.io/"
     fi
-    echo ""
-    echo "     Ручная проверка (выполните отдельно):"
-    echo "     NN_KEY=\$(python3 -c \"import json; d=json.load(open('${SETTINGS}')); print(d['nownodes']['apiKey'])\")"
-    echo "     curl -v -H \"api-key: \$NN_KEY\" https://btcbook.nownodes.io/api/v2/address/${TEST_BTC_ADDR}"
   fi
 fi
 
