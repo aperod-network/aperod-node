@@ -8,6 +8,9 @@
 # Required env vars (set in /etc/environment or systemd override):
 #   APEROD_BACKUP_PASSWORD  — AES-256 encryption passphrase
 #   RCLONE_REMOTE           — rclone remote:bucket (default: s3-backup:aperod-vault)
+#
+# Prometheus metrics: written to /var/lib/node_exporter/textfile_collector/aperod_backup.prom
+# (requires node_exporter --collector.textfile.directory=... — see install-monitoring.sh)
 # ==========================================================
 
 set -euo pipefail
@@ -21,6 +24,34 @@ ENCRYPTION_PASSWORD="${APEROD_BACKUP_PASSWORD:?Set APEROD_BACKUP_PASSWORD env va
 RCLONE_REMOTE="${RCLONE_REMOTE:-s3-backup:aperod-vault}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 BACKUP_NAME="aperod_backup_${TIMESTAMP}"
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+TEXTFILE="${TEXTFILE_DIR}/aperod_backup.prom"
+START_TS=$(date +%s)
+
+# ── Helper: write prometheus textfile ────────────────────────────────────────
+write_metrics() {
+  local success=$1
+  local end_ts
+  end_ts=$(date +%s)
+  local duration=$((end_ts - START_TS))
+  mkdir -p "$TEXTFILE_DIR"
+  # Write atomically — prometheus textfile collector reads *.prom files
+  cat > "${TEXTFILE}.tmp" <<PROM
+# HELP aperod_backup_last_success 1 if the last backup completed successfully, 0 if it failed.
+# TYPE aperod_backup_last_success gauge
+aperod_backup_last_success ${success}
+# HELP aperod_backup_last_success_timestamp_seconds Unix timestamp of the last backup run start.
+# TYPE aperod_backup_last_success_timestamp_seconds gauge
+aperod_backup_last_success_timestamp_seconds ${START_TS}
+# HELP aperod_backup_duration_seconds Duration of the last backup run in seconds.
+# TYPE aperod_backup_duration_seconds gauge
+aperod_backup_duration_seconds ${duration}
+PROM
+  mv "${TEXTFILE}.tmp" "$TEXTFILE"
+}
+
+# Mark as "in progress / failed" at start — will be overwritten on success
+write_metrics 0
 
 mkdir -p "$BACKUP_DIR"
 echo "=== [1/4] Backup started: ${TIMESTAMP} ==="
@@ -61,5 +92,8 @@ rclone delete --min-age 336h "$RCLONE_REMOTE" 2>/dev/null || true
 # ── 5. Cleanup temp files ────────────────────────────────────────────────────
 echo "=== [4/4] Cleanup ==="
 rm -rf "$BACKUP_DIR"
+
+# ── Write success metrics ─────────────────────────────────────────────────────
+write_metrics 1
 
 echo "=== BACKUP COMPLETE: ${BACKUP_NAME}.tar.gpg → ${RCLONE_REMOTE} ==="

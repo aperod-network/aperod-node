@@ -6,25 +6,49 @@
 #
 # Then point Grafana at http://localhost:9090 as a Prometheus data source
 # and import grafana-dashboard.json.
+#
+# Required exporters (see install-monitoring.sh for one-command setup):
+#   nginx-prometheus-exporter  — listens on :9113, scrapes nginx stub_status
+#   node_exporter              — listens on :9100, provides system metrics
+#                                Enable --collector.textfile --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+#                                for cron/backup metrics written by aperod_backup.sh
 
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
 scrape_configs:
-  # Go node — chain height, mempool, peers, validators (blockchain/api/server.go handleMetrics).
+  # ── 1. Aperod Go node — chain height, mempool, peers, validators ──────────
   - job_name: aperod-node
     static_configs:
       - targets: ["127.0.0.1:8545"]
         labels:
           service: aperod-node
 
-  # Node.js API server — HTTP request counters + daily payout job outcomes
-  # (artifacts/api-server/src/routes/metrics.ts).
-  # Scraped directly on port 3001 (nginx on :80 does 301→HTTPS so Prometheus can't follow it).
+  # ── 2. Node.js API server — HTTP counters, daily payout job outcomes ──────
+  # Scraped on port 3001 (nginx on :80 does 301→HTTPS so Prometheus can't follow it).
   - job_name: aperod-api-server
     metrics_path: /api/metrics
     static_configs:
       - targets: ["127.0.0.1:3001"]
         labels:
           service: aperod-api-server
+
+  # ── 3. nginx-prometheus-exporter — connections, requests/sec ─────────────
+  # Install: see install-monitoring.sh
+  # Requires nginx stub_status at http://127.0.0.1/nginx_status (already in nginx config)
+  - job_name: nginx
+    static_configs:
+      - targets: ["127.0.0.1:9113"]
+        labels:
+          service: nginx
+
+  # ── 4. node_exporter — CPU, RAM, disk, network traffic, textfile ─────────
+  # Install: see install-monitoring.sh
+  # Enable textfile collector for cron backup metrics:
+  #   --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels:
+          service: node-exporter
