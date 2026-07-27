@@ -101,9 +101,9 @@ echo "=== [1/4] Бэкап начат: ${TIMESTAMP} ==="
 
 # ── 1. PostgreSQL dump ─────────────────────────────────────────────────────────
 echo "  Дамп PostgreSQL: ${DB_NAME} (user=${DB_USER}) ..."
-# Используем sudo -u для обхода peer-auth (root → postgres без пароля)
-sudo -u "$DB_USER" pg_dump -F c -b -f "${BACKUP_DIR}/explorer_db.dump" "$DB_NAME" \
-  || pg_dump -U "$DB_USER" -h 127.0.0.1 -F c -b -f "${BACKUP_DIR}/explorer_db.dump" "$DB_NAME"
+# sudo -u postgres — файл пишет root через shell redirection (не pg_dump),
+# обходит и peer-auth (не нужен пароль) и permission denied в /tmp.
+sudo -u "$DB_USER" pg_dump -F c -b "$DB_NAME" > "${BACKUP_DIR}/explorer_db.dump"
 echo "  Дамп БД: $(du -sh "${BACKUP_DIR}/explorer_db.dump" | cut -f1)"
 
 # ── 2. Blockchain node data ────────────────────────────────────────────────────
