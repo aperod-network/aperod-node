@@ -1,0 +1,197 @@
+# ==========================================================
+#  Aperod — полная конфигурация nginx для aperod.com
+#
+#  Установка на сервере:
+#    sudo cp /opt/aperod/blockchain/deploy/aperod.com.nginx \
+#            /etc/nginx/sites-available/aperod.com
+#    sudo ln -sf /etc/nginx/sites-available/aperod.com \
+#                /etc/nginx/sites-enabled/aperod.com
+#    sudo nginx -t && sudo systemctl reload nginx
+#
+#  Требуется:
+#    - SSL сертификат Let's Encrypt для aperod.com
+#      (certbot --nginx -d aperod.com -d www.aperod.com)
+#    - Фронтенды собраны: pnpm --filter @workspace/* run build
+#    - API сервер запущен на :3001
+#    - Grafana запущена на :3000
+# ==========================================================
+
+# ── HTTP → HTTPS редирект ──────────────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name aperod.com www.aperod.com;
+
+    # Let's Encrypt ACME challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://aperod.com$request_uri;
+    }
+}
+
+# ── www → без www ──────────────────────────────────────────
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name www.aperod.com;
+
+    ssl_certificate     /etc/letsencrypt/live/aperod.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/aperod.com/privkey.pem;
+
+    return 301 https://aperod.com$request_uri;
+}
+
+# ── Основной HTTPS сервер ──────────────────────────────────
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name aperod.com;
+
+    # SSL
+    ssl_certificate     /etc/letsencrypt/live/aperod.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/aperod.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Безопасность
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options    nosniff always;
+    add_header X-Frame-Options           SAMEORIGIN always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+
+    # Gzip
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript
+               application/xml+rss application/atom+xml image/svg+xml;
+
+    # ── API сервер (:3001) ─────────────────────────────────
+    location /api/ {
+        proxy_pass         http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        # SSE (уведомления, стримы)
+        proxy_buffering    off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    # ── Grafana (:3000/grafana/) ───────────────────────────
+    # ВАЖНО: proxy_pass должен содержать /grafana/ — иначе
+    # JS-ресурсы Grafana попадут в /api/ вашего API-сервера.
+    location /grafana/ {
+        proxy_pass         http://127.0.0.1:3000/grafana/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_buffering    off;
+    }
+    location = /grafana {
+        return 301 /grafana/;
+    }
+
+    # ── Admin Panel (/admin-panel/) ────────────────────────
+    location /admin-panel/ {
+        alias   /opt/aperod/artifacts/admin-panel/dist/public/;
+        # SPA: все подпути → index.html
+        try_files $uri $uri/ @admin_spa;
+        expires 1h;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    location @admin_spa {
+        rewrite ^/admin-panel/.*$ /admin-panel/index.html break;
+        root /opt/aperod/artifacts/admin-panel/dist/public;
+    }
+    # Статические ресурсы admin-panel кэшируем надолго
+    location ~* ^/admin-panel/.+\.(js|css|woff2?|ttf|eot|svg|png|jpg|ico|webp)$ {
+        alias /opt/aperod/artifacts/admin-panel/dist/public/;
+        rewrite ^/admin-panel/(.*)$ /$1 break;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # ── Telegram Wallet (/telegram-wallet/) ───────────────
+    location /telegram-wallet/ {
+        alias   /opt/aperod/artifacts/telegram-wallet/dist/public/;
+        try_files $uri $uri/ @wallet_spa;
+        expires 1h;
+    }
+    location @wallet_spa {
+        rewrite ^/telegram-wallet/.*$ /telegram-wallet/index.html break;
+        root /opt/aperod/artifacts/telegram-wallet/dist/public;
+    }
+
+    # ── Block Explorer (/explorer/) ───────────────────────
+    location /explorer/ {
+        alias   /opt/aperod/artifacts/explorer/dist/public/;
+        try_files $uri $uri/ @explorer_spa;
+        expires 1h;
+    }
+    location @explorer_spa {
+        rewrite ^/explorer/.*$ /explorer/index.html break;
+        root /opt/aperod/artifacts/explorer/dist/public;
+    }
+
+    # ── Landing Page (корень /) ────────────────────────────
+    location / {
+        root    /opt/aperod/artifacts/landing/dist/public;
+        index   index.html;
+        try_files $uri $uri/ /index.html;
+        expires 1h;
+        add_header Cache-Control "public, must-revalidate";
+    }
+    # Статические ресурсы landing
+    location ~* \.(js|css|woff2?|ttf|eot|svg|png|jpg|ico|webp)$ {
+        root    /opt/aperod/artifacts/landing/dist/public;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+        try_files $uri =404;
+    }
+
+    # ── NowPayments webhook ───────────────────────────────
+    # Webhook напрямую принимает API без /api/ префикса (для обратной совместимости)
+    location /nowpayments/ {
+        proxy_pass         http://127.0.0.1:3001/api/nowpayments/;
+        proxy_set_header   Host            $host;
+        proxy_set_header   X-Real-IP       $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    # Логи
+    access_log /var/log/nginx/aperod.com.access.log;
+    error_log  /var/log/nginx/aperod.com.error.log warn;
+}
+
+# ── nginx stub_status (для node_exporter / nginx-prometheus-exporter) ──
+# Только localhost — НИКОГДА не открывать наружу
+server {
+    listen 127.0.0.1:8080;
+    server_name _;
+    access_log off;
+
+    location /nginx_status {
+        stub_status;
+        allow 127.0.0.1;
+        deny  all;
+    }
+}

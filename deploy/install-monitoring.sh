@@ -36,31 +36,58 @@ apt-get install -y -q prometheus grafana curl wget nginx
 ok "Базовые пакеты установлены"
 
 # ── 2. node_exporter ─────────────────────────────────────
-info "Устанавливаем node_exporter ${NODE_EXPORTER_VER}…"
-NE_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VER}/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}.tar.gz"
-wget -q "$NE_URL" -O /tmp/node_exporter.tar.gz
-tar -xzf /tmp/node_exporter.tar.gz -C /tmp
-cp "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}/node_exporter" /usr/local/bin/node_exporter
-chmod +x /usr/local/bin/node_exporter
-rm -rf /tmp/node_exporter.tar.gz "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}"
-
-# Директория для textfile_collector (backup.sh пишет сюда .prom файлы)
+# Директория textfile_collector — создаём в любом случае
 TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
 mkdir -p "$TEXTFILE_DIR"
-
 useradd --no-create-home --shell /bin/false node_exporter 2>/dev/null || true
 chown -R node_exporter:node_exporter /var/lib/node_exporter
+chmod 755 "$TEXTFILE_DIR"
 
-cat > /etc/systemd/system/node_exporter.service <<'EOF'
+# Проверяем: установлен ли node_exporter через apt (prometheus-node-exporter)
+APT_NE=false
+if dpkg -s prometheus-node-exporter &>/dev/null 2>&1; then
+  APT_NE=true
+  info "Обнаружен prometheus-node-exporter (apt) — настраиваем textfile collector"
+  # Добавляем флаг textfile в /etc/default/prometheus-node-exporter
+  NE_DEFAULT="/etc/default/prometheus-node-exporter"
+  if [[ -f "$NE_DEFAULT" ]]; then
+    if grep -q "textfile" "$NE_DEFAULT"; then
+      ok "textfile.directory уже задан в $NE_DEFAULT"
+    else
+      sed -i "s|ARGS=\"\(.*\)\"|ARGS=\"\1 --collector.textfile.directory=${TEXTFILE_DIR}\"|" "$NE_DEFAULT"
+      ok "Добавлен --collector.textfile.directory в $NE_DEFAULT"
+    fi
+  else
+    echo "ARGS=\"--collector.textfile.directory=${TEXTFILE_DIR}\"" > "$NE_DEFAULT"
+    ok "Создан $NE_DEFAULT с textfile collector"
+  fi
+  systemctl restart prometheus-node-exporter 2>/dev/null || true
+  ok "prometheus-node-exporter перезапущен"
+fi
+
+# Если apt-версии нет — скачиваем и ставим как собственный systemd-сервис
+if ! $APT_NE; then
+  info "Устанавливаем node_exporter ${NODE_EXPORTER_VER}…"
+  NE_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VER}/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}.tar.gz"
+  wget -q "$NE_URL" -O /tmp/node_exporter.tar.gz
+  tar -xzf /tmp/node_exporter.tar.gz -C /tmp
+  cp "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}/node_exporter" /usr/local/bin/node_exporter
+  chmod +x /usr/local/bin/node_exporter
+  rm -rf /tmp/node_exporter.tar.gz "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}"
+
+  # Останавливаем старый сервис если есть (мог быть запущен без textfile)
+  systemctl stop node_exporter 2>/dev/null || true
+
+  cat > /etc/systemd/system/node_exporter.service <<EOF
 [Unit]
 Description=Prometheus Node Exporter
 After=network.target
 
 [Service]
 User=node_exporter
-ExecStart=/usr/local/bin/node_exporter \
-  --collector.textfile.directory=/var/lib/node_exporter/textfile_collector \
-  --collector.systemd \
+ExecStart=/usr/local/bin/node_exporter \\
+  --collector.textfile.directory=${TEXTFILE_DIR} \\
+  --collector.systemd \\
   --collector.processes
 Restart=always
 RestartSec=5
@@ -69,9 +96,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now node_exporter
-ok "node_exporter запущен на :9100"
+  systemctl daemon-reload
+  systemctl enable --now node_exporter
+fi
+ok "node_exporter запущен на :9100 (textfile: ${TEXTFILE_DIR})"
 
 # ── 3. nginx — включаем stub_status ──────────────────────
 info "Настраиваем nginx stub_status…"

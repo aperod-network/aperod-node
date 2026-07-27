@@ -301,8 +301,8 @@
       "options": { "tooltip": { "mode": "multi" } },
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 8 } }, "overrides": [] },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_receive_bytes_total{device=~\"eth0|ens.*|enp.*\"}[5m])", "legendFormat": "входящий" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_transmit_bytes_total{device=~\"eth0|ens.*|enp.*\"}[5m])", "legendFormat": "исходящий" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_receive_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])", "legendFormat": "входящий ({{device}})" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_transmit_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])", "legendFormat": "исходящий ({{device}})" }
       ]
     },
 
