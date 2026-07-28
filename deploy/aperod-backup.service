@@ -1,0 +1,42 @@
+# ==========================================================
+# Aperod backup — privileged oneshot systemd service
+#
+# Deploy:
+#   sudo cp blockchain/deploy/aperod-backup.service /etc/systemd/system/
+#   sudo cp blockchain/deploy/aperod-backup.path    /etc/systemd/system/
+#   sudo cp blockchain/deploy/aperod-backup-trigger.conf /etc/tmpfiles.d/
+#   sudo systemd-tmpfiles --create /etc/tmpfiles.d/aperod-backup-trigger.conf
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable aperod-backup.path
+#   sudo systemctl start  aperod-backup.path
+#
+# The aperod-api service triggers a backup by writing:
+#   /run/aperod/backup-trigger
+# (the /run/aperod directory is owned by the 'aperod' user so no sudo needed)
+# ==========================================================
+
+[Unit]
+Description=Aperod backup (pg_dump + GPG encrypt + rclone upload)
+After=network-online.target postgresql.service
+# Never auto-restart — triggered by path unit only
+RefuseManualStart=no
+
+[Service]
+Type=oneshot
+User=root
+
+# Read APEROD_BACKUP_PASSWORD and DATA_DIR from /etc/environment
+EnvironmentFile=-/etc/environment
+
+# Remove the trigger file BEFORE running the script so the path unit
+# doesn't fire a second time while the backup is still in progress.
+ExecStartPre=/bin/rm -f /run/aperod/backup-trigger
+
+ExecStart=/usr/local/bin/aperod_backup.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aperod-backup
+
+# Give large databases up to 2 hours
+TimeoutStartSec=7200
