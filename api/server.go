@@ -289,15 +289,19 @@ func (s *Server) aprGetNodeInfo() (interface{}, error) {
 
 // BlockResponse is returned by block-fetching methods.
 type BlockResponse struct {
-        Hash         string               `json:"hash"`
-        Height       uint64               `json:"height"`
-        PrevHash     string               `json:"prev_hash"`
-        MerkleRoot   string               `json:"merkle_root"`
-        Timestamp    string               `json:"timestamp"`
-        Round        uint32               `json:"round"`
-        ValidatorPub string               `json:"validator_pub"`
-        TxCount      int                  `json:"tx_count"`
-        Size         int                  `json:"size"`
+        Hash         string `json:"hash"`
+        Height       uint64 `json:"height"`
+        PrevHash     string `json:"prev_hash"`
+        MerkleRoot   string `json:"merkle_root"`
+        Timestamp    string `json:"timestamp"`
+        Round        uint32 `json:"round"`
+        ValidatorPub string `json:"validator_pub"`
+        TxCount      int    `json:"tx_count"`
+        Size         int    `json:"size"`
+        // OraclePrice is the APRO/USD price embedded by the validator,
+        // expressed as USD-per-APRO × 10^9 (9-decimal fixed-point uint64).
+        // Zero means no price was embedded (pre-oracle or non-oracle block).
+        OraclePrice uint64 `json:"oracle_price"`
 }
 
 func blockToResponse(b *core.Block) BlockResponse {
@@ -312,6 +316,7 @@ func blockToResponse(b *core.Block) BlockResponse {
                 ValidatorPub: b.Header.ValidatorPub.Hex(),
                 TxCount:      len(b.Txs),
                 Size:         b.Size(),
+                OraclePrice:  b.Header.OraclePrice,
         }
 }
 

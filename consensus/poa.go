@@ -4,8 +4,11 @@
 package consensus
 
 import (
+        "encoding/json"
         "fmt"
         "log/slog"
+        "math"
+        "net/http"
         "sync"
         "time"
 
@@ -34,6 +37,16 @@ type Config struct {
         // BlockRewardNAPR is the block reward in base units (nAPRO).
         // 0 uses the default: 10_000_000 nAPRO = 0.1 APRO.
         BlockRewardNAPR uint64
+        // OracleURL is the HTTP endpoint from which the node fetches the current
+        // APRO/USD price before embedding it in each produced block header.
+        // Expected response: JSON object with a numeric "price_usd" field.
+        // If empty, oracle price embedding is skipped (OraclePrice = 0).
+        OracleURL string
+        // OracleMaxDeviation is the maximum allowed fractional deviation between
+        // a peer's embedded OraclePrice and our own local price (e.g. 0.05 = 5%).
+        // Incoming blocks whose price deviates beyond this are rejected.
+        // Zero (default) disables the deviation check.
+        OracleMaxDeviation float64
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -201,6 +214,61 @@ func (e *Engine) tick() error {
 // At 1 block/second this yields 157,680,000 APRO/year across all 21 validators.
 const defaultBlockRewardNAPR uint64 = 500_000_000
 
+// oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
+// OraclePrice = price_usd × oraclePriceScale  (i.e. 9 decimal places).
+const oraclePriceScale float64 = 1_000_000_000
+
+// oraclePriceResponse is the minimal subset of the oracle API JSON we need.
+type oraclePriceResponse struct {
+        PriceUSD float64 `json:"price_usd"`
+}
+
+// fetchOraclePrice calls cfg.OracleURL and returns the embedded fixed-point price.
+// Returns 0 if OracleURL is empty, the request fails, or the price is zero/negative.
+func (e *Engine) fetchOraclePrice() uint64 {
+        if e.cfg.OracleURL == "" {
+                return 0
+        }
+        client := &http.Client{Timeout: 3 * time.Second}
+        resp, err := client.Get(e.cfg.OracleURL)
+        if err != nil {
+                e.log.Warn("oracle price fetch failed", "url", e.cfg.OracleURL, "err", err)
+                return 0
+        }
+        defer resp.Body.Close()
+        var p oraclePriceResponse
+        if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+                e.log.Warn("oracle price decode failed", "err", err)
+                return 0
+        }
+        if p.PriceUSD <= 0 {
+                return 0
+        }
+        return uint64(math.Round(p.PriceUSD * oraclePriceScale))
+}
+
+// checkOraclePriceDeviation returns an error if the block's embedded oracle price
+// deviates from the local price by more than cfg.OracleMaxDeviation.
+// Skipped when OracleURL or OracleMaxDeviation are unset, or when either price is zero.
+func (e *Engine) checkOraclePriceDeviation(blockPrice uint64) error {
+        if e.cfg.OracleURL == "" || e.cfg.OracleMaxDeviation <= 0 || blockPrice == 0 {
+                return nil
+        }
+        localPrice := e.fetchOraclePrice()
+        if localPrice == 0 {
+                return nil // can't verify if we can't fetch our own price
+        }
+        deviation := math.Abs(float64(blockPrice)-float64(localPrice)) / float64(localPrice)
+        if deviation > e.cfg.OracleMaxDeviation {
+                return fmt.Errorf(
+                        "oracle price deviation too large: block=%d local=%d deviation=%.2f%% (max %.2f%%)",
+                        blockPrice, localPrice,
+                        deviation*100, e.cfg.OracleMaxDeviation*100,
+                )
+        }
+        return nil
+}
+
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
         txs := e.pool.SelectTxs(500) // up to 500 txs per block
@@ -219,6 +287,8 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 }
         }
 
+        oraclePrice := e.fetchOraclePrice()
+
         header := core.BlockHeader{
                 Height:       height,
                 PrevHash:     parent.Hash(),
@@ -226,9 +296,17 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 Timestamp:    time.Now().UTC().UnixNano(),
                 Round:        uint32(round),
                 ValidatorPub: e.cfg.MyKey.Public(),
+                OraclePrice:  oraclePrice,
         }
         if err := header.Sign(*e.cfg.MyKey); err != nil {
                 return nil, err
+        }
+        if oraclePrice > 0 {
+                e.log.Info("embedded oracle price in block",
+                        "height", height,
+                        "oracle_price_fixed", oraclePrice,
+                        "price_usd", float64(oraclePrice)/oraclePriceScale,
+                )
         }
         return &core.Block{Header: header, Txs: txs}, nil
 }
@@ -260,6 +338,12 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
         if block.Header.Height != tip.Header.Height+1 {
                 return fmt.Errorf("block height %d doesn't extend tip %d",
                         block.Header.Height, tip.Header.Height)
+        }
+
+        // Oracle price sanity check: reject blocks whose embedded price deviates
+        // too far from our local oracle reading (BFT oracle enforcement).
+        if err := e.checkOraclePriceDeviation(block.Header.OraclePrice); err != nil {
+                return fmt.Errorf("oracle price check failed: %w", err)
         }
 
         if err := e.chain.AddBlock(block); err != nil {

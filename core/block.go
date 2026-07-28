@@ -24,6 +24,11 @@ type BlockHeader struct {
 	Round uint32
 	// ValidatorPub is the public key of the validator that proposed this block.
 	ValidatorPub crypto.ValidatorPubKey
+	// OraclePrice is the APRO/USD price embedded by the proposing validator,
+	// expressed as USD-per-APRO × 10^9 (9 decimal fixed-point, uint64).
+	// Example: price $0.001 → OraclePrice = 1_000_000.
+	// Zero means the validator did not embed a price (pre-oracle blocks).
+	OraclePrice uint64
 	// Signature is the ED25519 signature of the block header hash by ValidatorPub.
 	Signature []byte
 }
@@ -35,6 +40,8 @@ type Block struct {
 }
 
 // Hash computes the SHA3-256 hash of the block header (the canonical block ID).
+// OraclePrice is included so any tampering with the embedded price invalidates
+// the block hash and thus the validator's signature.
 func (h *BlockHeader) Hash() crypto.Hash32 {
 	return crypto.HashBytes(
 		encodeUint64(h.Height),
@@ -43,6 +50,7 @@ func (h *BlockHeader) Hash() crypto.Hash32 {
 		encodeInt64(h.Timestamp),
 		encodeUint32(h.Round),
 		h.ValidatorPub,
+		encodeUint64(h.OraclePrice),
 	)
 }
 
