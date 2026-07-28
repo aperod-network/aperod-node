@@ -316,21 +316,42 @@ type BlockResponse struct {
         // expressed as USD-per-APRO × 10^9 (9-decimal fixed-point uint64).
         // Zero means no price was embedded (pre-oracle or non-oracle block).
         OraclePrice uint64 `json:"oracle_price"`
+        // FeesBurnedNAPRO is the sum of fees from all non-coinbase transactions
+        // in this block, expressed in nAPRO. All base fees are burned (100%).
+        FeesBurnedNAPRO uint64 `json:"fees_burned_napro"`
 }
 
 func blockToResponse(b *core.Block) BlockResponse {
         h := b.Hash()
+        baseFee := b.Header.BaseFee
+        if baseFee == 0 {
+                baseFee = core.InitialBaseFeePerByte
+        }
+        var burned uint64
+        for i := range b.Txs {
+                tx := &b.Txs[i]
+                if tx.IsCoinbase() || tx.IsStake() {
+                        continue
+                }
+                minFee := tx.MinFeeAt(baseFee)
+                if tx.Fee < minFee {
+                        burned += tx.Fee
+                } else {
+                        burned += minFee
+                }
+        }
         return BlockResponse{
-                Hash:         fmt.Sprintf("%x", h[:]),
-                Height:       b.Header.Height,
-                PrevHash:     fmt.Sprintf("%x", b.Header.PrevHash[:]),
-                MerkleRoot:   fmt.Sprintf("%x", b.Header.MerkleRoot[:]),
-                Timestamp:    time.Unix(0, b.Header.Timestamp).UTC().Format(time.RFC3339),
-                Round:        b.Header.Round,
-                ValidatorPub: b.Header.ValidatorPub.Hex(),
-                TxCount:      len(b.Txs),
-                Size:         b.Size(),
-                OraclePrice:  b.Header.OraclePrice,
+                Hash:            fmt.Sprintf("%x", h[:]),
+                Height:          b.Header.Height,
+                PrevHash:        fmt.Sprintf("%x", b.Header.PrevHash[:]),
+                MerkleRoot:      fmt.Sprintf("%x", b.Header.MerkleRoot[:]),
+                Timestamp:       time.Unix(0, b.Header.Timestamp).UTC().Format(time.RFC3339),
+                Round:           b.Header.Round,
+                ValidatorPub:    b.Header.ValidatorPub.Hex(),
+                TxCount:         len(b.Txs),
+                Size:            b.Size(),
+                OraclePrice:     b.Header.OraclePrice,
+                FeesBurnedNAPRO: burned,
         }
 }
 

@@ -297,8 +297,9 @@ func prunedBlockDetailResponse(sb *store.StoredBlock) map[string]interface{} {
                 "validator_pub": "",
                 "merkle_root":   "",
                 "size":          0,
-                "oracle_price":  0,
-                "pruned":        true,
+                "oracle_price":       0,
+                "fees_burned_napro": 0,
+                "pruned":            true,
         }
 }
 
