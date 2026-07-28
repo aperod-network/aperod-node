@@ -74,7 +74,16 @@ func (d *Discovery) round() {
 	if len(peers) == 0 {
 		h.log.Debug("discovery: no peers, re-dialling bootnodes")
 		for _, addr := range h.cfg.Bootnodes {
-			go h.dialPeer(addr)
+			go func(a string) {
+				resolved, err := resolveBootnode(a)
+				if err != nil {
+					h.log.Debug("discovery: bootnode dns resolve failed", "addr", a, "err", err)
+					return
+				}
+				for _, r := range resolved {
+					h.dialPeer(r)
+				}
+			}(addr)
 		}
 		return
 	}

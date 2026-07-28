@@ -10,6 +10,7 @@ import (
         "path/filepath"
         "regexp"
         "syscall"
+        "time"
 
         "github.com/aperod/aperod/api"
         "github.com/aperod/aperod/config"
@@ -345,7 +346,37 @@ func run() error {
                 "p2p", cfg.P2P.ListenAddr,
         )
 
-        // ── 10. Wait for signal ───────────────────────────────────────────────────
+        // ── 10. Background pruning worker (light mode only) ────────────────────────
+        // Strips RingCT/Bulletproof tx data from blocks older than KeepBlocks.
+        // Fires once per epoch (~100 blocks × block_time).
+        if cfg.Pruning.Mode == "light" {
+                epochDur := cfg.Consensus.BlockTime * 100
+                if epochDur <= 0 {
+                        epochDur = 5 * 60 * 1000000000 // 5 min default
+                }
+                go func() {
+                        t := time.NewTicker(epochDur)
+                        defer t.Stop()
+                        for {
+                                select {
+                                case <-stop:
+                                        return
+                                case <-t.C:
+                                        n, err := chain.PruneOldData(db, cfg.Pruning.KeepBlocks)
+                                        if err != nil {
+                                                log.Warn("pruning error", "err", err)
+                                        } else if n > 0 {
+                                                log.Info("pruned old block tx data",
+                                                        "blocks", n,
+                                                        "keep_blocks", cfg.Pruning.KeepBlocks)
+                                        }
+                                }
+                        }
+                }()
+                log.Info("light pruning enabled", "keep_blocks", cfg.Pruning.KeepBlocks)
+        }
+
+        // ── 11. Wait for signal ───────────────────────────────────────────────────
         sig := make(chan os.Signal, 1)
         signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
         <-sig

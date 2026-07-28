@@ -112,9 +112,19 @@ func (h *Host) Start() error {
         go h.acceptLoop()
         go h.maintainLoop()
 
-        // Dial bootnodes
+        // Dial bootnodes — resolve DNS hostnames before dialling so the
+        // canonical peer key in h.peers is always an IP:port string.
         for _, addr := range h.cfg.Bootnodes {
-                go h.dialPeer(addr)
+                go func(a string) {
+                        resolved, err := resolveBootnode(a)
+                        if err != nil {
+                                h.log.Warn("bootnode dns resolve failed", "addr", a, "err", err)
+                                return
+                        }
+                        for _, r := range resolved {
+                                h.dialPeer(r)
+                        }
+                }(addr)
         }
         return nil
 }

@@ -177,6 +177,31 @@ func (c *Chain) GetTransaction(hash crypto.Hash32) (Transaction, TxLocation, boo
         return loc.Block.Txs[loc.TxIndex], loc, true
 }
 
+// BlockPruner is the interface used by PruneOldData to strip transaction data
+// from blocks older than a given height.  *store.DB satisfies this interface.
+type BlockPruner interface {
+	PruneBlocksOlderThan(pruneBelow uint64) (int, error)
+}
+
+// PruneOldData removes full transaction data (RingCT signatures, Bulletproofs)
+// from blocks older than keepBlocks heights relative to the current tip.  The
+// block headers and height index remain intact so chain integrity is not
+// affected.  UTXO set and key-image records are never touched.
+//
+// Safe to call from a background goroutine; it reads the tip under its own
+// lock and then delegates the disk operation to pruner.
+//
+// Returns the number of blocks whose transaction data was erased, or 0 if
+// pruning is not yet due (tip too low).
+func (c *Chain) PruneOldData(pruner BlockPruner, keepBlocks uint64) (int, error) {
+	tip := c.Tip()
+	if tip == nil || tip.Header.Height <= keepBlocks {
+		return 0, nil
+	}
+	pruneBelow := tip.Header.Height - keepBlocks
+	return pruner.PruneBlocksOlderThan(pruneBelow)
+}
+
 // Reorg replaces the canonical chain from forkPoint+1 onwards with newBlocks.
 // newBlocks must be contiguous, validated, and have higher cumulative weight.
 func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {

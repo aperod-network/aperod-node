@@ -22,3 +22,11 @@ api:
 
 genesis:
   file: "config/genesis-testnet.yaml"
+
+# Pruning controls on-disk block history retention.
+# mode: "archive" — keep all block data forever (default, recommended for explorers/RPC nodes)
+# mode: "light"   — strip RingCT/Bulletproof tx data from blocks older than keep_blocks
+#                   (reduces disk usage by ~70-80%; headers + UTXO set are always kept)
+pruning:
+  mode: "archive"
+  keep_blocks: 100000   # ~3.5 days at 3 s/block; ignored in archive mode
