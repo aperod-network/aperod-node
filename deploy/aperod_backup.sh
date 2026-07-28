@@ -35,6 +35,33 @@ TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
 TEXTFILE="${TEXTFILE_DIR}/aperod_backup.prom"
 START_TS=$(date +%s)
 
+# ── Run-history log (parsed by Admin Panel /api/admin/backup/history) ─────────
+HISTORY_LOG="/var/log/aperod_backup.log"
+_BACKUP_FINAL_STATUS="fail"
+_BACKUP_FILE_BYTES=0
+_BACKUP_FILE_NAME=""
+
+# Write one JSON line to the history log on every exit (success or failure).
+_write_history_log() {
+  local end_ts
+  end_ts=$(date +%s)
+  local duration=$(( end_ts - START_TS ))
+  local ts_iso
+  ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  # Escape double-quotes in filename (should never happen, but be safe)
+  local safe_file="${_BACKUP_FILE_NAME//\"/\\\"}"
+  local entry="{\"ts\":\"${ts_iso}\",\"status\":\"${_BACKUP_FINAL_STATUS}\",\"duration\":${duration},\"sizeBytes\":${_BACKUP_FILE_BYTES},\"file\":\"${safe_file}\"}"
+  # Append to log; create file + dir if they don't exist yet
+  mkdir -p "$(dirname "$HISTORY_LOG")" 2>/dev/null || true
+  echo "$entry" >> "$HISTORY_LOG" 2>/dev/null || true
+  # Keep only the last 100 lines so the log never grows unbounded
+  if [ -f "$HISTORY_LOG" ]; then
+    local tmp
+    tmp=$(tail -n 100 "$HISTORY_LOG") && echo "$tmp" > "$HISTORY_LOG" || true
+  fi
+}
+trap _write_history_log EXIT
+
 # ── Helper: write prometheus textfile ─────────────────────────────────────────
 write_metrics() {
   local success=$1
@@ -141,6 +168,13 @@ rclone delete --min-age "$PRUNE_AGE" "$RCLONE_REMOTE" 2>/dev/null || true
 echo "=== [4/4] Очистка временных файлов ==="
 rm -rf "$BACKUP_DIR"
 
+# ── Capture final file size (before cleanup removed the local copy) ───────────
+# The file was already uploaded; get its size from the remote listing (quick).
+_BACKUP_FILE_NAME="${BACKUP_NAME}.tar.gpg"
+_BACKUP_FILE_BYTES=$(rclone size "${RCLONE_REMOTE}/${BACKUP_NAME}.tar.gpg" --s3-no-check-bucket --json 2>/dev/null \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('bytes',0))" 2>/dev/null || echo 0)
+
 # ── Write success metrics ──────────────────────────────────────────────────────
+_BACKUP_FINAL_STATUS="ok"
 write_metrics 1
 echo "=== БЭКАП ЗАВЕРШЁН: ${BACKUP_NAME}.tar.gpg → ${RCLONE_REMOTE} ==="
