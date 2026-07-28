@@ -24,6 +24,7 @@ import (
 
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/store"
 )
 
 // registerRESTRoutes adds all REST routes to the server mux.
@@ -131,44 +132,192 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
         const txsSuffix = "/transactions"
         if strings.HasSuffix(tail, txsSuffix) {
                 id := strings.TrimSuffix(tail, txsSuffix)
-                b := s.resolveBlock(w, id)
-                if b == nil {
+                // Try in-memory chain first (O(1), covers the recent window).
+                if b := s.lookupBlockMem(id); b != nil {
+                        s.writeBlockTransactions(w, b)
                         return
                 }
-                s.writeBlockTransactions(w, b)
+                // Validate ID syntax: reject before hitting disk to give 400 not 404.
+                if !isValidBlockID(id) {
+                        writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
+                        return
+                }
+                // Fall back to the on-disk store for old or pruned blocks.
+                if s.blockStore != nil {
+                        fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(id)
+                        if fullBlock != nil {
+                                s.writeBlockTransactions(w, fullBlock)
+                                return
+                        }
+                        if prunedBlock != nil {
+                                s.writePrunedBlockTransactions(w, prunedBlock)
+                                return
+                        }
+                }
+                writeJSONError(w, http.StatusNotFound, "block not found")
                 return
         }
 
-        b := s.resolveBlock(w, tail)
-        if b == nil {
+        // Block detail endpoint
+        if b := s.lookupBlockMem(tail); b != nil {
+                writeJSON(w, http.StatusOK, blockToResponse(b))
                 return
         }
-        writeJSON(w, http.StatusOK, blockToResponse(b))
+        // Validate ID syntax before disk fallback.
+        if !isValidBlockID(tail) {
+                writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
+                return
+        }
+        // Fall back to disk for old / pruned blocks.
+        if s.blockStore != nil {
+                fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(tail)
+                if fullBlock != nil {
+                        writeJSON(w, http.StatusOK, blockToResponse(fullBlock))
+                        return
+                }
+                if prunedBlock != nil {
+                        writeJSON(w, http.StatusOK, prunedBlockDetailResponse(prunedBlock))
+                        return
+                }
+        }
+        writeJSONError(w, http.StatusNotFound, "block not found")
 }
 
-// resolveBlock looks up a block by height or hash; writes error and returns nil on failure.
-func (s *Server) resolveBlock(w http.ResponseWriter, id string) *core.Block {
+// isValidBlockID returns true when id is either a decimal height or a
+// 64-character lowercase hex block hash (32 bytes).
+func isValidBlockID(id string) bool {
+        if _, err := strconv.ParseUint(id, 10, 64); err == nil {
+                return true
+        }
+        raw, err := hex.DecodeString(id)
+        return err == nil && len(raw) == 32
+}
+
+// lookupBlockMem returns the block from the in-memory sliding window, or nil.
+func (s *Server) lookupBlockMem(id string) *core.Block {
         if height, err := strconv.ParseUint(id, 10, 64); err == nil {
-                b := s.chain.GetByHeight(height)
-                if b == nil {
-                        writeJSONError(w, http.StatusNotFound, fmt.Sprintf("block not found at height %d", height))
-                        return nil
-                }
-                return b
+                return s.chain.GetByHeight(height)
         }
         raw, err := hex.DecodeString(id)
         if err != nil || len(raw) != 32 {
-                writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
                 return nil
         }
         var hash crypto.Hash32
         copy(hash[:], raw)
-        b := s.chain.GetByHash(hash)
-        if b == nil {
-                writeJSONError(w, http.StatusNotFound, "block not found")
-                return nil
+        return s.chain.GetByHash(hash)
+}
+
+// lookupBlockFromDisk reads a block from LevelDB by height or hash string.
+// It handles both storage formats:
+//
+//   - core.Block JSON: written by the node via json.Marshal(b) / PutRawBlock.
+//     Identified by the top-level "Header" key (Go's default field name).
+//
+//   - StoredBlock JSON: written by the pruner via PutBlock after TxData is
+//     stripped.  Identified by the "tx_count" key (json struct tag).
+//
+// Returns (fullBlock, nil, nil) for the native format, (nil, prunedBlock, nil)
+// for the pruned format, or (nil, nil, nil) if not found / unrecognised.
+func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock, error) {
+        var rawBytes []byte
+        var ioErr error
+
+        if height, err := strconv.ParseUint(id, 10, 64); err == nil {
+                rawBytes, ioErr = s.blockStore.GetRawBlockByHeight(height)
+        } else {
+                rawSlice, hexErr := hex.DecodeString(id)
+                if hexErr != nil || len(rawSlice) != 32 {
+                        return nil, nil, fmt.Errorf("invalid id")
+                }
+                var h crypto.Hash32
+                copy(h[:], rawSlice)
+                rawBytes, ioErr = s.blockStore.GetRawBlock(h)
         }
-        return b
+
+        if ioErr != nil || len(rawBytes) == 0 {
+                return nil, nil, ioErr
+        }
+
+        // Probe the top-level JSON to determine which format was stored.
+        // core.Block is marshaled with Go default field names ("Header", "Txs").
+        // StoredBlock uses json struct tags ("tx_count", "tx_data", etc.).
+        var probe struct {
+                Header  *json.RawMessage `json:"Header"`   // present in core.Block JSON
+                TxCount *int             `json:"tx_count"` // present in StoredBlock JSON
+        }
+        if err := json.Unmarshal(rawBytes, &probe); err != nil {
+                return nil, nil, nil // unrecognised format — treat as not found
+        }
+
+        if probe.Header != nil {
+                // Native core.Block format.
+                var b core.Block
+                if err := json.Unmarshal(rawBytes, &b); err != nil {
+                        return nil, nil, nil
+                }
+                return &b, nil, nil
+        }
+
+        if probe.TxCount != nil {
+                // Pruned StoredBlock format written by prune.go.
+                var sb store.StoredBlock
+                if err := json.Unmarshal(rawBytes, &sb); err != nil {
+                        return nil, nil, nil
+                }
+                return nil, &sb, nil
+        }
+
+        return nil, nil, nil
+}
+
+// writePrunedBlockTransactions returns the transactions endpoint response for a
+// block whose TxData was stripped by the pruner.  pruned:true signals to the
+// explorer that it should show an "archived" notice rather than "no txs".
+func (s *Server) writePrunedBlockTransactions(w http.ResponseWriter, sb *store.StoredBlock) {
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "block_hash":   fmt.Sprintf("%x", sb.Hash[:]),
+                "block_height": sb.Height,
+                "tx_count":     sb.TxCount,
+                "transactions": []interface{}{},
+                "pruned":       true,
+        })
+}
+
+// prunedBlockDetailResponse builds a block-detail response from a pruned
+// StoredBlock.  Fields not preserved by the pruner (validator_pub, merkle_root,
+// oracle_price) are empty/zero; pruned:true is always set.
+func prunedBlockDetailResponse(sb *store.StoredBlock) map[string]interface{} {
+        return map[string]interface{}{
+                "hash":          fmt.Sprintf("%x", sb.Hash[:]),
+                "height":        sb.Height,
+                "prev_hash":     fmt.Sprintf("%x", sb.PrevHash[:]),
+                "timestamp":     time.Unix(0, sb.Timestamp).UTC().Format(time.RFC3339),
+                "round":         sb.Round,
+                "tx_count":      sb.TxCount,
+                "validator_pub": "",
+                "merkle_root":   "",
+                "size":          0,
+                "oracle_price":  0,
+                "pruned":        true,
+        }
+}
+
+// resolveBlock looks up a block by height or hash; writes error and returns nil on failure.
+// Kept for RPC handlers that don't need store fallback.
+func (s *Server) resolveBlock(w http.ResponseWriter, id string) *core.Block {
+        if b := s.lookupBlockMem(id); b != nil {
+                return b
+        }
+        // Validate id syntax before returning 404 vs 400.
+        if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+                raw, hexErr := hex.DecodeString(id)
+                if hexErr != nil || len(raw) != 32 {
+                        writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
+                        return nil
+                }
+        }
+        writeJSONError(w, http.StatusNotFound, "block not found")
+        return nil
 }
 
 // BlockTxItem is one transaction summary inside a block.

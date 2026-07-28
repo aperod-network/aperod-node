@@ -13,6 +13,7 @@ import (
 
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/store"
 )
 
 // Server is the JSON-RPC 2.0 HTTP server.
@@ -23,6 +24,7 @@ type Server struct {
         utxos       *core.UTXOSet
         registry    *core.ValidatorRegistry  // live PoS validator registry (optional)
         myKey       *crypto.ValidatorPrivKey // node's own validator key for admin stake ops (optional)
+        blockStore  *store.DB               // optional: LevelDB store for pruned-block fallback
         log         *slog.Logger
         mux         *http.ServeMux
         hub         *Hub
@@ -69,6 +71,11 @@ func (s *Server) SetAPIKey(key string) { s.apiKey = key }
 // SetAllowedOrigins configures the CORS origin whitelist.
 // Empty slice allows all origins ("*").
 func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
+
+// SetStore wires the LevelDB block store so the API can fall back to disk
+// when looking up old or pruned blocks that have been evicted from memory.
+// Optional — endpoints return 404 for old blocks when no store is wired.
+func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.

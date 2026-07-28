@@ -388,22 +388,22 @@ func TestRPC_EstimateFee_Default(t *testing.T) {
         if result["fee"] == nil {
                 t.Error("expected fee in response")
         }
-        if result["unit"] != "nAPR" {
-                t.Errorf("unit = %v, want nAPR", result["unit"])
+        if result["unit"] != "nAPRO" {
+                t.Errorf("unit = %v, want nAPRO", result["unit"])
         }
 }
 
 func TestRPC_EstimateFee_WithSize(t *testing.T) {
         srv, _ := newTestServer(t)
-        // size_bytes is ignored — flat fee is always returned
+	// size_bytes drives the estimate: fee = size_bytes x InitialBaseFeePerByte
         resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1000})
         if resp["error"] != nil {
                 t.Fatalf("apr_estimateFee error: %v", resp["error"])
         }
         result := resp["result"].(map[string]interface{})
         fee := result["fee"].(float64)
-        if fee != float64(core.FlatFee) {
-                t.Errorf("fee = %v, want %d (flat fee)", fee, core.FlatFee)
+	if fee != float64(1000*core.InitialBaseFeePerByte) {
+		t.Errorf("fee = %v, want %v (size_based_eip1559)", fee, float64(1000*core.InitialBaseFeePerByte))
         }
 }
 
@@ -412,8 +412,8 @@ func TestRPC_EstimateFee_SmallTx_MinFee(t *testing.T) {
         resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1})
         result := resp["result"].(map[string]interface{})
         fee := result["fee"].(float64)
-        if fee < float64(core.FlatFee) {
-                t.Errorf("fee = %v, should be >= %d (flat fee)", fee, core.FlatFee)
+	if fee < float64(core.MinBaseFeePerByte) {
+		t.Errorf("fee = %v, should be >= %d (MinBaseFeePerByte)", fee, core.MinBaseFeePerByte)
         }
 }
 
