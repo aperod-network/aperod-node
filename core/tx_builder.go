@@ -14,27 +14,35 @@ import (
 
 // TxBuilder constructs RingCT transactions.
 type TxBuilder struct {
-        spendPriv  crypto.Scalar32
-        viewPriv   crypto.Scalar32
-        spendPub   crypto.Point32
-        ownedUTXOs []OwnedUTXO
+        spendPriv    crypto.Scalar32
+        viewPriv     crypto.Scalar32
+        spendPub     crypto.Point32
+        ownedUTXOs   []OwnedUTXO
+        feePerByte   uint64 // base-fee + optional tip per byte in nAPRO
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
 // ownedUTXOs must come from WalletScanner.ScanChain — amounts must be decrypted.
-// The fee is always FlatFee (0.5 APRO = 50_000_000 nAPRO); the feePerByte parameter is kept for
-// backwards-compatibility but ignored.
+//
+// feePerByte is the total fee per byte the sender is willing to pay (nAPRO/byte).
+// It should be at least the current network BaseFee (from the latest block header)
+// plus any priority tip the sender wants to add.  If zero, InitialBaseFeePerByte is used.
+// Fee = EstimatedTxSize × feePerByte; 100% of BaseFee portion is burned, tip goes to validator.
 func NewTxBuilder(
         spendPriv, viewPriv crypto.Scalar32,
         spendPub crypto.Point32,
         ownedUTXOs []OwnedUTXO,
-        _ uint64, // feePerByte — deprecated, flat fee is used instead
+        feePerByte uint64,
 ) *TxBuilder {
+        if feePerByte == 0 {
+                feePerByte = InitialBaseFeePerByte
+        }
         return &TxBuilder{
                 spendPriv:  spendPriv,
                 viewPriv:   viewPriv,
                 spendPub:   spendPub,
                 ownedUTXOs: ownedUTXOs,
+                feePerByte: feePerByte,
         }
 }
 
@@ -83,14 +91,21 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         })
 
         // ── UTXO selection: iterate until fee estimate stabilises ────────────────
+        // Fee = estimated_tx_size_bytes × feePerByte.
+        // We iterate: pick UTXOs → estimate size → recalculate fee → check again.
+        // In practice this converges in ≤2 iterations because adding one UTXO
+        // changes fee by at most one input's weight (~576 bytes × feePerByte).
         const maxInputs = 8
         var (
                 selected     []OwnedUTXO
                 totalIn      uint64
                 estimatedFee uint64
         )
-        // Flat fee is fixed regardless of transaction size.
-        estimatedFee = FlatFee
+        // Rough initial fee: assume 1 input, 2 outputs (pay + change).
+        // txBytesPerInput already includes the MLSAG signature bytes.
+        // txBytesPerOutput already includes the range proof bytes.
+        initialSize := txOverheadBytes + 1*txBytesPerInput + 2*txBytesPerOutput
+        estimatedFee = uint64(initialSize) * b.feePerByte
         needed := amount + estimatedFee
 
         for _, u := range available {
@@ -103,6 +118,12 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                         break
                 }
         }
+        // Recalculate fee based on actual number of selected inputs.
+        nOut := 2 // pay + change; refined below
+        actualSize := txOverheadBytes + len(selected)*txBytesPerInput + nOut*txBytesPerOutput
+        estimatedFee = uint64(actualSize) * b.feePerByte
+        needed = amount + estimatedFee
+
         if totalIn < needed {
                 return nil, fmt.Errorf("insufficient funds: have %d, need %d (amount %d + fee %d)",
                         totalIn, needed, amount, estimatedFee)

@@ -29,6 +29,13 @@ type BlockHeader struct {
 	// Example: price $0.001 → OraclePrice = 1_000_000.
 	// Zero means the validator did not embed a price (pre-oracle blocks).
 	OraclePrice uint64
+	// BaseFee is the protocol-level base fee per byte in nAPRO for this block,
+	// computed from the previous block's fill ratio (EIP-1559 style).
+	// Every transaction must satisfy tx.Fee >= tx.Size() × BaseFee.
+	// 100% of BaseFee × tx.Size() is burned; the excess (priority tip) goes to the validator.
+	// Encoded as nAPRO per byte (e.g. 200 = 200 nAPRO/byte).
+	// Zero is treated as InitialBaseFeePerByte (genesis / pre-dynamic-fee blocks).
+	BaseFee uint64
 	// Signature is the ED25519 signature of the block header hash by ValidatorPub.
 	Signature []byte
 }
@@ -51,6 +58,7 @@ func (h *BlockHeader) Hash() crypto.Hash32 {
 		encodeUint32(h.Round),
 		h.ValidatorPub,
 		encodeUint64(h.OraclePrice),
+		encodeUint64(h.BaseFee),
 	)
 }
 

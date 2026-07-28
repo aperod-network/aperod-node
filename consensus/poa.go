@@ -71,6 +71,12 @@ type Engine struct {
         finalized map[uint64]bool
         // slashing detector for double-sign evidence
         slashing  *slashingDetector
+        // baseFee is the current EIP-1559 base fee per byte (nAPRO/byte).
+        // Updated after every accepted block; embedded in every produced block header.
+        baseFee   uint64
+        // accumulatedTips holds priority tips collected across blocks until the
+        // next coinbase is produced by this validator, when they are paid out.
+        accumulatedTips uint64
 
         // Channels for external events
         newBlockCh chan *core.Block  // incoming blocks from P2P
@@ -88,6 +94,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 votes:      make(map[crypto.Hash32]map[string][]byte),
                 finalized:  make(map[uint64]bool),
                 slashing:   newSlashingDetector(),
+                baseFee:    core.InitialBaseFeePerByte,
                 newBlockCh: make(chan *core.Block, 64),
                 newVoteCh:  make(chan FinalizeMsg, 256),
                 producedCh: make(chan *core.Block, 64),
@@ -214,6 +221,57 @@ func (e *Engine) tick() error {
 // At 1 block/second this yields 157,680,000 APRO/year across all 21 validators.
 const defaultBlockRewardNAPR uint64 = 500_000_000
 
+// EIP-1559–style dynamic base fee constants.
+const (
+        // targetBlockSizeBytes is the ideal block size (50% of practical max).
+        // With up to 500 txs at ~2 000 bytes each the max is ~1 MB; target = 500 KB.
+        targetBlockSizeBytes = 500_000
+
+        // baseFeeMaxChangePct is the maximum ±change per block (12.5%, same as EIP-1559).
+        // At exactly 2× target the base fee rises by 12.5%; at 0 bytes it falls by 12.5%.
+        baseFeeMaxChangePct = 0.125
+)
+
+// nextBaseFee computes the base fee for the next block using EIP-1559 adjustment.
+// blockSizeBytes is the total byte size of all transactions in the current block.
+// The fee rises when blockSizeBytes > targetBlockSizeBytes and falls otherwise,
+// capped at ±12.5% per block, and never below core.MinBaseFeePerByte.
+func nextBaseFee(current uint64, blockSizeBytes int) uint64 {
+        if current == 0 {
+                current = core.InitialBaseFeePerByte
+        }
+        // delta = current × (blockSize - target) / target × maxChangePct
+        // Simplified: delta = current × fillRatio × maxChangePct
+        // where fillRatio = (blockSize - target) / target  (can be negative)
+        diff := float64(blockSizeBytes) - float64(targetBlockSizeBytes)
+        delta := float64(current) * (diff / float64(targetBlockSizeBytes)) * baseFeeMaxChangePct
+        next := int64(current) + int64(math.Round(delta))
+        if next < int64(core.MinBaseFeePerByte) {
+                next = int64(core.MinBaseFeePerByte)
+        }
+        return uint64(next)
+}
+
+// blockFeeStats computes burned nAPRO and priority-tip nAPRO for a block's transactions.
+// burned   = Σ tx.Size() × baseFeePerByte  (100% destroyed)
+// tipTotal = Σ tx.Fee - burned              (goes to validator)
+func blockFeeStats(txs []core.Transaction, baseFeePerByte uint64) (burned, tipTotal uint64) {
+        for _, tx := range txs {
+                if tx.IsCoinbase() || tx.IsStake() {
+                        continue
+                }
+                minFee := tx.MinFeeAt(baseFeePerByte)
+                if tx.Fee >= minFee {
+                        burned += minFee
+                        tipTotal += tx.Fee - minFee
+                } else {
+                        // Malformed tx slipped through; treat entire fee as burned.
+                        burned += tx.Fee
+                }
+        }
+        return
+}
+
 // oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
 // OraclePrice = price_usd × oraclePriceScale  (i.e. 9 decimal places).
 const oraclePriceScale float64 = 1_000_000_000
@@ -292,13 +350,26 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 )
         }
 
+        // Compute burned fees and priority tips for selected txs, then include
+        // tips in the coinbase reward (validator earns block reward + tips).
+        e.mu.Lock()
+        currentBaseFee := e.baseFee
+        tips := e.accumulatedTips
+        e.accumulatedTips = 0
+        e.mu.Unlock()
+
+        _, tipThisBlock := blockFeeStats(txs, currentBaseFee)
+        tips += tipThisBlock
+
         // Prepend coinbase block reward transaction when reward_address is configured.
         if e.cfg.RewardAddress != "" {
                 rewardNAPR := e.cfg.BlockRewardNAPR
                 if rewardNAPR == 0 {
                         rewardNAPR = defaultBlockRewardNAPR
                 }
-                mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), rewardNAPR, height)
+                // Validator earns block reward + priority tips from all txs in this block.
+                totalReward := rewardNAPR + tips
+                mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
                 if err != nil {
                         e.log.Warn("failed to build coinbase reward tx", "err", err)
                 } else {
@@ -316,6 +387,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 Round:        uint32(round),
                 ValidatorPub: e.cfg.MyKey.Public(),
                 OraclePrice:  oraclePrice,
+                BaseFee:      currentBaseFee,
         }
         if err := header.Sign(*e.cfg.MyKey); err != nil {
                 return nil, err
@@ -367,6 +439,36 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add block: %w", err)
+        }
+
+        // ── EIP-1559 base fee update ─────────────────────────────────────────────
+        blockBaseFee := block.Header.BaseFee
+        if blockBaseFee == 0 {
+                blockBaseFee = core.InitialBaseFeePerByte
+        }
+        burnedNAPR, tipNAPR := blockFeeStats(block.Txs, blockBaseFee)
+        newFee := nextBaseFee(blockBaseFee, block.Size())
+
+        e.mu.Lock()
+        e.baseFee = newFee
+        // Accumulate tips so our next produced block's coinbase can pay them out.
+        e.accumulatedTips += tipNAPR
+        e.mu.Unlock()
+
+        // Propagate new base fee to the mempool so incoming txs are validated at
+        // the correct rate immediately.
+        e.pool.SetBaseFee(newFee)
+
+        if burnedNAPR > 0 || tipNAPR > 0 {
+                e.log.Info("block fees",
+                        "height", block.Header.Height,
+                        "base_fee_per_byte", blockBaseFee,
+                        "burned_napro", burnedNAPR,
+                        "burned_apro", float64(burnedNAPR)/1e8,
+                        "tip_napro", tipNAPR,
+                        "tip_apro", float64(tipNAPR)/1e8,
+                        "next_base_fee", newFee,
+                )
         }
 
         // Process any stake transactions included in the block

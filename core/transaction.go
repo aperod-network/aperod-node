@@ -167,12 +167,22 @@ func (tx *Transaction) Size() int {
         return size
 }
 
-// FlatFee is the fixed transaction fee: 0.5 APRO = 50_000_000 nAPRO (1 APRO = 100_000_000 nAPRO).
-const FlatFee uint64 = 50_000_000
+// InitialBaseFeePerByte is the starting base fee per byte at genesis: 200 nAPRO/byte.
+// A typical P2P transfer (~2 000 bytes) costs 400 000 nAPRO = 0.004 APRO at genesis.
+// The base fee adjusts dynamically each block based on block fill ratio (EIP-1559).
+const InitialBaseFeePerByte uint64 = 200
 
-// MinFee returns the minimum fee for any transaction (flat rate, size-independent).
-func (tx *Transaction) MinFee() uint64 {
-        return FlatFee
+// MinBaseFeePerByte is the floor below which the base fee never drops: 50 nAPRO/byte.
+// A 2 000-byte tx therefore costs at least 100 000 nAPRO = 0.001 APRO.
+const MinBaseFeePerByte uint64 = 50
+
+// MinFeeAt returns the minimum acceptable fee for this transaction at the given
+// base fee rate.  Any excess paid above this minimum is a priority tip to the validator.
+func (tx *Transaction) MinFeeAt(baseFeePerByte uint64) uint64 {
+        if baseFeePerByte == 0 {
+                baseFeePerByte = InitialBaseFeePerByte
+        }
+        return uint64(tx.Size()) * baseFeePerByte
 }
 
 // KeyImages returns all key images from inputs (for double-spend checking).

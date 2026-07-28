@@ -517,12 +517,21 @@ func (s *Server) aprEstimateFee(params json.RawMessage) (interface{}, error) {
         // params may be null — tolerate unmarshal failure
         _ = json.Unmarshal(params, &args)
 
-        // Flat fee: 0.5 APRO = 50_000_000 nAPRO, size-independent.
-        const flatFee = core.FlatFee
+        // Dynamic EIP-1559 fee: baseFeePerByte × tx_size_bytes.
+        // Return the current InitialBaseFeePerByte as a reference rate.
+        // Callers should multiply by their actual tx size; use /estimate_fee RPC for precision.
+        sizeBytes := args.SizeBytes
+        if sizeBytes == 0 {
+                sizeBytes = 2000 // default: typical P2P transfer ~2 KB
+        }
+        estimatedFee := uint64(sizeBytes) * core.InitialBaseFeePerByte
         return map[string]interface{}{
-                "fee":  flatFee,
-                "unit": "nAPRO",
-                "flat": true,
+                "fee":                estimatedFee,
+                "base_fee_per_byte":  core.InitialBaseFeePerByte,
+                "size_bytes":         sizeBytes,
+                "unit":               "nAPRO",
+                "flat":               false,
+                "model":              "size_based_eip1559",
         }, nil
 }
 

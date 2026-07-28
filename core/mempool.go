@@ -11,19 +11,19 @@ import (
 
 // MempoolConfig holds tuning parameters for the transaction pool.
 type MempoolConfig struct {
-        MaxSize   int           // maximum number of transactions
-        MaxTxSize int           // maximum size of a single transaction in bytes
-        TTL       time.Duration // evict transactions older than this
-        MinFee    uint64        // minimum flat fee in nAPRO (0.5 APRO = 50_000_000 nAPRO)
+        MaxSize          int           // maximum number of transactions
+        MaxTxSize        int           // maximum size of a single transaction in bytes
+        TTL              time.Duration // evict transactions older than this
+        BaseFeePerByte   uint64        // current network base fee in nAPRO/byte (updated each block)
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
 func DefaultMempoolConfig() MempoolConfig {
         return MempoolConfig{
-                MaxSize:   5_000,
-                MaxTxSize: 100_000,
-                TTL:       2 * time.Hour,
-                MinFee:    50_000_000, // 0.5 APRO
+                MaxSize:        5_000,
+                MaxTxSize:      100_000,
+                TTL:            2 * time.Hour,
+                BaseFeePerByte: InitialBaseFeePerByte, // 200 nAPRO/byte
         }
 }
 
@@ -53,6 +53,18 @@ func NewMempool(cfg MempoolConfig) *Mempool {
         }
 }
 
+// SetBaseFee updates the minimum fee rate used to validate incoming transactions.
+// Called by the consensus engine after each accepted block so new txs must meet
+// the network's current EIP-1559 base fee.
+func (m *Mempool) SetBaseFee(baseFeePerByte uint64) {
+        if baseFeePerByte < MinBaseFeePerByte {
+                baseFeePerByte = MinBaseFeePerByte
+        }
+        m.mu.Lock()
+        m.cfg.BaseFeePerByte = baseFeePerByte
+        m.mu.Unlock()
+}
+
 // Add attempts to add a transaction to the mempool.
 // Returns an error if the tx is invalid, duplicate, too large, or a double-spend.
 func (m *Mempool) Add(tx Transaction) error {
@@ -68,8 +80,15 @@ func (m *Mempool) Add(tx Transaction) error {
         // Coinbase and stake transactions are fee-exempt:
         // coinbase = block reward / admin mint (Fee=0 by design)
         // stake    = validator deposit/withdrawal (protocol-level, not ring-sig tx)
-        if !tx.IsCoinbase() && !tx.IsStake() && tx.Fee < m.cfg.MinFee {
-                return fmt.Errorf("mempool: fee too low: %d < %d nAPRO (minimum flat fee)", tx.Fee, m.cfg.MinFee)
+        if !tx.IsCoinbase() && !tx.IsStake() {
+                m.mu.RLock()
+                baseFee := m.cfg.BaseFeePerByte
+                m.mu.RUnlock()
+                minFee := tx.MinFeeAt(baseFee)
+                if tx.Fee < minFee {
+                        return fmt.Errorf("mempool: fee too low: %d nAPRO < %d nAPRO minimum (%d bytes × %d nAPRO/byte)",
+                                tx.Fee, minFee, tx.Size(), baseFee)
+                }
         }
 
         hash := tx.Hash()
@@ -139,7 +158,9 @@ func (m *Mempool) Get(hash crypto.Hash32) (Transaction, bool) {
         return e.Tx, true
 }
 
-// SelectTxs returns up to n transactions ordered by fee rate (highest first).
+// SelectTxs returns up to n transactions ordered by fee rate nAPRO/byte (highest first).
+// Sorting by fee/size selects transactions that pay the best rate, maximising
+// validator tip income and ensuring high-priority txs are included first.
 // Used by the block proposer to fill a block.
 func (m *Mempool) SelectTxs(n int) []Transaction {
         m.mu.RLock()
@@ -150,7 +171,17 @@ func (m *Mempool) SelectTxs(n int) []Transaction {
                 entries = append(entries, e)
         }
         sort.Slice(entries, func(i, j int) bool {
-                return entries[i].Tx.Fee > entries[j].Tx.Fee
+                // fee rate = fee / size; avoid division by zero
+                si, sj := entries[i].Size, entries[j].Size
+                if si == 0 {
+                        si = 1
+                }
+                if sj == 0 {
+                        sj = 1
+                }
+                ri := entries[i].Tx.Fee / uint64(si)
+                rj := entries[j].Tx.Fee / uint64(sj)
+                return ri > rj
         })
 
         if n > len(entries) {
