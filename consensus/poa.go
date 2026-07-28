@@ -273,6 +273,25 @@ func (e *Engine) checkOraclePriceDeviation(blockPrice uint64) error {
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
         txs := e.pool.SelectTxs(500) // up to 500 txs per block
 
+        // EIP-1559–style 100% base-fee burn: fees are NOT forwarded to the
+        // validator — they are destroyed upon block finalization by never
+        // appearing in any output.  Validators earn only the explicit coinbase
+        // mint reward below.  Log the burned amount for observability.
+        var burnedNAPR uint64
+        for _, tx := range txs {
+                if !tx.IsCoinbase() && !tx.IsStake() {
+                        burnedNAPR += tx.Fee
+                }
+        }
+        if burnedNAPR > 0 {
+                e.log.Info("base fee burned (100%)",
+                        "height", height,
+                        "burned_napro", burnedNAPR,
+                        "burned_apro", float64(burnedNAPR)/1e8,
+                        "tx_count", len(txs),
+                )
+        }
+
         // Prepend coinbase block reward transaction when reward_address is configured.
         if e.cfg.RewardAddress != "" {
                 rewardNAPR := e.cfg.BlockRewardNAPR
