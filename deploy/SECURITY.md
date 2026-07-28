@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/dep
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Report security issues privately via Telegram: **[@aperod_bot](https://t.me/aperod_bot)** — send `/security` followed by a description.
+Report security issues privately via Telegram: **[@sup_apro_bot](https://t.me/sup_apro_bot)** — describe the vulnerability in plain text.
 
 Include:
 - A description of the vulnerability and its impact
@@ -27,6 +27,20 @@ Include:
 - Affected component (`crypto/`, `consensus/`, `p2p/`, etc.)
 
 You will receive a response within **48 hours**. Critical issues are patched within **7 days**.
+
+---
+
+## Bug Bounty
+
+| Severity | Reward |
+|----------|--------|
+| **Critical** (consensus break, key extraction, double-spend, network halt) | **$1,000,000** |
+| **High** (remote code execution, eclipse attack, auth bypass) | up to **$100,000** |
+| **Medium** (data integrity, privacy leaks, DoS) | up to **$100,000** |
+| **Low / Informational** | up to **$100,000** |
+
+Rewards are paid in APRO at the 7-day average market price on date of disclosure acceptance.  
+Duplicate reports and reports for issues already known to the team are not eligible.
 
 ---
 

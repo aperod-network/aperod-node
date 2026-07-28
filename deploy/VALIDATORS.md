@@ -66,8 +66,8 @@ A node ranked 22nd or below is **standby** — it does not produce blocks or ear
 
 | Parameter | Value |
 |-----------|-------|
-| Epoch length | **100 blocks** (~5 minutes at 3 s/block) |
-| Block time target | **3 seconds** |
+| Epoch length | **100 blocks** (~100 seconds at 1 s/block) |
+| Block time target | **1 second** |
 | Proposer selection | Round-robin within the active set |
 | Finality | BFT — block is final once 2/3 validators have signed |
 
@@ -83,7 +83,7 @@ At each epoch boundary the consensus engine:
 
 | Item | Detail |
 |------|--------|
-| Block reward | **0.1 APRO** per block produced |
+| Block reward | **5 APRO** per block produced |
 | Reward destination | Validator's configured `reward_address` (Telegram wallet) |
 | Notification | Telegram push notification on every reward payment |
 | Fee share | **0 %** — all fees are burned, none go to validators |

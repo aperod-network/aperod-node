@@ -43,7 +43,7 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 | **Telegram wallet** | Full wallet inside Telegram — create, send, receive, and stake APRO without any app download |
 | **100 % fee burn** | Every transaction fee is permanently destroyed, reducing total supply with every block |
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
-| **Block rewards** | 0.1 APRO per block paid directly to the validator's Telegram wallet + push notification |
+| **Block rewards** | 5 APRO per block paid directly to the validator's Telegram wallet + push notification |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
 | **Open source** | Go 1.25, Apache 2.0, independently auditable cryptographic primitives |
 
