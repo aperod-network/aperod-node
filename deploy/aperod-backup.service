@@ -25,8 +25,11 @@ RefuseManualStart=no
 Type=oneshot
 User=root
 
-# Read APEROD_BACKUP_PASSWORD and DATA_DIR from /etc/environment
+# Load /etc/environment first (lower priority — legacy / fallback values)
 EnvironmentFile=-/etc/environment
+# Load the dedicated secrets file last so it always wins over /etc/environment
+# (root:root, mode 0600 — created by blockchain/deploy/setup-backup.sh)
+EnvironmentFile=-/etc/aperod/backup-secrets.env
 
 # Remove the trigger file BEFORE running the script so the path unit
 # doesn't fire a second time while the backup is still in progress.

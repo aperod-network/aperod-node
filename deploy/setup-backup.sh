@@ -124,6 +124,67 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+step "8. Пароль шифрования в /etc/aperod/backup-secrets.env (root-only 0600)"
+
+SECRETS_DIR="/etc/aperod"
+SECRETS_FILE="${SECRETS_DIR}/backup-secrets.env"
+
+mkdir -p "${SECRETS_DIR}"
+chmod 700 "${SECRETS_DIR}"
+
+if [ -f "${SECRETS_FILE}" ] && grep -q 'APEROD_BACKUP_PASSWORD' "${SECRETS_FILE}" 2>/dev/null; then
+  ok "APEROD_BACKUP_PASSWORD уже задан в ${SECRETS_FILE}"
+else
+  # Migrate from /etc/environment if the variable exists there
+  LEGACY_PASS=$(grep -o 'APEROD_BACKUP_PASSWORD=[^ ]*' /etc/environment 2>/dev/null | head -1 | cut -d= -f2-)
+  if [ -n "${LEGACY_PASS}" ]; then
+    (umask 077 && printf 'APEROD_BACKUP_PASSWORD=%s\n' "${LEGACY_PASS}" > "${SECRETS_FILE}")
+    chown root:root "${SECRETS_FILE}"
+    chmod 600 "${SECRETS_FILE}"
+    # Remove from world-readable /etc/environment now that we have the secure file
+    sed -i '/^APEROD_BACKUP_PASSWORD=/d' /etc/environment
+    ok "APEROD_BACKUP_PASSWORD перенесён из /etc/environment → ${SECRETS_FILE} (root:root 0600)"
+    ok "Удалён из /etc/environment"
+  else
+    NEW_PASS=$(openssl rand -hex 32)
+    # Write with O_CREAT | secure permissions — never expose to world-readable files
+    (umask 077 && printf 'APEROD_BACKUP_PASSWORD=%s\n' "${NEW_PASS}" > "${SECRETS_FILE}")
+    chown root:root "${SECRETS_FILE}"
+    chmod 600 "${SECRETS_FILE}"
+    ok "APEROD_BACKUP_PASSWORD сгенерирован → ${SECRETS_FILE} (root:root 0600)"
+    echo ""
+    echo -e "  ${YELLOW}⚠  ВАЖНО: Сохраните пароль в надёжное место — без него бэкапы нельзя расшифровать!${NC}"
+    echo -e "  ${CYAN}Просмотр: sudo grep APEROD_BACKUP_PASSWORD ${SECRETS_FILE}${NC}"
+    echo ""
+  fi
+fi
+
+# Restart API so it picks up the new EnvironmentFile path if needed
+if systemctl is-active --quiet "${API_UNIT}" 2>/dev/null; then
+  systemctl restart "${API_UNIT}"
+  ok "${API_UNIT} перезапущен"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+step "9. Cron-задание бэкапа (каждые 12 часов)"
+
+CRON_FILE="/etc/cron.d/aperod-backup"
+
+# Cron triggers the systemd service, NOT the script directly.
+# The service already has:  EnvironmentFile=-/etc/aperod/backup-secrets.env
+# This is the only safe way — cron does not load /etc/environment.
+cat > "${CRON_FILE}" <<'EOF'
+# Aperod automatic backup — every 12 hours
+# Triggers the systemd service which loads APEROD_BACKUP_PASSWORD
+# from /etc/aperod/backup-secrets.env (root:root 0600).
+# Installed by blockchain/deploy/setup-backup.sh
+0 */12 * * * root systemctl start aperod-backup.service
+EOF
+chmod 644 "${CRON_FILE}"
+ok "Cron задание создано: ${CRON_FILE}"
+cat "${CRON_FILE}" | grep -v '^#' | sed 's/^/     /'
+
+# ═══════════════════════════════════════════════════════════════════════════════
 echo
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}${BOLD}  ✓  Система бэкапа установлена и готова к работе!${NC}"
@@ -131,18 +192,13 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo
 echo -e "  ${BOLD}Следующие шаги:${NC}"
 echo
-echo -e "  1. Задайте пароль шифрования (${BOLD}один раз${NC}, запишите его!):"
-echo -e "     ${CYAN}sudo bash -c 'echo \"APEROD_BACKUP_PASSWORD=\$(openssl rand -hex 32)\" >> /etc/environment'${NC}"
-echo -e "     ${CYAN}sudo systemctl restart ${API_UNIT}${NC}"
+echo -e "  1. Убедитесь что S3-ключи настроены:"
+echo -e "     Admin Panel → Integrations → S3-хранилище"
 echo
-echo -e "  2. Запустите первый бэкап из Admin Panel → Integrations → S3-хранилище"
+echo -e "  2. Запустите первый бэкап из Admin Panel → Integrations → «Запустить сейчас»"
 echo -e "     или вручную:"
 echo -e "     ${CYAN}sudo bash /usr/local/bin/aperod_backup.sh${NC}"
 echo
-echo -e "  3. Настройте cron (бэкап каждые 12 часов):"
-echo -e "     ${CYAN}echo \"0 */12 * * * root /usr/local/bin/aperod_backup.sh >> /var/log/aperod_backup.log 2>&1\" \\"
-echo -e "       | sudo tee /etc/cron.d/aperod-backup${NC}"
-echo
-echo -e "  4. Проверьте статус:"
+echo -e "  3. Проверьте статус (cron + пароль + S3):"
 echo -e "     ${CYAN}sudo bash blockchain/deploy/check-system.sh${NC}"
 echo

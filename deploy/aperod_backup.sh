@@ -1,16 +1,19 @@
 #!/bin/bash
 # ==========================================================
 # Aperod Automatic Backup, Encryption & S3 Upload
-# Deploy: sudo cp blockchain/deploy/aperod_backup.sh /usr/local/bin/aperod_backup.sh
-#         sudo chmod 700 /usr/local/bin/aperod_backup.sh
-# Cron:   0 */12 * * * root /usr/local/bin/aperod_backup.sh >> /var/log/aperod_backup.log 2>&1
+# Deploy: sudo bash blockchain/deploy/setup-backup.sh
+#         (installs this script, systemd units, cron, and secrets file)
+#
+# Schedule: cron triggers `systemctl start aperod-backup.service` every 12 h.
+#           The service loads APEROD_BACKUP_PASSWORD from /etc/aperod/backup-secrets.env
+#           (root:root 0600) — never from a world-readable file or the command line.
 #
 # S3 credentials are read AUTOMATICALLY from:
 #   ${DATA_DIR}/integration-settings.json  (set via /admin-panel/integrations)
 #   No manual rclone config needed!
 #
-# Optional env vars (override integration-settings.json):
-#   APEROD_BACKUP_PASSWORD  — AES-256 encryption passphrase (required)
+# Required env vars (loaded by aperod-backup.service EnvironmentFile):
+#   APEROD_BACKUP_PASSWORD  — AES-256 encryption passphrase
 #   DATA_DIR                — where integration-settings.json lives (default: /opt/aperod/data)
 #
 # Prometheus metrics: /var/lib/node_exporter/textfile_collector/aperod_backup.prom

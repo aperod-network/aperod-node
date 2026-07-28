@@ -331,20 +331,34 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 hdr "9. APEROD_BACKUP_PASSWORD"
 
+SECRETS_FILE="/etc/aperod/backup-secrets.env"
+SECRETS_PASS=$(grep 'APEROD_BACKUP_PASSWORD' "${SECRETS_FILE}" 2>/dev/null | head -1)
 ENV_PASS=$(grep 'APEROD_BACKUP_PASSWORD' /etc/environment 2>/dev/null | head -1)
 SYSTEMD_PASS=$(systemctl show aperod-api --property=Environment 2>/dev/null | grep -o 'APEROD_BACKUP_PASSWORD=[^ ]*')
 SHELL_PASS="${APEROD_BACKUP_PASSWORD:-}"
 
-if [ -n "$ENV_PASS" ]; then
-  ok "Задан в /etc/environment"
+if [ -n "$SECRETS_PASS" ]; then
+  SECRETS_PERMS=$(stat -c '%a %U:%G' "${SECRETS_FILE}" 2>/dev/null)
+  ok "Задан в ${SECRETS_FILE} (${SECRETS_PERMS})"
+  # Warn if permissions are too open
+  PERMS=$(stat -c '%a' "${SECRETS_FILE}" 2>/dev/null)
+  if [ "${PERMS}" != "600" ] && [ "${PERMS}" != "400" ]; then
+    warn "  ВНИМАНИЕ: права файла ${PERMS} — должны быть 600 (root-only)"
+    echo "     → sudo chmod 600 ${SECRETS_FILE}"
+  fi
+elif [ -n "$ENV_PASS" ]; then
+  warn "Задан в /etc/environment (небезопасно — этот файл доступен всем пользователям)"
+  echo "     → Переместите в ${SECRETS_FILE} (root:root 0600):"
+  echo "     → sudo mkdir -p /etc/aperod"
+  echo "     → sudo bash -c 'grep APEROD_BACKUP_PASSWORD /etc/environment >> ${SECRETS_FILE}'"
+  echo "     → sudo chmod 600 ${SECRETS_FILE} && sudo chown root:root ${SECRETS_FILE}"
+  echo "     → sudo sed -i '/APEROD_BACKUP_PASSWORD/d' /etc/environment"
 elif [ -n "$SYSTEMD_PASS" ]; then
-  ok "Задан в systemd unit"
-elif [ -n "$SHELL_PASS" ]; then
-  warn "Задан в среде shell (только для текущей сессии — не персистентен)"
+  warn "Задан в systemd unit (небезопасно — виден через systemctl show)"
 else
   err "НЕ задан нигде"
-  echo "     → sudo bash -c 'echo \"APEROD_BACKUP_PASSWORD=$(openssl rand -hex 32)\" >> /etc/environment'"
-  echo "     (запишите пароль в надёжное место — без него бэкапы нельзя расшифровать)"
+  echo "     → sudo bash blockchain/deploy/setup-backup.sh"
+  echo "       (скрипт генерирует пароль и сохраняет в ${SECRETS_FILE} автоматически)"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
