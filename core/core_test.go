@@ -229,8 +229,8 @@ func TestMempool_Remove(t *testing.T) {
 func TestMempool_SelectByFeeRate(t *testing.T) {
         mp := core.NewMempool(core.DefaultMempoolConfig())
         // Add two txs with different fees (higher fee wins); both must meet MinFee.
-        tx1 := makeValidTxWithFee(t, core.FlatFee)
-        tx2 := makeValidTxWithFee(t, core.FlatFee*2)
+        tx1 := makeValidTxWithFee(t, core.InitialBaseFeePerByte*1000)
+        tx2 := makeValidTxWithFee(t, core.InitialBaseFeePerByte*2000)
         mp.Add(tx1)
         mp.Add(tx2)
 
@@ -508,7 +508,7 @@ func makeCoinbaseTx() core.Transaction {
 
 func makeValidTx(t *testing.T) core.Transaction {
         t.Helper()
-        return makeValidTxWithFee(t, core.FlatFee)
+        return makeValidTxWithFee(t, core.InitialBaseFeePerByte*1000)
 }
 
 // makeValidTxWithFee creates a synthetic RingCT transaction with the given absolute fee.

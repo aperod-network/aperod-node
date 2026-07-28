@@ -20,7 +20,7 @@ func TestMempool_Evict_Ages(t *testing.T) {
                 MaxSize:   5_000,
                 MaxTxSize: 100_000,
                 TTL:       time.Millisecond, // very short TTL
-                MinFee:    500_000_000,
+                BaseFeePerByte: core.InitialBaseFeePerByte,
         }
         mp := core.NewMempool(cfg)
         time.Sleep(5 * time.Millisecond)

@@ -154,7 +154,7 @@ func TestMempool_Evict(t *testing.T) {
 func TestTransaction_MinFee(t *testing.T) {
         wk, _ := crypto.GenerateWalletKeys()
         cb := core.CoinbaseTx(wk.Spend.Public, 5_000_000)
-        fee := cb.MinFee()
+        fee := cb.MinFeeAt(core.InitialBaseFeePerByte)
         // MinFee for a zero-input tx could be 0 — just must not panic
         _ = fee
 }

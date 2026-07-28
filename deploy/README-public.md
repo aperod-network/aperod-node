@@ -139,7 +139,7 @@ systemctl restart aperod-node
 ## Architecture
 
 ```
-aperod/blockchain/
+aperod-node/
 ├── crypto/      — Ed25519, SHA3, RingCT, Pedersen commitments, Bulletproofs
 ├── core/        — Block, Transaction, UTXO, Mempool, Chain
 ├── consensus/   — PoA engine (round-robin proposer + BFT 2/3 threshold)
