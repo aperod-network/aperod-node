@@ -109,7 +109,7 @@ func (tx *Transaction) Validate() error {
                                 StakePayloadSize, len(tx.Extra))
                 }
                 action := StakeAction(tx.Extra[0])
-                if action != StakeDeposit && action != StakeWithdraw {
+                if action != StakeDeposit && action != StakeWithdraw && action != StakePartialWithdraw {
                         return fmt.Errorf("stake tx: unknown action %d", action)
                 }
                 return nil

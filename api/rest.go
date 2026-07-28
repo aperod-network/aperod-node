@@ -2,12 +2,15 @@ package api
 
 // REST API handlers for Phase 2 (blocks 2.1.10-2.1.13).
 // Routes:
-//   GET  /api/v1/blocks                        — paginated block list
-//   GET  /api/v1/blocks/{id}                   — block by height or hash
-//   GET  /api/v1/transactions/{hash}           — tx by hash
-//   GET  /api/v1/address/{addr}/transactions   — incoming tx for address
-//   GET  /api/v1/network/stats                 — network statistics
-//   POST /api/v1/admin/mint                    — admin-only: mint APRO to address
+//   GET  /api/v1/blocks                                — paginated block list
+//   GET  /api/v1/blocks/{id}                           — block by height or hash
+//   GET  /api/v1/transactions/{hash}                   — tx by hash
+//   GET  /api/v1/address/{addr}/transactions           — incoming tx for address
+//   GET  /api/v1/network/stats                         — network statistics
+//   GET  /api/v1/validators                            — all registry validators + stake state
+//   GET  /api/v1/validators/{pubkey}/unbonding         — partial-unbonding queue for one validator
+//   POST /api/v1/admin/mint                            — admin-only: mint APRO to address
+//   POST /api/v1/admin/partial-unstake                 — admin-only: apply partial stake withdrawal
 
 import (
         "encoding/hex"
@@ -30,7 +33,11 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/transactions/", s.restTransaction)
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
+        s.mux.HandleFunc("/api/v1/validators", s.restValidators)
+        s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
+        s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
+        s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -410,6 +417,276 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 "mempool_count": s.mempool.Count(),
                 "tps_last_10":   0,
         })
+}
+
+// ─── GET /api/v1/validators ──────────────────────────────────────────────────
+
+// validatorResponse is one validator entry returned by the REST API.
+type validatorResponse struct {
+	PubKey              string                   `json:"pub_key"`
+	StakeNAPR           uint64                   `json:"stake_napr"`
+	StakeAPR            float64                  `json:"stake_apr"`
+	Status              string                   `json:"status"`
+	ActivationEpoch     uint64                   `json:"activation_epoch"`
+	UnbondEndBlock      uint64                   `json:"unbond_end_block,omitempty"`
+	PendingUnbondingNAPR uint64                  `json:"pending_unbonding_napr"`
+	PendingUnbondingAPR  float64                 `json:"pending_unbonding_apr"`
+	UnbondingQueue      []unbondingEntryResponse `json:"unbonding_queue"`
+}
+
+// unbondingEntryResponse is one entry in a validator's partial unbonding queue.
+type unbondingEntryResponse struct {
+	AmountNAPR     uint64  `json:"amount_napr"`
+	AmountAPR      float64 `json:"amount_apr"`
+	EndBlock       uint64  `json:"end_block"`
+	EndEstimatedMs int64   `json:"end_estimated_ms"` // wall-clock estimate at 1 block/s
+}
+
+func validatorToResponse(e core.ValidatorEntry, currentHeight uint64) validatorResponse {
+	queue := make([]unbondingEntryResponse, 0, len(e.UnbondingQueue))
+	nowMs := time.Now().UnixMilli()
+	for _, ub := range e.UnbondingQueue {
+		blocksLeft := int64(0)
+		if ub.EndBlock > currentHeight {
+			blocksLeft = int64(ub.EndBlock - currentHeight)
+		}
+		queue = append(queue, unbondingEntryResponse{
+			AmountNAPR:     ub.Amount,
+			AmountAPR:      float64(ub.Amount) / 1e8,
+			EndBlock:       ub.EndBlock,
+			EndEstimatedMs: nowMs + blocksLeft*1000, // 1 block ≈ 1 second
+		})
+	}
+	pending := e.PendingUnbondingNAPR()
+	return validatorResponse{
+		PubKey:               e.PubKey.Hex(),
+		StakeNAPR:            e.StakeNAPR,
+		StakeAPR:             float64(e.StakeNAPR) / 1e8,
+		Status:               e.Status.String(),
+		ActivationEpoch:      e.ActivationEpoch,
+		UnbondEndBlock:       e.UnbondEndBlock,
+		PendingUnbondingNAPR: pending,
+		PendingUnbondingAPR:  float64(pending) / 1e8,
+		UnbondingQueue:       queue,
+	}
+}
+
+func (s *Server) restValidators(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	if s.registry == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"validators": []interface{}{}})
+		return
+	}
+	currentHeight := uint64(0)
+	if tip := s.chain.Tip(); tip != nil {
+		currentHeight = tip.Header.Height
+	}
+	entries := s.registry.AllEntries()
+	result := make([]validatorResponse, 0, len(entries))
+	for _, e := range entries {
+		result = append(result, validatorToResponse(e, currentHeight))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"validators": result,
+		"count":      len(result),
+	})
+}
+
+// ─── GET /api/v1/validators/{pubkey}/unbonding ───────────────────────────────
+
+func (s *Server) restValidatorUnbonding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	// Path: /api/v1/validators/{pubkey}/unbonding
+	tail := pathSuffix("/api/v1/validators/", r.URL.Path)
+	const unbondingSuffix = "/unbonding"
+	if !strings.HasSuffix(tail, unbondingSuffix) {
+		writeJSONError(w, http.StatusNotFound, "not found; use /api/v1/validators/{pubkey}/unbonding")
+		return
+	}
+	pubHex := strings.TrimSuffix(tail, unbondingSuffix)
+	if pubHex == "" {
+		writeJSONError(w, http.StatusBadRequest, "pubkey required")
+		return
+	}
+	if s.registry == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"pub_key": pubHex, "pending_unbonding_napr": 0, "pending_unbonding_apr": 0.0, "unbonding_queue": []interface{}{},
+		})
+		return
+	}
+	pubBytes, err := hex.DecodeString(pubHex)
+	if err != nil || len(pubBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "pubkey must be 64 hex chars")
+		return
+	}
+	var pub crypto.ValidatorPubKey = pubBytes
+	entry, ok := s.registry.GetEntry(pub)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "validator not found in registry")
+		return
+	}
+	currentHeight := uint64(0)
+	if tip := s.chain.Tip(); tip != nil {
+		currentHeight = tip.Header.Height
+	}
+	resp := validatorToResponse(entry, currentHeight)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pub_key":               resp.PubKey,
+		"stake_napr":            resp.StakeNAPR,
+		"stake_apr":             resp.StakeAPR,
+		"status":                resp.Status,
+		"pending_unbonding_napr": resp.PendingUnbondingNAPR,
+		"pending_unbonding_apr":  resp.PendingUnbondingAPR,
+		"unbonding_queue":        resp.UnbondingQueue,
+	})
+}
+
+// ─── POST /api/v1/admin/partial-unstake ──────────────────────────────────────
+
+type partialUnstakeRequest struct {
+	PubKey     string `json:"pub_key"`    // 64-hex target validator pubkey
+	AmountNAPR uint64 `json:"amount_napr"` // nAPRO to withdraw
+}
+
+// restAdminPartialUnstake builds a signed StakePartialWithdraw transaction and
+// submits it to the mempool.  The node may only unstake its OWN validator
+// (pub_key in the request must equal this node's configured validator pubkey).
+// This preserves the existing signature invariant (pub.Verify == target) while
+// allowing the admin REST endpoint to initiate the withdrawal.
+func (s *Server) restAdminPartialUnstake(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.myKey == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "validator key not configured on this node")
+		return
+	}
+	if s.registry == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialised")
+		return
+	}
+
+	var req partialUnstakeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.AmountNAPR == 0 {
+		writeJSONError(w, http.StatusBadRequest, "amount_napr must be > 0")
+		return
+	}
+	pubBytes, err := hex.DecodeString(req.PubKey)
+	if err != nil || len(pubBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "pub_key must be a 64-hex-char Ed25519 public key")
+		return
+	}
+	targetPub := crypto.ValidatorPubKey(pubBytes)
+
+	// Security: this endpoint can only unstake the LOCAL node's own validator.
+	// StakePartialWithdraw requires pub.Verify(sig) — only the key holder can
+	// authorize their own withdrawal.  Cross-validator admin unstake is not
+	// supported via REST; validators must submit their own signed tx.
+	myPub := s.myKey.Public()
+	if !myPub.Equals(targetPub) {
+		writeJSONError(w, http.StatusForbidden,
+			"this endpoint can only unstake the local node's own validator; connect to the target validator's node to initiate its withdrawal")
+		return
+	}
+
+	// Pre-validate against registry so we fail fast before touching the mempool.
+	entry, ok := s.registry.GetEntry(targetPub)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "validator not found in registry")
+		return
+	}
+	effectiveMin := s.registry.CurrentMinStake()
+	if entry.StakeNAPR <= req.AmountNAPR {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+			"withdrawal %d >= current stake %d; use full StakeWithdraw instead",
+			req.AmountNAPR, entry.StakeNAPR))
+		return
+	}
+	remaining := entry.StakeNAPR - req.AmountNAPR
+	if remaining < effectiveMin {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+			"remaining stake %.4f APRO < minimum %.4f APRO; reduce withdrawal amount",
+			float64(remaining)/1e8, float64(effectiveMin)/1e8))
+		return
+	}
+
+	// Sign with the node's own key (which IS the target validator's key).
+	// pub.Verify(StakeSignMsg(StakePartialWithdraw, pub, amount), sig) will pass
+	// because myKey.Public() == targetPub.
+	msg := core.StakeSignMsg(core.StakePartialWithdraw, targetPub, req.AmountNAPR)
+	sig, err := s.myKey.Sign(msg)
+	if err != nil {
+		s.log.Error("admin partial unstake: sign failed", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "sign: "+err.Error())
+		return
+	}
+	extra, err := core.EncodeStakeExtra(core.StakePartialWithdraw, targetPub, req.AmountNAPR, sig)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "encode extra: "+err.Error())
+		return
+	}
+	tx := core.Transaction{
+		Version: core.TxVersionStake,
+		Extra:   extra,
+	}
+	if err := s.mempool.Add(tx); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "mempool: "+err.Error())
+		return
+	}
+
+	txHash := tx.Hash()
+	txHashHex := fmt.Sprintf("%x", txHash[:])
+	s.log.Info("admin partial unstake queued",
+		"pub_key", req.PubKey[:8],
+		"amount_napr", req.AmountNAPR,
+		"tx_hash", txHashHex,
+	)
+
+	currentHeight := uint64(0)
+	if tip := s.chain.Tip(); tip != nil {
+		currentHeight = tip.Header.Height
+	}
+	endBlock := currentHeight + core.PartialUnbondingBlocks
+	endEstimatedMs := time.Now().UnixMilli() + int64(core.PartialUnbondingBlocks)*1000
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"tx_hash":          txHashHex,
+		"pub_key":          req.PubKey,
+		"amount_napr":      req.AmountNAPR,
+		"amount_apr":       float64(req.AmountNAPR) / 1e8,
+		"end_block":        endBlock,
+		"end_estimated_ms": endEstimatedMs,
+		"status":           "pending",
+		"message":          "StakePartialWithdraw transaction submitted to mempool; applied when included in the next block",
+	})
+}
+
+// restMyValidator exposes the node's own validator pubkey so the admin panel
+// can show the "Withdraw Excess Stake" action only for the locally-managed validator.
+func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	if s.myKey == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"pub_key": nil})
+		return
+	}
+	pub := s.myKey.Public()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pub_key": pub.Hex(),
+	})
 }
 
 // ─── POST /api/v1/admin/mint ──────────────────────────────────────────────────

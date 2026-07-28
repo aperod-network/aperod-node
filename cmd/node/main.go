@@ -289,6 +289,7 @@ func run() error {
                 apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 apiSrv.SetRegistry(engine.Registry())
+                apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
                 go func() {
                         if err := apiSrv.Start(); err != nil {

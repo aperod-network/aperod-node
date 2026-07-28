@@ -53,9 +53,14 @@ const (
 type StakeAction uint8
 
 const (
-	StakeDeposit  StakeAction = 1 // Lock APRO to enter validator queue
-	StakeWithdraw StakeAction = 2 // Initiate unbonding period
+	StakeDeposit         StakeAction = 1 // Lock APRO to enter validator queue
+	StakeWithdraw        StakeAction = 2 // Initiate full unbonding period
+	StakePartialWithdraw StakeAction = 3 // Partially withdraw excess stake (7-day unbonding)
 )
+
+// PartialUnbondingBlocks is the unbonding period for partial stake withdrawals.
+// 7 days × 86,400 seconds/day = 604,800 blocks at 1 block/second.
+const PartialUnbondingBlocks uint64 = 604_800
 
 // StakePayloadSize is the fixed byte length of tx.Extra for TxVersionStake.
 // Layout: action(1) + pubkey(32) + amount_nAPR(8) + ed25519_sig(64) = 105
@@ -132,18 +137,35 @@ func (s ValidatorStatus) String() string {
 	}
 }
 
+// UnbondingEntry records one partial stake withdrawal in progress.
+// The amount is locked for PartialUnbondingBlocks to prevent slashing evasion.
+type UnbondingEntry struct {
+	Amount   uint64 // nAPRO being unbonded
+	EndBlock uint64 // block height after which this entry is released
+}
+
 // ValidatorEntry is one validator's record in the registry.
 type ValidatorEntry struct {
 	PubKey          crypto.ValidatorPubKey
 	StakeNAPR       uint64
 	Status          ValidatorStatus
-	ActivationEpoch uint64 // epoch when the validator first becomes eligible
-	UnbondEndBlock  uint64 // block height after which stake is released (Unbonding only)
+	ActivationEpoch uint64         // epoch when the validator first becomes eligible
+	UnbondEndBlock  uint64         // block height after which stake is released (full Unbonding only)
+	UnbondingQueue  []UnbondingEntry // partial withdrawal queue; released in UpdateEpoch
 }
 
 // APRStake returns the stake in whole APRO (for display).
 func (e *ValidatorEntry) APRStake() float64 {
 	return float64(e.StakeNAPR) / float64(BaseUnitsPerAPR)
+}
+
+// PendingUnbondingNAPR returns the total nAPRO currently in the partial unbonding queue.
+func (e *ValidatorEntry) PendingUnbondingNAPR() uint64 {
+	var total uint64
+	for _, ub := range e.UnbondingQueue {
+		total += ub.Amount
+	}
+	return total
 }
 
 // ─── Dynamic Stake Threshold ──────────────────────────────────────────────────
@@ -239,7 +261,9 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		return fmt.Errorf("registry: %w", err)
 	}
 
-	// Verify the validator's self-signed authorization
+	// Every stake action is authorized by the validator's own self-signed key.
+	// StakePartialWithdraw submitted via the admin endpoint uses the node's own
+	// key — which is valid only when pub == node's own pubkey.
 	msg := StakeSignMsg(action, pub, amount)
 	if !pub.Verify(msg, sig) {
 		return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
@@ -254,6 +278,8 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		return r.applyDeposit(key, pub, amount, height)
 	case StakeWithdraw:
 		return r.applyWithdraw(key, height)
+	case StakePartialWithdraw:
+		return r.applyPartialWithdraw(key, amount, height)
 	default:
 		return fmt.Errorf("registry: unknown stake action %d", action)
 	}
@@ -307,6 +333,44 @@ func (r *ValidatorRegistry) applyWithdraw(key string, height uint64) error {
 	return nil
 }
 
+// applyPartialWithdraw reduces the validator's stake by amount and queues it for
+// release after PartialUnbondingBlocks.  The validator remains Active/Pending as
+// long as the remaining stake satisfies the current minimum stake threshold.
+func (r *ValidatorRegistry) applyPartialWithdraw(key string, amount, height uint64) error {
+	entry, ok := r.validators[key]
+	if !ok {
+		return fmt.Errorf("validator %s not registered", key[:8])
+	}
+	if entry.Status == ValidatorUnbonding || entry.Status == ValidatorExited {
+		return fmt.Errorf("validator is unbonding/exited; cannot partial withdraw")
+	}
+	if amount == 0 {
+		return fmt.Errorf("partial withdraw amount must be > 0")
+	}
+	if amount >= entry.StakeNAPR {
+		return fmt.Errorf("withdrawal amount %d >= current stake %d; use full StakeWithdraw instead",
+			amount, entry.StakeNAPR)
+	}
+
+	remaining := entry.StakeNAPR - amount
+	effectiveMin := r.dynamicMinNAPR
+	if effectiveMin == 0 {
+		effectiveMin = MinStakeNAPR
+	}
+	if remaining < effectiveMin {
+		return fmt.Errorf("remaining stake %.4f APRO < minimum %.4f APRO; reduce withdrawal amount or use full exit",
+			float64(remaining)/float64(BaseUnitsPerAPR),
+			float64(effectiveMin)/float64(BaseUnitsPerAPR))
+	}
+
+	entry.StakeNAPR = remaining
+	entry.UnbondingQueue = append(entry.UnbondingQueue, UnbondingEntry{
+		Amount:   amount,
+		EndBlock: height + PartialUnbondingBlocks,
+	})
+	return nil
+}
+
 // UpdateEpoch is called at every epoch boundary (height % EpochLength == 0).
 // It finalises unbonding validators, activates the top-staked pending ones
 // (up to ChurnLimit), and rebalances the active set to MaxValidators.
@@ -317,10 +381,21 @@ func (r *ValidatorRegistry) UpdateEpoch(height uint64) []crypto.ValidatorPubKey 
 
 	currentEpoch := height / EpochLength
 
-	// 1. Release fully-unbonded validators
+	// 1. Release fully-unbonded validators and clean up completed partial unbonding entries
 	for _, e := range r.validators {
 		if e.Status == ValidatorUnbonding && height >= e.UnbondEndBlock {
 			e.Status = ValidatorExited
+		}
+		// Drop partial-unbonding entries whose lock period has elapsed
+		if len(e.UnbondingQueue) > 0 {
+			active := e.UnbondingQueue[:0]
+			for _, ub := range e.UnbondingQueue {
+				if height < ub.EndBlock {
+					active = append(active, ub)
+				}
+				// entries past EndBlock are released (dropped silently — funds unlocked)
+			}
+			e.UnbondingQueue = active
 		}
 	}
 
@@ -463,3 +538,4 @@ func (r *ValidatorRegistry) Count() (active, total int) {
 	}
 	return
 }
+

@@ -21,7 +21,8 @@ type Server struct {
         chain       *core.Chain
         mempool     *core.Mempool
         utxos       *core.UTXOSet
-        registry    *core.ValidatorRegistry // live PoS validator registry (optional)
+        registry    *core.ValidatorRegistry  // live PoS validator registry (optional)
+        myKey       *crypto.ValidatorPrivKey // node's own validator key for admin stake ops (optional)
         log         *slog.Logger
         mux         *http.ServeMux
         hub         *Hub
@@ -54,6 +55,12 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
 // SetRegistry wires the live PoS validator registry so the API can serve
 // /api/v1/validators and include validator_count in network stats.
 func (s *Server) SetRegistry(r *core.ValidatorRegistry) { s.registry = r }
+
+// SetValidatorKey provides the node's own validator private key to the API
+// server so the /api/v1/admin/partial-unstake endpoint can create properly
+// signed StakeAdminWithdraw transactions.  Optional — endpoint returns 503
+// when no key is configured.
+func (s *Server) SetValidatorKey(key *crypto.ValidatorPrivKey) { s.myKey = key }
 
 // APIKeyConfig optionally sets the required API key for write operations.
 // Call before Start(). Empty string disables key enforcement (dev mode).
