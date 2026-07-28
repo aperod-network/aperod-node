@@ -232,13 +232,15 @@ func run() error {
         registry := core.NewValidatorRegistry()
 
         engine := consensus.NewEngine(consensus.Config{
-                BlockTime:       cfg.Consensus.BlockTime,
-                BFTThreshold:    genesisConfig.BFTThreshold,
-                Validators:      validators,
-                Registry:        registry,
-                MyKey:           myKey,
-                RewardAddress:   cfg.Consensus.RewardAddress,
-                BlockRewardNAPR: cfg.Consensus.BlockRewardNAPR,
+                BlockTime:          cfg.Consensus.BlockTime,
+                BFTThreshold:       genesisConfig.BFTThreshold,
+                Validators:         validators,
+                Registry:           registry,
+                MyKey:              myKey,
+                RewardAddress:      cfg.Consensus.RewardAddress,
+                BlockRewardNAPR:    cfg.Consensus.BlockRewardNAPR,
+                OracleURL:          cfg.Consensus.OracleURL,
+                OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
                 OnBlockProduced: func(block *core.Block) {
                         if err := storeBlock(db, block); err != nil {
                                 log.Error("failed to persist block", "height", block.Header.Height, "err", err)
