@@ -25,6 +25,7 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 - [Become a Validator](#-become-a-validator)
 - [Validator Rules](#-validator-rules)
 - [Tokenomics & Fee Burn](#-tokenomics--fee-burn)
+- [📈 Why APRO? The Deflationary Case](#-why-apro-the-deflationary-case)
 - [Architecture](#-architecture)
 - [Building from Source](#-building-from-source)
 - [Requirements](#-requirements)
@@ -176,6 +177,57 @@ Validators earn **block rewards only**. Zero fees reach validator wallets.
 The burn is enforced at the consensus layer — not a governance parameter, not toggleable.
 
 See [**BURN\_POLICY.md**](BURN_POLICY.md) for full tokenomics and deflationary mechanics.
+
+---
+
+## 📈 Why APRO? The Deflationary Case
+
+### EIP-1559 = Automatic Token Buyback
+
+> *"The EIP-1559 mechanism in Aperod works like an automatic buyback — for every type of transaction. A simple wallet transfer burns APRO. An NFT trade burns APRO. A DeFi swap burns APRO. A game action burns APRO. The more the network is used for anything, the fewer coins remain in circulation. By year 5, even modest everyday usage alone shrinks the supply by ~10%, creating organic scarcity that pushes APRO price up — without any manipulation."*
+
+Every on-chain transaction type permanently destroys the base fee:
+
+| Transaction type | Approx. fee burned per tx |
+|-----------------|--------------------------|
+| P2P transfer (~2 KB) | ~0.004 APRO |
+| Token swap / DeFi (~3 KB) | ~0.006 APRO |
+| NFT trade (~4 KB) | ~0.008 APRO |
+| Game action (~4 KB) | ~0.008 APRO |
+
+The burn is consensus-enforced — not a governance parameter, not toggleable.  
+**Starting at launch: −9.87 % supply reduction by 2031** from ordinary network usage alone.
+
+---
+
+### 3 Price Growth Scenarios
+
+*Starting price $0.001 · Supply 10 B APRO · 5-year horizon (2026–2031)*
+
+| Scenario | Driver | Price target | Change |
+|----------|--------|-------------|--------|
+| **A · Conservative** — deflation only, demand stable | Supply shrinks 9.87 %; market cap stays at $10 M. Pure math, no extra demand needed. | $0.001 → **$0.00111** | **+10.9 %** |
+| **B · Realistic Web3** — deflation + organic gaming demand | Real network usage (transfers, DeFi, NFTs) + 20–30 games. Supply −10 % meets demand ×10–15 (normal for any active L1). Market cap grows to $100 M. | $0.001 → **$0.011** | **+1,100 %** |
+| **C · Maximum** — Global GameFi hub, year 25 | 3–4 B tokens burned over 25 years. Aperod reaches top-tier L1 network status. Market cap $1–2 B. | $0.001 → **$0.15 – $0.30** | **+15,000 % – +30,000 %** |
+
+---
+
+### Your APRO Validator Reward Grows in USD as Price Rises
+
+Validators earn **≈ 2,503,000 APRO / year** (round-robin across 21 active validators).  
+As deflation drives the price up, that fixed reward becomes worth exponentially more in USD:
+
+| APRO price | Annual validator income (USD) |
+|-----------|------------------------------|
+| $0.001 (launch) | **$2,503 / year** |
+| $0.0011 (Scenario A, 2031) | **$2,753 / year** |
+| $0.011 (Scenario B, 2031) | **$27,533 / year** |
+| $0.15 (Scenario C, low) | **$375,450 / year** |
+| $0.30 (Scenario C, high) | **$750,900 / year** |
+
+Run the node, earn APRO. Let deflation do the rest.
+
+> **Stake requirement:** ≥ 100,000 APRO &nbsp;·&nbsp; **Reward destination:** your Telegram wallet &nbsp;·&nbsp; **No approval needed**
 
 ---
 
