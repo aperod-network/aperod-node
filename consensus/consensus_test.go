@@ -48,7 +48,7 @@ func makeChainWithGenesis(t *testing.T, priv crypto.ValidatorPrivKey, pub crypto
 	return chain
 }
 
-func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.ValidatorPrivKey, chain *core.Chain) *consensus.Engine {
+func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.LockedValidatorKey, chain *core.Chain) *consensus.Engine {
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	return consensus.NewEngine(consensus.Config{
@@ -227,7 +227,9 @@ func TestVote_DuplicateCounted(t *testing.T) {
 func TestEngine_ProducesBlock(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	chain := makeChainWithGenesis(t, priv, pub)
-	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, &priv, chain)
+	lk, _ := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	defer lk.Destroy()
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, lk, chain)
 
 	stop := make(chan struct{})
 	go eng.Run(stop)
@@ -254,7 +256,9 @@ func TestEngine_NonProposer_Silent(t *testing.T) {
 		privs[i], pubs[i], _ = crypto.GenerateValidatorKey()
 	}
 	chain := makeChainWithGenesis(t, privs[0], pubs[0])
-	eng := newEngine(t, pubs, &privs[2], chain)
+	lk2, _ := crypto.NewLockedValidatorKey(privs[2].Bytes(), nil)
+	defer lk2.Destroy()
+	eng := newEngine(t, pubs, lk2, chain)
 
 	stop := make(chan struct{})
 	go eng.Run(stop)
@@ -360,7 +364,9 @@ func TestEngine_RejectsBlock_NoVerifier(t *testing.T) {
 func TestEngine_SingleValidator_Finalizes(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	chain := makeChainWithGenesis(t, priv, pub)
-	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, &priv, chain)
+	lk, _ := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	defer lk.Destroy()
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, lk, chain)
 
 	stop := make(chan struct{})
 	go eng.Run(stop)

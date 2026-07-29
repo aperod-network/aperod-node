@@ -114,18 +114,21 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
         blockV := core.NewBlockVerifier(core.DefaultBlockVerifierConfig(), chain, txV)
 
         // ── Validator key ─────────────────────────────────────────────────────────
-        var myKey *crypto.ValidatorPrivKey
+        var myKey *crypto.LockedValidatorKey
         if cfg.ValidatorKeyFile != "" {
                 raw, err := os.ReadFile(cfg.ValidatorKeyFile)
                 if err != nil {
                         return nil, fmt.Errorf("read validator key: %w", err)
                 }
-                priv, err := crypto.ValidatorPrivKeyFromBytes(raw)
+                lk, err := crypto.NewLockedValidatorKey(raw, func(mlockErr error) {
+                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", mlockErr)
+                })
+                crypto.ZeroBytes(raw) // zero transient bytes after key derivation
                 if err != nil {
                         return nil, fmt.Errorf("parse validator key: %w", err)
                 }
-                myKey = &priv
-                log.Info("loaded validator key", "pub", priv.Public().ID())
+                myKey = lk
+                log.Info("loaded validator key", "pub", lk.Public().ID())
         }
 
         // ── Validator set from genesis ────────────────────────────────────────────

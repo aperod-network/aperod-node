@@ -23,7 +23,7 @@ type Server struct {
         mempool     *core.Mempool
         utxos       *core.UTXOSet
         registry    *core.ValidatorRegistry  // live PoS validator registry (optional)
-        myKey       *crypto.ValidatorPrivKey // node's own validator key for admin stake ops (optional)
+        myKey       *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
         blockStore  *store.DB               // optional: LevelDB store for pruned-block fallback
         log         *slog.Logger
         mux         *http.ServeMux
@@ -62,7 +62,7 @@ func (s *Server) SetRegistry(r *core.ValidatorRegistry) { s.registry = r }
 // server so the /api/v1/admin/partial-unstake endpoint can create properly
 // signed StakeAdminWithdraw transactions.  Optional — endpoint returns 503
 // when no key is configured.
-func (s *Server) SetValidatorKey(key *crypto.ValidatorPrivKey) { s.myKey = key }
+func (s *Server) SetValidatorKey(key *crypto.LockedValidatorKey) { s.myKey = key }
 
 // APIKeyConfig optionally sets the required API key for write operations.
 // Call before Start(). Empty string disables key enforcement (dev mode).

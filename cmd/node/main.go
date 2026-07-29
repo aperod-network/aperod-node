@@ -165,7 +165,7 @@ func run() error {
 
         if tipHash == (crypto.Hash32{}) {
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
-                genesis, err := core.CreateGenesisBlock(genesisConfig, *myKey)
+                genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
                 if err != nil {
                         return fmt.Errorf("create genesis: %w", err)
                 }
@@ -475,7 +475,7 @@ func checkKeyFilePermissions(path string) error {
 }
 
 // loadOrGenerateValidatorKey returns the node's validator private key.
-func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.ValidatorPrivKey, error) {
+func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.LockedValidatorKey, error) {
         if cfg.Consensus.ValidatorKey != "" {
                 if err := checkKeyFilePermissions(cfg.Consensus.ValidatorKey); err != nil {
                         return nil, err
@@ -484,24 +484,15 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 if err != nil {
                         return nil, fmt.Errorf("read validator key file: %w", err)
                 }
-                // Lock key bytes in RAM so they cannot be swapped to disk or
-                // captured in a core dump (#416). Non-fatal: warn and continue.
-                if err := crypto.MlockBytes(privBytes); err != nil {
-                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", err)
-                }
-                // Zero and unlock the seed bytes after key derivation.
-                defer func() {
-                        if len(privBytes) == 32 {
-                                crypto.ZeroBytes(privBytes)
-                        }
-                        _ = crypto.MunlockBytes(privBytes)
-                }()
-                priv, err := crypto.ValidatorPrivKeyFromBytes(privBytes)
+                lk, err := crypto.NewLockedValidatorKey(privBytes, func(mlockErr error) {
+                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", mlockErr)
+                })
+                crypto.ZeroBytes(privBytes) // zero transient copy immediately after derivation
                 if err != nil {
                         return nil, fmt.Errorf("parse validator private key: %w", err)
                 }
-                log.Info("loaded validator key from config", "pub", priv.Public().ID())
-                return &priv, nil
+                log.Info("loaded validator key from config", "pub", lk.Public().ID())
+                return lk, nil
         }
 
         keyPath := filepath.Join(cfg.DataDir, "validator.key")
@@ -512,18 +503,15 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 if err := crypto.MlockBytes(data); err != nil {
                         log.Warn("mlock validator key bytes failed (non-fatal)", "err", err)
                 }
-                defer func() {
-                        if len(data) == 32 {
-                                crypto.ZeroBytes(data)
-                        }
-                        _ = crypto.MunlockBytes(data)
-                }()
-                priv, err := crypto.ValidatorPrivKeyFromBytes(data)
+                lk, err := crypto.NewLockedValidatorKey(data, func(mlockErr error) {
+                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", mlockErr)
+                })
+                crypto.ZeroBytes(data) // zero transient copy immediately after derivation
                 if err != nil {
                         return nil, fmt.Errorf("parse persisted validator key: %w", err)
                 }
-                log.Info("loaded persisted validator key", "pub", priv.Public().ID())
-                return &priv, nil
+                log.Info("loaded persisted validator key", "pub", lk.Public().ID())
+                return lk, nil
         }
 
         priv, _, err := crypto.GenerateValidatorKey()
@@ -533,8 +521,15 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
         if err := os.WriteFile(keyPath, priv.Bytes(), 0600); err != nil {
                 return nil, fmt.Errorf("save validator key: %w", err)
         }
-        log.Info("generated new validator key", "pub", priv.Public().ID(), "saved", keyPath)
-        return &priv, nil
+        lk, err := crypto.NewLockedValidatorKey(priv.Bytes(), func(mlockErr error) {
+                log.Warn("mlock validator key bytes failed (non-fatal)", "err", mlockErr)
+        })
+        crypto.ZeroBytes(priv.Bytes()) // zero the plain-text key after locking
+        if err != nil {
+                return nil, fmt.Errorf("lock generated validator key: %w", err)
+        }
+        log.Info("generated new validator key", "pub", lk.Public().ID(), "saved", keyPath)
+        return lk, nil
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.

@@ -27,7 +27,7 @@ type Config struct {
         // If nil the engine falls back to the static Validators list.
         Registry *core.ValidatorRegistry
         // MyKey is this node's validator key (nil if not a validator).
-        MyKey *crypto.ValidatorPrivKey
+        MyKey *crypto.LockedValidatorKey
         // OnBlockProduced is an optional callback called after each block is added
         // to the chain. Use it to persist blocks to durable storage.
         OnBlockProduced func(block *core.Block)
@@ -514,7 +514,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 OraclePrice:  oraclePrice,
                 BaseFee:      currentBaseFee,
         }
-        if err := header.Sign(*e.cfg.MyKey); err != nil {
+        if err := header.Sign(e.cfg.MyKey.PrivKey()); err != nil {
                 return nil, err
         }
         if oraclePrice > 0 {
