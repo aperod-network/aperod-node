@@ -441,6 +441,137 @@ func TestHandleIncomingBlock_SlightlyAhead(t *testing.T) {
 	}
 }
 
+// ─── Clock-drift edge cases (#440) ────────────────────────────────────────────
+
+// TestHandleIncomingBlock_14sAhead verifies that a block whose timestamp is
+// 14 seconds in the future is accepted — it is within the ±15 s tolerance window.
+// This simulates a validator node whose system clock runs ~14 s ahead of ours
+// and ensures such nodes can still propagate blocks without getting stuck.
+func TestHandleIncomingBlock_14sAhead(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().Add(14 * time.Second).UnixNano(), // 14 s ahead — within ±15 s tolerance
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case <-deadline:
+			t.Errorf("chain height = %d after 300 ms — 14 s-ahead block should have been accepted (skew < 15 s)",
+				chain.Height())
+			return
+		default:
+			if chain.Height() == 1 {
+				t.Log("OK: 14 s-ahead block accepted, chain advanced to height 1")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// TestHandleIncomingBlock_14sBehind verifies that a block whose timestamp is
+// 14 seconds in the past is accepted — it is within the ±15 s tolerance window.
+// This simulates a validator whose clock lags slightly behind ours.
+func TestHandleIncomingBlock_14sBehind(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().Add(-14 * time.Second).UnixNano(), // 14 s behind — within ±15 s tolerance
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case <-deadline:
+			t.Errorf("chain height = %d after 300 ms — 14 s-behind block should have been accepted (skew < 15 s)",
+				chain.Height())
+			return
+		default:
+			if chain.Height() == 1 {
+				t.Log("OK: 14 s-behind block accepted, chain advanced to height 1")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// TestHandleIncomingBlock_JustOverLimit verifies that a block whose timestamp is
+// 16 seconds ahead (just over the 15 s cap) is rejected — this is the exact
+// boundary condition a slightly-over-drifted node would hit.
+func TestHandleIncomingBlock_JustOverLimit(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().Add(16 * time.Second).UnixNano(), // 16 s — just over ±15 s cap
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	time.Sleep(150 * time.Millisecond)
+
+	if chain.Height() != 0 {
+		t.Errorf("chain advanced to height %d — 16 s-ahead block should have been rejected (skew > 15 s)",
+			chain.Height())
+	} else {
+		t.Log("OK: 16 s-ahead block rejected, chain stayed at genesis")
+	}
+}
+
 // TestEngine_SingleValidator_Finalizes verifies a 1-of-1 validator set auto-finalizes.
 func TestEngine_SingleValidator_Finalizes(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()
