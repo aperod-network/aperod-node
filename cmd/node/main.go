@@ -151,7 +151,7 @@ func run() error {
 
         // ── 6. Initialize chain ───────────────────────────────────────────────────
         chain := core.NewChain()
-        mempool := core.NewMempool(core.DefaultMempoolConfig())
+        mempool := core.NewMempool(core.DefaultMempoolConfig(), log)
 
         // Create the UTXO set here (before chain loading) so the resume path
         // can populate it from stored blocks, ensuring historical spent key
