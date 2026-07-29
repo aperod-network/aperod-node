@@ -35,8 +35,8 @@ You will receive a response within **48 hours**. Critical issues are patched wit
 | Severity | Reward |
 |----------|--------|
 | **Critical** (consensus break, key extraction, double-spend, network halt) | **$1,000,000** |
-| **High** (remote code execution, eclipse attack, auth bypass) | up to **$100,000** |
-| **Medium** (data integrity, privacy leaks, DoS) | up to **$100,000** |
+| **High** (remote code execution, eclipse attack, auth bypass) | up to **$500,000** |
+| **Medium** (data integrity, privacy leaks, DoS) | up to **$300,000** |
 | **Low / Informational** | up to **$100,000** |
 
 Rewards are paid in APRO at the 7-day average market price on date of disclosure acceptance.  
