@@ -216,10 +216,20 @@ func (e *Engine) tick() error {
         return nil
 }
 
-// defaultBlockRewardNAPR is 5 APRO in base units (TZ §1.2 Tail Emission).
-// 1 APRO = 100_000_000 nAPRO, so 5 APRO = 500_000_000 nAPRO.
-// At 1 block/second this yields 157,680,000 APRO/year across all 21 validators.
-const defaultBlockRewardNAPR uint64 = 500_000_000
+// DefaultBlockRewardNAPR is the block reward paid to the producing validator
+// when no override is set in Config.BlockRewardNAPR.
+// 5 APRO in base units: 1 APRO = 100_000_000 nAPRO → 5 APRO = 500_000_000 nAPRO.
+// At 3 s/block this yields ~52,560,000 APRO/year across all 21 validators.
+const DefaultBlockRewardNAPR uint64 = 500_000_000
+
+// HalvingIntervalBlocks is the number of blocks between each block-reward
+// halving event.  At 3 s/block, 21 024 000 blocks ≈ 2 years.
+// Must match the "Halving interval" row in deploy/VALIDATORS.md.
+const HalvingIntervalBlocks uint64 = 21_024_000
+
+// defaultBlockRewardNAPR is an unexported alias kept for backward-compat
+// within this package.  External code should use DefaultBlockRewardNAPR.
+const defaultBlockRewardNAPR = DefaultBlockRewardNAPR
 
 // EIP-1559–style dynamic base fee constants.
 const (
