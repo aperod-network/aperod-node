@@ -107,22 +107,32 @@ server {
         return 301 /grafana/;
     }
 
-    # ── Admin Panel (/admin-panel/) ────────────────────────
-    location /admin-panel/ {
+    # ── Старые пути админки — явный 404 ──────────────────────
+    location = /admin-panel { return 404; }
+    location /admin-panel/  { return 404; }
+    location = /admin       { return 404; }
+    location /admin/        { return 404; }
+    location /capibaradog/  { return 404; }
+
+    # ── Admin Panel (/capibaradoglog/) ─────────────────────
+    location = /capibaradoglog {
+        return 301 /capibaradoglog/;
+    }
+
+    location /capibaradoglog/ {
         alias   /opt/aperod/artifacts/admin-panel/dist/public/;
-        # SPA: все подпути → index.html
         try_files $uri $uri/ @admin_spa;
-        expires 1h;
-        add_header Cache-Control "public, must-revalidate";
+        expires -1;
+        add_header Cache-Control "no-store";
     }
     location @admin_spa {
-        rewrite ^/admin-panel/.*$ /admin-panel/index.html break;
         root /opt/aperod/artifacts/admin-panel/dist/public;
+        rewrite ^/capibaradoglog/.*$ /index.html break;
     }
     # Статические ресурсы admin-panel кэшируем надолго
-    location ~* ^/admin-panel/.+\.(js|css|woff2?|ttf|eot|svg|png|jpg|ico|webp)$ {
+    location ~* ^/capibaradoglog/.+\.(js|css|woff2?|ttf|eot|svg|png|jpg|ico|webp)$ {
         alias /opt/aperod/artifacts/admin-panel/dist/public/;
-        rewrite ^/admin-panel/(.*)$ /$1 break;
+        rewrite ^/capibaradoglog/(.*)$ /$1 break;
         expires 1y;
         add_header Cache-Control "public, immutable";
         access_log off;
