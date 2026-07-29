@@ -78,6 +78,16 @@ type Engine struct {
         // next coinbase is produced by this validator, when they are paid out.
         accumulatedTips uint64
 
+        // txVerifier performs full cryptographic verification of incoming block txs.
+        // If nil, cryptographic verification is skipped (dev/test only — never in production).
+        txVerifier *core.TxVerifier
+        // utxos is the live UTXO set kept in sync with the chain.
+        // Required for double-spend detection via txVerifier.
+        utxos *core.UTXOSet
+        // pendingVoteHeight maps block hash → height for blocks with pending (non-finalized)
+        // votes. Used to prune the votes map by height to prevent unbounded growth.
+        pendingVoteHeight map[crypto.Hash32]uint64
+
         // Channels for external events
         newBlockCh chan *core.Block  // incoming blocks from P2P
         newVoteCh  chan FinalizeMsg  // incoming finalization votes
@@ -87,17 +97,18 @@ type Engine struct {
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
         e := &Engine{
-                cfg:        cfg,
-                chain:      chain,
-                pool:       pool,
-                log:        log,
-                votes:      make(map[crypto.Hash32]map[string][]byte),
-                finalized:  make(map[uint64]bool),
-                slashing:   newSlashingDetector(),
-                baseFee:    core.InitialBaseFeePerByte,
-                newBlockCh: make(chan *core.Block, 64),
-                newVoteCh:  make(chan FinalizeMsg, 256),
-                producedCh: make(chan *core.Block, 64),
+                cfg:               cfg,
+                chain:             chain,
+                pool:              pool,
+                log:               log,
+                votes:             make(map[crypto.Hash32]map[string][]byte),
+                finalized:         make(map[uint64]bool),
+                pendingVoteHeight: make(map[crypto.Hash32]uint64),
+                slashing:          newSlashingDetector(),
+                baseFee:           core.InitialBaseFeePerByte,
+                newBlockCh:        make(chan *core.Block, 64),
+                newVoteCh:         make(chan FinalizeMsg, 256),
+                producedCh:        make(chan *core.Block, 64),
         }
         // Seed the registry with genesis validators so they start Active.
         if cfg.Registry != nil && len(cfg.Validators) > 0 {
@@ -105,6 +116,15 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
         }
         return e
+}
+
+// SetTxVerifier attaches a full cryptographic transaction verifier to the engine.
+// Must be called before Run() in production deployments so that incoming P2P
+// blocks are validated before being accepted into the chain.
+// utxos must be the same UTXOSet passed to the verifier so it stays in sync.
+func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
+        e.txVerifier = v
+        e.utxos = utxos
 }
 
 // activeValidators returns the current active validator set.
@@ -179,6 +199,16 @@ func (e *Engine) tick() error {
         // Add to our own chain
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add produced block: %w", err)
+        }
+
+        // Keep the UTXO set in sync so the TxVerifier has correct state
+        // for subsequent blocks (both ours and peers').
+        if e.utxos != nil {
+                if err := e.utxos.ApplyBlock(block); err != nil {
+                        // Log but don't fail — the block is already on chain.
+                        e.log.Warn("utxo apply failed for self-produced block",
+                                "height", block.Header.Height, "err", err)
+                }
         }
 
         // Process stake txs and epoch updates for self-produced blocks
@@ -464,8 +494,30 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("oracle price check failed: %w", err)
         }
 
+        // Full cryptographic transaction verification: ring sigs, range proofs,
+        // Pedersen commitment balance, and double-spend (key image) checks.
+        // This MUST run before AddBlock to prevent inflation or invalid-sig attacks.
+        // Without this check a malicious peer can broadcast blocks with unbalanced
+        // commitments (minting coins from thin air) or forged ring signatures.
+        if e.txVerifier != nil {
+                if err := e.txVerifier.VerifyBlock(block); err != nil {
+                        return fmt.Errorf("tx crypto verification failed: %w", err)
+                }
+        } else {
+                e.log.Warn("SECURITY: no TxVerifier set — skipping cryptographic block verification",
+                        "height", block.Header.Height)
+        }
+
         if err := e.chain.AddBlock(block); err != nil {
                 return fmt.Errorf("add block: %w", err)
+        }
+
+        // Keep UTXO set in sync so future VerifyBlock calls have correct state.
+        if e.utxos != nil {
+                if err := e.utxos.ApplyBlock(block); err != nil {
+                        e.log.Warn("utxo apply failed for incoming block",
+                                "height", block.Header.Height, "err", err)
+                }
         }
 
         // ── EIP-1559 base fee update ─────────────────────────────────────────────
@@ -575,6 +627,8 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 
         if e.votes[vote.BlockHash] == nil {
                 e.votes[vote.BlockHash] = make(map[string][]byte)
+                // Record the height for this block hash so we can prune by height.
+                e.pendingVoteHeight[vote.BlockHash] = vote.Height
         }
         e.votes[vote.BlockHash][vote.ValidatorPub.Hex()] = vote.Signature
 
@@ -587,8 +641,29 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
                         "votes", len(e.votes[vote.BlockHash]),
                         "needed", needed,
                 )
-                // Clean up old vote records
+                // Clean up vote records for this block once finalized.
                 delete(e.votes, vote.BlockHash)
+                delete(e.pendingVoteHeight, vote.BlockHash)
+        }
+
+        // Prune vote records and finalized entries for heights far below the
+        // current tip to prevent unbounded growth when blocks never reach quorum
+        // (e.g. due to network partitions or validator churn).
+        // Keep the most recent 256 heights of pending votes and finalized entries.
+        const votePruneDepth uint64 = 256
+        if vote.Height > votePruneDepth {
+                pruneBelow := vote.Height - votePruneDepth
+                for bh, ht := range e.pendingVoteHeight {
+                        if ht < pruneBelow {
+                                delete(e.votes, bh)
+                                delete(e.pendingVoteHeight, bh)
+                        }
+                }
+                for h := range e.finalized {
+                        if h < pruneBelow {
+                                delete(e.finalized, h)
+                        }
+                }
         }
 
         return nil

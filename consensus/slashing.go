@@ -52,6 +52,17 @@ func (sd *slashingDetector) CheckBlock(height uint64, round uint32, pub crypto.V
 	prev, exists := sd.seen[key]
 	if !exists {
 		sd.seen[key] = signedSlot{hash: hash, sig: sig}
+		// Opportunistically prune entries for heights far below this one to
+		// prevent the seen map from growing unboundedly.  Keep the last 2048
+		// heights of evidence so any delayed double-sign is still caught.
+		if height > 2048 {
+			pruneBelow := height - 2048
+			for k := range sd.seen {
+				if k.height < pruneBelow {
+					delete(sd.seen, k)
+				}
+			}
+		}
 		return nil
 	}
 	if prev.hash == hash {
@@ -65,6 +76,19 @@ func (sd *slashingDetector) CheckBlock(height uint64, round uint32, pub crypto.V
 		Sig1:      prev.sig,
 		Hash2:     hash,
 		Sig2:      sig,
+	}
+}
+
+// PruneBelow removes all slashing evidence records for heights strictly below
+// the given height.  Call this periodically (e.g. once per epoch) to bound
+// memory usage when the seen map is not pruned by CheckBlock alone.
+func (sd *slashingDetector) PruneBelow(height uint64) {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+	for k := range sd.seen {
+		if k.height < height {
+			delete(sd.seen, k)
+		}
 	}
 }
 

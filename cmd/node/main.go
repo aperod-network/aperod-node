@@ -287,6 +287,13 @@ func run() error {
         }()
 
         utxos := core.NewUTXOSet()
+
+        // Wire full cryptographic tx verification into the consensus engine.
+        // This ensures that P2P-received blocks have their ring signatures,
+        // range proofs, and Pedersen commitment balance checked before acceptance.
+        txVerifier := core.NewTxVerifier(utxos)
+        engine.SetTxVerifier(txVerifier, utxos)
+
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
                 apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)

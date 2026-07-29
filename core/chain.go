@@ -228,10 +228,17 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
                 }
         }
 
-        // Remove old canonical blocks above fork point
+        // Remove old canonical blocks above fork point from both indexes.
         oldTip := c.tip
         for h := oldTip.Header.Height; h > forkPoint; h-- {
-                delete(c.byHeight, h)
+                if old, ok := c.byHeight[h]; ok {
+                        delete(c.blocks, old.Hash())
+                        delete(c.byHeight, h)
+                        // Remove tx index entries for the orphaned block.
+                        for _, tx := range old.Txs {
+                                delete(c.txIndex, tx.Hash())
+                        }
+                }
         }
 
         // Install new blocks
