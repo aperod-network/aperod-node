@@ -3,9 +3,12 @@
 package main
 
 import (
+        "bytes"
         "encoding/hex"
         "encoding/json"
         "fmt"
+        "io"
+        "net/http"
         "os"
         "strings"
         "syscall"
@@ -16,6 +19,44 @@ import (
         "github.com/spf13/cobra"
         "golang.org/x/term"
 )
+
+// ─── JSON-RPC helper ──────────────────────────────────────────────────────────
+
+// rpcCall makes a JSON-RPC 2.0 call to the node and returns the raw result
+// bytes (or an error extracted from the response).
+func rpcCall(endpoint, method string, params interface{}) (json.RawMessage, error) {
+        body, err := json.Marshal(map[string]interface{}{
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  method,
+                "params":  params,
+        })
+        if err != nil {
+                return nil, err
+        }
+        resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body)) //nolint:noctx
+        if err != nil {
+                return nil, fmt.Errorf("RPC request failed: %w", err)
+        }
+        defer resp.Body.Close()
+        raw, err := io.ReadAll(resp.Body)
+        if err != nil {
+                return nil, fmt.Errorf("RPC read body: %w", err)
+        }
+        var rr struct {
+                Result json.RawMessage `json:"result"`
+                Error  *struct {
+                        Message string `json:"message"`
+                } `json:"error"`
+        }
+        if err := json.Unmarshal(raw, &rr); err != nil {
+                return nil, fmt.Errorf("RPC decode response: %w", err)
+        }
+        if rr.Error != nil {
+                return nil, fmt.Errorf("RPC error: %s", rr.Error.Message)
+        }
+        return rr.Result, nil
+}
 
 var (
         flagConfig   string
@@ -86,15 +127,17 @@ var nodeStatusCmd = &cobra.Command{
         RunE: func(cmd *cobra.Command, args []string) error {
                 rpcAddr, _ := cmd.Flags().GetString("rpc")
                 fmt.Printf("Querying node at %s...\n", rpcAddr)
-                // TODO Phase 2: call JSON-RPC apr_getNodeInfo
-                fmt.Println(`{
-  "status": "running",
-  "network": "testnet",
-  "height": 0,
-  "peers": 0,
-  "validators": 0,
-  "tps": 0
-}`)
+                result, err := rpcCall(rpcAddr, "apr_getNodeInfo", nil)
+                if err != nil {
+                        return fmt.Errorf("node status: %w", err)
+                }
+                // Pretty-print the JSON result
+                var pretty bytes.Buffer
+                if e := json.Indent(&pretty, result, "", "  "); e != nil {
+                        fmt.Println(string(result))
+                } else {
+                        fmt.Println(pretty.String())
+                }
                 return nil
         },
 }
@@ -336,9 +379,30 @@ var walletBalanceCmd = &cobra.Command{
                 viewKey, _ := cmd.Flags().GetString("view-key")
 
                 fmt.Printf("Scanning for UTXOs belonging to %s...\n", addr)
-                fmt.Printf("RPC: %s | View key: %s\n", rpc, viewKey)
-                // TODO Phase 2: call apr_getBalance with view key
-                fmt.Println("Balance: 0.00000000 APRO  (0 confirmed outputs)")
+
+                params := map[string]interface{}{"address": addr}
+                if viewKey != "" {
+                        params["view_key"] = viewKey
+                }
+                result, err := rpcCall(rpc, "apr_getBalance", params)
+                if err != nil {
+                        return fmt.Errorf("wallet balance: %w", err)
+                }
+                var resp struct {
+                        Balance uint64 `json:"balance"`
+                        Unit    string `json:"unit"`
+                }
+                if e := json.Unmarshal(result, &resp); e == nil && resp.Unit != "" {
+                        balanceAPRO := float64(resp.Balance) / 1e8
+                        fmt.Printf("Balance: %.8f APRO  (%d nAPRO)\n", balanceAPRO, resp.Balance)
+                } else {
+                        var pretty bytes.Buffer
+                        if e2 := json.Indent(&pretty, result, "", "  "); e2 != nil {
+                                fmt.Println(string(result))
+                        } else {
+                                fmt.Println(pretty.String())
+                        }
+                }
                 return nil
         },
 }
@@ -492,25 +556,22 @@ validator key configured; this command calls its admin REST endpoint.`,
                 fmt.Printf("  pub_key    : %s…%s\n", pubKey[:8], pubKey[56:])
                 fmt.Printf("  amount     : %.8f APRO (%d nAPRO)\n", amount, amountNAPR)
 
-                // Use Go's net/http to post the request and print the JSON response.
-                // We import net/http lazily via the standard library; it is always available.
-                resp, err := func() (string, error) {
-                        import_net_http := strings.Contains(nodeURL, "http") // always true
-                        _ = import_net_http
-                        // inline http call to avoid circular imports
-                        const maxBody = 8192
-                        req, e := fmt.Sprintf(`POST %s body:%s`, url, payload), error(nil)
-                        _ = req
-                        _ = e
-                        // NOTE: actual HTTP is done below via os/exec since we cannot import net/http here without the import block.
-                        // For a production CLI, add "net/http" to the import list above.
-                        return fmt.Sprintf("Would POST to %s with body: %s", url, payload), nil
-                }()
+                httpResp, err := http.Post(url, "application/json", strings.NewReader(payload)) //nolint:noctx
                 if err != nil {
-                        return err
+                        return fmt.Errorf("partial-unstake request failed: %w", err)
                 }
-
-                fmt.Println(resp)
+                defer httpResp.Body.Close()
+                body, _ := io.ReadAll(httpResp.Body)
+                if httpResp.StatusCode != 200 {
+                        return fmt.Errorf("partial-unstake: server returned %d — %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
+                }
+                // Pretty-print the JSON response
+                var pretty bytes.Buffer
+                if e := json.Indent(&pretty, body, "", "  "); e != nil {
+                        fmt.Println(string(body))
+                } else {
+                        fmt.Println(pretty.String())
+                }
                 fmt.Println()
                 fmt.Println("✅  Partial-unstake request sent. The unbonding period (~7 days) begins once")
                 fmt.Println("    the transaction is included in a block.")
@@ -546,15 +607,16 @@ var chainInfoCmd = &cobra.Command{
         RunE: func(cmd *cobra.Command, args []string) error {
                 rpc, _ := cmd.Flags().GetString("rpc")
                 fmt.Printf("Chain info from %s:\n", rpc)
-                // TODO Phase 2: call apr_getNodeInfo
-                fmt.Println(`{
-  "chain_id": "aperod-testnet-1",
-  "height": 0,
-  "genesis_hash": "0x0000...0000",
-  "validators": [],
-  "tps_1m": 0,
-  "tps_10m": 0
-}`)
+                result, err := rpcCall(rpc, "apr_getNodeInfo", nil)
+                if err != nil {
+                        return fmt.Errorf("chain info: %w", err)
+                }
+                var pretty bytes.Buffer
+                if e := json.Indent(&pretty, result, "", "  "); e != nil {
+                        fmt.Println(string(result))
+                } else {
+                        fmt.Println(pretty.String())
+                }
                 return nil
         },
 }
