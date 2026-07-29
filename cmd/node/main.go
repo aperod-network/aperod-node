@@ -455,9 +455,29 @@ func run() error {
         return nil
 }
 
+// checkKeyFilePermissions returns an error if the key file has group- or
+// world-readable/writable/executable bits set (mode & 0o077 != 0).
+// A compromised key file is a critical security risk — the node refuses to boot.
+func checkKeyFilePermissions(path string) error {
+        info, err := os.Stat(path)
+        if err != nil {
+                return nil // not found — handled by caller
+        }
+        if info.Mode().Perm()&0o077 != 0 {
+                return fmt.Errorf(
+                        "validator key file %q has unsafe permissions %s — "+
+                                "other users may read it; fix with: chmod 600 %q",
+                        path, info.Mode().Perm(), path)
+        }
+        return nil
+}
+
 // loadOrGenerateValidatorKey returns the node's validator private key.
 func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.ValidatorPrivKey, error) {
         if cfg.Consensus.ValidatorKey != "" {
+                if err := checkKeyFilePermissions(cfg.Consensus.ValidatorKey); err != nil {
+                        return nil, err
+                }
                 privBytes, err := os.ReadFile(cfg.Consensus.ValidatorKey)
                 if err != nil {
                         return nil, fmt.Errorf("read validator key file: %w", err)
@@ -471,6 +491,9 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
         }
 
         keyPath := filepath.Join(cfg.DataDir, "validator.key")
+        if err := checkKeyFilePermissions(keyPath); err != nil {
+                return nil, err
+        }
         if data, err := os.ReadFile(keyPath); err == nil {
                 priv, err := crypto.ValidatorPrivKeyFromBytes(data)
                 if err != nil {
