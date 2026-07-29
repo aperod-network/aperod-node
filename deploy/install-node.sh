@@ -242,7 +242,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=aperod
 ExecStart=/usr/local/bin/aperod-node --config ${CONFIG_DIR}/node.yaml
 Restart=always
 RestartSec=5
@@ -252,6 +252,23 @@ LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=aperod-node
+
+# ── Systemd Sandbox (prevents RCE escalation to full server access) ──────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=${DATA_DIR}
+ReadWritePaths=${CONFIG_DIR}
 
 [Install]
 WantedBy=multi-user.target

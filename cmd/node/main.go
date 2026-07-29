@@ -482,6 +482,8 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 if err != nil {
                         return nil, fmt.Errorf("read validator key file: %w", err)
                 }
+                // Zero the seed bytes after key derivation; safe for 32-byte seeds only.
+                defer func() { if len(privBytes) == 32 { crypto.ZeroBytes(privBytes) } }()
                 priv, err := crypto.ValidatorPrivKeyFromBytes(privBytes)
                 if err != nil {
                         return nil, fmt.Errorf("parse validator private key: %w", err)
@@ -495,6 +497,7 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 return nil, err
         }
         if data, err := os.ReadFile(keyPath); err == nil {
+                defer func() { if len(data) == 32 { crypto.ZeroBytes(data) } }()
                 priv, err := crypto.ValidatorPrivKeyFromBytes(data)
                 if err != nil {
                         return nil, fmt.Errorf("parse persisted validator key: %w", err)

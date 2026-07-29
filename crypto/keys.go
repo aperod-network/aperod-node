@@ -85,3 +85,12 @@ func (k ValidatorPubKey) Verify(hash Hash32, sig []byte) bool {
 func (k ValidatorPubKey) Equals(other ValidatorPubKey) bool {
         return string(k) == string(other)
 }
+
+// ZeroBytes overwrites b with zeros to remove sensitive key material from memory.
+// Call this immediately after extracting a structured key type from raw bytes,
+// so that heap dumps and core files cannot expose the unprocessed secret.
+func ZeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}

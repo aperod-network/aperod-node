@@ -37,7 +37,11 @@ const MaxMessageSize = 10 * 1024 * 1024
 const DialTimeout = 5 * time.Second
 
 // ReadTimeout for incoming messages.
-const ReadTimeout = 30 * time.Second
+// ReadTimeout for incoming messages — tight to prevent Slowloris-style stalls.
+const ReadTimeout = 5 * time.Second
+
+// WriteTimeout for outbound writes — prevents a slow peer from blocking the goroutine.
+const WriteTimeout = 5 * time.Second
 
 // Envelope wraps every network message with a type tag and length-prefixed body.
 type Envelope struct {
@@ -110,6 +114,7 @@ func ReadMsg(conn net.Conn) (MessageType, []byte, error) {
 }
 
 func writeMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
+        conn.SetWriteDeadline(time.Now().Add(WriteTimeout)) //nolint:errcheck
         data, err := json.Marshal(payload)
         if err != nil {
                 return fmt.Errorf("marshal: %w", err)

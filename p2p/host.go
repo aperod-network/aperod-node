@@ -4,6 +4,7 @@ import (
         "fmt"
         "log/slog"
         "net"
+        "runtime/debug"
         "sync"
         "time"
 
@@ -298,6 +299,21 @@ func (h *Host) dialPeer(addr string) {
 
 func (h *Host) handleConn(conn net.Conn, outbound bool) {
         addr := conn.RemoteAddr().String()
+
+        // Safety net: catch panics from malformed peer messages so a single
+        // misbehaving peer cannot crash the node process.
+        defer func() {
+                if r := recover(); r != nil {
+                        h.log.Error("panic in P2P handleConn — peer dropped, node is safe",
+                                "peer", addr,
+                                "panic", fmt.Sprintf("%v", r),
+                                "stack", string(debug.Stack()))
+                        conn.Close()
+                        h.mu.Lock()
+                        delete(h.peers, addr)
+                        h.mu.Unlock()
+                }
+        }()
 
         // Reject banned peers immediately
         if h.mgr.IsBanned(addr) {
