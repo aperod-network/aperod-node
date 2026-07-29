@@ -18,9 +18,10 @@ type Config struct {
         Bootnodes     []string
         MaxPeers      int
         MinPeers      int
-        MaxPeersPerIP int    // max inbound connections from one source IP (0 = unlimited, recommended: 3)
-        NodeID        string // hex-encoded public key or random ID
-        UserAgent     string
+        MaxPeersPerIP    int    // max inbound connections from one source IP (0 = unlimited, recommended: 3)
+        ReservedOutbound int    // inbound slots blocked off for outbound dial-out connections (0 = disable)
+        NodeID           string // hex-encoded public key or random ID
+        UserAgent        string
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -237,14 +238,38 @@ func (h *Host) acceptLoop() {
                 // when the peer table is already full.
                 if h.cfg.MaxPeers > 0 {
                         h.mu.RLock()
-                        count := len(h.peers)
+                        total := len(h.peers)
+                        outCount := 0
+                        if h.cfg.ReservedOutbound > 0 {
+                                for _, p := range h.peers {
+                                        if p.outbound {
+                                                outCount++
+                                        }
+                                }
+                        }
                         h.mu.RUnlock()
-                        if count >= h.cfg.MaxPeers {
+
+                        // Hard cap on total peers.
+                        if total >= h.cfg.MaxPeers {
                                 h.log.Debug("inbound connection rejected: MaxPeers reached",
                                         "addr", conn.RemoteAddr().String(),
                                         "max", h.cfg.MaxPeers)
                                 conn.Close()
                                 continue
+                        }
+                        // Reserve slots for outbound connections (#419): inbound flood
+                        // must not consume slots that validators need to dial out.
+                        if h.cfg.ReservedOutbound > 0 {
+                                inboundCap := h.cfg.MaxPeers - h.cfg.ReservedOutbound
+                                inboundCount := total - outCount
+                                if inboundCount >= inboundCap {
+                                        h.log.Debug("inbound connection rejected: reserved outbound slots",
+                                                "addr", conn.RemoteAddr().String(),
+                                                "inbound", inboundCount,
+                                                "cap", inboundCap)
+                                        conn.Close()
+                                        continue
+                                }
                         }
                 }
 
