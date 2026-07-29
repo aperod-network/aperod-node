@@ -32,6 +32,9 @@ type Server struct {
         corsOrigins []string // empty = allow all ("*")
         rateLimiter *RateLimiter
         peerCounter func() int // optional; wired to p2p.Host.PeerCount by cmd/node
+        // tsRejectedCounter returns the count of blocks rejected by the timejacking guard.
+        // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
+        tsRejectedCounter func() int64
 
         // txTotal is an O(1) cached total non-coinbase tx count.
         // Updated atomically so no lock is needed in hot paths.
@@ -80,6 +83,18 @@ func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
 func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
+
+// SetTimestampRejectedCounter wires a function returning the live count of blocks
+// rejected by the timejacking guard.  Optional — reports 0 when unset.
+func (s *Server) SetTimestampRejectedCounter(f func() int64) { s.tsRejectedCounter = f }
+
+// TimestampRejectedCount returns the current live count (0 when not wired).
+func (s *Server) TimestampRejectedCount() int64 {
+        if s.tsRejectedCounter == nil {
+                return 0
+        }
+        return s.tsRejectedCounter()
+}
 
 // SetTxTotal sets the initial total non-coinbase tx count (call once after
 // loading the chain from disk to avoid an O(n) scan on every stats request).

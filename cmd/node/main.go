@@ -359,6 +359,7 @@ func run() error {
                 apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetStore(db) // enables pruned-block fallback in the REST API
+        apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
                 go func() {
                         if err := apiSrv.Start(); err != nil {
                                 log.Error("API server stopped", "err", err)

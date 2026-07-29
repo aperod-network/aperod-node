@@ -10,6 +10,7 @@ import (
         "math"
         "net/http"
         "sync"
+	"sync/atomic"
         "time"
 
         "github.com/aperod/aperod/core"
@@ -88,6 +89,11 @@ type Engine struct {
         // votes. Used to prune the votes map by height to prevent unbounded growth.
         pendingVoteHeight map[crypto.Hash32]uint64
 
+        // timestampRejected counts how many incoming P2P blocks have been rejected by
+        // the timejacking guard since node start.  Incremented atomically; safe to
+        // read from outside the engine goroutine (e.g. the API server).
+        timestampRejected int64
+
         // Channels for external events
         newBlockCh chan *core.Block  // incoming blocks from P2P
         newVoteCh  chan FinalizeMsg  // incoming finalization votes
@@ -116,6 +122,12 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
         }
         return e
+}
+
+// TimestampRejectedCount returns the total number of incoming P2P blocks rejected
+// by the timejacking guard since this node started.  Safe to call from any goroutine.
+func (e *Engine) TimestampRejectedCount() int64 {
+        return atomic.LoadInt64(&e.timestampRejected)
 }
 
 // SetTxVerifier attaches a full cryptographic transaction verifier to the engine.
@@ -549,6 +561,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 skewNs = -skewNs
         }
         if skewNs > maxClockSkewNs {
+                atomic.AddInt64(&e.timestampRejected, 1)
                 return fmt.Errorf("block %d: timestamp too far from local clock (skew %dms, max %dms)",
                         block.Header.Height, skewNs/1_000_000, maxClockSkewNs/1_000_000)
         }

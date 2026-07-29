@@ -548,24 +548,26 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                         tps = float64(windowTxs) / (float64(windowBlocks) * 3.0)
                 }
                 writeJSON(w, http.StatusOK, map[string]interface{}{
-                        "height":          height,
-                        "tip_hash":        tipHash,
-                        "tip_time":        tipTime,
-                        "total_txs":       totalTxs,
-                        "mempool_count":   s.mempool.Count(),
-                        "tps_last_10":     tps,
-                        "block_time_secs": 3,
+                        "height":                   height,
+                        "tip_hash":                 tipHash,
+                        "tip_time":                 tipTime,
+                        "total_txs":                totalTxs,
+                        "mempool_count":            s.mempool.Count(),
+                        "tps_last_10":              tps,
+                        "block_time_secs":          3,
+                        "timestamp_rejected_count": s.TimestampRejectedCount(),
                 })
                 return
         }
 
         writeJSON(w, http.StatusOK, map[string]interface{}{
-                "height":        0,
-                "tip_hash":      "",
-                "tip_time":      "",
-                "total_txs":     0,
-                "mempool_count": s.mempool.Count(),
-                "tps_last_10":   0,
+                "height":                   0,
+                "tip_hash":                 "",
+                "tip_time":                 "",
+                "total_txs":                0,
+                "mempool_count":            s.mempool.Count(),
+                "tps_last_10":              0,
+                "timestamp_rejected_count": s.TimestampRejectedCount(),
         })
 }
 
