@@ -19,16 +19,17 @@ import (
 
 // Node is the complete Aperod node: chain + consensus + p2p + API.
 type Node struct {
-        cfg     *Config
-        log     *slog.Logger
-        chain   *core.Chain
-        utxos   *core.UTXOSet
-        mempool *core.Mempool
-        verifier *core.BlockVerifier
-        engine  *consensus.Engine
-        host    *p2p.Host
-        db      *store.DB
-        stop    chan struct{}
+        cfg        *Config
+        log        *slog.Logger
+        chain      *core.Chain
+        utxos      *core.UTXOSet
+        txVerifier *core.TxVerifier
+        mempool    *core.Mempool
+        verifier   *core.BlockVerifier
+        engine     *consensus.Engine
+        host       *p2p.Host
+        db         *store.DB
+        stop       chan struct{}
 }
 
 // Config holds all node configuration.
@@ -170,16 +171,17 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
         }, p2pHandler, log)
 
         return &Node{
-                cfg:      cfg,
-                log:      log,
-                chain:    chain,
-                utxos:    utxos,
-                mempool:  mempool,
-                verifier: blockV,
-                engine:   engine,
-                host:     host,
-                db:       db,
-                stop:     make(chan struct{}),
+                cfg:        cfg,
+                log:        log,
+                chain:      chain,
+                utxos:      utxos,
+                txVerifier: txV,
+                mempool:    mempool,
+                verifier:   blockV,
+                engine:     engine,
+                host:       host,
+                db:         db,
+                stop:       make(chan struct{}),
         }, nil
 }
 
@@ -195,6 +197,10 @@ func (n *Node) Start() error {
         if err := n.host.Start(); err != nil {
                 return fmt.Errorf("p2p start: %w", err)
         }
+
+        // Wire TxVerifier BEFORE starting the engine goroutine so that
+        // handleIncomingBlock never runs with e.txVerifier == nil (fail-closed).
+        n.engine.SetTxVerifier(n.txVerifier, n.utxos)
 
         // Start consensus loop
         go n.engine.Run(n.stop)
