@@ -108,9 +108,11 @@ func (m *Mempool) Add(tx Transaction) error {
                 }
         }
 
-        // Evict oldest if at capacity
+        // Evict lowest-fee transaction if at capacity to resist mempool-flood DDoS.
+        // A spammer filling the pool with dust-fee txs gets their own transactions
+        // displaced first, preserving room for legitimate high-value activity.
         if len(m.entries) >= m.cfg.MaxSize {
-                m.evictOldest()
+                m.evictLowestFee()
         }
 
         entry := &mempoolEntry{
@@ -244,4 +246,30 @@ func (m *Mempool) evictOldest() {
                 }
                 delete(m.entries, oldest.Hash)
         }
+}
+
+// evictLowestFee removes the lowest-fee non-system entry (called under lock).
+// This is the flood-resistant eviction policy: a spammer filling the pool with
+// dust-fee transactions will always evict their own entries first, preserving
+// slots for legitimate higher-value transactions.
+// Falls back to evictOldest if only coinbase/stake entries remain.
+func (m *Mempool) evictLowestFee() {
+	var cheapest *mempoolEntry
+	for _, e := range m.entries {
+		if e.Tx.IsCoinbase() || e.Tx.IsStake() {
+			continue
+		}
+		if cheapest == nil || e.Tx.Fee < cheapest.Tx.Fee {
+			cheapest = e
+		}
+	}
+	if cheapest == nil {
+		// Only system transactions in pool — fall back to FIFO eviction.
+		m.evictOldest()
+		return
+	}
+	for _, inp := range cheapest.Tx.Inputs {
+		delete(m.keyImages, inp.KeyImage)
+	}
+	delete(m.entries, cheapest.Hash)
 }

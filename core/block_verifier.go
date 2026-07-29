@@ -9,6 +9,11 @@ import (
 type BlockVerifierConfig struct {
 	// MaxBlockTime is the maximum allowed future timestamp for a block.
 	MaxBlockTime time.Duration
+	// MaxPastDrift is the maximum allowed age of a block timestamp relative to
+	// the node's wall clock. Blocks older than this are rejected to prevent
+	// Timejacking — replaying blocks with stale timestamps to skew chain time.
+	// Set to 0 to disable the past-drift check (e.g. during fast sync).
+	MaxPastDrift time.Duration
 	// MaxTxsPerBlock is the hard limit on transactions per block.
 	MaxTxsPerBlock int
 	// MaxBlockSize in bytes.
@@ -18,7 +23,8 @@ type BlockVerifierConfig struct {
 // DefaultBlockVerifierConfig returns safe production defaults.
 func DefaultBlockVerifierConfig() BlockVerifierConfig {
 	return BlockVerifierConfig{
-		MaxBlockTime:   2 * time.Second, // allow 2s clock drift
+		MaxBlockTime:   2 * time.Second,  // reject blocks > 2s in the future
+		MaxPastDrift:   30 * time.Second, // reject blocks > 30s in the past (anti-timejacking)
 		MaxTxsPerBlock: 2000,
 		MaxBlockSize:   4 * 1024 * 1024, // 4 MB
 	}
@@ -73,6 +79,12 @@ func (v *BlockVerifier) VerifyBlock(block *Block) error {
 		if blockTime.After(now.Add(v.cfg.MaxBlockTime)) {
 			return fmt.Errorf("block %d: timestamp %v too far in the future (now=%v)",
 				block.Header.Height, blockTime, now)
+		}
+		// Anti-timejacking: reject blocks with stale timestamps so an attacker
+		// cannot replay old headers to skew the chain's perceived wall time.
+		if v.cfg.MaxPastDrift > 0 && blockTime.Before(now.Add(-v.cfg.MaxPastDrift)) {
+			return fmt.Errorf("block %d: timestamp %v too far in the past (now=%v, maxDrift=%v)",
+				block.Header.Height, blockTime, now, v.cfg.MaxPastDrift)
 		}
 	}
 

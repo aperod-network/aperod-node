@@ -156,3 +156,61 @@ func TestUTXOSet_FreshSet_DoesNotBlockUnspentKeyImage(t *testing.T) {
 	}
 	t.Logf("fresh set correctly allows unspent key image (got: %v)", err)
 }
+
+// TestVerifyBlock_Timejacking_Rejected confirms that VerifyBlock rejects blocks
+// whose timestamps are too far in the past (anti-timejacking, MaxPastDrift, #418).
+func TestVerifyBlock_Timejacking_Rejected(t *testing.T) {
+	chain := core.NewChain()
+
+	// Genesis must be older than the stale block so the "after parent" check
+	// passes, leaving only the MaxPastDrift check to fire.
+	priv0, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey genesis: %v", err)
+	}
+	genesisHdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().Add(-90 * time.Second).UnixNano(), // 90s in the past
+		ValidatorPub: priv0.Public(),
+	}
+	if err := genesisHdr.Sign(priv0); err != nil {
+		t.Fatalf("Sign genesis: %v", err)
+	}
+	genesis := &core.Block{Header: genesisHdr}
+	chain.SetGenesis(genesis)
+
+	cfg := core.DefaultBlockVerifierConfig()
+	cfg.MaxPastDrift = 30 * time.Second
+
+	verifier := core.NewBlockVerifier(cfg, chain, nil)
+
+	// Craft a block with timestamp 60s in the past.
+	// It is after the genesis (90s ago) so the chain-order check passes,
+	// but it is 60s > MaxPastDrift=30s in the past — must be rejected.
+	priv1, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	staleTime := time.Now().Add(-60 * time.Second).UnixNano()
+	header := core.BlockHeader{
+		Height:       1,
+		PrevHash:     genesis.Hash(),
+		MerkleRoot:   core.MerkleRoot(nil),
+		Timestamp:    staleTime,
+		Round:        1,
+		ValidatorPub: priv1.Public(),
+	}
+	if err := header.Sign(priv1); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	staleBlock := &core.Block{Header: header}
+
+	err = verifier.VerifyBlock(staleBlock)
+	if err == nil {
+		t.Fatal("expected stale-timestamp block to be rejected, but VerifyBlock returned nil")
+	}
+	if !strings.Contains(err.Error(), "too far in the past") {
+		t.Fatalf("expected 'too far in the past' error, got: %v", err)
+	}
+	t.Logf("correctly rejected (timejacking block): %v", err)
+}

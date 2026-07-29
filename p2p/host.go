@@ -14,12 +14,22 @@ import (
 
 // Config holds p2p networking parameters.
 type Config struct {
-        ListenAddr string
-        Bootnodes  []string
-        MaxPeers   int
-        MinPeers   int
-        NodeID     string // hex-encoded public key or random ID
-        UserAgent  string
+        ListenAddr    string
+        Bootnodes     []string
+        MaxPeers      int
+        MinPeers      int
+        MaxPeersPerIP int    // max inbound connections from one source IP (0 = unlimited, recommended: 3)
+        NodeID        string // hex-encoded public key or random ID
+        UserAgent     string
+}
+
+// connIP extracts the host part from an "IP:port" address string.
+func connIP(addr string) string {
+        host, _, err := net.SplitHostPort(addr)
+        if err != nil {
+                return addr
+        }
+        return host
 }
 
 // Handler is the callback interface for handling incoming p2p messages.
@@ -233,6 +243,28 @@ func (h *Host) acceptLoop() {
                                 h.log.Debug("inbound connection rejected: MaxPeers reached",
                                         "addr", conn.RemoteAddr().String(),
                                         "max", h.cfg.MaxPeers)
+                                conn.Close()
+                                continue
+                        }
+                }
+
+                // Per-IP limit: prevents one IP from consuming all peer slots
+                // (eclipse / peer-slot-exhaustion attack, task #415).
+                if h.cfg.MaxPeersPerIP > 0 {
+                        remoteIP := connIP(conn.RemoteAddr().String())
+                        h.mu.RLock()
+                        ipCount := 0
+                        for peerAddr := range h.peers {
+                                if connIP(peerAddr) == remoteIP {
+                                        ipCount++
+                                }
+                        }
+                        h.mu.RUnlock()
+                        if ipCount >= h.cfg.MaxPeersPerIP {
+                                h.log.Debug("inbound connection rejected: MaxPeersPerIP reached",
+                                        "addr", conn.RemoteAddr().String(),
+                                        "ip", remoteIP,
+                                        "max", h.cfg.MaxPeersPerIP)
                                 conn.Close()
                                 continue
                         }
