@@ -223,23 +223,48 @@ func run() error {
                         "blocks_loaded_in_memory", len(recentBlocks),
                 )
 
-                // Rebuild UTXO set from the loaded blocks so TxVerifier has the
-                // correct spent key-image history before accepting any peer blocks.
-                // Without this, double-spend checks against pre-restart UTXOs are
-                // blind for the duration of the first accepted block after restart.
-                for _, b := range recentBlocks {
-                        if err := utxos.ApplyBlock(b); err != nil {
-                                // Log but don't fatal — a corrupt UTXO is still better than
-                                // refusing to start. The node will catch new double-spends.
-                                log.Warn("utxo rebuild: skipping block with error",
-                                        "height", b.Header.Height, "err", err)
+                // Rebuild the spent key-image set from FULL chain history so that
+                // TxVerifier.VerifyBlock can detect double-spends against any UTXO
+                // ever created, not only those within the recent in-memory window.
+                //
+                // We scan every stored block and mark each input's key image spent
+                // via MarkSpent (no IsSpent check — trusted store data).  This is
+                // intentionally fail-fast: any gap or decode error clears the set
+                // entirely to avoid partial state, which would be worse than an
+                // empty set (partial state gives false confidence).
+                log.Info("rebuilding spent key-image set from full chain history",
+                        "tip_height", tipHeight)
+                kiCount := 0
+                kiOK := true
+                for h := uint64(1); h <= tipHeight; h++ {
+                        raw, fetchErr := db.GetRawBlockByHeight(h)
+                        if fetchErr != nil || raw == nil {
+                                log.Error("key-image rebuild: missing block — resetting to empty set",
+                                        "height", h, "err", fetchErr)
+                                utxos = core.NewUTXOSet()
+                                kiOK = false
+                                break
+                        }
+                        var b core.Block
+                        if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
+                                log.Error("key-image rebuild: unmarshal error — resetting to empty set",
+                                        "height", h, "err", parseErr)
+                                utxos = core.NewUTXOSet()
+                                kiOK = false
+                                break
+                        }
+                        for _, tx := range b.Txs {
+                                for _, inp := range tx.Inputs {
+                                        utxos.MarkSpent(inp.KeyImage)
+                                        kiCount++
+                                }
                         }
                 }
-                utxoCount := utxos.Count()
-                log.Info("utxo set rebuilt from stored blocks",
-                        "blocks", len(recentBlocks),
-                        "utxos", utxoCount,
-                )
+                if kiOK {
+                        log.Info("spent key-image set rebuilt",
+                                "key_images_marked", kiCount,
+                                "blocks_scanned", tipHeight)
+                }
         }
 
         // initialTxTotal starts at 0; the counter accumulates from this run forward.
@@ -289,6 +314,18 @@ func run() error {
                         // Broadcast newly produced block to P2P peers (non-blocking).
                         if host != nil {
                                 host.BroadcastBlock(block)
+                        }
+                        // Persist spent key images to the LevelDB key-image index so
+                        // that future restarts can use db.IterKeyImages() instead of
+                        // scanning every raw block.  Non-fatal on error — the block is
+                        // already accepted; the index is a startup-performance optimisation.
+                        for _, tx := range block.Txs {
+                                for _, inp := range tx.Inputs {
+                                        if kiErr := db.MarkKeyImageSpent(inp.KeyImage); kiErr != nil {
+                                                log.Warn("failed to persist key image",
+                                                        "height", block.Header.Height, "err", kiErr)
+                                        }
+                                }
                         }
                 },
         }, chain, mempool, log)

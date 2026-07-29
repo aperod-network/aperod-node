@@ -241,11 +241,12 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
                 }
         }
 
-        // Install new blocks
+        // Install new blocks and index their transactions so GetTransaction works.
         for _, b := range newBlocks {
                 h := b.Hash()
                 c.blocks[h] = b
                 c.byHeight[b.Header.Height] = b
+                c.indexTxs(b)
         }
         c.tip = newBlocks[len(newBlocks)-1]
         return nil
