@@ -196,19 +196,24 @@ func (e *Engine) tick() error {
                 return fmt.Errorf("produce block: %w", err)
         }
 
-        // Add to our own chain
-        if err := e.chain.AddBlock(block); err != nil {
-                return fmt.Errorf("add produced block: %w", err)
-        }
-
-        // Keep the UTXO set in sync so the TxVerifier has correct state
-        // for subsequent blocks (both ours and peers').
+        // Apply UTXO state changes BEFORE adding to canonical chain so that if
+        // state transition fails the block is never inserted (atomic acceptance).
         if e.utxos != nil {
                 if err := e.utxos.ApplyBlock(block); err != nil {
-                        // Log but don't fail — the block is already on chain.
-                        e.log.Warn("utxo apply failed for self-produced block",
-                                "height", block.Header.Height, "err", err)
+                        return fmt.Errorf("utxo apply failed for self-produced block: %w", err)
                 }
+        }
+
+        // Add to our own chain; rollback UTXO changes on failure.
+        if err := e.chain.AddBlock(block); err != nil {
+                if e.utxos != nil {
+                        if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+                                e.log.Error("UTXO rollback failed after chain.AddBlock error (self-produced)",
+                                        "height", block.Header.Height,
+                                        "chain_err", err, "rollback_err", rbErr)
+                        }
+                }
+                return fmt.Errorf("add produced block: %w", err)
         }
 
         // Process stake txs and epoch updates for self-produced blocks
@@ -494,11 +499,18 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("oracle price check failed: %w", err)
         }
 
+        // Block-level key-image uniqueness check: detect duplicate key images
+        // across ALL transactions in the block before touching the UTXO set.
+        // TxVerifier.VerifyTx only catches duplicates within a single transaction;
+        // two separate txs in the same block can both reuse the same key image and
+        // each pass per-tx verification. This check closes that gap.
+        if err := blockKeyImageCheck(block); err != nil {
+                return fmt.Errorf("block key-image check failed: %w", err)
+        }
+
         // Full cryptographic transaction verification: ring sigs, range proofs,
-        // Pedersen commitment balance, and double-spend (key image) checks.
-        // This MUST run before AddBlock to prevent inflation or invalid-sig attacks.
-        // Without this check a malicious peer can broadcast blocks with unbalanced
-        // commitments (minting coins from thin air) or forged ring signatures.
+        // Pedersen commitment balance, and double-spend against historical UTXO set.
+        // This MUST run before UTXO application and chain insertion.
         if e.txVerifier != nil {
                 if err := e.txVerifier.VerifyBlock(block); err != nil {
                         return fmt.Errorf("tx crypto verification failed: %w", err)
@@ -508,16 +520,26 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                         "height", block.Header.Height)
         }
 
-        if err := e.chain.AddBlock(block); err != nil {
-                return fmt.Errorf("add block: %w", err)
-        }
-
-        // Keep UTXO set in sync so future VerifyBlock calls have correct state.
+        // Apply block to UTXO set BEFORE adding to canonical chain so that if the
+        // state transition fails (e.g. within-block double-spend caught by ApplyBlock)
+        // the block is never accepted. This makes block acceptance atomic.
         if e.utxos != nil {
                 if err := e.utxos.ApplyBlock(block); err != nil {
-                        e.log.Warn("utxo apply failed for incoming block",
-                                "height", block.Header.Height, "err", err)
+                        return fmt.Errorf("utxo state transition rejected block: %w", err)
                 }
+        }
+
+        if err := e.chain.AddBlock(block); err != nil {
+                // Chain insertion failed after UTXO state was already updated.
+                // Roll back UTXO changes to keep state consistent.
+                if e.utxos != nil {
+                        if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+                                e.log.Error("UTXO rollback failed after chain.AddBlock error",
+                                        "height", block.Header.Height,
+                                        "chain_err", err, "rollback_err", rbErr)
+                        }
+                }
+                return fmt.Errorf("add block: %w", err)
         }
 
         // ── EIP-1559 base fee update ─────────────────────────────────────────────
@@ -737,4 +759,29 @@ func (e *Engine) processStakeTxs(block *core.Block) {
 // HandleVote processes a finalization vote (exported for testing and P2P).
 func (e *Engine) HandleVote(vote FinalizeMsg) error {
         return e.handleVote(vote)
+}
+
+// blockKeyImageCheck detects duplicate key images across ALL transactions in a
+// block.  TxVerifier.VerifyTx only catches duplicates within a single
+// transaction; two distinct txs in the same block can each carry the same key
+// image and both pass per-tx verification.  This function closes that gap by
+// collecting every key image from every spending transaction in the block and
+// rejecting the block if any appears more than once.
+func blockKeyImageCheck(block *core.Block) error {
+        seen := make(map[crypto.KeyImage]int) // ki → first tx index
+        for txIdx, tx := range block.Txs {
+                if tx.IsCoinbase() || tx.IsStake() {
+                        continue
+                }
+                for _, inp := range tx.Inputs {
+                        if first, dup := seen[inp.KeyImage]; dup {
+                                return fmt.Errorf(
+                                        "block %d: duplicate key image %x in tx[%d] already seen in tx[%d]",
+                                        block.Header.Height, inp.KeyImage[:8], txIdx, first,
+                                )
+                        }
+                        seen[inp.KeyImage] = txIdx
+                }
+        }
+        return nil
 }

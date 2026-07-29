@@ -153,6 +153,11 @@ func run() error {
         chain := core.NewChain()
         mempool := core.NewMempool(core.DefaultMempoolConfig())
 
+        // Create the UTXO set here (before chain loading) so the resume path
+        // can populate it from stored blocks, ensuring historical spent key
+        // images are known to TxVerifier before the first peer block arrives.
+        utxos := core.NewUTXOSet()
+
         tipHash, tipHeight, err := db.GetTip()
         if err != nil {
                 return fmt.Errorf("get tip: %w", err)
@@ -216,6 +221,24 @@ func run() error {
                 log.Info("chain restored from storage",
                         "tip_height", tipHeight,
                         "blocks_loaded_in_memory", len(recentBlocks),
+                )
+
+                // Rebuild UTXO set from the loaded blocks so TxVerifier has the
+                // correct spent key-image history before accepting any peer blocks.
+                // Without this, double-spend checks against pre-restart UTXOs are
+                // blind for the duration of the first accepted block after restart.
+                for _, b := range recentBlocks {
+                        if err := utxos.ApplyBlock(b); err != nil {
+                                // Log but don't fatal — a corrupt UTXO is still better than
+                                // refusing to start. The node will catch new double-spends.
+                                log.Warn("utxo rebuild: skipping block with error",
+                                        "height", b.Header.Height, "err", err)
+                        }
+                }
+                utxoCount := utxos.Count()
+                log.Info("utxo set rebuilt from stored blocks",
+                        "blocks", len(recentBlocks),
+                        "utxos", utxoCount,
                 )
         }
 
@@ -286,11 +309,8 @@ func run() error {
                 }
         }()
 
-        utxos := core.NewUTXOSet()
-
         // Wire full cryptographic tx verification into the consensus engine.
-        // This ensures that P2P-received blocks have their ring signatures,
-        // range proofs, and Pedersen commitment balance checked before acceptance.
+        // utxos was created and populated from stored blocks above.
         txVerifier := core.NewTxVerifier(utxos)
         engine.SetTxVerifier(txVerifier, utxos)
 

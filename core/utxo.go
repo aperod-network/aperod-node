@@ -113,18 +113,28 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	return nil
 }
 
-// RollbackBlock reverses ApplyBlock for chain reorganization.
-// Note: rolling back spent key images requires a spend journal (not implemented here;
-// the persistent store tracks this).
+// RollbackBlock reverses ApplyBlock for chain reorganization or failed block
+// acceptance.  Removes all outputs added by this block and un-marks all key
+// images spent by its inputs, restoring the UTXO set to the state before the
+// block was applied.
+//
+// Caution: this is an in-memory rollback only.  The persistent store (LevelDB)
+// is not touched here; durable reorg recovery requires the store's revert journal.
 func (s *UTXOSet) RollbackBlock(block *Block) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
-		// Remove outputs added by this block
+		// Remove outputs that this block created.
 		for i := range tx.Outputs {
-			s.Remove(txHash, uint32(i))
+			delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: uint32(i)})
 		}
-		// NOTE: restoring spent key images requires the original UTXOs.
-		// In production this is handled by the store's revert journal.
+		// Un-mark key images spent by this block's inputs so they can be
+		// re-spent if the block is retried (or another valid block spends them).
+		for _, inp := range tx.Inputs {
+			delete(s.keyImages, inp.KeyImage)
+		}
 	}
 	return nil
 }
