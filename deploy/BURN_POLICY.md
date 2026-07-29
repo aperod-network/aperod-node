@@ -9,12 +9,14 @@
 
 | Parameter | Value |
 |-----------|-------|
-| Transaction fee | **0.5 APRO** (flat) |
-| Fee destination | 🔥 Burned — removed from supply forever |
-| Validator fee share | **0 %** |
-| Enforcement | Protocol layer — `consensus/poa.go` |
-| Total supply cap | **100,000,000 APRO** |
-| Circulating at launch | **21,000,000 APRO** |
+| Transaction fee | **dynamic EIP-1559** — base 200 nAPRO/byte, adjusts ±12.5%/block |
+| Typical P2P fee | **≈ 0.004 APRO** (2 KB transfer at genesis base fee) |
+| Typical game/NFT fee | **≈ 0.008 APRO** (4 KB tx at genesis base fee) |
+| Base fee destination | 🔥 Burned **100%** — removed from supply forever |
+| Priority tip destination | → Validator (fee − base fee × size) |
+| Total supply cap | **10,000,000,000 APRO** (10B) |
+| Circulating at launch | **9,000,000,000 APRO** (9B — 90% Public/IDO/Liquidity) |
+| Dev Fund | **1,000,000,000 APRO** (10%, 12-month cliff + 48-month linear vest) |
 | Block time | **3 seconds** |
 | Block throughput | **28,800 blocks / day** |
 | Block reward | **5 APRO** per block |
@@ -26,12 +28,22 @@
 
 ## How the Burn Works
 
-Every time a transaction is included in a block, the network charges a **flat fee of 0.5 APRO**.  
-That fee is not forwarded to the block proposer or any treasury. It is **destroyed at the consensus layer** — the output simply does not exist in the next UTXO set.
+Every time a transaction is included in a block, the network charges a **dynamic EIP-1559 fee**:  
+`fee = tx_size_bytes × (base_fee_per_byte + priority_tip_per_byte)`
+
+The **base fee portion is burned 100%** — it is not forwarded to the block proposer or any treasury, and simply does not exist in the next UTXO set. Only the optional **priority tip** goes to the validator.
 
 ```
-User sends TX  →  fee output (0.5 APRO)  →  PoA engine burns it  →  supply decreases
+User sends TX  →  base fee (200 nAPRO/byte × size)  →  PoA engine burns it  →  supply decreases
+                  priority tip (optional)             →  validator reward address
 ```
+
+The base fee adjusts ±12.5% per block toward a 500 KB target block size (same mechanism as Ethereum EIP-1559). At genesis base fee (200 nAPRO/byte):
+
+| Transaction type | Typical size | Fee burned |
+|-----------------|-------------|------------|
+| P2P transfer | ~2 KB | **≈ 0.004 APRO** |
+| Game / NFT tx | ~4 KB | **≈ 0.008 APRO** |
 
 The burn is recorded in the `emission_config` table and visible on the [Block Explorer](https://aperod.com/explorer/) under **Tokenomics → Burned**.
 

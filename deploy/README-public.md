@@ -157,16 +157,19 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 Aperod has a **fixed supply cap** and a **deflationary fee model**:
 
 ```
-Total supply cap:     100,000,000 APRO
-Circulating (launch): 21,000,000  APRO
-Block time:           3 seconds
-Block throughput:     28,800 blocks / day
-Block reward:         5 APRO per block
-Annual emission:      52,560,000 APRO / year  (≈ 52.56 M APRO)
-Per-validator income: ≈ 2,503,000 APRO / year (21 active validators, round-robin)
-Halving interval:     every 21,024,000 blocks  (~2 years)
-Transaction fee:      0.5 APRO flat
-Fee destination:      🔥 burned (removed from supply forever)
+Total supply cap:     10,000,000,000 APRO  (10B)
+Circulating (launch):  9,000,000,000 APRO  (9B — 90% Public / IDO / Liquidity)
+Dev Fund locked:       1,000,000,000 APRO  (10%, 12-month cliff + 48-month linear vest)
+Block time:            3 seconds
+Block throughput:      28,800 blocks / day
+Block reward:          5 APRO per block
+Annual emission:       52,560,000 APRO / year  (≈ 52.56 M APRO)
+Per-validator income:  ≈ 2,503,000 APRO / year (21 active validators, round-robin)
+Halving interval:      every 21,024,000 blocks  (~2 years)
+Transaction fee:       dynamic EIP-1559 · base 200 nAPRO/byte · adjusts ±12.5%/block
+                       P2P transfer ~2 KB ≈ 0.004 APRO
+                       Game / NFT tx ~4 KB ≈ 0.008 APRO
+Fee destination:       🔥 base fee — burned 100% · priority tip → validator
 ```
 
 Validators earn **block rewards only**. Zero fees reach validator wallets.  
