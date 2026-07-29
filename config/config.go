@@ -35,12 +35,16 @@ type Config struct {
 // at connect-time so that node operators can rotate IPs without changing
 // their configuration file.
 type P2PConfig struct {
-	ListenAddr       string   `yaml:"listen_addr"`        // e.g. "/ip4/0.0.0.0/tcp/30303"
-	Bootnodes        []string `yaml:"bootnodes"`          // "domain:port" or "ip:port"
-	MaxPeers         int      `yaml:"max_peers"`
-	MinPeers         int      `yaml:"min_peers"`
-	MaxPeersPerIP    int      `yaml:"max_peers_per_ip"`   // max inbound connections per source IP (0 = unlimited, recommended: 3)
-	ReservedOutbound int      `yaml:"reserved_outbound"`  // slots reserved for outbound dial-outs so the node can always gossip (#419)
+	ListenAddr    string   `yaml:"listen_addr"`      // e.g. "/ip4/0.0.0.0/tcp/30303"
+	Bootnodes     []string `yaml:"bootnodes"`        // "domain:port" or "ip:port"
+	MaxPeers      int      `yaml:"max_peers"`
+	MinPeers      int      `yaml:"min_peers"`
+	MaxPeersPerIP int      `yaml:"max_peers_per_ip"` // max inbound connections per source IP (0 = unlimited, recommended: 3)
+	// MinOutbound reserves this many peer slots exclusively for outbound dial-outs.
+	// Inbound connections are capped at (MaxPeers − MinOutbound) so a validator
+	// under an inbound flood can always gossip produced blocks to the network.
+	// Recommended: 4.  0 = feature disabled.
+	MinOutbound int `yaml:"min_outbound"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -83,11 +87,11 @@ func DefaultConfig() *Config {
 		DataDir:  "./data",
 		LogLevel: "info",
 		P2P: P2PConfig{
-			ListenAddr:       "/ip4/0.0.0.0/tcp/30303",
-			MaxPeers:         50,
-			MinPeers:         4,
-			MaxPeersPerIP:    3,  // eclipse/partition guard: max 3 connections per source IP
-			ReservedOutbound: 5,  // always keep 5 slots free for outbound dial-outs
+			ListenAddr:    "/ip4/0.0.0.0/tcp/30303",
+			MaxPeers:      50,
+			MinPeers:      4,
+			MaxPeersPerIP: 3, // eclipse/partition guard: max 3 connections per source IP
+			MinOutbound:   4, // always keep 4 slots free for outbound dial-outs
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,

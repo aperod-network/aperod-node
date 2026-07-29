@@ -18,10 +18,17 @@ type Config struct {
         Bootnodes     []string
         MaxPeers      int
         MinPeers      int
-        MaxPeersPerIP    int    // max inbound connections from one source IP (0 = unlimited, recommended: 3)
-        ReservedOutbound int    // inbound slots blocked off for outbound dial-out connections (0 = disable)
-        NodeID           string // hex-encoded public key or random ID
-        UserAgent        string
+        MaxPeersPerIP int    // max inbound connections from one source IP (0 = unlimited, recommended: 3)
+        // MinOutbound is the number of peer slots reserved exclusively for
+        // outbound dial-out connections.  Inbound connections may only occupy
+        // up to (MaxPeers − MinOutbound) slots; once that cap is reached new
+        // inbound connections are politely rejected while outbound dials to
+        // bootnodes / discovery peers continue unimpeded.  A validator under
+        // an inbound flood can therefore always broadcast produced blocks to
+        // the rest of the network.  Recommended: 4.  0 = feature disabled.
+        MinOutbound int
+        NodeID      string // hex-encoded public key or random ID
+        UserAgent   string
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -240,7 +247,7 @@ func (h *Host) acceptLoop() {
                         h.mu.RLock()
                         total := len(h.peers)
                         outCount := 0
-                        if h.cfg.ReservedOutbound > 0 {
+                        if h.cfg.MinOutbound > 0 {
                                 for _, p := range h.peers {
                                         if p.outbound {
                                                 outCount++
@@ -257,16 +264,19 @@ func (h *Host) acceptLoop() {
                                 conn.Close()
                                 continue
                         }
-                        // Reserve slots for outbound connections (#419): inbound flood
-                        // must not consume slots that validators need to dial out.
-                        if h.cfg.ReservedOutbound > 0 {
-                                inboundCap := h.cfg.MaxPeers - h.cfg.ReservedOutbound
+                        // MinOutbound: reserve slots exclusively for outbound dial-outs
+                        // so a validator under inbound flood can still broadcast blocks.
+                        // Inbound connections are capped at (MaxPeers − MinOutbound);
+                        // outbound dials are not subject to this cap.
+                        if h.cfg.MinOutbound > 0 {
+                                inboundCap := h.cfg.MaxPeers - h.cfg.MinOutbound
                                 inboundCount := total - outCount
                                 if inboundCount >= inboundCap {
-                                        h.log.Debug("inbound connection rejected: reserved outbound slots",
+                                        h.log.Debug("inbound connection rejected: MinOutbound slots reserved",
                                                 "addr", conn.RemoteAddr().String(),
                                                 "inbound", inboundCount,
-                                                "cap", inboundCap)
+                                                "cap", inboundCap,
+                                                "min_outbound", h.cfg.MinOutbound)
                                         conn.Close()
                                         continue
                                 }
@@ -329,6 +339,15 @@ func (h *Host) maintainLoop() {
                         }
                 }
         }
+}
+
+// DialPeer initiates an outbound connection to addr.  The dial happens in a
+// background goroutine; use PeerCount() after a short wait to confirm it
+// succeeded.  Outbound connections are not subject to the inbound cap
+// enforced by MinOutbound, so this succeeds even when the node is under an
+// inbound flood.
+func (h *Host) DialPeer(addr string) {
+        go h.dialPeer(addr)
 }
 
 func (h *Host) dialPeer(addr string) {
