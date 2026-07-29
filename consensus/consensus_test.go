@@ -360,6 +360,87 @@ func TestEngine_RejectsBlock_NoVerifier(t *testing.T) {
 	}
 }
 
+// ─── Timejacking guard (#418) ─────────────────────────────────────────────────
+
+// TestHandleIncomingBlock_FutureTooFar verifies that a block whose timestamp is
+// 60 seconds ahead of local wall clock is rejected (timejacking prevention).
+func TestHandleIncomingBlock_FutureTooFar(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().Add(60 * time.Second).UnixNano(), // 60 s in the future
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	time.Sleep(150 * time.Millisecond)
+
+	if chain.Height() != 0 {
+		t.Errorf("chain advanced to height %d — far-future block should have been rejected",
+			chain.Height())
+	}
+}
+
+// TestHandleIncomingBlock_SlightlyAhead verifies that a block 5 seconds ahead
+// of local wall clock is accepted (within the ±15 s tolerance window).
+func TestHandleIncomingBlock_SlightlyAhead(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().Add(5 * time.Second).UnixNano(), // 5 s ahead — within tolerance
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case <-deadline:
+			t.Errorf("chain height = %d after 300 ms — slightly-ahead block should have been accepted",
+				chain.Height())
+			return
+		default:
+			if chain.Height() == 1 {
+				t.Log("OK: slightly-ahead block accepted, chain advanced to height 1")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
 // TestEngine_SingleValidator_Finalizes verifies a 1-of-1 validator set auto-finalizes.
 func TestEngine_SingleValidator_Finalizes(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()
