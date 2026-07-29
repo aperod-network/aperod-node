@@ -159,8 +159,12 @@ Aperod has a **fixed supply cap** and a **deflationary fee model**:
 ```
 Total supply cap:     100,000,000 APRO
 Circulating (launch): 21,000,000  APRO
-Block reward:         0.1 APRO per block
-Halving interval:     every 2,100,000 blocks (~2 years)
+Block time:           3 seconds
+Block throughput:     28,800 blocks / day
+Block reward:         5 APRO per block
+Annual emission:      52,560,000 APRO / year  (≈ 52.56 M APRO)
+Per-validator income: ≈ 2,503,000 APRO / year (21 active validators, round-robin)
+Halving interval:     every 21,024,000 blocks  (~2 years)
 Transaction fee:      0.5 APRO flat
 Fee destination:      🔥 burned (removed from supply forever)
 ```
