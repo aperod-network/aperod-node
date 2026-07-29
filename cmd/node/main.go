@@ -328,7 +328,15 @@ func run() error {
                 },
         }, chain, mempool, log)
 
-        // ── 8. Start subsystems ───────────────────────────────────────────────────
+        // ── 8. Wire TxVerifier BEFORE starting the engine goroutine ──────────────
+        // engine.Run launches handleIncomingBlock immediately on incoming P2P
+        // blocks.  If SetTxVerifier is called after Run, there is a startup window
+        // where blocks are accepted without cryptographic verification (nil verifier
+        // = fail-open).  Wiring first closes that window entirely.
+        txVerifier := core.NewTxVerifier(utxos)
+        engine.SetTxVerifier(txVerifier, utxos)
+
+        // ── 9. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
         go engine.Run(stop)
 
@@ -343,11 +351,6 @@ func run() error {
                         }
                 }
         }()
-
-        // Wire full cryptographic tx verification into the consensus engine.
-        // utxos was created and populated from stored blocks above.
-        txVerifier := core.NewTxVerifier(utxos)
-        engine.SetTxVerifier(txVerifier, utxos)
 
         if cfg.API.Enabled && cfg.API.ListenAddr != "" {
                 apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)

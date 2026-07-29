@@ -511,13 +511,16 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
         // Full cryptographic transaction verification: ring sigs, range proofs,
         // Pedersen commitment balance, and double-spend against historical UTXO set.
         // This MUST run before UTXO application and chain insertion.
-        if e.txVerifier != nil {
-                if err := e.txVerifier.VerifyBlock(block); err != nil {
-                        return fmt.Errorf("tx crypto verification failed: %w", err)
-                }
-        } else {
-                e.log.Warn("SECURITY: no TxVerifier set — skipping cryptographic block verification",
-                        "height", block.Header.Height)
+        //
+        // Fail-closed: a nil verifier is a misconfiguration, not an optional path.
+        // Accepting blocks without verification would silently allow inflation and
+        // forged-signature attacks — reject rather than warn-and-continue.
+        if e.txVerifier == nil {
+                return fmt.Errorf("tx verifier not configured: refusing to accept block %d without cryptographic verification",
+                        block.Header.Height)
+        }
+        if err := e.txVerifier.VerifyBlock(block); err != nil {
+                return fmt.Errorf("tx crypto verification failed: %w", err)
         }
 
         // Apply block to UTXO set BEFORE adding to canonical chain so that if the

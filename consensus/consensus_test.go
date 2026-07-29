@@ -269,10 +269,16 @@ func TestEngine_NonProposer_Silent(t *testing.T) {
 }
 
 // TestEngine_AcceptsIncomingBlock verifies that a P2P block is accepted and chain grows.
+// TxVerifier must be wired before engine.Run — this mirrors production startup ordering.
 func TestEngine_AcceptsIncomingBlock(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	chain := makeChainWithGenesis(t, priv, pub)
 	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain) // observer
+
+	// Wire TxVerifier BEFORE Run (production ordering — block has no txs so
+	// crypto checks pass trivially; the important thing is the verifier is set).
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
@@ -306,6 +312,47 @@ func TestEngine_AcceptsIncomingBlock(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
+	}
+}
+
+// TestEngine_RejectsBlock_NoVerifier verifies that handleIncomingBlock is fail-closed
+// when no TxVerifier has been set: the block must not be added to the chain.
+// This is a regression guard for the startup ordering bug where engine.Run was
+// started before engine.SetTxVerifier was called.
+func TestEngine_RejectsBlock_NoVerifier(t *testing.T) {
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	chain := makeChainWithGenesis(t, priv, pub)
+
+	// Engine with no TxVerifier wired (simulates pre-SetTxVerifier startup window).
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+	// Deliberately do NOT call eng.SetTxVerifier.
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	// Build a structurally valid block at height 1.
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	block1 := &core.Block{Header: hdr}
+
+	eng.NewBlockCh() <- block1
+
+	// Give the engine time to process.
+	time.Sleep(100 * time.Millisecond)
+
+	// Block must NOT have been added to the chain: verifier is not set.
+	if chain.Height() != 0 {
+		t.Errorf("chain advanced to height %d without a TxVerifier — fail-open behavior detected", chain.Height())
 	}
 }
 
