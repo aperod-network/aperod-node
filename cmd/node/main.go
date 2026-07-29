@@ -388,12 +388,14 @@ func run() error {
                         log:    log,
                 }
                 host = p2p.NewHost(p2p.Config{
-                        ListenAddr: tcpAddr,
-                        Bootnodes:  bootnodes,
-                        MaxPeers:   cfg.P2P.MaxPeers,
-                        MinPeers:   cfg.P2P.MinPeers,
-                        NodeID:     myKey.Public().ID(),
-                        UserAgent:  "aperod-node/1.0",
+                        ListenAddr:       tcpAddr,
+                        Bootnodes:        bootnodes,
+                        MaxPeers:         cfg.P2P.MaxPeers,
+                        MinPeers:         cfg.P2P.MinPeers,
+                        MaxPeersPerIP:    cfg.P2P.MaxPeersPerIP,
+                        ReservedOutbound: cfg.P2P.ReservedOutbound,
+                        NodeID:           myKey.Public().ID(),
+                        UserAgent:        "aperod-node/1.0",
                 }, handler, log)
 
                 if err := host.Start(); err != nil {
