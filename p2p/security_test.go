@@ -305,3 +305,44 @@ func TestPeerCountLimit_MaxPeers1(t *testing.T) {
                 t.Logf("3.5.6 ✓ peer count=%d ≤ MaxPeers=1", host.PeerCount())
         }
 }
+
+// ─── 3.5.7 Malicious packet — node stays alive (#414) ────────────────────────
+
+// TestMaliciousPacket_NodeStaysAlive verifies that a peer sending a completely
+// broken (non-JSON, binary-garbage) message body does not crash the host process.
+// The defer/recover in handleConn should catch the panic and drop only the peer.
+func TestMaliciousPacket_NodeStaysAlive(t *testing.T) {
+        host, _, addr := startHost(t)
+
+        connectAndHandshake(t, addr, func(conn net.Conn) {
+                conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+                // Craft a raw TCP frame that passes the length prefix but carries
+                // pure binary garbage instead of valid JSON.  This triggers a JSON
+                // unmarshal panic inside handleConn's message loop.
+                //
+                // Frame layout: [4-byte big-endian body-length][msgType byte][body...]
+                //   body = 0xFF repeated 256 bytes — not valid JSON for any message type.
+                garbage := make([]byte, 256)
+                for i := range garbage {
+                        garbage[i] = 0xFF
+                }
+                // prepend msgType = MsgBlock (0x13) so it reaches the unmarshal path
+                frame := make([]byte, 4+1+len(garbage))
+                bodyLen := uint32(1 + len(garbage))
+                frame[0] = byte(bodyLen >> 24)
+                frame[1] = byte(bodyLen >> 16)
+                frame[2] = byte(bodyLen >> 8)
+                frame[3] = byte(bodyLen)
+                frame[4] = 0x13 // MsgBlock
+                copy(frame[5:], garbage)
+
+                conn.Write(frame) //nolint:errcheck
+                time.Sleep(150 * time.Millisecond)
+        })
+
+        // Host must still be alive and operational — PeerCount() would panic if the
+        // Host's internal map had been left in a corrupted state.
+        pc := host.PeerCount()
+        t.Logf("3.5.7 ✓ host alive after malicious packet, peerCount=%d", pc)
+}

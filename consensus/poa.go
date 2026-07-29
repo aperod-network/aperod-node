@@ -465,10 +465,29 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 }
 
 // handleIncomingBlock processes a block received from P2P.
+// maxClockSkewNs is the maximum allowed difference (in nanoseconds) between a
+// peer-submitted block's timestamp and our local wall clock.  Blocks whose
+// timestamp drifts more than ±15 s are rejected to prevent timejacking attacks
+// where a malicious peer shifts the chain tip into the far future, causing
+// legitimate blocks to be rejected as "too old" (#418).
+const maxClockSkewNs = int64(15 * 1_000_000_000)
+
 func (e *Engine) handleIncomingBlock(block *core.Block) error {
         // Basic structural validation
         if err := block.Validate(); err != nil {
                 return fmt.Errorf("invalid block: %w", err)
+        }
+
+        // Timejacking guard (#418): reject blocks whose timestamp deviates from
+        // local wall clock by more than ±15 seconds.
+        nowNs := time.Now().UTC().UnixNano()
+        skewNs := block.Header.Timestamp - nowNs
+        if skewNs < 0 {
+                skewNs = -skewNs
+        }
+        if skewNs > maxClockSkewNs {
+                return fmt.Errorf("block %d: timestamp too far from local clock (skew %dms, max %dms)",
+                        block.Header.Height, skewNs/1_000_000, maxClockSkewNs/1_000_000)
         }
 
         // Check proposer is a known validator
