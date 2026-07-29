@@ -220,16 +220,30 @@ func (e *Engine) tick() error {
 // when no override is set in Config.BlockRewardNAPR.
 // 5 APRO in base units: 1 APRO = 100_000_000 nAPRO → 5 APRO = 500_000_000 nAPRO.
 // At 3 s/block this yields ~52,560,000 APRO/year across all 21 validators.
+// Source of truth: deploy/BURN_POLICY.md — "Block reward: 5 APRO per block".
 const DefaultBlockRewardNAPR uint64 = 500_000_000
 
 // HalvingIntervalBlocks is the number of blocks between each block-reward
 // halving event.  At 3 s/block, 21 024 000 blocks ≈ 2 years.
-// Must match the "Halving interval" row in deploy/VALIDATORS.md.
+// Must match the "Halving interval" row in deploy/VALIDATORS.md and
+// the "Halving interval" row in deploy/BURN_POLICY.md.
 const HalvingIntervalBlocks uint64 = 21_024_000
 
 // defaultBlockRewardNAPR is an unexported alias kept for backward-compat
 // within this package.  External code should use DefaultBlockRewardNAPR.
 const defaultBlockRewardNAPR = DefaultBlockRewardNAPR
+
+// blockRewardAtHeight returns the coinbase reward in nAPRO for a block at the
+// given height, applying halvings per HalvingIntervalBlocks.
+// Era 0: DefaultBlockRewardNAPR; era 1: /2; era 2: /4; …
+// The reward is halved at most 63 times (era ≥ 64 pays 0 to avoid overflow).
+func blockRewardAtHeight(base uint64, height uint64) uint64 {
+        era := height / HalvingIntervalBlocks
+        if era >= 64 {
+                return 0
+        }
+        return base >> era
+}
 
 // EIP-1559–style dynamic base fee constants.
 const (
@@ -373,10 +387,13 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 
         // Prepend coinbase block reward transaction when reward_address is configured.
         if e.cfg.RewardAddress != "" {
-                rewardNAPR := e.cfg.BlockRewardNAPR
-                if rewardNAPR == 0 {
-                        rewardNAPR = defaultBlockRewardNAPR
+                baseReward := e.cfg.BlockRewardNAPR
+                if baseReward == 0 {
+                        baseReward = defaultBlockRewardNAPR
                 }
+                // Apply halving schedule: reward halves every HalvingIntervalBlocks.
+                // See deploy/BURN_POLICY.md for the emission schedule table.
+                rewardNAPR := blockRewardAtHeight(baseReward, height)
                 // Validator earns block reward + priority tips from all txs in this block.
                 totalReward := rewardNAPR + tips
                 mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
