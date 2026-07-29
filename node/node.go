@@ -88,8 +88,13 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
                 if err := chain.SetGenesis(genesis); err != nil {
                         return nil, err
                 }
-                if err := persistBlockToDB(db, genesis, utxos); err != nil {
+                if err := persistBlockToDB(db, genesis); err != nil {
                         return nil, fmt.Errorf("persist genesis: %w", err)
+                }
+                // Apply genesis outputs to in-memory UTXO set (no inputs, so
+                // no double-spend risk; this is safe to call before the engine starts).
+                if err := utxos.ApplyBlock(genesis); err != nil {
+                        return nil, fmt.Errorf("apply genesis to utxo set: %w", err)
                 }
                 genesisHash := genesis.Hash()
                 log.Info("genesis block created",
@@ -146,7 +151,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
                 // Persist every self-produced block synchronously inside tick()
                 // so the produced-block channel is only used for P2P broadcast.
                 OnBlockProduced: func(b *core.Block) {
-                        if err := persistBlockToDB(db, b, utxos); err != nil {
+                        // UTXO state is already updated by engine.tick() before this
+                        // callback fires. persistBlockToDB is DB-only — no ApplyBlock.
+                        if err := persistBlockToDB(db, b); err != nil {
                                 log.Error("persist produced block failed", "height", b.Header.Height, "err", err)
                         }
                 },
@@ -245,18 +252,22 @@ func (n *Node) broadcastLoop() {
         }
 }
 
-// persistBlock saves a block to LevelDB and updates the UTXO set.
+// persistBlock saves a block to LevelDB (DB-only; UTXO state already updated by engine).
 func (n *Node) persistBlock(block *Block) {
-        if err := persistBlockToDB(n.db, block, n.utxos); err != nil {
+        if err := persistBlockToDB(n.db, block); err != nil {
                 n.log.Error("persist block failed", "height", block.Header.Height, "err", err)
         } else {
                 n.log.Debug("block persisted", "height", block.Header.Height, "txs", len(block.Txs))
         }
 }
 
-// persistBlockToDB serializes block → LevelDB, updates UTXOs and key images.
-// Called on first genesis creation and on every new block produced/accepted.
-func persistBlockToDB(db *store.DB, block *core.Block, utxos *core.UTXOSet) error {
+// persistBlockToDB serializes block → LevelDB and persists UTXO/key-image
+// indexes for future startup restores.  It does NOT mutate the in-memory
+// UTXOSet — that state transition is owned by the consensus engine (tick /
+// handleIncomingBlock) which calls utxos.ApplyBlock before calling this.
+// Calling ApplyBlock here a second time would cause a double-apply error for
+// any block that spends inputs.
+func persistBlockToDB(db *store.DB, block *core.Block) error {
         // 1. Serialize the full block as JSON.
         data, err := json.Marshal(block)
         if err != nil {
@@ -267,19 +278,15 @@ func persistBlockToDB(db *store.DB, block *core.Block, utxos *core.UTXOSet) erro
                 return fmt.Errorf("put raw block: %w", err)
         }
 
-        // 2. Apply to in-memory UTXO set and persist UTXOs + key images.
-        if err := utxos.ApplyBlock(block); err != nil {
-                return fmt.Errorf("apply block to UTXO set: %w", err)
-        }
+        // 2. Persist key images and UTXOs to the LevelDB indexes so that
+        //    restoreChain can reconstruct in-memory state on next startup.
         for _, tx := range block.Txs {
                 txHash := tx.Hash()
-                // Persist spent key images.
                 for _, inp := range tx.Inputs {
                         if err := db.MarkKeyImageSpent(inp.KeyImage); err != nil {
                                 return fmt.Errorf("mark key image spent: %w", err)
                         }
                 }
-                // Persist new UTXOs.
                 for i, out := range tx.Outputs {
                         su := &store.StoredUTXO{
                                 TxHash:       txHash,
