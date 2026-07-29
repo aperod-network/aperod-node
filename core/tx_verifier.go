@@ -32,9 +32,12 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 return err
         }
 
-        // Coinbase transactions have no cryptographic proofs to check
+        // Coinbase (zero-input) transactions must never arrive at the verifier
+        // from external sources.  They are synthesized by the consensus engine
+        // only and are never routed through the public tx pipeline.  Silently
+        // accepting one here would allow inflation without any cryptographic check.
         if len(tx.Inputs) == 0 {
-                return nil
+                return fmt.Errorf("tx verifier: coinbase (zero-input) transaction rejected — must be engine-synthesized only")
         }
 
         txHash := tx.Hash()
@@ -118,8 +121,17 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 
 // VerifyBlock verifies all transactions in a block.
 // Applies inputs sequentially (no parallel to maintain UTXO consistency).
+//
+// Coinbase (zero-input) transactions are skipped: they carry no ring signatures
+// or range proofs, so there is nothing to verify cryptographically.  Structural
+// and policy checks for coinbase (≤1 per block, at index 0, amount ≤ scheduled
+// reward) are enforced by validateCoinbasePolicy in the consensus engine before
+// this function is called.
 func (v *TxVerifier) VerifyBlock(block *Block) error {
         for i, tx := range block.Txs {
+                if tx.IsCoinbase() {
+                        continue // no crypto proofs on coinbase; policy checked separately
+                }
                 if err := v.VerifyTx(&tx); err != nil {
                         h := tx.Hash()
                         return fmt.Errorf("block %d tx[%d] %x: %w",

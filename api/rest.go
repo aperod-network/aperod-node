@@ -906,7 +906,9 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        if err := s.mempool.Add(*tx); err != nil {
+        // Use AddPrivileged so the coinbase bypasses the external-coinbase rejection
+        // guard in Add().  This endpoint is only reachable from localhost (127.0.0.1:8545).
+        if err := s.mempool.AddPrivileged(*tx); err != nil {
                 s.log.Error("admin mint: mempool add failed", "err", err)
                 writeJSONError(w, http.StatusInternalServerError, "mempool: "+err.Error())
                 return

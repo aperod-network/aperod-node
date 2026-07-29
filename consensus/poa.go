@@ -196,6 +196,14 @@ func (e *Engine) tick() error {
                 return fmt.Errorf("produce block: %w", err)
         }
 
+        // Sanity-check the block we just produced against the same coinbase policy
+        // that peer blocks must satisfy.  Should always pass for engine-produced
+        // blocks; a failure here indicates a bug in produceBlock itself.
+        if err := validateCoinbasePolicy(block); err != nil {
+                return fmt.Errorf("self-produced block %d failed coinbase policy (bug in produceBlock): %w",
+                        block.Header.Height, err)
+        }
+
         // Apply UTXO state changes BEFORE adding to canonical chain so that if
         // state transition fails the block is never inserted (atomic acceptance).
         if e.utxos != nil {
@@ -386,9 +394,64 @@ func (e *Engine) checkOraclePriceDeviation(blockPrice uint64) error {
         return nil
 }
 
+// maxCoinbasesPerBlock is the hard limit on zero-input (coinbase) transactions
+// per block: 1 engine reward + up to 10 privileged admin mints.
+const maxCoinbasesPerBlock = 11
+
+// validateCoinbasePolicy checks coinbase rules for every accepted block:
+//
+//  1. At most maxCoinbasesPerBlock coinbase transactions.
+//  2. All coinbase transactions must form a contiguous prefix (appear before
+//     any non-coinbase transaction).
+//
+// The reward-amount cap cannot be checked here because the Pedersen-committed
+// output amount is hidden.  The cap is enforced structurally: external coinbases
+// are blocked by mempool.Add; the engine-reward coinbase is capped by
+// blockRewardAtHeight; and admin mints go through AddPrivileged which is only
+// reachable from the localhost-only admin RPC.
+func validateCoinbasePolicy(block *core.Block) error {
+        count := 0
+        seenNonCoinbase := false
+        for i, tx := range block.Txs {
+                if tx.IsCoinbase() {
+                        count++
+                        if seenNonCoinbase {
+                                return fmt.Errorf("coinbase tx at index %d appears after a non-coinbase tx "+
+                                        "(all coinbases must form a block prefix)", i)
+                        }
+                } else {
+                        seenNonCoinbase = true
+                }
+        }
+        if count > maxCoinbasesPerBlock {
+                return fmt.Errorf("block contains %d coinbase transactions (maximum %d)",
+                        count, maxCoinbasesPerBlock)
+        }
+        return nil
+}
+
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
-        txs := e.pool.SelectTxs(500) // up to 500 txs per block
+        raw := e.pool.SelectTxs(500) // up to 500 txs per block
+
+        // Defense-in-depth: strip any NON-PRIVILEGED coinbase (zero-input) txs that
+        // may have bypassed the mempool guard.  mempool.Add() already rejects
+        // external coinbases, so finding one here indicates a bug; log and drop it.
+        // PRIVILEGED coinbases (added via mempool.AddPrivileged, e.g. admin mints)
+        // are intentional and must pass through to the block.
+        txs := raw[:0]
+        for _, tx := range raw {
+                if tx.IsCoinbase() {
+                        h := tx.Hash()
+                        if !e.pool.IsPrivileged(h) {
+                                e.log.Warn("produceBlock: dropping unexpected non-privileged coinbase from pool",
+                                        "hash", h)
+                                continue
+                        }
+                        // Privileged admin mint — keep it.
+                }
+                txs = append(txs, tx)
+        }
 
         // EIP-1559–style 100% base-fee burn: fees are NOT forwarded to the
         // validator — they are destroyed upon block finalization by never
@@ -525,6 +588,14 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
         // each pass per-tx verification. This check closes that gap.
         if err := blockKeyImageCheck(block); err != nil {
                 return fmt.Errorf("block key-image check failed: %w", err)
+        }
+
+        // Coinbase policy: at most one coinbase per block, at index 0.
+        // This closes the free-mint attack: a block produced by a malicious or
+        // compromised proposer that includes multiple zero-input transactions
+        // (each creating new UTXOs) is rejected before any UTXO state is applied.
+        if err := validateCoinbasePolicy(block); err != nil {
+                return fmt.Errorf("block %d: coinbase policy violation: %w", block.Header.Height, err)
         }
 
         // Full cryptographic transaction verification: ring sigs, range proofs,

@@ -322,10 +322,14 @@ func TestChain_Reorg(t *testing.T) {
 // ─── TxVerifier ──────────────────────────────────────────────────────────────
 
 func TestTxVerifier_ValidateCoinbase(t *testing.T) {
+        // VerifyTx must REJECT coinbase (zero-input) transactions.
+        // Coinbase txs are synthesized by the consensus engine only and must
+        // never be accepted from external sources (P2P peers, RPC callers, etc.).
+        // VerifyBlock skips coinbase rows; VerifyTx is the external-tx path.
         v := core.NewTxVerifier(nil)
         tx := makeCoinbaseTx()
-        if err := v.VerifyTx(&tx); err != nil {
-                t.Fatalf("coinbase should pass: %v", err)
+        if err := v.VerifyTx(&tx); err == nil {
+                t.Fatal("VerifyTx should reject coinbase (zero-input) transaction, but returned nil")
         }
 }
 

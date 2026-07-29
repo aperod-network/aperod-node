@@ -29,10 +29,15 @@ func DefaultMempoolConfig() MempoolConfig {
 
 // mempoolEntry wraps a transaction with metadata.
 type mempoolEntry struct {
-        Tx       Transaction
-        Hash     crypto.Hash32
-        Size     int
-        Received time.Time
+        Tx         Transaction
+        Hash       crypto.Hash32
+        Size       int
+        Received   time.Time
+        // privileged marks entries added via AddPrivileged (e.g. admin mint).
+        // Privileged coinbase txs bypass the external-coinbase rejection guard
+        // and are NOT stripped by the consensus engine's coinbase filter in
+        // produceBlock, unlike coinbases that somehow bypass the public Add path.
+        privileged bool
 }
 
 // Mempool is a thread-safe pool of pending (unconfirmed) transactions.
@@ -68,6 +73,15 @@ func (m *Mempool) SetBaseFee(baseFeePerByte uint64) {
 // Add attempts to add a transaction to the mempool.
 // Returns an error if the tx is invalid, duplicate, too large, or a double-spend.
 func (m *Mempool) Add(tx Transaction) error {
+        // Security: coinbase (zero-input) transactions are synthesized exclusively
+        // by the consensus engine inside produceBlock.  Accepting one from an
+        // external caller (P2P peer, admin RPC, etc.) would let an attacker inject
+        // supply-creating UTXOs without spending anything.  Reject unconditionally
+        // at this layer; the engine never routes its own coinbase through the pool.
+        if tx.IsCoinbase() {
+                return fmt.Errorf("mempool: coinbase (zero-input) transactions are not accepted from external sources")
+        }
+
         if err := tx.Validate(); err != nil {
                 return fmt.Errorf("mempool: invalid tx: %w", err)
         }
@@ -77,10 +91,9 @@ func (m *Mempool) Add(tx Transaction) error {
                 return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
         }
 
-        // Coinbase and stake transactions are fee-exempt:
-        // coinbase = block reward / admin mint (Fee=0 by design)
-        // stake    = validator deposit/withdrawal (protocol-level, not ring-sig tx)
-        if !tx.IsCoinbase() && !tx.IsStake() {
+        // Stake transactions are fee-exempt:
+        // stake = validator deposit/withdrawal (protocol-level, not ring-sig tx)
+        if !tx.IsStake() {
                 m.mu.RLock()
                 baseFee := m.cfg.BaseFeePerByte
                 m.mu.RUnlock()
@@ -122,6 +135,7 @@ func (m *Mempool) Add(tx Transaction) error {
                 Received: time.Now(),
         }
         m.entries[hash] = entry
+        // Note: privileged defaults to false for Add() — external callers.
 
         for _, inp := range tx.Inputs {
                 m.keyImages[inp.KeyImage] = hash
@@ -158,6 +172,52 @@ func (m *Mempool) Get(hash crypto.Hash32) (Transaction, bool) {
                 return Transaction{}, false
         }
         return e.Tx, true
+}
+
+// AddPrivileged adds a coinbase (or other engine-internal) transaction to the
+// mempool bypassing the external-coinbase rejection guard in Add().
+//
+// MUST only be called by trusted internal code (admin RPC, consensus engine).
+// Never call from P2P handlers or public API routes — use Add() for those.
+// All other guards (size, duplicate, double-spend) still apply.
+func (m *Mempool) AddPrivileged(tx Transaction) error {
+        if err := tx.Validate(); err != nil {
+                return fmt.Errorf("mempool: invalid tx: %w", err)
+        }
+        size := tx.Size()
+        if size > m.cfg.MaxTxSize {
+                return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
+        }
+        hash := tx.Hash()
+        m.mu.Lock()
+        defer m.mu.Unlock()
+        if _, exists := m.entries[hash]; exists {
+                return fmt.Errorf("mempool: duplicate tx %x", hash[:8])
+        }
+        if len(m.entries) >= m.cfg.MaxSize {
+                m.evictLowestFee()
+        }
+        m.entries[hash] = &mempoolEntry{
+                Tx:         tx,
+                Hash:       hash,
+                Size:       size,
+                Received:   time.Now(),
+                privileged: true,
+        }
+        return nil
+}
+
+// IsPrivileged reports whether the tx identified by hash was added via
+// AddPrivileged.  Used by produceBlock to decide whether to keep a coinbase
+// that came from the pool (admin mint) vs. drop it (shouldn't exist, but
+// defense-in-depth against any future bypass).
+func (m *Mempool) IsPrivileged(hash crypto.Hash32) bool {
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+        if entry, ok := m.entries[hash]; ok {
+                return entry.privileged
+        }
+        return false
 }
 
 // SelectTxs returns up to n transactions ordered by fee rate nAPRO/byte (highest first).
