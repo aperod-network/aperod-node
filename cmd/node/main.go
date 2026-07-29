@@ -482,8 +482,18 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 if err != nil {
                         return nil, fmt.Errorf("read validator key file: %w", err)
                 }
-                // Zero the seed bytes after key derivation; safe for 32-byte seeds only.
-                defer func() { if len(privBytes) == 32 { crypto.ZeroBytes(privBytes) } }()
+                // Lock key bytes in RAM so they cannot be swapped to disk or
+                // captured in a core dump (#416). Non-fatal: warn and continue.
+                if err := crypto.MlockBytes(privBytes); err != nil {
+                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", err)
+                }
+                // Zero and unlock the seed bytes after key derivation.
+                defer func() {
+                        if len(privBytes) == 32 {
+                                crypto.ZeroBytes(privBytes)
+                        }
+                        _ = crypto.MunlockBytes(privBytes)
+                }()
                 priv, err := crypto.ValidatorPrivKeyFromBytes(privBytes)
                 if err != nil {
                         return nil, fmt.Errorf("parse validator private key: %w", err)
@@ -497,7 +507,15 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.V
                 return nil, err
         }
         if data, err := os.ReadFile(keyPath); err == nil {
-                defer func() { if len(data) == 32 { crypto.ZeroBytes(data) } }()
+                if err := crypto.MlockBytes(data); err != nil {
+                        log.Warn("mlock validator key bytes failed (non-fatal)", "err", err)
+                }
+                defer func() {
+                        if len(data) == 32 {
+                                crypto.ZeroBytes(data)
+                        }
+                        _ = crypto.MunlockBytes(data)
+                }()
                 priv, err := crypto.ValidatorPrivKeyFromBytes(data)
                 if err != nil {
                         return nil, fmt.Errorf("parse persisted validator key: %w", err)
