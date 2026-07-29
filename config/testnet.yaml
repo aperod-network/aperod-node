@@ -13,7 +13,7 @@ consensus:
   reward_address: ""         # APRO wallet address for block rewards — get yours at https://t.me/aperod_bot
   block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
   block_time: "3s"
-  oracle_url: "http://localhost:8545/api/v1/oracle/price"  # APRO/USD price endpoint; empty = skip embedding
+  oracle_url: "http://localhost:3000/api/v1/oracle/price"  # APRO/USD price endpoint (Node.js API server); empty = skip embedding
   oracle_max_deviation: 0.05                               # reject peer blocks whose price deviates >5%
 
 api:
