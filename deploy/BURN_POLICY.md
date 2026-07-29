@@ -15,8 +15,12 @@
 | Enforcement | Protocol layer — `consensus/poa.go` |
 | Total supply cap | **100,000,000 APRO** |
 | Circulating at launch | **21,000,000 APRO** |
-| Block reward | **0.1 APRO** per block |
-| Halving interval | Every **2,100,000 blocks** (~2 years) |
+| Block time | **3 seconds** |
+| Block throughput | **28,800 blocks / day** |
+| Block reward | **5 APRO** per block |
+| Annual emission | **52,560,000 APRO / year** (≈ 52.56 M APRO) |
+| Per-validator income | **≈ 2,503,000 APRO / year** (21 validators, round-robin) |
+| Halving interval | Every **21,024,000 blocks** (~2 years) |
 
 ---
 
@@ -45,12 +49,15 @@ Aperod is designed to be **deflationary by usage**. The more the network is used
 
 ## Emission Schedule
 
-| Era | Blocks | Block Reward | Duration (~) |
-|-----|--------|--------------|--------------|
-| 1 | 0 – 2,099,999 | 0.1 APRO | ~2 years |
-| 2 | 2,100,000 – 4,199,999 | 0.05 APRO | ~2 years |
-| 3 | 4,200,000 – 6,299,999 | 0.025 APRO | ~2 years |
-| … | … | halved each era | … |
+| Era | Blocks | Block Reward | Annual emission | Duration (~) |
+|-----|--------|--------------|-----------------|--------------|
+| 1 | 0 – 21,023,999 | **5 APRO** | ~52,560,000 APRO | ~2 years |
+| 2 | 21,024,000 – 42,047,999 | **2.5 APRO** | ~26,280,000 APRO | ~2 years |
+| 3 | 42,048,000 – 63,071,999 | **1.25 APRO** | ~13,140,000 APRO | ~2 years |
+| … | … | halved each era | halved each era | … |
+
+> **Block math:** 28,800 blocks/day × 365 days = 10,512,000 blocks/year.  
+> Halving every 21,024,000 blocks ≈ every 2 years.
 
 Total newly minted APRO converges to a finite cap. Combined with the continuous fee burn, the **real circulating supply decreases over time**.
 
