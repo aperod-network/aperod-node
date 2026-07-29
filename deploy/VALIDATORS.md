@@ -87,6 +87,7 @@ At each epoch boundary the consensus engine:
 | Reward destination | Validator's configured `reward_address` (Telegram wallet) |
 | Notification | Telegram push notification on every reward payment |
 | Fee share | **0 %** — all fees are burned, none go to validators |
+| Halving interval | Every **21,024,000 blocks** (~2 years) |
 
 Block rewards are minted directly to the `reward_address` in `node.yaml`.  
 You must configure a valid APRO address — rewards cannot be redirected after a block is produced.
