@@ -228,30 +228,30 @@ func run() error {
                 // ever created, not only those within the recent in-memory window.
                 //
                 // We scan every stored block and mark each input's key image spent
-                // via MarkSpent (no IsSpent check — trusted store data).  This is
-                // intentionally fail-fast: any gap or decode error clears the set
-                // entirely to avoid partial state, which would be worse than an
-                // empty set (partial state gives false confidence).
+                // via MarkSpent (no IsSpent check — trusted store data).
+                //
+                // This is FAIL-CLOSED: any missing or corrupt block in the store
+                // is a fatal error.  Continuing with a partial set would give false
+                // confidence — the node would accept blocks that re-spend key images
+                // from the uncovered height range, which is the exact vulnerability
+                // this fix is meant to close.  Aborting is the only safe behaviour.
                 log.Info("rebuilding spent key-image set from full chain history",
                         "tip_height", tipHeight)
                 kiCount := 0
-                kiOK := true
                 for h := uint64(1); h <= tipHeight; h++ {
                         raw, fetchErr := db.GetRawBlockByHeight(h)
                         if fetchErr != nil || raw == nil {
-                                log.Error("key-image rebuild: missing block — resetting to empty set",
-                                        "height", h, "err", fetchErr)
-                                utxos = core.NewUTXOSet()
-                                kiOK = false
-                                break
+                                return fmt.Errorf(
+                                        "key-image rebuild failed: block at height %d missing from store (%v) — "+
+                                                "node cannot start safely; repair the store and restart",
+                                        h, fetchErr)
                         }
                         var b core.Block
                         if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
-                                log.Error("key-image rebuild: unmarshal error — resetting to empty set",
-                                        "height", h, "err", parseErr)
-                                utxos = core.NewUTXOSet()
-                                kiOK = false
-                                break
+                                return fmt.Errorf(
+                                        "key-image rebuild failed: cannot decode block at height %d: %w — "+
+                                                "node cannot start safely; repair the store and restart",
+                                        h, parseErr)
                         }
                         for _, tx := range b.Txs {
                                 for _, inp := range tx.Inputs {
@@ -260,11 +260,9 @@ func run() error {
                                 }
                         }
                 }
-                if kiOK {
-                        log.Info("spent key-image set rebuilt",
-                                "key_images_marked", kiCount,
-                                "blocks_scanned", tipHeight)
-                }
+                log.Info("spent key-image set rebuilt",
+                        "key_images_marked", kiCount,
+                        "blocks_scanned", tipHeight)
         }
 
         // initialTxTotal starts at 0; the counter accumulates from this run forward.

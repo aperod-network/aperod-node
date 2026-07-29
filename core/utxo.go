@@ -86,20 +86,48 @@ func (s *UTXOSet) IsSpent(ki crypto.KeyImage) bool {
 
 // ApplyBlock updates the UTXO set by processing all transactions in a block.
 // Inputs are removed (key images marked spent), outputs are added.
+//
+// The operation is transactional: a two-pass approach ensures that the UTXO
+// set is never partially mutated on rejection.
+//
+//   Pass 1 — pre-validation (read-only, whole-block lock held):
+//     • Check every input key image for historical or within-block double-spend.
+//     • If any check fails the function returns an error and the set is unchanged.
+//
+//   Pass 2 — apply (write, same lock held throughout):
+//     • Mark key images spent and add outputs.  Cannot fail after pass 1.
+//
+// Holding the lock across both passes prevents a concurrent goroutine from
+// sneaking in a conflicting key image between validation and application.
 func (s *UTXOSet) ApplyBlock(block *Block) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Pass 1: validate all inputs without any state mutation.
+	seen := make(map[crypto.KeyImage]int) // ki → first tx index (for error reporting)
+	for txIdx, tx := range block.Txs {
+		for _, inp := range tx.Inputs {
+			if _, spent := s.keyImages[inp.KeyImage]; spent {
+				return fmt.Errorf("double-spend detected: key image %x in block %d (historical)",
+					inp.KeyImage[:8], block.Header.Height)
+			}
+			if firstIdx, dup := seen[inp.KeyImage]; dup {
+				return fmt.Errorf("double-spend detected: key image %x in block %d (within-block: tx[%d] and tx[%d])",
+					inp.KeyImage[:8], block.Header.Height, firstIdx, txIdx)
+			}
+			seen[inp.KeyImage] = txIdx
+		}
+	}
+
+	// Pass 2: apply state changes — cannot fail after pass 1 succeeded.
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
-		// Mark all input key images as spent
 		for _, inp := range tx.Inputs {
-			if s.IsSpent(inp.KeyImage) {
-				return fmt.Errorf("double-spend detected: key image %x in block %d",
-					inp.KeyImage, block.Header.Height)
-			}
-			s.MarkSpent(inp.KeyImage)
+			s.keyImages[inp.KeyImage] = struct{}{}
 		}
-		// Add all new outputs
 		for i, out := range tx.Outputs {
-			s.Add(&UTXO{
+			key := UTXOKey{TxHash: txHash, OutputIndex: uint32(i)}
+			s.utxos[key] = &UTXO{
 				TxHash:       txHash,
 				OutputIndex:  uint32(i),
 				OneTimePub:   out.OneTimePub,
@@ -107,7 +135,7 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 				AmountCommit: out.AmountCommit,
 				EncAmount:    out.EncAmount,
 				BlockHeight:  block.Header.Height,
-			})
+			}
 		}
 	}
 	return nil
