@@ -66,8 +66,8 @@ A node ranked 22nd or below is **standby** — it does not produce blocks or ear
 
 | Parameter | Value |
 |-----------|-------|
-| Epoch length | **100 blocks** (~100 seconds at 1 s/block) |
-| Block time target | **1 second** |
+| Epoch length | **100 blocks** (~300 seconds at 3 s/block) |
+| Block time target | **3 seconds** |
 | Proposer selection | Round-robin within the active set |
 | Finality | BFT — block is final once 2/3 validators have signed |
 
