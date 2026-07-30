@@ -16,7 +16,7 @@ build: build-node build-cli
 
 build-node:
 	mkdir -p $(BUILD_DIR)
-	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NODE) ./cmd/node
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NODE) ./cmd/node
 
 build-cli:
 	mkdir -p $(BUILD_DIR)
