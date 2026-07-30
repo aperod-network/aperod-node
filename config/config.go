@@ -50,6 +50,12 @@ type P2PConfig struct {
 	// TLS fingerprint is not on the list is disconnected immediately after the
 	// TLS handshake.  An empty list means open network (default behaviour).
 	AllowedPeers []string `yaml:"allowed_peers"`
+	// IdentityKey is the path to the node's persistent Ed25519 TLS identity key
+	// file.  When empty, defaults to <data_dir>/p2p_identity.key.  The file is
+	// created on first start and reused on subsequent starts so the node's TLS
+	// fingerprint stays stable across restarts.  Pass --reset-p2p-identity on
+	// the command line to force regeneration (e.g. after a key compromise).
+	IdentityKey string `yaml:"identity_key"`
 }
 
 // ConsensusConfig holds PoA settings.

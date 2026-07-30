@@ -359,6 +359,61 @@ func TestTLS_AllowedPeers_EmptyMeansOpen(t *testing.T) {
 	}
 }
 
+// ─── T-9: LoadOrSaveP2PIdentity — persistence across calls ───────────────────
+//
+// Verifies that:
+//   - First call (no file) generates a key, saves it (isNew=true).
+//   - Second call loads the same key and returns the identical fingerprint
+//     (isNew=false).
+//   - Calling with resetIdentity=true regenerates the key (different
+//     fingerprint, isNew=true).
+
+func TestLoadOrSaveP2PIdentity_Persistence(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := dir + "/p2p_identity.key"
+
+	// First call — key file does not yet exist.
+	cfg1, fp1, isNew1, err := p2p.LoadOrSaveP2PIdentity(keyPath, false)
+	if err != nil {
+		t.Fatalf("T-9 first call: %v", err)
+	}
+	if !isNew1 {
+		t.Error("T-9: first call should return isNew=true (no prior key file)")
+	}
+	if cfg1 == nil || fp1 == "" {
+		t.Fatal("T-9: first call returned nil config or empty fingerprint")
+	}
+
+	// Second call — key file now exists; must return the same fingerprint.
+	cfg2, fp2, isNew2, err := p2p.LoadOrSaveP2PIdentity(keyPath, false)
+	if err != nil {
+		t.Fatalf("T-9 second call: %v", err)
+	}
+	if isNew2 {
+		t.Error("T-9: second call should return isNew=false (key file already exists)")
+	}
+	if fp2 != fp1 {
+		t.Errorf("T-9: fingerprint changed across restarts: %s → %s", fp1[:8], fp2[:8])
+	}
+	if cfg2 == nil {
+		t.Fatal("T-9: second call returned nil config")
+	}
+
+	// Reset call — must generate a fresh key (different fingerprint).
+	_, fp3, isNew3, err := p2p.LoadOrSaveP2PIdentity(keyPath, true)
+	if err != nil {
+		t.Fatalf("T-9 reset call: %v", err)
+	}
+	if !isNew3 {
+		t.Error("T-9: reset call should return isNew=true")
+	}
+	if fp3 == fp1 {
+		t.Error("T-9: reset did not change the fingerprint")
+	}
+
+	t.Logf("T-9 ✓ identity persisted: fp1=%s… fp2=%s… fp3(reset)=%s…", fp1[:8], fp2[:8], fp3[:8])
+}
+
 func TestTLS_PeerFingerprint_PlainConn(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()

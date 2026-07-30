@@ -418,20 +418,31 @@ func run() error {
                 }
 
                 // Load or generate a persistent Ed25519 TLS identity.
-                // The key is stored in <data_dir>/p2p_identity.key so the
-                // fingerprint is stable across restarts.  Pass --reset-p2p-identity
-                // on the command line to force regeneration (e.g. after a key
-                // compromise).  Every connection is encrypted (TLS 1.3) and
-                // mutually authenticated — plaintext or unauthenticated peers are
-                // rejected at the handshake stage (security finding F-030).
-                tlsCfg, nodeFingerprint, tlsErr := p2p.LoadOrSaveP2PIdentity(cfg.DataDir, resetP2PIdentity)
+                // The key file path is configurable via p2p.identity_key in
+                // node.yaml; if not set it defaults to <data_dir>/p2p_identity.key.
+                // Pass --reset-p2p-identity on the command line to force
+                // regeneration (e.g. after a key compromise).  Every connection
+                // is encrypted (TLS 1.3) and mutually authenticated — plaintext
+                // or unauthenticated peers are rejected at the handshake stage
+                // (security finding F-030).
+                identityKeyPath := cfg.P2P.IdentityKey
+                if identityKeyPath == "" {
+                        identityKeyPath = filepath.Join(cfg.DataDir, "p2p_identity.key")
+                }
+                tlsCfg, nodeFingerprint, isNewIdentity, tlsErr := p2p.LoadOrSaveP2PIdentity(identityKeyPath, resetP2PIdentity)
                 if tlsErr != nil {
                         log.Error("p2p tls identity load/generate failed — aborting p2p startup", "err", tlsErr)
                 } else {
-                        if resetP2PIdentity {
-                                log.Info("p2p tls identity reset and regenerated", "fingerprint", nodeFingerprint)
-                        } else {
-                                log.Info("p2p tls identity loaded", "fingerprint", nodeFingerprint)
+                        switch {
+                        case resetP2PIdentity:
+                                log.Info("p2p tls identity reset and regenerated",
+                                        "fingerprint", nodeFingerprint, "path", identityKeyPath)
+                        case isNewIdentity:
+                                log.Warn("p2p tls identity generated for the first time — record this fingerprint for peer allow-lists",
+                                        "fingerprint", nodeFingerprint, "path", identityKeyPath)
+                        default:
+                                log.Info("p2p tls identity loaded",
+                                        "fingerprint", nodeFingerprint, "path", identityKeyPath)
                         }
 
                         handler := &nodeHandler{

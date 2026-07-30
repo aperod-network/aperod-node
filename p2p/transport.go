@@ -29,23 +29,25 @@ import (
 	"time"
 )
 
-// LoadOrSaveP2PIdentity loads the node's P2P TLS identity from
-// <dataDir>/p2p_identity.key.  On first start (or when resetIdentity is true)
-// a fresh Ed25519 key is generated and written to disk with mode 0600.
-// Subsequent starts load the persisted key so the node's TLS fingerprint
-// remains stable across restarts, preventing certificate errors on peer
-// allow-lists.
+// LoadOrSaveP2PIdentity loads the node's P2P TLS identity from keyPath.
+// On first start (or when resetIdentity is true) a fresh Ed25519 key is
+// generated and written to disk with mode 0600.  Subsequent starts load the
+// persisted key so the node's TLS fingerprint remains stable across restarts,
+// preventing certificate errors on peer allow-lists.
+//
+// keyPath is the full path to the key file (e.g. "<data_dir>/p2p_identity.key").
+// The boolean return value isNew is true when a key was generated during this
+// call; false means an existing key was loaded from disk.
 //
 // The key file contains the raw 64-byte Ed25519 private key (seed || public).
-func LoadOrSaveP2PIdentity(dataDir string, resetIdentity bool) (*tls.Config, string, error) {
-	keyPath := filepath.Join(dataDir, "p2p_identity.key")
-
+func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, string, bool, error) {
 	if !resetIdentity {
 		if data, err := os.ReadFile(keyPath); err == nil {
 			if len(data) == ed25519.PrivateKeySize {
 				priv := ed25519.PrivateKey(data)
 				pub := priv.Public().(ed25519.PublicKey)
-				return nodeConfigFromKey(priv, pub)
+				cfg, fp, err := nodeConfigFromKey(priv, pub)
+				return cfg, fp, false, err
 			}
 			// File exists but is corrupt — fall through and regenerate.
 		}
@@ -54,12 +56,16 @@ func LoadOrSaveP2PIdentity(dataDir string, resetIdentity bool) (*tls.Config, str
 	// Generate a new identity key.
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, "", fmt.Errorf("p2p/transport: generate ed25519 identity key: %w", err)
+		return nil, "", false, fmt.Errorf("p2p/transport: generate ed25519 identity key: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return nil, "", false, fmt.Errorf("p2p/transport: create identity key dir: %w", err)
 	}
 	if err := os.WriteFile(keyPath, []byte(priv), 0600); err != nil {
-		return nil, "", fmt.Errorf("p2p/transport: save identity key to %s: %w", keyPath, err)
+		return nil, "", false, fmt.Errorf("p2p/transport: save identity key to %s: %w", keyPath, err)
 	}
-	return nodeConfigFromKey(priv, pub)
+	cfg, fp, err := nodeConfigFromKey(priv, pub)
+	return cfg, fp, true, err
 }
 
 // GenerateNodeTLSConfig creates an ephemeral Ed25519 identity and returns a
