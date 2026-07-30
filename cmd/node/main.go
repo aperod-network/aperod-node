@@ -501,6 +501,7 @@ func run() error {
                                         return out
                                 })
                                 apiSrv.SetBanLiftFunc(host.LiftBan)
+                                apiSrv.SetBanAddFunc(host.BanPeer)
                                 }
                                 // Background goroutine: if an allow-list is active and no peers
                                 // connect after 2×block_time, the list may be misconfigured

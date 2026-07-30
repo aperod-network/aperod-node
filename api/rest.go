@@ -508,20 +508,56 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 //
 // Lifts the ban for addr. Returns 404 when no active ban exists for that addr.
 
+// banAddRequest is the JSON body for POST /api/v1/network/bans.
+type banAddRequest struct {
+        Addr            string `json:"addr"`             // IP or IP:port
+        Reason          string `json:"reason"`           // human-readable reason
+        DurationMinutes int    `json:"duration_minutes"` // 0 → default 60 minutes
+}
+
 func (s *Server) restNetworkBans(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodGet {
+        switch r.Method {
+        case http.MethodGet:
+                if s.banListFn == nil {
+                        writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                        return
+                }
+                bans := s.banListFn()
+                if bans == nil {
+                        bans = []BanEntry{}
+                }
+                writeJSON(w, http.StatusOK, map[string]interface{}{"bans": bans})
+
+        case http.MethodPost:
+                if s.banAddFn == nil {
+                        writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                        return
+                }
+                var req banAddRequest
+                if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+                        return
+                }
+                if req.Addr == "" {
+                        writeJSONError(w, http.StatusBadRequest, "addr is required")
+                        return
+                }
+                if req.DurationMinutes <= 0 {
+                        req.DurationMinutes = 60
+                }
+                d := time.Duration(req.DurationMinutes) * time.Minute
+                s.banAddFn(req.Addr, req.Reason, d)
+                expiresAt := time.Now().Add(d).UTC()
+                writeJSON(w, http.StatusCreated, map[string]interface{}{
+                        "message":    "ban added",
+                        "addr":       req.Addr,
+                        "reason":     req.Reason,
+                        "expires_at": expiresAt,
+                })
+
+        default:
                 writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-                return
         }
-        if s.banListFn == nil {
-                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
-                return
-        }
-        bans := s.banListFn()
-        if bans == nil {
-                bans = []BanEntry{}
-        }
-        writeJSON(w, http.StatusOK, map[string]interface{}{"bans": bans})
 }
 
 func (s *Server) restNetworkBanByAddr(w http.ResponseWriter, r *http.Request) {
