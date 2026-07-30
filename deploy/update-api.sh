@@ -91,6 +91,16 @@ fi
 #         any crash-loop that starts immediately after this deploy.
 # ---------------------------------------------------------------------------
 echo "==> [3/4] Restarting PM2 process '$PM2_APP'..."
+# Kill any orphaned Node.js process still holding port 3001 (can happen when a
+# previous PM2 daemon was killed but its child process survived). Without this,
+# the new process crashes immediately with EADDRINUSE and PM2 enters a crash loop.
+API_PORT="${API_PORT:-3001}"
+if fuser "${API_PORT}/tcp" >/dev/null 2>&1; then
+  echo "  Port ${API_PORT} is in use — killing orphaned process..."
+  fuser -k "${API_PORT}/tcp" 2>/dev/null || true
+  sleep 1
+fi
+
 # If the process is not yet registered in PM2 (e.g. after server reboot or
 # accidental `pm2 delete`), `pm2 restart` exits non-zero with "not found".
 # Fall back to a clean start from the ecosystem config in that case.
