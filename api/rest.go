@@ -649,6 +649,7 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                         "tps_last_10":              tps,
                         "block_time_secs":          3,
                         "timestamp_rejected_count": s.TimestampRejectedCount(),
+                        "peer_count":               s.livePeerCount(),
                 })
                 return
         }
@@ -661,7 +662,16 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 "mempool_count":            s.mempool.Count(),
                 "tps_last_10":              0,
                 "timestamp_rejected_count": s.TimestampRejectedCount(),
+                "peer_count":               s.livePeerCount(),
         })
+}
+
+// livePeerCount returns the current P2P peer count, or 0 if not wired.
+func (s *Server) livePeerCount() int {
+        if s.peerCounter == nil {
+                return 0
+        }
+        return s.peerCounter()
 }
 
 // ─── GET /api/v1/validators ──────────────────────────────────────────────────
