@@ -85,3 +85,39 @@ func (pm *PeerMgr) BannedCount() int {
 	}
 	return count
 }
+
+// BanInfo is a snapshot of one active ban entry.
+type BanInfo struct {
+	Addr      string    `json:"addr"`
+	Reason    string    `json:"reason"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ListBans returns a snapshot of all currently active bans (expired entries
+// are pruned before the snapshot is taken).
+func (pm *PeerMgr) ListBans() []BanInfo {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	now := time.Now()
+	out := make([]BanInfo, 0, len(pm.banned))
+	for addr, e := range pm.banned {
+		if now.After(e.until) {
+			delete(pm.banned, addr)
+			continue
+		}
+		out = append(out, BanInfo{Addr: addr, Reason: e.reason, ExpiresAt: e.until})
+	}
+	return out
+}
+
+// LiftBan removes the ban for addr (exact match only).
+// Returns true when a ban was found and removed; false when addr was not banned.
+func (pm *PeerMgr) LiftBan(addr string) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if _, ok := pm.banned[addr]; ok {
+		delete(pm.banned, addr)
+		return true
+	}
+	return false
+}

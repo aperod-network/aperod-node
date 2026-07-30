@@ -492,6 +492,15 @@ func run() error {
                                 defer host.Stop()
                                 if apiSrv != nil {
                                         apiSrv.SetPeerCounter(host.PeerCount)
+                                apiSrv.SetBanListFunc(func() []api.BanEntry {
+                                        bans := host.ListBans()
+                                        out := make([]api.BanEntry, len(bans))
+                                        for i, b := range bans {
+                                                out[i] = api.BanEntry{Addr: b.Addr, Reason: b.Reason, ExpiresAt: b.ExpiresAt}
+                                        }
+                                        return out
+                                })
+                                apiSrv.SetBanLiftFunc(host.LiftBan)
                                 }
                                 // Background goroutine: if an allow-list is active and no peers
                                 // connect after 2×block_time, the list may be misconfigured

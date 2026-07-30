@@ -253,6 +253,16 @@ func (h *Host) PeerCount() int {
         return len(h.peers)
 }
 
+// ListBans returns a snapshot of all currently active P2P bans.
+func (h *Host) ListBans() []BanInfo {
+        return h.mgr.ListBans()
+}
+
+// LiftBan removes the P2P ban for addr. Returns true if the ban existed.
+func (h *Host) LiftBan(addr string) bool {
+        return h.mgr.LiftBan(addr)
+}
+
 // ListenAddr returns the actual bound address (useful when ListenAddr was ":0").
 func (h *Host) ListenAddr() string {
         if h.listener == nil {

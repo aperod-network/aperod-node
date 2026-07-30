@@ -36,6 +36,9 @@ type Server struct {
         // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
         tsRejectedCounter func() int64
 
+        banListFn func() []BanEntry  // optional; wired to p2p.Host.ListBans by cmd/node
+        banLiftFn func(string) bool  // optional; wired to p2p.Host.LiftBan by cmd/node
+
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
@@ -88,6 +91,22 @@ func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
 func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
+
+// BanEntry is a snapshot of one active P2P ban entry, returned by the REST API.
+type BanEntry struct {
+        Addr      string    `json:"addr"`
+        Reason    string    `json:"reason"`
+        ExpiresAt time.Time `json:"expires_at"`
+}
+
+// SetBanListFunc wires a function that returns active P2P bans.
+// Optional — GET /api/v1/network/bans returns 503 when not wired.
+func (s *Server) SetBanListFunc(f func() []BanEntry) { s.banListFn = f }
+
+// SetBanLiftFunc wires a function that removes a P2P ban by addr.
+// Returns true when a ban was found and lifted.
+// Optional — DELETE /api/v1/network/bans/:addr returns 503 when not wired.
+func (s *Server) SetBanLiftFunc(f func(string) bool) { s.banLiftFn = f }
 
 // SetTimestampRejectedCounter wires a function returning the live count of blocks
 // rejected by the timejacking guard.  Optional — reports 0 when unset.

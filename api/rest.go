@@ -40,6 +40,8 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
+        s.mux.HandleFunc("/api/v1/network/bans", s.restNetworkBans)
+        s.mux.HandleFunc("/api/v1/network/bans/", s.restNetworkBanByAddr)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -495,6 +497,53 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
                 "transactions": results,
                 "note":         "shows transparent (non-stealth) outputs only; full privacy scanning requires view key",
         })
+}
+
+// ─── GET /api/v1/network/bans ─────────────────────────────────────────────────
+//
+// Returns all currently active P2P bans.  Requires the ban-list function to be
+// wired via SetBanListFunc; returns 503 when the P2P layer is not running.
+//
+// DELETE /api/v1/network/bans/:addr
+//
+// Lifts the ban for addr. Returns 404 when no active ban exists for that addr.
+
+func (s *Server) restNetworkBans(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+                return
+        }
+        if s.banListFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+        bans := s.banListFn()
+        if bans == nil {
+                bans = []BanEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"bans": bans})
+}
+
+func (s *Server) restNetworkBanByAddr(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodDelete {
+                writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+                return
+        }
+        if s.banLiftFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+        addr := pathSuffix("/api/v1/network/bans/", r.URL.Path)
+        if addr == "" {
+                writeJSONError(w, http.StatusBadRequest, "addr is required")
+                return
+        }
+        lifted := s.banLiftFn(addr)
+        if !lifted {
+                writeJSONError(w, http.StatusNotFound, "no active ban for this address")
+                return
+        }
+        writeJSON(w, http.StatusOK, map[string]string{"message": "ban lifted", "addr": addr})
 }
 
 // ─── GET /api/v1/network/stats (2.1.13) ──────────────────────────────────────
