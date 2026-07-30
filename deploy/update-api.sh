@@ -112,6 +112,13 @@ else
   # Delete any stale/corrupted entry before starting fresh to avoid the
   # "Cannot read properties of undefined (reading 'pm2_env')" TypeError.
   pm2 delete "$PM2_APP" 2>/dev/null || true
+  # pm2 start from a bare ecosystem file loses the env vars that were in the
+  # previous process descriptor (DATABASE_URL, SESSION_SECRET, etc.).
+  # Source /opt/aperod/.env first so the new process inherits them.
+  if [[ -f "${APEROD_DIR}/.env" ]]; then
+    set -a && source "${APEROD_DIR}/.env" && set +a
+    echo "  Loaded env vars from ${APEROD_DIR}/.env"
+  fi
   pm2 start "${DEPLOY_DIR}/ecosystem.config.cjs"
 fi
 
