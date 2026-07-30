@@ -17,6 +17,10 @@ type MempoolConfig struct {
 	MaxTxSize        int           // maximum size of a single transaction in bytes
 	TTL              time.Duration // evict transactions older than this
 	BaseFeePerByte   uint64        // current network base fee in nAPRO/byte (updated each block)
+	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
+	// When nil the mempool only runs structural Validate() (dev/test mode).
+	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
+	Verifier         *TxVerifier
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -97,6 +101,15 @@ func (m *Mempool) Add(tx Transaction) error {
 
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
+	}
+
+	// Full RingCT cryptographic verification (ring sigs, range proofs, Pedersen balance).
+	// C-0/C-1: prevents supply inflation via forged AmountCommit or unbound stake amount.
+	// Stake txs are included — they carry ring inputs whose proofs must be valid.
+	if m.cfg.Verifier != nil {
+		if err := m.cfg.Verifier.VerifyTx(&tx); err != nil {
+			return fmt.Errorf("mempool: crypto verification failed: %w", err)
+		}
 	}
 
 	size := tx.Size()
@@ -308,6 +321,15 @@ func (m *Mempool) TotalBytes() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.totalBytes
+}
+
+// SetVerifier wires a TxVerifier into the mempool after creation.
+// Called once the UTXO set has been populated from the stored chain.
+// Until this is called the mempool runs in structural-only mode (dev/test).
+func (m *Mempool) SetVerifier(v *TxVerifier) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg.Verifier = v
 }
 
 // Hashes returns all transaction hashes currently in the pool.

@@ -62,6 +62,10 @@ type APIConfig struct {
 	Enabled    bool     `yaml:"enabled"`
 	ListenAddr string   `yaml:"listen_addr"`
 	CORS       []string `yaml:"cors"`
+	// Key, when non-empty, requires all write RPC methods (apr_sendRawTransaction
+	// etc.) to supply a matching api_key param or X-API-Key header.
+	// Empty = dev/open mode (F-5 fix: must be set in production node.yaml).
+	Key        string   `yaml:"key"`
 }
 
 // GenesisRef points to the genesis file.

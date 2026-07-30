@@ -344,6 +344,9 @@ func run() error {
         // = fail-open).  Wiring first closes that window entirely.
         txVerifier := core.NewTxVerifier(utxos)
         engine.SetTxVerifier(txVerifier, utxos)
+        // Wire the same verifier into the mempool so Add() runs full RingCT checks
+        // (C-0 / C-1 fix: prevents inflation via forged commitments or unbound stake).
+        mempool.SetVerifier(txVerifier)
 
         // ── 9. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
@@ -368,6 +371,10 @@ func run() error {
                 apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetStore(db) // enables pruned-block fallback in the REST API
+                // F-5 fix: wire API key so apr_sendRawTransaction requires auth in production.
+                if cfg.API.Key != "" {
+                        apiSrv.SetAPIKey(cfg.API.Key)
+                }
         apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
                 go func() {
                         if err := apiSrv.Start(); err != nil {

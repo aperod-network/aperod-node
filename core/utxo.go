@@ -37,6 +37,7 @@ type UTXOSet struct {
 	mu        sync.RWMutex
 	utxos     map[UTXOKey]*UTXO
 	keyImages map[crypto.KeyImage]struct{} // spent key images
+	byPubKey  map[crypto.Point32]*UTXO     // index by OneTimePub for ring-member lookup (C-0 fix)
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
@@ -44,6 +45,7 @@ func NewUTXOSet() *UTXOSet {
 	return &UTXOSet{
 		utxos:     make(map[UTXOKey]*UTXO),
 		keyImages: make(map[crypto.KeyImage]struct{}),
+		byPubKey:  make(map[crypto.Point32]*UTXO),
 	}
 }
 
@@ -53,6 +55,7 @@ func (s *UTXOSet) Add(u *UTXO) {
 	defer s.mu.Unlock()
 	key := UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}
 	s.utxos[key] = u
+	s.byPubKey[u.OneTimePub] = u
 }
 
 // Get retrieves a UTXO by its key. Returns nil if not found.
@@ -62,11 +65,24 @@ func (s *UTXOSet) Get(txHash crypto.Hash32, outIdx uint32) *UTXO {
 	return s.utxos[UTXOKey{TxHash: txHash, OutputIndex: outIdx}]
 }
 
+// GetByPubKey looks up a UTXO by its stealth one-time public key.
+// Used by TxVerifier to bind ring member AmountCommits to actual on-chain
+// UTXO commitments (C-0 fix: prevents attacker-supplied fake commitments).
+func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.byPubKey[pub]
+}
+
 // Remove deletes a UTXO from the set (called when it is spent).
 func (s *UTXOSet) Remove(txHash crypto.Hash32, outIdx uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: outIdx})
+	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
+	if u, ok := s.utxos[k]; ok {
+		delete(s.byPubKey, u.OneTimePub)
+	}
+	delete(s.utxos, k)
 }
 
 // MarkSpent records a Key Image as spent.

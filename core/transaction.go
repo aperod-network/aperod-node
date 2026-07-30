@@ -102,7 +102,9 @@ func (tx *Transaction) Validate() error {
                 return fmt.Errorf("tx version 0 is invalid")
         }
 
-        // Stake transactions carry payload only in Extra; no RingCT fields required.
+        // Stake transactions carry payload in Extra.  Validate the Extra field,
+        // then fall through to enforce RangeProof count for any outputs (C-2 fix:
+        // the previous early-return let stake txs carry outputs without proofs).
         if tx.IsStake() {
                 if len(tx.Extra) != StakePayloadSize {
                         return fmt.Errorf("stake tx: extra must be exactly %d bytes, got %d",
@@ -112,7 +114,11 @@ func (tx *Transaction) Validate() error {
                 if action != StakeDeposit && action != StakeWithdraw && action != StakePartialWithdraw {
                         return fmt.Errorf("stake tx: unknown action %d", action)
                 }
-                return nil
+                // Stake txs with no outputs need no further RingCT validation.
+                if len(tx.Outputs) == 0 {
+                        return nil
+                }
+                // Has outputs → fall through to enforce len(RangeProofs)==len(Outputs).
         }
 
         if len(tx.Outputs) == 0 {

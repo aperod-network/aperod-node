@@ -14,6 +14,7 @@ package core
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -38,6 +39,10 @@ const (
 	// ChurnLimit is the maximum number of new validators that can be
 	// activated per epoch (ETH-style entry rate limit).
 	ChurnLimit = 3
+
+	// MaxStakeNAPR is the per-validator hard cap (100 M APRO × 10^8).
+	// Prevents C-3 uint64-overflow: Extra.amount cannot wrap StakeNAPR to MaxUint64.
+	MaxStakeNAPR uint64 = 10_000_000_000_000_000
 
 	// UnbondingBlocks is how long stake is locked after a withdrawal request.
 	// ~2 hours at 1-second blocks.
@@ -298,13 +303,25 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 			float64(effectiveMin)/float64(BaseUnitsPerAPR))
 	}
 
+	// C-3 / C-1 guard: cap stake amount to prevent uint64 overflow attacks.
+	if amount > MaxStakeNAPR {
+		return fmt.Errorf("deposit amount %.4f APRO exceeds per-validator cap %.4f APRO",
+			float64(amount)/float64(BaseUnitsPerAPR),
+			float64(MaxStakeNAPR)/float64(BaseUnitsPerAPR))
+	}
+
 	if existing, ok := r.validators[key]; ok {
 		switch existing.Status {
 		case ValidatorUnbonding, ValidatorExited:
 			return fmt.Errorf("validator is unbonding/exited; wait %d blocks before re-staking",
 				UnbondingBlocks)
 		default:
-			// Top-up: increase stake for pending or active validator
+			// Top-up: increase stake — checked addition prevents uint64 overflow.
+			if existing.StakeNAPR > math.MaxUint64-amount {
+				return fmt.Errorf("stake top-up overflow: current %.4f + deposit %.4f would exceed uint64",
+					float64(existing.StakeNAPR)/float64(BaseUnitsPerAPR),
+					float64(amount)/float64(BaseUnitsPerAPR))
+			}
 			existing.StakeNAPR += amount
 			return nil
 		}
