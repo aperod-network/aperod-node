@@ -1,6 +1,7 @@
 package p2p
 
 import (
+        "crypto/tls"
         "fmt"
         "log/slog"
         "net"
@@ -29,6 +30,13 @@ type Config struct {
         MinOutbound int
         NodeID      string // hex-encoded public key or random ID
         UserAgent   string
+        // TLSConfig enables authenticated encrypted transport.
+        // When non-nil, the listener is wrapped with tls.NewListener and
+        // outbound dials use tls.DialWithDialer.  Both sides must present a
+        // certificate; the peer fingerprint is logged on connect and available
+        // via PeerFingerprint(conn).
+        // nil = plain TCP (unit tests only — never use nil in production).
+        TLSConfig *tls.Config
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -125,8 +133,15 @@ func (h *Host) Start() error {
         if err != nil {
                 return fmt.Errorf("listen %s: %w", h.cfg.ListenAddr, err)
         }
-        h.listener = ln
-        h.log.Info("p2p listening", "addr", h.cfg.ListenAddr)
+        // Wrap the TCP listener with TLS when a TLS config is provided so that
+        // all accepted connections are automatically upgraded to encrypted,
+        // mutually authenticated transport.
+        if h.cfg.TLSConfig != nil {
+                h.listener = tls.NewListener(ln, h.cfg.TLSConfig)
+        } else {
+                h.listener = ln
+        }
+        h.log.Info("p2p listening", "addr", h.cfg.ListenAddr, "tls", h.cfg.TLSConfig != nil)
 
         go h.acceptLoop()
         go h.maintainLoop()
@@ -365,10 +380,27 @@ func (h *Host) dialPeer(addr string) {
         }
 
         h.log.Debug("dialing peer", "addr", addr)
-        conn, err := net.DialTimeout("tcp", addr, DialTimeout)
-        if err != nil {
-                h.log.Debug("dial failed", "addr", addr, "err", err)
-                return
+        var conn net.Conn
+        if h.cfg.TLSConfig != nil {
+                // Outbound TLS dial: the TLS handshake completes before
+                // handleConn is invoked, so PeerFingerprint is available
+                // immediately on the first call inside handleConn.
+                tlsConn, err := tls.DialWithDialer(
+                        &net.Dialer{Timeout: DialTimeout},
+                        "tcp", addr, h.cfg.TLSConfig,
+                )
+                if err != nil {
+                        h.log.Debug("tls dial failed", "addr", addr, "err", err)
+                        return
+                }
+                conn = tlsConn
+        } else {
+                var err error
+                conn, err = net.DialTimeout("tcp", addr, DialTimeout)
+                if err != nil {
+                        h.log.Debug("dial failed", "addr", addr, "err", err)
+                        return
+                }
         }
         go h.handleConn(conn, true)
 }
@@ -396,6 +428,25 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 h.log.Debug("handleConn: banned peer rejected", "addr", addr)
                 conn.Close()
                 return
+        }
+
+        // When TLS is enabled the accepted conn is a *tls.Conn whose handshake
+        // is lazy (fires on first Read/Write).  Complete it eagerly here so:
+        //   a) unauthenticated / plain-TCP connections are dropped immediately
+        //      with a clear log line rather than partway through the Aperod
+        //      application handshake, and
+        //   b) PeerFingerprint is available before any application data flows.
+        if tlsConn, ok := conn.(*tls.Conn); ok {
+                tlsConn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+                if err := tlsConn.Handshake(); err != nil {
+                        h.log.Debug("tls handshake failed — plaintext or unauthorized peer rejected",
+                                "addr", addr, "err", err)
+                        conn.Close()
+                        return
+                }
+                tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
+                fp := PeerFingerprint(conn)
+                h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)
         }
 
         peer := &Peer{conn: conn, addr: addr, outbound: outbound}

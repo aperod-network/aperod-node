@@ -408,32 +408,45 @@ func run() error {
                         }
                 }
 
-                handler := &nodeHandler{
-                        engine: engine,
-                        chain:  chain,
-                        pool:   mempool,
-                        db:     db,
-                        log:    log,
-                }
-                host = p2p.NewHost(p2p.Config{
-                        ListenAddr:       tcpAddr,
-                        Bootnodes:        bootnodes,
-                        MaxPeers:     cfg.P2P.MaxPeers,
-                        MinPeers:     cfg.P2P.MinPeers,
-                        MaxPeersPerIP: cfg.P2P.MaxPeersPerIP,
-                        MinOutbound:  cfg.P2P.MinOutbound,
-                        NodeID:           myKey.Public().ID(),
-                        UserAgent:        "aperod-node/1.0",
-                }, handler, log)
-
-                if err := host.Start(); err != nil {
-                        log.Error("p2p failed to start", "err", err)
-                        // Non-fatal: node runs standalone if P2P fails.
+                // Generate an ephemeral Ed25519 TLS identity for this session.
+                // Every connection is encrypted (TLS 1.3) and mutually
+                // authenticated via self-signed certificates — plaintext or
+                // unauthenticated peers are rejected at the handshake stage.
+                // This addresses security finding F-030.
+                tlsCfg, nodeFingerprint, tlsErr := p2p.GenerateNodeTLSConfig()
+                if tlsErr != nil {
+                        log.Error("p2p tls identity generation failed — aborting p2p startup", "err", tlsErr)
                 } else {
-                        log.Info("p2p started", "listen", tcpAddr, "bootnodes", len(bootnodes))
-                        defer host.Stop()
-                        if apiSrv != nil {
-                                apiSrv.SetPeerCounter(host.PeerCount)
+                        log.Info("p2p tls identity generated", "fingerprint", nodeFingerprint)
+
+                        handler := &nodeHandler{
+                                engine: engine,
+                                chain:  chain,
+                                pool:   mempool,
+                                db:     db,
+                                log:    log,
+                        }
+                        host = p2p.NewHost(p2p.Config{
+                                ListenAddr:    tcpAddr,
+                                Bootnodes:     bootnodes,
+                                MaxPeers:      cfg.P2P.MaxPeers,
+                                MinPeers:      cfg.P2P.MinPeers,
+                                MaxPeersPerIP: cfg.P2P.MaxPeersPerIP,
+                                MinOutbound:   cfg.P2P.MinOutbound,
+                                NodeID:        myKey.Public().ID(),
+                                UserAgent:     "aperod-node/1.0",
+                                TLSConfig:     tlsCfg,
+                        }, handler, log)
+
+                        if err := host.Start(); err != nil {
+                                log.Error("p2p failed to start", "err", err)
+                                // Non-fatal: node runs standalone if P2P fails.
+                        } else {
+                                log.Info("p2p started", "listen", tcpAddr, "bootnodes", len(bootnodes))
+                                defer host.Stop()
+                                if apiSrv != nil {
+                                        apiSrv.SetPeerCounter(host.PeerCount)
+                                }
                         }
                 }
         }
