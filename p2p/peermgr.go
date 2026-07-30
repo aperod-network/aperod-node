@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"net"
 	"sync"
 	"time"
 )
@@ -30,18 +31,33 @@ func (pm *PeerMgr) Ban(addr, reason string, d time.Duration) {
 }
 
 // IsBanned returns true if addr is currently banned.
+// It checks both the full "IP:port" address and the bare IP so that a ban
+// registered with just the IP (e.g. "1.2.3.4") blocks all connections from
+// that host regardless of source port.
 func (pm *PeerMgr) IsBanned(addr string) bool {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	e, ok := pm.banned[addr]
-	if !ok {
-		return false
+
+	check := func(key string) bool {
+		e, ok := pm.banned[key]
+		if !ok {
+			return false
+		}
+		if time.Now().After(e.until) {
+			delete(pm.banned, key)
+			return false
+		}
+		return true
 	}
-	if time.Now().After(e.until) {
-		delete(pm.banned, addr)
-		return false
+
+	if check(addr) {
+		return true
 	}
-	return true
+	// Also check a bare-IP ban when addr is "IP:port".
+	if ip, _, err := net.SplitHostPort(addr); err == nil && ip != addr {
+		return check(ip)
+	}
+	return false
 }
 
 // Prune removes expired ban entries.

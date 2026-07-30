@@ -426,6 +426,88 @@ func TestTLS_PeerFingerprint_PlainConn(t *testing.T) {
 	t.Log("T-5 ✓ PeerFingerprint returns empty string for plain net.Conn")
 }
 
+// ─── T-10: Banned IP rejected even when its certificate is on AllowedPeers ────
+//
+// Security regression guard: the ban-list check in handleConn MUST run before
+// the AllowedPeers (TLS fingerprint) check.  If these checks are ever
+// accidentally reordered, a banned attacker holding a valid certificate would
+// slip through.
+//
+// Test sequence:
+//  1. Generate the attacker's TLS identity (cfgAttacker / fpAttacker).
+//  2. Start a host with AllowedPeers containing ONLY fpAttacker — so the cert
+//     IS explicitly allowed.
+//  3. Pre-ban the loopback IP "127.0.0.1" (bare IP) before any connection is
+//     made — this simulates an operator banning the attacker's host.
+//  4. Attacker dials with cfgAttacker (the allowed cert).
+//  5. Assert PeerCount == 0: the ban gate fires first and the connection is
+//     dropped regardless of the valid certificate.
+
+func TestTLS_BannedIPRejectedDespiteValidCert(t *testing.T) {
+	// Attacker identity — will be placed on AllowedPeers.
+	cfgAttacker, fpAttacker, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-10: gen attacker config: %v", err)
+	}
+
+	// Host identity.
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-10: gen host config: %v", err)
+	}
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:   "127.0.0.1:0",
+		MaxPeers:     5,
+		NodeID:       "ban-test-host",
+		UserAgent:    "aperod/test",
+		TLSConfig:    cfgHost,
+		AllowedPeers: []string{fpAttacker}, // attacker's cert IS on the allow-list
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("T-10: host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	// Pre-ban the loopback IP before the attacker connects.
+	// Using the bare IP (no port) so that any ephemeral source port from
+	// 127.0.0.1 is blocked — this tests the IP-level ban path in PeerMgr.
+	host.BanPeer("127.0.0.1", "attacker ip banned", time.Hour)
+
+	// Attacker dials with their allowed certificate.
+	attackConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", host.ListenAddr(), cfgAttacker,
+	)
+	if err != nil {
+		// Host closed the connection before or during the TLS handshake — this
+		// is an acceptable (and stronger) form of rejection.
+		t.Logf("T-10 ✓ banned attacker rejected at/before TLS handshake: %v", err)
+	} else {
+		defer attackConn.Close()
+		// TLS handshake completed; the host must close the connection immediately
+		// at the ban check without sending any Aperod data.
+		attackConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+		buf := make([]byte, 8)
+		n, readErr := attackConn.Read(buf)
+		if readErr != nil {
+			t.Logf("T-10 ✓ banned attacker connection closed by host after TLS handshake (n=%d err=%v)", n, readErr)
+		} else {
+			t.Logf("T-10: host sent %d bytes to banned peer (unexpected — checking peer count)", n)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if host.PeerCount() != 0 {
+		t.Errorf("T-10: banned IP was registered despite holding a valid allowed certificate "+
+			"(peer count=%d) — ban check must precede AllowedPeers check", host.PeerCount())
+	} else {
+		t.Logf("T-10 ✓ ban takes precedence over AllowedPeers: fpAttacker=%s… peer count=0",
+			fpAttacker[:8])
+	}
+}
+
 // ─── T-8: Forged-cert peer cannot inject a block ──────────────────────────────
 //
 // Security regression test: a peer that presents a self-signed certificate
