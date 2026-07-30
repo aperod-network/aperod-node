@@ -34,7 +34,7 @@ Response within **48 hours**. Critical issues patched within **7 days**.
 
 | Severity | Reward |
 |----------|--------|
-| **Critical** (consensus break, key extraction, double-spend, network halt) | **$1,000,000** |
+| **Critical** (consensus break, key extraction, double-spend, network halt) | up to **$1,000,000** |
 | **High** (RCE, eclipse attack, auth bypass) | up to **$500,000** |
 | **Medium** (data integrity, privacy leaks, DoS) | up to **$300,000** |
 | **Low / Informational** | up to **$100,000** |
