@@ -104,8 +104,14 @@ fi
 # If the process is not yet registered in PM2 (e.g. after server reboot or
 # accidental `pm2 delete`), `pm2 restart` exits non-zero with "not found".
 # Fall back to a clean start from the ecosystem config in that case.
-if ! pm2 restart "$PM2_APP" 2>/dev/null; then
+# Use `--update-env` so new env vars in .env are picked up on restart.
+if pm2 restart "$PM2_APP" --update-env 2>/dev/null; then
+  echo "  PM2 restart successful."
+else
   echo "  Process not found in PM2 — starting fresh from ecosystem config..."
+  # Delete any stale/corrupted entry before starting fresh to avoid the
+  # "Cannot read properties of undefined (reading 'pm2_env')" TypeError.
+  pm2 delete "$PM2_APP" 2>/dev/null || true
   pm2 start "${DEPLOY_DIR}/ecosystem.config.cjs"
 fi
 
