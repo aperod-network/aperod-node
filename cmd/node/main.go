@@ -458,16 +458,17 @@ func run() error {
                                 log:    log,
                         }
                         host = p2p.NewHost(p2p.Config{
-                                ListenAddr:    tcpAddr,
-                                Bootnodes:     bootnodes,
-                                MaxPeers:      cfg.P2P.MaxPeers,
-                                MinPeers:      cfg.P2P.MinPeers,
-                                MaxPeersPerIP: cfg.P2P.MaxPeersPerIP,
-                                MinOutbound:   cfg.P2P.MinOutbound,
-                                NodeID:        myKey.Public().ID(),
-                                UserAgent:     "aperod-node/1.0",
-                                TLSConfig:     tlsCfg,
-                                AllowedPeers:  cfg.P2P.AllowedPeers,
+                                ListenAddr:           tcpAddr,
+                                Bootnodes:            bootnodes,
+                                MaxPeers:             cfg.P2P.MaxPeers,
+                                MinPeers:             cfg.P2P.MinPeers,
+                                MaxPeersPerIP:        cfg.P2P.MaxPeersPerIP,
+                                MinOutbound:          cfg.P2P.MinOutbound,
+                                NodeID:               myKey.Public().ID(),
+                                UserAgent:            "aperod-node/1.0",
+                                TLSConfig:            tlsCfg,
+                                AllowedPeers:         cfg.P2P.AllowedPeers,
+                                MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
                         }, handler, log)
                         if len(cfg.P2P.AllowedPeers) > 0 {
                                 log.Info("allow-list active",

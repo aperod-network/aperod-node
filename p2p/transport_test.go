@@ -508,6 +508,97 @@ func TestTLS_BannedIPRejectedDespiteValidCert(t *testing.T) {
 	}
 }
 
+// ─── T-11: MaxPendingHandshakes — (N+1)th slow connection is rejected ─────────
+//
+// A malicious peer opens MaxPendingHandshakes raw TCP connections that never
+// send any TLS ClientHello, holding the handshake goroutines blocked for up
+// to 10 s each.  The (N+1)th connection must be closed immediately by
+// acceptLoop before any goroutine is spawned for it.
+//
+// Slow connections are raw TCP (no TLS client) so the host's
+// tlsConn.Handshake() blocks waiting for data — simulating a peer that stalls
+// the handshake indefinitely.
+
+func TestTLS_HandshakeFlood(t *testing.T) {
+	const limit = 3
+
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-11: gen host config: %v", err)
+	}
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             20,
+		NodeID:               "flood-test-node",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		MaxPendingHandshakes: limit,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("T-11: host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	addr := host.ListenAddr()
+
+	// Open `limit` raw TCP connections (no TLS).  The host accepts each one,
+	// acquires a pending-handshake semaphore slot, and spawns a goroutine that
+	// blocks in tlsConn.Handshake() waiting for the client's ClientHello.
+	// This holds all semaphore slots.
+	slowConns := make([]net.Conn, limit)
+	for i := 0; i < limit; i++ {
+		c, dialErr := net.DialTimeout("tcp", addr, 2*time.Second)
+		if dialErr != nil {
+			t.Fatalf("T-11: slow conn %d dial: %v", i, dialErr)
+		}
+		slowConns[i] = c
+		t.Cleanup(func() { c.Close() })
+	}
+
+	// Give acceptLoop time to accept all slow connections and for each
+	// goroutine to reach the blocking tlsConn.Handshake() call, consuming
+	// all MaxPendingHandshakes slots.
+	time.Sleep(150 * time.Millisecond)
+
+	// The (limit+1)th connection must be rejected immediately by acceptLoop
+	// (before any goroutine is launched) because the semaphore is full.
+	extra, dialErr := net.DialTimeout("tcp", addr, 2*time.Second)
+	if dialErr != nil {
+		t.Fatalf("T-11: extra conn dial: %v", dialErr)
+	}
+	defer extra.Close()
+
+	// Use a short deadline so we can distinguish an immediate close (EOF /
+	// connection reset) from the connection simply hanging open — a timeout
+	// here would mean the semaphore check is NOT working.
+	extra.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+	buf := make([]byte, 64)
+	n, readErr := extra.Read(buf)
+	if readErr == nil && n > 0 {
+		// Some stacks send bytes (e.g. a TCP RST) before closing; drain and
+		// wait for the actual close.
+		_, readErr = extra.Read(buf)
+	}
+
+	if readErr == nil {
+		t.Errorf("T-11: (limit+1)th connection still open — MaxPendingHandshakes not enforced")
+		return
+	}
+	// A timeout means the connection was NOT rejected — it just hung.
+	if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+		t.Errorf("T-11: (limit+1)th connection timed out instead of being rejected immediately — "+
+			"MaxPendingHandshakes semaphore not working (timeout after 500 ms)")
+		return
+	}
+	t.Logf("T-11 ✓ (limit+1)th connection rejected immediately (err=%v, bytes=%d)", readErr, n)
+
+	// Slow connections did not complete the handshake, so PeerCount stays 0.
+	if cnt := host.PeerCount(); cnt != 0 {
+		t.Logf("T-11: note — PeerCount=%d (unexpected if slow conns completed handshake)", cnt)
+	}
+}
+
 // ─── T-8: Forged-cert peer cannot inject a block ──────────────────────────────
 //
 // Security regression test: a peer that presents a self-signed certificate

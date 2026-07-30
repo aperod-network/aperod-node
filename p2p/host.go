@@ -7,6 +7,7 @@ import (
         "net"
         "runtime/debug"
         "sync"
+        "sync/atomic"
         "time"
 
         "github.com/aperod/aperod/core"
@@ -43,6 +44,13 @@ type Config struct {
         // immediately after the TLS handshake with a clear log entry.
         // An empty slice means open network (default behaviour).
         AllowedPeers []string
+        // MaxPendingHandshakes limits the number of inbound TCP connections
+        // that are concurrently in the TLS handshake phase.  A peer that
+        // opens many connections but never completes the handshake would
+        // otherwise hold one goroutine each for up to 10 s; this cap bounds
+        // the blast radius to MaxPendingHandshakes goroutines.
+        // 0 = no limit (not recommended for production).  Default: 20.
+        MaxPendingHandshakes int
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -98,6 +106,12 @@ type Host struct {
         mgr     *PeerMgr       // ban list
         gossip  *GossipFilter  // dedup filter for relay
         headers HeaderProvider // optional: serves headers for sync
+
+        // pendingHandshakes counts inbound connections that are currently
+        // executing the TLS handshake.  Guarded by MaxPendingHandshakes;
+        // uses atomic ops so acceptLoop and handleConn coordinate without
+        // holding h.mu.
+        pendingHandshakes atomic.Int64
 }
 
 // NewHost creates a new p2p host.
@@ -326,6 +340,23 @@ func (h *Host) acceptLoop() {
                         }
                 }
 
+                // Handshake-goroutine semaphore: an attacker that opens many
+                // TCP connections but never completes the TLS handshake would
+                // hold one goroutine per connection for up to 10 s.
+                // MaxPendingHandshakes caps the total in-flight handshakes so
+                // the node cannot be goroutine-starved by a connect-flood.
+                if h.cfg.MaxPendingHandshakes > 0 && h.cfg.TLSConfig != nil {
+                        cur := h.pendingHandshakes.Add(1)
+                        if cur > int64(h.cfg.MaxPendingHandshakes) {
+                                h.pendingHandshakes.Add(-1)
+                                h.log.Info("MaxPendingHandshakes reached — inbound connection rejected",
+                                        "addr", conn.RemoteAddr().String(),
+                                        "limit", h.cfg.MaxPendingHandshakes)
+                                conn.Close()
+                                continue
+                        }
+                }
+
                 go h.handleConn(conn, false)
         }
 }
@@ -429,6 +460,21 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 }
         }()
 
+        // Pending-handshake semaphore: the slot is acquired by acceptLoop for
+        // every inbound TLS connection.  We must release it on ALL exit paths —
+        // including early returns before the TLS block (e.g. the ban check
+        // below).  releaseHS is idempotent; calling it more than once is safe.
+        // We also call it explicitly right after a successful handshake so that
+        // the slot is freed as early as possible rather than at connection close.
+        hsSlotHeld := !outbound && h.cfg.MaxPendingHandshakes > 0 && h.cfg.TLSConfig != nil
+        releaseHS := func() {
+                if hsSlotHeld {
+                        h.pendingHandshakes.Add(-1)
+                        hsSlotHeld = false
+                }
+        }
+        defer releaseHS() // safety net: covers ban-check return and any other early exit
+
         // Reject banned peers immediately
         if h.mgr.IsBanned(addr) {
                 h.log.Debug("handleConn: banned peer rejected", "addr", addr)
@@ -445,11 +491,13 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         if tlsConn, ok := conn.(*tls.Conn); ok {
                 tlsConn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
                 if err := tlsConn.Handshake(); err != nil {
+                        // releaseHS() via defer; no explicit call needed here.
                         h.log.Debug("tls handshake failed — plaintext or unauthorized peer rejected",
                                 "addr", addr, "err", err)
                         conn.Close()
                         return
                 }
+                releaseHS() // handshake complete — free the slot early, before message loop
                 tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
                 fp := PeerFingerprint(conn)
                 h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)

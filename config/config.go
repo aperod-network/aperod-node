@@ -50,6 +50,12 @@ type P2PConfig struct {
 	// TLS fingerprint is not on the list is disconnected immediately after the
 	// TLS handshake.  An empty list means open network (default behaviour).
 	AllowedPeers []string `yaml:"allowed_peers"`
+	// MaxPendingHandshakes caps the number of inbound connections that are
+	// concurrently executing the TLS handshake.  A peer that opens many TCP
+	// connections but never sends a ClientHello holds one goroutine each for
+	// up to 10 s; this cap limits goroutine exhaustion under a connect-flood.
+	// 0 = no limit (not recommended).  Default: 20.
+	MaxPendingHandshakes int `yaml:"max_pending_handshakes"`
 	// IdentityKey is the path to the node's persistent Ed25519 TLS identity key
 	// file.  When empty, defaults to <data_dir>/p2p_identity.key.  The file is
 	// created on first start and reused on subsequent starts so the node's TLS
@@ -102,11 +108,12 @@ func DefaultConfig() *Config {
 		DataDir:  "./data",
 		LogLevel: "info",
 		P2P: P2PConfig{
-			ListenAddr:    "/ip4/0.0.0.0/tcp/30303",
-			MaxPeers:      50,
-			MinPeers:      4,
-			MaxPeersPerIP: 3, // eclipse/partition guard: max 3 connections per source IP
-			MinOutbound:   4, // always keep 4 slots free for outbound dial-outs
+			ListenAddr:           "/ip4/0.0.0.0/tcp/30303",
+			MaxPeers:             50,
+			MinPeers:             4,
+			MaxPeersPerIP:        3,  // eclipse/partition guard: max 3 connections per source IP
+			MinOutbound:          4,  // always keep 4 slots free for outbound dial-outs
+			MaxPendingHandshakes: 20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
