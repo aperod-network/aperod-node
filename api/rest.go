@@ -512,7 +512,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 type banAddRequest struct {
         Addr            string `json:"addr"`             // IP or IP:port
         Reason          string `json:"reason"`           // human-readable reason
-        DurationMinutes int    `json:"duration_minutes"` // 0 → default 60 minutes
+        DurationMinutes int    `json:"duration_minutes"` // 0 → permanent ban (~100 years); negative → default 60 minutes
 }
 
 func (s *Server) restNetworkBans(w http.ResponseWriter, r *http.Request) {
@@ -542,10 +542,16 @@ func (s *Server) restNetworkBans(w http.ResponseWriter, r *http.Request) {
                         writeJSONError(w, http.StatusBadRequest, "addr is required")
                         return
                 }
-                if req.DurationMinutes <= 0 {
+                permanent := req.DurationMinutes == 0
+                if req.DurationMinutes < 0 {
                         req.DurationMinutes = 60
                 }
-                d := time.Duration(req.DurationMinutes) * time.Minute
+                var d time.Duration
+                if permanent {
+                        d = 100 * 365 * 24 * time.Hour // ~100 years sentinel for permanent bans
+                } else {
+                        d = time.Duration(req.DurationMinutes) * time.Minute
+                }
                 s.banAddFn(req.Addr, req.Reason, d)
                 expiresAt := time.Now().Add(d).UTC()
                 writeJSON(w, http.StatusCreated, map[string]interface{}{
@@ -553,6 +559,7 @@ func (s *Server) restNetworkBans(w http.ResponseWriter, r *http.Request) {
                         "addr":       req.Addr,
                         "reason":     req.Reason,
                         "expires_at": expiresAt,
+                        "permanent":  permanent,
                 })
 
         default:
