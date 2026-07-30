@@ -34,13 +34,14 @@ Response within **48 hours**. Critical issues patched within **7 days**.
 
 | Severity | Reward |
 |----------|--------|
-| **Critical** (consensus break, key extraction, double-spend, network halt) | up to **$1,000,000** |
-| **High** (RCE, eclipse attack, auth bypass) | up to **$500,000** |
-| **Medium** (data integrity, privacy leaks, DoS) | up to **$300,000** |
-| **Low / Informational** | up to **$100,000** |
+| **Critical** (consensus break, key extraction, double-spend, network halt) | up to **$5,000** |
+| **High** (RCE, eclipse attack, auth bypass) | up to **$2,000** |
+| **Medium** (data integrity, privacy leaks, DoS) | up to **$500** |
+| **Low / Informational** | up to **$100** |
 
 Rewards paid in APRO at the 7-day average market price on disclosure acceptance date.  
-Duplicates and already-known issues are not eligible.
+Duplicates and already-known issues are not eligible.  
+All reward amounts are at the sole discretion of the Aperod team and subject to change without prior notice.
 
 ---
 
