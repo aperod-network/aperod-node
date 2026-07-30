@@ -42,6 +42,18 @@ func MLSAGSign(message Hash32, ring []RingMember, realIdx int, privKey Scalar32)
         if realIdx < 0 || realIdx >= RingSize {
                 return nil, fmt.Errorf("realIdx %d out of range [0, %d)", realIdx, RingSize)
         }
+        // C3 fix: reject rings with duplicate members.  A ring where all 16 keys
+        // are identical still produces a valid MLSAG challenge chain but collapses
+        // the anonymity set to 1, trivially identifying the signer.
+        {
+                seen := make(map[RingMember]struct{}, RingSize)
+                for i, m := range ring {
+                        if _, dup := seen[m]; dup {
+                                return nil, fmt.Errorf("ring member %d is a duplicate — ring must contain distinct keys", i)
+                        }
+                        seen[m] = struct{}{}
+                }
+        }
 
         x, err := ScalarFromBytes(privKey[:])
         if err != nil {
@@ -125,6 +137,18 @@ func MLSAGVerify(message Hash32, ring []RingMember, sig *MLSAGSignature) (bool, 
         }
         if len(ring) != RingSize || len(sig.SS) != RingSize {
                 return false, fmt.Errorf("ring size mismatch")
+        }
+        // C3 fix: reject rings with duplicate members at verification time too.
+        // Without this check a verifier would accept a ring crafted by a signer
+        // that skipped the uniqueness guard.
+        {
+                seen := make(map[RingMember]struct{}, RingSize)
+                for i, m := range ring {
+                        if _, dup := seen[m]; dup {
+                                return false, fmt.Errorf("ring member %d is a duplicate — ring must contain distinct keys", i)
+                        }
+                        seen[m] = struct{}{}
+                }
         }
 
         I, err := PointFromBytes(sig.KeyImage[:])

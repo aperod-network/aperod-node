@@ -2,6 +2,7 @@ package crypto
 
 import (
         "crypto/sha512"
+        "crypto/subtle"
         "fmt"
 
         "filippo.io/edwards25519"
@@ -139,7 +140,12 @@ func ScanForOutput(viewPriv Scalar32, spendPub Point32, txPubKey, oneTimePub Poi
         var expectedPub Point32
         copy(expectedPub[:], expectedP.Bytes())
 
-        if expectedPub != oneTimePub {
+        // C4 fix: use constant-time comparison so a LAN-level timing attacker
+        // cannot distinguish "this output belongs to me" from "it doesn't" by
+        // measuring how long ScanForOutput takes.  Go's != on [32]byte is not
+        // guaranteed to be constant-time by the spec (it may short-circuit on
+        // some architectures).
+        if subtle.ConstantTimeCompare(expectedPub[:], oneTimePub[:]) != 1 {
                 return nil, nil // not our output
         }
 

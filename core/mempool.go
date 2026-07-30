@@ -227,6 +227,15 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
+	// C1 fix: run full cryptographic verification even for privileged transactions.
+	// Coinbase txs (admin mints) have no ring inputs so VerifyTx is lightweight,
+	// but calling it unconditionally closes the gap: if a non-coinbase tx were
+	// ever routed through AddPrivileged it would still be fully verified.
+	if m.cfg.Verifier != nil {
+		if err := m.cfg.Verifier.VerifyTx(&tx); err != nil {
+			return fmt.Errorf("mempool: crypto verification failed (privileged): %w", err)
+		}
+	}
 	size := tx.Size()
 	if size > m.cfg.MaxTxSize {
 		return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
