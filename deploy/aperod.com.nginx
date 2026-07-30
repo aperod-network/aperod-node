@@ -81,6 +81,10 @@ server {
         proxy_set_header   X-Real-IP         $remote_addr;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
+        # CF-Connecting-IP содержит реальный IP посетителя, который Cloudflare
+        # подставляет в каждый запрос. Без этого заголовка rate-limiter видит
+        # Cloudflare edge IP ($remote_addr) и банит весь CF-узел целиком.
+        proxy_set_header   CF-Connecting-IP  $http_cf_connecting_ip;
         proxy_set_header   Upgrade           $http_upgrade;
         proxy_set_header   Connection        "upgrade";
         # SSE (уведомления, стримы)
@@ -181,10 +185,11 @@ server {
     # Webhook напрямую принимает API без /api/ префикса (для обратной совместимости)
     location /nowpayments/ {
         proxy_pass         http://127.0.0.1:3001/api/nowpayments/;
-        proxy_set_header   Host            $host;
-        proxy_set_header   X-Real-IP       $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   CF-Connecting-IP  $http_cf_connecting_ip;
     }
 
     # Логи
