@@ -195,6 +195,168 @@ func TestTLS_DifferentIdentities(t *testing.T) {
 
 // ─── T-5: PeerFingerprint on plain net.Conn returns "" ───────────────────────
 
+// ─── T-6: AllowedPeers — unlisted fingerprint is rejected ────────────────────
+//
+// Start a TLS host with AllowedPeers set to a known good fingerprint (fpGood).
+// Connect with a different identity (fpBad) and verify:
+//   - The TLS handshake itself completes (mutual auth works).
+//   - The host closes the connection before the Aperod application handshake
+//     (peer is never registered in h.peers).
+//
+// Then connect with the allowed identity (fpGood) and verify the peer IS
+// registered — confirming the allow-list only blocks unknown fingerprints.
+
+func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
+	// "good" identity — will be on the allow-list.
+	cfgGood, fpGood, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config good: %v", err)
+	}
+
+	// Host identity.
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config host: %v", err)
+	}
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:   "127.0.0.1:0",
+		MaxPeers:     5,
+		NodeID:       "allowlist-node",
+		UserAgent:    "aperod/test",
+		TLSConfig:    cfgHost,
+		AllowedPeers: []string{fpGood}, // only fpGood is allowed
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	addr := host.ListenAddr()
+
+	// ── Attempt 1: connect with an UNLISTED identity ──────────────────────────
+	cfgBad, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config bad: %v", err)
+	}
+	badConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", addr, cfgBad,
+	)
+	if err != nil {
+		// Host closed the connection during TLS handshake itself — also acceptable.
+		t.Logf("T-6 ✓ unlisted peer rejected at TLS handshake level: %v", err)
+	} else {
+		defer badConn.Close()
+		badConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+		// The host should close the connection without sending a MsgPing.
+		buf := make([]byte, 8)
+		n, readErr := badConn.Read(buf)
+		if readErr == nil && n > 0 {
+			// Host unexpectedly sent data — check peer count below.
+			t.Logf("T-6: host sent %d bytes to unlisted peer (unexpected)", n)
+		} else {
+			t.Logf("T-6 ✓ unlisted peer connection closed by host after TLS handshake (n=%d err=%v)", n, readErr)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if host.PeerCount() != 0 {
+		t.Errorf("T-6: unlisted peer was registered — AllowedPeers not enforced (peer count = %d)", host.PeerCount())
+	}
+
+	// ── Attempt 2: connect with the LISTED identity ───────────────────────────
+	goodConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", addr, cfgGood,
+	)
+	if err != nil {
+		t.Fatalf("T-6: allowed peer TLS dial failed: %v", err)
+	}
+	defer goodConn.Close()
+	goodConn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+
+	// Complete the Aperod handshake: host sends MsgPing, peer replies MsgPong.
+	msgType, _, err := p2p.ReadMsg(goodConn)
+	if err != nil || msgType != p2p.MsgPing {
+		t.Fatalf("T-6: expected MsgPing from host, got %v err=%v", msgType, err)
+	}
+	if err := p2p.WriteMsg(goodConn, p2p.MsgPong, p2p.PingMsg{
+		NodeID: "good-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("T-6: write pong: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if host.PeerCount() != 1 {
+		t.Errorf("T-6: allowed peer was NOT registered (peer count = %d, want 1)", host.PeerCount())
+	} else {
+		t.Logf("T-6 ✓ AllowedPeers enforced: unlisted=rejected allowed=registered fpGood=%s…", fpGood[:8])
+	}
+}
+
+// ─── T-7: AllowedPeers empty = open network ───────────────────────────────────
+//
+// When AllowedPeers is empty (nil), all peers with valid TLS credentials
+// should be accepted — existing default behaviour is preserved.
+
+func TestTLS_AllowedPeers_EmptyMeansOpen(t *testing.T) {
+	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config peer: %v", err)
+	}
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config host: %v", err)
+	}
+
+	// No AllowedPeers set — open network.
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   5,
+		NodeID:     "open-node",
+		UserAgent:  "aperod/test",
+		TLSConfig:  cfgHost,
+		// AllowedPeers intentionally omitted
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	conn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", host.ListenAddr(), cfgPeer,
+	)
+	if err != nil {
+		t.Fatalf("T-7: tls dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+
+	msgType, _, err := p2p.ReadMsg(conn)
+	if err != nil || msgType != p2p.MsgPing {
+		t.Fatalf("T-7: expected MsgPing, got %v err=%v", msgType, err)
+	}
+	if err := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+		NodeID: "any-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("T-7: write pong: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if host.PeerCount() != 1 {
+		t.Errorf("T-7: open-network peer was NOT accepted (peer count = %d, want 1)", host.PeerCount())
+	} else {
+		t.Log("T-7 ✓ empty AllowedPeers = open network; arbitrary TLS peer accepted")
+	}
+}
+
 func TestTLS_PeerFingerprint_PlainConn(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()

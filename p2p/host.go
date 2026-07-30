@@ -37,6 +37,12 @@ type Config struct {
         // via PeerFingerprint(conn).
         // nil = plain TCP (unit tests only — never use nil in production).
         TLSConfig *tls.Config
+        // AllowedPeers is an optional list of hex-encoded SHA-256 SPKI
+        // fingerprints that are permitted to connect.  When non-empty, any
+        // peer whose TLS fingerprint is not on the list is disconnected
+        // immediately after the TLS handshake with a clear log entry.
+        // An empty slice means open network (default behaviour).
+        AllowedPeers []string
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -447,6 +453,26 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
                 fp := PeerFingerprint(conn)
                 h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)
+
+                // Validator allow-list: when AllowedPeers is non-empty, only
+                // fingerprints on the list may proceed.  An empty list means
+                // open network (no restriction).
+                if len(h.cfg.AllowedPeers) > 0 {
+                        allowed := false
+                        for _, a := range h.cfg.AllowedPeers {
+                                if a == fp {
+                                        allowed = true
+                                        break
+                                }
+                        }
+                        if !allowed {
+                                h.log.Info("peer rejected: fingerprint not in allowed_peers list",
+                                        "addr", addr, "fingerprint", fp)
+                                conn.Close()
+                                return
+                        }
+                        h.log.Debug("peer fingerprint allowed", "addr", addr, "fingerprint", fp)
+                }
         }
 
         peer := &Peer{conn: conn, addr: addr, outbound: outbound}

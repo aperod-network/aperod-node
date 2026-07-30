@@ -45,6 +45,11 @@ type P2PConfig struct {
 	// under an inbound flood can always gossip produced blocks to the network.
 	// Recommended: 4.  0 = feature disabled.
 	MinOutbound int `yaml:"min_outbound"`
+	// AllowedPeers is an optional list of hex-encoded SHA-256 SPKI fingerprints
+	// that are permitted to join the network.  When non-empty, any peer whose
+	// TLS fingerprint is not on the list is disconnected immediately after the
+	// TLS handshake.  An empty list means open network (default behaviour).
+	AllowedPeers []string `yaml:"allowed_peers"`
 }
 
 // ConsensusConfig holds PoA settings.

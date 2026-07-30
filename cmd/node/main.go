@@ -436,7 +436,12 @@ func run() error {
                                 NodeID:        myKey.Public().ID(),
                                 UserAgent:     "aperod-node/1.0",
                                 TLSConfig:     tlsCfg,
+                                AllowedPeers:  cfg.P2P.AllowedPeers,
                         }, handler, log)
+                        if len(cfg.P2P.AllowedPeers) > 0 {
+                                log.Info("p2p validator allow-list active",
+                                        "allowed_count", len(cfg.P2P.AllowedPeers))
+                        }
 
                         if err := host.Start(); err != nil {
                                 log.Error("p2p failed to start", "err", err)
