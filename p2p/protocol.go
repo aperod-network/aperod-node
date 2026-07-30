@@ -85,6 +85,8 @@ type SerializedHeader struct {
         Round        uint32   `json:"round"`
         ValidatorPub []byte   `json:"validator_pub"`
         Signature    []byte   `json:"sig"`
+        OraclePrice  uint64   `json:"oracle_price"`
+        BaseFee      uint64   `json:"base_fee"`
 }
 
 // GetBlockMsg requests a specific block by hash.

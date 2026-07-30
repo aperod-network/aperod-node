@@ -784,6 +784,8 @@ func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
                                 Round:        ch.Round,
                                 ValidatorPub: ch.ValidatorPub,
                                 Signature:    ch.Signature,
+                                OraclePrice:  ch.OraclePrice,
+                                BaseFee:      ch.BaseFee,
                         })
                 }
         }
@@ -862,6 +864,8 @@ func blockToMsg(b *core.Block) SerializedBlock {
                         Round:        h.Round,
                         ValidatorPub: h.ValidatorPub,
                         Signature:    h.Signature,
+                        OraclePrice:  h.OraclePrice,
+                        BaseFee:      h.BaseFee,
                 },
                 Txs: b.Txs,
         }
@@ -878,6 +882,8 @@ func msgToBlock(sb SerializedBlock) *core.Block {
                         Round:        sb.Header.Round,
                         ValidatorPub: pub,
                         Signature:    sb.Header.Signature,
+                        OraclePrice:  sb.Header.OraclePrice,
+                        BaseFee:      sb.Header.BaseFee,
                 },
                 Txs: sb.Txs,
         }
