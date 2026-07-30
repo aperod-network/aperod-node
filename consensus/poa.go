@@ -94,6 +94,12 @@ type Engine struct {
         // read from outside the engine goroutine (e.g. the API server).
         timestampRejected int64
 
+        // oracleConsecFails is the number of consecutive oracle fetch failures.
+        // Incremented atomically on each failure in fetchOraclePrice; reset to 0 on
+        // success.  When it exceeds oracleErrorThreshold the log level escalates from
+        // Warn to Error so the alert reaches the Telegram admin notification channel.
+        oracleConsecFails int64
+
         // Channels for external events
         newBlockCh chan *core.Block  // incoming blocks from P2P
         newVoteCh  chan FinalizeMsg  // incoming finalization votes
@@ -355,6 +361,12 @@ func blockFeeStats(txs []core.Transaction, baseFeePerByte uint64) (burned, tipTo
 // OraclePrice = price_usd × oraclePriceScale  (i.e. 9 decimal places).
 const oraclePriceScale float64 = 1_000_000_000
 
+// oracleErrorThreshold is the number of consecutive oracle fetch failures after
+// which fetchOraclePrice escalates its log message from Warn to Error.  An Error
+// is visible in structured-log pipelines that feed the Telegram admin channel,
+// whereas a Warn may be silently filtered.
+const oracleErrorThreshold int64 = 10
+
 // oraclePriceResponse is the minimal subset of the oracle API JSON we need.
 type oraclePriceResponse struct {
         PriceUSD float64 `json:"price_usd"`
@@ -362,6 +374,12 @@ type oraclePriceResponse struct {
 
 // fetchOraclePrice calls cfg.OracleURL and returns the embedded fixed-point price.
 // Returns 0 if OracleURL is empty, the request fails, or the price is zero/negative.
+//
+// Failure escalation: on each consecutive failure the internal oracleConsecFails
+// counter is incremented atomically.  Once the counter exceeds oracleErrorThreshold
+// the log level escalates from Warn to Error so the message is visible in
+// structured-log pipelines that feed the Telegram admin notification channel.
+// The counter is reset to 0 on any successful fetch.
 func (e *Engine) fetchOraclePrice() uint64 {
         if e.cfg.OracleURL == "" {
                 return 0
@@ -369,18 +387,32 @@ func (e *Engine) fetchOraclePrice() uint64 {
         client := &http.Client{Timeout: 3 * time.Second}
         resp, err := client.Get(e.cfg.OracleURL)
         if err != nil {
-                e.log.Warn("oracle price fetch failed", "url", e.cfg.OracleURL, "err", err)
+                fails := atomic.AddInt64(&e.oracleConsecFails, 1)
+                if fails > oracleErrorThreshold {
+                        e.log.Error("oracle price fetch failed (consecutive failures exceed threshold — check oracle_url in node.yaml)",
+                                "url", e.cfg.OracleURL, "err", err, "consecutive_failures", fails)
+                } else {
+                        e.log.Warn("oracle price fetch failed", "url", e.cfg.OracleURL, "err", err, "consecutive_failures", fails)
+                }
                 return 0
         }
         defer resp.Body.Close()
         var p oraclePriceResponse
         if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
-                e.log.Warn("oracle price decode failed", "err", err)
+                fails := atomic.AddInt64(&e.oracleConsecFails, 1)
+                if fails > oracleErrorThreshold {
+                        e.log.Error("oracle price decode failed (consecutive failures exceed threshold — check oracle_url in node.yaml)",
+                                "err", err, "consecutive_failures", fails)
+                } else {
+                        e.log.Warn("oracle price decode failed", "err", err, "consecutive_failures", fails)
+                }
                 return 0
         }
         if p.PriceUSD <= 0 {
                 return 0
         }
+        // Successful fetch: reset consecutive-failure counter.
+        atomic.StoreInt64(&e.oracleConsecFails, 0)
         return uint64(math.Round(p.PriceUSD * oraclePriceScale))
 }
 
