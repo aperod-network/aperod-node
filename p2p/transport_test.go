@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -367,4 +369,108 @@ func TestTLS_PeerFingerprint_PlainConn(t *testing.T) {
 		t.Errorf("T-5: PeerFingerprint on plain net.Conn = %q, want \"\"", fp)
 	}
 	t.Log("T-5 ✓ PeerFingerprint returns empty string for plain net.Conn")
+}
+
+// ─── T-8: Forged-cert peer cannot inject a block ──────────────────────────────
+//
+// Security regression test: a peer that presents a self-signed certificate
+// that is NOT on the host's AllowedPeers list must not be able to inject a
+// block into the chain via MsgBlock, even though the TLS handshake itself
+// succeeds (mutual TLS authenticates the cert as valid, but the fingerprint
+// is not recognised).
+//
+// Done looks like:
+//   - handler.OnBlock is never called after the attacker sends MsgBlock.
+//   - The host registers 0 peers (the attacker was dropped).
+
+func TestTLS_ForgedCert_CannotInjectBlock(t *testing.T) {
+	// "good" identity placed on the allow-list (never actually connects here).
+	_, fpGood, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config good: %v", err)
+	}
+
+	// Host identity.
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config host: %v", err)
+	}
+
+	handler := &stubHandler{}
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:   "127.0.0.1:0",
+		MaxPeers:     5,
+		NodeID:       "secure-node",
+		UserAgent:    "aperod/test",
+		TLSConfig:    cfgHost,
+		AllowedPeers: []string{fpGood}, // attacker's fingerprint is NOT here
+	}, handler, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	// Attacker generates a fresh self-signed certificate (unknown fingerprint).
+	cfgAttacker, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("gen config attacker: %v", err)
+	}
+
+	attackConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", host.ListenAddr(), cfgAttacker,
+	)
+	if err != nil {
+		// Host may have closed the connection at TLS handshake level — still a
+		// successful rejection; block injection is impossible.
+		t.Logf("T-8 ✓ attacker rejected at TLS handshake level: %v", err)
+		time.Sleep(100 * time.Millisecond)
+		if host.PeerCount() != 0 {
+			t.Errorf("T-8: attacker registered as peer after TLS rejection (count=%d)", host.PeerCount())
+		}
+		if len(handler.blocks) != 0 {
+			t.Errorf("T-8: OnBlock called %d time(s) despite TLS rejection", len(handler.blocks))
+		}
+		return
+	}
+	defer attackConn.Close()
+
+	// TLS handshake completed — the host will now reject the connection at the
+	// application layer (AllowedPeers check) and close it.  The attacker
+	// attempts to inject a block by sending MsgBlock immediately.
+	attackConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+
+	// Build a minimal but structurally valid block to send.
+	priv, pub, genErr := crypto.GenerateValidatorKey()
+	if genErr != nil {
+		t.Fatalf("T-8: generate validator key: %v", genErr)
+	}
+	hdr := core.BlockHeader{
+		Height:       1,
+		ValidatorPub: pub,
+		Timestamp:    time.Now().UnixNano(),
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	_ = hdr.Sign(priv)
+	injectedBlock := &core.Block{Header: hdr}
+	sb := p2p.BlockToMsg(injectedBlock)
+
+	// Write MsgBlock — ignore write errors; the connection may already be
+	// closing on the host side.
+	_ = p2p.WriteMsg(attackConn, p2p.MsgBlock, sb)
+
+	// Give the host enough time to process the write (if it even reads it).
+	time.Sleep(200 * time.Millisecond)
+
+	// ── Key assertions ────────────────────────────────────────────────────────
+
+	if host.PeerCount() != 0 {
+		t.Errorf("T-8: attacker was registered as a peer (count=%d, want 0)", host.PeerCount())
+	}
+
+	if len(handler.blocks) != 0 {
+		t.Errorf("T-8: OnBlock was called %d time(s) — forged-cert peer injected a block", len(handler.blocks))
+	} else {
+		t.Logf("T-8 ✓ forged-cert peer could not inject block: OnBlock=0 peers=%d", host.PeerCount())
+	}
 }
