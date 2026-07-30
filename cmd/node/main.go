@@ -163,6 +163,9 @@ func run() error {
                 return fmt.Errorf("get tip: %w", err)
         }
 
+        // Populated during the key-image rebuild scan below; stays 0 for genesis.
+        var initialTxTotal int64
+
         if tipHash == (crypto.Hash32{}) {
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
@@ -238,6 +241,7 @@ func run() error {
                 log.Info("rebuilding spent key-image set from full chain history",
                         "tip_height", tipHeight)
                 kiCount := 0
+                var txCount int64 = 0
                 for h := uint64(1); h <= tipHeight; h++ {
                         raw, fetchErr := db.GetRawBlockByHeight(h)
                         if fetchErr != nil || raw == nil {
@@ -253,21 +257,26 @@ func run() error {
                                                 "node cannot start safely; repair the store and restart",
                                         h, parseErr)
                         }
-                        for _, tx := range b.Txs {
+                        for txIdx, tx := range b.Txs {
                                 for _, inp := range tx.Inputs {
                                         utxos.MarkSpent(inp.KeyImage)
                                         kiCount++
                                 }
+                                // Count non-coinbase transactions for the /network/stats total.
+                                if !(txIdx == 0 && tx.IsCoinbase()) {
+                                        txCount++
+                                }
                         }
                 }
+                initialTxTotal = txCount
                 log.Info("spent key-image set rebuilt",
                         "key_images_marked", kiCount,
-                        "blocks_scanned", tipHeight)
+                        "blocks_scanned", tipHeight,
+                        "total_txs_counted", txCount)
         }
 
-        // initialTxTotal starts at 0; the counter accumulates from this run forward.
-        // Historical total is not critical — the value is only shown in /network/stats.
-        var initialTxTotal int64 = 0
+        // initialTxTotal is populated by the key-image rebuild loop above (full
+        // scan, so the count is exact). In the genesis path it stays 0.
 
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
         // host and apiSrv are declared here so OnBlockProduced can reference them
