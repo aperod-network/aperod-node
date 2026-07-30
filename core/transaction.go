@@ -65,13 +65,19 @@ type Output struct {
 
 // Hash returns the SHA3-256 hash of the transaction (used as transaction ID).
 func (tx *Transaction) Hash() crypto.Hash32 {
+        // F-4 fix: hash covers ALL fields that determine what the transaction does,
+        // so that the MLSAG signing message H(txHash||inputIdx) binds the signature
+        // to FeeCommit, per-input AmountCommit, and per-output TxPubKey/EncAmount.
+        // A third party cannot swap these fields without invalidating all signatures.
         parts := [][]byte{
                 {byte(tx.Version)},
                 encodeUint64(tx.Fee),
+                tx.FeeCommit[:],
                 tx.Extra,
         }
         for _, inp := range tx.Inputs {
                 parts = append(parts, inp.KeyImage[:])
+                parts = append(parts, inp.AmountCommit[:]) // F-4: was missing
                 for _, rm := range inp.Ring {
                         parts = append(parts, rm[:])
                 }
@@ -79,6 +85,8 @@ func (tx *Transaction) Hash() crypto.Hash32 {
         for _, out := range tx.Outputs {
                 parts = append(parts, out.OneTimePub[:])
                 parts = append(parts, out.AmountCommit[:])
+                parts = append(parts, out.TxPubKey[:])    // F-4: was missing
+                parts = append(parts, out.EncAmount[:])   // F-4: was missing
         }
         return crypto.HashBytes(parts...)
 }

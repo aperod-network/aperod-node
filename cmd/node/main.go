@@ -175,6 +175,12 @@ func run() error {
                 if err := chain.SetGenesis(genesis); err != nil {
                         return fmt.Errorf("set genesis: %w", err)
                 }
+                // F-7 fix: populate the in-memory UTXO set with genesis outputs so
+                // TxVerifier.VerifyTx can validate ring commitments that reference
+                // genesis UTXOs from the very first block onwards.
+                if err := utxos.ApplyBlock(genesis); err != nil {
+                        return fmt.Errorf("apply genesis UTXOs: %w", err)
+                }
                 if err := storeBlock(db, genesis); err != nil {
                         return fmt.Errorf("store genesis: %w", err)
                 }
@@ -197,6 +203,11 @@ func run() error {
                 }
                 if err := chain.SetGenesis(&genesisBlk); err != nil {
                         return fmt.Errorf("restore genesis: %w", err)
+                }
+                // F-7 fix: apply genesis UTXOs to the in-memory set on resume so
+                // genesis-era ring members pass the C-0 commitment binding check.
+                if err := utxos.ApplyBlock(&genesisBlk); err != nil {
+                        return fmt.Errorf("apply genesis UTXOs on resume: %w", err)
                 }
 
                 // Load only the most recent maxInMemoryBlocks blocks.

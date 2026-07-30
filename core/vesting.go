@@ -82,7 +82,10 @@ func (v *VestingSchedule) VestedAmount(totalAmount uint64, genesisTime, now int6
 		return mulDiv(totalAmount, uint64(elapsed), uint64(v.VestSeconds))
 
 	default:
-		return totalAmount
+		// F-17 fix: unknown vesting type → fail-closed (0 tokens unlocked).
+		// Previously this returned totalAmount (full immediate unlock), allowing
+		// a typo or unknown future type to bypass all vesting restrictions.
+		return 0
 	}
 }
 
@@ -124,7 +127,8 @@ func (v *VestingSchedule) FullUnlockAt(genesisTime int64) int64 {
 	case VestingCliffLinear:
 		return genesisTime + v.CliffSeconds + v.VestSeconds
 	default:
-		return genesisTime
+		// F-17 fix: unknown type → never unlocks (max int64 timestamp).
+		return 1<<62 - 1
 	}
 }
 

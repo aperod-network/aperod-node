@@ -63,34 +63,27 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
         }
 
-        // 3b. Ring members must exist in the UTXO set and inp.AmountCommit must
-        // match one of the ring members' actual on-chain Pedersen commitments.
+        // 3b. Commitment binding — partial C-0 fix.
         //
-        // C-0 fix: prevents "fresh keypair" inflation — an attacker with zero UTXOs
-        // cannot craft a ring with fictional members and a fake AmountCommit that
-        // makes the Pedersen balance check pass.  All ring members must be real
-        // unspent outputs, and the AmountCommit used in the balance equation must
-        // equal the commitment of one of them (the real spend key's output).
+        // For every ring member that IS present in the in-memory UTXO set,
+        // inp.AmountCommit must equal that member's actual on-chain Pedersen
+        // commitment.  This prevents an attacker who owns a real UTXO from
+        // swapping its AmountCommit for a larger fabricated value.
+        //
+        // Limitation: ring members not present in the in-memory UTXO set (old
+        // UTXOs from blocks that pre-date the current in-memory window, or a
+        // freshly restarted node whose set is still building) are skipped to
+        // avoid rejecting legitimate transactions.  A complete check requires a
+        // persistent UTXO index backed by the block store.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
-                        anyExists := false
-                        commitOK := false
                         for _, member := range inp.Ring {
                                 utxo := v.utxos.GetByPubKey(member)
-                                if utxo != nil {
-                                        anyExists = true
-                                        if utxo.AmountCommit == inp.AmountCommit {
-                                                commitOK = true
-                                        }
+                                if utxo != nil && utxo.AmountCommit != inp.AmountCommit {
+                                        return fmt.Errorf("tx %x: input %d AmountCommit does not match "+
+                                                "ring member's on-chain UTXO commitment (C-0 check)",
+                                                txHashPrefix[:8], i)
                                 }
-                        }
-                        if !anyExists {
-                                return fmt.Errorf("tx %x: input %d ring contains no members present in the UTXO set",
-                                        txHashPrefix[:8], i)
-                        }
-                        if !commitOK {
-                                return fmt.Errorf("tx %x: input %d AmountCommit does not match any ring member's on-chain UTXO commitment",
-                                        txHashPrefix[:8], i)
                         }
                 }
         }
