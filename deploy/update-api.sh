@@ -91,7 +91,13 @@ fi
 #         any crash-loop that starts immediately after this deploy.
 # ---------------------------------------------------------------------------
 echo "==> [3/4] Restarting PM2 process '$PM2_APP'..."
-pm2 restart "$PM2_APP"
+# If the process is not yet registered in PM2 (e.g. after server reboot or
+# accidental `pm2 delete`), `pm2 restart` exits non-zero with "not found".
+# Fall back to a clean start from the ecosystem config in that case.
+if ! pm2 restart "$PM2_APP" 2>/dev/null; then
+  echo "  Process not found in PM2 — starting fresh from ecosystem config..."
+  pm2 start "${DEPLOY_DIR}/ecosystem.config.cjs"
+fi
 
 # Give PM2 a moment to initialise the new process before sampling the counter.
 sleep 2
