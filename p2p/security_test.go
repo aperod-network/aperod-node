@@ -46,14 +46,17 @@ func TestEclipseAttack_MaxPeers(t *testing.T) {
                         t.Fatalf("dial %d: %v", i, err)
                 }
                 c.SetDeadline(time.Now().Add(2 * time.Second))
-                // Complete handshake.
+                // Asymmetric handshake: dialer sends Ping, host replies with Pong.
+                if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
+                        NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+                }); err != nil {
+                        c.Close()
+                        continue
+                }
                 if _, _, err := p2p.ReadMsg(c); err != nil {
                         c.Close()
                         continue
                 }
-                _ = p2p.WriteMsg(c, p2p.MsgPong, p2p.PingMsg{
-                        NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
-                })
                 conns = append(conns, c)
         }
         defer func() {
@@ -74,18 +77,20 @@ func TestEclipseAttack_MaxPeers(t *testing.T) {
         defer attacker.Close()
         attacker.SetDeadline(time.Now().Add(500 * time.Millisecond))
 
-        // The host either sends a ping or immediately drops the conn.
+        // Try to handshake — host may drop the conn immediately if MaxPeers exceeded.
+        if err := p2p.WriteMsg(attacker, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "attacker", Height: 0, UserAgent: "evil", Timestamp: time.Now().Unix(),
+        }); err != nil {
+                t.Log("3.5.1 ✓ 3rd connection dropped during handshake (MaxPeers enforced)")
+                return
+        }
         msgType, _, err := p2p.ReadMsg(attacker)
         if err != nil {
-                // Connection closed before completing handshake — MaxPeers enforced.
+                // Connection closed before host replied with Pong — MaxPeers enforced.
                 t.Log("3.5.1 ✓ 3rd connection dropped during/before handshake (MaxPeers enforced)")
                 return
         }
-        // If a ping arrived, host may still be evaluating; try to handshake.
         _ = msgType
-        _ = p2p.WriteMsg(attacker, p2p.MsgPong, p2p.PingMsg{
-                NodeID: "attacker", Height: 0, UserAgent: "evil", Timestamp: time.Now().Unix(),
-        })
         time.Sleep(80 * time.Millisecond)
 
         // Verify total peer count hasn't exceeded MaxPeers.
@@ -187,19 +192,22 @@ func TestRateLimiting_BannedPeerDropped(t *testing.T) {
         t.Cleanup(host.Stop)
         addr := host.ListenAddr()
 
-        // Connect once and complete the handshake.
+        // Connect once and complete the handshake (asymmetric: dialer sends Ping, host replies Pong).
         conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
         if err != nil {
                 t.Fatalf("dial: %v", err)
         }
         conn.SetDeadline(time.Now().Add(2 * time.Second))
+        if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "bad-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+        }); err != nil {
+                conn.Close()
+                t.Fatalf("write ping: %v", err)
+        }
         if _, _, err := p2p.ReadMsg(conn); err != nil {
                 conn.Close()
-                t.Fatalf("read ping: %v", err)
+                t.Fatalf("read pong: %v", err)
         }
-        _ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
-                NodeID: "bad-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
-        })
         time.Sleep(50 * time.Millisecond)
 
         // Ban the peer address.
@@ -215,8 +223,9 @@ func TestRateLimiting_BannedPeerDropped(t *testing.T) {
                 return
         }
         defer conn2.Close()
+        // Ban check runs before the Ping wait; the host closes the conn immediately.
         conn2.SetDeadline(time.Now().Add(500 * time.Millisecond))
-        _, _, _ = p2p.ReadMsg(conn2)
+        _, _, _ = p2p.ReadMsg(conn2) // expect EOF / connection closed
 
         t.Log("3.5.4 ✓ ban registered; host operational after ban")
 }
@@ -277,13 +286,17 @@ func TestPeerCountLimit_MaxPeers1(t *testing.T) {
                         return nil, false
                 }
                 c.SetDeadline(time.Now().Add(2 * time.Second))
+                // Asymmetric handshake: dialer sends Ping, host replies with Pong.
+                if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
+                        NodeID: id, Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+                }); err != nil {
+                        c.Close()
+                        return nil, false
+                }
                 if _, _, err := p2p.ReadMsg(c); err != nil {
                         c.Close()
                         return nil, false
                 }
-                _ = p2p.WriteMsg(c, p2p.MsgPong, p2p.PingMsg{
-                        NodeID: id, Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
-                })
                 return c, true
         }
 

@@ -14,8 +14,9 @@ import (
 	"github.com/aperod/aperod/p2p"
 )
 
-// connectAndHandshake dials addr, performs the handshake, then runs fn(conn)
-// in the test goroutine. The connection is closed after fn returns.
+// connectAndHandshake dials addr, performs the asymmetric handshake
+// (dialer sends Ping, host replies with Pong), then runs fn(conn).
+// The connection is closed after fn returns.
 func connectAndHandshake(t *testing.T, addr string, fn func(conn net.Conn)) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -26,18 +27,18 @@ func connectAndHandshake(t *testing.T, addr string, fn func(conn net.Conn)) {
 
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 
-	// Receive ping from host
-	msgType, _, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPing {
-		t.Fatalf("expected ping, got %v err=%v", msgType, err)
-	}
-
-	// Reply with pong
-	if err := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+	// Send ping to host (dialer goes first under the asymmetric protocol)
+	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "dispatch-test-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); err != nil {
-		t.Fatalf("write pong: %v", err)
+		t.Fatalf("write ping: %v", err)
+	}
+
+	// Read pong from host
+	msgType, _, err := p2p.ReadMsg(conn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("expected pong, got %v err=%v", msgType, err)
 	}
 
 	// Give host time to register peer

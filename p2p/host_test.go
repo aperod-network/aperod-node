@@ -92,8 +92,10 @@ func TestHost_Start_InvalidAddr(t *testing.T) {
 
 // ─── Full handshake over net.Listener ────────────────────────────────────────
 
-// dialAndHandshake: simulates what an outbound peer would do — respond with
-// pong on the first ping, then send a message, then disconnect.
+// dialAndHandshake: simulates an inbound peer connecting to the host.
+// With the asymmetric handshake: dialer (us) sends Ping first, host replies
+// with Pong.  The old symmetric protocol where the host sent first caused a
+// deadlock between two Host instances.
 func dialAndHandshake(t *testing.T, addr string, extraMsg func(conn net.Conn)) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
@@ -103,18 +105,19 @@ func dialAndHandshake(t *testing.T, addr string, extraMsg func(conn net.Conn)) {
 	}
 	defer conn.Close()
 
-	// Receive ping from host
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	msgType, data, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPing {
-		t.Logf("dialAndHandshake: expected ping, got %v err=%v (data=%d bytes)", msgType, err, len(data))
+
+	// Send ping to host (dialer goes first under the asymmetric protocol)
+	ping := p2p.PingMsg{NodeID: "fake-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix()}
+	if err := p2p.WriteMsg(conn, p2p.MsgPing, ping); err != nil {
+		t.Logf("dialAndHandshake: write ping: %v", err)
 		return
 	}
 
-	// Reply with pong
-	pong := p2p.PingMsg{NodeID: "fake-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix()}
-	if err := p2p.WriteMsg(conn, p2p.MsgPong, pong); err != nil {
-		t.Logf("dialAndHandshake: write pong: %v", err)
+	// Host replies with pong
+	msgType, data, err := p2p.ReadMsg(conn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Logf("dialAndHandshake: expected pong, got %v err=%v (data=%d bytes)", msgType, err, len(data))
 		return
 	}
 
@@ -413,21 +416,20 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 		}
 		c.SetDeadline(time.Now().Add(2 * time.Second))
 
-		// Receive ping from hA.
-		msgType, _, err := p2p.ReadMsg(c)
-		if err != nil || msgType != p2p.MsgPing {
-			c.Close()
-			t.Fatalf("flooder %d: expected MsgPing, got %v err=%v", i, msgType, err)
-		}
-		// Reply with pong so hA registers us as a live inbound peer.
-		if err := p2p.WriteMsg(c, p2p.MsgPong, p2p.PingMsg{
+		// Asymmetric handshake: dialer sends Ping first, host replies with Pong.
+		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
 			NodeID:    fmt.Sprintf("flooder-%d", i),
 			Height:    0,
 			UserAgent: "flood",
 			Timestamp: time.Now().Unix(),
 		}); err != nil {
 			c.Close()
-			t.Fatalf("flooder %d: write pong: %v", i, err)
+			t.Fatalf("flooder %d: write ping: %v", i, err)
+		}
+		msgType, _, err := p2p.ReadMsg(c)
+		if err != nil || msgType != p2p.MsgPong {
+			c.Close()
+			t.Fatalf("flooder %d: expected MsgPong, got %v err=%v", i, msgType, err)
 		}
 		c.SetDeadline(time.Time{}) // clear deadline — keep connection open
 		inConns = append(inConns, c)
@@ -451,11 +453,11 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 	extra, err := net.DialTimeout("tcp", addrA, time.Second)
 	if err == nil {
 		extra.SetDeadline(time.Now().Add(300 * time.Millisecond))
-		if msgType, _, readErr := p2p.ReadMsg(extra); readErr == nil {
-			_ = msgType
-			_ = p2p.WriteMsg(extra, p2p.MsgPong, p2p.PingMsg{
-				NodeID: "extra", UserAgent: "test", Timestamp: time.Now().Unix(),
-			})
+		// Asymmetric handshake: send Ping, try to read Pong (host may reject before replying).
+		if writeErr := p2p.WriteMsg(extra, p2p.MsgPing, p2p.PingMsg{
+			NodeID: "extra", UserAgent: "test", Timestamp: time.Now().Unix(),
+		}); writeErr == nil {
+			_, _, _ = p2p.ReadMsg(extra) // host may close early if cap exceeded
 			time.Sleep(80 * time.Millisecond)
 		}
 		extra.Close()

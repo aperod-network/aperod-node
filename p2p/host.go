@@ -535,31 +535,61 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 
         peer := &Peer{conn: conn, addr: addr, outbound: outbound}
 
-        // Handshake: send ping
-        ping := PingMsg{
+        // Handshake — asymmetric:
+        //   Outbound (dialer)  : send Ping → receive Pong
+        //   Inbound (acceptor) : receive Ping → send Pong
+        // Both sides are trying to send first results in a deadlock where
+        // each side reads the other's Ping expecting a Pong and closes.
+        selfMsg := PingMsg{
                 NodeID:    h.cfg.NodeID,
                 Height:    h.handler.CurrentHeight(),
                 UserAgent: h.cfg.UserAgent,
                 Timestamp: time.Now().UnixNano(),
         }
-        if err := writeMsg(conn, MsgPing, ping); err != nil {
-                conn.Close()
-                return
+
+        var peerID string
+        var peerHeight uint64
+
+        if outbound {
+                // Dialer: send Ping, wait for Pong
+                if err := writeMsg(conn, MsgPing, selfMsg); err != nil {
+                        conn.Close()
+                        return
+                }
+                msgType, data, err := readMsg(conn)
+                if err != nil || msgType != MsgPong {
+                        conn.Close()
+                        return
+                }
+                var pong PingMsg
+                if err := unmarshal(data, &pong); err != nil {
+                        conn.Close()
+                        return
+                }
+                peerID = pong.NodeID
+                peerHeight = pong.Height
+        } else {
+                // Acceptor: wait for Ping, send Pong
+                msgType, data, err := readMsg(conn)
+                if err != nil || msgType != MsgPing {
+                        conn.Close()
+                        return
+                }
+                var theirPing PingMsg
+                if err := unmarshal(data, &theirPing); err != nil {
+                        conn.Close()
+                        return
+                }
+                peerID = theirPing.NodeID
+                peerHeight = theirPing.Height
+                if err := writeMsg(conn, MsgPong, selfMsg); err != nil {
+                        conn.Close()
+                        return
+                }
         }
 
-        // Expect pong
-        msgType, data, err := readMsg(conn)
-        if err != nil || msgType != MsgPong {
-                conn.Close()
-                return
-        }
-        var pong PingMsg
-        if err := unmarshal(data, &pong); err != nil {
-                conn.Close()
-                return
-        }
-        peer.id = pong.NodeID
-        peer.height = pong.Height
+        peer.id = peerID
+        peer.height = peerHeight
 
         h.mu.Lock()
         if _, exists := h.peers[addr]; exists {
@@ -572,12 +602,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 
         h.log.Info("peer connected",
                 "addr", addr,
-                "peer_height", pong.Height,
+                "peer_height", peerHeight,
                 "direction", map[bool]string{true: "out", false: "in"}[outbound],
         )
 
         // Initiate header sync if peer is ahead
-        if pong.Height > h.handler.CurrentHeight() {
+        if peerHeight > h.handler.CurrentHeight() {
                 h.requestHeaders(peer)
         }
 

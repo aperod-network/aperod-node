@@ -46,11 +46,8 @@ func TestTLS_GenerateNodeTLSConfig(t *testing.T) {
 
 // ─── T-2: TLS host accepts a raw TLS peer that completes the Aperod handshake ─
 //
-// Two p2p.Host instances cannot be directly connected because both sides
-// send MsgPing first — a known protocol constraint documented in host_test.go.
-// Instead we start one TLS-enabled Host and use a raw *tls.Conn peer that
-// follows the correct initiator role: receive MsgPing from the host, reply
-// MsgPong.  This exercises:
+// Uses the asymmetric handshake: raw TLS dialer (inbound peer) sends MsgPing
+// first; TLS host (acceptor) replies with MsgPong.  This exercises:
 //   • the full TLS 1.3 handshake with mutual certificates
 //   • the Aperod application handshake running over the encrypted channel
 //   • PeerFingerprint returning the peer's authenticated identity
@@ -92,19 +89,19 @@ func TestTLS_MutualAuth_HostAndRawPeer(t *testing.T) {
 	defer tlsConn.Close()
 	tlsConn.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
 
-	// The host sends MsgPing first; the raw peer must reply with MsgPong.
-	msgType, _, err := p2p.ReadMsg(tlsConn)
-	if err != nil {
-		t.Fatalf("T-2: read from TLS conn: %v", err)
-	}
-	if msgType != p2p.MsgPing {
-		t.Fatalf("T-2: expected MsgPing, got %v", msgType)
-	}
-	if err := p2p.WriteMsg(tlsConn, p2p.MsgPong, p2p.PingMsg{
+	// Asymmetric handshake: dialer (us) sends MsgPing first; host replies MsgPong.
+	if err := p2p.WriteMsg(tlsConn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "raw-tls-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); err != nil {
-		t.Fatalf("T-2: write pong: %v", err)
+		t.Fatalf("T-2: write ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(tlsConn)
+	if err != nil {
+		t.Fatalf("T-2: read pong from TLS conn: %v", err)
+	}
+	if msgType != p2p.MsgPong {
+		t.Fatalf("T-2: expected MsgPong, got %v", msgType)
 	}
 
 	// Give the host time to register the peer.
@@ -279,16 +276,16 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 	defer goodConn.Close()
 	goodConn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 
-	// Complete the Aperod handshake: host sends MsgPing, peer replies MsgPong.
-	msgType, _, err := p2p.ReadMsg(goodConn)
-	if err != nil || msgType != p2p.MsgPing {
-		t.Fatalf("T-6: expected MsgPing from host, got %v err=%v", msgType, err)
-	}
-	if err := p2p.WriteMsg(goodConn, p2p.MsgPong, p2p.PingMsg{
+	// Complete the Aperod handshake: dialer sends MsgPing, host replies MsgPong.
+	if err := p2p.WriteMsg(goodConn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "good-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); err != nil {
-		t.Fatalf("T-6: write pong: %v", err)
+		t.Fatalf("T-6: write ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(goodConn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("T-6: expected MsgPong from host, got %v err=%v", msgType, err)
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -339,15 +336,16 @@ func TestTLS_AllowedPeers_EmptyMeansOpen(t *testing.T) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 
-	msgType, _, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPing {
-		t.Fatalf("T-7: expected MsgPing, got %v err=%v", msgType, err)
-	}
-	if err := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+	// Asymmetric handshake: dialer sends MsgPing, host replies MsgPong.
+	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "any-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); err != nil {
-		t.Fatalf("T-7: write pong: %v", err)
+		t.Fatalf("T-7: write ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(conn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("T-7: expected MsgPong, got %v err=%v", msgType, err)
 	}
 
 	time.Sleep(100 * time.Millisecond)
