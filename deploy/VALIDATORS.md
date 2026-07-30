@@ -182,5 +182,43 @@ curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/dep
 
 ---
 
+## Updating the Node Binary
+
+**Always use `update-node.sh` — never build and copy manually.**
+
+Two silent failure modes occur with a manual update:
+
+| Mistake | Symptom |
+|---------|---------|
+| Building to the wrong path (e.g. `/opt/aperod/data/aperod-node`) | Binary never picked up — service runs old code silently |
+| Copying over a running binary | `Text file busy` (ETXTBSY) — copy fails, old binary still running |
+
+The update script handles both correctly — it stops the service first, then installs to `/usr/local/bin/aperod-node` (the path the `aperod-node.service` unit executes), then starts the service and waits for the API to respond.
+
+```bash
+sudo bash /opt/aperod/blockchain/deploy/update-node.sh
+```
+
+The script performs these steps in order:
+
+1. `git pull` latest source
+2. `make build` — if this fails, the service is **not stopped** (old binary keeps running)
+3. `systemctl stop aperod-node`
+4. `cp build/aperod-node /usr/local/bin/aperod-node`
+5. `systemctl start aperod-node`
+6. Polls `http://localhost:8545/api/v1/status` until the node responds (sends a Telegram alert on failure)
+
+**Optional env vars:**
+
+```bash
+SUPPORT_BOT_TOKEN=<token> \
+SUPPORT_ADMIN_CHAT_ID=<chat_id> \
+  sudo bash /opt/aperod/blockchain/deploy/update-node.sh
+```
+
+Set `SKIP_HEALTH_CHECK=1` if the RPC port is not exposed on this machine.
+
+---
+
 *Rules enforced by protocol — `consensus/poa.go`, `core/chain.go`.*  
 *Last updated: 2024 — [aperod-network](https://github.com/aperod-network)*

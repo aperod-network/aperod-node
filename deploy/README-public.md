@@ -303,6 +303,19 @@ Outputs:
 ./build/aperod chain block <height>
 ```
 
+### Updating a running node (production)
+
+**Use `update-node.sh` — do not build and copy manually.**
+
+```bash
+sudo bash /opt/aperod/blockchain/deploy/update-node.sh
+```
+
+The script stops the service, builds the binary, installs it to `/usr/local/bin/aperod-node` (the path the `systemd` service runs), starts the service, and waits for the API to respond. Telegram alerts are sent on build or startup failure.
+
+> **Why not `make build` + `cp` directly?**
+> Copying over a running binary fails with `Text file busy`. Building to any path other than `/usr/local/bin/aperod-node` is silently ignored by the service. The update script prevents both mistakes.
+
 ### Run tests
 
 ```bash
