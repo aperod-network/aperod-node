@@ -39,6 +39,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
         s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
+        s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -855,6 +856,26 @@ type mintResponse struct {
         AmountAPR float64 `json:"amount_apr"`
         Address   string  `json:"address"`
         BlindHex  string  `json:"blind_hex"` // hex-encoded blind factor used for the commitment
+}
+
+// ─── GET /api/v1/network/identity ────────────────────────────────────────────
+
+// restNetworkIdentity returns the node's P2P TLS fingerprint, listen address,
+// and node ID.  Requires the X-API-Key header when an API key is configured.
+func (s *Server) restNetworkIdentity(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
+                writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
+                return
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "node_id":         s.nodeID,
+                "tls_fingerprint": s.tlsFingerprint,
+                "listen_addr":     s.p2pListenAddr,
+        })
 }
 
 // restAdminMint creates a coinbase-style mint transaction and adds it to the mempool.

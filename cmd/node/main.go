@@ -450,6 +450,11 @@ func run() error {
                                         "fingerprint", nodeFingerprint, "path", identityKeyPath)
                         }
 
+                        // Expose fingerprint, P2P listen address, and node ID via REST.
+                        if apiSrv != nil {
+                                apiSrv.SetNodeIdentity(nodeFingerprint, tcpAddr, myKey.Public().ID())
+                        }
+
                         handler := &nodeHandler{
                                 engine: engine,
                                 chain:  chain,

@@ -36,6 +36,11 @@ type Server struct {
         // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
         tsRejectedCounter func() int64
 
+        // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
+        tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
+        p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
+        nodeID         string // hex node ID derived from the validator public key
+
         // txTotal is an O(1) cached total non-coinbase tx count.
         // Updated atomically so no lock is needed in hot paths.
         txTotal int64
@@ -87,6 +92,15 @@ func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
 // SetTimestampRejectedCounter wires a function returning the live count of blocks
 // rejected by the timejacking guard.  Optional — reports 0 when unset.
 func (s *Server) SetTimestampRejectedCounter(f func() int64) { s.tsRejectedCounter = f }
+
+// SetNodeIdentity stores the P2P TLS fingerprint, listen address, and node ID
+// so they can be returned by GET /api/v1/network/identity.
+// Call after p2p.LoadOrSaveP2PIdentity succeeds in cmd/node.
+func (s *Server) SetNodeIdentity(fingerprint, listenAddr, nodeID string) {
+        s.tlsFingerprint = fingerprint
+        s.p2pListenAddr = listenAddr
+        s.nodeID = nodeID
+}
 
 // TimestampRejectedCount returns the current live count (0 when not wired).
 func (s *Server) TimestampRejectedCount() int64 {
