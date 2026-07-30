@@ -35,9 +35,11 @@ module.exports = {
       // Disable file-watch mode — building to dist/ should NOT auto-restart
       // mid-build (each file write would trigger a partial restart).
       watch: false,
-      // Restart on crash, but cap restarts to avoid infinite boot loops.
+      // Restart on crash automatically. No cap — a crashed PM2 process that
+      // reaches max_restarts is DELETED from PM2 and `pm2 restart` stops
+      // working, requiring manual intervention. Production servers should
+      // auto-recover indefinitely; a real boot-loop is caught by monitoring.
       autorestart: true,
-      max_restarts: 10,
       restart_delay: 2000,
       // Log paths (PM2 default: ~/.pm2/logs/).
       out_file: "/root/.pm2/logs/aperod-api-out.log",
