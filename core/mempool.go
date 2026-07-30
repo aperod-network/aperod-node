@@ -55,7 +55,11 @@ type Mempool struct {
 	totalBytes int             // running total of all entry sizes for RAM-cap enforcement
 	// Track key images to detect double-spend attempts before they reach a block.
 	keyImages map[crypto.KeyImage]crypto.Hash32 // ki → txHash
-	log       *slog.Logger
+	// stakeSenders prevents scripted validators from flooding the mempool with
+	// multiple stake transactions before any of them are confirmed.
+	// Maps hex(validatorPubKey) → txHash of the pending stake TX.
+	stakeSenders map[string]crypto.Hash32
+	log          *slog.Logger
 }
 
 // NewMempool creates a new empty mempool with the given config.
@@ -68,10 +72,11 @@ func NewMempool(cfg MempoolConfig, logger ...*slog.Logger) *Mempool {
 		l = slog.Default()
 	}
 	return &Mempool{
-		cfg:       cfg,
-		entries:   make(map[crypto.Hash32]*mempoolEntry),
-		keyImages: make(map[crypto.KeyImage]crypto.Hash32),
-		log:       l,
+		cfg:          cfg,
+		entries:      make(map[crypto.Hash32]*mempoolEntry),
+		keyImages:    make(map[crypto.KeyImage]crypto.Hash32),
+		stakeSenders: make(map[string]crypto.Hash32),
+		log:          l,
 	}
 }
 
@@ -139,6 +144,24 @@ func (m *Mempool) Add(tx Transaction) error {
 		return fmt.Errorf("mempool: duplicate tx %x", hash[:8])
 	}
 
+	// C-4: per-address stake-TX rate limit.
+	// Only one stake deposit/withdrawal per validator pubkey may sit in the
+	// mempool at a time.  Scripted depositors that fire multiple identical
+	// transactions before the first is confirmed are rejected here with a
+	// clear message rather than consuming block space and alert bandwidth.
+	var stakeSenderKey string
+	if tx.IsStake() {
+		_, stakePub, _, _, err := DecodeStakeExtra(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("mempool: malformed stake extra: %w", err)
+		}
+		stakeSenderKey = stakePub.Hex()
+		if conflicting, pending := m.stakeSenders[stakeSenderKey]; pending {
+			return fmt.Errorf("mempool: stake tx from validator %s already pending (tx %x); wait for confirmation before submitting another",
+				stakeSenderKey[:8], conflicting[:8])
+		}
+	}
+
 	// Check for double-spend via key images
 	for _, inp := range tx.Inputs {
 		if conflicting, spent := m.keyImages[inp.KeyImage]; spent {
@@ -179,6 +202,9 @@ func (m *Mempool) Add(tx Transaction) error {
 	for _, inp := range tx.Inputs {
 		m.keyImages[inp.KeyImage] = hash
 	}
+	if stakeSenderKey != "" {
+		m.stakeSenders[stakeSenderKey] = hash
+	}
 
 	return nil
 }
@@ -191,11 +217,30 @@ func (m *Mempool) Remove(hash crypto.Hash32) {
 		for _, inp := range entry.Tx.Inputs {
 			delete(m.keyImages, inp.KeyImage)
 		}
+		m.removeStakeSenderLocked(entry)
 		m.totalBytes -= entry.Size
 		if m.totalBytes < 0 {
 			m.totalBytes = 0
 		}
 		delete(m.entries, hash)
+	}
+}
+
+// removeStakeSenderLocked clears the stakeSenders entry for a stake tx entry.
+// Must be called with m.mu held for writing.  Safe to call on non-stake entries
+// (no-op).
+func (m *Mempool) removeStakeSenderLocked(entry *mempoolEntry) {
+	if !entry.Tx.IsStake() {
+		return
+	}
+	_, stakePub, _, _, err := DecodeStakeExtra(entry.Tx.Extra)
+	if err != nil {
+		return
+	}
+	key := stakePub.Hex()
+	// Only delete if the map still points to this entry's hash (not a later one).
+	if m.stakeSenders[key] == entry.Hash {
+		delete(m.stakeSenders, key)
 	}
 }
 
@@ -363,6 +408,7 @@ func (m *Mempool) Evict() int {
 			for _, inp := range e.Tx.Inputs {
 				delete(m.keyImages, inp.KeyImage)
 			}
+			m.removeStakeSenderLocked(e)
 			m.totalBytes -= e.Size
 			if m.totalBytes < 0 {
 				m.totalBytes = 0
@@ -389,6 +435,7 @@ func (m *Mempool) evictOldest() bool {
 	for _, inp := range oldest.Tx.Inputs {
 		delete(m.keyImages, inp.KeyImage)
 	}
+	m.removeStakeSenderLocked(oldest)
 	m.totalBytes -= oldest.Size
 	if m.totalBytes < 0 {
 		m.totalBytes = 0
