@@ -133,6 +133,11 @@ func run() error {
 
         log.Info("starting Aperod node", "network", cfg.Network, "data_dir", cfg.DataDir)
 
+        // Emit any non-fatal configuration warnings now that the logger is ready.
+        for _, w := range cfg.Warnings() {
+                log.Warn("config warning", "msg", w)
+        }
+
         // ── 3. Open storage ───────────────────────────────────────────────────────
         if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
                 return fmt.Errorf("create data dir: %w", err)
@@ -465,8 +470,12 @@ func run() error {
                                 AllowedPeers:  cfg.P2P.AllowedPeers,
                         }, handler, log)
                         if len(cfg.P2P.AllowedPeers) > 0 {
-                                log.Info("p2p validator allow-list active",
-                                        "allowed_count", len(cfg.P2P.AllowedPeers))
+                                log.Info("allow-list active",
+                                        "allowed_peers", len(cfg.P2P.AllowedPeers))
+                                if len(bootnodes) == 0 {
+                                        log.Warn("allow-list is active but no bootnodes are configured — node may not connect to any peers",
+                                                "allowed_peers", len(cfg.P2P.AllowedPeers))
+                                }
                         }
 
                         if err := host.Start(); err != nil {
@@ -477,6 +486,41 @@ func run() error {
                                 defer host.Stop()
                                 if apiSrv != nil {
                                         apiSrv.SetPeerCounter(host.PeerCount)
+                                }
+                                // Background goroutine: if an allow-list is active and no peers
+                                // connect after 2×block_time, the list may be misconfigured
+                                // (e.g. bootnode fingerprints missing).  Fire a WARN on every
+                                // check interval so the operator notices quickly.
+                                if len(cfg.P2P.AllowedPeers) > 0 {
+                                        checkDelay := 2 * cfg.Consensus.BlockTime
+                                        if checkDelay <= 0 {
+                                                checkDelay = 6 * time.Second
+                                        }
+                                        go func() {
+                                                // Wait the initial 2×block_time before first check.
+                                                timer := time.NewTimer(checkDelay)
+                                                defer timer.Stop()
+                                                select {
+                                                case <-stop:
+                                                        return
+                                                case <-timer.C:
+                                                }
+                                                // Then repeat every checkDelay until a peer appears or node stops.
+                                                ticker := time.NewTicker(checkDelay)
+                                                defer ticker.Stop()
+                                                for {
+                                                        if host.PeerCount() == 0 {
+                                                                log.Warn("allow-list may be misconfigured — no peers connected",
+                                                                        "allowed_peers", len(cfg.P2P.AllowedPeers),
+                                                                        "hint", "ensure bootnode TLS fingerprints are in allowed_peers")
+                                                        }
+                                                        select {
+                                                        case <-stop:
+                                                                return
+                                                        case <-ticker.C:
+                                                        }
+                                                }
+                                        }()
                                 }
                         }
                 }

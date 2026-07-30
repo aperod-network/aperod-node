@@ -157,6 +157,16 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// Warnings returns a list of non-fatal configuration warnings that operators
+// should investigate but that do not prevent the node from starting.
+func (c *Config) Warnings() []string {
+	var ws []string
+	if len(c.P2P.AllowedPeers) > 0 && len(c.P2P.Bootnodes) == 0 {
+		ws = append(ws, "allowed_peers is set but bootnodes is empty — node may be isolated (no peers to connect to)")
+	}
+	return ws
+}
+
 // Validate checks that required fields are present and valid.
 func (c *Config) Validate() error {
 	if c.Network == "" {
