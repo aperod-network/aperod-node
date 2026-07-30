@@ -7,8 +7,13 @@
  *   # First-time start (after git pull + build):
  *   pm2 start /opt/aperod/ecosystem.config.cjs
  *
- *   # Subsequent updates (after git pull + build):
- *   pm2 restart aperod-api          ← preserves env vars
+ *   # Subsequent updates — ALWAYS use the update script, never bare pm2 restart:
+ *   sudo bash /opt/aperod/blockchain/deploy/update-api.sh
+ *
+ *   WHY: bare `pm2 restart aperod-api` replays the OLD compiled dist/index.mjs.
+ *   New TypeScript source changes are silently ignored until a rebuild runs.
+ *   The update script does: git pull → pnpm build → pm2 restart (in that order).
+ *
  *   # OR if ecosystem file changed:
  *   pm2 startOrRestart /opt/aperod/ecosystem.config.cjs
  *
