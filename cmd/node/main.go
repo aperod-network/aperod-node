@@ -97,9 +97,18 @@ func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
 func run() error {
         // ── 1. Load configuration ─────────────────────────────────────────────────
         cfgPath := "config/testnet.yaml"
-        if len(os.Args) > 2 && os.Args[1] == "--config" {
-                cfgPath = os.Args[2]
+        resetP2PIdentity := false
+        for i, arg := range os.Args[1:] {
+                switch arg {
+                case "--config":
+                        if i+2 < len(os.Args) {
+                                cfgPath = os.Args[i+2]
+                        }
+                case "--reset-p2p-identity":
+                        resetP2PIdentity = true
+                }
         }
+        _ = resetP2PIdentity // used below in P2P startup
 
         cfg, err := config.Load(cfgPath)
         if err != nil {
@@ -408,16 +417,22 @@ func run() error {
                         }
                 }
 
-                // Generate an ephemeral Ed25519 TLS identity for this session.
-                // Every connection is encrypted (TLS 1.3) and mutually
-                // authenticated via self-signed certificates — plaintext or
-                // unauthenticated peers are rejected at the handshake stage.
-                // This addresses security finding F-030.
-                tlsCfg, nodeFingerprint, tlsErr := p2p.GenerateNodeTLSConfig()
+                // Load or generate a persistent Ed25519 TLS identity.
+                // The key is stored in <data_dir>/p2p_identity.key so the
+                // fingerprint is stable across restarts.  Pass --reset-p2p-identity
+                // on the command line to force regeneration (e.g. after a key
+                // compromise).  Every connection is encrypted (TLS 1.3) and
+                // mutually authenticated — plaintext or unauthenticated peers are
+                // rejected at the handshake stage (security finding F-030).
+                tlsCfg, nodeFingerprint, tlsErr := p2p.LoadOrSaveP2PIdentity(cfg.DataDir, resetP2PIdentity)
                 if tlsErr != nil {
-                        log.Error("p2p tls identity generation failed — aborting p2p startup", "err", tlsErr)
+                        log.Error("p2p tls identity load/generate failed — aborting p2p startup", "err", tlsErr)
                 } else {
-                        log.Info("p2p tls identity generated", "fingerprint", nodeFingerprint)
+                        if resetP2PIdentity {
+                                log.Info("p2p tls identity reset and regenerated", "fingerprint", nodeFingerprint)
+                        } else {
+                                log.Info("p2p tls identity loaded", "fingerprint", nodeFingerprint)
+                        }
 
                         handler := &nodeHandler{
                                 engine: engine,
