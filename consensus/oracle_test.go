@@ -404,6 +404,71 @@ func TestOraclePrice_ConsecFailsExceedThreshold(t *testing.T) {
 	}
 }
 
+// TestOracleSlowFetch_DoesNotDelayBlockProduction verifies that a slow oracle
+// (2-second HTTP response time) does not stall block production.
+//
+// With the async oracle fetcher the price is updated in a background goroutine;
+// produceBlock() reads the cached value atomically and never waits on the
+// network.  Five blocks at 30 ms block-time should complete in well under
+// 2 seconds; without the fix each block would stall for up to 2 s, making the
+// same five blocks take ≥ 10 s.
+func TestOracleSlowFetch_DoesNotDelayBlockProduction(t *testing.T) {
+	const (
+		blockTime   = 30 * time.Millisecond
+		oracleDelay = 2 * time.Second // far longer than blockTime
+		wantBlocks  = 5
+	)
+
+	// Slow oracle: responds correctly but only after oracleDelay.
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(oracleDelay)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]float64{"price_usd": 0.05})
+	}))
+	defer slowSrv.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := makeGenesisChain(t, priv, pub)
+	lk, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Destroy()
+
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	eng := consensus.NewEngine(consensus.Config{
+		BlockTime:    blockTime,
+		BFTThreshold: 0.667,
+		Validators:   []crypto.ValidatorPubKey{pub},
+		MyKey:        lk,
+		OracleURL:    slowSrv.URL, // slow — responds after 2 s
+	}, chain, mp, newNopLogger())
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	// Measure how long it takes to collect wantBlocks blocks.
+	// With the async fix this should finish in well under oracleDelay;
+	// without the fix it would take ≥ wantBlocks × oracleDelay.
+	start := time.Now()
+	// Generous deadline: 5× blockTime × wantBlocks still << oracleDelay.
+	drainBlocks(t, eng.ProducedCh(), wantBlocks, 3*time.Second)
+	elapsed := time.Since(start)
+
+	// If oracle latency leaked into block production the elapsed time would be
+	// several seconds.  Require it completes in under oracleDelay.
+	if elapsed >= oracleDelay {
+		t.Errorf("block production took %s for %d blocks — oracle latency is blocking produceBlock (want < %s)",
+			elapsed, wantBlocks, oracleDelay)
+	}
+	t.Logf("OK: produced %d blocks in %s with oracle_delay=%s (async fetcher working)",
+		wantBlocks, elapsed, oracleDelay)
+}
+
 // Ensure we have a local newNopLogger if this file is compiled in isolation.
 // consensus_test.go defines it already; this compile-time check prevents
 // duplicate-symbol errors by relying on the package-level definition there.

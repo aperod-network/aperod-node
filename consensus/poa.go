@@ -100,6 +100,13 @@ type Engine struct {
         // Warn to Error so the alert reaches the Telegram admin notification channel.
         oracleConsecFails int64
 
+        // cachedOraclePrice holds the last successfully fetched oracle price in
+        // fixed-point units (price_usd × oraclePriceScale).  Updated by the
+        // background oracle fetcher goroutine; read atomically by produceBlock so
+        // block production is never gated on oracle HTTP latency.  0 means the price
+        // is unavailable (oracle down or not yet fetched).
+        cachedOraclePrice uint64
+
         // Channels for external events
         newBlockCh chan *core.Block  // incoming blocks from P2P
         newVoteCh  chan FinalizeMsg  // incoming finalization votes
@@ -157,10 +164,37 @@ func (e *Engine) activeValidators() []crypto.ValidatorPubKey {
         return e.cfg.Validators
 }
 
+// runOracleFetcher is a background goroutine that polls fetchOraclePrice() once
+// per BlockTime and stores the result in cachedOraclePrice atomically.
+// This decouples oracle HTTP latency from block production: produceBlock reads
+// the cached value instantly instead of making a blocking HTTP call.
+// Stops when stop is closed.
+func (e *Engine) runOracleFetcher(stop <-chan struct{}) {
+        // Fetch immediately on startup so the first produced block has a price.
+        atomic.StoreUint64(&e.cachedOraclePrice, e.fetchOraclePrice())
+
+        ticker := time.NewTicker(e.cfg.BlockTime)
+        defer ticker.Stop()
+        for {
+                select {
+                case <-stop:
+                        return
+                case <-ticker.C:
+                        atomic.StoreUint64(&e.cachedOraclePrice, e.fetchOraclePrice())
+                }
+        }
+}
+
 // Run starts the consensus loop. Blocks until ctx is done.
 func (e *Engine) Run(stop <-chan struct{}) {
         ticker := time.NewTicker(e.cfg.BlockTime)
         defer ticker.Stop()
+
+        // Start background oracle price fetcher so produceBlock never blocks on
+        // oracle HTTP latency.  Only started when an oracle URL is configured.
+        if e.cfg.OracleURL != "" {
+                go e.runOracleFetcher(stop)
+        }
 
         e.log.Info("consensus engine started",
                 "validators", len(e.cfg.Validators),
@@ -546,7 +580,9 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 }
         }
 
-        oraclePrice := e.fetchOraclePrice()
+        // Read the last price fetched by the background oracle goroutine.
+        // This is an atomic load — never blocks on network I/O.
+        oraclePrice := atomic.LoadUint64(&e.cachedOraclePrice)
 
         header := core.BlockHeader{
                 Height:       height,
