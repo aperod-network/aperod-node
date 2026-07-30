@@ -325,6 +325,37 @@ func TestMempool_RejectWhenPoolFullAndNothingToEvict(t *testing.T) {
 	}
 }
 
+// TestAddPrivileged_VerifiesNonCoinbaseTx confirms that AddPrivileged runs full
+// cryptographic verification via TxVerifier.VerifyTx when a Verifier is wired in.
+//
+// A non-coinbase transaction carrying stub (all-zero) ring signatures must be
+// rejected even on the privileged path — AddPrivileged is only exempt from fee
+// and count checks, not from cryptographic validity.  This guards against an
+// attacker who somehow obtains privileged access to the mempool and tries to
+// inject an unverified transaction.
+func TestAddPrivileged_VerifiesNonCoinbaseTx(t *testing.T) {
+	cfg := core.MempoolConfig{
+		MaxSize:        100,
+		MaxBytes:       256 * 1024 * 1024,
+		MaxTxSize:      1_000_000,
+		BaseFeePerByte: 0, // no fee minimum — we test signature rejection, not fee policy
+	}
+	pool := core.NewMempool(cfg, silentLogger())
+
+	// Wire a real TxVerifier with a nil UTXOSet (double-spend checks are skipped,
+	// but MLSAG ring-signature and commitment checks still run).
+	v := core.NewTxVerifier(nil)
+	pool.SetVerifier(v)
+
+	// makeTx produces a non-coinbase tx (1 ring input) with an all-zero stub
+	// MLSAGSignature.  The ring-closure check in MLSAGVerify must reject it.
+	tx := makeTx(0, 42)
+	err := pool.AddPrivileged(tx)
+	if err == nil {
+		t.Error("AddPrivileged: expected non-nil error for non-coinbase tx with stub ring signature, got nil — verifier not enforced on privileged path?")
+	}
+}
+
 // TestMempool_BytesTrackedCorrectlyAfterRemove confirms that Remove() correctly
 // decrements totalBytes so the byte cap stays accurate after block inclusion.
 func TestMempool_BytesTrackedCorrectlyAfterRemove(t *testing.T) {
