@@ -32,6 +32,11 @@ module.exports = {
       // Load all env vars from the .env file at project root.
       // Adjust path if your .env lives elsewhere.
       env_file: "/opt/aperod/.env",
+      // Hard-code vars that must survive even if .env has a parse error on
+      // a line above them (e.g. a placeholder value with angle brackets).
+      env: {
+        ADMIN_IP_WHITELIST: "*",
+      },
       // Disable file-watch mode — building to dist/ should NOT auto-restart
       // mid-build (each file write would trigger a partial restart).
       watch: false,
