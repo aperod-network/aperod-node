@@ -23,10 +23,11 @@ type scanUTXOsParams struct {
 }
 
 type scannedUTXO struct {
-        TxHash     string `json:"tx_hash"`
-        OutIdx     uint32 `json:"out_idx"`
-        AmountNAPR uint64 `json:"amount_napr"`
-        BlindHex   string `json:"blind_hex"` // always "" — Go recomputes deterministically
+        TxHash      string `json:"tx_hash"`
+        OutIdx      uint32 `json:"out_idx"`
+        AmountNAPR  uint64 `json:"amount_napr"`
+        BlindHex    string `json:"blind_hex"`     // always "" — Go recomputes deterministically
+        HsScalarHex string `json:"hs_scalar_hex"` // ECDH shared secret; pass to stake-deposit to derive blind
 }
 
 func (s *Server) aprScanUTXOs(params json.RawMessage) (interface{}, error) {
@@ -83,10 +84,11 @@ func (s *Server) aprScanUTXOs(params json.RawMessage) (interface{}, error) {
                 }
 
                 result = append(result, scannedUTXO{
-                        TxHash:     fmt.Sprintf("%x", u.TxHash[:]),
-                        OutIdx:     u.OutputIndex,
-                        AmountNAPR: u.Amount,
-                        BlindHex:   "", // Go spending path derives this deterministically
+                        TxHash:      fmt.Sprintf("%x", u.TxHash[:]),
+                        OutIdx:      u.OutputIndex,
+                        AmountNAPR:  u.Amount,
+                        BlindHex:    "", // Go spending path derives this deterministically
+                        HsScalarHex: fmt.Sprintf("%x", u.HsScalar[:]),
                 })
         }
 

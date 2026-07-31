@@ -1163,13 +1163,39 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blindBytes, err := hex.DecodeString(req.BlindHex)
-	if err != nil || len(blindBytes) != 32 {
-		writeJSONError(w, http.StatusBadRequest, "blind_hex must be a 64-hex-char blinding factor")
-		return
-	}
+	// Resolve the blinding factor: stealth scan-recovered outputs pass
+	// blind_hex="" and supply hs_scalar_hex so the node derives the blind
+	// deterministically via DeterministicPaymentBlind(HsScalar, amount).
 	var burnBlind crypto.BlindFactor
-	copy(burnBlind[:], blindBytes)
+	if req.BlindHex == "" {
+		// Stealth path: derive blind from ECDH shared secret + amount.
+		if req.HsScalarHex == "" {
+			writeJSONError(w, http.StatusBadRequest,
+				"blind_hex is empty; supply hs_scalar_hex for stealth scan-recovered outputs")
+			return
+		}
+		hsBytes, hsErr := hex.DecodeString(req.HsScalarHex)
+		if hsErr != nil || len(hsBytes) != 32 {
+			writeJSONError(w, http.StatusBadRequest, "hs_scalar_hex must be a 64-hex-char scalar")
+			return
+		}
+		var hsScalar crypto.Scalar32
+		copy(hsScalar[:], hsBytes)
+		derivedBlind, bErr := crypto.DeterministicPaymentBlind(hsScalar, req.AmountNAPR)
+		if bErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "derive blind from hs_scalar_hex: "+bErr.Error())
+			return
+		}
+		burnBlind = derivedBlind
+	} else {
+		// Transparent path: caller supplies the explicit blinding factor.
+		blindBytes, blindErr := hex.DecodeString(req.BlindHex)
+		if blindErr != nil || len(blindBytes) != 32 {
+			writeJSONError(w, http.StatusBadRequest, "blind_hex must be a 64-hex-char blinding factor")
+			return
+		}
+		copy(burnBlind[:], blindBytes)
+	}
 
 	// ── Pre-mempool commitment check ───────────────────────────────────────────
 	// Recompute Commit(amount, blind) and require it to equal the UTXO's
@@ -1241,11 +1267,12 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 // stakeDepositRequest is the JSON body for POST /api/v1/admin/stake-deposit.
 // The node signs the deposit on behalf of its own configured validator key.
 type stakeDepositRequest struct {
-        PubKey     string `json:"pub_key"`      // 64-hex-char Ed25519 public key
-        AmountNAPR uint64 `json:"amount_napr"`  // stake amount in nAPRO (base units)
-        UTXOTxHash string `json:"utxo_txhash"` // 64-hex-char tx hash of the burn UTXO
-        UTXOOutIdx uint32 `json:"utxo_out_idx"` // output index of the burn UTXO
-        BlindHex   string `json:"blind_hex"`    // 64-hex-char Pedersen blinding factor
+        PubKey      string `json:"pub_key"`       // 64-hex-char Ed25519 public key
+        AmountNAPR  uint64 `json:"amount_napr"`   // stake amount in nAPRO (base units)
+        UTXOTxHash  string `json:"utxo_txhash"`   // 64-hex-char tx hash of the burn UTXO
+        UTXOOutIdx  uint32 `json:"utxo_out_idx"`  // output index of the burn UTXO
+        BlindHex    string `json:"blind_hex"`     // 64-hex-char Pedersen blinding factor; "" for stealth outputs
+        HsScalarHex string `json:"hs_scalar_hex"` // optional: ECDH shared secret for stealth outputs; used when blind_hex is empty
 }
 
 // ─── POST /api/v1/stake ───────────────────────────────────────────────────────
