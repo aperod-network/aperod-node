@@ -98,6 +98,7 @@ func run() error {
         // ── 1. Load configuration ─────────────────────────────────────────────────
         cfgPath := "config/testnet.yaml"
         resetP2PIdentity := false
+        validateOnly := false
         for i, arg := range os.Args[1:] {
                 switch arg {
                 case "--config":
@@ -106,6 +107,8 @@ func run() error {
                         }
                 case "--reset-p2p-identity":
                         resetP2PIdentity = true
+                case "--validate-config":
+                        validateOnly = true
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
@@ -116,6 +119,15 @@ func run() error {
         }
         if err := cfg.Validate(); err != nil {
                 return fmt.Errorf("invalid config: %w", err)
+        }
+
+        // --validate-config: exit 0 after a successful parse+validate so
+        // operators (and node-config.sh) can verify node.yaml without starting
+        // the node.  Prints the config path and network name so the caller can
+        // confirm which file was checked.
+        if validateOnly {
+                fmt.Fprintf(os.Stdout, "config OK: %s (network=%s)\n", cfgPath, cfg.Network)
+                return nil
         }
 
         // ── 2. Setup logger ───────────────────────────────────────────────────────

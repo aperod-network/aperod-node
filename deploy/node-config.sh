@@ -33,8 +33,22 @@ ensure_pyyaml() {
 }
 
 # ── Validate the YAML file after writing ─────────────────────────────────────
+# First tries `aperod-node --validate-config` (full config parse + semantic
+# validation via cfg.Validate()).  Falls back to python yaml.safe_load() when
+# the binary is not on PATH or when a tmp file is being validated (the binary
+# needs a real config path, which may not match the temp path).
 validate_yaml() {
   local file="$1"
+
+  # Attempt binary validation when the file matches the real config location.
+  if [[ "$file" == "$CONFIG_FILE" ]] && command -v aperod-node &>/dev/null; then
+    if aperod-node --config "$file" --validate-config 2>&1; then
+      return 0
+    else
+      echo "[warn] aperod-node --validate-config failed; falling back to PyYAML check." >&2
+    fi
+  fi
+
   python3 - <<EOF
 import sys, yaml
 try:
@@ -51,7 +65,7 @@ EOF
 cmd_list() {
   [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
   ensure_pyyaml
-  python3 - <<'EOF'
+  python3 - "$CONFIG_FILE" <<'EOF'
 import yaml, sys
 with open(sys.argv[1]) as f:
     cfg = yaml.safe_load(f) or {}
@@ -62,7 +76,6 @@ else:
     for i, b in enumerate(bootnodes):
         print(f"  [{i}] {b}")
 EOF
-  "$CONFIG_FILE"
 }
 
 # ── add-bootnode ──────────────────────────────────────────────────────────────

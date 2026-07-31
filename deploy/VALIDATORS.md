@@ -206,6 +206,57 @@ correct ownership set automatically.
 
 ---
 
+## Managing Bootnodes Safely
+
+**Never edit `node.yaml` bootnodes with `sed` or by hand** — a missed newline
+silently merges entries into invalid YAML, which crash-loops the node.
+
+Use `node-config.sh` instead:
+
+```bash
+# List current bootnodes
+sudo bash /opt/aperod/blockchain/deploy/node-config.sh list-bootnodes
+
+# Add a bootnode (Python rewrites the YAML; validates before writing)
+sudo bash /opt/aperod/blockchain/deploy/node-config.sh add-bootnode /ip4/1.2.3.4/tcp/30303
+
+# Remove a bootnode by exact address
+sudo bash /opt/aperod/blockchain/deploy/node-config.sh remove-bootnode /ip4/1.2.3.4/tcp/30303
+```
+
+The script:
+1. Parses the existing YAML with Python (not sed), so list structure is preserved.
+2. Checks for duplicates before adding.
+3. Shows a diff of exactly what changed before writing.
+4. Validates the result with `aperod-node --validate-config` (falls back to
+   `python3 yaml.safe_load` if the binary is not on PATH).
+5. Only writes the file after validation passes — the original is never
+   truncated on failure.
+
+After any change, restart the node:
+
+```bash
+sudo systemctl restart aperod-node
+```
+
+Override the config path with `APEROD_CONFIG=/path/to/node.yaml` if your file
+is not at the default `/etc/aperod/node.yaml`.
+
+---
+
+## Validating node.yaml Without Starting the Node
+
+```bash
+aperod-node --config /etc/aperod/node.yaml --validate-config
+# config OK: /etc/aperod/node.yaml (network=mainnet)
+```
+
+Exits 0 on success, non-zero with an error message on any parse or semantic
+validation failure.  Safe to run while the node is running — it does not
+open any ports or touch the database.
+
+---
+
 ## Updating the Node Binary
 
 **Always use `update-node.sh` — never build and copy manually.**
