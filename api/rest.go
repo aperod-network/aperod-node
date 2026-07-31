@@ -11,6 +11,7 @@ package api
 //   GET  /api/v1/validators/{pubkey}/unbonding         — partial-unbonding queue for one validator
 //   POST /api/v1/admin/mint                            — admin-only: mint APRO to address
 //   POST /api/v1/admin/partial-unstake                 — admin-only: apply partial stake withdrawal
+//   POST /api/v1/admin/stake-deposit                   — admin-only: v2 UTXO-backed stake deposit
 
 import (
         "encoding/hex"
@@ -39,6 +40,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
         s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
+        s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.restAdminStakeDeposit)
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.restNetworkBans)
@@ -953,6 +955,134 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 	pub := s.myKey.Public()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"pub_key": pub.Hex(),
+	})
+}
+
+// ─── POST /api/v1/admin/stake-deposit ────────────────────────────────────────
+//
+// Builds a v2 UTXO-backed stake deposit transaction and submits it to the
+// mempool.  The node signs with its own validator key — the caller must provide
+// the UTXO details (tx hash, output index) and the blinding factor that was
+// used when that output was created.
+//
+// Request body:
+//
+//	{
+//	  "pub_key":      "<64-hex Ed25519 public key — must match this node's key>",
+//	  "amount_napr":  <uint64 nAPRO>,
+//	  "utxo_txhash":  "<64-hex transaction hash>",
+//	  "utxo_out_idx": <uint32 output index>,
+//	  "blind_hex":    "<64-hex Pedersen blinding factor>"
+//	}
+
+type stakeDepositRequest struct {
+	PubKey     string `json:"pub_key"`      // 64-hex validator pubkey (must match this node)
+	AmountNAPR uint64 `json:"amount_napr"`  // stake amount in nAPRO
+	UTXOTxHash string `json:"utxo_txhash"`  // 64-hex hash of the UTXO tx being burned
+	UTXOOutIdx uint32 `json:"utxo_out_idx"` // output index within that tx
+	BlindHex   string `json:"blind_hex"`    // 64-hex Pedersen blind of the UTXO
+}
+
+func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.myKey == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "validator key not configured on this node")
+		return
+	}
+
+	var req stakeDepositRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	// ── Validate fields ────────────────────────────────────────────────────────
+	if req.AmountNAPR == 0 {
+		writeJSONError(w, http.StatusBadRequest, "amount_napr must be > 0")
+		return
+	}
+	pubBytes, err := hex.DecodeString(req.PubKey)
+	if err != nil || len(pubBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "pub_key must be a 64-hex-char Ed25519 public key")
+		return
+	}
+	targetPub := crypto.ValidatorPubKey(pubBytes)
+
+	// Only the local node's own key can be used — the signature is over (pub, amount, utxo)
+	// and must verify against pub itself.
+	myPub := s.myKey.Public()
+	if !myPub.Equals(targetPub) {
+		writeJSONError(w, http.StatusForbidden,
+			"pub_key must match this node's configured validator key")
+		return
+	}
+
+	txHashBytes, err := hex.DecodeString(req.UTXOTxHash)
+	if err != nil || len(txHashBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "utxo_txhash must be a 64-hex-char transaction hash")
+		return
+	}
+	var burnTxHash crypto.Hash32
+	copy(burnTxHash[:], txHashBytes)
+
+	blindBytes, err := hex.DecodeString(req.BlindHex)
+	if err != nil || len(blindBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "blind_hex must be a 64-hex-char blinding factor")
+		return
+	}
+	var burnBlind crypto.BlindFactor
+	copy(burnBlind[:], blindBytes)
+
+	// ── Sign ───────────────────────────────────────────────────────────────────
+	msg := core.StakeSignMsgV2(core.StakeDeposit, targetPub, req.AmountNAPR, burnTxHash, req.UTXOOutIdx)
+	sig, err := s.myKey.Sign(msg)
+	if err != nil {
+		s.log.Error("admin stake deposit: sign failed", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "sign: "+err.Error())
+		return
+	}
+
+	// ── Build v2 Extra payload ─────────────────────────────────────────────────
+	extra, err := core.EncodeStakeExtraV2(
+		core.StakeDeposit, targetPub, req.AmountNAPR, sig,
+		burnTxHash, req.UTXOOutIdx, burnBlind,
+	)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "encode extra: "+err.Error())
+		return
+	}
+
+	// ── Submit to mempool ──────────────────────────────────────────────────────
+	tx := core.Transaction{
+		Version: core.TxVersionStake,
+		Extra:   extra,
+	}
+	if err := s.mempool.Add(tx); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "mempool: "+err.Error())
+		return
+	}
+
+	txHash := tx.Hash()
+	txHashHex := fmt.Sprintf("%x", txHash[:])
+	s.log.Info("admin stake deposit queued",
+		"pub_key", req.PubKey[:8],
+		"amount_napr", req.AmountNAPR,
+		"utxo_txhash", req.UTXOTxHash[:8],
+		"tx_hash", txHashHex,
+	)
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"tx_hash":        txHashHex,
+		"pub_key":        req.PubKey,
+		"amount_napr":    req.AmountNAPR,
+		"amount_apr":     float64(req.AmountNAPR) / 1e8,
+		"utxo_txhash":    req.UTXOTxHash,
+		"utxo_out_idx":   req.UTXOOutIdx,
+		"status":         "pending",
+		"message":        "StakeDeposit v2 transaction submitted to mempool; applied when included in the next block",
 	})
 }
 

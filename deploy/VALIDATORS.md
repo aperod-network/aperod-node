@@ -182,6 +182,30 @@ curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/dep
 
 ---
 
+## One-time Fix: validator.key File Permissions (existing validators)
+
+If your validator node was installed before **July 2026**, the key file may have
+wrong ownership or permissions, causing the node to fail with
+`permission denied` or `unsafe permissions` on the next binary update.
+
+Run this one-time fix **on the validator server**:
+
+```bash
+sudo chown aperod:aperod /etc/aperod/validator.key
+sudo chmod 600 /etc/aperod/validator.key
+```
+
+Verify:
+```bash
+sudo ls -la /etc/aperod/validator.key
+# expected: -rw------- aperod aperod ...
+```
+
+Newly installed validators (using the current `install-validator.sh`) have the
+correct ownership set automatically.
+
+---
+
 ## Updating the Node Binary
 
 **Always use `update-node.sh` — never build and copy manually.**

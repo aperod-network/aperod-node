@@ -159,6 +159,54 @@ Inspect logs: <code>journalctl -u ${SERVICE_NAME} -n 100</code>"
   fi
 fi
 
+# ── P2P peer count check (non-fatal warning) ────────────────────────────────
+# After the HTTP API is up, wait for at least one P2P peer to reconnect.
+# A deploy that breaks TLS config or the protocol version passes the API check
+# while leaving the node completely isolated — this check catches that case.
+#
+# Configurable env vars:
+#   PEER_WAIT_SECS  — total seconds to wait for a peer (default: 30)
+#   SKIP_PEER_CHECK — set to 1 to bypass (e.g. single-node devnet)
+
+PEER_STATS_URL="http://localhost:8545/api/v1/network/stats"
+PEER_WAIT_SECS="${PEER_WAIT_SECS:-30}"
+SKIP_PEER_CHECK="${SKIP_PEER_CHECK:-0}"
+
+if [[ "$SKIP_HEALTH_CHECK" == "1" || "$SKIP_PEER_CHECK" == "1" ]]; then
+  echo "  Skipping P2P peer check."
+else
+  echo ""
+  echo "  Checking P2P connectivity (waiting up to ${PEER_WAIT_SECS}s for ≥1 peer)..."
+  peer_ok=false
+  peer_elapsed=0
+  while [[ $peer_elapsed -lt $PEER_WAIT_SECS ]]; do
+    peer_count=$(curl -sf --connect-timeout 2 "${PEER_STATS_URL}" 2>/dev/null \
+      | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('peer_count',0))" 2>/dev/null || echo "0")
+    if [[ "${peer_count:-0}" -gt 0 ]]; then
+      echo "  ✓ P2P connected: ${peer_count} peer(s) active."
+      peer_ok=true
+      break
+    fi
+    sleep 5
+    peer_elapsed=$(( peer_elapsed + 5 ))
+    echo "    Still waiting... peer_count=${peer_count:-0} (${peer_elapsed}s / ${PEER_WAIT_SECS}s)"
+  done
+
+  if [[ "${peer_ok}" != "true" ]]; then
+    echo ""
+    echo "  ⚠  WARNING: node has 0 P2P peers after ${PEER_WAIT_SECS}s." >&2
+    echo "     The API is responding but the node may be network-isolated." >&2
+    echo "     Common causes: bad TLS config, changed protocol version, firewall." >&2
+    echo "     Check: journalctl -u ${SERVICE_NAME} -n 50 --no-pager" >&2
+
+    send_telegram_alert "⚠️ <b>aperod-node P2P isolation warning</b>
+Server: $(hostname)
+The node restarted successfully (API responds) but has <b>0 P2P peers</b> after ${PEER_WAIT_SECS}s.
+The node may be network-isolated after this deploy.
+Check: <code>journalctl -u ${SERVICE_NAME} -n 50</code>"
+  fi
+fi
+
 echo ""
 echo "✓ Update complete. New build is live."
 echo "  Service status : systemctl status ${SERVICE_NAME}"

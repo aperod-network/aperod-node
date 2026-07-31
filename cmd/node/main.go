@@ -341,6 +341,16 @@ func run() error {
         // initialTxTotal is populated by the key-image rebuild loop above (full
         // scan, so the count is exact). In the genesis path it stays 0.
 
+        // Safety invariant: the UTXO set (byPubKey index + spent key-image set)
+        // is now fully populated from the chain store.  The consensus engine,
+        // P2P host, and API server are all wired AFTER this point, so no
+        // external transaction can reach the mempool before ring-member
+        // verification is active.  This prevents the "startup window" attack
+        // where a ring tx referencing unknown decoys is accepted during replay.
+        log.Info("UTXO set ready — ring-member verification active",
+                "unspent_outputs", utxos.Count(),
+        )
+
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
         // host and apiSrv are declared here so OnBlockProduced can reference them
         // (both are assigned after engine creation, but closures capture by reference).

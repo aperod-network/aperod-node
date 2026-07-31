@@ -579,19 +579,129 @@ validator key configured; this command calls its admin REST endpoint.`,
         },
 }
 
-func init() {
-        txSendCmd.Flags().String("to", "", "Recipient Aperod address")
-        txSendCmd.Flags().Float64("amount", 0, "Amount in APRO")
-        txSendCmd.Flags().String("rpc", "http://localhost:8545", "RPC endpoint")
-        txSendCmd.Flags().String("key-file", "", "Wallet keystore file")
-        txCmd.AddCommand(txSendCmd)
+// ─── validator stake ──────────────────────────────────────────────────────────
+//
+// Builds and broadcasts a v2 UTXO-backed stake deposit via the node's admin
+// REST endpoint.  The node signs with its own validator key; the caller must
+// supply the UTXO details and the Pedersen blinding factor for that output.
+//
+// Usage:
+//
+//	aperod validator stake \
+//	  --node      http://localhost:8080 \
+//	  --pub-key   <64-hex validator public key> \
+//	  --utxo-txhash <64-hex UTXO transaction hash> \
+//	  --utxo-idx    <output index, default 0> \
+//	  --amount      <APRO, e.g. 100000> \
+//	  --blind       <64-hex Pedersen blinding factor of the UTXO>
+var validatorStakeCmd = &cobra.Command{
+	Use:   "stake",
+	Short: "Submit a v2 UTXO-backed stake deposit to enter the validator queue",
+	Long: `Builds a StakeDeposit v2 transaction (173-byte payload with UTXO burn proof)
+and broadcasts it via the node's admin REST endpoint.
 
-        // Task #356 — validator partial-unstake CLI command
-        validatorPartialUnstakeCmd.Flags().String("node", "http://localhost:8080", "Node admin REST URL")
-        validatorPartialUnstakeCmd.Flags().String("pub-key", "", "Validator public key (64-hex)")
-        validatorPartialUnstakeCmd.Flags().Float64("amount", 0, "Amount to withdraw in APRO")
-        validatorCmd.AddCommand(validatorPartialUnstakeCmd)
-        rootCmd.AddCommand(validatorCmd)
+The node must be configured with the same validator key as --pub-key; it will
+sign the canonical StakeSignMsgV2 internally.  You must provide the Pedersen
+blinding factor (--blind) of the UTXO being burned as the stake proof.
+`,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		nodeURL, _ := cmd.Flags().GetString("node")
+		pubKey, _ := cmd.Flags().GetString("pub-key")
+		utxoTxHash, _ := cmd.Flags().GetString("utxo-txhash")
+		utxoIdx, _ := cmd.Flags().GetUint32("utxo-idx")
+		amount, _ := cmd.Flags().GetFloat64("amount")
+		blind, _ := cmd.Flags().GetString("blind")
+
+		// ── Validate flags ────────────────────────────────────────────────────
+		if pubKey == "" {
+			return fmt.Errorf("--pub-key is required (64-hex validator public key)")
+		}
+		if len(pubKey) != 64 {
+			return fmt.Errorf("--pub-key must be exactly 64 hex characters (got %d)", len(pubKey))
+		}
+		if _, err := hex.DecodeString(pubKey); err != nil {
+			return fmt.Errorf("--pub-key is not valid hex: %w", err)
+		}
+		if utxoTxHash == "" {
+			return fmt.Errorf("--utxo-txhash is required (64-hex UTXO transaction hash)")
+		}
+		if len(utxoTxHash) != 64 {
+			return fmt.Errorf("--utxo-txhash must be exactly 64 hex characters (got %d)", len(utxoTxHash))
+		}
+		if _, err := hex.DecodeString(utxoTxHash); err != nil {
+			return fmt.Errorf("--utxo-txhash is not valid hex: %w", err)
+		}
+		if amount <= 0 {
+			return fmt.Errorf("--amount must be a positive number of APRO (e.g. 100000)")
+		}
+		if blind == "" {
+			return fmt.Errorf("--blind is required (64-hex Pedersen blinding factor of the UTXO)")
+		}
+		if len(blind) != 64 {
+			return fmt.Errorf("--blind must be exactly 64 hex characters (got %d)", len(blind))
+		}
+		if _, err := hex.DecodeString(blind); err != nil {
+			return fmt.Errorf("--blind is not valid hex: %w", err)
+		}
+
+		amountNAPR := uint64(amount * 1e8)
+		payload := fmt.Sprintf(
+			`{"pub_key":%q,"amount_napr":%d,"utxo_txhash":%q,"utxo_out_idx":%d,"blind_hex":%q}`,
+			pubKey, amountNAPR, utxoTxHash, utxoIdx, blind,
+		)
+
+		url := strings.TrimRight(nodeURL, "/") + "/api/v1/admin/stake-deposit"
+		fmt.Printf("Submitting stake deposit to %s\n", url)
+		fmt.Printf("  pub_key      : %s…%s\n", pubKey[:8], pubKey[56:])
+		fmt.Printf("  amount       : %.8f APRO (%d nAPRO)\n", amount, amountNAPR)
+		fmt.Printf("  utxo_txhash  : %s…%s\n", utxoTxHash[:8], utxoTxHash[56:])
+		fmt.Printf("  utxo_out_idx : %d\n", utxoIdx)
+
+		httpResp, err := http.Post(url, "application/json", strings.NewReader(payload)) //nolint:noctx
+		if err != nil {
+			return fmt.Errorf("stake deposit request failed: %w", err)
+		}
+		defer httpResp.Body.Close()
+		body, _ := io.ReadAll(httpResp.Body)
+		if httpResp.StatusCode != 201 && httpResp.StatusCode != 200 {
+			return fmt.Errorf("stake deposit: server returned %d — %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var pretty bytes.Buffer
+		if e := json.Indent(&pretty, body, "", "  "); e != nil {
+			fmt.Println(string(body))
+		} else {
+			fmt.Println(pretty.String())
+		}
+		fmt.Println()
+		fmt.Println("✅  Stake deposit submitted. The node will enter the validator queue once")
+		fmt.Println("    the transaction is included in a block (next epoch boundary).")
+		return nil
+	},
+}
+
+func init() {
+	txSendCmd.Flags().String("to", "", "Recipient Aperod address")
+	txSendCmd.Flags().Float64("amount", 0, "Amount in APRO")
+	txSendCmd.Flags().String("rpc", "http://localhost:8545", "RPC endpoint")
+	txSendCmd.Flags().String("key-file", "", "Wallet keystore file")
+	txCmd.AddCommand(txSendCmd)
+
+	// validator partial-unstake (Task #356)
+	validatorPartialUnstakeCmd.Flags().String("node", "http://localhost:8080", "Node admin REST URL")
+	validatorPartialUnstakeCmd.Flags().String("pub-key", "", "Validator public key (64-hex)")
+	validatorPartialUnstakeCmd.Flags().Float64("amount", 0, "Amount to withdraw in APRO")
+	validatorCmd.AddCommand(validatorPartialUnstakeCmd)
+
+	// validator stake (Task #573)
+	validatorStakeCmd.Flags().String("node", "http://localhost:8080", "Node admin REST URL")
+	validatorStakeCmd.Flags().String("pub-key", "", "Validator public key (64-hex) — must match this node's key")
+	validatorStakeCmd.Flags().String("utxo-txhash", "", "64-hex hash of the UTXO transaction to burn as proof")
+	validatorStakeCmd.Flags().Uint32("utxo-idx", 0, "Output index within the UTXO transaction (default 0)")
+	validatorStakeCmd.Flags().Float64("amount", 0, "Amount to stake in APRO (e.g. 100000)")
+	validatorStakeCmd.Flags().String("blind", "", "64-hex Pedersen blinding factor of the UTXO")
+	validatorCmd.AddCommand(validatorStakeCmd)
+
+	rootCmd.AddCommand(validatorCmd)
 }
 
 // ─── chain ────────────────────────────────────────────────────────────────────

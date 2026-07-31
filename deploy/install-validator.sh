@@ -228,8 +228,11 @@ if [[ "${KEY_CHOICE}" != "keep" ]]; then
   fi
 fi
 
-chmod 640 "${CONFIG_DIR}/validator.key"
-chown root:"${APEROD_USER}" "${CONFIG_DIR}/validator.key"
+# The aperod-node service runs as User=aperod and the binary enforces strict
+# permissions (chmod 600).  Wrong owner (root) → EPERM; wrong mode (640) →
+# "unsafe permissions" error on startup.  Both are set correctly here.
+chmod 600 "${CONFIG_DIR}/validator.key"
+chown "${APEROD_USER}:${APEROD_USER}" "${CONFIG_DIR}/validator.key"
 
 echo
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗"
