@@ -42,6 +42,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
         s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
+        s.mux.HandleFunc("/api/v1/admin/full-unstake", s.restAdminFullUnstake)
         s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.restAdminStakeDeposit)
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
@@ -1044,6 +1045,99 @@ func (s *Server) restAdminPartialUnstake(w http.ResponseWriter, r *http.Request)
 		"status":           "pending",
 		"message":          "StakePartialWithdraw transaction submitted to mempool; applied when included in the next block",
 	})
+}
+
+// ─── POST /api/v1/admin/full-unstake ─────────────────────────────────────────
+
+// restAdminFullUnstake builds a signed StakeWithdraw transaction (full exit)
+// and submits it to the mempool.  The validator is immediately moved to the
+// ValidatorUnbonding status (inactive, no rewards) and the entire stake is
+// locked for UnbondingBlocks (144 000 blocks ≈ 10 days).
+func (s *Server) restAdminFullUnstake(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+                writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+                return
+        }
+        if s.myKey == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "validator key not configured on this node")
+                return
+        }
+        if s.registry == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialised")
+                return
+        }
+
+        // Accept an optional JSON body with pub_key for consistency with the
+        // partial-unstake endpoint, but it must equal the local node's key.
+        var req struct {
+                PubKey string `json:"pub_key"`
+        }
+        _ = json.NewDecoder(r.Body).Decode(&req) // body is optional
+
+        myPub := s.myKey.Public()
+        myPubHex := fmt.Sprintf("%x", []byte(myPub))
+
+        // If the caller supplied a pub_key, verify it matches this node.
+        if req.PubKey != "" && req.PubKey != myPubHex {
+                writeJSONError(w, http.StatusForbidden,
+                        "this endpoint can only unstake the local node's own validator; connect to the target validator's node to initiate its withdrawal")
+                return
+        }
+
+        entry, ok := s.registry.GetEntry(myPub)
+        if !ok {
+                writeJSONError(w, http.StatusNotFound, "validator not found in registry")
+                return
+        }
+        totalNAPR := entry.StakeNAPR
+
+        // StakeWithdraw uses amount=0 by convention (full exit).
+        msg := core.StakeSignMsg(core.StakeWithdraw, myPub, 0)
+        sig, err := s.myKey.Sign(msg)
+        if err != nil {
+                s.log.Error("admin full unstake: sign failed", "err", err)
+                writeJSONError(w, http.StatusInternalServerError, "sign: "+err.Error())
+                return
+        }
+        extra, err := core.EncodeStakeExtra(core.StakeWithdraw, myPub, 0, sig)
+        if err != nil {
+                writeJSONError(w, http.StatusInternalServerError, "encode extra: "+err.Error())
+                return
+        }
+        tx := core.Transaction{
+                Version: core.TxVersionStake,
+                Extra:   extra,
+        }
+        if err := s.mempool.Add(tx); err != nil {
+                writeJSONError(w, http.StatusInternalServerError, "mempool: "+err.Error())
+                return
+        }
+
+        txHash := tx.Hash()
+        txHashHex := fmt.Sprintf("%x", txHash[:])
+        s.log.Info("admin full unstake queued",
+                "pub_key", myPubHex[:8],
+                "total_napr", totalNAPR,
+                "tx_hash", txHashHex,
+        )
+
+        currentHeight := uint64(0)
+        if tip := s.chain.Tip(); tip != nil {
+                currentHeight = tip.Header.Height
+        }
+        endBlock := currentHeight + core.UnbondingBlocks
+        endEstimatedMs := time.Now().UnixMilli() + int64(core.UnbondingBlocks)*6000 // 6 s/block
+
+        writeJSON(w, http.StatusCreated, map[string]interface{}{
+                "tx_hash":          txHashHex,
+                "pub_key":          myPubHex,
+                "amount_napr":      totalNAPR,
+                "amount_apr":       float64(totalNAPR) / 1e8,
+                "end_block":        endBlock,
+                "end_estimated_ms": endEstimatedMs,
+                "status":           "pending",
+                "message":          "StakeWithdraw transaction submitted to mempool; validator enters unbonding immediately",
+        })
 }
 
 // restMyValidator exposes the node's own validator pubkey so the admin panel
