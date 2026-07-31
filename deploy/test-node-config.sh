@@ -636,6 +636,113 @@ else
   fail "config has $COUNT12 bootnodes — lost-update bug (lock not held during restore)"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 13: concurrent-write stress — 10 parallel add-bootnode + 5 parallel
+#          remove-bootnode calls against the same config file.
+#
+# Without the advisory flock the processes race: each reads the same snapshot,
+# writes an independent temp file, and the last mv wins — silently discarding
+# every other process's change.  With flock they serialise, so the final
+# bootnode list is exactly what the sequence of serialised operations produces:
+# every successfully committed add must survive, and every successfully
+# committed remove must have removed exactly the address it targeted.
+#
+# What we check:
+#   a) All 15 processes exit 0 (no deadlock, no spurious failure from the lock).
+#   b) The final node.yaml is parseable YAML (no torn write / truncation).
+#   c) The bootnode count exactly equals the number of unique addresses that
+#      were added minus the ones that were successfully removed.  We pre-seed
+#      10 distinct addresses, add them all in parallel, then in a second wave
+#      remove 5 of them in parallel.  The expected final count is exactly 5.
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 13: stress — 15 parallel add/remove calls produce a consistent config"
+CFG13="$TMPDIR_TEST/node-t13.yaml"
+make_config "$CFG13"
+
+# 10 distinct bootnode addresses (indices 1-10).
+STRESS_ADDRS=()
+for i in $(seq 1 10); do
+  STRESS_ADDRS+=("/ip4/10.0.0.${i}/tcp/30303")
+done
+
+# Wave 1 — add all 10 addresses in parallel.
+PIDS13_ADD=()
+for addr in "${STRESS_ADDRS[@]}"; do
+  APEROD_CONFIG="$CFG13" bash "$NODE_CONFIG_SH" add-bootnode "$addr" >/dev/null 2>&1 &
+  PIDS13_ADD+=($!)
+done
+
+ALL_ADD_OK=1
+for pid in "${PIDS13_ADD[@]}"; do
+  wait "$pid" || ALL_ADD_OK=0
+done
+
+if [[ $ALL_ADD_OK -eq 1 ]]; then
+  pass "all 10 parallel add-bootnode calls exited 0"
+else
+  fail "one or more parallel add-bootnode calls failed (expected all to exit 0)"
+fi
+
+# Intermediate check: all 10 addresses must be present before the remove wave.
+COUNT13_AFTER_ADD=$(bootnode_count "$CFG13")
+if [[ "$COUNT13_AFTER_ADD" -eq 10 ]]; then
+  pass "all 10 bootnodes present after parallel add wave (count=$COUNT13_AFTER_ADD)"
+else
+  fail "expected 10 bootnodes after parallel add wave, got '$COUNT13_AFTER_ADD'"
+fi
+
+# Wave 2 — remove the first 5 addresses in parallel.
+PIDS13_RM=()
+for i in $(seq 0 4); do
+  APEROD_CONFIG="$CFG13" bash "$NODE_CONFIG_SH" remove-bootnode "${STRESS_ADDRS[$i]}" >/dev/null 2>&1 &
+  PIDS13_RM+=($!)
+done
+
+ALL_RM_OK=1
+for pid in "${PIDS13_RM[@]}"; do
+  wait "$pid" || ALL_RM_OK=0
+done
+
+if [[ $ALL_RM_OK -eq 1 ]]; then
+  pass "all 5 parallel remove-bootnode calls exited 0"
+else
+  fail "one or more parallel remove-bootnode calls failed (expected all to exit 0)"
+fi
+
+# Final state checks.
+if is_valid_yaml "$CFG13"; then
+  pass "node.yaml is valid YAML after 15 concurrent add/remove operations"
+else
+  fail "node.yaml is invalid YAML after 15 concurrent add/remove operations"
+fi
+
+COUNT13_FINAL=$(bootnode_count "$CFG13")
+if [[ "$COUNT13_FINAL" -eq 5 ]]; then
+  pass "bootnode count is exactly 5 after stress run (10 added − 5 removed = 5)"
+else
+  fail "expected 5 bootnodes after stress run, got '$COUNT13_FINAL' — concurrent-write race detected"
+fi
+
+# All 5 remaining addresses (indices 5-9) must still be present.
+MISSING13=0
+for i in $(seq 5 9); do
+  if ! grep -qF "${STRESS_ADDRS[$i]}" "$CFG13"; then
+    fail "expected address ${STRESS_ADDRS[$i]} missing from final config"
+    MISSING13=1
+  fi
+done
+[[ $MISSING13 -eq 0 ]] && pass "all 5 surviving addresses are present in the final config"
+
+# All 5 removed addresses (indices 0-4) must be absent.
+LEFTOVER13=0
+for i in $(seq 0 4); do
+  if grep -qF "${STRESS_ADDRS[$i]}" "$CFG13"; then
+    fail "removed address ${STRESS_ADDRS[$i]} still present in final config"
+    LEFTOVER13=1
+  fi
+done
+[[ $LEFTOVER13 -eq 0 ]] && pass "all 5 removed addresses are absent from the final config"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
