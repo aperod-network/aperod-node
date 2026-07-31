@@ -257,7 +257,123 @@ open any ports or touch the database.
 
 ---
 
-## Updating the Node Binary
+## Keeping Validator Binaries in Sync with the Main Node
+
+> **Critical:** The main node and every validator must run the **same binary
+> version** at all times.  When the main node gains a new feature (e.g. TLS
+> P2P encryption), validators running an older binary fail the handshake
+> silently — `peer_count` stays 0 for hours with no obvious error in the logs.
+
+### Standard update procedure
+
+Every time you update the main node, push the new binary to all validators
+immediately afterwards:
+
+```bash
+# Step 1 — Update the main node (builds binary, runs health + peer checks).
+sudo bash /opt/aperod/blockchain/deploy/update-node.sh
+
+# Step 2 — Push the same binary to every validator in validators.conf.
+sudo bash /opt/aperod/blockchain/deploy/update-validator.sh
+```
+
+That's it.  The two scripts must always be run as a pair.
+
+### Validator inventory: validators.conf
+
+The list of validator SSH targets lives in `deploy/validators.conf` (one
+`user@host` per line, `#` = comment).  Edit this file to add or remove
+validators:
+
+```
+# deploy/validators.conf
+aperod@203.0.113.10
+aperod@203.0.113.20
+```
+
+> **Security note:** If this repository is public, keep real production IPs in
+> a local file and point the script at it with the `VALIDATORS_CONF` env var:
+> ```bash
+> VALIDATORS_CONF=/etc/aperod/validators.conf \
+>   sudo bash /opt/aperod/blockchain/deploy/update-validator.sh
+> ```
+
+### Updating a single validator
+
+Pass the SSH target as a command-line argument to skip the conf file:
+
+```bash
+sudo bash /opt/aperod/blockchain/deploy/update-validator.sh aperod@203.0.113.10
+```
+
+### What update-validator.sh does
+
+For each validator listed in `validators.conf` (or passed as arguments):
+
+1. **SCP** the binary from `/usr/local/bin/aperod-node` on the main server to
+   a temporary path on the validator.
+2. **Stop** the `aperod-node` service (`systemctl stop`).
+3. **Install** the binary to `/usr/local/bin/aperod-node`.
+4. **Start** the service.
+5. **Health check** — polls `http://127.0.0.1:8545/api/v1/status` until the
+   node responds; fires a Telegram alert on failure.
+
+On failure the script reports which validators failed and exits non-zero.
+
+### Requirements
+
+- SSH key-based access to every validator (no password prompts).  
+  Default key: `~/.ssh/id_ed25519` — override with `SSH_KEY=<path>`.
+- The `aperod` user on each validator has `sudo` rights for `systemctl`.
+- Port 22 reachable from the main server to every validator.
+- Every validator's SSH host key must be pre-recorded in the known-hosts
+  file **before** the first run (see below).
+
+### First-time host-key verification (run once per new validator)
+
+The script uses `StrictHostKeyChecking=yes` — it will **refuse** to connect
+to any host whose key is not already recorded.  This prevents MITM attacks
+where an attacker intercepts the binary push.
+
+Add a validator's key once, **after verifying the fingerprint out-of-band**
+(e.g. via your cloud provider's console or an independent channel):
+
+```bash
+# 1. Fetch and display the fingerprint — verify it matches your provider:
+ssh-keyscan -H <validator-ip> 2>/dev/null | ssh-keygen -lf - -E sha256
+
+# 2. Once verified, append the key to the deploy known-hosts file:
+sudo mkdir -p /etc/aperod
+ssh-keyscan -H <validator-ip> | sudo tee -a /etc/aperod/validator_known_hosts
+sudo chmod 600 /etc/aperod/validator_known_hosts
+```
+
+If a validator's host key changes (e.g. server was reprovisioned), the script
+aborts with a clear error.  Remove the stale entry and add the new key after
+re-verifying the fingerprint:
+
+```bash
+ssh-keygen -R <validator-ip> -f /etc/aperod/validator_known_hosts
+ssh-keyscan -H <validator-ip> | sudo tee -a /etc/aperod/validator_known_hosts
+```
+
+### Optional env vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VALIDATORS_CONF` | `deploy/validators.conf` | Path to the inventory file |
+| `SSH_KEY` | `~/.ssh/id_ed25519` | SSH private key |
+| `KNOWN_HOSTS_FILE` | `/etc/aperod/validator_known_hosts` | Pre-verified host keys |
+| `BINARY_SRC` | `/usr/local/bin/aperod-node` | Binary to push |
+| `SKIP_HEALTH_CHECK` | `0` | Set to `1` to bypass health polling |
+| `HEALTH_MAX_ATTEMPTS` | `15` | Poll attempts before declaring failure |
+| `HEALTH_WAIT_SECS` | `2` | Seconds between health polls |
+| `SUPPORT_BOT_TOKEN` | — | Telegram bot token for failure alerts |
+| `SUPPORT_ADMIN_CHAT_ID` | — | Telegram chat ID for failure alerts |
+
+---
+
+## Updating the Main Node Binary
 
 **Always use `update-node.sh` — never build and copy manually.**
 
@@ -282,6 +398,9 @@ The script performs these steps in order:
 4. `cp build/aperod-node /usr/local/bin/aperod-node`
 5. `systemctl start aperod-node`
 6. Polls `http://localhost:8545/api/v1/status` until the node responds (sends a Telegram alert on failure)
+7. Polls `http://localhost:8545/api/v1/network/stats` for up to 30 s — warns if `peer_count` is still 0 (non-fatal)
+
+**After running update-node.sh, always run update-validator.sh (see above).**
 
 **Optional env vars:**
 
@@ -296,4 +415,4 @@ Set `SKIP_HEALTH_CHECK=1` if the RPC port is not exposed on this machine.
 ---
 
 *Rules enforced by protocol — `consensus/poa.go`, `core/chain.go`.*  
-*Last updated: 2024 — [aperod-network](https://github.com/aperod-network)*
+*Last updated: July 2026 — [aperod-network](https://github.com/aperod-network)*
