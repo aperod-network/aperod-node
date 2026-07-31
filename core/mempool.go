@@ -290,11 +290,12 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
-	// C1 fix: run full cryptographic verification even for privileged transactions.
-	// Coinbase txs (admin mints) have no ring inputs so VerifyTx is lightweight,
-	// but calling it unconditionally closes the gap: if a non-coinbase tx were
-	// ever routed through AddPrivileged it would still be fully verified.
-	if m.cfg.Verifier != nil {
+	// C1 fix: run full cryptographic verification even for privileged transactions,
+	// EXCEPT for coinbase (zero-input) transactions.  VerifyTx explicitly rejects
+	// coinbase txs to prevent external inflation attacks; engine-synthesized mints
+	// are trusted by construction and must not be re-verified through that path.
+	// Any non-coinbase tx routed through AddPrivileged is still fully verified.
+	if m.cfg.Verifier != nil && !tx.IsCoinbase() {
 		if err := m.cfg.Verifier.VerifyTx(&tx); err != nil {
 			return fmt.Errorf("mempool: crypto verification failed (privileged): %w", err)
 		}
