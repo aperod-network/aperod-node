@@ -432,6 +432,7 @@ type AddressUTXO struct {
         TxHash          string `json:"tx_hash"`
         OutIdx          uint32 `json:"out_idx"`
         AmountCommitHex string `json:"amount_commit_hex"`
+        EncAmountHex    string `json:"enc_amount_hex"`
         BlockHeight     uint64 `json:"block_height"`
 }
 
@@ -469,6 +470,7 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                                 TxHash:          fmt.Sprintf("%x", u.TxHash[:]),
                                 OutIdx:          u.OutputIndex,
                                 AmountCommitHex: fmt.Sprintf("%x", u.AmountCommit[:]),
+                                EncAmountHex:    fmt.Sprintf("%x", u.EncAmount[:]),
                                 BlockHeight:     u.BlockHeight,
                         })
                 }
