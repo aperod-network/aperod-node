@@ -90,6 +90,75 @@ send_telegram_alert() {
 }
 
 # ---------------------------------------------------------------------------
+# Step 0: Ensure the service file forwards logs to journald.
+#
+# Older installs generated the service without StandardOutput/StandardError,
+# so `journalctl -u aperod-node` showed only lifecycle events and nothing
+# from the application itself.  This step patches any existing service file
+# where a directive is absent OR set to a non-journal value.
+#
+# Each directive is checked and patched independently:
+#   - If absent:              insert it after the anchor line.
+#   - If present but wrong:   replace the existing line in-place.
+#   - If already correct:     leave it untouched.
+#
+# The anchor for insertions is the first ExecStart= line inside [Service],
+# which is always present.  This guarantees a valid insertion point regardless
+# of what other directives the file has.
+# ---------------------------------------------------------------------------
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# Helper: ensure a Key=Value directive exists in the service file with exactly
+# the required value.  If the key is absent it is appended after the anchor
+# line; if it is present with the wrong value it is replaced in-place.
+# Usage: _ensure_directive KEY VALUE ANCHOR_PATTERN
+_ensure_directive() {
+  local key="$1" value="$2" anchor="$3"
+  local required="${key}=${value}"
+  if grep -q "^${key}=" "${SERVICE_FILE}"; then
+    if ! grep -qF "^${required}" "${SERVICE_FILE}"; then
+      # Present but wrong value — replace it.
+      sed -i "s|^${key}=.*|${required}|" "${SERVICE_FILE}"
+      echo "  [patch] Updated ${key} → ${value}"
+      return 0
+    fi
+    # Already correct.
+    return 1
+  else
+    # Absent — insert after the anchor line.
+    sed -i "/^${anchor}/a ${required}" "${SERVICE_FILE}"
+    echo "  [patch] Inserted ${required}"
+    return 0
+  fi
+}
+
+if [[ -f "${SERVICE_FILE}" ]]; then
+  patched=false
+
+  _ensure_directive "StandardOutput" "journal"  "ExecStart=" && patched=true
+  _ensure_directive "StandardError"  "journal"  "ExecStart=" && patched=true
+  _ensure_directive "SyslogIdentifier" "aperod-node" "ExecStart=" && patched=true
+
+  if [[ "${patched}" == "true" ]]; then
+    systemctl daemon-reload
+    echo "  [patch] daemon-reload complete — new log settings take effect after restart."
+  else
+    echo "  [ok] Service file already has correct journal directives — no patch needed."
+  fi
+else
+  echo "  [warn] ${SERVICE_FILE} not found — skipping journal directive check."
+fi
+
+# Ensure log directory exists with correct ownership (used if an operator
+# sets up a file sink via ExecStart wrapper or logrotate).
+if [[ ! -d /var/log/aperod ]]; then
+  mkdir -p /var/log/aperod
+  chown aperod:adm /var/log/aperod 2>/dev/null || chown aperod:aperod /var/log/aperod
+  chmod 750 /var/log/aperod
+  echo "  [ok] Created /var/log/aperod/ for optional persistent log sink."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1: Pull latest source
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Pulling latest source as aperod..."
