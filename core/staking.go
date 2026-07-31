@@ -54,9 +54,9 @@ const (
 	// Prevents C-3 uint64-overflow: Extra.amount cannot wrap StakeNAPR to MaxUint64.
 	MaxStakeNAPR uint64 = 10_000_000_000_000_000
 
-	// UnbondingBlocks is how long stake is locked after a withdrawal request.
-	// ~2 hours at 1-second blocks.
-	UnbondingBlocks uint64 = 7_200
+	// UnbondingBlocks is how long stake is locked after a full withdrawal request.
+	// 10 days × 86,400 s/day ÷ 6 s/block = 144,000 blocks.
+	UnbondingBlocks uint64 = 144_000
 
 	// SlashPercent is the percentage of stake slashed for double-signing.
 	SlashPercent = 10
@@ -70,12 +70,12 @@ type StakeAction uint8
 const (
 	StakeDeposit         StakeAction = 1 // Lock APRO to enter validator queue
 	StakeWithdraw        StakeAction = 2 // Initiate full unbonding period
-	StakePartialWithdraw StakeAction = 3 // Partially withdraw excess stake (7-day unbonding)
+	StakePartialWithdraw StakeAction = 3 // Partially withdraw excess stake (3-day unbonding)
 )
 
 // PartialUnbondingBlocks is the unbonding period for partial stake withdrawals.
-// 7 days × 86,400 seconds/day = 604,800 blocks at 1 block/second.
-const PartialUnbondingBlocks uint64 = 604_800
+// 3 days × 86,400 s/day ÷ 6 s/block = 43,200 blocks.
+const PartialUnbondingBlocks uint64 = 43_200
 
 // StakePayloadSize is the fixed byte length of tx.Extra for v1 stake txs.
 // Layout: action(1) + pubkey(32) + amount_nAPR(8) + ed25519_sig(64) = 105
