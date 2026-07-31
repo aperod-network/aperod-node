@@ -192,6 +192,11 @@ func run() error {
         // Populated during the key-image rebuild scan below; stays 0 for genesis.
         var initialTxTotal int64
 
+        // Declared here so both the genesis and resume branches can assign it.
+        // The genesis path leaves it nil; NewEngine creates a fresh registry.
+        // The resume path initialises it inside the startup scan below.
+        var registry *core.ValidatorRegistry
+
         if tipHash == (crypto.Hash32{}) {
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
@@ -263,22 +268,37 @@ func run() error {
                         "blocks_loaded_in_memory", len(recentBlocks),
                 )
 
-                // Rebuild the spent key-image set from FULL chain history so that
-                // TxVerifier.VerifyBlock can detect double-spends against any UTXO
-                // ever created, not only those within the recent in-memory window.
+                // ── Unified startup scan ─────────────────────────────────────────────
                 //
-                // We scan every stored block and mark each input's key image spent
-                // via MarkSpent (no IsSpent check — trusted store data).
+                // Goals (all complete before any peer or API traffic arrives):
+                //  1. Rebuild the spent key-image set (double-spend prevention).
+                //  2. Rebuild the active UTXO set (ring-member lookup for C-0 check).
+                //  3. Restore the ValidatorRegistry from historical stake transactions.
+                //  4. Restore UTXOSet.stakedUTXOs so burned stake collateral cannot be
+                //     reused as a ring decoy or re-staked after a restart.
                 //
-                // This is FAIL-CLOSED: any missing or corrupt block in the store
-                // is a fatal error.  Continuing with a partial set would give false
-                // confidence — the node would accept blocks that re-spend key images
-                // from the uncovered height range, which is the exact vulnerability
-                // this fix is meant to close.  Aborting is the only safe behaviour.
-                // Fast path: read key images from the per-block LevelDB index
-                // written by OnBlockProduced, so we never decode raw blocks on
-                // restart.  Falls back to a full block scan if the index is
-                // missing or empty (e.g. after upgrading from an older version).
+                // Key-image fast path: load from the persistent LevelDB index when
+                // available, falling back to a block scan only when the index is missing.
+                // UTXO rebuild and stake replay always require a block scan, so there is
+                // one scan regardless of which key-image path is taken.
+                //
+                // Ordering: the registry must be seeded with genesis validators BEFORE
+                // the scan so that historical withdrawals by genesis validators replay
+                // correctly (applyWithdraw would fail "not registered" otherwise).
+                //
+                // FAIL-CLOSED: any missing or corrupt block causes the node to refuse to
+                // start for both key-image and stake replay.
+
+                // Registry setup must happen before the block scan so that the scan can
+                // replay stake txs (including withdrawals by genesis validators).
+                registry = core.NewValidatorRegistry()
+                registry.SetUTXOSet(utxos)
+                // InitFromGenesis is idempotent (!exists guard), so NewEngine's later
+                // call is a safe no-op for genesis validators already in the registry.
+                genesisStakeForReplay := core.MinStakeNAPR * 10 // must match consensus.NewEngine
+                registry.InitFromGenesis(validators, genesisStakeForReplay)
+
+                // Try the fast path for spent key images first.
                 log.Info("loading spent key-image set from database index",
                         "tip_height", tipHeight)
                 kiCount := 0
@@ -287,57 +307,8 @@ func run() error {
                         kiCount++
                         return nil
                 })
-                if kiIterErr != nil || (kiCount == 0 && tipHeight > 0) {
-                        // Index absent or corrupt — fall back to full block scan (fail-closed).
-                        if kiIterErr != nil {
-                                log.Warn("key-image index error; falling back to full block scan",
-                                        "err", kiIterErr, "tip_height", tipHeight)
-                        } else {
-                                log.Warn("key-image index is empty on a non-genesis chain; "+
-                                        "falling back to full block scan",
-                                        "tip_height", tipHeight)
-                        }
-                        kiCount = 0
-                        var txCount int64 = 0
-                        for h := uint64(1); h <= tipHeight; h++ {
-                                raw, fetchErr := db.GetRawBlockByHeight(h)
-                                if fetchErr != nil || raw == nil {
-                                        return fmt.Errorf(
-                                                "key-image rebuild failed: block at height %d missing from store (%v) — "+
-                                                        "node cannot start safely; repair the store and restart",
-                                                h, fetchErr)
-                                }
-                                var b core.Block
-                                if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
-                                        return fmt.Errorf(
-                                                "key-image rebuild failed: cannot decode block at height %d: %w — "+
-                                                        "node cannot start safely; repair the store and restart",
-                                                h, parseErr)
-                                }
-                                for txIdx, tx := range b.Txs {
-                                        for _, inp := range tx.Inputs {
-                                                utxos.MarkSpent(inp.KeyImage)
-                                                kiCount++
-                                                // Also backfill the index so next restart is fast.
-                                                _ = db.MarkKeyImageSpent(inp.KeyImage)
-                                        }
-                                        // Count non-coinbase transactions for the /network/stats total.
-                                        if !(txIdx == 0 && tx.IsCoinbase()) {
-                                                txCount++
-                                        }
-                                }
-                        }
-                        // Persist tx total so the fast restart path can restore it.
-                        if err := db.StoreTxTotal(txCount); err != nil {
-                                log.Warn("failed to persist tx total after block scan", "err", err)
-                        }
-                        initialTxTotal = txCount
-                        log.Info("spent key-image set rebuilt (full block scan fallback)",
-                                "key_images_marked", kiCount,
-                                "blocks_scanned", tipHeight,
-                                "total_txs_counted", txCount)
-                } else {
-                        // Index loaded successfully — restore the tx total from DB metadata.
+                kiFromIndex := kiIterErr == nil && (kiCount > 0 || tipHeight == 0)
+                if kiFromIndex {
                         storedTotal, loadErr := db.LoadTxTotal()
                         if loadErr != nil {
                                 log.Warn("could not read stored tx total — counter starts from 0",
@@ -347,18 +318,119 @@ func run() error {
                         log.Info("spent key-image set loaded from index",
                                 "key_images", kiCount,
                                 "tx_total_restored", initialTxTotal)
+                } else {
+                        if kiIterErr != nil {
+                                log.Warn("key-image index error; rebuilding from block scan",
+                                        "err", kiIterErr, "tip_height", tipHeight)
+                        } else {
+                                log.Warn("key-image index empty on non-genesis chain; rebuilding from block scan",
+                                        "tip_height", tipHeight)
+                        }
+                        kiCount = 0
+                }
+
+                // Single block scan for all three goals: active UTXO rebuild,
+                // key-image fallback, and stake replay.  One scan avoids decoding
+                // the full chain multiple times on restart.
+                log.Info("running startup block scan",
+                        "tip_height", tipHeight,
+                        "ki_from_index", kiFromIndex)
+                var txCount int64 = 0
+                blocksWithStake := 0
+                for h := uint64(1); h <= tipHeight; h++ {
+                        raw, fetchErr := db.GetRawBlockByHeight(h)
+                        if fetchErr != nil || raw == nil {
+                                return fmt.Errorf(
+                                        "startup scan: block at height %d missing from store (%v) — "+
+                                                "node cannot start safely; repair the store and restart",
+                                        h, fetchErr)
+                        }
+                        var b core.Block
+                        if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
+                                return fmt.Errorf(
+                                        "startup scan: cannot decode block at height %d: %w — "+
+                                                "node cannot start safely; repair the store and restart",
+                                        h, parseErr)
+                        }
+
+                        // Goal 2: Rebuild active UTXO set.
+                        //
+                        // ApplyBlock adds outputs and removes spent inputs by TxHash+OutIdx.
+                        // Stake txs have no regular inputs, so their burn UTXOs remain in
+                        // the active set here and are moved to stakedUTXOs by the
+                        // ReplayBlockStakeTxs call below.  MarkStakedKnown prefers the
+                        // active-set entry (correct OneTimePub) over the reconstructed
+                        // descriptor from the v2 payload.
+                        if applyErr := utxos.ApplyBlock(&b); applyErr != nil {
+                                log.Warn("startup scan: ApplyBlock failed (continuing)",
+                                        "height", h, "err", applyErr)
+                        }
+
+                        // Goal 1 (fallback): mark spent key images and backfill the index.
+                        if !kiFromIndex {
+                                for txIdx, tx := range b.Txs {
+                                        for _, inp := range tx.Inputs {
+                                                utxos.MarkSpent(inp.KeyImage)
+                                                kiCount++
+                                                _ = db.MarkKeyImageSpent(inp.KeyImage)
+                                        }
+                                        if !(txIdx == 0 && tx.IsCoinbase()) {
+                                                txCount++
+                                        }
+                                }
+                        }
+
+                        // Goal 3+4: Replay stake txs — restore registry entries and move
+                        // burn UTXOs from the just-rebuilt active set into stakedUTXOs.
+                        hasStake := false
+                        for _, tx := range b.Txs {
+                                if tx.IsStake() {
+                                        hasStake = true
+                                        break
+                                }
+                        }
+                        if hasStake {
+                                if replayErr := registry.ReplayBlockStakeTxs(b.Txs, b.Header.Height); replayErr != nil {
+                                        return fmt.Errorf(
+                                                "stake replay failed at height %d: %w — "+
+                                                        "node cannot start safely; repair the store and restart",
+                                                h, replayErr)
+                                }
+                                blocksWithStake++
+                        }
+                }
+
+                if !kiFromIndex {
+                        if err := db.StoreTxTotal(txCount); err != nil {
+                                log.Warn("failed to persist tx total after block scan", "err", err)
+                        }
+                        initialTxTotal = txCount
+                        log.Info("spent key-image set rebuilt (full block scan)",
+                                "key_images_marked", kiCount,
+                                "blocks_scanned", tipHeight,
+                                "total_txs_counted", txCount)
+                }
+                {
+                        active, total := registry.Count()
+                        log.Info("startup scan complete",
+                                "tip_height", tipHeight,
+                                "blocks_with_stake_txs", blocksWithStake,
+                                "active_validators", active,
+                                "total_registered", total,
+                                "unspent_outputs", utxos.Count(),
+                        )
                 }
         }
 
-        // initialTxTotal is populated by the key-image rebuild loop above (full
-        // scan, so the count is exact). In the genesis path it stays 0.
+        // initialTxTotal is populated by the scan above (genesis path stays 0).
 
-        // Safety invariant: the UTXO set (byPubKey index + spent key-image set)
-        // is now fully populated from the chain store.  The consensus engine,
-        // P2P host, and API server are all wired AFTER this point, so no
-        // external transaction can reach the mempool before ring-member
-        // verification is active.  This prevents the "startup window" attack
-        // where a ring tx referencing unknown decoys is accepted during replay.
+        // Safety invariant: the UTXO set (active outputs + byPubKey index +
+        // spent key-image set + stakedUTXOs) is fully populated from the chain
+        // store.  The consensus engine, P2P host, and API server are all wired
+        // AFTER this point so no external transaction can reach the mempool
+        // before ring-member verification is active.  This prevents the
+        // "startup window" attack where a ring tx referencing unknown decoys is
+        // accepted during the startup phase.
         log.Info("UTXO set ready — ring-member verification active",
                 "unspent_outputs", utxos.Count(),
         )
@@ -369,10 +441,8 @@ func run() error {
         var host *p2p.Host
         var apiSrv *api.Server
 
-        registry := core.NewValidatorRegistry()
-        // C-1 fix: wire UTXO set so ProcessStakeTx can verify and burn
-        // the depositor's UTXO (proves real on-chain funds back the stake).
-        registry.SetUTXOSet(utxos)
+        // For the resume path, registry is already created and seeded inside the
+        // startup scan above.  For genesis, it is nil here; NewEngine creates it.
 
         engine := consensus.NewEngine(consensus.Config{
                 BlockTime:          cfg.Consensus.BlockTime,

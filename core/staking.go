@@ -449,6 +449,513 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 	}
 }
 
+// deepCopyValidators returns a deep copy of the validators map (including
+// each ValidatorEntry's UnbondingQueue slice) for transactional rollback.
+// Caller must hold r.mu.
+func deepCopyValidators(src map[string]*ValidatorEntry) map[string]*ValidatorEntry {
+	dst := make(map[string]*ValidatorEntry, len(src))
+	for k, v := range src {
+		clone := *v // copy value fields
+		if len(v.UnbondingQueue) > 0 {
+			clone.UnbondingQueue = make([]UnbondingEntry, len(v.UnbondingQueue))
+			copy(clone.UnbondingQueue, v.UnbondingQueue)
+		}
+		dst[k] = &clone
+	}
+	return dst
+}
+
+// applyOneTxLocked applies a single stake transaction to the registry and UTXO
+// set.  It assumes r.mu is already held by the caller (Write lock).
+// Returns the UTXOKey that was staked (v2 deposits only) or nil, plus any error.
+// On error, the caller must rollback all previously applied changes.
+func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UTXOKey, error) {
+	if tx.Version != TxVersionStake {
+		return nil, fmt.Errorf("not a stake tx (version=%d)", tx.Version)
+	}
+	switch len(tx.Extra) {
+
+	case StakePayloadSize:
+		action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
+		if err != nil {
+			return nil, err
+		}
+		if action == StakeDeposit {
+			return nil, fmt.Errorf("StakeDeposit requires v2 payload (C-1 fix)")
+		}
+		msg := StakeSignMsg(action, pub, amount)
+		if !pub.Verify(msg, sig) {
+			return nil, fmt.Errorf("invalid stake signature from %s", pub.ID())
+		}
+		key := pub.Hex()
+		switch action {
+		case StakeWithdraw:
+			return nil, r.applyWithdraw(key, height) // modifies r.validators (r.mu held)
+		case StakePartialWithdraw:
+			return nil, r.applyPartialWithdraw(key, amount, height) // ditto
+		default:
+			return nil, fmt.Errorf("unknown stake action %d", action)
+		}
+
+	case StakePayloadSizeV2:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
+		if err != nil {
+			return nil, err
+		}
+		if action != StakeDeposit {
+			return nil, fmt.Errorf("v2 payload only valid for StakeDeposit, got action=%d", action)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return nil, fmt.Errorf("invalid v2 stake signature from %s", pub.ID())
+		}
+		if r.utxos == nil {
+			return nil, fmt.Errorf("UTXO set not wired (C-1 check)")
+		}
+		// UTXO access: r.utxos.Get acquires utxos.mu (RLock) independently.
+		// Safe to call while r.mu (Write) is held — no inverse lock ordering exists.
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return nil, fmt.Errorf("burn UTXO %x:%d not found in active set", burnTxHash[:8], burnOutIdx)
+		}
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return nil, fmt.Errorf("commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return nil, fmt.Errorf("burn UTXO %x:%d AmountCommit mismatch (C-1)", burnTxHash[:8], burnOutIdx)
+		}
+		// Stake the UTXO (utxos.mu briefly acquired internally — safe).
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return nil, fmt.Errorf("MarkStaked: %w", err)
+		}
+		// Apply registry deposit (r.mu already held — use internal helper directly).
+		key := pub.Hex()
+		if applyErr := r.applyDeposit(key, pub, amount, height); applyErr != nil {
+			// MarkStaked succeeded but registry update failed — unmark the UTXO.
+			r.utxos.UnmarkStaked(burnTxHash, burnOutIdx)
+			return nil, applyErr
+		}
+		k := UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}
+		return &k, nil
+
+	default:
+		return nil, fmt.Errorf("invalid stake extra length %d", len(tx.Extra))
+	}
+}
+
+// ApplyBlockStakeTxs atomically applies all stake transactions from a block to
+// the registry and UTXO staking state.  It holds r.mu for the entire operation
+// so that a concurrent oracle UpdateMinStake cannot alter the effective minimum
+// between transactions.
+//
+// If any stake tx fails to apply, all previously applied changes within the block
+// are rolled back (registry snapshot restored, staked UTXOs unmarked) before the
+// error is returned.  The block must NOT be inserted into the chain on error.
+//
+// On success, a rollback function is returned for use if the subsequent
+// chain.AddBlock call fails.  The caller MUST invoke rollback() if and only if
+// chain insertion fails; invoking it after a successful AddBlock corrupts state.
+func (r *ValidatorRegistry) ApplyBlockStakeTxs(txs []Transaction, height uint64) (rollback func(), err error) {
+	if r == nil {
+		return func() {}, nil
+	}
+	hasStake := false
+	for _, tx := range txs {
+		if tx.IsStake() {
+			hasStake = true
+			break
+		}
+	}
+	if !hasStake {
+		return func() {}, nil
+	}
+
+	// Acquire registry write lock for entire apply: prevents oracle from changing
+	// dynamicMinNAPR between transactions (atomicity with ValidateBlockStakeTxs).
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Snapshot registry state for rollback.
+	snap := deepCopyValidators(r.validators)
+	var stakedKeys []UTXOKey
+
+	for _, tx := range txs {
+		if !tx.IsStake() {
+			continue
+		}
+		k, txErr := r.applyOneTxLocked(tx, height)
+		if txErr != nil {
+			// Rollback: restore registry snapshot.
+			r.validators = snap
+			// Rollback: unmark any UTXOs staked by earlier txs in this block.
+			for _, sk := range stakedKeys {
+				r.utxos.UnmarkStaked(sk.TxHash, sk.OutputIndex)
+			}
+			return func() {}, txErr
+		}
+		if k != nil {
+			stakedKeys = append(stakedKeys, *k)
+		}
+	}
+
+	// Return a rollback closure for use if chain.AddBlock fails.
+	// Captured snap and stakedKeys are final at this point.
+	snapFinal := snap
+	stakedFinal := stakedKeys
+	rollback = func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.validators = snapFinal
+		for _, sk := range stakedFinal {
+			r.utxos.UnmarkStaked(sk.TxHash, sk.OutputIndex)
+		}
+	}
+	return rollback, nil
+}
+
+// ValidateBlockStakeTxs performs an ordered, stateful dry-run of every stake
+// transaction in the block BEFORE the block is added to the chain.  It:
+//
+//   - verifies each payload size, decode, and Ed25519 self-signature
+//   - enforces the v1-deposit ban (C-1 fix)
+//   - for v2 deposits: checks UTXO existence, commitment correctness, and
+//     min/max amount against the live registry state + oracle-adjusted minimum
+//   - detects duplicate burn UTXOs within the same block (two txs burning the
+//     same UTXO would both pass independent checks but only the first is applied)
+//   - simulates stateful registry changes in order so that later stake txs in the
+//     block see the effect of earlier ones (top-ups, status changes, etc.)
+//
+// Returns a non-nil error naming the offending tx index if any check fails.
+// The function returns an error before any state is mutated; the caller must
+// reject the block outright.
+func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint64) error {
+	if r == nil {
+		return nil
+	}
+
+	// Snapshot the effective minimum stake and current validator states under
+	// the read lock, then release it before accessing the UTXO set.
+	r.mu.RLock()
+	effectiveMin := r.dynamicMinNAPR
+	if effectiveMin == 0 {
+		effectiveMin = MinStakeNAPR
+	}
+	type shadowEntry struct {
+		stakeNAPR uint64
+		status    ValidatorStatus
+	}
+	snapshot := make(map[string]shadowEntry, len(r.validators))
+	for k, v := range r.validators {
+		snapshot[k] = shadowEntry{stakeNAPR: v.StakeNAPR, status: v.Status}
+	}
+	r.mu.RUnlock()
+
+	// Per-block reservation: burn UTXOs claimed by earlier txs in this block.
+	type utxoKey struct {
+		TxHash crypto.Hash32
+		OutIdx uint32
+	}
+	reserved := make(map[utxoKey]int) // key → first tx index that reserved it
+
+	for i, tx := range txs {
+		if !tx.IsStake() {
+			continue
+		}
+		if tx.Version != TxVersionStake {
+			return fmt.Errorf("stake tx[%d]: wrong version %d", i, tx.Version)
+		}
+
+		switch len(tx.Extra) {
+
+		// ── v1: withdraw / partial-withdraw ──────────────────────────────
+		case StakePayloadSize:
+			action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: decode: %w", i, err)
+			}
+			if action == StakeDeposit {
+				return fmt.Errorf("stake tx[%d]: StakeDeposit requires v2 payload with UTXO proof (C-1 fix)", i)
+			}
+			msg := StakeSignMsg(action, pub, amount)
+			if !pub.Verify(msg, sig) {
+				return fmt.Errorf("stake tx[%d]: invalid signature from %s", i, pub.ID())
+			}
+			key := pub.Hex()
+			se, known := snapshot[key]
+			switch action {
+			case StakeWithdraw:
+				if !known {
+					return fmt.Errorf("stake tx[%d]: validator %s not registered", i, pub.ID()[:8])
+				}
+				if se.status == ValidatorUnbonding || se.status == ValidatorExited {
+					return fmt.Errorf("stake tx[%d]: validator already unbonding/exited", i)
+				}
+				se.status = ValidatorUnbonding
+				snapshot[key] = se
+			case StakePartialWithdraw:
+				if !known {
+					return fmt.Errorf("stake tx[%d]: validator %s not registered", i, pub.ID()[:8])
+				}
+				if se.status == ValidatorUnbonding || se.status == ValidatorExited {
+					return fmt.Errorf("stake tx[%d]: validator is unbonding/exited; cannot partial withdraw", i)
+				}
+				if amount == 0 {
+					return fmt.Errorf("stake tx[%d]: partial withdraw amount must be > 0", i)
+				}
+				if amount >= se.stakeNAPR {
+					return fmt.Errorf("stake tx[%d]: withdrawal amount %d >= current stake %d", i, amount, se.stakeNAPR)
+				}
+				remaining := se.stakeNAPR - amount
+				if remaining < effectiveMin {
+					return fmt.Errorf("stake tx[%d]: remaining stake %.4f APRO < minimum %.4f APRO",
+						i, float64(remaining)/float64(BaseUnitsPerAPR), float64(effectiveMin)/float64(BaseUnitsPerAPR))
+				}
+				se.stakeNAPR = remaining
+				snapshot[key] = se
+			default:
+				return fmt.Errorf("stake tx[%d]: unknown action %d", i, action)
+			}
+
+		// ── v2: UTXO-backed deposit ────────────────────────────────────
+		case StakePayloadSizeV2:
+			action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: decode v2: %w", i, err)
+			}
+			if action != StakeDeposit {
+				return fmt.Errorf("stake tx[%d]: v2 payload only valid for StakeDeposit, got action=%d", i, action)
+			}
+			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+			if !pub.Verify(msg, sig) {
+				return fmt.Errorf("stake tx[%d]: invalid v2 signature from %s", i, pub.ID())
+			}
+			// Within-block duplicate burn UTXO.
+			uk := utxoKey{TxHash: burnTxHash, OutIdx: burnOutIdx}
+			if firstIdx, dup := reserved[uk]; dup {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d already claimed by tx[%d] in this block",
+					i, burnTxHash[:8], burnOutIdx, firstIdx)
+			}
+			// Cross-block UTXO existence and commitment check (C-1).
+			if r.utxos == nil {
+				return fmt.Errorf("stake tx[%d]: UTXO set not wired (C-1 check)", i)
+			}
+			burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+			if burnUTXO == nil {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d not found in active set (C-1 check)",
+					i, burnTxHash[:8], burnOutIdx)
+			}
+			expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+			if commitErr != nil {
+				return fmt.Errorf("stake tx[%d]: commitment computation failed: %w", i, commitErr)
+			}
+			if expectedCommit != burnUTXO.AmountCommit {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d AmountCommit mismatch (C-1 check)",
+					i, burnTxHash[:8], burnOutIdx)
+			}
+			// Stateful deposit checks — must exactly mirror applyDeposit ordering.
+			// Minimum check applies to ALL deposits (new and top-up) before any
+			// other stateful check, matching applyDeposit's unconditional gate.
+			if amount < effectiveMin {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO < minimum %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(effectiveMin)/float64(BaseUnitsPerAPR))
+			}
+			if amount > MaxStakeNAPR {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO exceeds cap %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(MaxStakeNAPR)/float64(BaseUnitsPerAPR))
+			}
+			key := pub.Hex()
+			se, existing := snapshot[key]
+			if existing {
+				switch se.status {
+				case ValidatorUnbonding, ValidatorExited:
+					return fmt.Errorf("stake tx[%d]: validator is unbonding/exited; cannot stake", i)
+				default:
+					if se.stakeNAPR > math.MaxUint64-amount {
+						return fmt.Errorf("stake tx[%d]: stake top-up overflow", i)
+					}
+					se.stakeNAPR += amount
+				}
+			} else {
+				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending}
+			}
+			reserved[uk] = i
+			snapshot[key] = se
+
+		default:
+			return fmt.Errorf("stake tx[%d]: invalid extra length %d (expected %d or %d)",
+				i, len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
+		}
+	}
+	return nil
+}
+
+// ValidateStakeTx performs all pre-acceptance checks for a single stake
+// transaction without applying any state changes.  Prefer ValidateBlockStakeTxs
+// when validating multiple txs in one block (it also handles duplicate UTXOs
+// and simulates stateful registry transitions in order).
+//
+// Checks performed:
+//   - payload size and decode correctness
+//   - Ed25519 self-signature (binds deposit to a specific UTXO)
+//   - v1 StakeDeposit rejected (C-1 fix: v2 required)
+//   - UTXO existence in the active set (C-1)
+//   - Pedersen commitment match: Commit(amount, blind) == UTXO.AmountCommit (C-1)
+func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
+	if tx.Version != TxVersionStake {
+		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
+	}
+	switch len(tx.Extra) {
+
+	case StakePayloadSize:
+		action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action == StakeDeposit {
+			return fmt.Errorf("registry: StakeDeposit requires v2 payload (173 bytes) with UTXO burn proof — v1 deposits no longer accepted (C-1 fix)")
+		}
+		msg := StakeSignMsg(action, pub, amount)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
+		}
+		return nil
+
+	case StakePayloadSizeV2:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("registry: v2 payload (173 bytes) is only valid for StakeDeposit, got action=%d", action)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
+		}
+		if r.utxos == nil {
+			return fmt.Errorf("registry: UTXO set not wired — cannot verify deposit (C-1 check)")
+		}
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return fmt.Errorf("registry: burn commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return fmt.Errorf("registry: burn UTXO %x:%d AmountCommit mismatch — "+
+				"claimed amount/blind does not open to the on-chain commitment (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw or %d for deposit)",
+			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
+	}
+}
+
+// ReplayBlockStakeTxs re-applies stake transactions from a previously committed
+// block during node startup.  It restores both the ValidatorRegistry entries and
+// the UTXOSet.stakedUTXOs map so that burned collateral cannot be reused as a
+// ring decoy or re-staked after a restart.
+//
+// Key differences from ApplyBlockStakeTxs (the live apply path):
+//   - Signature is still verified (store-integrity check).
+//   - UTXO existence in the active set is NOT checked — the UTXO was already
+//     removed from the active set in the previous run and is no longer present.
+//   - Pedersen commitment is NOT re-verified against the active UTXO set for the
+//     same reason; it was verified when the block was first accepted.
+//   - MarkStakedKnown is called instead of MarkStaked — idempotent, does not
+//     require the UTXO to be in the active set.
+//   - No rollback function is returned — committed blocks are never rolled back.
+//
+// Must be called in block-height order during startup before any peer connections
+// or API traffic are accepted, so the registry and staked-UTXO set are complete
+// before the first incoming stake tx or ring tx arrives.
+func (r *ValidatorRegistry) ReplayBlockStakeTxs(txs []Transaction, height uint64) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, tx := range txs {
+		if !tx.IsStake() {
+			continue
+		}
+		if err := r.replayOneTxLocked(tx, height); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replayOneTxLocked applies one stake tx during startup replay.
+// Assumes r.mu is held by the caller (Write lock).
+func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) error {
+	if tx.Version != TxVersionStake {
+		return nil // not a stake tx — nothing to do
+	}
+	switch len(tx.Extra) {
+
+	case StakePayloadSize:
+		action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		msg := StakeSignMsg(action, pub, amount)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("replay: invalid stake sig from %s at height %d", pub.ID(), height)
+		}
+		key := pub.Hex()
+		switch action {
+		case StakeWithdraw:
+			return r.applyWithdraw(key, height)
+		case StakePartialWithdraw:
+			return r.applyPartialWithdraw(key, amount, height)
+		case StakeDeposit:
+			// v1 deposits should not exist in a chain that enforces C-1, but handle
+			// them gracefully for chains that predate the C-1 fix.
+			return r.applyDeposit(key, pub, amount, height)
+		default:
+			return fmt.Errorf("replay: unknown stake action %d at height %d", action, height)
+		}
+
+	case StakePayloadSizeV2:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("replay: v2 payload with non-deposit action=%d at height %d", action, height)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("replay: invalid v2 stake sig from %s at height %d", pub.ID(), height)
+		}
+		// Reconstruct the burn-UTXO descriptor from payload data so MarkStakedKnown
+		// can restore it to the staked set.  The OneTimePub is set to zero — staked
+		// UTXOs are never used as ring decoys, so byPubKey lookup is irrelevant.
+		expectedCommit, _ := crypto.Commit(amount, burnBlind)
+		burnUTXO := &UTXO{
+			TxHash:       burnTxHash,
+			OutputIndex:  burnOutIdx,
+			AmountCommit: expectedCommit,
+		}
+		if r.utxos != nil {
+			r.utxos.MarkStakedKnown(burnTxHash, burnOutIdx, burnUTXO)
+		}
+		key := pub.Hex()
+		return r.applyDeposit(key, pub, amount, height)
+
+	default:
+		return fmt.Errorf("replay: invalid stake extra length %d at height %d", len(tx.Extra), height)
+	}
+}
+
 func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey, amount, height uint64) error {
 	// Use dynamic minimum stake (DST) if oracle price has been set, otherwise
 	// fall back to the static MinStakeNAPR constant.

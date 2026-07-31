@@ -100,7 +100,11 @@ func (m *Mempool) Add(tx Transaction) error {
 	// external caller (P2P peer, admin RPC, etc.) would let an attacker inject
 	// supply-creating UTXOs without spending anything.  Reject unconditionally
 	// at this layer; the engine never routes its own coinbase through the pool.
-	if tx.IsCoinbase() {
+	//
+	// Stake transactions (TxVersionStake) also have zero inputs — their payload
+	// is carried in Extra.  Exempt them from the coinbase rejection so they can
+	// be submitted via the public POST /api/v1/stake broadcast endpoint.
+	if tx.IsCoinbase() && !tx.IsStake() {
 		return fmt.Errorf("mempool: coinbase (zero-input) transactions are not accepted from external sources")
 	}
 
@@ -149,9 +153,12 @@ func (m *Mempool) Add(tx Transaction) error {
 	// mempool at a time.  Scripted depositors that fire multiple identical
 	// transactions before the first is confirmed are rejected here with a
 	// clear message rather than consuming block space and alert bandwidth.
+	//
+	// stakeExtraPubKey handles both v1 (105-byte withdraw) and v2 (173-byte
+	// deposit) payloads — the pubkey occupies bytes [1:33] in both layouts.
 	var stakeSenderKey string
 	if tx.IsStake() {
-		_, stakePub, _, _, err := DecodeStakeExtra(tx.Extra)
+		stakePub, err := stakeExtraPubKey(tx.Extra)
 		if err != nil {
 			return fmt.Errorf("mempool: malformed stake extra: %w", err)
 		}
@@ -233,7 +240,7 @@ func (m *Mempool) removeStakeSenderLocked(entry *mempoolEntry) {
 	if !entry.Tx.IsStake() {
 		return
 	}
-	_, stakePub, _, _, err := DecodeStakeExtra(entry.Tx.Extra)
+	stakePub, err := stakeExtraPubKey(entry.Tx.Extra)
 	if err != nil {
 		return
 	}
@@ -242,6 +249,17 @@ func (m *Mempool) removeStakeSenderLocked(entry *mempoolEntry) {
 	if m.stakeSenders[key] == entry.Hash {
 		delete(m.stakeSenders, key)
 	}
+}
+
+// stakeExtraPubKey extracts the validator public key from a stake Extra payload.
+// Handles both v1 (105-byte withdraw/partial-withdraw) and v2 (173-byte deposit)
+// layouts — in both cases the 32-byte pubkey occupies bytes [1:33].
+func stakeExtraPubKey(extra []byte) (crypto.ValidatorPubKey, error) {
+	if len(extra) != StakePayloadSize && len(extra) != StakePayloadSizeV2 {
+		return nil, fmt.Errorf("stake extra: expected %d or %d bytes, got %d",
+			StakePayloadSize, StakePayloadSizeV2, len(extra))
+	}
+	return crypto.ValidatorPubKey(extra[1:33]), nil
 }
 
 // RemoveBlock removes all transactions included in the given block.

@@ -38,7 +38,7 @@ type UTXOSet struct {
 	utxos       map[UTXOKey]*UTXO
 	keyImages   map[crypto.KeyImage]struct{} // spent key images
 	byPubKey    map[crypto.Point32]*UTXO     // index by OneTimePub for ring-member lookup (C-0 fix)
-	stakedUTXOs map[UTXOKey]struct{}         // UTXOs burned for staking (C-1 fix) — prevents double-use
+	stakedUTXOs map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
@@ -47,7 +47,7 @@ func NewUTXOSet() *UTXOSet {
 		utxos:       make(map[UTXOKey]*UTXO),
 		keyImages:   make(map[crypto.KeyImage]struct{}),
 		byPubKey:    make(map[crypto.Point32]*UTXO),
-		stakedUTXOs: make(map[UTXOKey]struct{}),
+		stakedUTXOs: make(map[UTXOKey]*UTXO),
 	}
 }
 
@@ -187,9 +187,9 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 
 // MarkStaked burns a UTXO for staking: removes it from the active set so it
 // cannot be spent in a normal RingCT transaction or re-used as a ring decoy.
-// The UTXOKey is recorded in stakedUTXOs to prevent double-staking the same
-// output.  Returns an error if the UTXO is not in the active set or has
-// already been staked.  (C-1 fix)
+// The UTXO data is preserved in stakedUTXOs (not discarded) so that
+// UnmarkStaked can restore it for transactional rollback.
+// Returns an error if the UTXO is not in the active set or already staked.  (C-1 fix)
 func (s *UTXOSet) MarkStaked(txHash crypto.Hash32, outIdx uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -204,8 +204,55 @@ func (s *UTXOSet) MarkStaked(txHash crypto.Hash32, outIdx uint32) error {
 	// Remove from both active indices — cannot be spent or used as ring decoy.
 	delete(s.byPubKey, u.OneTimePub)
 	delete(s.utxos, k)
-	s.stakedUTXOs[k] = struct{}{}
+	s.stakedUTXOs[k] = u // store data so UnmarkStaked can restore it
 	return nil
+}
+
+// MarkStakedKnown marks a UTXO as staked during startup replay of historical
+// committed blocks without requiring it to be present in the active set (it was
+// already removed by MarkStaked in a previous run).  Unlike MarkStaked, it never
+// returns an error for an already-absent UTXO.  If the UTXO is in the active set
+// (populated by the startup UTXO rebuild scan), it is removed there first exactly
+// as MarkStaked would do.  The existing UTXO data is preferred over the provided
+// u descriptor (which may have a zero OneTimePub) so that UnmarkStaked can restore
+// the correct entry on rollback.
+// Idempotent: a second call for the same key is a no-op.
+func (s *UTXOSet) MarkStakedKnown(txHash crypto.Hash32, outIdx uint32, u *UTXO) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
+	if _, already := s.stakedUTXOs[k]; already {
+		return // idempotent
+	}
+	// If the UTXO is currently in the active set (e.g. from the startup rebuild
+	// scan), use its data for the staked record and remove it from the active
+	// indices — exactly matching MarkStaked behaviour.
+	if existing, ok := s.utxos[k]; ok {
+		delete(s.byPubKey, existing.OneTimePub)
+		delete(s.utxos, k)
+		s.stakedUTXOs[k] = existing // correct data including OneTimePub
+		return
+	}
+	// UTXO absent from active set (e.g. node upgraded mid-chain without a rebuild
+	// or UTXO was already removed): store the provided descriptor so IsStaked()
+	// returns true and prevents collateral reuse.
+	s.stakedUTXOs[k] = u
+}
+
+// UnmarkStaked reverses MarkStaked for transactional rollback: moves the UTXO
+// back into the active set and removes it from the staked set.  No-op if the
+// UTXO is not in the staked set.
+func (s *UTXOSet) UnmarkStaked(txHash crypto.Hash32, outIdx uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
+	u, ok := s.stakedUTXOs[k]
+	if !ok {
+		return // already gone (no-op)
+	}
+	delete(s.stakedUTXOs, k)
+	s.utxos[k] = u
+	s.byPubKey[u.OneTimePub] = u
 }
 
 // IsStaked returns true if the UTXO has been burned for staking.

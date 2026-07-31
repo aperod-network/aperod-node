@@ -46,6 +46,8 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.restNetworkBans)
         s.mux.HandleFunc("/api/v1/network/bans/", s.restNetworkBanByAddr)
+        s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
+        s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -998,31 +1000,49 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── POST /api/v1/admin/stake-deposit ────────────────────────────────────────
-//
-// Builds a v2 UTXO-backed stake deposit transaction and submits it to the
-// mempool.  The node signs with its own validator key — the caller must provide
-// the UTXO details (tx hash, output index) and the blinding factor that was
-// used when that output was created.
-//
-// Request body:
-//
-//	{
-//	  "pub_key":      "<64-hex Ed25519 public key — must match this node's key>",
-//	  "amount_napr":  <uint64 nAPRO>,
-//	  "utxo_txhash":  "<64-hex transaction hash>",
-//	  "utxo_out_idx": <uint32 output index>,
-//	  "blind_hex":    "<64-hex Pedersen blinding factor>"
-//	}
+func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	// Path: /api/v1/utxo/{txhash}/{idx}
+	tail := pathSuffix("/api/v1/utxo/", r.URL.Path)
+	parts := strings.SplitN(tail, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		writeJSONError(w, http.StatusBadRequest, "path must be /api/v1/utxo/{txhash}/{idx}")
+		return
+	}
+	txHashHex := parts[0]
+	idxStr := parts[1]
 
-type stakeDepositRequest struct {
-	PubKey     string `json:"pub_key"`      // 64-hex validator pubkey (must match this node)
-	AmountNAPR uint64 `json:"amount_napr"`  // stake amount in nAPRO
-	UTXOTxHash string `json:"utxo_txhash"`  // 64-hex hash of the UTXO tx being burned
-	UTXOOutIdx uint32 `json:"utxo_out_idx"` // output index within that tx
-	BlindHex   string `json:"blind_hex"`    // 64-hex Pedersen blind of the UTXO
+	txHashBytes, err := hex.DecodeString(txHashHex)
+	if err != nil || len(txHashBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "txhash must be 64 hex characters")
+		return
+	}
+	var txHash crypto.Hash32
+	copy(txHash[:], txHashBytes)
+
+	idx64, err := strconv.ParseUint(idxStr, 10, 32)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "idx must be a non-negative integer")
+		return
+	}
+	outIdx := uint32(idx64)
+
+	utxo := s.utxos.Get(txHash, outIdx)
+	if utxo == nil {
+		writeJSONError(w, http.StatusNotFound, "UTXO not found in active set")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tx_hash":           txHashHex,
+		"out_idx":           outIdx,
+		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
+		"exists":            true,
+	})
 }
-
 func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
@@ -1124,6 +1144,26 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 		"status":         "pending",
 		"message":        "StakeDeposit v2 transaction submitted to mempool; applied when included in the next block",
 	})
+}
+
+// ─── POST /api/v1/admin/stake-deposit ────────────────────────────────────────
+
+// stakeDepositRequest is the JSON body for POST /api/v1/admin/stake-deposit.
+// The node signs the deposit on behalf of its own configured validator key.
+type stakeDepositRequest struct {
+        PubKey     string `json:"pub_key"`      // 64-hex-char Ed25519 public key
+        AmountNAPR uint64 `json:"amount_napr"`  // stake amount in nAPRO (base units)
+        UTXOTxHash string `json:"utxo_txhash"` // 64-hex-char tx hash of the burn UTXO
+        UTXOOutIdx uint32 `json:"utxo_out_idx"` // output index of the burn UTXO
+        BlindHex   string `json:"blind_hex"`    // 64-hex-char Pedersen blinding factor
+}
+
+// ─── POST /api/v1/stake ───────────────────────────────────────────────────────
+
+// stakeBroadcastRequest is the JSON body for POST /api/v1/stake.
+// The caller supplies a pre-signed 173-byte v2 stake payload (CLI-signed).
+type stakeBroadcastRequest struct {
+        TxExtraHex string `json:"tx_extra_hex"` // hex-encoded 173-byte v2 stake payload
 }
 
 // ─── POST /api/v1/admin/mint ──────────────────────────────────────────────────
@@ -1272,4 +1312,46 @@ func (s *Server) restMempoolMetrics(w http.ResponseWriter, r *http.Request) {
                 "max_bytes":   cfg.MaxBytes,
                 "max_tx_size": cfg.MaxTxSize,
         })
+}
+
+func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var req stakeBroadcastRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	extraBytes, err := hex.DecodeString(req.TxExtraHex)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "tx_extra_hex is not valid hex: "+err.Error())
+		return
+	}
+	if len(extraBytes) != core.StakePayloadSizeV2 {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("tx_extra_hex must decode to %d bytes (v2 stake payload), got %d",
+				core.StakePayloadSizeV2, len(extraBytes)))
+		return
+	}
+
+	tx := core.Transaction{
+		Version: core.TxVersionStake,
+		Extra:   extraBytes,
+	}
+	if err := s.mempool.Add(tx); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "mempool: "+err.Error())
+		return
+	}
+
+	txHash := tx.Hash()
+	txHashHex := fmt.Sprintf("%x", txHash[:])
+	s.log.Info("stake deposit broadcast", "tx_hash", txHashHex)
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"tx_hash": txHashHex,
+		"status":  "pending",
+		"message": "StakeDeposit v2 transaction submitted to mempool; applied when included in the next block",
+	})
 }

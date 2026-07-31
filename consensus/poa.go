@@ -256,15 +256,59 @@ func (e *Engine) tick() error {
                         block.Header.Height, err)
         }
 
-        // Apply UTXO state changes BEFORE adding to canonical chain so that if
-        // state transition fails the block is never inserted (atomic acceptance).
+        // Fast pre-check: detect invalid stake txs (bad sig, missing UTXO, duplicate
+        // burn UTXO, below-minimum, etc.) before touching any state.  If validation
+        // fails, evict ALL stake txs from this block so the next produced block does
+        // not re-select them and cause an infinite production failure.
+        if e.cfg.Registry != nil {
+                if err := e.cfg.Registry.ValidateBlockStakeTxs(block.Txs, block.Header.Height); err != nil {
+                        e.log.Warn("self-produced block contains invalid stake tx(s); evicting all stake txs from mempool",
+                                "height", block.Header.Height, "err", err)
+                        for _, tx := range block.Txs {
+                                if tx.IsStake() {
+                                        e.pool.Remove(tx.Hash())
+                                }
+                        }
+                        return fmt.Errorf("self-produced block %d: invalid stake tx (all stake txs evicted): %w",
+                                block.Header.Height, err)
+                }
+        }
+
+        // Apply UTXO outputs BEFORE stake application and chain insertion.
         if e.utxos != nil {
                 if err := e.utxos.ApplyBlock(block); err != nil {
                         return fmt.Errorf("utxo apply failed for self-produced block: %w", err)
                 }
         }
 
-        // Add to our own chain; rollback UTXO changes on failure.
+        // Atomically apply stake txs (registry + UTXO staking) BEFORE AddBlock so
+        // that any application failure prevents chain insertion — no post-insertion
+        // error swallowing.  ApplyBlockStakeTxs holds r.mu for the whole batch so
+        // a concurrent oracle UpdateMinStake cannot change effectiveMin mid-apply.
+        var stakeRollback func()
+        if e.cfg.Registry != nil {
+                var applyErr error
+                stakeRollback, applyErr = e.cfg.Registry.ApplyBlockStakeTxs(block.Txs, block.Header.Height)
+                if applyErr != nil {
+                        // Rollback UTXO outputs; stake registry was not mutated on error.
+                        if e.utxos != nil {
+                                if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+                                        e.log.Error("UTXO rollback failed after ApplyBlockStakeTxs error (self-produced)",
+                                                "height", block.Header.Height, "err", rbErr)
+                                }
+                        }
+                        // Evict the offending stake txs so they are not re-selected.
+                        for _, tx := range block.Txs {
+                                if tx.IsStake() {
+                                        e.pool.Remove(tx.Hash())
+                                }
+                        }
+                        return fmt.Errorf("self-produced block %d: stake apply failed (txs evicted): %w",
+                                block.Header.Height, applyErr)
+                }
+        }
+
+        // Add to canonical chain.  On failure, rollback BOTH UTXO outputs and stake state.
         if err := e.chain.AddBlock(block); err != nil {
                 if e.utxos != nil {
                         if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
@@ -273,11 +317,12 @@ func (e *Engine) tick() error {
                                         "chain_err", err, "rollback_err", rbErr)
                         }
                 }
+                if stakeRollback != nil {
+                        stakeRollback()
+                }
                 return fmt.Errorf("add produced block: %w", err)
         }
-
-        // Process stake txs and epoch updates for self-produced blocks
-        e.processStakeTxs(block)
+        // Stake txs already applied above — no processStakeTxs call needed.
         if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
                 newSet := e.cfg.Registry.UpdateEpoch(block.Header.Height)
                 e.log.Info("epoch updated (self-produced)",
@@ -487,11 +532,14 @@ const maxCoinbasesPerBlock = 11
 // are blocked by mempool.Add; the engine-reward coinbase is capped by
 // blockRewardAtHeight; and admin mints go through AddPrivileged which is only
 // reachable from the localhost-only admin RPC.
+//
+// Stake transactions (TxVersionStake) have zero inputs but are NOT coinbases —
+// they do not create supply and are exempt from this policy.
 func validateCoinbasePolicy(block *core.Block) error {
         count := 0
         seenNonCoinbase := false
         for i, tx := range block.Txs {
-                if tx.IsCoinbase() {
+                if tx.IsCoinbase() && !tx.IsStake() {
                         count++
                         if seenNonCoinbase {
                                 return fmt.Errorf("coinbase tx at index %d appears after a non-coinbase tx "+
@@ -517,9 +565,14 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
         // external coinbases, so finding one here indicates a bug; log and drop it.
         // PRIVILEGED coinbases (added via mempool.AddPrivileged, e.g. admin mints)
         // are intentional and must pass through to the block.
+        //
+        // Stake transactions (TxVersionStake) also have zero inputs — they carry
+        // their payload in Extra, not in Inputs.  They are NOT coinbases and must
+        // NOT be dropped here; they enter the pool via the public POST /api/v1/stake
+        // endpoint and must survive into the block for ProcessStakeTx to apply them.
         txs := raw[:0]
         for _, tx := range raw {
-                if tx.IsCoinbase() {
+                if tx.IsCoinbase() && !tx.IsStake() {
                         h := tx.Hash()
                         if !e.pool.IsPrivileged(h) {
                                 e.log.Warn("produceBlock: dropping unexpected non-privileged coinbase from pool",
@@ -679,6 +732,19 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("block %d: coinbase policy violation: %w", block.Header.Height, err)
         }
 
+        // Pre-acceptance stake transaction validation: ordered, stateful dry-run of
+        // all stake txs before UTXO state is applied or the block is inserted.
+        // TxVerifier.VerifyBlock skips stake txs (no ring-sig inputs), so this is
+        // the only place where signature, UTXO existence, commitment correctness,
+        // duplicate-burn-UTXO within the block, and stateful registry checks (min
+        // stake, cap, unbonding state, top-up overflow) are enforced for incoming
+        // blocks.  A failing check rejects the block before any state mutation.
+        if e.cfg.Registry != nil {
+                if err := e.cfg.Registry.ValidateBlockStakeTxs(block.Txs, block.Header.Height); err != nil {
+                        return fmt.Errorf("block %d: stake validation failed: %w", block.Header.Height, err)
+                }
+        }
+
         // Full cryptographic transaction verification: ring sigs, range proofs,
         // Pedersen commitment balance, and double-spend against historical UTXO set.
         // This MUST run before UTXO application and chain insertion.
@@ -694,18 +760,37 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("tx crypto verification failed: %w", err)
         }
 
-        // Apply block to UTXO set BEFORE adding to canonical chain so that if the
-        // state transition fails (e.g. within-block double-spend caught by ApplyBlock)
-        // the block is never accepted. This makes block acceptance atomic.
+        // Apply UTXO outputs BEFORE stake application and chain insertion.
         if e.utxos != nil {
                 if err := e.utxos.ApplyBlock(block); err != nil {
                         return fmt.Errorf("utxo state transition rejected block: %w", err)
                 }
         }
 
+        // Atomically apply stake txs (registry + UTXO staking) BEFORE AddBlock.
+        // ApplyBlockStakeTxs re-validates under a held registry write lock so a
+        // concurrent oracle UpdateMinStake cannot slip in between the earlier dry-run
+        // and actual application.  Any failure here rolls back UTXO outputs and
+        // rejects the block without ever touching the canonical chain.
+        var stakeRollback func()
+        if e.cfg.Registry != nil {
+                var applyErr error
+                stakeRollback, applyErr = e.cfg.Registry.ApplyBlockStakeTxs(block.Txs, block.Header.Height)
+                if applyErr != nil {
+                        if e.utxos != nil {
+                                if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+                                        e.log.Error("UTXO rollback failed after ApplyBlockStakeTxs error",
+                                                "height", block.Header.Height, "err", rbErr)
+                                }
+                        }
+                        return fmt.Errorf("block %d: stake apply failed (block rejected): %w",
+                                block.Header.Height, applyErr)
+                }
+        }
+
         if err := e.chain.AddBlock(block); err != nil {
-                // Chain insertion failed after UTXO state was already updated.
-                // Roll back UTXO changes to keep state consistent.
+                // Chain insertion failed after UTXO and stake state were already updated.
+                // Roll back both to keep all state consistent.
                 if e.utxos != nil {
                         if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
                                 e.log.Error("UTXO rollback failed after chain.AddBlock error",
@@ -713,8 +798,12 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                                         "chain_err", err, "rollback_err", rbErr)
                         }
                 }
+                if stakeRollback != nil {
+                        stakeRollback()
+                }
                 return fmt.Errorf("add block: %w", err)
         }
+        // Stake txs already applied above — no processStakeTxs call needed.
 
         // ── EIP-1559 base fee update ─────────────────────────────────────────────
         blockBaseFee := block.Header.BaseFee
@@ -745,9 +834,6 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                         "next_base_fee", newFee,
                 )
         }
-
-        // Process any stake transactions included in the block
-        e.processStakeTxs(block)
 
         // At epoch boundaries, recompute the active validator set
         if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
