@@ -132,6 +132,34 @@ _ensure_directive() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Step 0b: One-time validator.key ownership fix.
+#
+# Validators installed before July 2026 may have /etc/aperod/validator.key
+# owned by root instead of aperod.  The aperod-node service runs as
+# User=aperod, so a root-owned key causes "permission denied" on startup.
+# Newer binaries also reject any mode wider than 600 ("unsafe permissions").
+#
+# This block silently corrects both issues on every update so that operators
+# do not have to remember a one-time manual step.
+# ---------------------------------------------------------------------------
+VALIDATOR_KEY="/etc/aperod/validator.key"
+if [[ -f "${VALIDATOR_KEY}" ]]; then
+  key_owner=$(stat -c '%U' "${VALIDATOR_KEY}" 2>/dev/null || true)
+  key_mode=$(stat -c '%a'  "${VALIDATOR_KEY}" 2>/dev/null || true)
+  needs_fix=false
+  [[ "${key_owner}" != "aperod" ]] && needs_fix=true
+  [[ "${key_mode}"  != "600"    ]] && needs_fix=true
+  if [[ "${needs_fix}" == "true" ]]; then
+    echo "  [fix] ${VALIDATOR_KEY}: owner=${key_owner} mode=${key_mode} → fixing to aperod:aperod 600"
+    chown aperod:aperod "${VALIDATOR_KEY}"
+    chmod 600           "${VALIDATOR_KEY}"
+    echo "  [fix] validator.key ownership corrected (one-time fix for pre-July-2026 installs)."
+  else
+    echo "  [ok] ${VALIDATOR_KEY}: ownership and permissions are correct (aperod:aperod 600)."
+  fi
+fi
+
 if [[ -f "${SERVICE_FILE}" ]]; then
   patched=false
 
