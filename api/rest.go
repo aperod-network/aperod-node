@@ -1193,12 +1193,32 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"tx_hash":           txHashHex,
 		"out_idx":           outIdx,
 		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
 		"exists":            true,
-	})
+	}
+
+	// In light-pruning mode, warn the caller when the originating block is
+	// within 10 % of the prune window (tip − keep_blocks).  The field is
+	// omitted on archive nodes and when the UTXO is safely far from pruning.
+	if s.pruningMode == "light" && s.keepBlocks > 0 {
+		if tip := s.chain.Tip(); tip != nil {
+			tipHeight := tip.Header.Height
+			threshold := s.keepBlocks / 10 // 10 % of window
+			// pruneAt is the tip height at which this UTXO's block would be pruned.
+			pruneAt := utxo.BlockHeight + s.keepBlocks
+			if tipHeight < pruneAt {
+				blocksLeft := pruneAt - tipHeight
+				if blocksLeft <= threshold {
+					resp["blocks_until_pruned"] = blocksLeft
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

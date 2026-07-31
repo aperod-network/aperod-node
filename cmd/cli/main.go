@@ -682,10 +682,21 @@ Your private key is never sent to the node.`,
 				utxoResp.StatusCode, errMsg)
 		}
 		var utxoData struct {
-			AmountCommitHex string `json:"amount_commit_hex"`
+			AmountCommitHex  string  `json:"amount_commit_hex"`
+			BlocksUntilPruned *uint64 `json:"blocks_until_pruned"`
 		}
 		if err := json.Unmarshal(utxoBody, &utxoData); err != nil {
 			return fmt.Errorf("parse UTXO response: %w", err)
+		}
+		// Warn the operator if the UTXO's originating block is close to the
+		// prune window on a light-mode node.  The node only includes this field
+		// when the UTXO is within 10 % of keep_blocks from being pruned.
+		if utxoData.BlocksUntilPruned != nil {
+			fmt.Printf("\n⚠️  WARNING: this UTXO's block will be pruned in approximately %d blocks.\n"+
+				"   Once pruned, the stake transaction will be rejected.\n"+
+				"   Broadcast your stake transaction as soon as possible, or switch\n"+
+				"   to an archive node (pruning.mode: archive in node.yaml).\n\n",
+				*utxoData.BlocksUntilPruned)
 		}
 		commitRaw, err := hex.DecodeString(utxoData.AmountCommitHex)
 		if err != nil || len(commitRaw) != 32 {

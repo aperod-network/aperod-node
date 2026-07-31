@@ -559,6 +559,7 @@ func run() error {
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetStore(db)                       // enables pruned-block fallback in the REST API
                 apiSrv.SetPruningMode(cfg.Pruning.Mode)   // lets stake endpoints detect pruned UTXOs
+                apiSrv.SetKeepBlocks(cfg.Pruning.KeepBlocks) // enables blocks_until_pruned warning in restUTXO
                 // F-5 fix: wire API key so apr_sendRawTransaction requires auth in production.
                 if cfg.API.Key != "" {
                         apiSrv.SetAPIKey(cfg.API.Key)

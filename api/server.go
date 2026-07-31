@@ -50,6 +50,10 @@ type Server struct {
         // Set via SetPruningMode so the API can hint about pruned UTXOs.
         pruningMode string
 
+        // keepBlocks is the number of recent blocks whose full data is retained
+        // (cfg.Pruning.KeepBlocks).  Used by restUTXO to compute blocks_until_pruned.
+        keepBlocks uint64
+
         // txTotal is an O(1) cached total non-coinbase tx count.
         // Updated atomically so no lock is needed in hot paths.
         txTotal int64
@@ -98,6 +102,10 @@ func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 // stake endpoints can detect when a missing UTXO may have been pruned rather
 // than simply spent, and return a descriptive error.  Call after NewServer.
 func (s *Server) SetPruningMode(mode string) { s.pruningMode = mode }
+
+// SetKeepBlocks records cfg.Pruning.KeepBlocks so restUTXO can compute the
+// blocks_until_pruned warning field for UTXOs approaching the prune window.
+func (s *Server) SetKeepBlocks(n uint64) { s.keepBlocks = n }
 
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
