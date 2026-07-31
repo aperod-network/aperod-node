@@ -426,16 +426,76 @@ type AddressTx struct {
         OutputIndex int    `json:"output_index"`
 }
 
+// AddressUTXO is a single unspent output returned by the address UTXO listing endpoint.
+type AddressUTXO struct {
+        TxHash          string `json:"tx_hash"`
+        OutIdx          uint32 `json:"out_idx"`
+        AmountCommitHex string `json:"amount_commit_hex"`
+        BlockHeight     uint64 `json:"block_height"`
+}
+
+// restAddressUTXOs handles GET /api/v1/address/{addr}/utxos.
+// It returns all UTXOs in the active set whose OneTimePub matches the spend
+// public key encoded in the address (transparent / mint outputs only; stealth
+// outputs require a view-key scan which is not available here).
+func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrStr string) {
+        addr := crypto.Address(addrStr)
+        if err := crypto.Validate(addr); err != nil {
+                writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
+                return
+        }
+
+        _, spendPub, _, decErr := crypto.DecodeAddress(addr)
+        if decErr != nil {
+                writeJSONError(w, http.StatusBadRequest, "cannot decode address")
+                return
+        }
+
+        all := s.utxos.All()
+        results := make([]AddressUTXO, 0)
+        for _, u := range all {
+                match := u.OneTimePub == spendPub
+                if !match {
+                        // Check coinbase mint pub: OneTimePub = spend_pub + height*G
+                        if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(u.BlockHeight)); hErr == nil {
+                                if mintPub, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
+                                        match = u.OneTimePub == mintPub
+                                }
+                        }
+                }
+                if match {
+                        results = append(results, AddressUTXO{
+                                TxHash:          fmt.Sprintf("%x", u.TxHash[:]),
+                                OutIdx:          u.OutputIndex,
+                                AmountCommitHex: fmt.Sprintf("%x", u.AmountCommit[:]),
+                                BlockHeight:     u.BlockHeight,
+                        })
+                }
+        }
+
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "address": addrStr,
+                "utxos":   results,
+                "note":    "transparent outputs only; stealth outputs require view-key scanning",
+        })
+}
+
 func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet {
                 writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
                 return
         }
 
-        // Path: /api/v1/address/{addr}/transactions
+        // Path: /api/v1/address/{addr}/transactions  or  /api/v1/address/{addr}/utxos
         tail := pathSuffix("/api/v1/address/", r.URL.Path)
         parts := strings.SplitN(tail, "/", 2)
         addrStr := parts[0]
+
+        // Dispatch sub-paths
+        if len(parts) >= 2 && parts[1] == "utxos" {
+                s.restAddressUTXOs(w, r, addrStr)
+                return
+        }
 
         addr := crypto.Address(addrStr)
         if err := crypto.Validate(addr); err != nil {
