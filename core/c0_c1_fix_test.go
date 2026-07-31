@@ -375,6 +375,223 @@ func TestC1_RejectDoubleStake(t *testing.T) {
 	}
 }
 
+// ─── C-0: startup replay — byPubKey populated by ApplyBlock ─────────────────
+
+// TestC0_ApplyBlockPopulatesRingMemberIndex verifies that ApplyBlock correctly
+// populates the byPubKey ring-member index so that UTXOs added via block replay
+// (i.e. on node restart) are immediately visible to TxVerifier.GetByPubKey.
+// This is the root fix for the post-restart rejection bug: ApplyBlock previously
+// wrote to s.utxos but not to s.byPubKey, so the C-0 ring-member check always
+// failed after a cold start.
+func TestC0_ApplyBlockPopulatesRingMemberIndex(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(1_000_000, blind)
+
+	var pub crypto.Point32
+	pub[0] = 0xAB
+
+	// Build a block with one output — simulate what the startup scan sees.
+	txHash := crypto.Hash32{0x01}
+	block := &core.Block{
+		Header: core.BlockHeader{Height: 1},
+		Txs: []core.Transaction{
+			{
+				Version: core.TxVersionBase,
+				Outputs: []core.Output{
+					{
+						OneTimePub:   pub,
+						AmountCommit: commit,
+					},
+				},
+			},
+		},
+	}
+	// Manually set the transaction hash inside the block so ApplyBlock sees it.
+	// (In real blocks the hash is derived from the serialized transaction.)
+	_ = txHash // ApplyBlock uses tx.Hash() internally; pub is what we track.
+
+	if err := utxos.ApplyBlock(block); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+
+	// GetByPubKey must return the UTXO — not nil.
+	got := utxos.GetByPubKey(pub)
+	if got == nil {
+		t.Fatal("ApplyBlock did not populate byPubKey: GetByPubKey returned nil for a UTXO added via block replay (startup restart bug)")
+	}
+	if got.AmountCommit != commit {
+		t.Fatalf("byPubKey entry has wrong AmountCommit: got %x, want %x", got.AmountCommit[:8], commit[:8])
+	}
+	t.Log("ApplyBlock correctly populates byPubKey — startup replay ring-member index is consistent")
+}
+
+// TestC0_OldDecoyPassesAfterNodeRestart is the end-to-end confirmation that a
+// RingCT transaction referencing a UTXO created 30+ blocks ago passes the C-0
+// ring-member validation on a freshly-started node (i.e. after the UTXO set is
+// rebuilt from scratch by replaying stored blocks via ApplyBlock).
+//
+// Scenario:
+//   - Build 35 blocks.  Block 5 creates a UTXO with a known pub key that will be
+//     used as a ring decoy in a later transaction.
+//   - Simulate a node restart: create a brand-new UTXOSet and replay all 35 blocks
+//     through ApplyBlock (exactly as cmd/node/main.go's startup scan does).
+//   - Build a minimal RingCT tx whose ring contains the 30-block-old UTXO pub key
+//     as one of its RingSize members.
+//   - Confirm TxVerifier does NOT return a C-0 error for the old decoy.
+func TestC0_OldDecoyPassesAfterNodeRestart(t *testing.T) {
+	const totalBlocks = 35
+	const decoyAtBlock = 5 // UTXO created here is the "old decoy"
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(500_000, blind)
+
+	// The one-time pub key we will track as our old decoy.
+	var decoyPub crypto.Point32
+	decoyPub[0] = 0xDE
+	decoyPub[1] = 0xC0
+	decoyPub[2] = 0x1A // "decoy" marker
+
+	// Build totalBlocks synthetic blocks.  Block decoyAtBlock contains decoyPub.
+	blocks := make([]*core.Block, totalBlocks+1) // index 0 = genesis, 1..35 = real blocks
+	// Genesis (height 0) — empty.
+	blocks[0] = &core.Block{Header: core.BlockHeader{Height: 0}}
+
+	for h := uint64(1); h <= totalBlocks; h++ {
+		var txs []core.Transaction
+		if h == decoyAtBlock {
+			// Insert a tx that creates our tracked decoy UTXO.
+			txs = append(txs, core.Transaction{
+				Version: core.TxVersionBase,
+				Outputs: []core.Output{
+					{OneTimePub: decoyPub, AmountCommit: commit},
+				},
+			})
+		} else {
+			// Other blocks just have a coin-base-like output with a unique pub.
+			var p crypto.Point32
+			p[0] = byte(h)
+			p[1] = 0xFF
+			txs = append(txs, core.Transaction{
+				Version: core.TxVersionBase,
+				Outputs: []core.Output{
+					{OneTimePub: p, AmountCommit: commit},
+				},
+			})
+		}
+		blocks[h] = &core.Block{
+			Header: core.BlockHeader{Height: h},
+			Txs:    txs,
+		}
+	}
+
+	// ── Simulate node restart ────────────────────────────────────────────────
+	// Create a brand-new UTXOSet (empty, as it would be at process start) and
+	// replay every block exactly as the startup scan in cmd/node/main.go does.
+	freshUTXOs := core.NewUTXOSet()
+	for _, b := range blocks {
+		if err := freshUTXOs.ApplyBlock(b); err != nil {
+			t.Fatalf("ApplyBlock at height %d: %v", b.Header.Height, err)
+		}
+	}
+
+	// After replay, the 30-block-old decoy UTXO must be in byPubKey.
+	if freshUTXOs.GetByPubKey(decoyPub) == nil {
+		t.Fatal("30-block-old decoy UTXO not found in byPubKey after startup replay — node restart would reject all ring txs referencing it")
+	}
+
+	// Build a minimal RingCT tx with decoyPub as one of its ring members and
+	// fill the rest with real UTXOs too (C-0 checks all members).
+	ring := make([]crypto.Point32, crypto.RingSize)
+	ring[0] = decoyPub
+	for i := 1; i < crypto.RingSize; i++ {
+		var p crypto.Point32
+		p[0] = byte(i + 50)
+		ring[i] = p
+		// Add these extra ring members to the fresh UTXO set so C-0 passes them.
+		freshUTXOs.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: commit,
+		})
+	}
+
+	// Build a range proof for the output so the tx passes Validate().
+	var zeroBF crypto.BlindFactor
+	rp, _ := crypto.ProveRange(1, zeroBF)
+	tx := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{
+			{
+				Ring:         ring,
+				AmountCommit: commit,
+				KeyImage:     crypto.KeyImage{0xE2, 0xE2},
+			},
+		},
+		Outputs: []core.Output{
+			{OneTimePub: crypto.Point32{0x99}, AmountCommit: commit},
+		},
+		Signatures:  []*crypto.MLSAGSignature{nil}, // stub — C-0 fires before MLSAG
+		RangeProofs: []*crypto.RangeProof{rp},
+	}
+
+	verifier := core.NewTxVerifier(freshUTXOs)
+	err := verifier.VerifyTx(&tx)
+
+	// The C-0 check must NOT fire.  MLSAG will fail (nil sig) — that is
+	// expected and acceptable; the test only cares that the old decoy UTXO
+	// is accepted by the ring-member validation stage.
+	if err != nil && strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("C-0 incorrectly rejected 30-block-old decoy after startup replay: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "C-0") {
+		t.Logf("C-0 passed for 30-block-old decoy (error at later stage is expected): %v", err)
+	}
+}
+
+// TestC0_RollbackRemovesFromRingMemberIndex verifies that RollbackBlock
+// removes rolled-back outputs from byPubKey so they cannot be used as ring
+// decoys after an orphaned block is discarded.
+func TestC0_RollbackRemovesFromRingMemberIndex(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(1_000_000, blind)
+
+	var pub crypto.Point32
+	pub[0] = 0xBB
+
+	block := &core.Block{
+		Header: core.BlockHeader{Height: 1},
+		Txs: []core.Transaction{
+			{
+				Version: core.TxVersionBase,
+				Outputs: []core.Output{
+					{OneTimePub: pub, AmountCommit: commit},
+				},
+			},
+		},
+	}
+
+	if err := utxos.ApplyBlock(block); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+	if utxos.GetByPubKey(pub) == nil {
+		t.Fatal("UTXO not in byPubKey after ApplyBlock")
+	}
+
+	// Roll back the block — the UTXO was never on a canonical chain.
+	if err := utxos.RollbackBlock(block); err != nil {
+		t.Fatalf("RollbackBlock: %v", err)
+	}
+	if utxos.GetByPubKey(pub) != nil {
+		t.Fatal("rolled-back UTXO is still present in byPubKey — orphaned outputs must not remain as ring decoys")
+	}
+	t.Log("RollbackBlock correctly removes outputs from byPubKey")
+}
+
 // TestC1_RejectMissingUTXO verifies that a v2 deposit referencing a UTXO
 // that does not exist in the active set is rejected.
 func TestC1_RejectMissingUTXO(t *testing.T) {

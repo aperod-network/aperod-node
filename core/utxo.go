@@ -140,12 +140,19 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	// Pass 2: apply state changes — cannot fail after pass 1 succeeded.
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
+		// Mark inputs spent (key images only — do NOT remove from byPubKey so
+		// spent UTXOs remain available as ring decoys in future transactions).
 		for _, inp := range tx.Inputs {
 			s.keyImages[inp.KeyImage] = struct{}{}
 		}
+		// Add outputs to both primary index and the byPubKey ring-member index.
+		// byPubKey must be populated here so that TxVerifier.VerifyTx (C-0 full
+		// check) can look up ring members created in any historical block after a
+		// node restart.  Without this, the startup UTXO replay scan via ApplyBlock
+		// would leave byPubKey empty and reject every legitimate RingCT transaction.
 		for i, out := range tx.Outputs {
 			key := UTXOKey{TxHash: txHash, OutputIndex: uint32(i)}
-			s.utxos[key] = &UTXO{
+			u := &UTXO{
 				TxHash:       txHash,
 				OutputIndex:  uint32(i),
 				OneTimePub:   out.OneTimePub,
@@ -154,6 +161,8 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 				EncAmount:    out.EncAmount,
 				BlockHeight:  block.Header.Height,
 			}
+			s.utxos[key] = u
+			s.byPubKey[out.OneTimePub] = u
 		}
 	}
 	return nil
@@ -172,9 +181,12 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
-		// Remove outputs that this block created.
-		for i := range tx.Outputs {
+		// Remove outputs that this block created — both from the primary index
+		// and from byPubKey.  These UTXOs never made it onto a canonical chain,
+		// so they must not remain as usable ring decoys after rollback.
+		for i, out := range tx.Outputs {
 			delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: uint32(i)})
+			delete(s.byPubKey, out.OneTimePub)
 		}
 		// Un-mark key images spent by this block's inputs so they can be
 		// re-spent if the block is retried (or another valid block spends them).
