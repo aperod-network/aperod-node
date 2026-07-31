@@ -491,6 +491,156 @@ func TestREST_AdminMint_ZeroAmount(t *testing.T) {
         }
 }
 
+// ─── /api/v1/address/{addr}/utxos ────────────────────────────────────────────
+
+// buildUTXOServer returns a server and an exposed UTXOSet so tests can add/remove UTXOs directly.
+func buildUTXOServer(t *testing.T) (*api.Server, *core.UTXOSet) {
+        t.Helper()
+        priv, pub, _ := crypto.GenerateValidatorKey()
+        hdr := core.BlockHeader{
+                Height:       0,
+                Timestamp:    time.Now().UnixNano(),
+                ValidatorPub: pub,
+                MerkleRoot:   core.MerkleRoot(nil),
+        }
+        _ = hdr.Sign(priv)
+        genesis := &core.Block{Header: hdr}
+
+        chain := core.NewChain()
+        _ = chain.SetGenesis(genesis)
+
+        mp := core.NewMempool(core.DefaultMempoolConfig())
+        utxos := core.NewUTXOSet()
+        log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+        srv := api.NewServer(":0", chain, mp, utxos, log)
+        return srv, utxos
+}
+
+// TestREST_AddressUTXOs_TransparentMatch verifies that a UTXO whose OneTimePub
+// equals the address spend public key appears in the listing.
+func TestREST_AddressUTXOs_TransparentMatch(t *testing.T) {
+        srv, utxos := buildUTXOServer(t)
+
+        wk, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        spendPub := wk.Spend.Public
+        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+
+        var txHash crypto.Hash32
+        txHash[0] = 0xAB
+        utxos.Add(&core.UTXO{
+                TxHash:      txHash,
+                OutputIndex: 0,
+                OneTimePub:  spendPub,
+                BlockHeight: 0,
+        })
+
+        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+        if code != http.StatusOK {
+                t.Fatalf("status = %d, want 200", code)
+        }
+        list, _ := resp["utxos"].([]interface{})
+        if len(list) != 1 {
+                t.Fatalf("utxos count = %d, want 1", len(list))
+        }
+        entry := list[0].(map[string]interface{})
+        if entry["tx_hash"] != hex.EncodeToString(txHash[:]) {
+                t.Errorf("tx_hash = %v, want %s", entry["tx_hash"], hex.EncodeToString(txHash[:]))
+        }
+}
+
+// TestREST_AddressUTXOs_SpentRemoved verifies that once a UTXO is removed from
+// the set (simulating a spend), it no longer appears in the address listing.
+func TestREST_AddressUTXOs_SpentRemoved(t *testing.T) {
+        srv, utxos := buildUTXOServer(t)
+
+        wk, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        spendPub := wk.Spend.Public
+        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+
+        var txHash crypto.Hash32
+        txHash[0] = 0xCD
+        utxos.Add(&core.UTXO{
+                TxHash:      txHash,
+                OutputIndex: 0,
+                OneTimePub:  spendPub,
+                BlockHeight: 0,
+        })
+
+        // Confirm it appears before spending
+        _, before := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+        beforeList, _ := before["utxos"].([]interface{})
+        if len(beforeList) != 1 {
+                t.Fatalf("pre-spend utxos = %d, want 1", len(beforeList))
+        }
+
+        // Spend the UTXO (remove from set)
+        utxos.Remove(txHash, 0)
+
+        // Confirm it is gone
+        code, after := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+        if code != http.StatusOK {
+                t.Fatalf("status = %d, want 200", code)
+        }
+        afterList, _ := after["utxos"].([]interface{})
+        if len(afterList) != 0 {
+                t.Errorf("post-spend utxos = %d, want 0 (spent UTXO must not appear)", len(afterList))
+        }
+}
+
+// TestREST_AddressUTXOs_MintHeightMatch verifies that a coinbase/mint UTXO
+// whose OneTimePub was derived as spend_pub + height*G is matched correctly,
+// and that the returned block_height reflects the height used during derivation.
+func TestREST_AddressUTXOs_MintHeightMatch(t *testing.T) {
+        srv, utxos := buildUTXOServer(t)
+
+        wk, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        spendPub := wk.Spend.Public
+        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+
+        const mintHeight = uint64(42)
+
+        // Compute mint pub: spend_pub + mintHeight * G  (matches the handler logic)
+        heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(mintHeight))
+        if err != nil {
+                t.Fatalf("ScalarMulBase: %v", err)
+        }
+        mintPub, err := crypto.AddPoints(spendPub, heightPub)
+        if err != nil {
+                t.Fatalf("AddPoints: %v", err)
+        }
+
+        var txHash crypto.Hash32
+        txHash[0] = 0xEF
+        utxos.Add(&core.UTXO{
+                TxHash:      txHash,
+                OutputIndex: 0,
+                OneTimePub:  mintPub,
+                BlockHeight: mintHeight,
+        })
+
+        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+        if code != http.StatusOK {
+                t.Fatalf("status = %d, want 200", code)
+        }
+        list, _ := resp["utxos"].([]interface{})
+        if len(list) != 1 {
+                t.Fatalf("utxos count = %d, want 1 (mint UTXO must match via height-offset pub)", len(list))
+        }
+        entry := list[0].(map[string]interface{})
+        if entry["block_height"] != float64(mintHeight) {
+                t.Errorf("block_height = %v, want %d", entry["block_height"], mintHeight)
+        }
+}
+
 func TestWS_Endpoint_Registered(t *testing.T) {
         // golang.org/x/net/websocket requires http.Hijacker; use a real test server.
         srv, _ := newTestServer(t)
