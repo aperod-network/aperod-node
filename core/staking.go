@@ -21,6 +21,16 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// ─── Stake payload v2 (UTXO-backed deposit) ──────────────────────────────────
+//
+// StakeDeposit transactions must use the v2 payload which includes a reference
+// to a real UTXO and its Pedersen blinding factor.  The verifier recomputes
+// Commit(amount, burnBlind) and requires it to equal the UTXO's AmountCommit,
+// proving the sender actually owns the committed funds.  The UTXO is then
+// removed from the active set (burned) so it cannot be double-spent.
+//
+// Withdraw/PartialWithdraw continue to use the 105-byte v1 format.
+
 // ─── Staking constants ────────────────────────────────────────────────────────
 
 const (
@@ -67,11 +77,22 @@ const (
 // 7 days × 86,400 seconds/day = 604,800 blocks at 1 block/second.
 const PartialUnbondingBlocks uint64 = 604_800
 
-// StakePayloadSize is the fixed byte length of tx.Extra for TxVersionStake.
+// StakePayloadSize is the fixed byte length of tx.Extra for v1 stake txs.
 // Layout: action(1) + pubkey(32) + amount_nAPR(8) + ed25519_sig(64) = 105
+// Used for StakeWithdraw and StakePartialWithdraw only.
 const StakePayloadSize = 105
 
-// EncodeStakeExtra packs a stake operation into the 105-byte Extra field.
+// StakePayloadSizeV2 is the byte length of tx.Extra for v2 stake deposits.
+// Layout: action(1) + pubkey(32) + amount(8) + sig(64) +
+//
+//	burnTxHash(32) + burnOutIdx(4) + burnBlind(32) = 173
+//
+// The burn fields prove the depositor owns a real on-chain UTXO whose
+// Pedersen commitment opens to (amount, burnBlind).  The verifier recomputes
+// Commit(amount, burnBlind) and requires it to equal the UTXO's AmountCommit.
+const StakePayloadSizeV2 = 173
+
+// EncodeStakeExtra packs a withdraw/partial-withdraw operation into 105 bytes.
 // sig must be an ED25519 signature of StakeSignMsg(action, pub, amount).
 func EncodeStakeExtra(action StakeAction, pub crypto.ValidatorPubKey, amount uint64, sig []byte) ([]byte, error) {
 	if len(pub) != 32 {
@@ -88,7 +109,7 @@ func EncodeStakeExtra(action StakeAction, pub crypto.ValidatorPubKey, amount uin
 	return b, nil
 }
 
-// DecodeStakeExtra unpacks the 105-byte Extra field from a stake transaction.
+// DecodeStakeExtra unpacks the 105-byte v1 Extra field (withdraw/partial-withdraw).
 func DecodeStakeExtra(extra []byte) (action StakeAction, pub crypto.ValidatorPubKey, amount uint64, sig []byte, err error) {
 	if len(extra) != StakePayloadSize {
 		err = fmt.Errorf("stake extra: expected %d bytes, got %d", StakePayloadSize, len(extra))
@@ -101,8 +122,7 @@ func DecodeStakeExtra(extra []byte) (action StakeAction, pub crypto.ValidatorPub
 	return
 }
 
-// StakeSignMsg returns the canonical message that a validator must sign to
-// authorize a stake deposit or withdrawal (prevents replay attacks).
+// StakeSignMsg returns the canonical signing message for v1 withdraw/partial-withdraw.
 func StakeSignMsg(action StakeAction, pub crypto.ValidatorPubKey, amount uint64) crypto.Hash32 {
 	ab := make([]byte, 8)
 	binary.BigEndian.PutUint64(ab, amount)
@@ -111,6 +131,78 @@ func StakeSignMsg(action StakeAction, pub crypto.ValidatorPubKey, amount uint64)
 		[]byte{byte(action)},
 		[]byte(pub),
 		ab,
+	)
+}
+
+// EncodeStakeExtraV2 packs a UTXO-backed deposit into 173 bytes.
+// sig must be an ED25519 signature of StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx).
+// burnBlind is the Pedersen blinding factor of the burn UTXO — revealed here
+// because stake amounts are public in the validator registry.
+func EncodeStakeExtraV2(
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+) ([]byte, error) {
+	if len(pub) != 32 {
+		return nil, fmt.Errorf("stake extra v2: pubkey must be 32 bytes, got %d", len(pub))
+	}
+	if len(sig) != 64 {
+		return nil, fmt.Errorf("stake extra v2: signature must be 64 bytes, got %d", len(sig))
+	}
+	b := make([]byte, StakePayloadSizeV2)
+	b[0] = byte(action)
+	copy(b[1:33], pub)
+	binary.BigEndian.PutUint64(b[33:41], amount)
+	copy(b[41:105], sig)
+	copy(b[105:137], burnTxHash[:])
+	binary.BigEndian.PutUint32(b[137:141], burnOutIdx)
+	copy(b[141:173], burnBlind[:])
+	return b, nil
+}
+
+// DecodeStakeExtraV2 unpacks the 173-byte v2 Extra field from a deposit tx.
+func DecodeStakeExtraV2(extra []byte) (
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	err error,
+) {
+	if len(extra) != StakePayloadSizeV2 {
+		err = fmt.Errorf("stake extra v2: expected %d bytes, got %d", StakePayloadSizeV2, len(extra))
+		return
+	}
+	action = StakeAction(extra[0])
+	pub = crypto.ValidatorPubKey(extra[1:33])
+	amount = binary.BigEndian.Uint64(extra[33:41])
+	sig = extra[41:105]
+	copy(burnTxHash[:], extra[105:137])
+	burnOutIdx = binary.BigEndian.Uint32(extra[137:141])
+	copy(burnBlind[:], extra[141:173])
+	return
+}
+
+// StakeSignMsgV2 returns the canonical signing message for a v2 deposit.
+// Binds the signature to a specific burn UTXO (prevents replay with a different UTXO).
+func StakeSignMsgV2(action StakeAction, pub crypto.ValidatorPubKey, amount uint64, burnTxHash crypto.Hash32, burnOutIdx uint32) crypto.Hash32 {
+	ab := make([]byte, 8)
+	binary.BigEndian.PutUint64(ab, amount)
+	oidxb := make([]byte, 4)
+	binary.BigEndian.PutUint32(oidxb, burnOutIdx)
+	return crypto.HashBytes(
+		[]byte("aperod/stake/v2"),
+		[]byte{byte(action)},
+		[]byte(pub),
+		ab,
+		burnTxHash[:],
+		oidxb,
 	)
 }
 
@@ -191,6 +283,7 @@ type ValidatorRegistry struct {
 	mu             sync.RWMutex
 	validators     map[string]*ValidatorEntry // hex(pubkey) → entry
 	dynamicMinNAPR uint64                     // 0 = use static MinStakeNAPR constant
+	utxos          *UTXOSet                   // required for C-1 UTXO-backed deposit check
 }
 
 // NewValidatorRegistry creates an empty registry.
@@ -199,6 +292,14 @@ func NewValidatorRegistry() *ValidatorRegistry {
 		validators:     make(map[string]*ValidatorEntry),
 		dynamicMinNAPR: 0,
 	}
+}
+
+// SetUTXOSet wires the UTXO set into the registry so ProcessStakeTx can verify
+// and burn the depositor's UTXO.  Must be called before any blocks are processed.
+func (r *ValidatorRegistry) SetUTXOSet(utxos *UTXOSet) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.utxos = utxos
 }
 
 // UpdateMinStake recalculates the minimum stake from the current APRO market
@@ -257,36 +358,94 @@ func (r *ValidatorRegistry) InitFromGenesis(pubs []crypto.ValidatorPubKey, genes
 
 // ProcessStakeTx validates and applies a stake transaction to the registry.
 // Called by the consensus engine for every StakeTx included in a block.
+//
+// Extra payload routing:
+//   - 105 bytes (v1): StakeWithdraw / StakePartialWithdraw only.
+//   - 173 bytes (v2): StakeDeposit only — must include a valid UTXO burn proof.
+//     The verifier recomputes Commit(amount, burnBlind) and requires it to
+//     equal the referenced UTXO's AmountCommit (C-1 full fix).
 func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error {
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
 	}
-	action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
-	if err != nil {
-		return fmt.Errorf("registry: %w", err)
-	}
 
-	// Every stake action is authorized by the validator's own self-signed key.
-	// StakePartialWithdraw submitted via the admin endpoint uses the node's own
-	// key — which is valid only when pub == node's own pubkey.
-	msg := StakeSignMsg(action, pub, amount)
-	if !pub.Verify(msg, sig) {
-		return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
-	}
+	switch len(tx.Extra) {
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// ── v1: withdraw / partial-withdraw ──────────────────────────────────────
+	case StakePayloadSize:
+		action, pub, amount, sig, err := DecodeStakeExtra(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action == StakeDeposit {
+			return fmt.Errorf("registry: StakeDeposit requires v2 payload (173 bytes) with UTXO burn proof — v1 deposits no longer accepted (C-1 fix)")
+		}
+		msg := StakeSignMsg(action, pub, amount)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		key := pub.Hex()
+		switch action {
+		case StakeWithdraw:
+			return r.applyWithdraw(key, height)
+		case StakePartialWithdraw:
+			return r.applyPartialWithdraw(key, amount, height)
+		default:
+			return fmt.Errorf("registry: unknown stake action %d in v1 payload", action)
+		}
 
-	key := pub.Hex()
-	switch action {
-	case StakeDeposit:
-		return r.applyDeposit(key, pub, amount, height)
-	case StakeWithdraw:
-		return r.applyWithdraw(key, height)
-	case StakePartialWithdraw:
-		return r.applyPartialWithdraw(key, amount, height)
+	// ── v2: UTXO-backed deposit ───────────────────────────────────────────────
+	case StakePayloadSizeV2:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("registry: v2 payload (173 bytes) is only valid for StakeDeposit, got action=%d", action)
+		}
+
+		// Verify self-signature — binds the deposit to a specific burn UTXO,
+		// preventing replay attacks with a different UTXO at the same amount.
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
+		}
+
+		// ── C-1 full fix: verify and burn the referenced UTXO ────────────────
+		if r.utxos == nil {
+			return fmt.Errorf("registry: UTXO set not wired — cannot verify deposit (C-1 check)")
+		}
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		// Recompute Commit(amount, burnBlind) and require it to match the UTXO's
+		// on-chain AmountCommit.  If it doesn't, the depositor does not own the
+		// UTXO or has fabricated the amount (C-1 full check).
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return fmt.Errorf("registry: burn commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return fmt.Errorf("registry: burn UTXO %x:%d AmountCommit mismatch — "+
+				"claimed amount/blind does not open to the on-chain commitment (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		// Burn the UTXO: remove from active set and prevent re-use as ring decoy.
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return fmt.Errorf("registry: failed to burn stake UTXO: %w", err)
+		}
+
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.applyDeposit(pub.Hex(), pub, amount, height)
+
 	default:
-		return fmt.Errorf("registry: unknown stake action %d", action)
+		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw or %d for deposit)",
+			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
 	}
 }
 

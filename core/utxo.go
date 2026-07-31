@@ -34,18 +34,20 @@ type UTXOKey struct {
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
-	mu        sync.RWMutex
-	utxos     map[UTXOKey]*UTXO
-	keyImages map[crypto.KeyImage]struct{} // spent key images
-	byPubKey  map[crypto.Point32]*UTXO     // index by OneTimePub for ring-member lookup (C-0 fix)
+	mu          sync.RWMutex
+	utxos       map[UTXOKey]*UTXO
+	keyImages   map[crypto.KeyImage]struct{} // spent key images
+	byPubKey    map[crypto.Point32]*UTXO     // index by OneTimePub for ring-member lookup (C-0 fix)
+	stakedUTXOs map[UTXOKey]struct{}         // UTXOs burned for staking (C-1 fix) — prevents double-use
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
 func NewUTXOSet() *UTXOSet {
 	return &UTXOSet{
-		utxos:     make(map[UTXOKey]*UTXO),
-		keyImages: make(map[crypto.KeyImage]struct{}),
-		byPubKey:  make(map[crypto.Point32]*UTXO),
+		utxos:       make(map[UTXOKey]*UTXO),
+		keyImages:   make(map[crypto.KeyImage]struct{}),
+		byPubKey:    make(map[crypto.Point32]*UTXO),
+		stakedUTXOs: make(map[UTXOKey]struct{}),
 	}
 }
 
@@ -181,6 +183,37 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 		}
 	}
 	return nil
+}
+
+// MarkStaked burns a UTXO for staking: removes it from the active set so it
+// cannot be spent in a normal RingCT transaction or re-used as a ring decoy.
+// The UTXOKey is recorded in stakedUTXOs to prevent double-staking the same
+// output.  Returns an error if the UTXO is not in the active set or has
+// already been staked.  (C-1 fix)
+func (s *UTXOSet) MarkStaked(txHash crypto.Hash32, outIdx uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
+	if _, already := s.stakedUTXOs[k]; already {
+		return fmt.Errorf("UTXO %x:%d already staked", txHash[:8], outIdx)
+	}
+	u, ok := s.utxos[k]
+	if !ok {
+		return fmt.Errorf("UTXO %x:%d not found in active set", txHash[:8], outIdx)
+	}
+	// Remove from both active indices — cannot be spent or used as ring decoy.
+	delete(s.byPubKey, u.OneTimePub)
+	delete(s.utxos, k)
+	s.stakedUTXOs[k] = struct{}{}
+	return nil
+}
+
+// IsStaked returns true if the UTXO has been burned for staking.
+func (s *UTXOSet) IsStaked(txHash crypto.Hash32, outIdx uint32) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.stakedUTXOs[UTXOKey{TxHash: txHash, OutputIndex: outIdx}]
+	return ok
 }
 
 // Count returns the number of UTXOs in the set (for diagnostics).

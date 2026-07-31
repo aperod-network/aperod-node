@@ -310,6 +310,9 @@ func run() error {
         var apiSrv *api.Server
 
         registry := core.NewValidatorRegistry()
+        // C-1 fix: wire UTXO set so ProcessStakeTx can verify and burn
+        // the depositor's UTXO (proves real on-chain funds back the stake).
+        registry.SetUTXOSet(utxos)
 
         engine := consensus.NewEngine(consensus.Config{
                 BlockTime:          cfg.Consensus.BlockTime,

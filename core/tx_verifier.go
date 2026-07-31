@@ -63,26 +63,35 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
         }
 
-        // 3b. Commitment binding — partial C-0 fix.
+        // 3b. Commitment binding — full C-0 fix.
         //
-        // For every ring member that IS present in the in-memory UTXO set,
-        // inp.AmountCommit must equal that member's actual on-chain Pedersen
-        // commitment.  This prevents an attacker who owns a real UTXO from
-        // swapping its AmountCommit for a larger fabricated value.
+        // Every ring member must be present in the UTXO set.  Missing members
+        // are rejected outright: an attacker who fabricates a ring member that
+        // never existed on-chain (or references a UTXO that was never created)
+        // cannot pass this check.
         //
-        // Limitation: ring members not present in the in-memory UTXO set (old
-        // UTXOs from blocks that pre-date the current in-memory window, or a
-        // freshly restarted node whose set is still building) are skipped to
-        // avoid rejecting legitimate transactions.  A complete check requires a
-        // persistent UTXO index backed by the block store.
+        // Safety: ApplyBlock marks key images spent but does NOT remove UTXOs
+        // from the byPubKey index, so legitimately spent UTXOs (used as
+        // decoys) remain look-up-able for the lifetime of the node process.
+        // Only a UTXO that was burned for staking (MarkStaked) or that
+        // genuinely never existed will be absent.
+        //
+        // The original "partial" comment about freshly-restarted nodes was
+        // overly conservative: the UTXO set is built from a full chain replay
+        // on startup, so it contains every UTXO ever created.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
                         for _, member := range inp.Ring {
                                 utxo := v.utxos.GetByPubKey(member)
-                                if utxo != nil && utxo.AmountCommit != inp.AmountCommit {
+                                if utxo == nil {
+                                        return fmt.Errorf("tx %x: input %d ring member %x not found in "+
+                                                "UTXO set — output never created or already burned (C-0 full check)",
+                                                txHashPrefix[:8], i, member[:8])
+                                }
+                                if utxo.AmountCommit != inp.AmountCommit {
                                         return fmt.Errorf("tx %x: input %d AmountCommit does not match "+
-                                                "ring member's on-chain UTXO commitment (C-0 check)",
-                                                txHashPrefix[:8], i)
+                                                "ring member %x on-chain UTXO commitment (C-0 check)",
+                                                txHashPrefix[:8], i, member[:8])
                                 }
                         }
                 }

@@ -113,10 +113,14 @@ func (tx *Transaction) Validate() error {
         // Stake transactions carry payload in Extra.  Validate the Extra field,
         // then fall through to enforce RangeProof count for any outputs (C-2 fix:
         // the previous early-return let stake txs carry outputs without proofs).
+        //
+        // v1 payload (105 bytes): StakeWithdraw / StakePartialWithdraw
+        // v2 payload (173 bytes): StakeDeposit with UTXO burn proof (C-1 fix)
         if tx.IsStake() {
-                if len(tx.Extra) != StakePayloadSize {
-                        return fmt.Errorf("stake tx: extra must be exactly %d bytes, got %d",
-                                StakePayloadSize, len(tx.Extra))
+                extraLen := len(tx.Extra)
+                if extraLen != StakePayloadSize && extraLen != StakePayloadSizeV2 {
+                        return fmt.Errorf("stake tx: extra must be %d bytes (withdraw) or %d bytes (deposit), got %d",
+                                StakePayloadSize, StakePayloadSizeV2, extraLen)
                 }
                 action := StakeAction(tx.Extra[0])
                 if action != StakeDeposit && action != StakeWithdraw && action != StakePartialWithdraw {
