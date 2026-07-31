@@ -61,6 +61,32 @@ except Exception as e:
 EOF
 }
 
+# ── Backup current config before overwriting ──────────────────────────────────
+# Creates $CONFIG_FILE.bak-YYYYMMDD-HHMMSS-XXXXXX (unique even within the same
+# second) in the same directory.  Called just before every atomic rename so the
+# pre-write state is always recoverable with `restore-backup`.
+#
+# FAILURE POLICY: if the backup cannot be written, this function calls die()
+# so the caller exits before the atomic rename takes place.  The EXIT trap in
+# cmd_add / cmd_remove will clean up the pending tmp file.  Never silently
+# skipping the backup and continuing with the write would violate the guarantee
+# that every config change has a recoverable pre-write snapshot.
+backup_config() {
+  local ts bak
+  ts=$(date -u +%Y%m%d-%H%M%S)
+  # mktemp guarantees uniqueness even when two writes happen in the same second;
+  # the human-readable timestamp prefix keeps backups sortable by name.
+  # --tmpdir is not used so the file lands beside the config (same filesystem).
+  bak=$(mktemp "${CONFIG_FILE}.bak-${ts}-XXXXXX") || \
+    die "Cannot create backup temp file beside $CONFIG_FILE — aborting write."
+  # Preserve permissions only (not timestamps) so the backup's mtime reflects
+  # when it was created — this is what `ls -1t` relies on in restore-backup.
+  cp --preserve=mode "$CONFIG_FILE" "$bak" 2>/dev/null || \
+    cp "$CONFIG_FILE" "$bak" || \
+    { rm -f "$bak"; die "Cannot write backup $bak — aborting write to protect existing config."; }
+  ok "Backup saved: $bak"
+}
+
 # ── list-bootnodes ────────────────────────────────────────────────────────────
 cmd_list() {
   [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
@@ -149,6 +175,10 @@ EOF
   chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || \
     chmod "$(stat -f '%Mp%Lp' "$CONFIG_FILE" 2>/dev/null || echo 644)" "$tmp" 2>/dev/null || true
 
+  # Snapshot the current config BEFORE the atomic rename so it is always
+  # recoverable via `restore-backup` if the new values turn out to be wrong.
+  backup_config
+
   # Atomic rename: rename(2) on the same filesystem never truncates the
   # destination mid-write — the old inode remains intact until the syscall
   # succeeds, so a crash or ENOSPC here leaves node.yaml untouched.
@@ -209,11 +239,79 @@ EOF
   chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || \
     chmod "$(stat -f '%Mp%Lp' "$CONFIG_FILE" 2>/dev/null || echo 644)" "$tmp" 2>/dev/null || true
 
+  # Snapshot before the atomic rename (same policy as cmd_add).
+  backup_config
+
   mv "$tmp" "$CONFIG_FILE"
   ok "node.yaml updated successfully."
   echo ""
   echo "  Remaining bootnodes:"
   cmd_list
+  echo ""
+  warn "Restart aperod-node to apply: systemctl restart aperod-node"
+}
+
+# ── restore-backup ────────────────────────────────────────────────────────────
+# Finds the newest timestamped backup beside CONFIG_FILE and mv's it back into
+# place atomically.  The superseded (current) config is kept as a backup itself
+# so the restore is reversible.
+cmd_restore_backup() {
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+
+  local cfg_dir newest_bak ts lockfile
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  local base
+  base="$(basename "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
+
+  # Acquire the same exclusive advisory lock used by cmd_add / cmd_remove so
+  # that a restore cannot race against a concurrent mutation.  Without the lock
+  # two concurrent operations could each read the config, produce temp files,
+  # and then have the later mv silently overwrite the earlier commit.
+  exec 9>"$lockfile"
+  flock -x 9
+
+  # Find the most-recently-modified .bak-* file for this config.
+  # `|| true` prevents `set -eo pipefail` from triggering an early exit when
+  # `ls` finds no matching files (exit 1) before we reach the explicit die.
+  newest_bak=$(ls -1t "${cfg_dir}/${base}.bak-"* 2>/dev/null | head -1 || true)
+  [[ -n "$newest_bak" ]] || die "No backup found for $CONFIG_FILE (looked for ${cfg_dir}/${base}.bak-*)"
+
+  echo "  Newest backup : $newest_bak"
+  echo "  Diff (backup vs current):"
+  diff "$newest_bak" "$CONFIG_FILE" || true
+  echo ""
+
+  # Validate the backup before we do anything destructive.
+  ensure_pyyaml
+  python3 - <<EOF
+import sys, yaml
+try:
+    with open("${newest_bak}") as f:
+        yaml.safe_load(f)
+    sys.exit(0)
+except Exception as e:
+    print(f"Backup YAML validation failed: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+
+  # Atomically swap: first save the current config so the restore is reversible,
+  # then put the backup in place with a single rename(2).
+  # Use a distinct prefix (.before-restore-) so this snapshot is never
+  # mistaken for a regular pre-write backup (.bak-) and does not collide
+  # with the file we are about to restore even if clocks show the same second.
+  # mktemp ensures uniqueness even for rapid successive restores.
+  ts=$(date -u +%Y%m%d-%H%M%S)
+  local bak_of_current
+  bak_of_current=$(mktemp "${CONFIG_FILE}.before-restore-${ts}-XXXXXX") || \
+    die "Cannot create pre-restore snapshot temp file — aborting restore."
+  cp --preserve=mode "$CONFIG_FILE" "$bak_of_current" 2>/dev/null || \
+    cp "$CONFIG_FILE" "$bak_of_current" || \
+    { rm -f "$bak_of_current"; die "Cannot write pre-restore snapshot — aborting restore."; }
+  ok "Current config saved as: $bak_of_current"
+
+  mv "$newest_bak" "$CONFIG_FILE"
+  ok "Restored: $newest_bak → $CONFIG_FILE"
   echo ""
   warn "Restart aperod-node to apply: systemctl restart aperod-node"
 }
@@ -226,6 +324,7 @@ case "$SUBCMD" in
   list-bootnodes)    cmd_list ;;
   add-bootnode)      cmd_add "${1:-}" ;;
   remove-bootnode)   cmd_remove "${1:-}" ;;
+  restore-backup)    cmd_restore_backup ;;
   help|--help|-h)
     echo "Usage: $0 <subcommand> [args]"
     echo ""
@@ -233,6 +332,7 @@ case "$SUBCMD" in
     echo "  list-bootnodes            — List current bootnodes in node.yaml"
     echo "  add-bootnode    <addr>    — Safely append a bootnode"
     echo "  remove-bootnode <addr>    — Remove a bootnode by exact match"
+    echo "  restore-backup            — Roll back to the most-recent pre-write backup"
     echo ""
     echo "Config file: ${CONFIG_FILE}"
     echo "Override:    APEROD_CONFIG=/path/to/node.yaml $0 ..."

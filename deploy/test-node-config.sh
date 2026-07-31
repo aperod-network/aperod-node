@@ -303,9 +303,12 @@ check_order() {
 check_order "cmd_add"
 check_order "cmd_remove"
 
-# Assert no direct truncating writes to CONFIG_FILE exist (no cp, no > redirect).
+# Assert no direct truncating writes to CONFIG_FILE exist (no > redirect or
+# cp where CONFIG_FILE is the destination, i.e. not followed by another
+# quoted argument).  Backup lines that READ from CONFIG_FILE as the source
+# (cp "$CONFIG_FILE" "$bak") are intentional and must not be flagged.
 DIRECT_WRITES=$(grep -n \
-  '>"$CONFIG_FILE"\|>>"$CONFIG_FILE"\|tee.*"$CONFIG_FILE"\|cp .*"$CONFIG_FILE"' \
+  '>"$CONFIG_FILE"\|>>"$CONFIG_FILE"\|tee.*"$CONFIG_FILE"\|cp .*"$CONFIG_FILE"[^"]*$' \
   "$SCRIPT" || true)
 if [[ -z "$DIRECT_WRITES" ]]; then
   pass "no direct/truncating writes to \$CONFIG_FILE (only atomic mv from validated tmp)"
@@ -314,8 +317,10 @@ else
 fi
 
 # Assert mv is used (not cp) for the final replacement.
+# Only count cp lines where "$CONFIG_FILE" is the DESTINATION (no further
+# quoted argument follows on the same line).
 MV_LINES=$(grep -c '^\s*mv .*"\$CONFIG_FILE"' "$SCRIPT" || true)
-CP_LINES=$(grep -c '^\s*cp .*"\$CONFIG_FILE"' "$SCRIPT" || true)
+CP_LINES=$(grep -c '^\s*cp .*"\$CONFIG_FILE"[^"]*$' "$SCRIPT" || true)
 if [[ "$MV_LINES" -ge 2 ]]; then
   pass "mv used for final replacement in both cmd_add and cmd_remove ($MV_LINES occurrences)"
 else
@@ -407,6 +412,228 @@ if [[ $ADDR1_FOUND -eq 1 && $ADDR2_FOUND -eq 1 ]]; then
   pass "both ADDR1 and ADDR2 are present in the final config"
 else
   fail "one or both addresses missing from config after concurrent adds (ADDR1=$ADDR1_FOUND ADDR2=$ADDR2_FOUND)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 9: backup + restore-backup round-trip
+#
+# After add-bootnode:
+#   a) a .bak-* file must exist beside node.yaml
+#   b) the backup must contain the pre-add content (no new bootnode)
+#   c) restore-backup must bring node.yaml back to the pre-add state
+#   d) the restored config must be valid YAML with 0 bootnodes
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 9: backup created by add-bootnode; restore-backup recovers original"
+CFG9="$TMPDIR_TEST/node-t9.yaml"
+make_config "$CFG9"
+ORIGINAL9=$(cat "$CFG9")
+
+# Run add-bootnode — this should create a .bak-* file.
+APEROD_CONFIG="$CFG9" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR1" >/dev/null 2>&1
+ADD9_EXIT=$?
+
+if [[ $ADD9_EXIT -eq 0 ]]; then
+  pass "add-bootnode exited 0"
+else
+  fail "add-bootnode exited $ADD9_EXIT (expected 0)"
+fi
+
+# (a) A .bak-* file must exist.
+BAK9=$(ls -1t "${CFG9}.bak-"* 2>/dev/null | head -1)
+if [[ -n "$BAK9" ]]; then
+  pass "backup file created: $(basename "$BAK9")"
+else
+  fail "no .bak-* file found after add-bootnode"
+fi
+
+# (b) The backup must contain the pre-add content (0 bootnodes).
+if [[ -n "$BAK9" ]]; then
+  BAK9_COUNT=$(bootnode_count "$BAK9")
+  if [[ "$BAK9_COUNT" -eq 0 ]]; then
+    pass "backup contains the pre-add config (0 bootnodes)"
+  else
+    fail "backup has $BAK9_COUNT bootnode(s) — expected 0 (pre-add state)"
+  fi
+
+  BAK9_CONTENT=$(cat "$BAK9")
+  if [[ "$BAK9_CONTENT" == "$ORIGINAL9" ]]; then
+    pass "backup content is byte-for-byte identical to the original config"
+  else
+    fail "backup content differs from the original config"
+  fi
+fi
+
+# (c) restore-backup must succeed and replace the live config.
+APEROD_CONFIG="$CFG9" bash "$NODE_CONFIG_SH" restore-backup >/dev/null 2>&1
+RESTORE9_EXIT=$?
+
+if [[ $RESTORE9_EXIT -eq 0 ]]; then
+  pass "restore-backup exited 0"
+else
+  fail "restore-backup exited $RESTORE9_EXIT (expected 0)"
+fi
+
+# (d) Restored config must be valid YAML with 0 bootnodes (= pre-add state).
+if is_valid_yaml "$CFG9"; then
+  pass "restored node.yaml is valid YAML"
+else
+  fail "restored node.yaml is invalid YAML"
+fi
+
+RESTORED9_COUNT=$(bootnode_count "$CFG9")
+if [[ "$RESTORED9_COUNT" -eq 0 ]]; then
+  pass "restored config has 0 bootnodes (matches pre-add state)"
+else
+  fail "restored config has $RESTORED9_COUNT bootnode(s) — expected 0"
+fi
+
+RESTORED9_CONTENT=$(cat "$CFG9")
+if [[ "$RESTORED9_CONTENT" == "$ORIGINAL9" ]]; then
+  pass "restored config is byte-for-byte identical to the original"
+else
+  fail "restored config differs from the original"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 10: rapid successive writes each produce a distinct backup file
+#
+# Two add-bootnode calls in quick succession (possibly within the same wall-clock
+# second) must each create a separate .bak-* file.  If backup_config used only
+# a second-resolution timestamp the second write would overwrite the first
+# backup, silently destroying rollback history.  The mktemp suffix prevents this.
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 10: rapid successive writes each get a distinct backup file"
+CFG10="$TMPDIR_TEST/node-t10.yaml"
+make_config "$CFG10"
+
+APEROD_CONFIG="$CFG10" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR1" >/dev/null 2>&1
+APEROD_CONFIG="$CFG10" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR2" >/dev/null 2>&1
+
+# Collect backup files (handle the case where none exist without globbing error).
+shopt -s nullglob
+BAKS10=( "${CFG10}.bak-"* )
+shopt -u nullglob
+
+BAK10_COUNT="${#BAKS10[@]}"
+if [[ "$BAK10_COUNT" -eq 2 ]]; then
+  pass "two distinct backup files exist after two successive writes (count=$BAK10_COUNT)"
+else
+  fail "expected 2 distinct backup files, found $BAK10_COUNT (${BAKS10[*]:-none})"
+fi
+
+# Each backup must be valid YAML.
+ALL_VALID10=1
+for b in "${BAKS10[@]}"; do
+  if ! is_valid_yaml "$b"; then
+    fail "backup $b is not valid YAML"
+    ALL_VALID10=0
+  fi
+done
+[[ $ALL_VALID10 -eq 1 && ${#BAKS10[@]} -gt 0 ]] && pass "all backup files are valid YAML"
+
+# The two backup files must have different content (snapshots of different states).
+if [[ ${#BAKS10[@]} -ge 2 ]]; then
+  if ! diff -q "${BAKS10[0]}" "${BAKS10[1]}" >/dev/null 2>&1; then
+    pass "backup files have different content (distinct pre-write states captured)"
+  else
+    fail "backup files are identical — one likely overwrote the other (same-second collision?)"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 11: backup-creation failure aborts the write — config left unchanged
+#
+# If cp cannot write the backup (e.g. disk full, permission denied), node-config
+# must NOT proceed to rename the new config into place.  The operator ends up
+# with the original config and a clear error, not a changed config and no snapshot.
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 11: backup creation failure aborts the write — config unchanged"
+CFG11="$TMPDIR_TEST/node-t11.yaml"
+make_config "$CFG11"
+HASH11_BEFORE=$(sha256sum "$CFG11" | awk '{print $1}')
+
+# Inject a failing cp (simulates ENOSPC or permission-denied on the backup dir).
+FAKE_BIN11="$TMPDIR_TEST/fake-bin11"
+mkdir -p "$FAKE_BIN11"
+cat >"$FAKE_BIN11/cp" <<'CPSH'
+#!/usr/bin/env bash
+echo "cp: simulated write failure (ENOSPC)" >&2
+exit 1
+CPSH
+chmod +x "$FAKE_BIN11/cp"
+
+PATH="$FAKE_BIN11:$PATH" APEROD_CONFIG="$CFG11" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR1" >/dev/null 2>&1
+CP_FAIL_EXIT=$?
+
+if [[ $CP_FAIL_EXIT -ne 0 ]]; then
+  pass "add-bootnode exited non-zero ($CP_FAIL_EXIT) when backup cp failed"
+else
+  fail "add-bootnode exited 0 despite backup cp failure (should have aborted the write)"
+fi
+
+HASH11_AFTER=$(sha256sum "$CFG11" | awk '{print $1}')
+if [[ "$HASH11_AFTER" == "$HASH11_BEFORE" ]]; then
+  pass "config is byte-for-byte unchanged after aborted write"
+else
+  fail "config was modified despite backup failure — safety guarantee violated"
+fi
+
+# No orphaned (empty) backup files should be left from the failed mktemp path.
+shopt -s nullglob
+ORPHANS11=( "${CFG11}.bak-"* )
+shopt -u nullglob
+if [[ ${#ORPHANS11[@]} -eq 0 ]]; then
+  pass "no orphaned backup files left after aborted write"
+else
+  fail "orphaned backup file(s) left after aborted write: ${ORPHANS11[*]}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 12: concurrent restore-backup + add-bootnode — no corruption
+#
+# Without the advisory lock a restore could read an older backup while an
+# add-bootnode commits under the same lock, then atomically overwrite the new
+# commit with the stale backup (lost update).  With the lock the operations
+# serialise, so the final config is always a clean committed state.
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 12: concurrent restore-backup and add-bootnode — no lost update or corruption"
+CFG12="$TMPDIR_TEST/node-t12.yaml"
+make_config "$CFG12"
+
+# Pre-condition: add ADDR1 so there is at least one backup available for restore.
+APEROD_CONFIG="$CFG12" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR1" >/dev/null 2>&1
+
+# Fire restore-backup and a second add-bootnode concurrently.
+APEROD_CONFIG="$CFG12" bash "$NODE_CONFIG_SH" restore-backup >/dev/null 2>&1 &
+PID_R=$!
+APEROD_CONFIG="$CFG12" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR2" >/dev/null 2>&1 &
+PID_A=$!
+
+wait $PID_R; EXIT_R=$?
+wait $PID_A; EXIT_A=$?
+
+if [[ $EXIT_R -eq 0 && $EXIT_A -eq 0 ]]; then
+  pass "both concurrent operations exited 0"
+else
+  fail "concurrent ops: restore-backup exit=$EXIT_R  add-bootnode exit=$EXIT_A (expected both 0)"
+fi
+
+if is_valid_yaml "$CFG12"; then
+  pass "node.yaml is valid YAML after concurrent restore + add"
+else
+  fail "node.yaml is invalid YAML after concurrent restore + add"
+fi
+
+# With the lock the two operations serialize: one fully completes before the
+# other starts.  The only valid bootnode counts are 0 (restore won, then add
+# may or may not have run yet — but add is also serialised so it runs cleanly
+# after restore) or 1 (add won and restore found the backup from that add).
+# Count 2 (ADDR1 + ADDR2 both present) indicates a lost-update race.
+COUNT12=$(bootnode_count "$CFG12")
+if [[ "$COUNT12" -le 1 ]]; then
+  pass "config has ≤1 bootnode ($COUNT12) — operations correctly serialised by the lock"
+else
+  fail "config has $COUNT12 bootnodes — lost-update bug (lock not held during restore)"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
