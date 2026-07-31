@@ -36,6 +36,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
         s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
+        s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
         s.mux.HandleFunc("/api/v1/validators", s.restValidators)
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
@@ -590,6 +591,45 @@ func (s *Server) restNetworkBanByAddr(w http.ResponseWriter, r *http.Request) {
                 return
         }
         writeJSON(w, http.StatusOK, map[string]string{"message": "ban lifted", "addr": addr})
+}
+
+// ─── GET /api/v1/fee-estimate ────────────────────────────────────────────────
+//
+// Returns the current network base fee per byte and a pre-computed estimate for
+// a typical 1-in-2-out RingCT transfer so wallets can show an accurate fee.
+//
+// Response:
+//   base_fee_per_byte  uint64  nAPRO per serialised byte (current tip)
+//   estimated_fee_napro uint64  fee for a typical 1-in, 2-out APRO transfer
+//   estimated_fee_apro  float64 same value converted to APRO (÷ 1e8)
+//   tx_size_bytes       int     estimated serialised size used for the above
+func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+
+        // Read current base fee from tip block header.
+        var baseFeePerByte uint64 = core.InitialBaseFeePerByte
+        if tip := s.chain.Tip(); tip != nil && tip.Header.BaseFee > 0 {
+                baseFeePerByte = tip.Header.BaseFee
+        }
+        if baseFeePerByte < core.MinBaseFeePerByte {
+                baseFeePerByte = core.MinBaseFeePerByte
+        }
+
+        // Typical transfer: 1 input, 2 outputs (payment + change).
+        const typicalInputs = 1
+        const typicalOutputs = 2
+        estimatedFeeNapro := core.ExportedEstimateFee(typicalInputs, typicalOutputs, baseFeePerByte)
+        txSizeBytes := int(estimatedFeeNapro / baseFeePerByte)
+
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "base_fee_per_byte":   baseFeePerByte,
+                "estimated_fee_napro": estimatedFeeNapro,
+                "estimated_fee_apro":  float64(estimatedFeeNapro) / 1e8,
+                "tx_size_bytes":       txSizeBytes,
+        })
 }
 
 // ─── GET /api/v1/network/stats (2.1.13) ──────────────────────────────────────
