@@ -94,6 +94,12 @@ func Balance(utxos []OwnedUTXO) uint64 {
         return total
 }
 
+// DecryptAmount XOR-decrypts an 8-byte encrypted amount using H_s as the key stream.
+// Used by the API layer when a view key is available to decode on-chain amounts inline.
+func DecryptAmount(enc [8]byte, hs *crypto.Scalar32) uint64 {
+        return decryptAmount(enc, hs)
+}
+
 // decryptAmount XOR-decrypts an 8-byte encrypted amount using H_s as the key stream.
 // Encryption: enc = amount_bytes XOR SHA3("amount" || Hs)[0:8]
 func decryptAmount(enc [8]byte, hs *crypto.Scalar32) uint64 {

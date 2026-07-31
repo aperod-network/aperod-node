@@ -556,6 +556,7 @@ func run() error {
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 apiSrv.SetRegistry(engine.Registry())
                 apiSrv.SetValidatorKey(myKey)
+                apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey) // enables inline UTXO amount decryption when view_key set in node.yaml
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetStore(db)                       // enables pruned-block fallback in the REST API
                 apiSrv.SetPruningMode(cfg.Pruning.Mode)   // lets stake endpoints detect pruned UTXOs

@@ -46,6 +46,11 @@ type Server struct {
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
         nodeID         string // hex node ID derived from the validator public key
 
+        // nodeViewKeyHex is the hex-encoded Ed25519 view private scalar from node.yaml (optional).
+        // When non-empty, restAddressUTXOs uses it to decrypt enc_amount for owned stealth outputs
+        // inline, without requiring the caller to supply a view_key_hex query parameter.
+        nodeViewKeyHex string
+
         // pruningMode is "light" or "archive" (default "archive").
         // Set via SetPruningMode so the API can hint about pruned UTXOs.
         pruningMode string
@@ -106,6 +111,12 @@ func (s *Server) SetPruningMode(mode string) { s.pruningMode = mode }
 // SetKeepBlocks records cfg.Pruning.KeepBlocks so restUTXO can compute the
 // blocks_until_pruned warning field for UTXOs approaching the prune window.
 func (s *Server) SetKeepBlocks(n uint64) { s.keepBlocks = n }
+
+// SetNodeViewKey stores the node's configured view private key (hex-encoded).
+// When set, restAddressUTXOs automatically decrypts enc_amount for all owned
+// UTXOs — both transparent outputs and stealth outputs — without requiring the
+// caller to supply a view_key_hex query parameter.
+func (s *Server) SetNodeViewKey(hexKey string) { s.nodeViewKeyHex = hexKey }
 
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.

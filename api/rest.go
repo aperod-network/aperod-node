@@ -430,17 +430,29 @@ type AddressTx struct {
 
 // AddressUTXO is a single unspent output returned by the address UTXO listing endpoint.
 type AddressUTXO struct {
-        TxHash          string `json:"tx_hash"`
-        OutIdx          uint32 `json:"out_idx"`
-        AmountCommitHex string `json:"amount_commit_hex"`
-        EncAmountHex    string `json:"enc_amount_hex"`
-        BlockHeight     uint64 `json:"block_height"`
+        TxHash          string  `json:"tx_hash"`
+        OutIdx          uint32  `json:"out_idx"`
+        AmountCommitHex string  `json:"amount_commit_hex"`
+        EncAmountHex    string  `json:"enc_amount_hex"`
+        BlockHeight     uint64  `json:"block_height"`
+        // AmountNapr is the decrypted output amount in nAPRO. Populated when a
+        // view key is available (via view_key_hex query param or node.yaml view_key).
+        // Null when no view key is configured.
+        AmountNapr      *uint64 `json:"amount_napr"`
 }
 
 // restAddressUTXOs handles GET /api/v1/address/{addr}/utxos.
-// It returns all UTXOs in the active set whose OneTimePub matches the spend
-// public key encoded in the address (transparent / mint outputs only; stealth
-// outputs require a view-key scan which is not available here).
+//
+// Without a view key: returns transparent / mint outputs (OneTimePub matches
+// spend pub directly) with amount_napr=null.
+//
+// With a view key (view_key_hex query param or view_key in node.yaml): also
+// discovers stealth outputs via ECDH scan and sets amount_napr for them.
+//
+// Note on transparent/mint outputs: BuildMintTx leaves TxPubKey and EncAmount
+// as zero — there is no ECDH shared secret to derive, so amount_napr remains
+// null for those even when a view key is present.  Only stealth outputs
+// (TxPubKey = r·G, EncAmount = encrypted via Hs) are decrypted on the fly.
 func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrStr string) {
         addr := crypto.Address(addrStr)
         if err := crypto.Validate(addr); err != nil {
@@ -454,33 +466,88 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 return
         }
 
+        // Resolve view key: query param takes precedence over node config.
+        viewKeyHex := r.URL.Query().Get("view_key_hex")
+        if viewKeyHex == "" {
+                viewKeyHex = s.nodeViewKeyHex
+        }
+        var viewPriv *crypto.Scalar32
+        if viewKeyHex != "" {
+                raw, hexErr := hex.DecodeString(viewKeyHex)
+                if hexErr == nil && len(raw) == 32 {
+                        var vk crypto.Scalar32
+                        copy(vk[:], raw)
+                        viewPriv = &vk
+                }
+                // Silently ignore invalid hex — fall back to no-key behaviour.
+        }
+
         all := s.utxos.All()
         results := make([]AddressUTXO, 0)
+        seen := make(map[string]bool) // dedup by "txhash:outidx"
+
         for _, u := range all {
+                var hsScalar *crypto.Scalar32
+
+                // Transparent match: OneTimePub == spendPub (direct payment / old-style).
                 match := u.OneTimePub == spendPub
+
+                // Mint match: OneTimePub == spendPub + height*G (coinbase reward outputs).
                 if !match {
-                        // Check coinbase mint pub: OneTimePub = spend_pub + height*G
                         if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(u.BlockHeight)); hErr == nil {
                                 if mintPub, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
                                         match = u.OneTimePub == mintPub
                                 }
                         }
                 }
-                if match {
-                        results = append(results, AddressUTXO{
-                                TxHash:          fmt.Sprintf("%x", u.TxHash[:]),
-                                OutIdx:          u.OutputIndex,
-                                AmountCommitHex: fmt.Sprintf("%x", u.AmountCommit[:]),
-                                EncAmountHex:    fmt.Sprintf("%x", u.EncAmount[:]),
-                                BlockHeight:     u.BlockHeight,
-                        })
+
+                // Stealth match: ECDH scan using the view key.
+                // ScanForOutput returns the Hs scalar when the output belongs to us;
+                // nil when it doesn't.  This also covers any transparent output whose
+                // amount was encrypted with a real TxPubKey (non-zero).
+                if viewPriv != nil {
+                        hs, _ := crypto.ScanForOutput(*viewPriv, spendPub, u.TxPubKey, u.OneTimePub)
+                        if hs != nil {
+                                match = true
+                                hsScalar = hs
+                        }
                 }
+
+                if !match {
+                        continue
+                }
+
+                key := fmt.Sprintf("%x:%d", u.TxHash[:], u.OutputIndex)
+                if seen[key] {
+                        continue
+                }
+                seen[key] = true
+
+                var amountNapr *uint64
+                if hsScalar != nil {
+                        amt := core.DecryptAmount(u.EncAmount, hsScalar)
+                        amountNapr = &amt
+                }
+
+                results = append(results, AddressUTXO{
+                        TxHash:          fmt.Sprintf("%x", u.TxHash[:]),
+                        OutIdx:          u.OutputIndex,
+                        AmountCommitHex: fmt.Sprintf("%x", u.AmountCommit[:]),
+                        EncAmountHex:    fmt.Sprintf("%x", u.EncAmount[:]),
+                        BlockHeight:     u.BlockHeight,
+                        AmountNapr:      amountNapr,
+                })
+        }
+
+        note := "transparent outputs only; stealth outputs require view-key scanning"
+        if viewPriv != nil {
+                note = "includes stealth outputs discovered via view-key ECDH scan; amount_napr decoded inline for stealth outputs (transparent/mint outputs have null amount_napr)"
         }
 
         writeJSON(w, http.StatusOK, map[string]interface{}{
                 "address": addrStr,
                 "utxos":   results,
-                "note":    "transparent outputs only; stealth outputs require view-key scanning",
+                "note":    note,
         })
 }
 

@@ -67,6 +67,7 @@ type P2PConfig struct {
 // ConsensusConfig holds PoA settings.
 type ConsensusConfig struct {
 	ValidatorKey       string        `yaml:"validator_key"`        // path to ED25519 key file
+	ViewKey            string        `yaml:"view_key"`             // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
 	RewardAddress      string        `yaml:"reward_address"`       // APRO wallet address for block rewards
 	BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // reward in nAPRO; mainnet: 500_000_000 = 5 APRO; testnet default: 10_000_000 = 0.1 APRO. See deploy/BURN_POLICY.md.
 	BlockTime          time.Duration `yaml:"block_time"`
