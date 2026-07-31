@@ -85,10 +85,16 @@ cmd_add() {
   [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
   ensure_pyyaml
 
-  # Work on a temp file so the original is never truncated on failure.
-  local tmp
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
+  # Create the temp file in the same directory as CONFIG_FILE so that the final
+  # rename (mv) is an atomic same-filesystem operation.  cp is NOT used because
+  # it truncates the destination before writing — a crash or ENOSPC mid-copy
+  # would leave node.yaml empty/corrupt.  mv on the same filesystem is a single
+  # rename(2) syscall: it either succeeds atomically or leaves the original untouched.
+  local tmp cfg_dir
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+  # Use ${tmp:-} so the EXIT trap does not trip set -u after the function returns.
+  trap 'rm -f "${tmp:-}"' EXIT
 
   python3 - "$CONFIG_FILE" "$new_addr" "$tmp" <<'EOF'
 import yaml, sys
@@ -105,6 +111,11 @@ if "bootnodes" not in cfg["p2p"] or cfg["p2p"]["bootnodes"] is None:
 existing = cfg["p2p"]["bootnodes"]
 if new_addr in existing:
     print(f"Already present: {new_addr}")
+    # Still write the unchanged config so the temp file is non-empty and
+    # the validate_yaml + cp cycle is a safe no-op rather than overwriting
+    # the original with an empty file.
+    with open(out_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
     sys.exit(0)
 
 existing.append(new_addr)
@@ -123,7 +134,14 @@ EOF
   diff "$CONFIG_FILE" "$tmp" || true
   echo ""
 
-  cp "$tmp" "$CONFIG_FILE"
+  # Preserve original file permissions on the temp file before replacing.
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || \
+    chmod "$(stat -f '%Mp%Lp' "$CONFIG_FILE" 2>/dev/null || echo 644)" "$tmp" 2>/dev/null || true
+
+  # Atomic rename: rename(2) on the same filesystem never truncates the
+  # destination mid-write — the old inode remains intact until the syscall
+  # succeeds, so a crash or ENOSPC here leaves node.yaml untouched.
+  mv "$tmp" "$CONFIG_FILE"
   ok "node.yaml updated successfully."
   echo ""
   echo "  Current bootnodes:"
@@ -139,9 +157,10 @@ cmd_remove() {
   [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
   ensure_pyyaml
 
-  local tmp
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
+  local tmp cfg_dir
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+  trap 'rm -f "${tmp:-}"' EXIT
 
   python3 - "$CONFIG_FILE" "$rm_addr" "$tmp" <<'EOF'
 import yaml, sys
@@ -170,7 +189,10 @@ EOF
   diff "$CONFIG_FILE" "$tmp" || true
   echo ""
 
-  cp "$tmp" "$CONFIG_FILE"
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || \
+    chmod "$(stat -f '%Mp%Lp' "$CONFIG_FILE" 2>/dev/null || echo 644)" "$tmp" 2>/dev/null || true
+
+  mv "$tmp" "$CONFIG_FILE"
   ok "node.yaml updated successfully."
   echo ""
   echo "  Remaining bootnodes:"
