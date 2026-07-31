@@ -1154,7 +1154,8 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	// encoding the payload.  In light-pruning mode a missing UTXO likely means
 	// the originating block was stripped; return a descriptive error so the
 	// operator knows to use an archive node or acquire a newer UTXO.
-	if s.utxos.Get(burnTxHash, req.UTXOOutIdx) == nil {
+	burnUTXO := s.utxos.Get(burnTxHash, req.UTXOOutIdx)
+	if burnUTXO == nil {
 		writeJSONError(w, http.StatusUnprocessableEntity,
 			s.utxoMissingReason(burnTxHash, req.UTXOOutIdx))
 		return
@@ -1167,6 +1168,21 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	var burnBlind crypto.BlindFactor
 	copy(burnBlind[:], blindBytes)
+
+	// ── Pre-mempool commitment check ───────────────────────────────────────────
+	// Recompute Commit(amount, blind) and require it to equal the UTXO's
+	// on-chain AmountCommit.  A mismatch means the caller supplied a wrong
+	// amount or blinding factor; reject before the tx ever reaches the mempool.
+	expectedCommit, commitErr := crypto.Commit(req.AmountNAPR, burnBlind)
+	if commitErr != nil {
+		writeJSONError(w, http.StatusBadRequest, "commitment computation failed: "+commitErr.Error())
+		return
+	}
+	if expectedCommit != burnUTXO.AmountCommit {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("commitment mismatch: Commit(amount=%d, blind) does not equal the UTXO's on-chain AmountCommit — verify amount_napr and blind_hex", req.AmountNAPR))
+		return
+	}
 
 	// ── Sign ───────────────────────────────────────────────────────────────────
 	msg := core.StakeSignMsgV2(core.StakeDeposit, targetPub, req.AmountNAPR, burnTxHash, req.UTXOOutIdx)
@@ -1462,15 +1478,32 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Pre-flight UTXO existence check ───────────────────────────────────────
-	// Decode the payload to extract the burn UTXO reference, then verify it
-	// exists before handing the tx to the mempool.  A missing UTXO in light-
-	// pruning mode produces a descriptive error rather than a generic rejection.
-	_, _, _, _, burnTxHash, burnOutIdx, _, decodeErr := core.DecodeStakeExtraV2(extraBytes)
-	if decodeErr == nil && s.utxos.Get(burnTxHash, burnOutIdx) == nil {
-		writeJSONError(w, http.StatusUnprocessableEntity,
-			s.utxoMissingReason(burnTxHash, burnOutIdx))
-		return
+	// ── Pre-flight UTXO existence + commitment check ──────────────────────────
+	// Decode the payload to extract the burn UTXO reference and blinding factor,
+	// then verify the UTXO exists and that Commit(amount, blind) matches its
+	// on-chain AmountCommit before handing the tx to the mempool.  A missing
+	// UTXO in light-pruning mode produces a descriptive error rather than a
+	// generic rejection.  A commitment mismatch is rejected with 422 so the
+	// caller receives a structured error instead of the tx being silently queued.
+	_, _, broadcastAmount, _, burnTxHash, burnOutIdx, broadcastBlind, decodeErr := core.DecodeStakeExtraV2(extraBytes)
+	if decodeErr == nil {
+		broadcastUTXO := s.utxos.Get(burnTxHash, burnOutIdx)
+		if broadcastUTXO == nil {
+			writeJSONError(w, http.StatusUnprocessableEntity,
+				s.utxoMissingReason(burnTxHash, burnOutIdx))
+			return
+		}
+		// Pre-mempool commitment check: Commit(amount, blind) must equal the UTXO's AmountCommit.
+		broadcastCommit, broadcastCommitErr := crypto.Commit(broadcastAmount, broadcastBlind)
+		if broadcastCommitErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "commitment computation failed: "+broadcastCommitErr.Error())
+			return
+		}
+		if broadcastCommit != broadcastUTXO.AmountCommit {
+			writeJSONError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("commitment mismatch: Commit(amount=%d, blind) does not equal the UTXO's on-chain AmountCommit — the declared amount or blinding factor is incorrect", broadcastAmount))
+			return
+		}
 	}
 
 	tx := core.Transaction{

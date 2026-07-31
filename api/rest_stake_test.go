@@ -21,15 +21,23 @@ import (
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-// buildStakeServer creates a minimal server with an empty chain, mempool, and
-// a pre-populated UTXOSet containing one known UTXO.
-// Returns the server, the UTXO's tx hash, output index, and its AmountCommit.
-func buildStakeServer(t *testing.T) (
-	srv *api.Server,
-	utxoTxHash crypto.Hash32,
-	outIdx uint32,
-	commit crypto.Commitment,
-) {
+// stakeServerFixture holds everything the stake broadcast tests need to build
+// a payload whose Pedersen commitment matches the UTXO stored in the server.
+type stakeServerFixture struct {
+	srv        *api.Server
+	utxoTxHash crypto.Hash32
+	outIdx     uint32
+	commit     crypto.Commitment
+	priv       crypto.ValidatorPrivKey
+	pub        crypto.ValidatorPubKey
+	blind      crypto.BlindFactor
+	amount     uint64
+}
+
+// buildStakeServerFull creates a minimal server with an empty chain, mempool, and
+// a pre-populated UTXOSet containing one known UTXO, and returns all the details
+// needed to build a properly-committed v2 stake payload.
+func buildStakeServerFull(t *testing.T) stakeServerFixture {
 	t.Helper()
 
 	chain := core.NewChain()
@@ -42,7 +50,6 @@ func buildStakeServer(t *testing.T) (
 	if err != nil {
 		t.Fatalf("GenerateValidatorKey: %v", err)
 	}
-	_ = priv // kept for the signature helper below
 
 	// Derive the deterministic blind the same way the CLI does.
 	var spendPub crypto.Point32
@@ -61,7 +68,7 @@ func buildStakeServer(t *testing.T) (
 	for i := range txHash {
 		txHash[i] = 0xAB
 	}
-	outIdx = 0
+	const outIdx uint32 = 0
 
 	utxo := &core.UTXO{
 		TxHash:       txHash,
@@ -71,13 +78,56 @@ func buildStakeServer(t *testing.T) (
 	}
 	utxos.Add(utxo)
 
-	srv = api.NewServer(":0", chain, mp, utxos, testLogger())
-	return srv, txHash, outIdx, c
+	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	return stakeServerFixture{
+		srv:        srv,
+		utxoTxHash: txHash,
+		outIdx:     outIdx,
+		commit:     c,
+		priv:       priv,
+		pub:        pub,
+		blind:      blind,
+		amount:     amount,
+	}
+}
+
+// buildStakeServer is a backward-compatible wrapper for tests that only need
+// the server, txhash, outIdx, and commitment.
+func buildStakeServer(t *testing.T) (
+	srv *api.Server,
+	utxoTxHash crypto.Hash32,
+	outIdx uint32,
+	commit crypto.Commitment,
+) {
+	t.Helper()
+	f := buildStakeServerFull(t)
+	return f.srv, f.utxoTxHash, f.outIdx, f.commit
+}
+
+// makeV2StakeExtraFor builds a 173-byte v2 stake extra payload whose Pedersen
+// commitment matches the UTXO stored in the fixture.  The handler now verifies
+// Commit(amount, blind) == UTXO.AmountCommit before accepting the tx, so the
+// blind must be the same one used when building the fixture UTXO.
+func makeV2StakeExtraFor(t *testing.T, f stakeServerFixture) []byte {
+	t.Helper()
+	msg := core.StakeSignMsgV2(core.StakeDeposit, f.pub, f.amount, f.utxoTxHash, f.outIdx)
+	sig, err := f.priv.Sign(msg)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	extra, err := core.EncodeStakeExtraV2(
+		core.StakeDeposit, f.pub, f.amount, sig,
+		f.utxoTxHash, f.outIdx, f.blind,
+	)
+	if err != nil {
+		t.Fatalf("EncodeStakeExtraV2: %v", err)
+	}
+	return extra
 }
 
 // makeV2StakeExtra builds a structurally-valid 173-byte v2 stake extra payload
-// signed by priv.  The UTXO commit does not need to match anything in the test
-// UTXOSet — mempool.Add does not do crypto verification in tests (nil verifier).
+// with its own independent keypair and blind.  Used only for tests that don't
+// go through the broadcast endpoint commitment check (e.g. direct mempool tests).
 func makeV2StakeExtra(t *testing.T) ([]byte, crypto.ValidatorPubKey) {
 	t.Helper()
 	priv, pub, err := crypto.GenerateValidatorKey()
@@ -204,12 +254,13 @@ func TestREST_UTXO_MethodNotAllowed(t *testing.T) {
 // ─── POST /api/v1/stake ───────────────────────────────────────────────────────
 
 func TestREST_StakeBroadcast_ValidPayload(t *testing.T) {
-	srv, _, _, _ := buildStakeServer(t)
-
-	extra, _ := makeV2StakeExtra(t)
+	// Use the full fixture so the payload's Pedersen commitment matches the
+	// UTXO stored in the server (handler now verifies this pre-mempool).
+	f := buildStakeServerFull(t)
+	extra := makeV2StakeExtraFor(t, f)
 	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
 
-	code, resp := restPost(t, srv, "/api/v1/stake", body)
+	code, resp := restPost(t, f.srv, "/api/v1/stake", body)
 	if code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; resp = %v", code, resp)
 	}
@@ -223,20 +274,53 @@ func TestREST_StakeBroadcast_ValidPayload(t *testing.T) {
 }
 
 func TestREST_StakeBroadcast_DuplicateRejected(t *testing.T) {
-	srv, _, _, _ := buildStakeServer(t)
-
-	extra, _ := makeV2StakeExtra(t)
+	// Use the full fixture so the payload's Pedersen commitment matches the
+	// UTXO stored in the server (handler now verifies this pre-mempool).
+	f := buildStakeServerFull(t)
+	extra := makeV2StakeExtraFor(t, f)
 	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
 
 	// First submission should succeed.
-	code, _ := restPost(t, srv, "/api/v1/stake", body)
+	code, _ := restPost(t, f.srv, "/api/v1/stake", body)
 	if code != http.StatusCreated {
 		t.Fatalf("first POST status = %d, want 201", code)
 	}
 	// Second identical submission must fail (duplicate or same sender pending).
-	code2, resp2 := restPost(t, srv, "/api/v1/stake", body)
+	code2, resp2 := restPost(t, f.srv, "/api/v1/stake", body)
 	if code2 == http.StatusCreated {
 		t.Errorf("duplicate stake tx was accepted; resp = %v", resp2)
+	}
+}
+
+// TestREST_StakeBroadcast_CommitmentMismatch verifies that the handler rejects
+// a payload whose blind produces a commitment that doesn't match the UTXO's
+// on-chain AmountCommit (the new pre-mempool C-1 check).
+func TestREST_StakeBroadcast_CommitmentMismatch(t *testing.T) {
+	f := buildStakeServerFull(t)
+
+	// Build a payload with a wrong (all-zero) blind — commitment will not match.
+	var wrongBlind crypto.BlindFactor // all zeros
+	msg := core.StakeSignMsgV2(core.StakeDeposit, f.pub, f.amount, f.utxoTxHash, f.outIdx)
+	sig, err := f.priv.Sign(msg)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	extra, err := core.EncodeStakeExtraV2(
+		core.StakeDeposit, f.pub, f.amount, sig,
+		f.utxoTxHash, f.outIdx, wrongBlind,
+	)
+	if err != nil {
+		t.Fatalf("EncodeStakeExtraV2: %v", err)
+	}
+	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
+
+	code, resp := restPost(t, f.srv, "/api/v1/stake", body)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; resp = %v", code, resp)
+	}
+	errMsg, _ := resp["error"].(string)
+	if !strings.Contains(errMsg, "commitment mismatch") {
+		t.Errorf("error = %q, want it to contain \"commitment mismatch\"", errMsg)
 	}
 }
 
