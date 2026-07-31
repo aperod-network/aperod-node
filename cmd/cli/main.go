@@ -668,9 +668,18 @@ Your private key is never sent to the node.`,
 		defer utxoResp.Body.Close()
 		utxoBody, _ := io.ReadAll(utxoResp.Body)
 		if utxoResp.StatusCode != 200 {
+			errMsg := strings.TrimSpace(string(utxoBody))
+			// When the node is in light-pruning mode it embeds a hint in the
+			// error text; propagate it directly so the operator knows what to do.
+			if strings.Contains(errMsg, "pruning mode") || strings.Contains(errMsg, "pruned") {
+				return fmt.Errorf("UTXO not found (%d): %s\n\n"+
+					"Hint: Use an archive node (pruning.mode: archive in node.yaml) or "+
+					"acquire a UTXO from a recent block to stake.",
+					utxoResp.StatusCode, errMsg)
+			}
 			return fmt.Errorf("UTXO not found (%d): %s\n"+
 				"  Check --utxo-txhash / --utxo-idx and ensure the UTXO is unspent.",
-				utxoResp.StatusCode, strings.TrimSpace(string(utxoBody)))
+				utxoResp.StatusCode, errMsg)
 		}
 		var utxoData struct {
 			AmountCommitHex string `json:"amount_commit_hex"`
@@ -751,8 +760,16 @@ Your private key is never sent to the node.`,
 		defer httpResp.Body.Close()
 		body, _ := io.ReadAll(httpResp.Body)
 		if httpResp.StatusCode != 201 && httpResp.StatusCode != 200 {
+			errMsg := strings.TrimSpace(string(body))
+			// Surface pruning-aware hint when the node returns a pruning error.
+			if strings.Contains(errMsg, "pruning mode") || strings.Contains(errMsg, "pruned") {
+				return fmt.Errorf("broadcast failed (%d): %s\n\n"+
+					"Hint: Use an archive node (pruning.mode: archive in node.yaml) or "+
+					"acquire a UTXO from a recent block to stake.",
+					httpResp.StatusCode, errMsg)
+			}
 			return fmt.Errorf("broadcast failed (%d): %s",
-				httpResp.StatusCode, strings.TrimSpace(string(body)))
+				httpResp.StatusCode, errMsg)
 		}
 		var pretty bytes.Buffer
 		if e := json.Indent(&pretty, body, "", "  "); e != nil {

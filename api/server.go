@@ -46,6 +46,10 @@ type Server struct {
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
         nodeID         string // hex node ID derived from the validator public key
 
+        // pruningMode is "light" or "archive" (default "archive").
+        // Set via SetPruningMode so the API can hint about pruned UTXOs.
+        pruningMode string
+
         // txTotal is an O(1) cached total non-coinbase tx count.
         // Updated atomically so no lock is needed in hot paths.
         txTotal int64
@@ -89,6 +93,11 @@ func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 // when looking up old or pruned blocks that have been evicted from memory.
 // Optional — endpoints return 404 for old blocks when no store is wired.
 func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
+
+// SetPruningMode records the node's pruning mode ("archive" or "light") so
+// stake endpoints can detect when a missing UTXO may have been pruned rather
+// than simply spent, and return a descriptive error.  Call after NewServer.
+func (s *Server) SetPruningMode(mode string) { s.pruningMode = mode }
 
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.

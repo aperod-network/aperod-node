@@ -366,6 +366,29 @@ func run() error {
                                         "height", h, "err", applyErr)
                         }
 
+                        // UTXO index backfill: persist records for every output in this
+                        // block so that api.utxoMissingReason can distinguish "spent or
+                        // burned" from "originated in a pruned block" from "never existed".
+                        // For pruned blocks b.Txs is empty (TxData stripped), so no
+                        // records are written — which is correct because we cannot recover
+                        // the data anyway.  Records are never deleted, so this is safe to
+                        // run on every restart; PutUTXO is idempotent (overwrites same key).
+                        for _, tx := range b.Txs {
+                                txHash := tx.Hash()
+                                for i, out := range tx.Outputs {
+                                        su := &store.StoredUTXO{
+                                                TxHash:       txHash,
+                                                OutputIndex:  uint32(i),
+                                                OneTimePub:   out.OneTimePub,
+                                                TxPubKey:     out.TxPubKey,
+                                                AmountCommit: out.AmountCommit,
+                                                EncAmount:    out.EncAmount,
+                                                BlockHeight:  b.Header.Height,
+                                        }
+                                        _ = db.PutUTXO(txHash, uint32(i), su) // best-effort; non-fatal
+                                }
+                        }
+
                         // Goal 1 (fallback): mark spent key images and backfill the index.
                         if !kiFromIndex {
                                 for txIdx, tx := range b.Txs {
@@ -534,7 +557,8 @@ func run() error {
                 apiSrv.SetRegistry(engine.Registry())
                 apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
-                apiSrv.SetStore(db) // enables pruned-block fallback in the REST API
+                apiSrv.SetStore(db)                       // enables pruned-block fallback in the REST API
+                apiSrv.SetPruningMode(cfg.Pruning.Mode)   // lets stake endpoints detect pruned UTXOs
                 // F-5 fix: wire API key so apr_sendRawTransaction requires auth in production.
                 if cfg.API.Key != "" {
                         apiSrv.SetAPIKey(cfg.API.Key)
@@ -805,11 +829,37 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.
+// It also persists a UTXO record for every transaction output so that
+// api.utxoMissingReason can later distinguish "never existed" from "already
+// spent or burned" from "originated in a now-pruned block".  The records are
+// intentionally never deleted (no DeleteUTXO call) so that spent and staked
+// outputs remain queryable after they leave the active set.
 func storeBlock(db *store.DB, b *core.Block) error {
         data, err := json.Marshal(b)
         if err != nil {
                 return fmt.Errorf("marshal block: %w", err)
         }
         hash := b.Hash()
-        return db.PutRawBlock(hash, b.Header.Height, data)
+        if err := db.PutRawBlock(hash, b.Header.Height, data); err != nil {
+                return err
+        }
+        for _, tx := range b.Txs {
+                txHash := tx.Hash()
+                for i, out := range tx.Outputs {
+                        su := &store.StoredUTXO{
+                                TxHash:       txHash,
+                                OutputIndex:  uint32(i),
+                                OneTimePub:   out.OneTimePub,
+                                TxPubKey:     out.TxPubKey,
+                                AmountCommit: out.AmountCommit,
+                                EncAmount:    out.EncAmount,
+                                BlockHeight:  b.Header.Height,
+                        }
+                        if err := db.PutUTXO(txHash, uint32(i), su); err != nil {
+                                return fmt.Errorf("put utxo (height %d, tx %x, idx %d): %w",
+                                        b.Header.Height, txHash[:4], i, err)
+                        }
+                }
+        }
+        return nil
 }

@@ -14,6 +14,7 @@ package api
 //   POST /api/v1/admin/stake-deposit                   — admin-only: v2 UTXO-backed stake deposit
 
 import (
+        "encoding/binary"
         "encoding/hex"
         "encoding/json"
         "fmt"
@@ -1092,7 +1093,7 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 
 	utxo := s.utxos.Get(txHash, outIdx)
 	if utxo == nil {
-		writeJSONError(w, http.StatusNotFound, "UTXO not found in active set")
+		writeJSONError(w, http.StatusNotFound, s.utxoMissingReason(txHash, outIdx))
 		return
 	}
 
@@ -1147,6 +1148,17 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	var burnTxHash crypto.Hash32
 	copy(burnTxHash[:], txHashBytes)
+
+	// ── Pre-flight UTXO existence check ───────────────────────────────────────
+	// Verify the burn UTXO is present in the active set before signing and
+	// encoding the payload.  In light-pruning mode a missing UTXO likely means
+	// the originating block was stripped; return a descriptive error so the
+	// operator knows to use an archive node or acquire a newer UTXO.
+	if s.utxos.Get(burnTxHash, req.UTXOOutIdx) == nil {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			s.utxoMissingReason(burnTxHash, req.UTXOOutIdx))
+		return
+	}
 
 	blindBytes, err := hex.DecodeString(req.BlindHex)
 	if err != nil || len(blindBytes) != 32 {
@@ -1374,6 +1386,60 @@ func (s *Server) restMempoolMetrics(w http.ResponseWriter, r *http.Request) {
         })
 }
 
+// utxoMissingReason examines why a UTXO is absent from the active in-memory
+// set and returns a human-readable, actionable error string.  Three cases are
+// distinguished using the persisted LevelDB UTXO record:
+//
+//  1. Not in LevelDB at all → the UTXO was never created; the caller supplied
+//     a wrong tx hash or output index.
+//
+//  2. In LevelDB and the originating block height is below the node's prune
+//     cursor (light mode only) → the UTXO came from a block whose transaction
+//     data was pruned; after a node restart the key-image / burn record may
+//     have been lost.  The operator is directed to an archive node.
+//
+//  3. In LevelDB but the block is not pruned → the UTXO was already spent or
+//     burned by a prior stake deposit.
+//
+// If the block store is not wired a generic "not found in active set" message
+// is returned rather than guessing.
+func (s *Server) utxoMissingReason(txHash crypto.Hash32, outIdx uint32) string {
+        prefix := fmt.Sprintf("burn UTXO %x…:%d", txHash[:4], outIdx)
+
+        if s.blockStore == nil {
+                return prefix + " not found in active set"
+        }
+
+        su, err := s.blockStore.GetUTXO(txHash, outIdx)
+        if err != nil || su == nil {
+                // Never persisted → the caller supplied a non-existent reference.
+                return prefix + " does not exist (unknown tx hash or output index)"
+        }
+
+        // UTXO exists in LevelDB.  Check whether its originating block was pruned.
+        if s.pruningMode == "light" {
+                cursorBytes, cerr := s.blockStore.GetMeta("prune_cursor")
+                if cerr == nil && len(cursorBytes) == 8 {
+                        pruneBelow := binary.LittleEndian.Uint64(cursorBytes)
+                        if su.BlockHeight < pruneBelow {
+                                return fmt.Sprintf(
+                                        "%s originated at block %d whose transaction data has been pruned "+
+                                                "(this node runs in light-pruning mode, pruned up to block %d); "+
+                                                "connect to an archive node or acquire a UTXO from a more "+
+                                                "recent block to stake",
+                                        prefix, su.BlockHeight, pruneBelow)
+                        }
+                }
+        }
+
+        // Block is not pruned: the UTXO was already spent or burned by a prior
+        // transaction (e.g. an earlier stake deposit).
+        return fmt.Sprintf(
+                "%s was already spent or burned (originated at block %d, "+
+                        "no longer in the active UTXO set)",
+                prefix, su.BlockHeight)
+}
+
 func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
@@ -1393,6 +1459,17 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest,
 			fmt.Sprintf("tx_extra_hex must decode to %d bytes (v2 stake payload), got %d",
 				core.StakePayloadSizeV2, len(extraBytes)))
+		return
+	}
+
+	// ── Pre-flight UTXO existence check ───────────────────────────────────────
+	// Decode the payload to extract the burn UTXO reference, then verify it
+	// exists before handing the tx to the mempool.  A missing UTXO in light-
+	// pruning mode produces a descriptive error rather than a generic rejection.
+	_, _, _, _, burnTxHash, burnOutIdx, _, decodeErr := core.DecodeStakeExtraV2(extraBytes)
+	if decodeErr == nil && s.utxos.Get(burnTxHash, burnOutIdx) == nil {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			s.utxoMissingReason(burnTxHash, burnOutIdx))
 		return
 	}
 
