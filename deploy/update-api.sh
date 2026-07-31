@@ -112,6 +112,14 @@ else
   # Delete any stale/corrupted entry before starting fresh to avoid the
   # "Cannot read properties of undefined (reading 'pm2_env')" TypeError.
   pm2 delete "$PM2_APP" 2>/dev/null || true
+  # Kill the port again in the fallback path — the earlier kill ran before the
+  # failed pm2 restart, but a brief race or a surviving zombie could have
+  # re-bound it by the time we reach pm2 start.
+  if fuser "${API_PORT}/tcp" >/dev/null 2>&1; then
+    echo "  Port ${API_PORT} still in use before fresh start — killing..."
+    fuser -k "${API_PORT}/tcp" 2>/dev/null || true
+    sleep 1
+  fi
   # pm2 start from a bare ecosystem file loses the env vars that were in the
   # previous process descriptor (DATABASE_URL, SESSION_SECRET, etc.).
   # Source /opt/aperod/.env first so the new process inherits them.
