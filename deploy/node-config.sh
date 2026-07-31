@@ -90,9 +90,20 @@ cmd_add() {
   # it truncates the destination before writing — a crash or ENOSPC mid-copy
   # would leave node.yaml empty/corrupt.  mv on the same filesystem is a single
   # rename(2) syscall: it either succeeds atomically or leaves the original untouched.
-  local tmp cfg_dir
+  local tmp cfg_dir lockfile
   cfg_dir="$(dirname "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
   tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+
+  # Acquire an exclusive advisory lock on the lock file for the duration of the
+  # read→edit→validate→rename cycle.  Two concurrent invocations will serialise
+  # here so that the second one reads the file AFTER the first has already
+  # committed its rename(2).  The file descriptor (and thus the lock) is held
+  # until this process exits — no explicit close needed; bash releases all fds
+  # on exit automatically.
+  exec 9>"$lockfile"
+  flock -x 9
+
   # Use ${tmp:-} so the EXIT trap does not trip set -u after the function returns.
   trap 'rm -f "${tmp:-}"' EXIT
 
@@ -157,9 +168,15 @@ cmd_remove() {
   [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
   ensure_pyyaml
 
-  local tmp cfg_dir
+  local tmp cfg_dir lockfile
   cfg_dir="$(dirname "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
   tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+
+  # Acquire an exclusive advisory lock — same serialisation guarantee as cmd_add.
+  exec 9>"$lockfile"
+  flock -x 9
+
   trap 'rm -f "${tmp:-}"' EXIT
 
   python3 - "$CONFIG_FILE" "$rm_addr" "$tmp" <<'EOF'

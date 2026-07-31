@@ -358,6 +358,57 @@ else
   fail "YAML became invalid after failed remove-bootnode"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 8: concurrent add-bootnode calls — both addresses must survive
+#
+# Two admins run add-bootnode simultaneously.  Without flock they race: both
+# read the same original, write separate temp files, and the last mv wins —
+# silently discarding the other's change.  With flock they serialise, so both
+# addresses end up in the final config.
+# ─────────────────────────────────────────────────────────────────────────────
+section "Test 8: concurrent add-bootnode calls — both addresses survive"
+CFG8="$TMPDIR_TEST/node-t8.yaml"
+make_config "$CFG8"
+
+# Launch two concurrent add-bootnode invocations in the background.
+APEROD_CONFIG="$CFG8" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR1" >/dev/null 2>&1 &
+PID1=$!
+APEROD_CONFIG="$CFG8" bash "$NODE_CONFIG_SH" add-bootnode "$ADDR2" >/dev/null 2>&1 &
+PID2=$!
+
+wait $PID1; EXIT1=$?
+wait $PID2; EXIT2=$?
+
+if [[ $EXIT1 -eq 0 && $EXIT2 -eq 0 ]]; then
+  pass "both concurrent add-bootnode calls exited 0"
+else
+  fail "concurrent add-bootnode: exit codes were $EXIT1 and $EXIT2 (expected both 0)"
+fi
+
+if is_valid_yaml "$CFG8"; then
+  pass "node.yaml is valid YAML after concurrent adds"
+else
+  fail "node.yaml is invalid YAML after concurrent adds"
+fi
+
+COUNT8=$(bootnode_count "$CFG8")
+if [[ "$COUNT8" -eq 2 ]]; then
+  pass "both bootnodes present after concurrent adds (count=$COUNT8)"
+else
+  fail "expected 2 bootnodes after concurrent adds, got '$COUNT8'"
+fi
+
+CONTENT8=$(<"$CFG8")
+ADDR1_FOUND=0; ADDR2_FOUND=0
+echo "$CONTENT8" | grep -qF "$ADDR1" && ADDR1_FOUND=1
+echo "$CONTENT8" | grep -qF "$ADDR2" && ADDR2_FOUND=1
+
+if [[ $ADDR1_FOUND -eq 1 && $ADDR2_FOUND -eq 1 ]]; then
+  pass "both ADDR1 and ADDR2 are present in the final config"
+else
+  fail "one or both addresses missing from config after concurrent adds (ADDR1=$ADDR1_FOUND ADDR2=$ADDR2_FOUND)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
