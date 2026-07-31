@@ -364,6 +364,14 @@ func (m *Mempool) SelectTxs(n int) []Transaction {
 }
 
 // Count returns the number of pending transactions.
+// MempoolConfig returns a snapshot of the config the pool was created with.
+// Useful for exposing limits in metrics endpoints.
+func (m *Mempool) MempoolConfig() MempoolConfig {
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+        return m.cfg
+}
+
 func (m *Mempool) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

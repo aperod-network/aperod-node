@@ -34,6 +34,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/transactions/", s.restTransaction)
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
+        s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
         s.mux.HandleFunc("/api/v1/validators", s.restValidators)
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
         s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
@@ -648,21 +649,23 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                         "mempool_count":            s.mempool.Count(),
                         "tps_last_10":              tps,
                         "block_time_secs":          3,
-                        "timestamp_rejected_count": s.TimestampRejectedCount(),
-                        "peer_count":               s.livePeerCount(),
+                        "timestamp_rejected_count":   s.TimestampRejectedCount(),
+                        "peer_count":                 s.livePeerCount(),
+                        "pending_handshakes":          s.livePendingHandshakes(),
                 })
                 return
         }
 
         writeJSON(w, http.StatusOK, map[string]interface{}{
-                "height":                   0,
-                "tip_hash":                 "",
-                "tip_time":                 "",
-                "total_txs":                0,
-                "mempool_count":            s.mempool.Count(),
-                "tps_last_10":              0,
-                "timestamp_rejected_count": s.TimestampRejectedCount(),
-                "peer_count":               s.livePeerCount(),
+                "height":                     0,
+                "tip_hash":                   "",
+                "tip_time":                   "",
+                "total_txs":                  0,
+                "mempool_count":              s.mempool.Count(),
+                "tps_last_10":                0,
+                "timestamp_rejected_count":   s.TimestampRejectedCount(),
+                "peer_count":                 s.livePeerCount(),
+                "pending_handshakes":          s.livePendingHandshakes(),
         })
 }
 
@@ -672,6 +675,15 @@ func (s *Server) livePeerCount() int {
                 return 0
         }
         return s.peerCounter()
+}
+
+// livePendingHandshakes returns the number of inbound connections currently in
+// the TLS handshake phase, or 0 if the counter has not been wired (Task #504).
+func (s *Server) livePendingHandshakes() int64 {
+        if s.pendingHandshakeCounter == nil {
+                return 0
+        }
+        return s.pendingHandshakeCounter()
 }
 
 // ─── GET /api/v1/validators ──────────────────────────────────────────────────
@@ -1064,5 +1076,30 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 AmountAPR: req.AmountAPR,
                 Address:   req.Address,
                 BlindHex:  blindHex,
+        })
+}
+
+// ─── GET /api/v1/network/mempool (Task #435) ─────────────────────────────────
+//
+// Returns live mempool metrics: pending transaction count, total bytes in the
+// pool, and the configured capacity limits.  Operators can poll this endpoint
+// to detect congestion or flood conditions without parsing the full stats page.
+
+func (s *Server) restMempoolMetrics(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+
+        count      := s.mempool.Count()
+        totalBytes := s.mempool.TotalBytes()
+        cfg        := s.mempool.MempoolConfig()
+
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "count":       count,
+                "total_bytes": totalBytes,
+                "max_size":    cfg.MaxSize,
+                "max_bytes":   cfg.MaxBytes,
+                "max_tx_size": cfg.MaxTxSize,
         })
 }

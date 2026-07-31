@@ -31,7 +31,8 @@ type Server struct {
         apiKey      string   // optional; empty = dev mode (no auth)
         corsOrigins []string // empty = allow all ("*")
         rateLimiter *RateLimiter
-        peerCounter func() int // optional; wired to p2p.Host.PeerCount by cmd/node
+        peerCounter            func() int   // optional; wired to p2p.Host.PeerCount by cmd/node
+        pendingHandshakeCounter func() int64 // optional; wired to p2p.Host.PendingHandshakes by cmd/node
         // tsRejectedCounter returns the count of blocks rejected by the timejacking guard.
         // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
         tsRejectedCounter func() int64
@@ -92,6 +93,11 @@ func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
 func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
+
+// SetPendingHandshakeCounter wires a function returning the number of inbound
+// connections currently in the TLS handshake phase so /api/v1/network/stats
+// can report it (Task #504).
+func (s *Server) SetPendingHandshakeCounter(f func() int64) { s.pendingHandshakeCounter = f }
 
 // BanEntry is a snapshot of one active P2P ban entry, returned by the REST API.
 type BanEntry struct {

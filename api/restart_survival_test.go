@@ -252,3 +252,66 @@ func TestREST_NetworkStats_TxCountIncrements(t *testing.T) {
 		t.Errorf("total_txs = %v, want %v", resp["total_txs"], want)
 	}
 }
+
+// ── Task #510: node identity endpoint accessible after restart ─────────────────
+//
+// SetNodeIdentity stores the fingerprint, listen addr, and nodeID in memory.
+// If the server is recreated (simulating a restart) and SetNodeIdentity is
+// called again, /api/v1/network/identity must still return the correct values.
+
+func TestREST_NodeIdentity_AccessibleAfterRestart(t *testing.T) {
+const (
+        wantNodeID    = "deadbeef01234567"
+        wantFingerpr  = "AA:BB:CC:DD:EE:FF"
+        wantListenAddr = "0.0.0.0:30303"
+)
+
+_, chain := buildSeededStore(t, 1, 0)
+mp := core.NewMempool(core.DefaultMempoolConfig())
+utxos := core.NewUTXOSet()
+
+// Simulate fresh node start
+srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+srv.SetNodeIdentity(wantFingerpr, wantListenAddr, wantNodeID)
+
+// First request — must return identity
+req := httptest.NewRequest(http.MethodGet, "/api/v1/network/identity", nil)
+rr := httptest.NewRecorder()
+srv.ServeHTTP(rr, req)
+if rr.Code != http.StatusOK {
+        t.Fatalf("status = %d, want 200", rr.Code)
+}
+var first map[string]interface{}
+_ = json.NewDecoder(rr.Body).Decode(&first)
+if first["tls_fingerprint"] != wantFingerpr {
+        t.Errorf("tls_fingerprint = %v, want %q", first["tls_fingerprint"], wantFingerpr)
+}
+if first["node_id"] != wantNodeID {
+        t.Errorf("node_id = %v, want %q", first["node_id"], wantNodeID)
+}
+if first["listen_addr"] != wantListenAddr {
+        t.Errorf("listen_addr = %v, want %q", first["listen_addr"], wantListenAddr)
+}
+
+// Simulate a restart: recreate the server and re-apply identity
+srv2 := api.NewServer(":0", chain, mp, utxos, testLogger())
+srv2.SetNodeIdentity(wantFingerpr, wantListenAddr, wantNodeID)
+
+req2 := httptest.NewRequest(http.MethodGet, "/api/v1/network/identity", nil)
+rr2 := httptest.NewRecorder()
+srv2.ServeHTTP(rr2, req2)
+if rr2.Code != http.StatusOK {
+        t.Fatalf("post-restart status = %d, want 200", rr2.Code)
+}
+var second map[string]interface{}
+_ = json.NewDecoder(rr2.Body).Decode(&second)
+if second["tls_fingerprint"] != wantFingerpr {
+        t.Errorf("post-restart tls_fingerprint = %v, want %q", second["tls_fingerprint"], wantFingerpr)
+}
+if second["node_id"] != wantNodeID {
+        t.Errorf("post-restart node_id = %v, want %q", second["node_id"], wantNodeID)
+}
+if second["listen_addr"] != wantListenAddr {
+        t.Errorf("post-restart listen_addr = %v, want %q", second["listen_addr"], wantListenAddr)
+}
+}

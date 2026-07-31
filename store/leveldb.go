@@ -191,6 +191,31 @@ func (d *DB) GetMeta(key string) ([]byte, error) {
         return d.get(k)
 }
 
+// StoreTxTotal persists the cumulative non-coinbase transaction count as a
+// metadata value so the API server can restore the counter after a restart
+// without scanning all blocks.
+func (d *DB) StoreTxTotal(n int64) error {
+        buf := make([]byte, 8)
+        binary.LittleEndian.PutUint64(buf, uint64(n))
+        return d.PutMeta("tx_total", buf)
+}
+
+// LoadTxTotal returns the stored cumulative transaction count.
+// Returns (0, nil) if the value has never been stored (e.g. fresh chain).
+func (d *DB) LoadTxTotal() (int64, error) {
+        v, err := d.GetMeta("tx_total")
+        if err != nil {
+                return 0, err
+        }
+        if v == nil {
+                return 0, nil
+        }
+        if len(v) != 8 {
+                return 0, fmt.Errorf("store: tx_total metadata corrupted (got %d bytes, want 8)", len(v))
+        }
+        return int64(binary.LittleEndian.Uint64(v)), nil
+}
+
 // PutTip records the current canonical chain tip hash and height.
 func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
         if err := d.PutMeta("tip/hash", hash[:]); err != nil {

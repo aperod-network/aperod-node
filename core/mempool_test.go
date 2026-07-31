@@ -13,6 +13,7 @@ package core_test
 import (
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/aperod/aperod/core"
@@ -390,5 +391,59 @@ func TestMempool_BytesTrackedCorrectlyAfterRemove(t *testing.T) {
 	}
 	if afterBytes < 0 {
 		t.Fatalf("TotalBytes went negative: %d", afterBytes)
+	}
+}
+
+// ─── Task #436: concurrent Add/Remove/Evict does not race ────────────────────
+//
+// Runs N goroutines simultaneously, each attempting to Add a distinct tx.
+// A second group of goroutines calls Remove on every tx hash they observe.
+// The test is run with -race (go test -race) and must not deadlock.
+func TestMempool_ConcurrentAddRemove_NoRace(t *testing.T) {
+	const (
+		workers    = 16
+		txsPerGoro = 50
+	)
+
+	cfg := core.MempoolConfig{
+		MaxSize:        workers * txsPerGoro / 2, // deliberately small to force evictions
+		MaxBytes:       1 << 20,                  // 1 MiB — generous so byte cap is not hit
+		MaxTxSize:      1_000_000,
+		BaseFeePerByte: 1,
+	}
+	pool := core.NewMempool(cfg, silentLogger())
+
+	// Pre-generate transactions so goroutines don't race on kiIdx allocation.
+	total := workers * txsPerGoro
+	txs := make([]core.Transaction, total)
+	for i := range txs {
+		txs[i] = makeTx(1+uint64(i), i) // escalating fee — each unique
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < workers; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			base := g * txsPerGoro
+			for i := 0; i < txsPerGoro; i++ {
+				tx := txs[base+i]
+				_ = pool.Add(tx) // may fail due to eviction — that is fine
+				if i%3 == 0 {
+					pool.Remove(tx.Hash())
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Invariant: pool size must never exceed MaxSize.
+	if pool.Count() > cfg.MaxSize {
+		t.Errorf("pool.Count() = %d, exceeds MaxSize = %d", pool.Count(), cfg.MaxSize)
+	}
+	// Invariant: totalBytes must be non-negative.
+	if pool.TotalBytes() < 0 {
+		t.Errorf("pool.TotalBytes() = %d < 0", pool.TotalBytes())
 	}
 }

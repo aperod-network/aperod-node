@@ -253,6 +253,13 @@ func (h *Host) PeerCount() int {
         return len(h.peers)
 }
 
+// PendingHandshakes returns the number of inbound TCP connections that are
+// currently in the TLS handshake phase.  Operators can watch this counter
+// to detect a TLS-handshake flood (see Task #504).
+func (h *Host) PendingHandshakes() int64 {
+        return h.pendingHandshakes.Load()
+}
+
 // ListBans returns a snapshot of all currently active P2P bans.
 func (h *Host) ListBans() []BanInfo {
         return h.mgr.ListBans()

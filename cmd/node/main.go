@@ -263,41 +263,79 @@ func run() error {
                 // confidence — the node would accept blocks that re-spend key images
                 // from the uncovered height range, which is the exact vulnerability
                 // this fix is meant to close.  Aborting is the only safe behaviour.
-                log.Info("rebuilding spent key-image set from full chain history",
+                // Fast path: read key images from the per-block LevelDB index
+                // written by OnBlockProduced, so we never decode raw blocks on
+                // restart.  Falls back to a full block scan if the index is
+                // missing or empty (e.g. after upgrading from an older version).
+                log.Info("loading spent key-image set from database index",
                         "tip_height", tipHeight)
                 kiCount := 0
-                var txCount int64 = 0
-                for h := uint64(1); h <= tipHeight; h++ {
-                        raw, fetchErr := db.GetRawBlockByHeight(h)
-                        if fetchErr != nil || raw == nil {
-                                return fmt.Errorf(
-                                        "key-image rebuild failed: block at height %d missing from store (%v) — "+
-                                                "node cannot start safely; repair the store and restart",
-                                        h, fetchErr)
+                kiIterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
+                        utxos.MarkSpent(ki)
+                        kiCount++
+                        return nil
+                })
+                if kiIterErr != nil || (kiCount == 0 && tipHeight > 0) {
+                        // Index absent or corrupt — fall back to full block scan (fail-closed).
+                        if kiIterErr != nil {
+                                log.Warn("key-image index error; falling back to full block scan",
+                                        "err", kiIterErr, "tip_height", tipHeight)
+                        } else {
+                                log.Warn("key-image index is empty on a non-genesis chain; "+
+                                        "falling back to full block scan",
+                                        "tip_height", tipHeight)
                         }
-                        var b core.Block
-                        if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
-                                return fmt.Errorf(
-                                        "key-image rebuild failed: cannot decode block at height %d: %w — "+
-                                                "node cannot start safely; repair the store and restart",
-                                        h, parseErr)
-                        }
-                        for txIdx, tx := range b.Txs {
-                                for _, inp := range tx.Inputs {
-                                        utxos.MarkSpent(inp.KeyImage)
-                                        kiCount++
+                        kiCount = 0
+                        var txCount int64 = 0
+                        for h := uint64(1); h <= tipHeight; h++ {
+                                raw, fetchErr := db.GetRawBlockByHeight(h)
+                                if fetchErr != nil || raw == nil {
+                                        return fmt.Errorf(
+                                                "key-image rebuild failed: block at height %d missing from store (%v) — "+
+                                                        "node cannot start safely; repair the store and restart",
+                                                h, fetchErr)
                                 }
-                                // Count non-coinbase transactions for the /network/stats total.
-                                if !(txIdx == 0 && tx.IsCoinbase()) {
-                                        txCount++
+                                var b core.Block
+                                if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
+                                        return fmt.Errorf(
+                                                "key-image rebuild failed: cannot decode block at height %d: %w — "+
+                                                        "node cannot start safely; repair the store and restart",
+                                                h, parseErr)
+                                }
+                                for txIdx, tx := range b.Txs {
+                                        for _, inp := range tx.Inputs {
+                                                utxos.MarkSpent(inp.KeyImage)
+                                                kiCount++
+                                                // Also backfill the index so next restart is fast.
+                                                _ = db.MarkKeyImageSpent(inp.KeyImage)
+                                        }
+                                        // Count non-coinbase transactions for the /network/stats total.
+                                        if !(txIdx == 0 && tx.IsCoinbase()) {
+                                                txCount++
+                                        }
                                 }
                         }
+                        // Persist tx total so the fast restart path can restore it.
+                        if err := db.StoreTxTotal(txCount); err != nil {
+                                log.Warn("failed to persist tx total after block scan", "err", err)
+                        }
+                        initialTxTotal = txCount
+                        log.Info("spent key-image set rebuilt (full block scan fallback)",
+                                "key_images_marked", kiCount,
+                                "blocks_scanned", tipHeight,
+                                "total_txs_counted", txCount)
+                } else {
+                        // Index loaded successfully — restore the tx total from DB metadata.
+                        storedTotal, loadErr := db.LoadTxTotal()
+                        if loadErr != nil {
+                                log.Warn("could not read stored tx total — counter starts from 0",
+                                        "err", loadErr)
+                        }
+                        initialTxTotal = storedTotal
+                        log.Info("spent key-image set loaded from index",
+                                "key_images", kiCount,
+                                "tx_total_restored", initialTxTotal)
                 }
-                initialTxTotal = txCount
-                log.Info("spent key-image set rebuilt",
-                        "key_images_marked", kiCount,
-                        "blocks_scanned", tipHeight,
-                        "total_txs_counted", txCount)
         }
 
         // initialTxTotal is populated by the key-image rebuild loop above (full
@@ -344,6 +382,12 @@ func run() error {
                                 }
                                 if delta > 0 {
                                         apiSrv.AddTxCount(delta)
+                                        // Persist updated total so a fast restart can
+                                        // restore the counter without a full block scan.
+                                        if storeErr := db.StoreTxTotal(apiSrv.TxTotal()); storeErr != nil {
+                                                log.Warn("failed to persist tx total",
+                                                        "height", block.Header.Height, "err", storeErr)
+                                        }
                                 }
                         }
                         // Broadcast newly produced block to P2P peers (non-blocking).
@@ -495,6 +539,7 @@ func run() error {
                                 defer host.Stop()
                                 if apiSrv != nil {
                                         apiSrv.SetPeerCounter(host.PeerCount)
+                                apiSrv.SetPendingHandshakeCounter(host.PendingHandshakes)
                                 apiSrv.SetBanListFunc(func() []api.BanEntry {
                                         bans := host.ListBans()
                                         out := make([]api.BanEntry, len(bans))
