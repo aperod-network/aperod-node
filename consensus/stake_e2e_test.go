@@ -11,9 +11,16 @@ package consensus_test
 //   6. Confirm the burned UTXO is no longer in the active set.
 
 import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -611,6 +618,149 @@ func TestStakeDeposit_IncomingBlock_TopupBelowMinimum(t *testing.T) {
 		t.Error("burn UTXO was removed from active set despite block rejection — should still be spendable")
 	}
 	t.Log("burn UTXO correctly unchanged (block rejected before any state mutation)")
+}
+
+// TestStakeDeposit_BadCommit_E2E_NeverReachesChain is the full end-to-end test
+// that wires a real UTXOSet, Mempool, consensus Engine, and REST Server together
+// and confirms that a stake deposit with a mismatched Pedersen commitment is:
+//  1. Rejected at the REST handler (422 Unprocessable Entity).
+//  2. Never admitted to the mempool.
+//  3. Never included in a self-produced block.
+//
+// This closes the gap between the unit-level handler test
+// (TestREST_StakeBroadcast_CommitmentMismatch) and the incoming-block test
+// (TestStakeDeposit_IncomingBlock_CommitMismatch) by exercising the full
+// REST → mempool → engine path end-to-end.
+func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
+	// ── 1. Keys ───────────────────────────────────────────────────────────────
+	proposerPriv, proposerPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal("GenerateValidatorKey (proposer):", err)
+	}
+	stakerPriv, stakerPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal("GenerateValidatorKey (staker):", err)
+	}
+
+	// ── 2. UTXO with the CORRECT commitment ───────────────────────────────────
+	const stakeAmountNAPR uint64 = 10_000_000_000_000 // 100 000 APRO
+
+	var spendPub crypto.Point32
+	copy(spendPub[:], []byte(stakerPub))
+
+	realBlind, err := crypto.DeterministicMintBlind(spendPub, stakeAmountNAPR)
+	if err != nil {
+		t.Fatal("DeterministicMintBlind:", err)
+	}
+	realCommit, err := crypto.Commit(stakeAmountNAPR, realBlind)
+	if err != nil {
+		t.Fatal("Commit:", err)
+	}
+
+	var burnTxHash crypto.Hash32
+	for i := range burnTxHash {
+		burnTxHash[i] = 0x9E
+	}
+	const burnOutIdx uint32 = 0
+
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:       burnTxHash,
+		OutputIndex:  burnOutIdx,
+		OneTimePub:   spendPub,
+		AmountCommit: realCommit,
+	})
+
+	// ── 3. Shared Mempool and Chain ───────────────────────────────────────────
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
+
+	// ── 4. REST Server wired to the same UTXOSet + Mempool + Chain ────────────
+	srv := api.NewServer(":0", chain, mp, utxos, newNopLogger())
+
+	// ── 5. Build a stake payload with a WRONG (all-zero) blind ───────────────
+	// Commit(amount, zeroBlind) ≠ realCommit so the handler must reject it.
+	var wrongBlind crypto.BlindFactor // all zeros
+	msg := core.StakeSignMsgV2(core.StakeDeposit, stakerPub, stakeAmountNAPR, burnTxHash, burnOutIdx)
+	sig, err := stakerPriv.Sign(msg)
+	if err != nil {
+		t.Fatal("Sign:", err)
+	}
+	extra, err := core.EncodeStakeExtraV2(
+		core.StakeDeposit, stakerPub, stakeAmountNAPR, sig,
+		burnTxHash, burnOutIdx, wrongBlind,
+	)
+	if err != nil {
+		t.Fatal("EncodeStakeExtraV2:", err)
+	}
+	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
+
+	// ── 6. POST to the REST handler ────────────────────────────────────────────
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stake", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	// ── 7. Assert the handler rejected with 422 ───────────────────────────────
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("REST handler status = %d, want 422 (UnprocessableEntity); body = %s",
+			rr.Code, rr.Body.String())
+	} else {
+		t.Log("OK: REST handler rejected bad commitment with 422")
+	}
+	var respJSON map[string]interface{}
+	_ = json.NewDecoder(strings.NewReader(rr.Body.String())).Decode(&respJSON)
+	if errMsg, _ := respJSON["error"].(string); !strings.Contains(errMsg, "commitment mismatch") {
+		t.Errorf("error message = %q, want it to contain \"commitment mismatch\"", errMsg)
+	}
+
+	// ── 8. Mempool must be empty — the tx was never admitted ─────────────────
+	if mp.Count() != 0 {
+		t.Errorf("mempool.Count() = %d after rejected deposit, want 0", mp.Count())
+	} else {
+		t.Log("OK: mempool is empty after rejected deposit")
+	}
+
+	// ── 9. Wire the Engine and confirm no bad stake tx in the produced block ──
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{proposerPub}, 10_000_000_000_000)
+
+	lk, err := crypto.NewLockedValidatorKey(proposerPriv.Bytes(), nil)
+	if err != nil {
+		t.Fatal("NewLockedValidatorKey:", err)
+	}
+	defer lk.Destroy()
+
+	eng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   []crypto.ValidatorPubKey{proposerPub},
+		MyKey:        lk,
+		Registry:     registry,
+	}, chain, mp, newNopLogger())
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	var producedBlock *core.Block
+	select {
+	case producedBlock = <-eng.ProducedCh():
+		t.Logf("block produced: height=%d txs=%d", producedBlock.Header.Height, len(producedBlock.Txs))
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: engine did not produce a block in 2s")
+	}
+
+	// The produced block must contain no stake tx (mempool was empty).
+	for _, tx := range producedBlock.Txs {
+		if tx.Version == core.TxVersionStake {
+			t.Errorf("produced block contains a stake tx %x — bad commitment deposit leaked into the chain",
+				func() []byte { h := tx.Hash(); return h[:8] }())
+		}
+	}
+	t.Log("OK: produced block contains no stake tx — bad commitment deposit never reached the chain")
 }
 
 // TestStakeDeposit_SelfProduced_ResumesAfterDuplicateEviction verifies that
