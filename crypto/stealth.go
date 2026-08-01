@@ -31,7 +31,22 @@ func CreateStealthOutput(spendPub, viewPub Point32) (*StealthOutput, error) {
         if err != nil {
                 return nil, fmt.Errorf("random scalar: %w", err)
         }
+        return createStealthOutputWithScalar(spendPub, viewPub, rScalar)
+}
 
+// CreateStealthOutputFromEphemeralBytes generates a stealth output with a
+// caller-supplied 32-byte little-endian ephemeral scalar r (1 ≤ r < \u2113).
+// Intended for deterministic testing: a fixed r produces a reproducible vector.
+func CreateStealthOutputFromEphemeralBytes(spendPub, viewPub Point32, rBytes [32]byte) (*StealthOutput, error) {
+        rScalar, err := new(edwards25519.Scalar).SetCanonicalBytes(rBytes[:])
+        if err != nil {
+                return nil, fmt.Errorf("ephemeral scalar: %w", err)
+        }
+        return createStealthOutputWithScalar(spendPub, viewPub, rScalar)
+}
+
+// createStealthOutputWithScalar is the shared implementation used by both exported entry points.
+func createStealthOutputWithScalar(spendPub, viewPub Point32, rScalar *edwards25519.Scalar) (*StealthOutput, error) {
         R := (&edwards25519.Point{}).ScalarBaseMult(rScalar)
 
         V, err := PointFromBytes(viewPub[:])
@@ -62,6 +77,7 @@ func CreateStealthOutput(spendPub, viewPub Point32) (*StealthOutput, error) {
                 HsScalar:   hs,
         }, nil
 }
+
 
 // CreateStealthAddress generates a one-time stealth address for sending to (spendPub, viewPub).
 //

@@ -641,6 +641,180 @@ func TestREST_AddressUTXOs_MintHeightMatch(t *testing.T) {
         }
 }
 
+// TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey confirms that a
+// genuine stealth UTXO (TxPubKey ≠ zero, OneTimePub derived via ECDH) is
+// intentionally NOT returned by the address/utxos endpoint when no view key is
+// supplied.  This is the expected behaviour, not a bug — the server cannot
+// reverse the Diffie-Hellman without the receiver's private view key.
+//
+// The second sub-test verifies that supplying view_key_hex resolves the gap:
+// the same stealth UTXO is discovered and amount_napr is decoded inline.
+func TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+	// Build a genuine stealth output for this wallet.
+	stealthOut, err := crypto.CreateStealthOutput(wk.Spend.Public, wk.View.Public)
+	if err != nil {
+		t.Fatalf("CreateStealthOutput: %v", err)
+	}
+
+	// Encrypt a fake amount (500 nAPRO) so amount_napr can be decoded later.
+	const testAmountNapr = uint64(500)
+	encAmt := core.EncryptAmount(testAmountNapr, &stealthOut.HsScalar)
+
+	var txHash crypto.Hash32
+	txHash[0] = 0x5E
+
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		OneTimePub:  stealthOut.OneTimePub,
+		TxPubKey:    stealthOut.TxPubKey,
+		EncAmount:   encAmt,
+		BlockHeight: 1,
+	})
+
+	// ── Without view key: stealth output must be absent ──────────────────────
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 0 {
+		t.Errorf("without view key: utxos count = %d, want 0 — stealth output must NOT be returned without view-key scan (expected gap, not a bug)", len(list))
+	}
+	note, _ := resp["note"].(string)
+	if note == "" {
+		t.Error("without view key: expected a non-empty note documenting the stealth limitation")
+	}
+
+	// ── With view key: stealth output must be present and amount decoded ─────
+	viewKeyHex := hex.EncodeToString(wk.View.Private[:])
+	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos?view_key_hex="+viewKeyHex)
+	if code2 != http.StatusOK {
+		t.Fatalf("with view key: status = %d, want 200", code2)
+	}
+	list2, _ := resp2["utxos"].([]interface{})
+	if len(list2) != 1 {
+		t.Fatalf("with view key: utxos count = %d, want 1", len(list2))
+	}
+	entry := list2[0].(map[string]interface{})
+	if entry["tx_hash"] != hex.EncodeToString(txHash[:]) {
+		t.Errorf("with view key: tx_hash = %v, want %s", entry["tx_hash"], hex.EncodeToString(txHash[:]))
+	}
+	if entry["amount_napr"] == nil {
+		t.Error("with view key: amount_napr must be decoded (non-null) for stealth output")
+	} else if uint64(entry["amount_napr"].(float64)) != testAmountNapr {
+		t.Errorf("with view key: amount_napr = %v, want %d", entry["amount_napr"], testAmountNapr)
+	}
+}
+
+// TestREST_ScanOutputs_ReturnsStealthFields verifies that GET /api/v1/scan/outputs
+// returns all fields required for a client-side stealth scan (one_time_pub_hex,
+// tx_pub_key_hex, enc_amount_hex) and respects from_height / limit pagination.
+func TestREST_ScanOutputs_ReturnsStealthFields(t *testing.T) {
+	srv, _ := buildChainServer(t, 3) // genesis + 3 blocks, each with a coinbase tx
+
+	code, resp := restGet(t, srv, "/api/v1/scan/outputs?from_height=0&limit=50")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	outputs, ok := resp["outputs"].([]interface{})
+	if !ok || len(outputs) == 0 {
+		t.Fatalf("expected non-empty outputs array, got %v", resp["outputs"])
+	}
+
+	// Every output must carry the stealth-scan fields.
+	for i, raw := range outputs {
+		entry, _ := raw.(map[string]interface{})
+		for _, field := range []string{"tx_hash", "out_idx", "block_height",
+			"one_time_pub_hex", "tx_pub_key_hex", "amount_commit_hex", "enc_amount_hex"} {
+			if entry[field] == nil {
+				t.Errorf("output[%d] missing field %q", i, field)
+			}
+		}
+	}
+
+	// note must be present (documents that view key stays on device).
+	if resp["note"] == nil || resp["note"] == "" {
+		t.Error("expected non-empty note in response")
+	}
+}
+
+// TestREST_ScanOutputs_Pagination verifies that limit and from_height are honoured.
+func TestREST_ScanOutputs_Pagination(t *testing.T) {
+	srv, _ := buildChainServer(t, 5)
+
+	code, resp := restGet(t, srv, "/api/v1/scan/outputs?from_height=1&limit=2")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	// limit=2 caps the output count at 2 (assuming ≥1 output per block)
+	outputs, _ := resp["outputs"].([]interface{})
+	if len(outputs) > 2 {
+		t.Errorf("limit=2: got %d outputs, want ≤2", len(outputs))
+	}
+	// All returned outputs must be at height ≥1
+	for _, raw := range outputs {
+		entry := raw.(map[string]interface{})
+		if entry["block_height"].(float64) < 1 {
+			t.Errorf("from_height=1: got output at height %v", entry["block_height"])
+		}
+	}
+}
+
+// TestREST_AddressScan_PostViewKey verifies POST /api/v1/address/{addr}/scan
+// with the view key in the request body discovers stealth outputs and decodes amounts.
+func TestREST_AddressScan_PostViewKey(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+	stealthOut, err := crypto.CreateStealthOutput(wk.Spend.Public, wk.View.Public)
+	if err != nil {
+		t.Fatalf("CreateStealthOutput: %v", err)
+	}
+	const testAmt = uint64(42_00000000)
+	encAmt := core.EncryptAmount(testAmt, &stealthOut.HsScalar)
+
+	var txHash crypto.Hash32
+	txHash[0] = 0x7A
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		OneTimePub:  stealthOut.OneTimePub,
+		TxPubKey:    stealthOut.TxPubKey,
+		EncAmount:   encAmt,
+		BlockHeight: 1,
+	})
+
+	import_ := `{"view_key_hex":"` + hex.EncodeToString(wk.View.Private[:]) + `"}`
+	code, resp := restPostJSON(t, srv, "/api/v1/address/"+string(addr)+"/scan", []byte(import_))
+	if code != http.StatusOK {
+		t.Fatalf("POST /scan status = %d, want 200: %v", code, resp)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("utxos count = %d, want 1", len(list))
+	}
+	entry := list[0].(map[string]interface{})
+	if entry["amount_napr"] == nil {
+		t.Error("amount_napr must be non-null when view key is provided via POST body")
+	} else if uint64(entry["amount_napr"].(float64)) != testAmt {
+		t.Errorf("amount_napr = %v, want %d", entry["amount_napr"], testAmt)
+	}
+}
+
 func TestWS_Endpoint_Registered(t *testing.T) {
         // golang.org/x/net/websocket requires http.Hijacker; use a real test server.
         srv, _ := newTestServer(t)

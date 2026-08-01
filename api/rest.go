@@ -35,6 +35,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/blocks/", s.restBlockByIDOrTxs)
         s.mux.HandleFunc("/api/v1/transactions/", s.restTransaction)
         s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
+        s.mux.HandleFunc("/api/v1/scan/outputs", s.restScanOutputs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
         s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
         s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
@@ -552,19 +553,33 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 }
 
 func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodGet {
-                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
-                return
-        }
-
-        // Path: /api/v1/address/{addr}/transactions  or  /api/v1/address/{addr}/utxos
+        // Path: /api/v1/address/{addr}/transactions
+        //        /api/v1/address/{addr}/utxos        (GET)
+        //        /api/v1/address/{addr}/scan         (POST — view key in request body)
         tail := pathSuffix("/api/v1/address/", r.URL.Path)
         parts := strings.SplitN(tail, "/", 2)
         addrStr := parts[0]
 
-        // Dispatch sub-paths
+        // Dispatch sub-paths first so they can accept their own HTTP methods.
         if len(parts) >= 2 && parts[1] == "utxos" {
+                if r.Method != http.MethodGet {
+                        writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                        return
+                }
                 s.restAddressUTXOs(w, r, addrStr)
+                return
+        }
+        if len(parts) >= 2 && parts[1] == "scan" {
+                if r.Method != http.MethodPost {
+                        writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+                        return
+                }
+                s.restAddressScan(w, r, addrStr)
+                return
+        }
+
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
                 return
         }
 
@@ -633,6 +648,134 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
                 "address":      addrStr,
                 "transactions": results,
                 "note":         "shows transparent (non-stealth) outputs only; full privacy scanning requires view key",
+        })
+}
+
+// ─── POST /api/v1/address/{addr}/scan ────────────────────────────────────────
+//
+// View-key-assisted stealth scan: accepts the view key in the POST body (not the
+// URL) so it is protected from server/proxy access-log exposure.  Returns the
+// same UTXO shape as the /utxos endpoint plus amount_napr decoded for stealth
+// outputs.  Treat this as an opt-in privacy trade-off: the view key is sent to
+// the server but is NOT sufficient to spend funds (only the spend key can do that).
+
+type scanRequest struct {
+        ViewKeyHex string `json:"view_key_hex"`
+}
+
+func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr string) {
+        var req scanRequest
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+                return
+        }
+        if req.ViewKeyHex == "" {
+                writeJSONError(w, http.StatusBadRequest, "view_key_hex is required")
+                return
+        }
+        // Inject view_key_hex into a cloned GET request so restAddressUTXOs can
+        // read it from the query string.  Cloning avoids mutating shared state
+        // (s.nodeViewKeyHex) which would be a race condition under concurrent calls.
+        q := r.URL.Query()
+        q.Set("view_key_hex", req.ViewKeyHex)
+        r2 := r.Clone(r.Context())
+        r2.Method = http.MethodGet
+        r2.URL.RawQuery = q.Encode()
+        s.restAddressUTXOs(w, r2, addrStr)
+}
+
+// ─── GET /api/v1/scan/outputs ────────────────────────────────────────────────
+//
+// Returns raw transaction outputs from recent blocks, including all fields
+// needed for a client-side stealth scan (one_time_pub_hex, tx_pub_key_hex,
+// enc_amount_hex).  The view key never leaves the client — callers iterate the
+// returned outputs and call checkStealthOutput() locally.
+//
+// Query params:
+//   from_height  (uint64, default 0)  — inclusive start block height
+//   limit        (int, default 50, max 200) — max number of outputs to return
+//
+// Response:
+//   { "outputs": [...], "from_height": N, "next_height": M, "tip_height": T }
+
+type ScanOutput struct {
+        TxHash         string `json:"tx_hash"`
+        OutIdx         int    `json:"out_idx"`
+        BlockHeight    uint64 `json:"block_height"`
+        OneTimePubHex  string `json:"one_time_pub_hex"`
+        TxPubKeyHex    string `json:"tx_pub_key_hex"`
+        AmountCommitHex string `json:"amount_commit_hex"`
+        EncAmountHex   string `json:"enc_amount_hex"`
+}
+
+func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+
+        tip := s.chain.Tip()
+        if tip == nil {
+                writeJSON(w, http.StatusOK, map[string]interface{}{
+                        "outputs":     []ScanOutput{},
+                        "from_height": 0,
+                        "next_height": 0,
+                        "tip_height":  0,
+                        "note":        "scan outputs locally with your view key; view key stays on device",
+                })
+                return
+        }
+        tipHeight := tip.Header.Height
+
+        q := r.URL.Query()
+        fromHeight := uint64(0)
+        if fh := q.Get("from_height"); fh != "" {
+                if n, err := strconv.ParseUint(fh, 10, 64); err == nil {
+                        fromHeight = n
+                }
+        }
+        limit := 50
+        if l := q.Get("limit"); l != "" {
+                if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
+                        limit = n
+                }
+        }
+
+        outputs := make([]ScanOutput, 0, limit)
+        nextHeight := fromHeight
+        for h := fromHeight; h <= tipHeight && len(outputs) < limit; h++ {
+                b := s.chain.GetByHeight(h)
+                if b == nil {
+                        nextHeight = h + 1
+                        continue
+                }
+                for _, tx := range b.Txs {
+                        hash := tx.Hash()
+                        hashHex := fmt.Sprintf("%x", hash[:])
+                        for j, out := range tx.Outputs {
+                                if len(outputs) >= limit {
+                                        break
+                                }
+                                outputs = append(outputs, ScanOutput{
+                                        TxHash:          hashHex,
+                                        OutIdx:          j,
+                                        BlockHeight:     h,
+                                        OneTimePubHex:   fmt.Sprintf("%x", out.OneTimePub[:]),
+                                        TxPubKeyHex:     fmt.Sprintf("%x", out.TxPubKey[:]),
+                                        AmountCommitHex: fmt.Sprintf("%x", out.AmountCommit[:]),
+                                        EncAmountHex:    fmt.Sprintf("%x", out.EncAmount[:]),
+                                })
+                        }
+                }
+                nextHeight = h + 1
+        }
+
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "outputs":     outputs,
+                "from_height": fromHeight,
+                "next_height": nextHeight,
+                "tip_height":  tipHeight,
+                "note":        "scan these outputs locally with your view key; the view key never leaves your device",
         })
 }
 
