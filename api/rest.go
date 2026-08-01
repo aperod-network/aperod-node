@@ -1743,8 +1743,8 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
                 return
         }
-        if math.IsNaN(req.AmountAPR) || math.IsInf(req.AmountAPR, 0) || req.AmountAPR <= 0 || req.AmountAPR > 100_000_000 {
-                writeJSONError(w, http.StatusBadRequest, "amount_apr must be > 0 and <= 100000000")
+        if math.IsNaN(req.AmountAPR) || math.IsInf(req.AmountAPR, 0) || req.AmountAPR <= 0 || req.AmountAPR > 10_000_000_000 {
+                writeJSONError(w, http.StatusBadRequest, "amount_apr must be > 0 and <= 10000000000")
                 return
         }
 
