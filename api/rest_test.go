@@ -715,6 +715,137 @@ func TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey(t *testing.T) {
 	}
 }
 
+// TestREST_AddressUTXOs_RollbackTransparent verifies that after ApplyBlock adds a
+// block containing a transparent output for an address, then RollbackBlock reverts
+// it, the UTXO no longer appears in GET /api/v1/address/{addr}/utxos.
+func TestREST_AddressUTXOs_RollbackTransparent(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	spendPub := wk.Spend.Public
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+
+	// Build a block at height 1 with a transparent output (OneTimePub == spendPub).
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	tx := core.Transaction{
+		Version: core.TxVersionBase,
+		Outputs: []core.Output{
+			{OneTimePub: spendPub},
+		},
+	}
+	txs := []core.Transaction{tx}
+	hdr := core.BlockHeader{
+		Height:       1,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(txs),
+	}
+	_ = hdr.Sign(priv)
+	block := &core.Block{Header: hdr, Txs: txs}
+
+	// Apply the block — the transparent output must appear in the UTXO listing.
+	if err := utxos.ApplyBlock(block); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("post-apply: status = %d, want 200", code)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("post-apply: utxos = %d, want 1 (transparent output must appear after ApplyBlock)", len(list))
+	}
+
+	// Roll back the block — the output must disappear from the UTXO listing.
+	if err := utxos.RollbackBlock(block); err != nil {
+		t.Fatalf("RollbackBlock: %v", err)
+	}
+	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code2 != http.StatusOK {
+		t.Fatalf("post-rollback: status = %d, want 200", code2)
+	}
+	list2, _ := resp2["utxos"].([]interface{})
+	if len(list2) != 0 {
+		t.Errorf("post-rollback: utxos = %d, want 0 (rolled-back transparent UTXO must not appear in listing)", len(list2))
+	}
+}
+
+// TestREST_AddressUTXOs_RollbackCoinbase verifies the same rollback behaviour for
+// coinbase (height-offset mint) outputs, where OneTimePub = spend_pub + height*G.
+func TestREST_AddressUTXOs_RollbackCoinbase(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	spendPub := wk.Spend.Public
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+
+	const mintHeight = uint64(7)
+
+	// Compute mintPub = spendPub + mintHeight*G (mirrors restAddressUTXOs handler).
+	heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(mintHeight))
+	if err != nil {
+		t.Fatalf("ScalarMulBase: %v", err)
+	}
+	mintPub, err := crypto.AddPoints(spendPub, heightPub)
+	if err != nil {
+		t.Fatalf("AddPoints: %v", err)
+	}
+
+	// Build a block at mintHeight with a coinbase-style output (OneTimePub = mintPub).
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	tx := core.Transaction{
+		Version: core.TxVersionBase,
+		Outputs: []core.Output{
+			{OneTimePub: mintPub},
+		},
+	}
+	txs := []core.Transaction{tx}
+	hdr := core.BlockHeader{
+		Height:       mintHeight,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(txs),
+	}
+	_ = hdr.Sign(priv)
+	block := &core.Block{Header: hdr, Txs: txs}
+
+	// Apply the block — the mint output must appear in the UTXO listing.
+	if err := utxos.ApplyBlock(block); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("post-apply: status = %d, want 200", code)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("post-apply: utxos = %d, want 1 (coinbase mint UTXO must appear after ApplyBlock)", len(list))
+	}
+	entry := list[0].(map[string]interface{})
+	if entry["block_height"] != float64(mintHeight) {
+		t.Errorf("post-apply: block_height = %v, want %d", entry["block_height"], mintHeight)
+	}
+
+	// Roll back the block — the mint output must disappear from the UTXO listing.
+	if err := utxos.RollbackBlock(block); err != nil {
+		t.Fatalf("RollbackBlock: %v", err)
+	}
+	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code2 != http.StatusOK {
+		t.Fatalf("post-rollback: status = %d, want 200", code2)
+	}
+	list2, _ := resp2["utxos"].([]interface{})
+	if len(list2) != 0 {
+		t.Errorf("post-rollback: utxos = %d, want 0 (rolled-back coinbase UTXO must not appear in listing)", len(list2))
+	}
+}
+
 // TestREST_ScanOutputs_ReturnsStealthFields verifies that GET /api/v1/scan/outputs
 // returns all fields required for a client-side stealth scan (one_time_pub_hex,
 // tx_pub_key_hex, enc_amount_hex) and respects from_height / limit pagination.
