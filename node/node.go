@@ -111,6 +111,22 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 
         // ── Block/Tx verifiers ────────────────────────────────────────────────────
         txV := core.NewTxVerifier(utxos)
+        // Wire vesting enforcement using the actual genesis block timestamp.
+        // chain.Genesis() is always non-nil here because both fresh-start and resume
+        // paths above call chain.SetGenesis before this point.
+        // Use Header.Timestamp / 1e9 (nanoseconds → seconds) to get Unix seconds.
+        if genesisBlock := chain.Genesis(); genesisBlock != nil {
+                genesisTimeSec := genesisBlock.Header.Timestamp / 1e9
+                if vl, vlErr := core.BuildVestingLock(genesisCfg, genesisTimeSec); vlErr == nil {
+                        txV.SetVestingLock(vl)
+                        log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount())
+                } else {
+                        log.Warn("vesting lock build failed — enforcement disabled", "err", vlErr)
+                }
+        }
+        // Wire the verifier into the mempool so P2P-submitted transactions are
+        // fully verified (ring sigs, range proofs, vesting locks) before entering.
+        mempool.SetVerifier(txV)
         blockV := core.NewBlockVerifier(core.DefaultBlockVerifierConfig(), chain, txV)
 
         // ── Validator key ─────────────────────────────────────────────────────────

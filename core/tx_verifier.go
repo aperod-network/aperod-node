@@ -2,19 +2,106 @@ package core
 
 import (
         "fmt"
+        "time"
 
         "github.com/aperod/aperod/crypto"
 )
 
+// VestingLock holds the genesis vesting state needed to enforce spending
+// restrictions on locked genesis allocations at the protocol level.
+//
+// For each genesis allocation, the OneTimePub of the genesis UTXO equals the
+// spendPub decoded from the allocation address (transparent mint pattern).
+// BuildVestingLock constructs this map from a GenesisConfig.
+type VestingLock struct {
+        // allocs maps OneTimePub → GenesisAlloc for every genesis allocation that
+        // has a non-immediate vesting schedule.
+        allocs map[crypto.Point32]*GenesisAlloc
+        // genesisTime is the Unix-second timestamp of the genesis block.
+        genesisTime int64
+        // nowFn returns the current Unix time in seconds.  Defaults to
+        // time.Now().Unix(); overridable in tests.
+        nowFn func() int64
+}
+
+// BuildVestingLock constructs a VestingLock from the given genesis config and
+// the actual genesis block timestamp (Unix seconds).  The caller must pass the
+// persisted genesis block's Timestamp field divided by 1e9 (the block stores
+// nanoseconds); do NOT pass GenesisConfig.Timestamp which may be zero when the
+// node generates the block on first start.
+//
+// Allocations with placeholder addresses (that fail DecodeAddress) or
+// immediate vesting are silently skipped — only non-immediate locked
+// allocations are tracked.
+func BuildVestingLock(genesis *GenesisConfig, genesisTime int64) (*VestingLock, error) {
+        vl := &VestingLock{
+                allocs:      make(map[crypto.Point32]*GenesisAlloc),
+                genesisTime: genesisTime,
+                nowFn:       func() int64 { return time.Now().Unix() },
+        }
+        for i := range genesis.Allocations {
+                alloc := &genesis.Allocations[i]
+                if alloc.Address == "" {
+                        continue // placeholder
+                }
+                if alloc.Vesting == nil || alloc.Vesting.Type == VestingImmediate || alloc.Vesting.Type == "" {
+                        continue // no locking
+                }
+                _, spendPub, _, err := crypto.DecodeAddress(crypto.Address(alloc.Address))
+                if err != nil {
+                        // Placeholder or invalid address — skip rather than fail.
+                        continue
+                }
+                vl.allocs[spendPub] = alloc
+        }
+        return vl, nil
+}
+
+// LockedAllocsCount returns the number of genesis allocations tracked by this
+// vesting lock (i.e. non-immediate schedules).  Used for startup logging.
+func (vl *VestingLock) LockedAllocsCount() int {
+        return len(vl.allocs)
+}
+
+// NewVestingLockForTest constructs a VestingLock with a pre-built allocs map
+// and a custom nowFn.  Intended exclusively for unit tests that need direct
+// control over the genesis-pub → alloc mapping and the current time.
+func NewVestingLockForTest(allocs map[crypto.Point32]*GenesisAlloc, genesisTime int64, nowFn func() int64) *VestingLock {
+        return &VestingLock{
+                allocs:      allocs,
+                genesisTime: genesisTime,
+                nowFn:       nowFn,
+        }
+}
+
+// lockedAt returns the locked amount for a genesis allocation pub key at the
+// given Unix-second time.  Returns 0 if the pub key is not a tracked genesis
+// allocation or the allocation is fully vested.
+func (vl *VestingLock) lockedAt(pub crypto.Point32, now int64) uint64 {
+        alloc, ok := vl.allocs[pub]
+        if !ok {
+                return 0
+        }
+        return alloc.LockedAmount(now, vl.genesisTime)
+}
+
 // TxVerifier validates the cryptographic integrity of transactions.
 // Separate from Validate() (structural) — this checks ring sigs and range proofs.
 type TxVerifier struct {
-        utxos *UTXOSet
+        utxos       *UTXOSet
+        vestingLock *VestingLock // nil = vesting enforcement disabled
 }
 
 // NewTxVerifier creates a verifier backed by the given UTXO set.
 func NewTxVerifier(utxos *UTXOSet) *TxVerifier {
         return &TxVerifier{utxos: utxos}
+}
+
+// SetVestingLock wires a VestingLock into the verifier so that VerifyTx
+// rejects any transaction whose ring members include a still-locked genesis
+// UTXO.  Call once after BuildVestingLock at node startup.
+func (v *TxVerifier) SetVestingLock(vl *VestingLock) {
+        v.vestingLock = vl
 }
 
 // VerifyTx performs full cryptographic verification of a non-coinbase transaction.
@@ -92,6 +179,32 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                                         return fmt.Errorf("tx %x: input %d AmountCommit does not match "+
                                                 "ring member %x on-chain UTXO commitment (C-0 check)",
                                                 txHashPrefix[:8], i, member[:8])
+                                }
+                        }
+                }
+        }
+
+        // 3c. Vesting lock — reject any transaction that includes a still-locked
+        // genesis UTXO as a ring member.
+        //
+        // Genesis outputs use OneTimePub = spendPub directly (transparent mint),
+        // so each ring member can be cross-checked against the genesis allocation
+        // map without knowing the private key.  Because the real spender is hidden
+        // among ring members we cannot distinguish it from decoys; therefore we
+        // conservatively reject the entire transaction if any ring member is a
+        // locked genesis UTXO.  This closes the protocol gap where vesting was
+        // display-only: a compromised key holder can no longer spend locked tokens
+        // even if they construct a valid ring signature.
+        if v.vestingLock != nil && v.utxos != nil {
+                now := v.vestingLock.nowFn()
+                for i, inp := range tx.Inputs {
+                        for _, member := range inp.Ring {
+                                locked := v.vestingLock.lockedAt(member, now)
+                                if locked > 0 {
+                                        return fmt.Errorf("tx %x: input %d ring member %x is a "+
+                                                "locked genesis allocation (%d nAPRO still locked) — "+
+                                                "spending locked genesis tokens is not permitted",
+                                                txHashPrefix[:8], i, member[:8], locked)
                                 }
                         }
                 }

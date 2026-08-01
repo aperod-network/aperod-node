@@ -530,6 +530,20 @@ func run() error {
         // where blocks are accepted without cryptographic verification (nil verifier
         // = fail-open).  Wiring first closes that window entirely.
         txVerifier := core.NewTxVerifier(utxos)
+        // Wire vesting enforcement so the verifier rejects spending of still-locked
+        // genesis allocations at the protocol level (not just display-only).
+        // Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather
+        // than genesisConfig.Timestamp which may be zero (meaning "use current time")
+        // and would cause all allocations to appear fully vested since Unix epoch.
+        if genesisBlock := chain.Genesis(); genesisBlock != nil {
+                genesisTimeSec := genesisBlock.Header.Timestamp / 1e9
+                if vl, vlErr := core.BuildVestingLock(genesisConfig, genesisTimeSec); vlErr == nil {
+                        txVerifier.SetVestingLock(vl)
+                        log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount(), "genesis_time", genesisTimeSec)
+                } else {
+                        log.Warn("vesting lock build failed — enforcement disabled", "err", vlErr)
+                }
+        }
         engine.SetTxVerifier(txVerifier, utxos)
         // Wire the same verifier into the mempool so Add() runs full RingCT checks
         // (C-0 / C-1 fix: prevents inflation via forged commitments or unbound stake).
