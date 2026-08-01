@@ -462,3 +462,176 @@ func TestVestingEnforcement_SurvivesRestartReplay(t *testing.T) {
 	runRestart(t, "first restart", 0x70, 555)
 	runRestart(t, "second restart", 0x80, 444)
 }
+
+// TestVestingEnforcement_PrunedGenesisStart simulates a light-pruning startup
+// where the genesis block's TxData has been stripped by PruneBlocksOlderThan,
+// so the genesis UTXO is absent from byPubKey (it was never replayed into the
+// in-memory UTXOSet because ApplyBlock over a pruned block adds no outputs).
+//
+// This is the scenario described in the task: does vesting enforcement still
+// work correctly, or does the C-0 ring-member presence check fire first with
+// a misleading "not found in UTXO set" error?
+//
+// Finding: because the vesting check (3b in VerifyTx) now runs BEFORE the C-0
+// check (3c), VestingLock alone is sufficient.  byPubKey does NOT need to be
+// pre-seeded for vesting to fire — the VestingLock reads only from its own
+// allocs map (built from genesis config), independent of the UTXO set state.
+//
+// The test also confirms the complementary case: a non-genesis ring member
+// that IS absent from byPubKey fails with a C-0 error (not a vesting error),
+// which is the correct behaviour for a genuinely missing UTXO.
+func TestVestingEnforcement_PrunedGenesisStart(t *testing.T) {
+	const genesisTime = int64(1_700_000_000)
+	// "now" is 1 day after genesis — well within the 1-year cliff.
+	now := genesisTime + 86400
+
+	teamPub := crypto.Point32{0xCA, 0xFE, 0xBA, 0xBE}
+	commit := crypto.Commitment{0x55}
+
+	// ── Pruned-start UTXOSet: genesis block TxData was stripped ───────────────
+	// Simulate what happens when PruneBlocksOlderThan strips the genesis block:
+	// ApplyBlock on the pruned block adds no outputs (b.Txs is empty), so the
+	// genesis UTXO is absent from byPubKey.  We replicate this by building a
+	// UTXOSet with only recent-block decoys and NO genesis entry.
+	prunedUTXOs := core.NewUTXOSet()
+	// Add recent-block decoy UTXOs (height > 0) — these ARE in byPubKey.
+	for i := 1; i < crypto.RingSize; i++ {
+		decoyPub := crypto.Point32{byte(0x50 + i)}
+		prunedUTXOs.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(0x50 + i)},
+			OutputIndex:  0,
+			OneTimePub:   decoyPub,
+			AmountCommit: commit,
+			BlockHeight:  100, // recent block, not genesis
+		})
+	}
+	// Confirm: genesis UTXO is NOT reachable via byPubKey — this is the
+	// pruned-start state we are testing against.
+	if prunedUTXOs.GetByPubKey(teamPub) != nil {
+		t.Fatal("test setup error: genesis UTXO should be absent from pruned UTXOSet")
+	}
+
+	// ── VestingLock is always available (built from genesis config) ───────────
+	vl := buildTestVestingLock(teamPub, genesisTime, func() int64 { return now })
+	v := core.NewTxVerifier(prunedUTXOs)
+	v.SetVestingLock(vl)
+
+	// ── Sub-test A: spend attempt whose ring[0] is the locked genesis pub ─────
+	//
+	// With the old check ordering (C-0 before vesting), this would produce
+	// "not found in UTXO set — C-0 full check" because teamPub is absent from
+	// byPubKey.  After the fix (vesting before C-0), it must produce a
+	// "locked genesis" error regardless of pruning state.
+	t.Run("locked_genesis_pub_absent_from_byPubKey", func(t *testing.T) {
+		ring := make([]crypto.RingMember, crypto.RingSize)
+		ring[0] = teamPub // locked genesis UTXO — NOT in byPubKey
+		for i := 1; i < crypto.RingSize; i++ {
+			ring[i] = crypto.Point32{byte(0x50 + i)} // present in byPubKey
+		}
+		tx := core.Transaction{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{KeyImage: makeKeyImage(333), Ring: ring, AmountCommit: commit},
+			},
+			Outputs: []core.Output{
+				{OneTimePub: crypto.Point32{0xF7}, AmountCommit: crypto.Commitment{}},
+			},
+			Fee:         500,
+			Signatures:  []*crypto.MLSAGSignature{{}},
+			RangeProofs: []*crypto.RangeProof{{}},
+		}
+
+		err := v.VerifyTx(&tx)
+		if err == nil {
+			t.Fatal("VerifyTx must reject locked genesis spend in pruned-start scenario, got nil")
+		}
+		// Must be a vesting error, not a C-0 error.
+		if !strings.Contains(err.Error(), "locked genesis") {
+			t.Errorf("expected 'locked genesis' error (vesting check before C-0), got: %v", err)
+		}
+		if strings.Contains(err.Error(), "C-0") {
+			t.Errorf("must NOT be a C-0 error when genesis is pruned — vesting should fire first; got: %v", err)
+		}
+	})
+
+	// ── Sub-test B: non-genesis ring member absent from byPubKey ─────────────
+	//
+	// A ring member that was never in the genesis config and is also absent
+	// from byPubKey (fabricated / never-existed UTXO) must still fail C-0 —
+	// this confirms that moving vesting before C-0 does not weaken the C-0 guard.
+	t.Run("fabricated_non_genesis_pub_still_fails_C0", func(t *testing.T) {
+		fabricatedPub := crypto.Point32{0xDE, 0xAD, 0xBE, 0xEF}
+		ring := make([]crypto.RingMember, crypto.RingSize)
+		ring[0] = fabricatedPub // not in genesis allocs AND not in byPubKey
+		for i := 1; i < crypto.RingSize; i++ {
+			ring[i] = crypto.Point32{byte(0x50 + i)} // present in byPubKey
+		}
+		tx := core.Transaction{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{KeyImage: makeKeyImage(222), Ring: ring, AmountCommit: commit},
+			},
+			Outputs: []core.Output{
+				{OneTimePub: crypto.Point32{0xF6}, AmountCommit: crypto.Commitment{}},
+			},
+			Fee:         500,
+			Signatures:  []*crypto.MLSAGSignature{{}},
+			RangeProofs: []*crypto.RangeProof{{}},
+		}
+
+		err := v.VerifyTx(&tx)
+		if err == nil {
+			t.Fatal("VerifyTx must reject fabricated ring member, got nil")
+		}
+		// Must be a C-0 error (not a vesting error — fabricated pub is not in genesis allocs).
+		if !strings.Contains(err.Error(), "C-0") {
+			t.Errorf("expected C-0 error for fabricated ring member, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "locked genesis") {
+			t.Errorf("fabricated non-genesis pub should not trigger vesting check, got: %v", err)
+		}
+	})
+
+	// ── Sub-test C: mempool rejects locked genesis spend even when pruned ─────
+	//
+	// Confirms the full mempool path, not just TxVerifier directly.
+	t.Run("mempool_rejects_locked_spend_pruned_start", func(t *testing.T) {
+		cfg := core.MempoolConfig{
+			MaxSize:        10,
+			MaxBytes:       256 * 1024 * 1024,
+			MaxTxSize:      1_000_000,
+			BaseFeePerByte: 0,
+		}
+		pool := core.NewMempool(cfg, silentLogger())
+		pool.SetVerifier(v)
+
+		ring := make([]crypto.RingMember, crypto.RingSize)
+		ring[0] = teamPub
+		for i := 1; i < crypto.RingSize; i++ {
+			ring[i] = crypto.Point32{byte(0x50 + i)}
+		}
+		tx := core.Transaction{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{KeyImage: makeKeyImage(111), Ring: ring, AmountCommit: commit},
+			},
+			Outputs: []core.Output{
+				{OneTimePub: crypto.Point32{0xF5}, AmountCommit: crypto.Commitment{}},
+			},
+			Fee:         500,
+			Signatures:  []*crypto.MLSAGSignature{{}},
+			RangeProofs: []*crypto.RangeProof{{}},
+		}
+
+		err := pool.Add(tx)
+		if err == nil {
+			t.Fatal("pool.Add() must reject locked genesis spend in pruned-start scenario, got nil")
+		}
+		if !strings.Contains(err.Error(), "locked genesis") {
+			t.Errorf("mempool error must mention 'locked genesis', got: %v", err)
+		}
+		if pool.Count() != 0 {
+			t.Errorf("pool must be empty after rejection, got %d entries", pool.Count())
+		}
+	})
+}

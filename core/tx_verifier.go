@@ -150,7 +150,45 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
         }
 
-        // 3b. Commitment binding — full C-0 fix.
+        // 3b. Vesting lock — reject any transaction that includes a still-locked
+        // genesis UTXO as a ring member.
+        //
+        // ORDERING: This check intentionally runs BEFORE the C-0 ring-member
+        // presence check (3c below).  The VestingLock is built from the genesis
+        // config (address-decode path) and requires only the in-memory allocs
+        // map — it does NOT consult byPubKey.  Running vesting first means a
+        // locked-genesis spend is always rejected with the precise "locked genesis"
+        // error regardless of whether the genesis block's TxData was pruned and
+        // its UTXOs are therefore absent from byPubKey.
+        //
+        // If vesting ran after C-0 and genesis was pruned (UTXOs absent from
+        // byPubKey), the C-0 check would fire first with a misleading
+        // "not found in UTXO set" error rather than the intended vesting error.
+        //
+        // Genesis outputs use OneTimePub = spendPub directly (transparent mint),
+        // so each ring member can be cross-checked against the genesis allocation
+        // map without knowing the private key.  Because the real spender is hidden
+        // among ring members we cannot distinguish it from decoys; therefore we
+        // conservatively reject the entire transaction if any ring member is a
+        // locked genesis UTXO.  This closes the protocol gap where vesting was
+        // display-only: a compromised key holder can no longer spend locked tokens
+        // even if they construct a valid ring signature.
+        if v.vestingLock != nil {
+                now := v.vestingLock.nowFn()
+                for i, inp := range tx.Inputs {
+                        for _, member := range inp.Ring {
+                                locked := v.vestingLock.lockedAt(member, now)
+                                if locked > 0 {
+                                        return fmt.Errorf("tx %x: input %d ring member %x is a "+
+                                                "locked genesis allocation (%d nAPRO still locked) — "+
+                                                "spending locked genesis tokens is not permitted",
+                                                txHashPrefix[:8], i, member[:8], locked)
+                                }
+                        }
+                }
+        }
+
+        // 3c. Commitment binding — full C-0 fix.
         //
         // Every ring member must be present in the UTXO set.  Missing members
         // are rejected outright: an attacker who fabricates a ring member that
@@ -163,9 +201,12 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // Only a UTXO that was burned for staking (MarkStaked) or that
         // genuinely never existed will be absent.
         //
-        // The original "partial" comment about freshly-restarted nodes was
-        // overly conservative: the UTXO set is built from a full chain replay
-        // on startup, so it contains every UTXO ever created.
+        // NOTE ON PRUNED STARTS: In light-pruning mode the genesis block's
+        // TxData may be stripped, meaning genesis UTXOs are absent from
+        // byPubKey.  The vesting check (3b above) is not affected because it
+        // reads only from VestingLock.allocs.  The C-0 check here would
+        // previously fire first and produce a misleading error; the reordering
+        // ensures the vesting error is always surfaced when applicable.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
                         for _, member := range inp.Ring {
@@ -179,32 +220,6 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                                         return fmt.Errorf("tx %x: input %d AmountCommit does not match "+
                                                 "ring member %x on-chain UTXO commitment (C-0 check)",
                                                 txHashPrefix[:8], i, member[:8])
-                                }
-                        }
-                }
-        }
-
-        // 3c. Vesting lock — reject any transaction that includes a still-locked
-        // genesis UTXO as a ring member.
-        //
-        // Genesis outputs use OneTimePub = spendPub directly (transparent mint),
-        // so each ring member can be cross-checked against the genesis allocation
-        // map without knowing the private key.  Because the real spender is hidden
-        // among ring members we cannot distinguish it from decoys; therefore we
-        // conservatively reject the entire transaction if any ring member is a
-        // locked genesis UTXO.  This closes the protocol gap where vesting was
-        // display-only: a compromised key holder can no longer spend locked tokens
-        // even if they construct a valid ring signature.
-        if v.vestingLock != nil && v.utxos != nil {
-                now := v.vestingLock.nowFn()
-                for i, inp := range tx.Inputs {
-                        for _, member := range inp.Ring {
-                                locked := v.vestingLock.lockedAt(member, now)
-                                if locked > 0 {
-                                        return fmt.Errorf("tx %x: input %d ring member %x is a "+
-                                                "locked genesis allocation (%d nAPRO still locked) — "+
-                                                "spending locked genesis tokens is not permitted",
-                                                txHashPrefix[:8], i, member[:8], locked)
                                 }
                         }
                 }
