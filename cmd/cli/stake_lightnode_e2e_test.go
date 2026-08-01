@@ -124,58 +124,106 @@ func buildLightNodeE2EServer(t *testing.T, tipHeight int, keepBlocks uint64) (*h
 // TestStakeLightNodeE2E_WarningWhenClose exercises the full path from the real
 // api.Server (light mode, keepBlocks=50) through the CLI stake command.
 //
-// At tipHeight=46 the UTXO's block is 4 blocks from being pruned, which is
-// ≤ threshold (5), so the server includes blocks_until_pruned=4 and the CLI
-// must print the ⚠️ WARNING line.
+// At tipHeight=46 the UTXO's block is 4 blocks from being pruned.  4 is far
+// below PartialUnbondingBlocks (~43 200), so the CLI must now return a hard
+// rejection error rather than a warning — the commitment cannot be verified
+// before unbonding completes.
 func TestStakeLightNodeE2E_WarningWhenClose(t *testing.T) {
 	const (
 		keepBlocks uint64 = 50
-		tipHeight         = 46 // blocksLeft = 50−46 = 4, threshold = 5 → ⚠️
+		tipHeight         = 46 // blocksLeft = 50−46 = 4 < PartialUnbondingBlocks → rejected
 	)
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
 	resetStakeCmd()
-	out, runErr := runStakeCmd(t, httpSrv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+	_, runErr := runStakeCmd(t, httpSrv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
 
-	// A broadcast error is acceptable — the test server returns 201 ok, so this
-	// should succeed; but even if it doesn't, the warning is printed before the
-	// broadcast attempt, so stdout must already contain ⚠️ WARNING.
-	_ = runErr
-
-	if !strings.Contains(out, "⚠️") || !strings.Contains(out, "WARNING") {
-		t.Errorf(
-			"expected ⚠️ WARNING in stdout when tipHeight=%d, keepBlocks=%d "+
-				"(blocksLeft=4, threshold=5)\ngot stdout:\n%s",
-			tipHeight, keepBlocks, out,
+	// blocks_until_pruned=4 < PartialUnbondingBlocks: the command must error.
+	if runErr == nil {
+		t.Fatalf(
+			"expected rejection error when tipHeight=%d, keepBlocks=%d "+
+				"(blocksLeft=4 < PartialUnbondingBlocks=%d), got nil",
+			tipHeight, keepBlocks, core.PartialUnbondingBlocks,
 		)
 	}
-	// The warning must state the exact block count.
-	if !strings.Contains(out, "4") {
-		t.Errorf("expected blocks_until_pruned count (4) in warning; got stdout:\n%s", out)
+	// The error message must state the exact block count so the operator knows
+	// how close to pruning the UTXO is.
+	if !strings.Contains(runErr.Error(), "4") {
+		t.Errorf("expected block count (4) in rejection error; got: %v", runErr)
 	}
 }
 
 // TestStakeLightNodeE2E_NoWarningWhenFar exercises the same path as above but
-// with tipHeight=44, where blocksLeft=6 > threshold(5), so the server omits
-// blocks_until_pruned and the CLI must NOT print ⚠️ WARNING.
+// with a large keepBlocks so the UTXO is safely far from pruning:
+// blocksLeft=199995 >> PartialUnbondingBlocks(43200), so the server omits
+// blocks_until_pruned and the CLI must NOT error or print ⚠️ WARNING.
 func TestStakeLightNodeE2E_NoWarningWhenFar(t *testing.T) {
 	const (
-		keepBlocks uint64 = 50
-		tipHeight         = 44 // blocksLeft = 50−44 = 6, threshold = 5 → no ⚠️
+		keepBlocks uint64 = 200_000
+		tipHeight         = 5 // blocksLeft = 200 000−5 = 199 995 >> PartialUnbondingBlocks
 	)
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
 	resetStakeCmd()
 	out, runErr := runStakeCmd(t, httpSrv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
-	_ = runErr
 
+	if runErr != nil {
+		t.Fatalf(
+			"expected success when tipHeight=%d, keepBlocks=%d "+
+				"(blocksLeft=199995 >> PartialUnbondingBlocks=%d), got error: %v",
+			tipHeight, keepBlocks, core.PartialUnbondingBlocks, runErr,
+		)
+	}
 	if strings.Contains(out, "⚠️") || strings.Contains(out, "WARNING") {
 		t.Errorf(
-			"unexpected ⚠️ WARNING in stdout when tipHeight=%d, keepBlocks=%d "+
-				"(blocksLeft=6, threshold=5)\ngot stdout:\n%s",
-			tipHeight, keepBlocks, out,
+			"unexpected ⚠️ WARNING in stdout when far from prune window\ngot stdout:\n%s",
+			out,
+		)
+	}
+}
+
+// TestStakeLightNodeE2E_RejectsAtPruneBoundary verifies that the CLI returns
+// a hard rejection when the UTXO's originating block is exactly at the pruning
+// boundary (tipHeight == pruneAt), i.e. blocks_until_pruned=0.
+func TestStakeLightNodeE2E_RejectsAtPruneBoundary(t *testing.T) {
+	const (
+		keepBlocks uint64 = 50
+		tipHeight         = 50 // == pruneAt → blocks_until_pruned=0 → rejected
+	)
+
+	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
+
+	resetStakeCmd()
+	_, runErr := runStakeCmd(t, httpSrv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+
+	if runErr == nil {
+		t.Fatalf(
+			"expected rejection when tipHeight=%d == pruneAt (keepBlocks=%d, blocks_until_pruned=0), got nil",
+			tipHeight, keepBlocks,
+		)
+	}
+}
+
+// TestStakeLightNodeE2E_RejectsPastPruneBoundary verifies that the CLI returns
+// a hard rejection when the UTXO's originating block is past the pruning
+// boundary (tipHeight > pruneAt), i.e. blocks_until_pruned=0.
+func TestStakeLightNodeE2E_RejectsPastPruneBoundary(t *testing.T) {
+	const (
+		keepBlocks uint64 = 50
+		tipHeight         = 52 // > pruneAt=50 → blocks_until_pruned=0 → rejected
+	)
+
+	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
+
+	resetStakeCmd()
+	_, runErr := runStakeCmd(t, httpSrv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+
+	if runErr == nil {
+		t.Fatalf(
+			"expected rejection when tipHeight=%d > pruneAt=%d (keepBlocks=%d, blocks_until_pruned=0), got nil",
+			tipHeight, keepBlocks, keepBlocks,
 		)
 	}
 }

@@ -4,9 +4,15 @@ package api_test
 //
 // The field is emitted only when:
 //   - pruning_mode == "light" (archive nodes never emit it)
-//   - blocksLeft (= UTXO.BlockHeight + keep_blocks − tipHeight) ≤ keep_blocks/10
+//   - blocksLeft (= UTXO.BlockHeight + keep_blocks − tipHeight) ≤
+//     max(keep_blocks/10, core.PartialUnbondingBlocks)
 //
-// The tests cover boundary cases around the 10 % threshold.
+// The effective threshold is therefore at least PartialUnbondingBlocks so the
+// CLI always receives the field when the UTXO would be pruned before the
+// unbonding period completes, regardless of keep_blocks size.
+//
+// The tests cover boundary cases around both the 10 % threshold and the
+// PartialUnbondingBlocks floor.
 
 import (
 	"encoding/json"
@@ -134,17 +140,19 @@ func TestUTXOPruneWarning_FieldPresentWithCorrectValue(t *testing.T) {
 }
 
 // TestUTXOPruneWarning_FieldAbsentWhenFar verifies that blocks_until_pruned is
-// NOT present when the UTXO is still safely far from the prune window.
+// NOT present when the UTXO is safely far from pruning (blocksLeft well above
+// the effective threshold = max(keepBlocks/10, PartialUnbondingBlocks)).
 //
 // Setup:
 //
-//	keepBlocks = 20  →  threshold = 2
-//	utxoBlockHeight = 0,  pruneAt = 20
-//	tipHeight = 5     →  blocksLeft = 15  (> threshold → absent)
+//	keepBlocks = 100 000  →  10% threshold = 10 000
+//	effective threshold   = max(10 000, 43 200) = 43 200
+//	utxoBlockHeight = 0,  pruneAt = 100 000
+//	tipHeight = 10  →  blocksLeft = 99 990  (> 43 200 → absent)
 func TestUTXOPruneWarning_FieldAbsentWhenFar(t *testing.T) {
 	const (
-		keepBlocks      uint64 = 20
-		tipHeight              = 5
+		keepBlocks      uint64 = 100_000
+		tipHeight              = 10
 		utxoBlockHeight uint64 = 0
 	)
 
@@ -178,6 +186,66 @@ func TestUTXOPruneWarning_FieldAbsentInArchiveMode(t *testing.T) {
 	}
 	if v, ok := body["blocks_until_pruned"]; ok {
 		t.Errorf("blocks_until_pruned must not appear in archive mode, got %v", v)
+	}
+}
+
+// TestUTXOPruneWarning_ZeroAtPruneBoundary verifies that blocks_until_pruned=0
+// is reported when tipHeight == pruneAt (the UTXO is exactly at its pruning
+// boundary and the source block has been or is about to be stripped).
+//
+// Setup:
+//
+//	keepBlocks = 50, utxoBlockHeight = 0  →  pruneAt = 50
+//	tipHeight = 50  →  tipHeight == pruneAt  →  blocks_until_pruned = 0
+func TestUTXOPruneWarning_ZeroAtPruneBoundary(t *testing.T) {
+	const (
+		keepBlocks      uint64 = 50
+		tipHeight              = 50 // == pruneAt → at boundary
+		utxoBlockHeight uint64 = 0
+	)
+
+	srv, txHash := makePruneWarningFixture(t, tipHeight, utxoBlockHeight, keepBlocks, "light")
+	code, body := pruneGET(t, srv, txHash)
+
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	raw, ok := body["blocks_until_pruned"]
+	if !ok {
+		t.Fatalf("blocks_until_pruned must be present at prune boundary; body = %v", body)
+	}
+	if got, _ := raw.(float64); got != 0 {
+		t.Errorf("blocks_until_pruned = %v, want 0 at prune boundary", got)
+	}
+}
+
+// TestUTXOPruneWarning_ZeroPastPruneBoundary verifies that blocks_until_pruned=0
+// is reported when tipHeight > pruneAt (the source block has already been
+// pruned from the chain, but the UTXO entry still exists in the UTXO set).
+//
+// Setup:
+//
+//	keepBlocks = 50, utxoBlockHeight = 0  →  pruneAt = 50
+//	tipHeight = 51  →  tipHeight > pruneAt  →  blocks_until_pruned = 0
+func TestUTXOPruneWarning_ZeroPastPruneBoundary(t *testing.T) {
+	const (
+		keepBlocks      uint64 = 50
+		tipHeight              = 51 // > pruneAt → past boundary
+		utxoBlockHeight uint64 = 0
+	)
+
+	srv, txHash := makePruneWarningFixture(t, tipHeight, utxoBlockHeight, keepBlocks, "light")
+	code, body := pruneGET(t, srv, txHash)
+
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	raw, ok := body["blocks_until_pruned"]
+	if !ok {
+		t.Fatalf("blocks_until_pruned must be present past prune boundary; body = %v", body)
+	}
+	if got, _ := raw.(float64); got != 0 {
+		t.Errorf("blocks_until_pruned = %v, want 0 past prune boundary", got)
 	}
 }
 
@@ -227,17 +295,19 @@ func TestUTXOPruneWarning_ExactlyAtThreshold(t *testing.T) {
 }
 
 // TestUTXOPruneWarning_OneAboveThreshold verifies the boundary where
-// blocksLeft == threshold+1 — should NOT trigger the warning.
+// blocksLeft == PartialUnbondingBlocks+1 — should NOT trigger the field
+// (the effective threshold is max(keepBlocks/10, PartialUnbondingBlocks)).
 //
 // Setup:
 //
-//	keepBlocks=100  →  threshold=10
-//	utxoBlockHeight=0,  pruneAt=100
-//	tipHeight=89    →  blocksLeft=11 > threshold → absent
+//	keepBlocks = 43 211  →  10% threshold = 4 321
+//	effective threshold  = max(4 321, 43 200) = 43 200
+//	utxoBlockHeight = 0,  pruneAt = 43 211
+//	tipHeight = 10  →  blocksLeft = 43 201  (> 43 200 → absent)
 func TestUTXOPruneWarning_OneAboveThreshold(t *testing.T) {
 	const (
-		keepBlocks      uint64 = 100
-		tipHeight              = 89
+		keepBlocks      uint64 = 43_211
+		tipHeight              = 10
 		utxoBlockHeight uint64 = 0
 	)
 

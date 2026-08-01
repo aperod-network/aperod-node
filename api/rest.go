@@ -1410,16 +1410,29 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		"exists":            true,
 	}
 
-	// In light-pruning mode, warn the caller when the originating block is
-	// within 10 % of the prune window (tip − keep_blocks).  The field is
-	// omitted on archive nodes and when the UTXO is safely far from pruning.
+	// In light-pruning mode, include blocks_until_pruned so the CLI can
+	// reject stake attempts whose UTXO block will be pruned before unbonding
+	// completes.  Rules:
+	//   - tipHeight >= pruneAt: block is already at/past the prune boundary →
+	//     report 0 so the CLI's < PartialUnbondingBlocks guard always fires.
+	//   - tipHeight < pruneAt and blocksLeft ≤ max(keepBlocks/10,
+	//     PartialUnbondingBlocks): report the exact remaining block count.
+	//   - Otherwise (safely far): omit the field.
+	// The field is never emitted on archive nodes or when keepBlocks is zero.
 	if s.pruningMode == "light" && s.keepBlocks > 0 {
 		if tip := s.chain.Tip(); tip != nil {
 			tipHeight := tip.Header.Height
-			threshold := s.keepBlocks / 10 // 10 % of window
-			// pruneAt is the tip height at which this UTXO's block would be pruned.
+			// pruneAt is the tip height at which this UTXO's block is pruned.
 			pruneAt := utxo.BlockHeight + s.keepBlocks
-			if tipHeight < pruneAt {
+			if tipHeight >= pruneAt {
+				// At or past the prune boundary — report 0 so the CLI rejects.
+				resp["blocks_until_pruned"] = uint64(0)
+			} else {
+				// threshold = max(10% of window, PartialUnbondingBlocks)
+				threshold := s.keepBlocks / 10
+				if threshold < core.PartialUnbondingBlocks {
+					threshold = core.PartialUnbondingBlocks
+				}
 				blocksLeft := pruneAt - tipHeight
 				if blocksLeft <= threshold {
 					resp["blocks_until_pruned"] = blocksLeft

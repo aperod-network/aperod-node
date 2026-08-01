@@ -688,15 +688,31 @@ Your private key is never sent to the node.`,
 		if err := json.Unmarshal(utxoBody, &utxoData); err != nil {
 			return fmt.Errorf("parse UTXO response: %w", err)
 		}
-		// Warn the operator if the UTXO's originating block is close to the
-		// prune window on a light-mode node.  The node only includes this field
+		// Check whether the UTXO's originating block will be pruned before the
+		// unbonding period completes.  The node only includes blocks_until_pruned
 		// when the UTXO is within 10 % of keep_blocks from being pruned.
 		if utxoData.BlocksUntilPruned != nil {
+			bup := *utxoData.BlocksUntilPruned
+			if bup < core.PartialUnbondingBlocks {
+				// Hard rejection: the block carrying this UTXO will disappear
+				// before the unbonding period (~7 days) ends, breaking the
+				// commitment-verification path during unbonding.
+				return fmt.Errorf(
+					"UTXO will be pruned in %d blocks, which is less than the "+
+						"unbonding period (%d blocks, ≈7 days).\n"+
+						"   The node cannot verify the original commitment before "+
+						"unbonding completes, which would break the unbonding flow.\n"+
+						"   Use a UTXO from a more recent block, or switch to an "+
+						"archive node (pruning.mode: archive in node.yaml).",
+					bup, core.PartialUnbondingBlocks,
+				)
+			}
+			// Close to pruning but still within the safe window — warn only.
 			fmt.Printf("\n⚠️  WARNING: this UTXO's block will be pruned in approximately %d blocks.\n"+
 				"   Once pruned, the stake transaction will be rejected.\n"+
 				"   Broadcast your stake transaction as soon as possible, or switch\n"+
 				"   to an archive node (pruning.mode: archive in node.yaml).\n\n",
-				*utxoData.BlocksUntilPruned)
+				bup)
 		}
 		commitRaw, err := hex.DecodeString(utxoData.AmountCommitHex)
 		if err != nil || len(commitRaw) != 32 {

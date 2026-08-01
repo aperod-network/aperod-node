@@ -1,19 +1,23 @@
 package main
 
-// CLI integration test for the ⚠️ prune-window warning in the `validator stake`
+// CLI integration tests for the prune-window guard in the `validator stake`
 // command (step 3 of the stake flow).
 //
-// The command prints a warning line when the UTXO's API response includes
-// blocks_until_pruned.  This test:
+// The command now has two distinct behaviours depending on blocks_until_pruned:
 //
-//  1. Spins up an httptest.Server serving a minimal UTXO response with
-//     blocks_until_pruned set and a matching Pedersen commitment.
-//  2. Captures os.Stdout via os.Pipe.
-//  3. Calls the cobra command directly (no subprocess).
-//  4. Asserts that the ⚠️ warning line appears in stdout.
+//  1. blocks_until_pruned < core.PartialUnbondingBlocks
+//     → hard rejection: RunE returns a non-nil error containing the block count.
 //
-// A second sub-test confirms the warning is absent when blocks_until_pruned is
-// NOT present in the UTXO response.
+//  2. blocks_until_pruned >= core.PartialUnbondingBlocks (field present)
+//     → ⚠️ WARNING is printed to stdout but the stake proceeds.
+//
+//  3. blocks_until_pruned absent
+//     → no warning, no error related to pruning.
+//
+// Tests spin up an httptest.Server serving a minimal UTXO response (with a
+// valid Pedersen commitment so the pre-flight check passes), capture os.Stdout
+// via os.Pipe, call the cobra command directly (no subprocess), and assert
+// on stdout content and/or the returned error.
 
 import (
 	"bytes"
@@ -166,10 +170,10 @@ func runStakeCmd(t *testing.T, nodeURL, privKey, txHashHex string, amount float6
 	t.Helper()
 
 	f := validatorStakeCmd.Flags()
-	f.Set("node", nodeURL)           //nolint:errcheck
-	f.Set("priv-key", privKey)       //nolint:errcheck
-	f.Set("utxo-txhash", txHashHex)  //nolint:errcheck
-	f.Set("utxo-idx", "0")           //nolint:errcheck
+	f.Set("node", nodeURL)                              //nolint:errcheck
+	f.Set("priv-key", privKey)                          //nolint:errcheck
+	f.Set("utxo-txhash", txHashHex)                     //nolint:errcheck
+	f.Set("utxo-idx", "0")                              //nolint:errcheck
 	f.Set("amount", fmt.Sprintf("%g", amount)) //nolint:errcheck
 
 	var runErr error
@@ -179,32 +183,111 @@ func runStakeCmd(t *testing.T, nodeURL, privKey, txHashHex string, amount float6
 	return out, runErr
 }
 
-// TestCLIStakeWarning_WarningPresentWhenBlocksUntilPrunedReturned verifies that
-// the ⚠️ warning line is printed to stdout when the UTXO endpoint returns
-// blocks_until_pruned.
-func TestCLIStakeWarning_WarningPresentWhenBlocksUntilPrunedReturned(t *testing.T) {
+// ── Rejection tests (blocks_until_pruned < PartialUnbondingBlocks) ────────────
+
+// TestCLIPruneGuard_RejectsWhenBelowUnbondingPeriod verifies that the command
+// returns an error (and does NOT broadcast) when blocks_until_pruned is well
+// below PartialUnbondingBlocks.
+func TestCLIPruneGuard_RejectsWhenBelowUnbondingPeriod(t *testing.T) {
 	fix := newStakeFixture(t)
 
-	utxoBody := buildUTXOResponse(t, fix.commitHex, 50 /* blocks_until_pruned */)
+	// 50 blocks is far below PartialUnbondingBlocks (43 200).
+	utxoBody := buildUTXOResponse(t, fix.commitHex, 50)
 	srv := buildPruneTestServer(t, utxoBody)
 
 	resetStakeCmd()
-	out, _ := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+	_, err := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
 
-	if !strings.Contains(out, "⚠️") || !strings.Contains(out, "WARNING") {
-		t.Errorf("expected ⚠️ WARNING in stdout when blocks_until_pruned is set\n"+
-			"got stdout:\n%s", out)
+	if err == nil {
+		t.Fatal("expected an error when blocks_until_pruned < PartialUnbondingBlocks, got nil")
 	}
-	// The warning must mention the exact block count.
-	if !strings.Contains(out, "50") {
-		t.Errorf("expected block count 50 in stdout warning\ngot stdout:\n%s", out)
+	if !strings.Contains(err.Error(), "50") {
+		t.Errorf("error should mention the block count (50); got: %v", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d", core.PartialUnbondingBlocks)) {
+		t.Errorf("error should mention PartialUnbondingBlocks (%d); got: %v",
+			core.PartialUnbondingBlocks, err)
 	}
 }
 
-// TestCLIStakeWarning_WarningAbsentWhenFieldMissing verifies that no ⚠️ warning
+// TestCLIPruneGuard_RejectsAtBoundaryMinusOne verifies rejection exactly one
+// block before the unbonding period boundary.
+func TestCLIPruneGuard_RejectsAtBoundaryMinusOne(t *testing.T) {
+	fix := newStakeFixture(t)
+
+	boundary := core.PartialUnbondingBlocks - 1
+	utxoBody := buildUTXOResponse(t, fix.commitHex, boundary)
+	srv := buildPruneTestServer(t, utxoBody)
+
+	resetStakeCmd()
+	_, err := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+
+	if err == nil {
+		t.Fatalf("expected error for blocks_until_pruned=%d (boundary-1), got nil", boundary)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d", boundary)) {
+		t.Errorf("error should mention block count %d; got: %v", boundary, err)
+	}
+}
+
+// ── Warning tests (blocks_until_pruned >= PartialUnbondingBlocks) ─────────────
+
+// TestCLIPruneGuard_WarningAtBoundary verifies that a UTXO with
+// blocks_until_pruned == PartialUnbondingBlocks prints a warning but succeeds.
+func TestCLIPruneGuard_WarningAtBoundary(t *testing.T) {
+	fix := newStakeFixture(t)
+
+	boundary := core.PartialUnbondingBlocks
+	utxoBody := buildUTXOResponse(t, fix.commitHex, boundary)
+	srv := buildPruneTestServer(t, utxoBody)
+
+	resetStakeCmd()
+	out, err := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+
+	if err != nil {
+		t.Fatalf("expected success for blocks_until_pruned=%d (boundary), got error: %v",
+			boundary, err)
+	}
+	if !strings.Contains(out, "⚠️") || !strings.Contains(out, "WARNING") {
+		t.Errorf("expected ⚠️ WARNING in stdout for blocks_until_pruned=%d\ngot:\n%s",
+			boundary, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d", boundary)) {
+		t.Errorf("expected block count %d in warning; got:\n%s", boundary, out)
+	}
+}
+
+// TestCLIPruneGuard_WarningAboveBoundary verifies that a UTXO well above the
+// unbonding period prints a warning and still succeeds.
+func TestCLIPruneGuard_WarningAboveBoundary(t *testing.T) {
+	fix := newStakeFixture(t)
+
+	// Well above threshold — close enough to print the warning, safe enough to proceed.
+	safeCount := core.PartialUnbondingBlocks + 500
+	utxoBody := buildUTXOResponse(t, fix.commitHex, safeCount)
+	srv := buildPruneTestServer(t, utxoBody)
+
+	resetStakeCmd()
+	out, err := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+
+	if err != nil {
+		t.Fatalf("expected success for blocks_until_pruned=%d, got error: %v", safeCount, err)
+	}
+	if !strings.Contains(out, "⚠️") || !strings.Contains(out, "WARNING") {
+		t.Errorf("expected ⚠️ WARNING in stdout for blocks_until_pruned=%d\ngot:\n%s",
+			safeCount, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d", safeCount)) {
+		t.Errorf("expected block count %d in warning; got:\n%s", safeCount, out)
+	}
+}
+
+// ── No-warning tests (blocks_until_pruned absent) ─────────────────────────────
+
+// TestCLIPruneGuard_WarningAbsentWhenFieldMissing verifies that no ⚠️ warning
 // is printed when the UTXO endpoint does NOT include blocks_until_pruned
 // (archive mode or UTXO safely far from pruning).
-func TestCLIStakeWarning_WarningAbsentWhenFieldMissing(t *testing.T) {
+func TestCLIPruneGuard_WarningAbsentWhenFieldMissing(t *testing.T) {
 	fix := newStakeFixture(t)
 
 	// blocksUntilPruned = 0 → field omitted from response.
@@ -212,32 +295,14 @@ func TestCLIStakeWarning_WarningAbsentWhenFieldMissing(t *testing.T) {
 	srv := buildPruneTestServer(t, utxoBody)
 
 	resetStakeCmd()
-	out, _ := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
+	out, err := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
 
+	if err != nil {
+		t.Fatalf("expected success when blocks_until_pruned is absent, got error: %v", err)
+	}
 	if strings.Contains(out, "⚠️") || strings.Contains(out, "WARNING") {
 		t.Errorf("unexpected ⚠️ WARNING in stdout when blocks_until_pruned is absent\n"+
 			"got stdout:\n%s", out)
-	}
-}
-
-// TestCLIStakeWarning_WarningShowsCorrectCount checks that the block count in
-// the printed warning matches the value returned by the API (not hardcoded).
-func TestCLIStakeWarning_WarningShowsCorrectCount(t *testing.T) {
-	fix := newStakeFixture(t)
-
-	const wantCount = uint64(7)
-	utxoBody := buildUTXOResponse(t, fix.commitHex, wantCount)
-	srv := buildPruneTestServer(t, utxoBody)
-
-	resetStakeCmd()
-	out, _ := runStakeCmd(t, srv.URL, fix.privKeyHex, fix.txHashHex, fix.amountAPR)
-
-	if !strings.Contains(out, "⚠️") || !strings.Contains(out, "WARNING") {
-		t.Fatalf("expected ⚠️ WARNING in stdout; got:\n%s", out)
-	}
-	wantStr := fmt.Sprintf("%d", wantCount)
-	if !strings.Contains(out, wantStr) {
-		t.Errorf("expected %q (block count) in warning; got stdout:\n%s", wantStr, out)
 	}
 }
 
