@@ -5,6 +5,7 @@ package core_test
 // is rejected at mempool entry (and that unlocked / non-genesis UTXOs pass).
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -306,4 +307,158 @@ func TestVestingEnforcement_MempoolRejectsLockedSpend(t *testing.T) {
 	if pool.Count() != 0 {
 		t.Errorf("pool should be empty after rejection, got %d entries", pool.Count())
 	}
+}
+
+// TestVestingEnforcement_SurvivesRestartReplay is an integration test that
+// simulates a node restart by creating a real genesis block via
+// CreateGenesisBlock, then replaying it into a brand-new UTXOSet (exactly as
+// the node does on startup when it scans the chain from height 0).
+//
+// It verifies three invariants that must hold after replay:
+//
+//  1. ApplyBlock populates byPubKey with the genesis UTXO so ring-member
+//     lookups succeed (C-0 check passes).
+//  2. BuildVestingLock (the production address-decode path) correctly maps the
+//     team allocation's spendPub → GenesisAlloc — no synthetic helper is used.
+//  3. VerifyTx rejects an attempt to spend the still-locked genesis UTXO with
+//     an error mentioning "locked genesis" — enforcement is not bypassed by a
+//     restart or chain replay.
+//
+// The test is run twice (two independent fresh UTXOSets) to confirm the result
+// is idempotent across restarts.
+func TestVestingEnforcement_SurvivesRestartReplay(t *testing.T) {
+	// ── 1. Build genesis config with one cliff_linear team allocation ──────────
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	teamKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	teamAddr := crypto.AddressFromKeys(crypto.MainnetByte, teamKeys)
+
+	const teamAmount = uint64(1_000_000) * core.BaseUnitsPerAPR // 1 M APRO
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-restart-vesting",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		// ValidatorPubKey is an ed25519.PublicKey ([]byte); hex-encode for YAML field.
+		Validators: []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(teamAddr),
+				Amount:  teamAmount,
+				Label:   "Team",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),     // 1-year cliff
+					VestSeconds:  int64(4 * 365 * 86400), // 4-year linear vest
+				},
+			},
+		},
+	}
+
+	// ── 2. Create the genesis block (as the node does on first start) ─────────
+	genesisBlock, err := core.CreateGenesisBlock(genesis, validatorPriv)
+	if err != nil {
+		t.Fatalf("CreateGenesisBlock: %v", err)
+	}
+	// Header.Timestamp is stored in nanoseconds; convert to seconds for vesting.
+	genesisTimeSec := genesisBlock.Header.Timestamp / 1_000_000_000
+
+	// Recover the team allocation's spendPub — this equals OneTimePub in the
+	// genesis output (transparent mint: OneTimePub = spendPub, no stealth).
+	_, spendPub, _, err := crypto.DecodeAddress(teamAddr)
+	if err != nil {
+		t.Fatalf("DecodeAddress: %v", err)
+	}
+
+	// runRestart encapsulates one restart cycle: fresh UTXOSet + replay +
+	// VestingLock build + spend attempt.  Called twice to confirm idempotency.
+	runRestart := func(t *testing.T, label string, decoyBase byte, kiIdx int) {
+		t.Helper()
+
+		// ── 3. Simulate restart: fresh UTXOSet + chain replay from height 0 ───
+		freshUTXOs := core.NewUTXOSet()
+		if err := freshUTXOs.ApplyBlock(genesisBlock); err != nil {
+			t.Fatalf("%s: ApplyBlock on fresh UTXOSet: %v", label, err)
+		}
+
+		// Confirm genesis output is reachable via byPubKey — proves that
+		// ApplyBlock properly populates the index used by TxVerifier C-0 check.
+		genesisUTXO := freshUTXOs.GetByPubKey(spendPub)
+		if genesisUTXO == nil {
+			t.Fatalf("%s: genesis UTXO not found via GetByPubKey after ApplyBlock — "+
+				"byPubKey not populated on restart replay", label)
+		}
+
+		// ── 4. Build VestingLock via the production address-decode path ───────
+		vl, err := core.BuildVestingLock(genesis, genesisTimeSec)
+		if err != nil {
+			t.Fatalf("%s: BuildVestingLock: %v", label, err)
+		}
+		if vl.LockedAllocsCount() != 1 {
+			t.Fatalf("%s: expected 1 locked allocation, got %d", label, vl.LockedAllocsCount())
+		}
+
+		// ── 5. Populate ring decoys using the real genesis UTXO commitment ────
+		// All ring members must share the same AmountCommit as inp.AmountCommit
+		// so the C-0 commitment-binding check passes and execution reaches the
+		// vesting check (which fires next).
+		genesisCommit := genesisUTXO.AmountCommit
+		for i := 1; i < crypto.RingSize; i++ {
+			decoyPub := crypto.Point32{decoyBase + byte(i)}
+			freshUTXOs.Add(&core.UTXO{
+				TxHash:       crypto.Hash32{decoyBase + byte(i)},
+				OutputIndex:  0,
+				OneTimePub:   decoyPub,
+				AmountCommit: genesisCommit,
+				BlockHeight:  1,
+			})
+		}
+
+		// ── 6. Wire TxVerifier with the VestingLock (as node startup does) ────
+		v := core.NewTxVerifier(freshUTXOs)
+		v.SetVestingLock(vl)
+
+		// ── 7. Attempt to spend the locked genesis UTXO ───────────────────────
+		ring := make([]crypto.RingMember, crypto.RingSize)
+		ring[0] = spendPub // locked genesis UTXO
+		for i := 1; i < crypto.RingSize; i++ {
+			ring[i] = crypto.Point32{decoyBase + byte(i)}
+		}
+		tx := core.Transaction{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{
+					KeyImage:     makeKeyImage(kiIdx),
+					Ring:         ring,
+					AmountCommit: genesisCommit,
+				},
+			},
+			Outputs: []core.Output{
+				{OneTimePub: crypto.Point32{0xF8, decoyBase}, AmountCommit: crypto.Commitment{}},
+			},
+			Fee:         500,
+			Signatures:  []*crypto.MLSAGSignature{{}},
+			RangeProofs: []*crypto.RangeProof{{}},
+		}
+
+		verifyErr := v.VerifyTx(&tx)
+		if verifyErr == nil {
+			t.Fatalf("%s: VerifyTx should reject locked genesis UTXO spend after restart replay, got nil", label)
+		}
+		if !strings.Contains(verifyErr.Error(), "locked genesis") {
+			t.Errorf("%s: expected 'locked genesis' in error, got: %v", label, verifyErr)
+		}
+	}
+
+	// Run the restart simulation twice to confirm idempotency.
+	runRestart(t, "first restart", 0x70, 555)
+	runRestart(t, "second restart", 0x80, 444)
 }
