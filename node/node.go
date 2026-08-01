@@ -117,12 +117,16 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
         // Use Header.Timestamp / 1e9 (nanoseconds → seconds) to get Unix seconds.
         if genesisBlock := chain.Genesis(); genesisBlock != nil {
                 genesisTimeSec := genesisBlock.Header.Timestamp / 1e9
-                if vl, vlErr := core.BuildVestingLock(genesisCfg, genesisTimeSec); vlErr == nil {
-                        txV.SetVestingLock(vl)
-                        log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount())
-                } else {
-                        log.Warn("vesting lock build failed — enforcement disabled", "err", vlErr)
+                vl, vlErr := core.BuildVestingLock(genesisCfg, genesisTimeSec)
+                if vlErr != nil {
+                        // A BuildVestingLock failure means the genesis config is
+                        // malformed (e.g. duplicate spend keys).  Starting with
+                        // enforcement disabled would be a silent security bypass —
+                        // return a hard error so the caller rejects startup.
+                        return nil, fmt.Errorf("vesting lock build failed — refusing to start without enforcement: %w", vlErr)
                 }
+                txV.SetVestingLock(vl)
+                log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount())
         }
         // Wire the verifier into the mempool so P2P-submitted transactions are
         // fully verified (ring sigs, range proofs, vesting locks) before entering.

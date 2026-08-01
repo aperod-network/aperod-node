@@ -52,6 +52,11 @@ func BuildVestingLock(genesis *GenesisConfig, genesisTime int64) (*VestingLock, 
                         // Placeholder or invalid address — skip rather than fail.
                         continue
                 }
+                if _, exists := vl.allocs[spendPub]; exists {
+                        return nil, fmt.Errorf("BuildVestingLock: duplicate genesis allocation address %q (spendPub %x) — "+
+                                "two allocations share the same key, second would silently overwrite the first and could bypass vesting enforcement",
+                                alloc.Address, spendPub[:8])
+                }
                 vl.allocs[spendPub] = alloc
         }
         return vl, nil

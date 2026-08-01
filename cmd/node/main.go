@@ -537,12 +537,17 @@ func run() error {
         // and would cause all allocations to appear fully vested since Unix epoch.
         if genesisBlock := chain.Genesis(); genesisBlock != nil {
                 genesisTimeSec := genesisBlock.Header.Timestamp / 1e9
-                if vl, vlErr := core.BuildVestingLock(genesisConfig, genesisTimeSec); vlErr == nil {
-                        txVerifier.SetVestingLock(vl)
-                        log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount(), "genesis_time", genesisTimeSec)
-                } else {
-                        log.Warn("vesting lock build failed — enforcement disabled", "err", vlErr)
+                vl, vlErr := core.BuildVestingLock(genesisConfig, genesisTimeSec)
+                if vlErr != nil {
+                        // A BuildVestingLock failure means the genesis config is
+                        // malformed (e.g. duplicate spend keys).  Starting with
+                        // enforcement disabled would be a silent security bypass —
+                        // fail hard so the operator must fix the genesis config.
+                        log.Error("vesting lock build failed — refusing to start without enforcement", "err", vlErr)
+                        os.Exit(1)
                 }
+                txVerifier.SetVestingLock(vl)
+                log.Info("vesting lock loaded", "locked_allocs", vl.LockedAllocsCount(), "genesis_time", genesisTimeSec)
         }
         engine.SetTxVerifier(txVerifier, utxos)
         // Wire the same verifier into the mempool so Add() runs full RingCT checks

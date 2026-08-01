@@ -463,6 +463,306 @@ func TestVestingEnforcement_SurvivesRestartReplay(t *testing.T) {
 	runRestart(t, "second restart", 0x80, 444)
 }
 
+// TestBuildVestingLock_DuplicateAddressReturnsError verifies that
+// BuildVestingLock returns an error when the genesis config contains two
+// non-immediate allocations with the same address (same spendPub).
+// Previously the second entry silently overwrote the first, which could drop
+// a cliff_linear schedule and allow immediate spending of locked tokens.
+func TestBuildVestingLock_DuplicateAddressReturnsError(t *testing.T) {
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = validatorPriv
+
+	teamKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	teamAddr := crypto.AddressFromKeys(crypto.MainnetByte, teamKeys)
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-dup-vesting",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		Validators:    []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(teamAddr),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Team cliff_linear strict",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),
+					VestSeconds:  int64(4 * 365 * 86400),
+				},
+			},
+			{
+				// Same address, different (weaker) schedule — the second entry would
+				// silently overwrite the first, replacing a 4-year vest with a 1-year
+				// vest and letting the key-holder spend 3 years early.
+				Address: string(teamAddr),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Team cliff_linear weak duplicate",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(30 * 86400),  // only 30-day cliff
+					VestSeconds:  int64(365 * 86400), // only 1-year vest
+				},
+			},
+		},
+	}
+
+	const genesisTimeSec = int64(1_700_000_000)
+	_, buildErr := core.BuildVestingLock(genesis, genesisTimeSec)
+	if buildErr == nil {
+		t.Fatal("BuildVestingLock should return an error for duplicate allocation addresses, got nil")
+	}
+	if !strings.Contains(buildErr.Error(), "duplicate") {
+		t.Errorf("error should mention 'duplicate', got: %v", buildErr)
+	}
+}
+
+// TestGenesisValidate_DuplicateAddressRejected verifies that
+// GenesisConfig.Validate() rejects a config whose allocations contain two
+// entries with the same address.  This is the first defence — the config
+// should be rejected at load time before BuildVestingLock is ever called.
+func TestGenesisValidate_DuplicateAddressRejected(t *testing.T) {
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = validatorPriv
+
+	teamKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	teamAddr := crypto.AddressFromKeys(crypto.MainnetByte, teamKeys)
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-dup-validate",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		Validators:    []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(teamAddr),
+				Amount:  1_000_000 * core.BaseUnitsPerAPR,
+				Label:   "First entry",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),
+					VestSeconds:  int64(4 * 365 * 86400),
+				},
+			},
+			{
+				Address: string(teamAddr),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Duplicate entry",
+				Vesting: nil,
+			},
+		},
+	}
+
+	if err := genesis.Validate(); err == nil {
+		t.Fatal("Validate() should reject genesis with duplicate allocation addresses, got nil")
+	} else if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error should mention 'duplicate', got: %v", err)
+	}
+}
+
+// TestGenesisValidate_SameSpendPubDifferentAddressRejected verifies that
+// Validate() rejects two allocations whose addresses have distinct strings but
+// share the same spend public key (different view key).  This is the
+// "alias" attack: the attacker supplies addr1 = Encode(spendPub, viewA) and
+// addr2 = Encode(spendPub, viewB).  Both pass the string-equality check but
+// BuildVestingLock would overwrite the first alloc map entry with the second.
+func TestGenesisValidate_SameSpendPubDifferentAddressRejected(t *testing.T) {
+	// Construct two WalletKeyPairs that share the same spend public key but
+	// use different view keys by directly calling EncodeAddress.
+	keys1, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys2, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Addr1: keys1.Spend.Public + keys1.View.Public  (the real address)
+	// Addr2: keys1.Spend.Public + keys2.View.Public  (alias: same spendPub, different viewPub)
+	addr1 := crypto.EncodeAddress(crypto.MainnetByte, keys1.Spend.Public, keys1.View.Public)
+	addr2 := crypto.EncodeAddress(crypto.MainnetByte, keys1.Spend.Public, keys2.View.Public)
+
+	if addr1 == addr2 {
+		t.Fatal("test setup error: expected two distinct address strings for same spendPub + different viewPub")
+	}
+
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = validatorPriv
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-alias-spendpub",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		Validators:    []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(addr1),
+				Amount:  1_000_000 * core.BaseUnitsPerAPR,
+				Label:   "Team (real address)",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),
+					VestSeconds:  int64(4 * 365 * 86400),
+				},
+			},
+			{
+				// Different address string, same underlying spendPub — alias attack.
+				Address: string(addr2),
+				Amount:  1_000_000 * core.BaseUnitsPerAPR,
+				Label:   "Team (alias — same spendPub, different viewPub)",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(30 * 86400),
+					VestSeconds:  int64(365 * 86400),
+				},
+			},
+		},
+	}
+
+	if err := genesis.Validate(); err == nil {
+		t.Fatal("Validate() should reject genesis with two allocations sharing the same spendPub, got nil")
+	} else if !strings.Contains(err.Error(), "spend public key") {
+		t.Errorf("error should mention 'spend public key', got: %v", err)
+	}
+}
+
+// TestBuildVestingLock_SameSpendPubDifferentAddressReturnsError verifies that
+// BuildVestingLock also returns an error (second line of defence) when two
+// non-immediate allocations share a spendPub via distinct address strings.
+// This covers the case where the genesis config was not run through Validate()
+// before BuildVestingLock is called (e.g. programmatic construction in tooling).
+func TestBuildVestingLock_SameSpendPubDifferentAddressReturnsError(t *testing.T) {
+	keys1, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys2, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr1 := crypto.EncodeAddress(crypto.MainnetByte, keys1.Spend.Public, keys1.View.Public)
+	addr2 := crypto.EncodeAddress(crypto.MainnetByte, keys1.Spend.Public, keys2.View.Public)
+
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = validatorPriv
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-alias-build",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		Validators:    []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(addr1),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Alloc A",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),
+					VestSeconds:  int64(4 * 365 * 86400),
+				},
+			},
+			{
+				Address: string(addr2),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Alloc B (alias)",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(30 * 86400),
+					VestSeconds:  int64(365 * 86400),
+				},
+			},
+		},
+	}
+
+	const genesisTimeSec = int64(1_700_000_000)
+	_, buildErr := core.BuildVestingLock(genesis, genesisTimeSec)
+	if buildErr == nil {
+		t.Fatal("BuildVestingLock should return an error for two allocations sharing the same spendPub, got nil")
+	}
+	if !strings.Contains(buildErr.Error(), "duplicate") {
+		t.Errorf("error should mention 'duplicate', got: %v", buildErr)
+	}
+}
+
+// TestGenesisValidate_UniqueAddressesPass verifies that Validate() does not
+// reject a valid config where all allocation addresses are distinct.
+func TestGenesisValidate_UniqueAddressesPass(t *testing.T) {
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = validatorPriv
+
+	keys1, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys2, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr1 := crypto.AddressFromKeys(crypto.MainnetByte, keys1)
+	addr2 := crypto.AddressFromKeys(crypto.MainnetByte, keys2)
+
+	genesis := &core.GenesisConfig{
+		ChainID:       "test-unique-validate",
+		InitialSupply: 100_000_000,
+		MinValidators: 1,
+		BFTThreshold:  0.667,
+		RingSize:      crypto.RingSize,
+		Validators:    []string{fmt.Sprintf("%x", validatorPub)},
+		Allocations: []core.GenesisAlloc{
+			{
+				Address: string(addr1),
+				Amount:  1_000_000 * core.BaseUnitsPerAPR,
+				Label:   "Team",
+				Vesting: &core.VestingSchedule{
+					Type:         core.VestingCliffLinear,
+					CliffSeconds: int64(365 * 86400),
+					VestSeconds:  int64(4 * 365 * 86400),
+				},
+			},
+			{
+				Address: string(addr2),
+				Amount:  500_000 * core.BaseUnitsPerAPR,
+				Label:   "Advisors",
+				Vesting: nil,
+			},
+		},
+	}
+
+	if err := genesis.Validate(); err != nil {
+		t.Errorf("Validate() should accept genesis with unique allocation addresses, got: %v", err)
+	}
+}
+
 // TestVestingEnforcement_PrunedGenesisStart simulates a light-pruning startup
 // where the genesis block's TxData has been stripped by PruneBlocksOlderThan,
 // so the genesis UTXO is absent from byPubKey (it was never replayed into the

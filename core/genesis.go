@@ -103,6 +103,40 @@ func (g *GenesisConfig) Validate() error {
                 return fmt.Errorf("genesis has %d validators but min_validators=%d",
                         len(g.Validators), g.MinValidators)
         }
+        // Reject duplicate allocation addresses and duplicate spend public keys.
+        //
+        // Two entries sharing the same literal address string are an obvious
+        // duplicate.  Two entries can also share the same spend public key while
+        // using different view keys, producing distinct address strings — these
+        // are equally dangerous because BuildVestingLock keys by decoded spendPub,
+        // so the second entry would silently overwrite the first and could replace
+        // a strict vesting schedule with a weaker one (or, if the second entry
+        // passes the immediate-skip filter, leave a stale first entry in the map).
+        seenAddr := make(map[string]int, len(g.Allocations))
+        seenPub := make(map[crypto.Point32]int, len(g.Allocations))
+        for i, alloc := range g.Allocations {
+                if alloc.Address == "" {
+                        continue // placeholder — allowed
+                }
+                if prev, ok := seenAddr[alloc.Address]; ok {
+                        return fmt.Errorf("genesis allocation[%d] and allocation[%d] share the same address %q — "+
+                                "duplicate allocation addresses are not permitted (would bypass vesting enforcement)",
+                                prev, i, alloc.Address)
+                }
+                seenAddr[alloc.Address] = i
+                _, spendPub, _, err := crypto.DecodeAddress(crypto.Address(alloc.Address))
+                if err != nil {
+                        // Invalid addresses are caught at block-creation time; skip here.
+                        continue
+                }
+                if prev, ok := seenPub[spendPub]; ok {
+                        return fmt.Errorf("genesis allocation[%d] and allocation[%d] share the same spend public key %x — "+
+                                "two addresses with identical spend keys but different view keys are not permitted "+
+                                "(would bypass vesting enforcement)",
+                                prev, i, spendPub[:8])
+                }
+                seenPub[spendPub] = i
+        }
         return nil
 }
 
