@@ -1408,6 +1408,22 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		"out_idx":           outIdx,
 		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
 		"exists":            true,
+		"block_height":      utxo.BlockHeight,
+	}
+	// Include block_timestamp when the source block is available.
+	// Try the in-memory sliding window first; fall back to blockStore for
+	// blocks older than the in-memory window (archive nodes and restarted nodes).
+	if blk := s.chain.GetByHeight(utxo.BlockHeight); blk != nil {
+		resp["block_timestamp"] = time.Unix(0, blk.Header.Timestamp).UTC().Format(time.RFC3339)
+	} else if s.blockStore != nil {
+		heightStr := strconv.FormatUint(utxo.BlockHeight, 10)
+		fullBlk, prunedBlk, _ := s.lookupBlockFromDisk(heightStr)
+		switch {
+		case fullBlk != nil:
+			resp["block_timestamp"] = time.Unix(0, fullBlk.Header.Timestamp).UTC().Format(time.RFC3339)
+		case prunedBlk != nil:
+			resp["block_timestamp"] = time.Unix(0, prunedBlk.Timestamp).UTC().Format(time.RFC3339)
+		}
 	}
 
 	// In light-pruning mode, include blocks_until_pruned so the CLI can
