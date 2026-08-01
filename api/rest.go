@@ -49,6 +49,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.restNetworkBans)
         s.mux.HandleFunc("/api/v1/network/bans/", s.restNetworkBanByAddr)
+        s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 }
@@ -1365,6 +1366,52 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"pub_key": pub.Hex(),
 	})
+}
+
+// restUTXODecoys handles GET /api/v1/utxos/decoys?count=N
+//
+// Phase 2: returns N randomly-sampled UTXOs from the active UTXO set for use
+// as ring decoys.  count defaults to 120 (8 inputs × 15 decoys) and is capped
+// at 512 to prevent abuse.  The response is safe to cache briefly — callers
+// should request fresh decoys for every transaction.
+func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+
+        const defaultCount = 120
+        const maxCount = 512
+        count := defaultCount
+        if raw := r.URL.Query().Get("count"); raw != "" {
+                n, err := strconv.Atoi(raw)
+                if err != nil || n <= 0 {
+                        writeJSONError(w, http.StatusBadRequest, "count must be a positive integer")
+                        return
+                }
+                if n > maxCount {
+                        n = maxCount
+                }
+                count = n
+        }
+
+        decoys := s.utxos.SampleDecoys(count, nil)
+
+        type decoyEntry struct {
+                OneTimePubHex   string `json:"one_time_pub_hex"`
+                AmountCommitHex string `json:"amount_commit_hex"`
+        }
+        entries := make([]decoyEntry, len(decoys))
+        for i, d := range decoys {
+                entries[i] = decoyEntry{
+                        OneTimePubHex:   fmt.Sprintf("%x", d.OneTimePub[:]),
+                        AmountCommitHex: fmt.Sprintf("%x", d.AmountCommit[:]),
+                }
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "decoys": entries,
+                "count":  len(entries),
+        })
 }
 
 func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {

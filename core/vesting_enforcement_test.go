@@ -857,9 +857,14 @@ func TestVestingEnforcement_PrunedGenesisStart(t *testing.T) {
 	// ── Sub-test B: non-genesis ring member absent from byPubKey ─────────────
 	//
 	// A ring member that was never in the genesis config and is also absent
-	// from byPubKey (fabricated / never-existed UTXO) must still fail C-0 —
-	// this confirms that moving vesting before C-0 does not weaken the C-0 guard.
-	t.Run("fabricated_non_genesis_pub_still_fails_C0", func(t *testing.T) {
+	// from byPubKey (fabricated pub key) is treated identically to a Phase 1
+	// random decoy or a Phase 2 spent decoy: C-0 skips absent members.
+	//
+	// The remaining ring members (present in byPubKey with matching commitment)
+	// pass C-0.  The transaction is then rejected by the MLSAG verifier because
+	// the stub signature is structurally invalid — confirming that no vesting
+	// error is incorrectly raised for a fabricated non-genesis pub key.
+	t.Run("fabricated_non_genesis_pub_absent_skipped_not_vesting_error", func(t *testing.T) {
 		fabricatedPub := crypto.Point32{0xDE, 0xAD, 0xBE, 0xEF}
 		ring := make([]crypto.RingMember, crypto.RingSize)
 		ring[0] = fabricatedPub // not in genesis allocs AND not in byPubKey
@@ -881,15 +886,18 @@ func TestVestingEnforcement_PrunedGenesisStart(t *testing.T) {
 
 		err := v.VerifyTx(&tx)
 		if err == nil {
-			t.Fatal("VerifyTx must reject fabricated ring member, got nil")
+			t.Fatal("VerifyTx must reject the tx (stub signature), got nil")
 		}
-		// Must be a C-0 error (not a vesting error — fabricated pub is not in genesis allocs).
-		if !strings.Contains(err.Error(), "C-0") {
-			t.Errorf("expected C-0 error for fabricated ring member, got: %v", err)
-		}
+		// Must NOT be a vesting error — fabricated pub is not in genesis allocs
+		// so vesting check never fires for it.
 		if strings.Contains(err.Error(), "locked genesis") {
 			t.Errorf("fabricated non-genesis pub should not trigger vesting check, got: %v", err)
 		}
+		// Must NOT be a C-0 error — absent ring members are skipped.
+		if strings.Contains(err.Error(), "C-0") {
+			t.Errorf("absent ring member should be skipped by C-0, got: %v", err)
+		}
+		t.Logf("Fabricated non-genesis absent member correctly skipped by C-0 and vesting (got: %v)", err)
 	})
 
 	// ── Sub-test C: mempool rejects locked genesis spend even when pruned ─────

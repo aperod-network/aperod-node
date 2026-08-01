@@ -193,24 +193,26 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
         }
 
-        // 3c. Commitment binding — C-0 fix.
+        // 3c. C-0: ring-member commitment binding.
         //
-        // For every ring member found in the UTXO set, verify that its
-        // AmountCommit matches the on-chain value so forged commitments cannot
-        // be smuggled in via a known UTXO's public key.
+        // For every ring member that IS present in byPubKey (active unspent UTXO),
+        // its on-chain AmountCommit must equal inp.AmountCommit.  Absent members
+        // (Phase 1 random keys or Phase 2 spent decoys — absent because ApplyBlock
+        // moved them from byPubKey to spentPubKeys) are silently skipped.
         //
-        // Phase 1 compatibility: txBuildRing currently populates decoy slots
-        // with randomly-generated public keys that do not correspond to any
-        // on-chain UTXO.  Requiring all ring members to be present would
-        // reject every Phase 1 transaction.  Instead, absent members are
-        // silently skipped — the ring signature itself still proves knowledge
-        // of the real spending key, so no inflation is possible.  When Phase 2
-        // decoys (real chain UTXOs) are adopted, all members will be present
-        // and the commitment check will apply to each one automatically.
+        // C-0 commitment binding:
+        //   For every ring member that is present in byPubKey (active/unspent UTXO),
+        //   its on-chain AmountCommit must equal inp.AmountCommit.  This prevents a
+        //   malicious signer from claiming a larger-than-owned amount: the real
+        //   spending key belongs to an unspent UTXO in byPubKey, so its commitment
+        //   is checked here even though the signer is hidden among ring decoys.
         //
-        // Safety: ApplyBlock marks key images spent but does NOT remove UTXOs
-        // from byPubKey, so legitimately spent UTXOs remain look-up-able as
-        // ring decoys for the lifetime of the node process.
+        // Phase 2 decoy safety:
+        //   ApplyBlock moves the real spent UTXO from byPubKey to spentPubKeys once
+        //   the spending block is committed.  Future rings that include this UTXO as
+        //   a decoy see it as absent from byPubKey and C-0 skips it — identical
+        //   treatment to Phase 1 random keys.  The real (unspent) input is always
+        //   in byPubKey, so the commitment binding is preserved.
         //
         // NOTE ON PRUNED STARTS: genesis UTXOs may be absent from byPubKey
         // in light-pruning mode.  The vesting check (3b above) is ordered
@@ -220,13 +222,16 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                         for _, member := range inp.Ring {
                                 utxo := v.utxos.GetByPubKey(member)
                                 if utxo == nil {
-                                        // Phase 1 random decoy — not in UTXO set, skip.
+                                        // Absent: Phase 1 random key or Phase 2 spent decoy — skip.
                                         continue
                                 }
+                                // Member is in byPubKey (active unspent UTXO).
+                                // Its on-chain commitment must equal inp.AmountCommit.
                                 if utxo.AmountCommit != inp.AmountCommit {
-                                        return fmt.Errorf("tx %x: input %d AmountCommit does not match "+
-                                                "ring member %x on-chain UTXO commitment (C-0 check)",
-                                                txHashPrefix[:8], i, member[:8])
+                                        return fmt.Errorf("tx %x: input %d ring member %x "+
+                                                "commitment mismatch — on-chain %x != claimed %x (C-0 check)",
+                                                txHashPrefix[:8], i, member[:8],
+                                                utxo.AmountCommit[:8], inp.AmountCommit[:8])
                                 }
                         }
                 }

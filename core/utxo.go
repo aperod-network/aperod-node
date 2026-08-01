@@ -2,10 +2,19 @@ package core
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/aperod/aperod/crypto"
 )
+
+// DecoyUTXO is a stripped UTXO descriptor used as a ring decoy in Phase 2.
+// Only the public-key and commitment fields are needed to build a ring member.
+type DecoyUTXO struct {
+	OneTimePub   crypto.Point32
+	AmountCommit crypto.Commitment
+}
 
 // UTXO represents an unspent transaction output.
 type UTXO struct {
@@ -34,20 +43,22 @@ type UTXOKey struct {
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
-	mu          sync.RWMutex
-	utxos       map[UTXOKey]*UTXO
-	keyImages   map[crypto.KeyImage]struct{} // spent key images
-	byPubKey    map[crypto.Point32]*UTXO     // index by OneTimePub for ring-member lookup (C-0 fix)
-	stakedUTXOs map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	mu           sync.RWMutex
+	utxos        map[UTXOKey]*UTXO
+	keyImages    map[crypto.KeyImage]struct{} // spent key images
+	byPubKey     map[crypto.Point32]*UTXO     // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
+	stakedUTXOs  map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	spentPubKeys map[crypto.Point32]*UTXO     // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
 func NewUTXOSet() *UTXOSet {
 	return &UTXOSet{
-		utxos:       make(map[UTXOKey]*UTXO),
-		keyImages:   make(map[crypto.KeyImage]struct{}),
-		byPubKey:    make(map[crypto.Point32]*UTXO),
-		stakedUTXOs: make(map[UTXOKey]*UTXO),
+		utxos:        make(map[UTXOKey]*UTXO),
+		keyImages:    make(map[crypto.KeyImage]struct{}),
+		byPubKey:     make(map[crypto.Point32]*UTXO),
+		stakedUTXOs:  make(map[UTXOKey]*UTXO),
+		spentPubKeys: make(map[crypto.Point32]*UTXO),
 	}
 }
 
@@ -140,10 +151,26 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	// Pass 2: apply state changes — cannot fail after pass 1 succeeded.
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
-		// Mark inputs spent (key images only — do NOT remove from byPubKey so
-		// spent UTXOs remain available as ring decoys in future transactions).
+		// Mark inputs spent and move the real spent UTXO from byPubKey to
+		// spentPubKeys.  Phase 2 transactions sample decoys from spentPubKeys
+		// (historical spent UTXOs absent from byPubKey); C-0 skips absent members
+		// exactly as it skips Phase 1 random keys, while still binding the
+		// commitment check to the REAL (unspent) input that IS in byPubKey.
+		//
+		// Identification: in a validated transaction the C-0 invariant guarantees
+		// exactly one ring member in byPubKey has AmountCommit == inp.AmountCommit
+		// (the real spent UTXO).  We find it, move it to spentPubKeys, and break.
 		for _, inp := range tx.Inputs {
 			s.keyImages[inp.KeyImage] = struct{}{}
+			for _, member := range inp.Ring {
+				if utxo, ok := s.byPubKey[member]; ok {
+					if utxo.AmountCommit == inp.AmountCommit {
+						delete(s.byPubKey, member)
+						s.spentPubKeys[member] = utxo
+						break // exactly one match expected (Pedersen commitments are binding)
+					}
+				}
+			}
 		}
 		// Add outputs to both primary index and the byPubKey ring-member index.
 		// byPubKey must be populated here so that TxVerifier.VerifyTx (C-0 full
@@ -188,10 +215,19 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 			delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: uint32(i)})
 			delete(s.byPubKey, out.OneTimePub)
 		}
-		// Un-mark key images spent by this block's inputs so they can be
-		// re-spent if the block is retried (or another valid block spends them).
+		// Restore inputs: un-mark key images and move the real spent UTXO
+		// from spentPubKeys back to byPubKey (reverting ApplyBlock's move).
 		for _, inp := range tx.Inputs {
 			delete(s.keyImages, inp.KeyImage)
+			for _, member := range inp.Ring {
+				if utxo, ok := s.spentPubKeys[member]; ok {
+					if utxo.AmountCommit == inp.AmountCommit {
+						delete(s.spentPubKeys, member)
+						s.byPubKey[member] = utxo
+						break
+					}
+				}
+			}
 		}
 	}
 	return nil
@@ -273,6 +309,106 @@ func (s *UTXOSet) IsStaked(txHash crypto.Hash32, outIdx uint32) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.stakedUTXOs[UTXOKey{TxHash: txHash, OutputIndex: outIdx}]
 	return ok
+}
+
+// SampleDecoys returns up to count Phase 2 ring decoys from the spentPubKeys
+// pool — UTXOs that have already been spent and are therefore absent from
+// byPubKey.  Because they are absent, C-0 skips them exactly as it skips Phase
+// 1 random keys, so adding them to a ring does NOT trigger a commitment-mismatch
+// error for the real (unspent) ring member.
+//
+// Security invariant: the real spending key belongs to an UNSPENT UTXO that IS
+// in byPubKey; C-0 checks its commitment against inp.AmountCommit and rejects
+// forgery.  Spent decoys are transparent to C-0 because they are absent.
+//
+// Any UTXO whose OneTimePub appears in exclude is omitted; callers use this to
+// prevent the real input from appearing as its own decoy.
+//
+// Selection is randomised with a time-seeded PRNG (decoys are public knowledge;
+// randomness serves privacy, not security).  If fewer than count candidates
+// remain after exclusions, all available candidates are returned — txBuildRing
+// fills the remaining ring slots with Phase 1 random keys.
+func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []DecoyUTXO {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	candidates := make([]*UTXO, 0, len(s.spentPubKeys))
+	for pub, u := range s.spentPubKeys {
+		if !exclude[pub] {
+			candidates = append(candidates, u)
+		}
+	}
+
+	n := len(candidates)
+	want := count
+	if want > n {
+		want = n
+	}
+	if want == 0 {
+		return nil
+	}
+
+	// Fisher-Yates partial shuffle to pick `want` items in random order.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // privacy, not security
+	for i := 0; i < want; i++ {
+		j := i + rng.Intn(n-i)
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	}
+
+	out := make([]DecoyUTXO, want)
+	for i := 0; i < want; i++ {
+		out[i] = DecoyUTXO{
+			OneTimePub:   candidates[i].OneTimePub,
+			AmountCommit: candidates[i].AmountCommit,
+		}
+	}
+	return out
+}
+
+// ApplyBlockForSpentDecoys rebuilds the spentPubKeys pool during a node restart.
+// It must be called after the active UTXO set has been fully restored from the
+// persistent store (IterUTXOs → Add).  For each spending input in the block it
+// finds the ring member in byPubKey whose AmountCommit equals inp.AmountCommit
+// and moves it to spentPubKeys — exactly the transition that ApplyBlock performs
+// at runtime when a new block is committed.
+//
+// The method is idempotent: if a member was already moved (spent by an earlier
+// block in the replay sequence) it will be absent from byPubKey and is silently
+// skipped.  Call this for every canonical block from genesis to chain tip in
+// ascending height order.
+func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, tx := range block.Txs {
+		for _, inp := range tx.Inputs {
+			for _, member := range inp.Ring {
+				if utxo, ok := s.byPubKey[member]; ok {
+					if utxo.AmountCommit == inp.AmountCommit {
+						delete(s.byPubKey, member)
+						s.spentPubKeys[member] = utxo
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+// SpentDecoyCount returns the number of spent UTXOs in the decoy pool.
+// Used for logging and diagnostics; not a security-critical value.
+func (s *UTXOSet) SpentDecoyCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.spentPubKeys)
+}
+
+// AddSpentDecoyForTest directly inserts a UTXO into the spentPubKeys pool.
+// For use in unit tests only; production code populates spentPubKeys through
+// ApplyBlock when a block containing a spending transaction is committed.
+func (s *UTXOSet) AddSpentDecoyForTest(u *UTXO) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spentPubKeys[u.OneTimePub] = u
 }
 
 // Count returns the number of UTXOs in the set (for diagnostics).

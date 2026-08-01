@@ -68,6 +68,15 @@ func populateFullRingUTXOs(utxos *core.UTXOSet, realPub crypto.Point32, commit c
 
 // TestTxVerifier_C0_FabricatedRingCommitment (#486) — TxVerifier must reject a
 // tx where the ring member's AmountCommit does not match the on-chain UTXO commit.
+//
+// Security: the real (unspent) spending key is in byPubKey.  C-0 checks every
+// ring member found in byPubKey against inp.AmountCommit.  If the signer forges
+// inp.AmountCommit to claim a larger amount, the on-chain UTXO's commitment
+// won't match and C-0 rejects the transaction before MLSAG is ever checked.
+//
+// Phase 2 note: spent decoys are absent from byPubKey (moved to spentPubKeys by
+// ApplyBlock) and C-0 skips them.  Only the real unspent ring member triggers
+// the commitment check.
 func TestTxVerifier_C0_FabricatedRingCommitment(t *testing.T) {
 	commitOnChain := crypto.Commitment{0xAA}
 	fabricatedCommit := crypto.Commitment{0xBB}

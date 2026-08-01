@@ -391,6 +391,31 @@ func restoreChain(db *store.DB, chain *core.Chain, utxos *core.UTXOSet, tipHeigh
                 return fmt.Errorf("iter key images: %w", err)
         }
         log.Info("key images restored", "count", kiCount)
+
+        // ── Rebuild Phase 2 spent-decoy pool ─────────────────────────────────────
+        // Re-iterate all canonical blocks and call ApplyBlockForSpentDecoys for
+        // each one.  This reconstructs the spentPubKeys pool that was populated at
+        // runtime by ApplyBlock — without it SampleDecoys returns nothing after a
+        // restart and wallet sends silently fall back to Phase 1 random keys.
+        //
+        // The block data is already persisted in LevelDB from the first loop above;
+        // this second pass reads only the block JSON, which is cheap relative to the
+        // full chain replay done by the consensus layer.
+        for h := uint64(0); h <= tipHeight; h++ {
+                data, err := db.GetRawBlockByHeight(h)
+                if err != nil {
+                        return fmt.Errorf("get block at height %d for decoy rebuild: %w", h, err)
+                }
+                if data == nil {
+                        return fmt.Errorf("missing block at height %d during decoy rebuild", h)
+                }
+                var block core.Block
+                if err := json.Unmarshal(data, &block); err != nil {
+                        return fmt.Errorf("unmarshal block at height %d for decoy rebuild: %w", h, err)
+                }
+                utxos.ApplyBlockForSpentDecoys(&block)
+        }
+        log.Info("spent decoy pool rebuilt", "size", utxos.SpentDecoyCount())
         return nil
 }
 

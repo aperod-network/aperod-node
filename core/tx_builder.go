@@ -18,7 +18,8 @@ type TxBuilder struct {
         viewPriv     crypto.Scalar32
         spendPub     crypto.Point32
         ownedUTXOs   []OwnedUTXO
-        feePerByte   uint64 // base-fee + optional tip per byte in nAPRO
+        feePerByte   uint64   // base-fee + optional tip per byte in nAPRO
+        utxoSet      *UTXOSet // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
@@ -44,6 +45,14 @@ func NewTxBuilder(
                 ownedUTXOs: ownedUTXOs,
                 feePerByte: feePerByte,
         }
+}
+
+// WithDecoySet wires a live UTXOSet so that ring decoy slots are filled with
+// real on-chain UTXOs (Phase 2).  Without this, decoys are randomly generated
+// keys (Phase 1).  Returns the builder for chaining.
+func (b *TxBuilder) WithDecoySet(utxos *UTXOSet) *TxBuilder {
+        b.utxoSet = utxos
+        return b
 }
 
 // BuildResult contains the signed transaction and its metadata.
@@ -204,6 +213,19 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 payBlindResult = payBlind
         }
 
+        // ── Sample decoys for Phase 2 ring construction ───────────────────────────
+        // Each ring needs RingSize-1 decoys.  Exclude the real inputs' pub keys
+        // so the wallet's own outputs are not also used as decoys in the same tx.
+        var allDecoys []DecoyUTXO
+        if b.utxoSet != nil {
+                excludePubs := make(map[crypto.Point32]bool, len(selected))
+                for _, u := range selected {
+                        excludePubs[u.OneTimePub] = true
+                }
+                need := len(selected) * (crypto.RingSize - 1)
+                allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
+        }
+
         // ── Build ring inputs and derive one-time spend keys ─────────────────────
         inputs := make([]RingInput, len(selected))
         inputPrivKeys := make([]crypto.Scalar32, len(selected))
@@ -217,7 +239,18 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 }
                 inputPrivKeys[i] = oneTimePriv
 
-                ring, realIdx, err := txBuildRing(u.OneTimePub)
+                // Assign a non-overlapping slice of decoys to this ring.
+                start := i * (crypto.RingSize - 1)
+                end := start + (crypto.RingSize - 1)
+                if end > len(allDecoys) {
+                        end = len(allDecoys)
+                }
+                var ringDecoys []DecoyUTXO
+                if start < end {
+                        ringDecoys = allDecoys[start:end]
+                }
+
+                ring, realIdx, err := txBuildRing(u.OneTimePub, ringDecoys)
                 if err != nil {
                         return nil, fmt.Errorf("build ring [%d]: %w", i, err)
                 }
@@ -348,18 +381,35 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
 }
 
 // txBuildRing assembles a ring of RingSize with the real key at a deterministic
-// position (derived from the key bytes so signing is consistent).
-// Phase 1: decoys are randomly generated keys; Phase 2+ will use real chain UTXOs.
-func txBuildRing(realPub crypto.Point32) ([]crypto.RingMember, int, error) {
-        ring := make([]crypto.RingMember, crypto.RingSize)
-        for i := range ring {
-                decoy, err := crypto.GenerateWalletKeys()
-                if err != nil {
-                        return nil, 0, err
-                }
-                ring[i] = decoy.Spend.Public
-        }
+// position derived from the key bytes (so signing is consistent across retries).
+//
+// Phase 2 (decoys provided): decoy slots use real on-chain UTXOs from the supplied
+// slice.  Each DecoyUTXO contributes its OneTimePub to the ring; the caller must
+// supply at least RingSize-1 entries.  If fewer are provided, remaining slots are
+// filled with randomly-generated keys (Phase 1 fallback for that slot).
+//
+// Phase 1 (decoys nil or empty): all decoy slots use randomly-generated keys.
+func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMember, int, error) {
         realIdx := int(realPub[0]) % crypto.RingSize
+        ring := make([]crypto.RingMember, crypto.RingSize)
+
+        di := 0
+        for i := range ring {
+                if i == realIdx {
+                        continue
+                }
+                if di < len(decoys) {
+                        ring[i] = decoys[di].OneTimePub
+                        di++
+                } else {
+                        // Phase 1 fallback: not enough real decoys — generate a random key.
+                        fake, err := crypto.GenerateWalletKeys()
+                        if err != nil {
+                                return nil, 0, err
+                        }
+                        ring[i] = fake.Spend.Public
+                }
+        }
         ring[realIdx] = realPub
         return ring, realIdx, nil
 }

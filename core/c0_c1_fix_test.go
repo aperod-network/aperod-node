@@ -43,20 +43,17 @@ func minimalRingCTTx(ring []crypto.Point32, commit crypto.Commitment) core.Trans
 	}
 }
 
-// ─── C-0: missing ring member (Phase 1 decoy) ────────────────────────────────
+// ─── C-0: ring-member UTXO presence check ─────────────────────────────────────
 
-// TestC0_Phase1RandomDecoyPasses verifies that TxVerifier accepts a transaction
-// whose ring contains pub keys not present in the UTXO set.
+// TestC0_Phase1CompatModeSkipsAbsentMembers verifies that a non-strict verifier
+// (Phase 1 compat mode, the default) accepts a transaction whose ring contains
+// keys not present in the UTXO set.
 //
-// Phase 1 behaviour: txBuildRing generates random pub keys as decoys.  These
-// keys are not on-chain and therefore absent from the UTXO set.  The C-0
-// commitment-binding check is skipped for absent members so that Phase 1
-// wallets can send transactions.  The ring signature itself still proves
-// knowledge of the real spending key, so no inflation is possible.
-//
-// When Phase 2 decoys (real chain UTXOs) are adopted, all ring members will be
-// present in the UTXO set and the commitment check will apply to each one.
-func TestC0_Phase1RandomDecoyPasses(t *testing.T) {
+// Phase 1 wallets generate random decoy keys.  Without strict mode enabled the
+// C-0 check skips absent members so in-flight Phase 1 transactions are not
+// orphaned during migration.  The MLSAG ring signature still proves knowledge
+// of the real spending key, so no inflation is possible.
+func TestC0_Phase1CompatModeSkipsAbsentMembers(t *testing.T) {
 	utxos := core.NewUTXOSet()
 
 	blind, err := crypto.NewBlindFactor()
@@ -76,21 +73,66 @@ func TestC0_Phase1RandomDecoyPasses(t *testing.T) {
 	}
 
 	tx := minimalRingCTTx(ring, commit)
-	verifier := core.NewTxVerifier(utxos)
+	verifier := core.NewTxVerifier(utxos) // default: strictRingMembers = false
 	err = verifier.VerifyTx(&tx)
 
-	// Phase 1: missing ring members are allowed — C-0 must NOT fire.
-	// The tx may still fail at a later stage (e.g. MLSAG with a nil sig),
-	// but it must not be rejected by the ring-member UTXO existence check.
+	// Phase 1 compat mode: absent ring members must NOT trigger a C-0 error.
+	// The tx may still fail at a later stage (e.g. MLSAG nil signature in this
+	// test), but it must pass the ring-member UTXO existence check.
 	if err != nil && strings.Contains(err.Error(), "C-0") {
-		t.Fatalf("Phase 1 random decoy incorrectly rejected by C-0: %v", err)
+		t.Fatalf("Phase 1 compat mode: absent ring member incorrectly rejected by C-0: %v", err)
 	}
-	t.Logf("Phase 1 random decoy correctly accepted past C-0 (later stage: %v)", err)
+	t.Logf("Phase 1 compat: absent member correctly skipped (later stage: %v)", err)
 }
 
-// TestC0_RejectCommitMismatch verifies that TxVerifier rejects a transaction
-// whose ring member IS in the UTXO set but the AmountCommit is forged.
-func TestC0_RejectCommitMismatch(t *testing.T) {
+// TestC0_AllMembersInUTXOSet_SameCommit verifies that a ring where every member
+// is present in byPubKey and all have the same commitment passes C-0.
+// This models Phase 2 decoys sampled from spentPubKeys (absent from byPubKey)
+// combined with a real unspent member — but here all members are active for
+// the convenience of testing C-0 in isolation.
+func TestC0_AllMembersInUTXOSet_SameCommit(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(1000, blind)
+
+	// Populate UTXO set with all ring members sharing the same commitment.
+	ring := make([]crypto.Point32, crypto.RingSize)
+	for i := range ring {
+		p := crypto.Point32{byte(i + 1)}
+		ring[i] = p
+		utxos.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 1)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: commit,
+		})
+	}
+
+	tx := minimalRingCTTx(ring, commit)
+	verifier := core.NewTxVerifier(utxos)
+	err := verifier.VerifyTx(&tx)
+
+	// All ring members present with matching commitment — C-0 must NOT fire.
+	// The tx will still fail later (nil MLSAG sig stub), but not at C-0.
+	if err != nil && strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("real UTXO ring incorrectly rejected by C-0: %v", err)
+	}
+	t.Logf("All real UTXOs with same commit accepted past C-0 (later: %v)", err)
+}
+
+// TestC0_ForgedCommit_RejectedByC0 verifies that a transaction whose
+// inp.AmountCommit does NOT match the on-chain commitment of a ring member in
+// byPubKey is rejected with a C-0 error.
+//
+// Security argument: the real (unspent) spending key lives in byPubKey.  A
+// malicious signer cannot claim a larger amount by forging inp.AmountCommit
+// because C-0 detects the mismatch for the active UTXO.
+//
+// Phase 2 decoys (from spentPubKeys) are absent from byPubKey and C-0 skips
+// them — identical treatment to Phase 1 random keys.  Only the real unspent
+// input triggers the commitment check.
+func TestC0_ForgedCommit_RejectedByC0(t *testing.T) {
 	utxos := core.NewUTXOSet()
 
 	blind, err := crypto.NewBlindFactor()
@@ -102,51 +144,47 @@ func TestC0_RejectCommitMismatch(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	// Add a UTXO for the first ring member.
-	var memberPub crypto.Point32
-	memberPub[0] = 0xCC
+	// The real ring member: unspent, in byPubKey with realCommit.
+	var realPub crypto.Point32
+	realPub[0] = 0xCC
 	utxos.Add(&core.UTXO{
 		TxHash:       crypto.Hash32{0x10},
 		OutputIndex:  0,
-		OneTimePub:   memberPub,
+		OneTimePub:   realPub,
 		AmountCommit: realCommit,
 	})
 
-	// Fill the rest of the ring with UTXOs too.
+	// Build a ring: realPub at index 0, remaining slots absent (random / Phase 1).
 	ring := make([]crypto.Point32, crypto.RingSize)
-	ring[0] = memberPub
+	ring[0] = realPub
 	for i := 1; i < crypto.RingSize; i++ {
-		var p crypto.Point32
-		p[0] = byte(i)
-		ring[i] = p
-		utxos.Add(&core.UTXO{
-			TxHash:       crypto.Hash32{byte(i)},
-			OutputIndex:  0,
-			OneTimePub:   p,
-			AmountCommit: realCommit,
-		})
+		ring[i][0] = byte(i + 100) // not in UTXO set
 	}
 
-	// Build tx that claims a DIFFERENT (forged) commitment for all ring members.
+	// Build a transaction with a FORGED inp.AmountCommit.
 	forgedBlind, _ := crypto.NewBlindFactor()
 	forgedCommit, _ := crypto.Commit(9_999_999, forgedBlind)
 
 	tx := minimalRingCTTx(ring, forgedCommit)
 	verifier := core.NewTxVerifier(utxos)
 	err = verifier.VerifyTx(&tx)
+
+	// C-0 must fire: realPub is in byPubKey with realCommit ≠ forgedCommit.
 	if err == nil {
-		t.Fatal("expected commitment-mismatch error, got nil")
+		t.Fatal("expected C-0 rejection of forged commitment, got nil error")
 	}
-	if !strings.Contains(err.Error(), "C-0 check") {
-		t.Fatalf("expected C-0 commit mismatch error, got: %v", err)
+	if !strings.Contains(err.Error(), "C-0") {
+		t.Errorf("expected C-0 error, got: %v", err)
 	}
-	t.Logf("C-0 commit-mismatch correctly rejected: %v", err)
+	t.Logf("Forged commit correctly rejected by C-0: %v", err)
 }
 
-// TestC0_SpentUTXOsRemainsValidDecoy verifies that a UTXO spent via a normal
-// key-image mark still appears in byPubKey (so it can be used as a ring decoy
-// in a subsequent transaction without triggering C-0).
-func TestC0_SpentUTXOsRemainsValidDecoy(t *testing.T) {
+// TestC0_MarkSpentAloneKeepsUTXOInByPubKey verifies that calling MarkSpent
+// (key-image only) does NOT remove the UTXO from byPubKey.  The UTXO is moved
+// to spentPubKeys only when ApplyBlock processes a full block that identifies
+// the real spent UTXO by commitment match.  MarkSpent is used during startup
+// replay where only key-image data is available.
+func TestC0_MarkSpentAloneKeepsUTXOInByPubKey(t *testing.T) {
 	utxos := core.NewUTXOSet()
 
 	blind, _ := crypto.NewBlindFactor()
@@ -162,14 +200,224 @@ func TestC0_SpentUTXOsRemainsValidDecoy(t *testing.T) {
 		AmountCommit: commit,
 	})
 
-	// Mark as spent (key image used) — UTXO should still be in byPubKey.
+	// MarkSpent records the key image but CANNOT identify which pub key was spent
+	// (that requires the ring + commitment match in ApplyBlock).  The UTXO must
+	// remain in byPubKey.
 	utxos.MarkSpent(crypto.KeyImage{0x99})
 
 	result := utxos.GetByPubKey(memberPub)
 	if result == nil {
-		t.Fatal("spent UTXO should still be accessible as ring decoy via byPubKey")
+		t.Fatal("UTXO should remain in byPubKey after MarkSpent-only (no ring data)")
 	}
-	t.Log("C-0: spent UTXO correctly remains available as ring decoy")
+	t.Log("C-0: MarkSpent alone correctly leaves UTXO in byPubKey")
+}
+
+// TestC0_Phase2SpentDecoyAbsentFromByPubKey verifies that UTXOs added to
+// spentPubKeys via AddSpentDecoyForTest are absent from byPubKey and therefore
+// C-0 skips them — making them safe Phase 2 ring decoys.
+func TestC0_Phase2SpentDecoyAbsentFromByPubKey(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(200, blind)
+
+	var spentPub crypto.Point32
+	spentPub[0] = 0xEE
+
+	spentUTXO := &core.UTXO{
+		TxHash:       crypto.Hash32{0x30},
+		OutputIndex:  0,
+		OneTimePub:   spentPub,
+		AmountCommit: commit,
+	}
+	// Simulate ApplyBlock moving the spent UTXO out of byPubKey.
+	utxos.AddSpentDecoyForTest(spentUTXO)
+
+	// Must be absent from byPubKey — C-0 will skip it as a ring decoy.
+	if utxos.GetByPubKey(spentPub) != nil {
+		t.Fatal("spent decoy should NOT be in byPubKey; C-0 would fire with commitment mismatch")
+	}
+	t.Log("Phase 2 spent decoy correctly absent from byPubKey — safe for ring")
+}
+
+// ─── Phase 2: UTXOSet.SampleDecoys ───────────────────────────────────────────
+
+// TestSampleDecoys_BasicSampling verifies that SampleDecoys returns the
+// requested number of decoys from spentPubKeys and excludes specified pub keys.
+//
+// SampleDecoys sources from spentPubKeys (spent UTXOs moved out of byPubKey by
+// ApplyBlock).  Tests use AddSpentDecoyForTest to populate the pool directly.
+func TestSampleDecoys_BasicSampling(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	// Populate spentPubKeys with 20 spent UTXOs.
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(100, blind)
+	for i := 0; i < 20; i++ {
+		p := crypto.Point32{byte(i + 1)}
+		utxos.AddSpentDecoyForTest(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 1)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: commit,
+		})
+	}
+
+	exclude := map[crypto.Point32]bool{{0x01}: true, {0x02}: true}
+	decoys := utxos.SampleDecoys(15, exclude)
+	if len(decoys) != 15 {
+		t.Fatalf("want 15 decoys, got %d", len(decoys))
+	}
+	for _, d := range decoys {
+		if exclude[d.OneTimePub] {
+			t.Fatalf("excluded pub key %x appeared in decoys", d.OneTimePub[:4])
+		}
+	}
+	t.Logf("SampleDecoys: 15 unique non-excluded decoys returned")
+}
+
+// TestSampleDecoys_ShortfallReturnsAll verifies that SampleDecoys returns all
+// available candidates when fewer than count are present in spentPubKeys.
+func TestSampleDecoys_ShortfallReturnsAll(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(50, blind)
+	for i := 0; i < 5; i++ {
+		p := crypto.Point32{byte(i + 1)}
+		utxos.AddSpentDecoyForTest(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 1)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: commit,
+		})
+	}
+
+	decoys := utxos.SampleDecoys(15, nil)
+	if len(decoys) != 5 {
+		t.Fatalf("want 5 (all available), got %d", len(decoys))
+	}
+	t.Log("SampleDecoys: shortfall returns all available candidates")
+}
+
+// TestSampleDecoys_EmptyPoolReturnsNil verifies that SampleDecoys returns nil
+// when no spent UTXOs are in the pool (new node with no transactions yet).
+func TestSampleDecoys_EmptyPoolReturnsNil(t *testing.T) {
+	utxos := core.NewUTXOSet()
+	decoys := utxos.SampleDecoys(15, nil)
+	if len(decoys) != 0 {
+		t.Fatalf("want 0 decoys from empty pool, got %d", len(decoys))
+	}
+	t.Log("SampleDecoys: empty pool correctly returns nil (caller falls back to Phase 1)")
+}
+
+// TestSpentDecoyPool_SurvivesRestartReplay verifies the restart lifecycle:
+//
+//  1. Start: add active UTXOs, apply a block that spends one.
+//     → spentPubKeys has the spent UTXO; SampleDecoys returns it.
+//
+//  2. Simulate restart: create a new UTXOSet and restore only active UTXOs
+//     (as restoreChain does via IterUTXOs+Add).
+//     → spentPubKeys is empty; SampleDecoys returns nothing.
+//
+//  3. Replay the spending block via ApplyBlockForSpentDecoys.
+//     → spentPubKeys is rebuilt; SampleDecoys returns the spent UTXO again.
+//
+// This mirrors what restoreChain does at node startup and proves that the
+// decoy pool is available to wallet sends immediately after a restart.
+func TestSpentDecoyPool_SurvivesRestartReplay(t *testing.T) {
+	// ── Phase A: runtime (new block committed) ────────────────────────────────
+	utxosRuntime := core.NewUTXOSet()
+
+	blind, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor: %v", err)
+	}
+	realCommit, err := crypto.Commit(1000, blind)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Add 16 UTXOs (the real input and 15 decoys).
+	ring := make([]crypto.Point32, crypto.RingSize)
+	for i := 0; i < crypto.RingSize; i++ {
+		p := crypto.Point32{byte(i + 1)}
+		ring[i] = p
+		utxosRuntime.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 1)},
+			OutputIndex:  0,
+			OneTimePub:   ring[i],
+			AmountCommit: realCommit,
+		})
+	}
+
+	// Build a minimal spending block (no outputs needed for this test).
+	spendingBlock := &core.Block{
+		Header: core.BlockHeader{Height: 1},
+		Txs: []core.Transaction{
+			{
+				Version: core.TxVersionBase,
+				Inputs: []core.RingInput{
+					{Ring: ring, AmountCommit: realCommit, KeyImage: crypto.KeyImage{0xFF}},
+				},
+			},
+		},
+	}
+
+	// Apply the block at runtime — real UTXO (ring[0]) is moved to spentPubKeys.
+	if err := utxosRuntime.ApplyBlock(spendingBlock); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+	if utxosRuntime.SpentDecoyCount() == 0 {
+		t.Fatal("runtime: spentPubKeys must be non-empty after ApplyBlock")
+	}
+	runtimeDecoys := utxosRuntime.SampleDecoys(1, nil)
+	if len(runtimeDecoys) == 0 {
+		t.Fatal("runtime: SampleDecoys must return spent decoys")
+	}
+	t.Logf("runtime: %d decoy(s) available", len(runtimeDecoys))
+
+	// ── Phase B: simulate restart — restore only active UTXOs ─────────────────
+	utxosAfterRestart := core.NewUTXOSet()
+	// restoreChain calls IterUTXOs → Add for each active (unspent) UTXO.
+	// ring[0] was spent, so it is absent from the persisted active set.
+	for i := 1; i < crypto.RingSize; i++ {
+		utxosAfterRestart.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 1)},
+			OutputIndex:  0,
+			OneTimePub:   ring[i],
+			AmountCommit: realCommit,
+		})
+	}
+	if utxosAfterRestart.SpentDecoyCount() != 0 {
+		t.Fatal("post-restart: spentPubKeys must be empty before replay")
+	}
+	if decoysBeforeReplay := utxosAfterRestart.SampleDecoys(1, nil); len(decoysBeforeReplay) != 0 {
+		t.Fatalf("post-restart before replay: expected 0 decoys, got %d", len(decoysBeforeReplay))
+	}
+	t.Log("post-restart: decoy pool correctly empty before ApplyBlockForSpentDecoys")
+
+	// ── Phase C: replay spending block via ApplyBlockForSpentDecoys ───────────
+	utxosAfterRestart.ApplyBlockForSpentDecoys(spendingBlock)
+	if utxosAfterRestart.SpentDecoyCount() == 0 {
+		t.Fatal("post-restart after replay: spentPubKeys must be non-empty")
+	}
+	replayDecoys := utxosAfterRestart.SampleDecoys(1, nil)
+	if len(replayDecoys) == 0 {
+		t.Fatal("post-restart after replay: SampleDecoys must return spent decoys")
+	}
+	// Verify the returned decoy was a member of the original ring.
+	found := false
+	for _, r := range ring {
+		if replayDecoys[0].OneTimePub == r {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("replayed decoy pub %x was not in the original ring", replayDecoys[0].OneTimePub[:4])
+	}
+	t.Logf("post-restart: decoy pool correctly rebuilt — %d decoy(s) available", len(replayDecoys))
 }
 
 // ─── C-1: UTXO-backed stake deposit ──────────────────────────────────────────

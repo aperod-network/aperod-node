@@ -234,13 +234,15 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         }
 
         // ── 5. Build and sign the transaction ────────────────────────────────────
-        builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0)
+        builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0).
+                WithDecoySet(s.utxos) // Phase 2: sample real chain UTXOs as ring decoys
         result, err := builder.Build(p.AmountNAPR, crypto.Address(p.ToAddress), changeAddr)
         if err != nil {
                 return nil, fmt.Errorf("build: %w", err)
         }
 
         // ── 6. Cryptographic verification ────────────────────────────────────────
+        // Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
         verifier := core.NewTxVerifier(s.utxos)
         if err := verifier.VerifyTx(&result.Tx); err != nil {
                 return nil, fmt.Errorf("verify: %w", err)
