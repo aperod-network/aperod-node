@@ -420,6 +420,129 @@ func TestSpentDecoyPool_SurvivesRestartReplay(t *testing.T) {
 	t.Logf("post-restart: decoy pool correctly rebuilt — %d decoy(s) available", len(replayDecoys))
 }
 
+// ─── Faucet spend: Phase 1 decoys + C-0 live UTXO set ────────────────────────
+
+// TestFaucetUTXOSpendable_Phase1Decoys is the end-to-end regression test for
+// the C-0 "ring member not found" bug that previously blocked any wallet that
+// received funds from the faucet from sending them onward.
+//
+// The bug: C-0 enforced that every ring member must be present in byPubKey,
+// which failed for Phase 1 random decoy keys (they are never in the UTXO set
+// by design).  The fix makes C-0 skip absent members — only present ones are
+// checked for commitment binding.
+//
+// Flow:
+//  1. Mint a faucet UTXO to Alice via BuildMintTx (height=5, simulating a
+//     block-height-specific faucet grant).
+//  2. Register the UTXO in a UTXOSet (activates the C-0 check).
+//  3. Build a spend transaction via TxBuilder WITHOUT WithDecoySet (Phase 1:
+//     all ring decoys are randomly generated, absent from the UTXO set).
+//  4. Verify with TxVerifier backed by the same UTXOSet — C-0 must NOT fire:
+//     - The real UTXO is in byPubKey; its commitment matches inp.AmountCommit ✓
+//     - Phase 1 random decoys are absent → skipped by the fix ✓
+func TestFaucetUTXOSpendable_Phase1Decoys(t *testing.T) {
+	const faucetHeight = uint64(5)
+	const faucetAmount = uint64(100_000_000_000) // 1000 APRO
+	const sendAmount = uint64(10_000_000_000)    // 100  APRO
+
+	// ── 1. Generate Alice's wallet keys ──────────────────────────────────────
+	aliceKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	aliceAddr := crypto.AddressFromKeys(crypto.MainnetByte, aliceKeys)
+
+	_, aliceSpendPub, _, err := crypto.DecodeAddress(aliceAddr)
+	if err != nil {
+		t.Fatalf("DecodeAddress: %v", err)
+	}
+
+	// ── 2. Mint the faucet UTXO at the given height ───────────────────────────
+	// BuildMintTx uses mint_pub = spend_pub + height*G and a deterministic blind
+	// so the wallet can always recompute the blind from (spendPub, amount).
+	mintTx, err := core.BuildMintTx(aliceAddr, faucetAmount, faucetHeight)
+	if err != nil {
+		t.Fatalf("BuildMintTx: %v", err)
+	}
+	mintOut := mintTx.Outputs[0]
+	t.Logf("faucet UTXO oneTimePub=%x commit=%x", mintOut.OneTimePub[:8], mintOut.AmountCommit[:8])
+
+	// ── 3. Register the UTXO in the active UTXO set (enables C-0) ────────────
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:       mintTx.Hash(),
+		OutputIndex:  0,
+		OneTimePub:   mintOut.OneTimePub,
+		TxPubKey:     mintOut.TxPubKey,
+		AmountCommit: mintOut.AmountCommit,
+	})
+
+	// ── 4. Recover the blind and one-time private key as the wallet would ─────
+	// DeterministicMintBlind(spendPub, amount) matches what BuildMintTx used.
+	blind, err := crypto.DeterministicMintBlind(aliceSpendPub, faucetAmount)
+	if err != nil {
+		t.Fatalf("DeterministicMintBlind: %v", err)
+	}
+
+	// one_time_priv = height_scalar + spend_priv  (for mint outputs)
+	// TxBuilder derives: oneTimePriv = HsScalar + spendPriv, so HsScalar = height scalar.
+	hsScalar := crypto.ScalarFromUint64(faucetHeight)
+
+	ownedUTXO := core.OwnedUTXO{
+		UTXO: core.UTXO{
+			TxHash:       mintTx.Hash(),
+			OutputIndex:  0,
+			OneTimePub:   mintOut.OneTimePub,
+			TxPubKey:     mintOut.TxPubKey,
+			AmountCommit: mintOut.AmountCommit,
+		},
+		HsScalar: hsScalar,
+		Amount:   faucetAmount,
+		Blind:    blind,
+	}
+
+	// ── 5. Build a spend transaction (Phase 1: no WithDecoySet) ──────────────
+	// Phase 1 means all ring decoys are randomly generated — none will be present
+	// in the UTXO set.  This is exactly the scenario that triggered C-0 failures
+	// before the fix.
+	bobKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys bob: %v", err)
+	}
+	bobAddr := crypto.AddressFromKeys(crypto.MainnetByte, bobKeys)
+
+	builder := core.NewTxBuilder(
+		aliceKeys.Spend.Private,
+		aliceKeys.View.Private,
+		aliceSpendPub,
+		[]core.OwnedUTXO{ownedUTXO},
+		0, // use InitialBaseFeePerByte
+		// NOTE: WithDecoySet is intentionally NOT called — Phase 1 random decoys.
+	)
+
+	result, err := builder.Build(sendAmount, bobAddr, aliceAddr)
+	if err != nil {
+		t.Fatalf("TxBuilder.Build: %v", err)
+	}
+	t.Logf("built tx: %d input(s), %d output(s), fee=%d nAPRO", result.InputCount, result.OutputCount, result.TotalFee)
+
+	// ── 6. Verify through TxVerifier with the live UTXO set ──────────────────
+	// The C-0 check will encounter the real UTXO in byPubKey (commitment must
+	// match) and random Phase 1 decoys absent from byPubKey (must be skipped).
+	verifier := core.NewTxVerifier(utxos)
+	err = verifier.VerifyTx(&result.Tx)
+
+	// Primary assertion: C-0 must NOT fire for a correctly built faucet spend.
+	if err != nil && strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("C-0 incorrectly blocked faucet spend (Phase 1 random decoys): %v", err)
+	}
+	// Secondary: the tx should pass full verification (ring sigs + range proofs).
+	if err != nil {
+		t.Fatalf("VerifyTx failed (non-C-0 error): %v", err)
+	}
+	t.Log("faucet UTXO spend passed full TxVerifier with live UTXO set ✓")
+}
+
 // ─── C-1: UTXO-backed stake deposit ──────────────────────────────────────────
 
 // TestC1_RejectV1Deposit ensures that old 105-byte StakeDeposit txs are rejected.
