@@ -830,6 +830,10 @@ func (h *Host) handleGetPeers(peer *Peer) error {
         return peer.Send(MsgPeers, PeersMsg{Addrs: addrs})
 }
 
+// maxKnownPeers caps the peerList to prevent memory exhaustion from
+// unbounded peer-addr accumulation (and outbound dial-flood amplification).
+const maxKnownPeers = 512
+
 func (h *Host) addKnownPeers(addrs []string) {
         h.mu.Lock()
         defer h.mu.Unlock()
@@ -838,8 +842,12 @@ func (h *Host) addKnownPeers(addrs []string) {
                 known[a] = true
         }
         for _, a := range addrs {
+                if len(h.peerList) >= maxKnownPeers {
+                        break // cap reached; ignore excess peer addrs
+                }
                 if !known[a] {
                         h.peerList = append(h.peerList, a)
+                        known[a] = true
                 }
         }
 }

@@ -114,11 +114,19 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// realIP extracts the real client IP, honouring X-Forwarded-For if set.
+// realIP extracts the real client IP.
+// X-Forwarded-For is only trusted when the request comes from the loopback
+// interface (127.0.0.1 / ::1), i.e. from a local reverse proxy.  Accepting
+// XFF unconditionally lets any client spoof its IP and bypass rate-limiting.
 func realIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take only the first (leftmost) address — must be behind trusted proxy.
-		if i := len(xff); i > 0 {
+	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if remoteIP == "" {
+		remoteIP = r.RemoteAddr
+	}
+	// Only honour X-Forwarded-For from a trusted local proxy.
+	if remoteIP == "127.0.0.1" || remoteIP == "::1" {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Take only the first (leftmost) address.
 			for idx := 0; idx < len(xff); idx++ {
 				if xff[idx] == ',' {
 					xff = xff[:idx]
@@ -131,10 +139,7 @@ func realIP(r *http.Request) string {
 			}
 		}
 	}
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return ip
-	}
-	return r.RemoteAddr
+	return remoteIP
 }
 
 func trimSpace(s string) string {

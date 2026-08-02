@@ -692,6 +692,16 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("block from unknown validator %s", block.Header.ValidatorPub.ID())
         }
 
+        // Proposer-slot check: only the scheduled proposer may produce this round's block.
+        // Without this any known validator could front-run the legitimate proposer,
+        // capture all block rewards, and censor transactions.
+        if expected := e.proposerAt(block.Header.Round); expected != nil {
+                if !expected.Equals(block.Header.ValidatorPub) {
+                        return fmt.Errorf("block round %d: producer %s is not the scheduled proposer %s",
+                                block.Header.Round, block.Header.ValidatorPub.ID(), expected.ID())
+                }
+        }
+
         // Double-sign detection
         hash := block.Hash()
         if ev := e.slashing.CheckBlock(

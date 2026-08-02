@@ -19,6 +19,7 @@ import (
         "encoding/json"
         "fmt"
         "math"
+        "net"
         "net/http"
         "strconv"
         "strings"
@@ -41,13 +42,13 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
         s.mux.HandleFunc("/api/v1/validators", s.restValidators)
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
-        s.mux.HandleFunc("/api/v1/admin/mint", s.restAdminMint)
-        s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.restAdminPartialUnstake)
-        s.mux.HandleFunc("/api/v1/admin/full-unstake", s.restAdminFullUnstake)
-        s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.restAdminStakeDeposit)
+        s.mux.HandleFunc("/api/v1/admin/mint", s.localOnly(s.restAdminMint))
+        s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.restAdminPartialUnstake))
+        s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.restAdminFullUnstake))
+        s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.restAdminStakeDeposit))
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
-        s.mux.HandleFunc("/api/v1/network/bans", s.restNetworkBans)
+        s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.restNetworkBans))
         s.mux.HandleFunc("/api/v1/network/bans/", s.restNetworkBanByAddr)
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
@@ -1682,6 +1683,26 @@ type stakeDepositRequest struct {
 // The caller supplies a pre-signed 173-byte v2 stake payload (CLI-signed).
 type stakeBroadcastRequest struct {
         TxExtraHex string `json:"tx_extra_hex"` // hex-encoded 173-byte v2 stake payload
+}
+
+// localOnly wraps an http.HandlerFunc with a DNS-rebinding guard.
+// It rejects any request whose Host header is not the loopback address,
+// preventing a malicious web page from POST-ing to admin endpoints via
+// DNS rebinding (attacker.com resolves to 127.0.0.1, browser sends
+// Host: attacker.com — the guard catches it).
+func (s *Server) localOnly(next http.HandlerFunc) http.HandlerFunc {
+        return func(w http.ResponseWriter, r *http.Request) {
+                host := r.Host
+                // Strip port if present.
+                if h, _, err := net.SplitHostPort(host); err == nil {
+                        host = h
+                }
+                if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+                        writeJSONError(w, http.StatusForbidden, "forbidden: admin endpoints are local-only")
+                        return
+                }
+                next(w, r)
+        }
 }
 
 // ─── POST /api/v1/admin/mint ──────────────────────────────────────────────────
