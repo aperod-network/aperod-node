@@ -446,6 +446,221 @@ else
 fi
 
 # =============================================================================
+# Tests for aperod-watchdog-set-interval.sh
+# =============================================================================
+SET_INTERVAL_SH="$SCRIPT_DIR/aperod-watchdog-set-interval.sh"
+
+if [[ ! -f "$SET_INTERVAL_SH" ]]; then
+  echo -e "${RED}[ERR]${NC}  aperod-watchdog-set-interval.sh not found at: $SET_INTERVAL_SH" >&2
+  ((FAIL++))
+else
+
+# Helper: build a fake systemctl stub that silently accepts any arguments.
+make_fake_systemctl() {
+  local log_file="$1"
+  local fake_dir
+  fake_dir=$(mktemp -d "$TMPDIR_TEST/fake-sc-XXXXXXXX")
+  cat >"$fake_dir/systemctl" <<STUB
+#!/usr/bin/env bash
+echo "systemctl \$*" >> "$log_file"
+exit 0
+STUB
+  chmod +x "$fake_dir/systemctl"
+  echo "$fake_dir"
+}
+
+# =============================================================================
+# Test 9: valid integer → correct OnBootSec/OnUnitActiveSec in the drop-in
+# =============================================================================
+section "Test 9: valid WATCHDOG_INTERVAL_SECS=30 → drop-in contains OnBootSec=30"
+
+T9_DIR=$(mktemp -d "$TMPDIR_TEST/t9-XXXXXXXX")
+T9_ENV="$T9_DIR/watchdog.env"
+T9_DROPIN_DIR="$T9_DIR/dropin"
+T9_SC_LOG="$T9_DIR/systemctl.log"
+T9_FAKE_SC=$(make_fake_systemctl "$T9_SC_LOG")
+
+echo "WATCHDOG_INTERVAL_SECS=30" > "$T9_ENV"
+
+_APEROD_TEST=1 \
+  ENV_FILE="$T9_ENV" \
+  DROPIN_DIR="$T9_DROPIN_DIR" \
+  PATH="$T9_FAKE_SC:$PATH" \
+  bash "$SET_INTERVAL_SH" >/dev/null 2>&1
+T9_EXIT=$?
+
+if [[ $T9_EXIT -eq 0 ]]; then
+  pass "aperod-watchdog-set-interval.sh exited 0 for valid interval"
+else
+  fail "aperod-watchdog-set-interval.sh exited $T9_EXIT (expected 0)"
+fi
+
+T9_DROPIN="$T9_DROPIN_DIR/interval.conf"
+if [[ -f "$T9_DROPIN" ]]; then
+  pass "drop-in file was created at $T9_DROPIN"
+else
+  fail "drop-in file was NOT created at $T9_DROPIN"
+fi
+
+if grep -q "^OnBootSec=30$" "$T9_DROPIN" 2>/dev/null; then
+  pass "drop-in contains OnBootSec=30"
+else
+  fail "drop-in does NOT contain OnBootSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "^OnUnitActiveSec=30$" "$T9_DROPIN" 2>/dev/null; then
+  pass "drop-in contains OnUnitActiveSec=30"
+else
+  fail "drop-in does NOT contain OnUnitActiveSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "daemon-reload" "$T9_SC_LOG" 2>/dev/null; then
+  pass "systemctl daemon-reload was called"
+else
+  fail "systemctl daemon-reload was NOT called (log: $(cat "$T9_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if grep -q "restart aperod-node-watchdog.timer" "$T9_SC_LOG" 2>/dev/null; then
+  pass "systemctl restart aperod-node-watchdog.timer was called"
+else
+  fail "systemctl restart aperod-node-watchdog.timer was NOT called (log: $(cat "$T9_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 10: missing WATCHDOG_INTERVAL_SECS → defaults to 60
+# =============================================================================
+section "Test 10: missing WATCHDOG_INTERVAL_SECS → drop-in defaults to 60"
+
+T10_DIR=$(mktemp -d "$TMPDIR_TEST/t10-XXXXXXXX")
+T10_ENV="$T10_DIR/watchdog.env"
+T10_DROPIN_DIR="$T10_DIR/dropin"
+T10_SC_LOG="$T10_DIR/systemctl.log"
+T10_FAKE_SC=$(make_fake_systemctl "$T10_SC_LOG")
+
+# Write env file without the key
+echo "# no interval here" > "$T10_ENV"
+
+_APEROD_TEST=1 \
+  ENV_FILE="$T10_ENV" \
+  DROPIN_DIR="$T10_DROPIN_DIR" \
+  PATH="$T10_FAKE_SC:$PATH" \
+  bash "$SET_INTERVAL_SH" >/dev/null 2>&1
+T10_EXIT=$?
+
+if [[ $T10_EXIT -eq 0 ]]; then
+  pass "script exited 0 when WATCHDOG_INTERVAL_SECS is absent"
+else
+  fail "script exited $T10_EXIT (expected 0)"
+fi
+
+T10_DROPIN="$T10_DROPIN_DIR/interval.conf"
+if grep -q "^OnBootSec=60$" "$T10_DROPIN" 2>/dev/null; then
+  pass "drop-in defaults to OnBootSec=60 when key is missing"
+else
+  fail "drop-in does NOT contain OnBootSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "^OnUnitActiveSec=60$" "$T10_DROPIN" 2>/dev/null; then
+  pass "drop-in defaults to OnUnitActiveSec=60 when key is missing"
+else
+  fail "drop-in does NOT contain OnUnitActiveSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 11: value below 5 → warning + fallback to 60
+# =============================================================================
+section "Test 11: WATCHDOG_INTERVAL_SECS=3 (< 5) → warning on stderr, fallback to 60"
+
+T11_DIR=$(mktemp -d "$TMPDIR_TEST/t11-XXXXXXXX")
+T11_ENV="$T11_DIR/watchdog.env"
+T11_DROPIN_DIR="$T11_DIR/dropin"
+T11_SC_LOG="$T11_DIR/systemctl.log"
+T11_STDERR="$T11_DIR/stderr.log"
+T11_FAKE_SC=$(make_fake_systemctl "$T11_SC_LOG")
+
+echo "WATCHDOG_INTERVAL_SECS=3" > "$T11_ENV"
+
+_APEROD_TEST=1 \
+  ENV_FILE="$T11_ENV" \
+  DROPIN_DIR="$T11_DROPIN_DIR" \
+  PATH="$T11_FAKE_SC:$PATH" \
+  bash "$SET_INTERVAL_SH" >/dev/null 2>"$T11_STDERR"
+T11_EXIT=$?
+
+if [[ $T11_EXIT -eq 0 ]]; then
+  pass "script exited 0 for below-minimum value"
+else
+  fail "script exited $T11_EXIT (expected 0)"
+fi
+
+if grep -qi "warn" "$T11_STDERR" 2>/dev/null; then
+  pass "warning emitted to stderr for value below 5"
+else
+  fail "no warning on stderr for value below 5 (stderr: $(cat "$T11_STDERR" 2>/dev/null || echo '<empty>'))"
+fi
+
+T11_DROPIN="$T11_DROPIN_DIR/interval.conf"
+if grep -q "^OnBootSec=60$" "$T11_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnBootSec=60 for value below minimum"
+else
+  fail "drop-in does NOT fall back to 60 for value below minimum (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "^OnUnitActiveSec=60$" "$T11_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnUnitActiveSec=60 for value below minimum"
+else
+  fail "drop-in does NOT fall back to 60 for OnUnitActiveSec (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 12: non-integer value → warning + fallback to 60
+# =============================================================================
+section "Test 12: WATCHDOG_INTERVAL_SECS=abc (non-integer) → warning + fallback to 60"
+
+T12_DIR=$(mktemp -d "$TMPDIR_TEST/t12-XXXXXXXX")
+T12_ENV="$T12_DIR/watchdog.env"
+T12_DROPIN_DIR="$T12_DIR/dropin"
+T12_SC_LOG="$T12_DIR/systemctl.log"
+T12_STDERR="$T12_DIR/stderr.log"
+T12_FAKE_SC=$(make_fake_systemctl "$T12_SC_LOG")
+
+echo "WATCHDOG_INTERVAL_SECS=abc" > "$T12_ENV"
+
+_APEROD_TEST=1 \
+  ENV_FILE="$T12_ENV" \
+  DROPIN_DIR="$T12_DROPIN_DIR" \
+  PATH="$T12_FAKE_SC:$PATH" \
+  bash "$SET_INTERVAL_SH" >/dev/null 2>"$T12_STDERR"
+T12_EXIT=$?
+
+if [[ $T12_EXIT -eq 0 ]]; then
+  pass "script exited 0 for non-integer value"
+else
+  fail "script exited $T12_EXIT (expected 0)"
+fi
+
+if grep -qi "warn" "$T12_STDERR" 2>/dev/null; then
+  pass "warning emitted to stderr for non-integer value"
+else
+  fail "no warning on stderr for non-integer value (stderr: $(cat "$T12_STDERR" 2>/dev/null || echo '<empty>'))"
+fi
+
+T12_DROPIN="$T12_DROPIN_DIR/interval.conf"
+if grep -q "^OnBootSec=60$" "$T12_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnBootSec=60 for non-integer"
+else
+  fail "drop-in does NOT fall back to 60 for non-integer (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "^OnUnitActiveSec=60$" "$T12_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnUnitActiveSec=60 for non-integer"
+else
+  fail "drop-in does NOT fall back to 60 for OnUnitActiveSec (non-integer) (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+fi  # end of set-interval tests block (script exists guard)
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
