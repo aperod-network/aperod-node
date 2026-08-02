@@ -1,22 +1,32 @@
 # =============================================================================
-#  aperod-node-watchdog.timer — fire the watchdog probe every 60 seconds
+#  aperod-node-watchdog.timer — fire the watchdog probe periodically
+#
+#  The default interval is 60 s.  To change it without editing this file:
+#
+#    1.  Edit /etc/aperod/watchdog.env and set WATCHDOG_INTERVAL_SECS=<n>
+#    2.  Run:  sudo aperod-watchdog-set-interval
+#
+#  The helper script writes a systemd drop-in under
+#  /etc/systemd/system/aperod-node-watchdog.timer.d/interval.conf and
+#  then restarts the timer — no manual daemon-reload is required.
 #
 #  Enabled alongside aperod-node-watchdog.service:
 #    sudo systemctl enable --now aperod-node-watchdog.timer
 # =============================================================================
 
 [Unit]
-Description=Aperod node API watchdog timer (every 60 s)
+Description=Aperod node API watchdog timer (every 60 s by default)
 After=aperod-node.service
 
 [Timer]
-# First run 60 s after the timer unit activates (gives the node time to start)
+# First run after the timer unit activates (gives the node time to start).
+# Overridden by the drop-in written by aperod-watchdog-set-interval.
 OnBootSec=60
-# Repeat every 60 s thereafter
+# Repeat every 60 s thereafter.
 OnUnitActiveSec=60
-# If a run is missed (e.g. system was suspended) catch up immediately
+# If a run is missed (e.g. system was suspended) catch up immediately.
 AccuracySec=5
-# Persist the last-fire timestamp across reboots
+# Persist the last-fire timestamp across reboots.
 Persistent=true
 
 [Install]

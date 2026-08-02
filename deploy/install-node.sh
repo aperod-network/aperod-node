@@ -290,13 +290,29 @@ cp "${SCRIPT_DIR}/aperod-node-watchdog.timer"   /etc/systemd/system/
 mkdir -p /etc/aperod
 if [[ ! -f /etc/aperod/watchdog.env ]]; then
   cat > /etc/aperod/watchdog.env <<WENV
-# Watchdog alert credentials — fill in to receive Telegram notifications on node restarts
+# Aperod node watchdog configuration
+# ─────────────────────────────────────────────────────────────────
+# Probe interval (seconds).  Default: 60.
+# To change without a redeploy:
+#   1. Edit this value.
+#   2. Run: sudo aperod-watchdog-set-interval
+# Minimum accepted value: 5
+WATCHDOG_INTERVAL_SECS=60
+
+# Telegram alert credentials — fill in to receive notifications on node restarts.
 # SUPPORT_BOT_TOKEN=
 # SUPPORT_ADMIN_CHAT_ID=
 WENV
   chmod 600 /etc/aperod/watchdog.env
 fi
-systemctl daemon-reload
+
+# Install the interval-apply helper so operators can change the timer on the fly
+cp "${SCRIPT_DIR}/aperod-watchdog-set-interval.sh" /usr/local/bin/aperod-watchdog-set-interval
+chmod +x /usr/local/bin/aperod-watchdog-set-interval
+
+# Apply WATCHDOG_INTERVAL_SECS from watchdog.env to the timer drop-in
+/usr/local/bin/aperod-watchdog-set-interval
+
 systemctl enable --now aperod-node-watchdog.timer
 ok "Watchdog установлен (aperod-node-watchdog.timer запущен)"
 

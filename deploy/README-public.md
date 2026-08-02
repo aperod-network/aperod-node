@@ -70,6 +70,33 @@ journalctl -u aperod-node -f          # live logs
 curl -s http://localhost:8545/api/v1/status | jq .   # chain tip
 ```
 
+### Watchdog — configurable probe interval
+
+The installer sets up a **watchdog timer** (`aperod-node-watchdog.timer`) that probes the node API every 60 seconds and automatically restarts the node if it stops responding.
+
+To change the interval **without editing unit files or redeploying**:
+
+```bash
+# 1. Open the watchdog config (created automatically by the installer)
+sudo nano /etc/aperod/watchdog.env
+
+# 2. Set the desired interval in seconds (minimum: 5)
+WATCHDOG_INTERVAL_SECS=15   # faster detection for HA setups
+# WATCHDOG_INTERVAL_SECS=60  # default — suitable for most nodes
+# WATCHDOG_INTERVAL_SECS=120  # reduced noise for low-power validators
+
+# 3. Apply the change (writes a systemd drop-in and restarts the timer)
+sudo aperod-watchdog-set-interval
+```
+
+Verify the new interval is active:
+
+```bash
+systemctl list-timers aperod-node-watchdog.timer
+```
+
+The `60 s` default is preserved for all existing deployments — only nodes that explicitly set `WATCHDOG_INTERVAL_SECS` in `watchdog.env` and run `aperod-watchdog-set-interval` will use a different value.
+
 ---
 
 ## 🛡 Become a Validator
