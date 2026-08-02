@@ -1,0 +1,23 @@
+# =============================================================================
+#  aperod-node-watchdog.timer — fire the watchdog probe every 60 seconds
+#
+#  Enabled alongside aperod-node-watchdog.service:
+#    sudo systemctl enable --now aperod-node-watchdog.timer
+# =============================================================================
+
+[Unit]
+Description=Aperod node API watchdog timer (every 60 s)
+After=aperod-node.service
+
+[Timer]
+# First run 60 s after the timer unit activates (gives the node time to start)
+OnBootSec=60
+# Repeat every 60 s thereafter
+OnUnitActiveSec=60
+# If a run is missed (e.g. system was suspended) catch up immediately
+AccuracySec=5
+# Persist the last-fire timestamp across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

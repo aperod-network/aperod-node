@@ -278,6 +278,28 @@ systemctl daemon-reload
 systemctl enable aperod-node
 systemctl start  aperod-node
 
+# ── 11. Watchdog — автоматический перезапуск при зависании API ────────────────
+info "Устанавливаем watchdog для aperod-node…"
+# Resolve the script directory so we can reference sibling deploy files
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cp "${SCRIPT_DIR}/aperod-node-watchdog.sh" /usr/local/bin/aperod-node-watchdog.sh
+chmod +x /usr/local/bin/aperod-node-watchdog.sh
+cp "${SCRIPT_DIR}/aperod-node-watchdog.service" /etc/systemd/system/
+cp "${SCRIPT_DIR}/aperod-node-watchdog.timer"   /etc/systemd/system/
+# Create optional env file for Telegram alerts (operator fills in bot token / chat ID)
+mkdir -p /etc/aperod
+if [[ ! -f /etc/aperod/watchdog.env ]]; then
+  cat > /etc/aperod/watchdog.env <<WENV
+# Watchdog alert credentials — fill in to receive Telegram notifications on node restarts
+# SUPPORT_BOT_TOKEN=
+# SUPPORT_ADMIN_CHAT_ID=
+WENV
+  chmod 600 /etc/aperod/watchdog.env
+fi
+systemctl daemon-reload
+systemctl enable --now aperod-node-watchdog.timer
+ok "Watchdog установлен (aperod-node-watchdog.timer запущен)"
+
 # Проверяем что стартовал
 sleep 3
 if systemctl is-active --quiet aperod-node; then
