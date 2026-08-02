@@ -295,6 +295,148 @@ else
   fail "systemctl restart was NOT called for 404 response"
 fi
 
+# ---------------------------------------------------------------------------
+# make_fake_curl  — builds a stub `curl` that:
+#   * logs every invocation to $2
+#   * if the URL contains "api.telegram.org" → just exits 0 (Telegram path)
+#   * otherwise → prints $3 to stdout (health-probe path needs HTTP code)
+# ---------------------------------------------------------------------------
+make_fake_curl() {
+  local log_file="$1"
+  local health_code="$2"   # e.g. "503", "200"
+  local fake_dir
+  fake_dir=$(mktemp -d "$TMPDIR_TEST/fake-curl-XXXXXXXX")
+  cat >"$fake_dir/curl" <<STUB
+#!/usr/bin/env bash
+# Log all arguments so tests can grep them
+echo "curl \$*" >> "$log_file"
+# Telegram calls: output suppressed by watchdog; just exit 0
+if echo "\$*" | grep -q "api.telegram.org"; then
+  exit 0
+fi
+# Health-probe call: watchdog captures stdout as the HTTP code
+echo "$health_code"
+exit 0
+STUB
+  chmod +x "$fake_dir/curl"
+  echo "$fake_dir"
+}
+
+# =============================================================================
+# Test 6: Telegram sendMessage IS called when probe fails and tokens are set
+# =============================================================================
+section "Test 6: Telegram sendMessage is called on probe failure (tokens set)"
+
+LOG6_CURL="$TMPDIR_TEST/curl-t6.log"
+LOG6_SC="$TMPDIR_TEST/systemctl-t6.log"
+FAKE6_CURL=$(make_fake_curl "$LOG6_CURL" "503")
+FAKE6_SC=$(make_fake_bin "systemctl" "$LOG6_SC")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="test-bot-token" \
+  SUPPORT_ADMIN_CHAT_ID="123456789" \
+  PATH="$FAKE6_CURL:$FAKE6_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+WDEXIT6=$?
+
+if [[ $WDEXIT6 -eq 0 ]]; then
+  pass "watchdog exited 0 when probe failed (tokens set)"
+else
+  fail "watchdog exited $WDEXIT6 (expected 0)"
+fi
+
+if [[ -f "$LOG6_CURL" ]] && grep -q "api.telegram.org" "$LOG6_CURL"; then
+  pass "curl was called with api.telegram.org (Telegram alert sent)"
+else
+  fail "curl was NOT called with api.telegram.org (log: $(cat "$LOG6_CURL" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$LOG6_CURL" ]] && grep -q "sendMessage" "$LOG6_CURL"; then
+  pass "Telegram sendMessage endpoint was called"
+else
+  fail "Telegram sendMessage endpoint was NOT called (log: $(cat "$LOG6_CURL" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$LOG6_SC" ]] && grep -q "systemctl restart aperod-node" "$LOG6_SC"; then
+  pass "systemctl restart also called alongside Telegram alert"
+else
+  fail "systemctl restart was NOT called (log: $(cat "$LOG6_SC" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 7: Telegram NOT called when probe returns 200
+# =============================================================================
+section "Test 7: Telegram is NOT called when probe returns 200"
+
+LOG7_CURL="$TMPDIR_TEST/curl-t7.log"
+LOG7_SC="$TMPDIR_TEST/systemctl-t7.log"
+FAKE7_CURL=$(make_fake_curl "$LOG7_CURL" "200")
+FAKE7_SC=$(make_fake_bin "systemctl" "$LOG7_SC")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="test-bot-token" \
+  SUPPORT_ADMIN_CHAT_ID="123456789" \
+  PATH="$FAKE7_CURL:$FAKE7_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+WDEXIT7=$?
+
+if [[ $WDEXIT7 -eq 0 ]]; then
+  pass "watchdog exited 0 on healthy node (200)"
+else
+  fail "watchdog exited $WDEXIT7 (expected 0)"
+fi
+
+if [[ ! -f "$LOG7_CURL" ]] || ! grep -q "api.telegram.org" "$LOG7_CURL" 2>/dev/null; then
+  pass "Telegram was NOT called for a healthy 200 response"
+else
+  fail "Telegram was unexpectedly called for a 200 response"
+fi
+
+if [[ ! -f "$LOG7_SC" ]] || ! grep -q "restart aperod-node" "$LOG7_SC" 2>/dev/null; then
+  pass "systemctl restart was NOT called for a healthy 200 response"
+else
+  fail "systemctl restart was unexpectedly called for a 200 response"
+fi
+
+# =============================================================================
+# Test 8: Telegram silently skipped when tokens are unset
+# =============================================================================
+section "Test 8: Telegram silently skipped when SUPPORT_BOT_TOKEN / SUPPORT_ADMIN_CHAT_ID are unset"
+
+LOG8_CURL="$TMPDIR_TEST/curl-t8.log"
+LOG8_SC="$TMPDIR_TEST/systemctl-t8.log"
+FAKE8_CURL=$(make_fake_curl "$LOG8_CURL" "503")
+FAKE8_SC=$(make_fake_bin "systemctl" "$LOG8_SC")
+
+# Explicitly unset the Telegram env vars
+NODE_API_URL="http://127.0.0.1:19999" \
+  TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$FAKE8_CURL:$FAKE8_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+WDEXIT8=$?
+
+if [[ $WDEXIT8 -eq 0 ]]; then
+  pass "watchdog exited 0 even without Telegram tokens (probe failed)"
+else
+  fail "watchdog exited $WDEXIT8 (expected 0)"
+fi
+
+if [[ ! -f "$LOG8_CURL" ]] || ! grep -q "api.telegram.org" "$LOG8_CURL" 2>/dev/null; then
+  pass "Telegram was NOT called when tokens are unset (silent skip)"
+else
+  fail "Telegram was unexpectedly called when tokens are unset"
+fi
+
+if [[ -f "$LOG8_SC" ]] && grep -q "systemctl restart aperod-node" "$LOG8_SC"; then
+  pass "systemctl restart still called even without Telegram tokens"
+else
+  fail "systemctl restart was NOT called when tokens are unset (log: $(cat "$LOG8_SC" 2>/dev/null || echo '<empty>'))"
+fi
+
 # =============================================================================
 # Summary
 # =============================================================================
