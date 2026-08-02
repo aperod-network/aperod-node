@@ -49,7 +49,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.restNetworkBans))
-        s.mux.HandleFunc("/api/v1/network/bans/", s.restNetworkBanByAddr)
+        s.mux.HandleFunc("/api/v1/network/bans/", s.localOnly(s.restNetworkBanByAddr))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)

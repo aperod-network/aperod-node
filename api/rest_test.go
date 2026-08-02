@@ -461,13 +461,24 @@ func restPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int,
         return rr.Code, resp
 }
 
+func restLocalPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int, map[string]interface{}) {
+        t.Helper()
+        req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+        req.Host = "127.0.0.1"
+        req.Header.Set("Content-Type", "application/json")
+        rr := httptest.NewRecorder()
+        srv.ServeHTTP(rr, req)
+        var resp map[string]interface{}
+        _ = json.NewDecoder(rr.Body).Decode(&resp)
+        return rr.Code, resp
+}
 func TestREST_AdminMint_FractionalAmount(t *testing.T) {
         srv, _ := newTestServer(t)
         wk, _ := crypto.GenerateWalletKeys()
         addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
         body := []byte(`{"address":"` + string(addr) + `","amount_apr":5909.5}`)
-        code, resp := restPostJSON(t, srv, "/api/v1/admin/mint", body)
+        code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
         if code != http.StatusCreated {
                 t.Fatalf("expected 201, got %d: %v", code, resp)
         }
@@ -486,15 +497,25 @@ func TestREST_AdminMint_ZeroAmount(t *testing.T) {
         addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
         body := []byte(`{"address":"` + string(addr) + `","amount_apr":0}`)
-        code, _ := restPostJSON(t, srv, "/api/v1/admin/mint", body)
+        code, _ := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
         if code != http.StatusBadRequest {
                 t.Fatalf("expected 400 for zero amount, got %d", code)
         }
 }
 
-// ─── /api/v1/address/{addr}/utxos ────────────────────────────────────────────
+func TestREST_NetworkBanByAddr_LocalOnly(t *testing.T) {
+        srv, _ := newTestServer(t)
+        srv.SetBanLiftFunc(func(string) bool { return true }) // always succeeds
 
-// buildUTXOServer returns a server and an exposed UTXOSet so tests can add/remove UTXOs directly.
+        // Request with a non-loopback Host must be rejected.
+        req := httptest.NewRequest(http.MethodDelete, "/api/v1/network/bans/192.0.2.1", nil)
+        req.Host = "attacker.example.com"
+        rr := httptest.NewRecorder()
+        srv.ServeHTTP(rr, req)
+        if rr.Code != http.StatusForbidden {
+                t.Fatalf("expected 403 for non-loopback Host, got %d", rr.Code)
+        }
+}
 func buildUTXOServer(t *testing.T) (*api.Server, *core.UTXOSet) {
         t.Helper()
         priv, pub, _ := crypto.GenerateValidatorKey()
@@ -961,5 +982,28 @@ func TestWS_Endpoint_Registered(t *testing.T) {
         defer resp.Body.Close()
         if resp.StatusCode == http.StatusNotFound {
                 t.Error("/ws route not registered (got 404)")
+        }
+}
+
+func restLocalDelete(t *testing.T, srv *api.Server, path string) (int, map[string]interface{}) {
+        t.Helper()
+        req := httptest.NewRequest(http.MethodDelete, path, nil)
+        req.Host = "127.0.0.1"
+        rr := httptest.NewRecorder()
+        srv.ServeHTTP(rr, req)
+        var resp map[string]interface{}
+        _ = json.NewDecoder(rr.Body).Decode(&resp)
+        return rr.Code, resp
+}
+
+func TestREST_NetworkBanByAddr_LoopbackHost(t *testing.T) {
+        srv, _ := newTestServer(t)
+        srv.SetBanLiftFunc(func(string) bool { return false }) // no active ban
+
+        code, _ := restLocalDelete(t, srv, "/api/v1/network/bans/192.0.2.1")
+        // 404 = "no active ban for this address" which is the correct non-error
+        // response when the guard has passed and the ban simply isn't found.
+        if code != http.StatusNotFound {
+                t.Fatalf("expected 404 (no active ban), got %d", code)
         }
 }

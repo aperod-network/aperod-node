@@ -310,7 +310,7 @@ func postAdminStakePayload(t *testing.T, srv *api.Server, pubHex string, txHash 
 		pubHex, amount, fmt.Sprintf("%x", txHash[:]), outIdx, blindHex,
 	)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/stake-deposit", strings.NewReader(body))
-	req.Host = "127.0.0.1" // localOnly guard: simulate loopback caller
+	req.Host = "127.0.0.1" // localOnly DNS-rebinding guard requires a loopback Host
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
