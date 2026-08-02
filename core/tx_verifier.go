@@ -273,6 +273,35 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
         }
 
+        // 5b. Fee commitment binding.
+        //
+        // tx.Fee is the public plaintext fee in nAPRO.  A well-formed transaction
+        // must commit to it with a zero blinding factor: C_fee = Commit(fee, 0).
+        // Without this check an attacker can supply an arbitrary C_fee — notably a
+        // commitment to a *negative* value — and the balance equation
+        // ΣC_in = ΣC_out + C_fee still holds, because Pedersen commitments are
+        // additively homomorphic and have no range restriction on C_fee itself.
+        //
+        // Example attack (reported, August 2026):
+        //   in = 1 APRO, out1 = out2 = 1000 APRO, C_fee = C_in − C_out1 − C_out2
+        //   → C_fee commits to −1999 APRO.  Balance: ✓ Range proofs on outputs: ✓
+        //   Net effect: 1999 APRO minted from nothing.
+        //
+        // Fix: recompute the expected commitment from the public fee value and
+        // require an exact match.  Zero-blind commitment = value * H in Pedersen,
+        // which anyone can verify without knowing any secret.
+        {
+                var zeroFeeBlind crypto.BlindFactor
+                expectedFeeCommit, feeErr := crypto.Commit(tx.Fee, zeroFeeBlind)
+                if feeErr != nil {
+                        return fmt.Errorf("tx %x: fee commitment derivation: %w", txHashPrefix[:8], feeErr)
+                }
+                if tx.FeeCommit != expectedFeeCommit {
+                        return fmt.Errorf("tx %x: fee commitment mismatch — C_fee ≠ Commit(fee, 0); negative-fee inflation attack rejected",
+                                txHashPrefix[:8])
+                }
+        }
+
         // 6. Commitment balance: ΣC_in = ΣC_out + C_fee
         inCommits := make([]crypto.Commitment, len(tx.Inputs))
         for i, inp := range tx.Inputs {

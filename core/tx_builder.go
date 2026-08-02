@@ -142,10 +142,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         hasChange := changeAmount > 0
 
         // ── Fee commitment ────────────────────────────────────────────────────────
-        feeBlind, err := crypto.NewBlindFactor()
-        if err != nil {
-                return nil, fmt.Errorf("fee blind: %w", err)
-        }
+        // Fee is a public plaintext value, so its Pedersen commitment uses a zero
+        // blinding factor.  This lets VerifyTx enforce C_fee == Commit(fee, 0),
+        // closing the negative-fee inflation path where an attacker could set C_fee
+        // to a commitment to a negative number while keeping ΣC_in = ΣC_out + C_fee
+        // balanced.  The blind-balance constraint still holds with r_fee = 0:
+        //   Σr_in = Σr_out + 0  →  Σr_in = Σr_out.
+        var feeBlind crypto.BlindFactor // zero blind — fee is public, not hidden
         feeCommit, err := crypto.Commit(estimatedFee, feeBlind)
         if err != nil {
                 return nil, fmt.Errorf("fee commit: %w", err)
