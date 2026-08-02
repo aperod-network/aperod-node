@@ -145,6 +145,8 @@ FAKE1=$(make_fake_bin "systemctl" "$LOG1")
 
 NODE_API_URL="http://127.0.0.1:${PORT1}" \
   TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE1:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT1=$?
@@ -190,6 +192,8 @@ FAKE2=$(make_fake_bin "systemctl" "$LOG2")
 
 NODE_API_URL="http://127.0.0.1:${PORT2}" \
   TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE2:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT2=$?
@@ -222,6 +226,8 @@ FAKE3=$(make_fake_bin "systemctl" "$LOG3")
 
 NODE_API_URL="http://127.0.0.1:${PORT3}" \
   TIMEOUT_SECS="2" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE3:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT3=$?
@@ -276,6 +282,8 @@ FAKE5=$(make_fake_bin "systemctl" "$LOG5")
 
 NODE_API_URL="http://127.0.0.1:${PORT5}" \
   TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE5:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT5=$?
