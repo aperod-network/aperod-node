@@ -52,6 +52,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
+        s.mux.HandleFunc("/api/v1/status", s.restStatus)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -1952,5 +1953,27 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		"tx_hash": txHashHex,
 		"status":  "pending",
 		"message": "StakeDeposit v2 transaction submitted to mempool; applied when included in the next block",
+	})
+}
+
+// ─── GET /api/v1/status ───────────────────────────────────────────────────────
+//
+// Lightweight liveness endpoint used by the systemd watchdog (aperod-node-watchdog.timer).
+// Returns 200 {"ok":true,"height":N} as long as the HTTP server is responsive.
+// No authentication required. Exempted from the per-IP rate-limit bucket — see
+// rateLimitExempt in middleware.go — so watchdog probes can never be throttled.
+
+func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	height := uint64(0)
+	if tip := s.chain.Tip(); tip != nil {
+		height = tip.Header.Height
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":     true,
+		"height": height,
 	})
 }
