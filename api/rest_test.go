@@ -452,6 +452,7 @@ func TestHub_BroadcastConfirmed_NoPeers(t *testing.T) {
 func restPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int, map[string]interface{}) {
         t.Helper()
         req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+        req.Host = "127.0.0.1" // localOnly guard: simulate loopback caller
         req.Header.Set("Content-Type", "application/json")
         rr := httptest.NewRecorder()
         srv.ServeHTTP(rr, req)
