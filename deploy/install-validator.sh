@@ -347,6 +347,29 @@ systemctl enable aperod-node
 systemctl start  aperod-node
 ok "Сервис aperod-node запущен"
 
+# ── Watchdog — автоматический перезапуск при зависании API ────────────────────
+# After the node is started, install the watchdog timer that polls
+# GET /api/v1/status every 60 s and calls `systemctl restart aperod-node`
+# if the probe does not return HTTP 200 within 5 s.
+info "Устанавливаем watchdog для aperod-node…"
+cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.sh" /usr/local/bin/aperod-node-watchdog.sh
+chmod +x /usr/local/bin/aperod-node-watchdog.sh
+cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.service" /etc/systemd/system/
+cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.timer"   /etc/systemd/system/
+# Create optional env file for Telegram alerts (operator fills in credentials)
+mkdir -p /etc/aperod
+if [[ ! -f /etc/aperod/watchdog.env ]]; then
+  cat > /etc/aperod/watchdog.env <<WENV
+# Watchdog alert credentials — fill in to receive Telegram notifications on node restarts
+# SUPPORT_BOT_TOKEN=
+# SUPPORT_ADMIN_CHAT_ID=
+WENV
+  chmod 600 /etc/aperod/watchdog.env
+fi
+systemctl daemon-reload
+systemctl enable --now aperod-node-watchdog.timer
+ok "Watchdog установлен (aperod-node-watchdog.timer запущен)"
+
 sleep 3
 if systemctl is-active --quiet aperod-node; then
   ok "Нода работает нормально"

@@ -91,12 +91,24 @@ func (rl *RateLimiter) bucket(ip string) *tokenBucket {
 }
 
 // Middleware returns an http.Handler that enforces the rate limit.
+// rateLimitExempt lists paths that bypass the per-IP token bucket entirely.
+// Use sparingly — only for internal probes that must never be throttled.
+var rateLimitExempt = map[string]bool{
+	// Watchdog liveness probe: fired every 60 s from localhost by the
+	// aperod-node-watchdog.timer systemd unit.  Exempting it ensures the
+	// watchdog never triggers a spurious rate-limit 429, which would cause a
+	// false-positive node restart.
+	"/api/v1/status": true,
+}
+
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := realIP(r)
-		if !rl.bucket(ip).allow() {
-			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
-			return
+		if !rateLimitExempt[r.URL.Path] {
+			ip := realIP(r)
+			if !rl.bucket(ip).allow() {
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -1960,7 +1960,8 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 //
 // Lightweight liveness endpoint used by the systemd watchdog (aperod-node-watchdog.timer).
 // Returns 200 {"ok":true,"height":N} as long as the HTTP server is responsive.
-// No authentication required; no rate-limit bucket consumed (watchdog hits every 60 s).
+// No authentication required. Exempted from the per-IP rate-limit bucket — see
+// rateLimitExempt in middleware.go — so watchdog probes can never be throttled.
 
 func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
