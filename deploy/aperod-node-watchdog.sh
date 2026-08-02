@@ -19,6 +19,12 @@ NODE_API_URL="${NODE_API_URL:-http://127.0.0.1:8545}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-5}"
 STATUS_URL="${NODE_API_URL}/api/v1/status"
 
+# State files written every run so the Admin Panel can show watchdog status
+STATE_DIR="/var/lib/aperod"
+LAST_CHECK_FILE="${STATE_DIR}/watchdog-last-check"
+LAST_RESTART_FILE="${STATE_DIR}/watchdog-last-restart"
+RESTART_COUNT_FILE="${STATE_DIR}/watchdog-restarts"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -35,6 +41,28 @@ send_telegram() {
       >/dev/null 2>&1 || true
   fi
 }
+
+# Record the current UTC timestamp to a file (creates state dir if needed)
+write_timestamp() {
+  local file="$1"
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "${file}" || true
+}
+
+# Atomically increment the restart counter file
+increment_restart_count() {
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  local count=0
+  if [[ -f "${RESTART_COUNT_FILE}" ]]; then
+    count=$(cat "${RESTART_COUNT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+  fi
+  echo $(( count + 1 )) > "${RESTART_COUNT_FILE}" || true
+}
+
+# ---------------------------------------------------------------------------
+# Record this check run (always — so Admin Panel can detect liveness)
+# ---------------------------------------------------------------------------
+write_timestamp "${LAST_CHECK_FILE}"
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -60,6 +88,10 @@ Result: HTTP ${HTTP_CODE}
 Action: <code>systemctl restart aperod-node</code>"
 
 systemctl restart aperod-node
+
+# Record the restart event
+write_timestamp "${LAST_RESTART_FILE}"
+increment_restart_count
 
 log "aperod-node restarted"
 exit 0
