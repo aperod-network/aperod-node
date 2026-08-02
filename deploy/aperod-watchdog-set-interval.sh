@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  aperod-watchdog-set-interval — apply WATCHDOG_INTERVAL_SECS from
-#  /etc/aperod/watchdog.env to the aperod-node-watchdog.timer unit.
+#  aperod-watchdog-set-interval — write WATCHDOG_INTERVAL_SECS to
+#  /etc/aperod/watchdog.env and apply it to the aperod-node-watchdog.timer.
 #
 #  Usage (as root):
-#    sudo aperod-watchdog-set-interval
+#    sudo aperod-watchdog-set-interval [--interval=<seconds>]
 #
-#  The script:
-#    1. Reads WATCHDOG_INTERVAL_SECS from /etc/aperod/watchdog.env
-#       (defaults to 60 if the variable is absent or invalid).
-#    2. Writes a systemd drop-in that overrides OnBootSec / OnUnitActiveSec.
-#    3. Runs systemctl daemon-reload and restarts the timer — no manual
-#       step required on the operator's side.
+#  Without --interval the script reads the existing value from watchdog.env
+#  (defaults to 60 if absent/invalid) and re-applies it to the timer.
+#
+#  With --interval=N the script:
+#    1. Validates N (integer 5–3600).
+#    2. Writes WATCHDOG_INTERVAL_SECS=N to /etc/aperod/watchdog.env
+#       (creates the file / directory if absent; preserves other lines).
+#    3. Writes a systemd drop-in that overrides OnBootSec / OnUnitActiveSec.
+#    4. Runs systemctl daemon-reload and restarts the timer.
+#
+#  The Admin Panel API calls this with --interval=N via a sudoers rule
+#  (installed by blockchain/deploy/setup-watchdog-interval.sh) so the
+#  aperod-api service never needs direct write access to /etc/aperod.
 #
 #  To restore the hard-coded default simply remove the drop-in:
 #    sudo rm -f /etc/systemd/system/aperod-node-watchdog.timer.d/interval.conf
@@ -33,6 +40,33 @@ DEFAULT_INTERVAL=60
 if [[ "${_APEROD_TEST:-0}" != "1" ]] && [[ $(id -u) -ne 0 ]]; then
   echo "[ERR] Run as root: sudo aperod-watchdog-set-interval" >&2
   exit 1
+fi
+
+# ── Parse optional --interval=N argument ─────────────────────────────────────
+ARG_INTERVAL=""
+for arg in "$@"; do
+  if [[ "${arg}" =~ ^--interval=([0-9]+)$ ]]; then
+    ARG_INTERVAL="${BASH_REMATCH[1]}"
+  fi
+done
+
+# ── If --interval=N provided, write it to the env file first ─────────────────
+if [[ -n "${ARG_INTERVAL}" ]]; then
+  if [[ "${ARG_INTERVAL}" -lt 5 || "${ARG_INTERVAL}" -gt 3600 ]]; then
+    echo "[ERR] --interval=${ARG_INTERVAL} is out of range (5–3600)." >&2
+    exit 1
+  fi
+  # Ensure parent directory exists and is root-owned 0700
+  mkdir -p "$(dirname "${ENV_FILE}")"
+  chmod 700 "$(dirname "${ENV_FILE}")"
+  KEY_LINE="WATCHDOG_INTERVAL_SECS=${ARG_INTERVAL}"
+  if [[ -f "${ENV_FILE}" ]] && grep -qE '^\s*WATCHDOG_INTERVAL_SECS\s*=' "${ENV_FILE}" 2>/dev/null; then
+    # Replace existing line in-place (BSD + GNU sed compatible)
+    sed -i "s|^\s*WATCHDOG_INTERVAL_SECS\s*=.*|${KEY_LINE}|" "${ENV_FILE}"
+  else
+    echo "${KEY_LINE}" >> "${ENV_FILE}"
+  fi
+  echo "[INFO] Wrote ${KEY_LINE} to ${ENV_FILE}"
 fi
 
 # ── Read interval from env file ───────────────────────────────────────────────
