@@ -406,11 +406,20 @@ func run() error {
                         "heap_sys_mib_before", msScanStart.Sys/(1024*1024))
                 var txCount int64 = 0
                 blocksWithStake := 0
-                const syncProgressInterval = uint64(1000) // report every 1 000 blocks
+                const syncProgressInterval = uint64(1000)  // report every 1 000 blocks
+                const gcInterval            = uint64(10000) // force GC every 10 000 blocks to keep scan RSS flat
                 for h := uint64(1); h <= tipHeight; h++ {
                         // Update syncing progress so /api/v1/status can report it.
                         if apiSrv != nil && h%syncProgressInterval == 0 {
                                 apiSrv.SetSyncProgress(h, tipHeight)
+                        }
+                        // Force a GC cycle periodically so that the decoded block
+                        // objects from previous iterations are collected before the
+                        // next batch is allocated.  Without this the Go GC is too
+                        // lazy during a tight allocation loop and RSS grows linearly
+                        // with the number of blocks scanned.
+                        if h%gcInterval == 0 {
+                                runtime.GC()
                         }
 
                         raw, fetchErr := db.GetRawBlockByHeight(h)
