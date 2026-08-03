@@ -575,10 +575,15 @@ func run() error {
         // apiSrv was declared above and started in the early API server section.
         var host *p2p.Host
 
+        // engine is pre-declared with var so that the OnBlockProduced closure
+        // can reference it (e.g. engine.Registry()) via a captured pointer.
+        // By the time any block is produced, engine is fully initialised.
+        var engine *consensus.Engine
+
         // For the resume path, registry is already created and seeded inside the
         // startup scan above.  For genesis, it is nil here; NewEngine creates it.
 
-        engine := consensus.NewEngine(consensus.Config{
+        engine = consensus.NewEngine(consensus.Config{
                 BlockTime:          cfg.Consensus.BlockTime,
                 BFTThreshold:       genesisConfig.BFTThreshold,
                 Validators:         validators,
@@ -631,6 +636,36 @@ func run() error {
                                                         "height", block.Header.Height, "err", kiErr)
                                         }
                                 }
+                        }
+                        // ── Periodic mid-operation snapshot ──────────────────────────
+                        // Write a snapshot every 500 blocks so an OOM kill during
+                        // normal operation does not force the full 5-6 h startup scan
+                        // on the next restart.  TakeSnapshot is a read lock + deep
+                        // copy; the goroutine does the slow file I/O off the critical
+                        // path.
+                        if h := block.Header.Height; h > 0 && h%500 == 0 {
+                                var txTot int64
+                                if apiSrv != nil {
+                                        txTot = apiSrv.TxTotal()
+                                }
+                                hash := block.Hash()
+                                periodicSnap := startupSnapshot{
+                                        Version:    snapVersion,
+                                        TipHeight:  h,
+                                        TipHashHex: fmt.Sprintf("%x", hash[:]),
+                                        TxTotal:    txTot,
+                                        UTXOs:      utxos.TakeSnapshot(),
+                                        Registry:   engine.Registry().TakeSnapshot(),
+                                }
+                                go func(snap startupSnapshot, height uint64) {
+                                        if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
+                                                log.Warn("failed to save periodic snapshot",
+                                                        "height", height, "err", saveErr)
+                                        } else {
+                                                log.Info("periodic snapshot saved", "height", height)
+                                                deleteOldSnapshots(cfg.DataDir, height)
+                                        }
+                                }(periodicSnap, h)
                         }
                 },
         }, chain, mempool, log)
