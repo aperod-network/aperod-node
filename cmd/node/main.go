@@ -352,6 +352,11 @@ func run() error {
                                         "key_images", len(snap.UTXOs.KeyImages),
                                 )
                                 snapLoaded = true
+                                // Release the raw snapshot struct now that its contents have been
+                                // copied into the UTXOSet maps.  Without an explicit GC the
+                                // deserialised snapshot and the in-memory maps coexist until the
+                                // next automatic collection, doubling peak RSS on load.
+                                runtime.GC()
                         } else if !os.IsNotExist(serr) {
                                 log.Warn("snapshot load error, falling back to block scan", "err", serr)
                         }
@@ -555,6 +560,12 @@ func run() error {
                 }
                 } // end !snapLoaded
         }
+
+        // Release all block objects decoded during the startup scan.  The GC is
+        // not triggered automatically between the last scan iteration and engine
+        // startup, so without this call the decoded block tree stays live and
+        // inflates RSS until the first scheduled collection.
+        runtime.GC()
 
         // initialTxTotal is populated by the scan above (genesis path stays 0).
 

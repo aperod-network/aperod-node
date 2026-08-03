@@ -40,6 +40,13 @@ type UTXOKey struct {
 	OutputIndex uint32
 }
 
+// maxSpentDecoys is the maximum number of entries kept in the spentPubKeys
+// ring-decoy pool.  Once this limit is reached, new entries are silently
+// dropped (the pool already has enough decoys; dropping older ones has no
+// security impact because spent outputs cannot be double-spent regardless).
+// This cap prevents unbounded memory growth on long-running chains.
+const maxSpentDecoys = 50_000
+
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
@@ -187,7 +194,9 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
-						s.spentPubKeys[member] = utxo
+						if len(s.spentPubKeys) < maxSpentDecoys {
+							s.spentPubKeys[member] = utxo
+						}
 						break // exactly one match expected (Pedersen commitments are binding)
 					}
 				}
@@ -406,7 +415,9 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
-						s.spentPubKeys[member] = utxo
+						if len(s.spentPubKeys) < maxSpentDecoys {
+							s.spentPubKeys[member] = utxo
+						}
 						break
 					}
 				}
