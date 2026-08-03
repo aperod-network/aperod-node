@@ -166,14 +166,26 @@ func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
 // ─── Key Image tracking ───────────────────────────────────────────────────────
 
 // MarkKeyImageSpent records that a key image has been used.
+// The key image is normalised to its canonical prime-order representative
+// before storage so that any torsion variant maps to the same DB entry.
 func (d *DB) MarkKeyImageSpent(ki crypto.KeyImage) error {
-        key := append(prefixKeyImage, ki[:]...)
+        canonical, err := crypto.CanonicalKeyImage(ki)
+        if err != nil {
+                return fmt.Errorf("key image canonicalization: %w", err)
+        }
+        key := append(prefixKeyImage, canonical[:]...)
         return d.put(key, []byte{0x01})
 }
 
 // IsKeyImageSpent returns true if the key image has been recorded as spent.
+// Normalises to the canonical representative before lookup so that any
+// torsion variant of a spent key image is correctly detected as spent.
 func (d *DB) IsKeyImageSpent(ki crypto.KeyImage) (bool, error) {
-        key := append(prefixKeyImage, ki[:]...)
+        canonical, err := crypto.CanonicalKeyImage(ki)
+        if err != nil {
+                return false, fmt.Errorf("key image canonicalization: %w", err)
+        }
+        key := append(prefixKeyImage, canonical[:]...)
         return d.has(key)
 }
 

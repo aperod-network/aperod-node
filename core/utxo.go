@@ -99,17 +99,29 @@ func (s *UTXOSet) Remove(txHash crypto.Hash32, outIdx uint32) {
 }
 
 // MarkSpent records a Key Image as spent.
+// The key image is normalised to its prime-order subgroup representative before
+// storage so that torsion variants (ki + T) map to the same entry.
 func (s *UTXOSet) MarkSpent(ki crypto.KeyImage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keyImages[ki] = struct{}{}
+	canonical, err := crypto.CanonicalKeyImage(ki)
+	if err != nil {
+		return // malformed/torsion point — caller (VerifyTx) already rejects these
+	}
+	s.keyImages[canonical] = struct{}{}
 }
 
 // IsSpent returns true if the Key Image has already been used.
+// Normalises to the canonical representative before lookup so that any
+// torsion variant of a spent key image is correctly detected as spent.
 func (s *UTXOSet) IsSpent(ki crypto.KeyImage) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, spent := s.keyImages[ki]
+	canonical, err := crypto.CanonicalKeyImage(ki)
+	if err != nil {
+		return false // malformed point; treat as not found, caller rejects it
+	}
+	_, spent := s.keyImages[canonical]
 	return spent
 }
 
@@ -136,15 +148,20 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	seen := make(map[crypto.KeyImage]int) // ki → first tx index (for error reporting)
 	for txIdx, tx := range block.Txs {
 		for _, inp := range tx.Inputs {
-			if _, spent := s.keyImages[inp.KeyImage]; spent {
+			canonical, cerr := crypto.CanonicalKeyImage(inp.KeyImage)
+			if cerr != nil {
+				return fmt.Errorf("block %d tx[%d]: invalid key image: %w",
+					block.Header.Height, txIdx, cerr)
+			}
+			if _, spent := s.keyImages[canonical]; spent {
 				return fmt.Errorf("double-spend detected: key image %x in block %d (historical)",
 					inp.KeyImage[:8], block.Header.Height)
 			}
-			if firstIdx, dup := seen[inp.KeyImage]; dup {
+			if firstIdx, dup := seen[canonical]; dup {
 				return fmt.Errorf("double-spend detected: key image %x in block %d (within-block: tx[%d] and tx[%d])",
 					inp.KeyImage[:8], block.Header.Height, firstIdx, txIdx)
 			}
-			seen[inp.KeyImage] = txIdx
+			seen[canonical] = txIdx
 		}
 	}
 
@@ -161,7 +178,11 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 		// exactly one ring member in byPubKey has AmountCommit == inp.AmountCommit
 		// (the real spent UTXO).  We find it, move it to spentPubKeys, and break.
 		for _, inp := range tx.Inputs {
-			s.keyImages[inp.KeyImage] = struct{}{}
+			if canonical, cerr := crypto.CanonicalKeyImage(inp.KeyImage); cerr == nil {
+				s.keyImages[canonical] = struct{}{}
+			} else {
+				s.keyImages[inp.KeyImage] = struct{}{} // fallback: store raw (already validated)
+			}
 			for _, member := range inp.Ring {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {

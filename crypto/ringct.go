@@ -155,6 +155,19 @@ func MLSAGVerify(message Hash32, ring []RingMember, sig *MLSAGSignature) (bool, 
         if err != nil {
                 return false, fmt.Errorf("key image: %w", err)
         }
+        // Torsion subgroup check (CVE-2017-12424 analogue for APRO RingCT).
+        // Ed25519 has an 8-element torsion subgroup.  A forged key image
+        // I' = I + T (T small-order) carries the same ring equations but maps
+        // to a different raw encoding, letting an attacker spend the same UTXO
+        // up to 8 times.  Reject any key image whose canonical form differs
+        // from its raw encoding — i.e. any key image with a torsion component.
+        canonicalKI, canonErr := CanonicalKeyImage(sig.KeyImage)
+        if canonErr != nil {
+                return false, fmt.Errorf("key image subgroup check: %w", canonErr)
+        }
+        if canonicalKI != sig.KeyImage {
+                return false, fmt.Errorf("key image is not in the prime-order subgroup (torsion component detected)")
+        }
 
         c0, err := ScalarFromBytes(sig.C0[:])
         if err != nil {

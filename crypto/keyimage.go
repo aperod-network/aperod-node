@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 
 	"filippo.io/edwards25519"
 )
@@ -78,6 +79,51 @@ func hashToCurvePoint(data []byte) *edwards25519.Point {
 // HashToCurvePoint is exported for use in RingCT.
 func HashToCurvePoint(data []byte) *edwards25519.Point {
 	return hashToCurvePoint(data)
+}
+
+// inv8ModL is 8^{-1} mod l in little-endian, where l is the Ed25519 prime
+// group order.  Used by CanonicalKeyImage to clear torsion components.
+// Precomputed: python3 -c "l=2**252+27742317777372353535851937790883648493; print(pow(8,-1,l).to_bytes(32,'little').hex())"
+var inv8ModL = [32]byte{
+	0x79, 0x2f, 0xdc, 0xe2, 0x29, 0xe5, 0x06, 0x61,
+	0xd0, 0xda, 0x1c, 0x7d, 0xb3, 0x9d, 0xd3, 0x07,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06,
+}
+
+// CanonicalKeyImage normalises ki to its prime-order subgroup representative:
+//
+//	canonical = (8^{-1} mod l) * (8 * ki)
+//
+// Because 8 * T == identity for every torsion point T (whose order divides
+// the cofactor 8), any two encodings that differ only by a torsion component
+// map to the same canonical bytes:
+//
+//	8*(ki + T) = 8*ki   →   canonical(ki+T) == canonical(ki)
+//
+// For honest key images already in the prime-order subgroup the function is
+// the identity map (canonical(ki) == ki), so no index migration is required.
+//
+// Returns an error when ki is not a valid compressed Ed25519 point, or when
+// ki is itself a small-order (torsion) point.
+func CanonicalKeyImage(ki KeyImage) (KeyImage, error) {
+	p, err := new(edwards25519.Point).SetBytes(ki[:])
+	if err != nil {
+		return KeyImage{}, fmt.Errorf("key image not a valid curve point: %w", err)
+	}
+	// Multiply by the cofactor (8) to clear any torsion component.
+	q := new(edwards25519.Point).MultByCofactor(p)
+	// Reject pure torsion points (8*p == identity means p has order dividing 8).
+	if q.Equal(edwards25519.NewIdentityPoint()) == 1 {
+		return KeyImage{}, fmt.Errorf("key image is a small-order (torsion) point")
+	}
+	// Multiply by 8^{-1} mod l to recover the prime-order representative.
+	// For ki in the prime-order subgroup this round-trips to ki exactly.
+	inv8, _ := edwards25519.NewScalar().SetCanonicalBytes(inv8ModL[:])
+	canonical := new(edwards25519.Point).ScalarMult(inv8, q)
+	var out KeyImage
+	copy(out[:], canonical.Bytes())
+	return out, nil
 }
 
 // Equal returns true if two Key Images are identical (detects double-spends).
