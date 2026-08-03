@@ -234,14 +234,15 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         }
 
         // ── 5. Build and sign the transaction ────────────────────────────────────
-        // Phase 1 decoys (randomly-generated keys): the C-0 check in tx_verifier.go
-        // requires that every ring member found in the UTXO set has the same
-        // AmountCommit as the input.  Phase 2 (WithDecoySet) uses real on-chain UTXOs
-        // as decoys, but those have different amounts → different AmountCommit →
-        // C-0 fails with "commitment mismatch".  Phase 1 avoids this: random keys
-        // are absent from the UTXO set, only the real spender is present and its
-        // commitment always matches.
-        builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0)
+        // Phase 2 decoys: WithDecoySet supplies the live UTXOSet so that
+        // TxBuilder.SampleDecoys pulls real spent UTXOs from spentPubKeys as ring
+        // members.  Spent UTXOs are absent from byPubKey, so the C-0 check in
+        // tx_verifier.go skips them (identical to Phase 1 random keys).  The
+        // redesigned C-0 check also tolerates active decoys with different
+        // AmountCommit values — it requires only that AT LEAST ONE present ring
+        // member matches inp.AmountCommit (the real spender, always in byPubKey).
+        builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0).
+                WithDecoySet(s.utxos)
         result, err := builder.Build(p.AmountNAPR, crypto.Address(p.ToAddress), changeAddr)
         if err != nil {
                 return nil, fmt.Errorf("build: %w", err)

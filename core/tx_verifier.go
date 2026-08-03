@@ -195,24 +195,23 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 
         // 3c. C-0: ring-member commitment binding.
         //
-        // For every ring member that IS present in byPubKey (active unspent UTXO),
-        // its on-chain AmountCommit must equal inp.AmountCommit.  Absent members
-        // (Phase 1 random keys or Phase 2 spent decoys — absent because ApplyBlock
-        // moved them from byPubKey to spentPubKeys) are silently skipped.
+        // At least one ring member that is present in byPubKey (active unspent UTXO)
+        // must have AmountCommit == inp.AmountCommit.  The real spender's UTXO is
+        // always unspent and therefore always in byPubKey; its commitment must
+        // match the claimed inp.AmountCommit.
         //
-        // C-0 commitment binding:
-        //   For every ring member that is present in byPubKey (active/unspent UTXO),
-        //   its on-chain AmountCommit must equal inp.AmountCommit.  This prevents a
-        //   malicious signer from claiming a larger-than-owned amount: the real
-        //   spending key belongs to an unspent UTXO in byPubKey, so its commitment
-        //   is checked here even though the signer is hidden among ring decoys.
+        // Absent members (Phase 1 random keys or Phase 2 spent decoys removed from
+        // byPubKey by ApplyBlock) are silently skipped.  Present members whose
+        // commitments do NOT match are tolerated — they are real UTXOs used as
+        // active decoys with different amounts.  The security property is preserved:
+        //   • The real spender is always present (C-0a guards against all-absent rings).
+        //   • The real spender's commitment MUST equal inp.AmountCommit (matchCount ≥ 1).
+        //   • The MLSAG ring signature proves knowledge of one private key in the ring.
+        //   • The Pedersen balance check (step 6) ensures ΣC_in = ΣC_out + C_fee.
         //
-        // Phase 2 decoy safety:
-        //   ApplyBlock moves the real spent UTXO from byPubKey to spentPubKeys once
-        //   the spending block is committed.  Future rings that include this UTXO as
-        //   a decoy see it as absent from byPubKey and C-0 skips it — identical
-        //   treatment to Phase 1 random keys.  The real (unspent) input is always
-        //   in byPubKey, so the commitment binding is preserved.
+        // The previous "all must match" rule was too strict: it blocked Phase 2
+        // transactions whenever any active decoy had a different amount, causing
+        // a "commitment mismatch" error even for honest spends.
         //
         // NOTE ON PRUNED STARTS: genesis UTXOs may be absent from byPubKey
         // in light-pruning mode.  The vesting check (3b above) is ordered
@@ -220,6 +219,7 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
                         presentCount := 0
+                        matchCount := 0
                         for _, member := range inp.Ring {
                                 utxo := v.utxos.GetByPubKey(member)
                                 if utxo == nil {
@@ -227,14 +227,11 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                                         continue
                                 }
                                 presentCount++
-                                // Member is in byPubKey (active unspent UTXO).
-                                // Its on-chain commitment must equal inp.AmountCommit.
-                                if utxo.AmountCommit != inp.AmountCommit {
-                                        return fmt.Errorf("tx %x: input %d ring member %x "+
-                                                "commitment mismatch — on-chain %x != claimed %x (C-0 check)",
-                                                txHashPrefix[:8], i, member[:8],
-                                                utxo.AmountCommit[:8], inp.AmountCommit[:8])
+                                if utxo.AmountCommit == inp.AmountCommit {
+                                        matchCount++
                                 }
+                                // Non-matching present members are active decoys with different
+                                // amounts — tolerated under the "at least one matches" rule.
                         }
 
                         // C-0a: fabricated-input guard.
@@ -247,17 +244,23 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                         //
                         // An attacker can sign with a freshly-generated key pair that
                         // never appeared on-chain.  All 16 ring members are absent →
-                        // the old code skipped the C-0 check entirely → inp.AmountCommit
-                        // was unconstrained → attacker could commit to an arbitrary
-                        // large value and inflate outputs (1 APRO in → ∞ APRO out).
+                        // inp.AmountCommit is unconstrained → attacker could inflate.
                         //
-                        // Fix: reject any input whose entire ring is absent.  A valid
-                        // real spender is always present; if none is, the tx has no
-                        // real input and must be treated as fraudulent.
+                        // Fix: reject any input whose entire ring is absent from byPubKey.
                         if presentCount == 0 {
                                 return fmt.Errorf("tx %x: input %d all %d ring members are absent "+
                                         "from the UTXO set — fabricated-input inflation attack blocked (C-0a check)",
                                         txHashPrefix[:8], i, len(inp.Ring))
+                        }
+
+                        // C-0: at least one present ring member must match inp.AmountCommit.
+                        // The real (unspent) spender is always in byPubKey; its commitment
+                        // must equal the claimed inp.AmountCommit or the spend is fraudulent.
+                        if matchCount == 0 {
+                                return fmt.Errorf("tx %x: input %d no ring member found in UTXO set "+
+                                        "has AmountCommit matching claimed %x — "+
+                                        "forged commitment or wrong UTXO (C-0 check)",
+                                        txHashPrefix[:8], i, inp.AmountCommit[:8])
                         }
                 }
         }

@@ -1016,3 +1016,252 @@ func TestC1_RejectMissingUTXO(t *testing.T) {
 	}
 	t.Logf("C-1 missing UTXO correctly rejected: %v", err)
 }
+
+// ─── Phase 2: active decoys with different amounts pass the redesigned C-0 ───
+
+// TestC0_Phase2ActiveDecoyDifferentAmount verifies that the redesigned C-0
+// check ("at least one present member matches") passes when the ring contains
+// the real spender (in byPubKey, AmountCommit = realCommit) alongside active
+// decoys that are also in byPubKey but with different AmountCommit values.
+//
+// Before the redesign, C-0 required ALL present ring members to share the same
+// AmountCommit.  This blocked any Phase 2 spend where a decoy UTXO happened to
+// be active (in byPubKey) with a different amount, returning "commitment
+// mismatch" even for honest transactions.
+//
+// After the redesign, only one present member needs to match — the real
+// spender's commitment.  Decoys with different commitments are tolerated.
+func TestC0_Phase2ActiveDecoyDifferentAmount(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	// Real spender's commitment.
+	realBlind, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor: %v", err)
+	}
+	realCommit, err := crypto.Commit(1_000_000_000, realBlind) // 10 APRO
+	if err != nil {
+		t.Fatalf("Commit real: %v", err)
+	}
+
+	// Real spender's pub key — placed at ring index 3.
+	var realPub crypto.Point32
+	realPub[0] = 0xAA
+	utxos.Add(&core.UTXO{
+		TxHash:       crypto.Hash32{0x01},
+		OutputIndex:  0,
+		OneTimePub:   realPub,
+		AmountCommit: realCommit,
+	})
+
+	// Build a ring: realPub at index 3, all other slots are active decoys
+	// present in byPubKey but with DIFFERENT commitments (different amounts).
+	ring := make([]crypto.Point32, crypto.RingSize)
+	ring[3] = realPub
+	for i := 0; i < crypto.RingSize; i++ {
+		if i == 3 {
+			continue
+		}
+		var p crypto.Point32
+		p[0] = byte(i + 10)
+		ring[i] = p
+
+		// Each decoy has a different amount → different AmountCommit.
+		decoyBlind, _ := crypto.NewBlindFactor()
+		decoyCommit, _ := crypto.Commit(uint64((i+1)*50_000_000), decoyBlind)
+		utxos.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 10)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: decoyCommit, // different from realCommit
+		})
+	}
+
+	// Transaction claims inp.AmountCommit = realCommit (honest spend).
+	tx := minimalRingCTTx(ring, realCommit)
+	verifier := core.NewTxVerifier(utxos)
+	err = verifier.VerifyTx(&tx)
+
+	// C-0 must NOT fire: realPub is present with AmountCommit == realCommit.
+	if err != nil && strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("redesigned C-0 incorrectly blocked Phase 2 decoys with different amounts: %v", err)
+	}
+	t.Logf("Phase 2 active decoys with different amounts passed C-0 (later stage: %v)", err)
+}
+
+// TestC0_Phase2ForgedCommitStillRejected verifies that the redesigned C-0
+// still rejects a transaction where inp.AmountCommit does not match any present
+// ring member — i.e. a forged commitment cannot sneak through just because
+// there are active decoys with different amounts.
+//
+// Attack: attacker puts their real UTXO in the ring but sets inp.AmountCommit
+// to a LARGER forged value.  realPub is present in byPubKey with realCommit ≠
+// forgedCommit, and no other member has forgedCommit → matchCount = 0 → C-0
+// fires.
+func TestC0_Phase2ForgedCommitStillRejected(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	realBlind, _ := crypto.NewBlindFactor()
+	realCommit, _ := crypto.Commit(1_000_000_000, realBlind)
+
+	var realPub crypto.Point32
+	realPub[0] = 0xBB
+	utxos.Add(&core.UTXO{
+		TxHash:       crypto.Hash32{0x02},
+		OutputIndex:  0,
+		OneTimePub:   realPub,
+		AmountCommit: realCommit,
+	})
+
+	// Add decoys with various (different) amounts — none matches forgedCommit.
+	ring := make([]crypto.Point32, crypto.RingSize)
+	ring[0] = realPub
+	for i := 1; i < crypto.RingSize; i++ {
+		var p crypto.Point32
+		p[0] = byte(i + 20)
+		ring[i] = p
+		decoyBlind, _ := crypto.NewBlindFactor()
+		decoyCommit, _ := crypto.Commit(uint64(i*1_000_000), decoyBlind)
+		utxos.Add(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 20)},
+			OutputIndex:  0,
+			OneTimePub:   p,
+			AmountCommit: decoyCommit,
+		})
+	}
+
+	// Attacker claims a forged (inflated) commitment.
+	forgedBlind, _ := crypto.NewBlindFactor()
+	forgedCommit, _ := crypto.Commit(999_999_999_999, forgedBlind)
+
+	tx := minimalRingCTTx(ring, forgedCommit)
+	verifier := core.NewTxVerifier(utxos)
+	err := verifier.VerifyTx(&tx)
+
+	if err == nil {
+		t.Fatal("expected C-0 rejection of forged commit among mixed-amount decoys, got nil")
+	}
+	if !strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("expected C-0 error, got: %v", err)
+	}
+	t.Logf("C-0 correctly rejected forged commit with mixed-amount decoys: %v", err)
+}
+
+// TestPhase2Transfer_WithDecoySet_EndToEnd is the end-to-end regression test
+// for Phase 2 ring privacy: a 1-in-2-out transfer built with WithDecoySet
+// (real on-chain spent UTXOs as decoys) must pass full TxVerifier verification.
+//
+// Flow:
+//  1. Mint a faucet UTXO for Alice at height 5.
+//  2. Register the UTXO in the active UTXO set.
+//  3. Add 15 spent UTXOs to spentPubKeys (simulating prior on-chain transactions)
+//     — each has a DIFFERENT amount and therefore a different AmountCommit.
+//  4. Build a spend transaction using TxBuilder.WithDecoySet so SampleDecoys
+//     fills ring slots from spentPubKeys (different-amount UTXOs absent from
+//     byPubKey).
+//  5. Verify with TxVerifier backed by the same UTXOSet — C-0 must NOT fire.
+func TestPhase2Transfer_WithDecoySet_EndToEnd(t *testing.T) {
+	const faucetHeight = uint64(5)
+	const faucetAmount = uint64(500_000_000_000) // 5000 APRO
+	const sendAmount = uint64(10_000_000_000)    // 100 APRO
+
+	// ── 1. Alice's wallet keys ────────────────────────────────────────────────
+	aliceKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys alice: %v", err)
+	}
+	aliceAddr := crypto.AddressFromKeys(crypto.MainnetByte, aliceKeys)
+	_, aliceSpendPub, _, err := crypto.DecodeAddress(aliceAddr)
+	if err != nil {
+		t.Fatalf("DecodeAddress: %v", err)
+	}
+
+	// ── 2. Mint a faucet UTXO at height 5 ────────────────────────────────────
+	mintTx, err := core.BuildMintTx(aliceAddr, faucetAmount, faucetHeight)
+	if err != nil {
+		t.Fatalf("BuildMintTx: %v", err)
+	}
+	mintOut := mintTx.Outputs[0]
+
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:       mintTx.Hash(),
+		OutputIndex:  0,
+		OneTimePub:   mintOut.OneTimePub,
+		TxPubKey:     mintOut.TxPubKey,
+		AmountCommit: mintOut.AmountCommit,
+	})
+
+	// ── 3. Populate spentPubKeys with 15 spent UTXOs (different amounts) ─────
+	// These will be returned by SampleDecoys as ring decoys.  Each has a
+	// different AmountCommit to prove the redesigned C-0 is amount-agnostic.
+	// Pub keys must be valid Ed25519 curve points so MLSAGSign can use them.
+	for i := 0; i < 15; i++ {
+		decoyKeys, kErr := crypto.GenerateWalletKeys()
+		if kErr != nil {
+			t.Fatalf("GenerateWalletKeys decoy[%d]: %v", i, kErr)
+		}
+		decoyBlind, _ := crypto.NewBlindFactor()
+		decoyAmount := uint64((i+1) * 3_000_000_000) // 30..450 APRO each
+		decoyCommit, _ := crypto.Commit(decoyAmount, decoyBlind)
+		utxos.AddSpentDecoyForTest(&core.UTXO{
+			TxHash:       crypto.Hash32{byte(i + 50)},
+			OutputIndex:  0,
+			OneTimePub:   decoyKeys.Spend.Public,
+			AmountCommit: decoyCommit,
+		})
+	}
+
+	// ── 4. Recover the blind and build the OwnedUTXO ─────────────────────────
+	blind, err := crypto.DeterministicMintBlind(aliceSpendPub, faucetAmount)
+	if err != nil {
+		t.Fatalf("DeterministicMintBlind: %v", err)
+	}
+	hsScalar := crypto.ScalarFromUint64(faucetHeight)
+
+	ownedUTXO := core.OwnedUTXO{
+		UTXO: core.UTXO{
+			TxHash:       mintTx.Hash(),
+			OutputIndex:  0,
+			OneTimePub:   mintOut.OneTimePub,
+			TxPubKey:     mintOut.TxPubKey,
+			AmountCommit: mintOut.AmountCommit,
+		},
+		HsScalar: hsScalar,
+		Amount:   faucetAmount,
+		Blind:    blind,
+	}
+
+	// ── 5. Build and verify with WithDecoySet (Phase 2) ───────────────────────
+	bobKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys bob: %v", err)
+	}
+	bobAddr := crypto.AddressFromKeys(crypto.MainnetByte, bobKeys)
+
+	builder := core.NewTxBuilder(
+		aliceKeys.Spend.Private,
+		aliceKeys.View.Private,
+		aliceSpendPub,
+		[]core.OwnedUTXO{ownedUTXO},
+		0,
+	).WithDecoySet(utxos) // Phase 2: real on-chain spent UTXOs as decoys
+
+	result, err := builder.Build(sendAmount, bobAddr, aliceAddr)
+	if err != nil {
+		t.Fatalf("TxBuilder.Build with WithDecoySet: %v", err)
+	}
+	t.Logf("Phase 2 tx built: %d input(s), %d output(s), fee=%d nAPRO",
+		result.InputCount, result.OutputCount, result.TotalFee)
+
+	verifier := core.NewTxVerifier(utxos)
+	err = verifier.VerifyTx(&result.Tx)
+
+	if err != nil && strings.Contains(err.Error(), "C-0") {
+		t.Fatalf("C-0 blocked Phase 2 transfer with real spent decoys (different amounts): %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerifyTx failed for Phase 2 transfer: %v", err)
+	}
+	t.Log("Phase 2 transfer with WithDecoySet passed full TxVerifier ✓")
+}
