@@ -65,6 +65,13 @@ type Config struct {
 	Pruning   PruningConfig   `yaml:"pruning"`
 	Snapshot  SnapshotConfig  `yaml:"snapshot"`
 	Pprof     PprofConfig     `yaml:"pprof"`
+	// MemoryLimitBytes, when positive, is passed to runtime/debug.SetMemoryLimit
+	// at startup if the GOMEMLIMIT environment variable is not already set.
+	// This lets operators running outside of systemd (Docker, bare shell, CI)
+	// set a safe memory cap without needing OS-level service configuration.
+	// Recommended production value: 5905580032 (≈5.5 GB).
+	// Set to 0 (default) to rely solely on the GOMEMLIMIT env var.
+	MemoryLimitBytes int64 `yaml:"memory_limit_bytes"`
 }
 
 // P2PConfig holds networking settings.

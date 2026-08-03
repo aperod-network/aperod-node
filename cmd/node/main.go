@@ -175,8 +175,21 @@ func run() error {
         // zero.  Without a memory limit the Go runtime can exhaust all available
         // RAM — the exact OOM scenario the drop-in was introduced to prevent.
         // Pass the drop-in path so the function can suggest the canonical fix.
+        //
+        // If the operator has set memory_limit_bytes in node.yaml and GOMEMLIMIT
+        // is absent from the environment, apply the config value in-process now
+        // (before the guard runs) so the guard sees it as satisfied.
+        configMemLimitApplied := false
+        if cfg.MemoryLimitBytes > 0 && os.Getenv("GOMEMLIMIT") == "" {
+                debug.SetMemoryLimit(cfg.MemoryLimitBytes)
+                configMemLimitApplied = true
+                log.Info("memory limit applied from config",
+                        "memory_limit_bytes", cfg.MemoryLimitBytes,
+                )
+        }
         if err := checkGOMLEMLIMIT(
                 os.Getenv("GOMEMLIMIT"),
+                configMemLimitApplied,
                 strictMemLimit,
                 "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf",
                 log,
@@ -1094,14 +1107,23 @@ func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
 //
 // Parameters:
 //
-//	gomlimitEnv – value of os.Getenv("GOMEMLIMIT") (injected for testability)
-//	strictMode  – when true, treat a missing/zero limit as a fatal error
-//	dropinPath  – canonical path of the systemd drop-in that sets GOMEMLIMIT;
-//	              included in the suggested fix message so operators know exactly
-//	              which file to recreate
-//	log         – structured logger
-func checkGOMLEMLIMIT(gomlimitEnv string, strictMode bool, dropinPath string, log *slog.Logger) error {
+//	gomlimitEnv          – value of os.Getenv("GOMEMLIMIT") (injected for testability)
+//	configLimitApplied   – true when a positive memory_limit_bytes was read from
+//	                        node.yaml and applied via debug.SetMemoryLimit before
+//	                        this call; treated as equivalent to the env var being set
+//	strictMode           – when true, treat a missing/zero limit as a fatal error
+//	dropinPath           – canonical path of the systemd drop-in that sets GOMEMLIMIT;
+//	                        included in the suggested fix message so operators know
+//	                        exactly which file to recreate
+//	log                  – structured logger
+func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bool, dropinPath string, log *slog.Logger) error {
         const warnMsg = "GOMEMLIMIT is not set — node may OOM under load"
+
+        // A limit applied via node.yaml memory_limit_bytes satisfies the check
+        // in the same way as a positive GOMEMLIMIT environment variable.
+        if configLimitApplied {
+                return nil
+        }
 
         _, ok := parseGOMLEMLIMITBytes(gomlimitEnv)
         if ok {
@@ -1109,7 +1131,7 @@ func checkGOMLEMLIMIT(gomlimitEnv string, strictMode bool, dropinPath string, lo
         }
 
         fix := fmt.Sprintf(
-                "recreate the drop-in at %s with 'Environment=\"GOMEMLIMIT=<bytes>\"' and run: systemctl daemon-reload && systemctl restart aperod-node",
+                "set 'memory_limit_bytes: <bytes>' in node.yaml, or recreate the drop-in at %s with 'Environment=\"GOMEMLIMIT=<bytes>\"' and run: systemctl daemon-reload && systemctl restart aperod-node",
                 dropinPath,
         )
 

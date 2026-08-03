@@ -523,7 +523,7 @@ func TestCheckGOMLEMLIMIT_WarnCases(t *testing.T) {
 	cases := []string{"", "0", "off", "OFF", "Off", "garbage", "5GB", "5MB", " 5GiB "}
 	for _, val := range cases {
 		var logBuf bytes.Buffer
-		err := checkGOMLEMLIMIT(val, false, dropin, newCaptureLogger(&logBuf))
+		err := checkGOMLEMLIMIT(val, false, false, dropin, newCaptureLogger(&logBuf))
 		if err != nil {
 			t.Errorf("GOMEMLIMIT=%q: expected nil error in non-strict mode, got: %v", val, err)
 		}
@@ -545,7 +545,7 @@ func TestCheckGOMLEMLIMIT_SilentWhenSet(t *testing.T) {
 	}
 	for _, val := range validValues {
 		var logBuf bytes.Buffer
-		err := checkGOMLEMLIMIT(val, false, dropin, newCaptureLogger(&logBuf))
+		err := checkGOMLEMLIMIT(val, false, false, dropin, newCaptureLogger(&logBuf))
 		if err != nil {
 			t.Errorf("GOMEMLIMIT=%q: unexpected error: %v", val, err)
 		}
@@ -561,7 +561,7 @@ func TestCheckGOMLEMLIMIT_StrictModeErrorsOnMissing(t *testing.T) {
 	cases := []string{"", "0", "off", "garbage", "5GB", "OFF", " 5GiB ", "8388608TiB"}
 	for _, val := range cases {
 		var logBuf bytes.Buffer
-		err := checkGOMLEMLIMIT(val, true, dropin, newCaptureLogger(&logBuf))
+		err := checkGOMLEMLIMIT(val, false, true, dropin, newCaptureLogger(&logBuf))
 		if err == nil {
 			t.Errorf("GOMEMLIMIT=%q: expected error in strict mode, got nil", val)
 		}
@@ -577,12 +577,38 @@ func TestCheckGOMLEMLIMIT_StrictModeSilentWhenSet(t *testing.T) {
 	}
 	for _, val := range validValues {
 		var logBuf bytes.Buffer
-		err := checkGOMLEMLIMIT(val, true, dropin, newCaptureLogger(&logBuf))
+		err := checkGOMLEMLIMIT(val, false, true, dropin, newCaptureLogger(&logBuf))
 		if err != nil {
 			t.Errorf("GOMEMLIMIT=%q: unexpected error in strict mode: %v", val, err)
 		}
 		if logContainsMsg(&logBuf, "GOMEMLIMIT is not set") {
 			t.Errorf("GOMEMLIMIT=%q: unexpected warning\nlog:\n%s", val, logBuf.String())
+		}
+	}
+}
+
+// TestCheckGOMLEMLIMIT_ConfigLimitApplied verifies that when configLimitApplied
+// is true, checkGOMLEMLIMIT returns nil and emits no warning — regardless of
+// whether GOMEMLIMIT env is set — because the in-process limit already covers it.
+func TestCheckGOMLEMLIMIT_ConfigLimitApplied(t *testing.T) {
+	// Both empty and non-empty env values should be silent when configLimitApplied=true.
+	envValues := []string{"", "0", "off", "5905580032"}
+	for _, val := range envValues {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, true, false, dropin, newCaptureLogger(&logBuf))
+		if err != nil {
+			t.Errorf("configLimitApplied=true, GOMEMLIMIT=%q: unexpected error: %v", val, err)
+		}
+		if logContainsMsg(&logBuf, "GOMEMLIMIT is not set") {
+			t.Errorf("configLimitApplied=true, GOMEMLIMIT=%q: unexpected warning\nlog:\n%s", val, logBuf.String())
+		}
+	}
+	// strict mode + configLimitApplied should also be silent.
+	for _, val := range []string{"", "0"} {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, true, true, dropin, newCaptureLogger(&logBuf))
+		if err != nil {
+			t.Errorf("configLimitApplied=true strict, GOMEMLIMIT=%q: unexpected error: %v", val, err)
 		}
 	}
 }
