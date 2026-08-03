@@ -24,6 +24,19 @@ REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
 
+# ── Лимит памяти Go-рантайма (GOMEMLIMIT) ─────────────────
+# По умолчанию — 75 % от общей RAM хоста, но не меньше 1.5 ГБ и не больше
+# 5.5 ГБ (значение, проверенное на продакшн-ноде с 7.8 ГБ RAM).
+# Переопределить: GOMEMLIMIT_BYTES=3221225472 sudo bash install-node.sh
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTAL_RAM_BYTES=$(( TOTAL_RAM_KB * 1024 ))
+AUTO_GOMEMLIMIT=$(( TOTAL_RAM_BYTES * 3 / 4 ))
+MIN_GOMEMLIMIT=$(( 1536 * 1024 * 1024 ))   # 1.5 GiB floor
+MAX_GOMEMLIMIT=$(( 5905580032 ))            # 5500 MiB ceiling (prod-tested value)
+if (( AUTO_GOMEMLIMIT < MIN_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MIN_GOMEMLIMIT}; fi
+if (( AUTO_GOMEMLIMIT > MAX_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MAX_GOMEMLIMIT}; fi
+GOMEMLIMIT_BYTES="${GOMEMLIMIT_BYTES:-${AUTO_GOMEMLIMIT}}"
+
 echo -e "
 ${BOLD}╔════════════════════════════════════════════╗
 ║   Aperod APRO Full Node — Installer        ║
@@ -252,10 +265,11 @@ LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=aperod-node
-# Must be ≥ 300 s so the shutdown snapshot goroutine can flush to disk before
-# systemd sends SIGKILL.  A shorter timeout causes OOM loops on the next
-# restart because the node always falls back to the multi-hour block scan.
-TimeoutStopSec=300
+# Must be ≥ 900 s so the shutdown snapshot goroutine can flush to disk before
+# systemd sends SIGKILL.  A shorter timeout truncates the snapshot and forces
+# the next restart into the multi-hour 800K-block scan — root cause of the
+# August 2026 outage.
+TimeoutStopSec=900
 
 # ── Systemd Sandbox (prevents RCE escalation to full server access) ──────────
 NoNewPrivileges=true
@@ -277,6 +291,34 @@ ReadWritePaths=${CONFIG_DIR}
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# ── 10b. GOMEMLIMIT drop-in ───────────────────────────────
+# Creates /etc/systemd/system/aperod-node.service.d/gomemlimit.conf so
+# the Go runtime stays within the host's available memory and the
+# shutdown snapshot has enough time to flush before SIGKILL.
+DROPIN_DIR="/etc/systemd/system/aperod-node.service.d"
+mkdir -p "${DROPIN_DIR}"
+cat > "${DROPIN_DIR}/gomemlimit.conf" <<EOF
+# Aperod node — memory limit and shutdown tuning
+# ─────────────────────────────────────────────
+# Install path: /etc/systemd/system/aperod-node.service.d/gomemlimit.conf
+#
+# GOMEMLIMIT=${GOMEMLIMIT_BYTES} bytes (~$(( GOMEMLIMIT_BYTES / 1024 / 1024 )) MiB)
+#   Go soft memory limit.  Set to 75 % of host RAM at install time.
+#   To change: edit this file then run:
+#     systemctl daemon-reload && systemctl restart aperod-node
+#
+# TimeoutStopSec=900
+#   Give the SIGTERM shutdown handler up to 15 minutes to flush the UTXO
+#   snapshot to disk before systemd sends SIGKILL.  A shorter timeout
+#   truncates the snapshot and forces the next restart into the multi-hour
+#   800K-block scan — root cause of the August 2026 outage.
+
+[Service]
+Environment="GOMEMLIMIT=${GOMEMLIMIT_BYTES}"
+TimeoutStopSec=900
+EOF
+ok "GOMEMLIMIT drop-in создан: ${DROPIN_DIR}/gomemlimit.conf (лимит: $(( GOMEMLIMIT_BYTES / 1024 / 1024 )) МиБ)"
 
 systemctl daemon-reload
 systemctl enable aperod-node
