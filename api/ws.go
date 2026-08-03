@@ -18,6 +18,7 @@ import (
         "encoding/json"
         "fmt"
         "log/slog"
+        "net"
         "net/http"
         "sync"
         "time"
@@ -37,20 +38,23 @@ type wsClient struct {
         conn   *websocket.Conn
         send   chan WSEvent
         topics map[string]bool // subscribed topics ("" = all)
+        ip     string          // remote IP (for per-IP cap tracking)
 }
 
 // Hub manages all active WebSocket connections.
 type Hub struct {
-        mu      sync.RWMutex
-        clients map[*wsClient]struct{}
-        log     *slog.Logger
+        mu         sync.RWMutex
+        clients    map[*wsClient]struct{}
+        connPerIP  map[string]int // per-IP connection count for F-006 cap
+        log        *slog.Logger
 }
 
 // NewHub creates a Hub and starts the heartbeat goroutine.
 func NewHub(log *slog.Logger) *Hub {
         h := &Hub{
-                clients: make(map[*wsClient]struct{}),
-                log:     log,
+                clients:   make(map[*wsClient]struct{}),
+                connPerIP: make(map[string]int),
+                log:       log,
         }
         go h.heartbeat()
         return h
@@ -115,17 +119,26 @@ func (h *Hub) ClientCount() int {
         return len(h.clients)
 }
 
-// register adds a client to the hub.
+// register adds a client to the hub and increments the per-IP counter.
 func (h *Hub) register(c *wsClient) {
         h.mu.Lock()
         h.clients[c] = struct{}{}
+        if c.ip != "" {
+                h.connPerIP[c.ip]++
+        }
         h.mu.Unlock()
 }
 
-// unregister removes a client and closes its send channel.
+// unregister removes a client and decrements the per-IP counter.
 func (h *Hub) unregister(c *wsClient) {
         h.mu.Lock()
         delete(h.clients, c)
+        if c.ip != "" {
+                h.connPerIP[c.ip]--
+                if h.connPerIP[c.ip] <= 0 {
+                        delete(h.connPerIP, c.ip)
+                }
+        }
         h.mu.Unlock()
         close(c.send)
 }
@@ -133,9 +146,23 @@ func (h *Hub) unregister(c *wsClient) {
 // Handler returns an http.Handler that upgrades HTTP to WebSocket.
 func (h *Hub) Handler() http.Handler {
         return websocket.Handler(func(conn *websocket.Conn) {
-                // Enforce max concurrent WS clients (2.2.5)
+                // Extract client IP for per-IP cap check.
+                remoteAddr := conn.RemoteAddr().String()
+                clientIP, _, err := net.SplitHostPort(remoteAddr)
+                if err != nil {
+                        clientIP = remoteAddr
+                }
+
+                // Enforce global max concurrent WS clients (2.2.5).
                 if !h.CanAcceptClient() {
-                        h.log.Warn("ws client rejected: max clients reached", "max", MaxWSClients)
+                        h.log.Warn("ws client rejected: global max reached", "max", MaxWSClients, "ip", clientIP)
+                        conn.Close()
+                        return
+                }
+                // Enforce per-IP cap (security: F-006 — prevents a single host
+                // from monopolising the hub even when the global cap has room).
+                if !h.CanAcceptFromIP(clientIP) {
+                        h.log.Warn("ws client rejected: per-IP max reached", "max", MaxWSClientsPerIP, "ip", clientIP)
                         conn.Close()
                         return
                 }
@@ -143,6 +170,7 @@ func (h *Hub) Handler() http.Handler {
                         conn:   conn,
                         send:   make(chan WSEvent, 64),
                         topics: map[string]bool{"new_block": true, "new_transaction": true, "confirmed_transaction": true},
+                        ip:     clientIP,
                 }
                 h.register(c)
                 defer h.unregister(c)

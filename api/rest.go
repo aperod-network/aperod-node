@@ -471,8 +471,14 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 return
         }
 
-        // Resolve view key: query param takes precedence over node config.
-        viewKeyHex := r.URL.Query().Get("view_key_hex")
+        // Resolve view key: X-View-Key header takes precedence over query param
+        // (which is deprecated — putting private scalars in URLs leaks them to
+        // access logs, browser history, and reverse-proxy request logs).
+        // Fall back to the node-level view key if neither is supplied.
+        viewKeyHex := r.Header.Get("X-View-Key")
+        if viewKeyHex == "" {
+                viewKeyHex = r.URL.Query().Get("view_key_hex")
+        }
         if viewKeyHex == "" {
                 viewKeyHex = s.nodeViewKeyHex
         }

@@ -2,9 +2,10 @@ package api
 
 // Middleware for the Aperod API server:
 //   - Per-IP rate limiting  (2.5.1): token bucket, 100 req/s, burst 200
+//   - Heavy-endpoint RL     (2.5.1b): O(N) UTXO-scan capped at 2 req/s per IP
 //   - API key auth          (2.5.2): X-API-Key header for write operations
 //   - CORS                  (2.5.3): configurable allowed origins
-//   - WS client cap         (2.2.5): max 1000 concurrent WebSocket connections
+//   - WS client cap         (2.2.5): max 1000 concurrent / 10 per IP
 
 import (
 	"net"
@@ -90,6 +91,86 @@ func (rl *RateLimiter) bucket(ip string) *tokenBucket {
 	return tb
 }
 
+// heavyRL is a stricter rate limiter for O(N) endpoints like the UTXO
+// address scan.  It uses a separate token bucket (2 req/s, burst 5) so a
+// single client cannot drive 100% CPU by hammering the endpoint.
+type heavyRL struct {
+	mu      sync.RWMutex
+	buckets map[string]*tokenBucket
+}
+
+func newHeavyRL() *heavyRL {
+	h := &heavyRL{buckets: make(map[string]*tokenBucket)}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-2 * time.Minute)
+			h.mu.Lock()
+			for ip, tb := range h.buckets {
+				tb.mu.Lock()
+				stale := tb.lastFill.Before(cutoff)
+				tb.mu.Unlock()
+				if stale {
+					delete(h.buckets, ip)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}()
+	return h
+}
+
+const (
+	heavyRate  = 2   // tokens per second
+	heavyBurst = 5   // bucket capacity
+)
+
+func (h *heavyRL) allow(ip string) bool {
+	h.mu.RLock()
+	tb, ok := h.buckets[ip]
+	h.mu.RUnlock()
+	if !ok {
+		h.mu.Lock()
+		if tb, ok = h.buckets[ip]; !ok {
+			tb = &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
+			h.buckets[ip] = tb
+		}
+		h.mu.Unlock()
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(tb.lastFill).Seconds()
+	tb.lastFill = now
+	tb.tokens += elapsed * heavyRate
+	if tb.tokens > heavyBurst {
+		tb.tokens = heavyBurst
+	}
+	if tb.tokens < 1 {
+		return false
+	}
+	tb.tokens--
+	return true
+}
+
+// globalHeavyRL is shared across all rate-limiter middleware instances.
+var globalHeavyRL = newHeavyRL()
+
+// isHeavyPath returns true for endpoints whose response cost is O(N) in the
+// UTXO-set size.  These get the stricter heavyRL bucket (2 req/s, burst 5).
+func isHeavyPath(path string) bool {
+	// /api/v1/address/{addr}/utxos — full UTXO-set copy + per-UTXO point ops.
+	const pfx = "/api/v1/address/"
+	const sfx = "/utxos"
+	if len(path) > len(pfx)+len(sfx) {
+		if path[:len(pfx)] == pfx && path[len(path)-len(sfx):] == sfx {
+			return true
+		}
+	}
+	return false
+}
+
 // Middleware returns an http.Handler that enforces the rate limit.
 // rateLimitExempt lists paths that bypass the per-IP token bucket entirely.
 // Use sparingly — only for internal probes that must never be throttled.
@@ -105,6 +186,11 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !rateLimitExempt[r.URL.Path] {
 			ip := realIP(r)
+			// Heavy endpoints (O(N) UTXO scan) get a stricter bucket first.
+			if isHeavyPath(r.URL.Path) && !globalHeavyRL.allow(ip) {
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
 			if !rl.bucket(ip).allow() {
 				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
 				return
@@ -208,9 +294,22 @@ func (c CORSConfig) Middleware(next http.Handler) http.Handler {
 
 // ─── WS client cap ────────────────────────────────────────────────────────────
 
-const MaxWSClients = 1000
+const (
+	// MaxWSClients is the global concurrent WebSocket connection limit.
+	MaxWSClients = 1000
+	// MaxWSClientsPerIP is the per-source-IP WebSocket connection limit.
+	// Prevents a single host from monopolising the hub (F-006 fix).
+	MaxWSClientsPerIP = 10
+)
 
-// CanAcceptClient reports whether the hub has capacity for another WS client.
+// CanAcceptClient reports whether the hub has global capacity for another WS client.
 func (h *Hub) CanAcceptClient() bool {
 	return h.ClientCount() < MaxWSClients
+}
+
+// CanAcceptFromIP reports whether the given IP is below its per-IP cap.
+func (h *Hub) CanAcceptFromIP(ip string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.connPerIP[ip] < MaxWSClientsPerIP
 }
