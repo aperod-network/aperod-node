@@ -75,21 +75,52 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	scanFrom := uint64(1)
 	txTotal := p.InitTxTotal
 	if partial := findLatestSnapshot(p.DataDir, p.TipHeight); partial != nil {
-		p.UTXOs.RestoreFromSnapshot(partial.UTXOs)
-		p.Registry.RestoreFromSnapshot(partial.Registry)
-		p.Registry.SetUTXOSet(p.UTXOs)
-		if partial.TxTotal > 0 {
-			txTotal = partial.TxTotal
+		// Cross-check: verify the snapshot's recorded TipHashHex against the
+		// actual block stored in the DB at that height.  A mismatch means the
+		// block was reorganised (e.g. in dev/test) after the checkpoint was
+		// written; restoring stale UTXO state would cause silent corruption.
+		// In that case we discard the checkpoint and scan from block 1.
+		hashOK := false
+		dbRaw, dbErr := p.DB.GetRawBlockByHeight(partial.TipHeight)
+		if dbErr != nil || dbRaw == nil {
+			p.Log.Warn("partial snapshot discarded — cannot fetch block for hash check",
+				"snapshot_height", partial.TipHeight, "err", dbErr)
+		} else {
+			var dbBlk core.Block
+			if jsonErr := json.Unmarshal(dbRaw, &dbBlk); jsonErr != nil {
+				p.Log.Warn("partial snapshot discarded — cannot decode block for hash check",
+					"snapshot_height", partial.TipHeight, "err", jsonErr)
+			} else {
+				dbHash := dbBlk.Hash()
+				dbHashHex := fmt.Sprintf("%x", dbHash[:])
+				if dbHashHex == partial.TipHashHex {
+					hashOK = true
+				} else {
+					p.Log.Warn("partial snapshot discarded — hash mismatch against DB block",
+						"snapshot_height", partial.TipHeight,
+						"snapshot_hash", partial.TipHashHex,
+						"db_hash", dbHashHex,
+					)
+				}
+			}
 		}
-		scanFrom = partial.TipHeight + 1
-		p.Log.Info("partial snapshot loaded — resuming scan from checkpoint",
-			"snapshot_height", partial.TipHeight,
-			"resume_from", scanFrom,
-			"tip_height", p.TipHeight,
-			"blocks_to_scan", p.TipHeight-partial.TipHeight,
-		)
-		runtime.GC()
-		debug.FreeOSMemory()
+		if hashOK {
+			p.UTXOs.RestoreFromSnapshot(partial.UTXOs)
+			p.Registry.RestoreFromSnapshot(partial.Registry)
+			p.Registry.SetUTXOSet(p.UTXOs)
+			if partial.TxTotal > 0 {
+				txTotal = partial.TxTotal
+			}
+			scanFrom = partial.TipHeight + 1
+			p.Log.Info("partial snapshot loaded — resuming scan from checkpoint",
+				"snapshot_height", partial.TipHeight,
+				"resume_from", scanFrom,
+				"tip_height", p.TipHeight,
+				"blocks_to_scan", p.TipHeight-partial.TipHeight,
+			)
+			runtime.GC()
+			debug.FreeOSMemory()
+		}
 	}
 
 	// ── Main scan loop ─────────────────────────────────────────────────────

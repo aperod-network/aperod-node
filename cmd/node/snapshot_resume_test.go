@@ -339,7 +339,100 @@ func TestFindLatestSnapshot_CorruptFile(t *testing.T) {
 	}
 }
 
-// ─── Test 5: multiple checkpoints — highest eligible is chosen ───────────────
+// ─── Test 5: hash mismatch → checkpoint discarded, scan from 1 ───────────────
+
+// TestPartialSnapshot_HashMismatch verifies that when the snapshot's
+// TipHashHex does not match the actual block stored in the DB at that height,
+// runStartupScan discards the checkpoint, logs a warning, and scans from
+// block 1 (ScanFrom == 1) instead of from checkpoint+1.
+func TestPartialSnapshot_HashMismatch(t *testing.T) {
+	const totalBlocks = 10
+	const checkpointAt = 5
+
+	dir := t.TempDir()
+	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height // 10
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	// Build a checkpoint snapshot at height 5 but with a deliberately wrong
+	// TipHashHex so that the DB cross-check will detect the mismatch.
+	cpUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, cpUTXOs, blocks, 0, checkpointAt)
+	cpRegistry := core.NewValidatorRegistry()
+	cpRegistry.SetUTXOSet(cpUTXOs)
+	cpRegistry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	wrongHashHex := fmt.Sprintf("%064x", 0xdeadbeef) // bogus hash — will not match DB
+	cpSnap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  uint64(checkpointAt),
+		TipHashHex: wrongHashHex,
+		TxTotal:    int64(checkpointAt),
+		UTXOs:      cpUTXOs.TakeSnapshot(),
+		Registry:   cpRegistry.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, cpSnap); err != nil {
+		t.Fatalf("saveStartupSnapshot(checkpoint): %v", err)
+	}
+
+	// Sanity: the checkpoint file exists.
+	if _, err := os.Stat(snapshotPath(dir, uint64(checkpointAt))); os.IsNotExist(err) {
+		t.Fatalf("checkpoint snapshot file not created")
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	var wg sync.WaitGroup
+	result, err := runStartupScan(startupScanParams{
+		DataDir:     dir,
+		TipHeight:   tipHeight,
+		TipHashHex:  tipHashHex,
+		DB:          db,
+		UTXOs:       utxos,
+		Registry:    registry,
+		KiFromIndex: false,
+		InitTxTotal: 0,
+		Log:         log,
+		SnapshotWg:  &wg,
+	})
+	if err != nil {
+		t.Fatalf("runStartupScan: %v", err)
+	}
+	wg.Wait()
+
+	// ── Assertion 1: warning log emitted for the discarded checkpoint.
+	if !logContainsMsg(&logBuf, "partial snapshot discarded — hash mismatch against DB block") {
+		t.Errorf("expected hash-mismatch warning was not logged\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Assertion 2: the partial-snapshot resume log must NOT appear (checkpoint was discarded).
+	if logContainsMsg(&logBuf, "partial snapshot loaded — resuming scan from checkpoint") {
+		t.Error("partial-snapshot resume log must NOT appear when hash mismatches")
+	}
+
+	// ── Assertion 3: scan started from block 1, not from checkpoint+1.
+	if result.ScanFrom != 1 {
+		t.Errorf("ScanFrom = %d, want 1 when checkpoint hash mismatches", result.ScanFrom)
+	}
+
+	// ── Assertion 4: UTXO count matches a full scan from block 1.
+	refUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, refUTXOs, blocks, 0, len(blocks)-1)
+	if got, want := utxos.Count(), refUTXOs.Count(); got != want {
+		t.Errorf("UTXOSet.Count() after discarded checkpoint = %d, want %d (full-scan reference)", got, want)
+	}
+}
+
+// ─── Test 6: multiple checkpoints — highest eligible is chosen ───────────────
 
 // TestFindLatestSnapshot_MultipleCheckpoints saves several checkpoints and
 // confirms findLatestSnapshot always picks the highest one strictly below
