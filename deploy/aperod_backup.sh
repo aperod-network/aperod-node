@@ -152,6 +152,10 @@ RCLONE_REMOTE="s3backup:${S3_BUCKET}"
 PRUNE_AGE="${S3_RETENTION_DAYS}d"
 
 mkdir -p "$BACKUP_DIR"
+# Guarantee cleanup even when the script exits with an error.
+# Without this a failed run leaves gigabytes in /tmp and the next run fails
+# immediately with "No space left on device".
+trap 'rm -rf "$BACKUP_DIR"' EXIT
 echo "=== [1/4] Бэкап начат: ${TIMESTAMP} ==="
 
 # ── 1. PostgreSQL dump ─────────────────────────────────────────────────────────
@@ -164,7 +168,10 @@ echo "  Дамп БД: $(du -sh "${BACKUP_DIR}/explorer_db.dump" | cut -f1)"
 # ── 2. Blockchain node data ────────────────────────────────────────────────────
 if [ -d "$NODE_DATA_DIR" ]; then
   echo "  Архивируем данные ноды (${NODE_DATA_DIR})..."
-  tar -czf "${BACKUP_DIR}/node_chain_data.tar.gz" -C "$NODE_DATA_DIR" .
+  # --ignore-failed-read prevents tar from dying when LevelDB compaction
+  # deletes an SST file mid-archive (this is safe: the DB remains consistent).
+  tar --ignore-failed-read --warning=no-file-removed \
+    -czf "${BACKUP_DIR}/node_chain_data.tar.gz" -C "$NODE_DATA_DIR" . || true
   echo "  Архив ноды: $(du -sh "${BACKUP_DIR}/node_chain_data.tar.gz" | cut -f1)"
 else
   echo "  ПРЕДУПРЕЖДЕНИЕ: NODE_DATA_DIR=${NODE_DATA_DIR} не найден, пропускаем."
