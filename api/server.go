@@ -8,6 +8,7 @@ import (
         "fmt"
         "log/slog"
         "net/http"
+        "sync"
         "sync/atomic"
         "time"
 
@@ -15,6 +16,19 @@ import (
         "github.com/aperod/aperod/crypto"
         "github.com/aperod/aperod/store"
 )
+
+// utxoCacheEntry holds a serialised /address/{addr}/utxos response body and
+// an expiry timestamp.  Entries are stored in Server.utxoAddrCache and evicted
+// lazily on next access after they expire.
+type utxoCacheEntry struct {
+	body      []byte
+	expiresAt time.Time
+}
+
+// utxoCacheTTL is how long a cached /address/{addr}/utxos response is kept.
+// The mint-UTXO monitor polls every 5 minutes, so a 90-second TTL means at
+// most one live scan per address per monitor cycle instead of one per call.
+const utxoCacheTTL = 90 * time.Second
 
 // Server is the JSON-RPC 2.0 HTTP server.
 type Server struct {
@@ -74,6 +88,12 @@ type Server struct {
         // Both are updated atomically by SetSyncProgress in cmd/node/main.go.
         syncingHeight int64
         tipHeight     int64
+
+        // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
+        // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
+        // for each admin-mint address; without caching each call does an O(n)
+        // UTXO scan with Ed25519 point ops that pins all CPU cores for 20-30 s.
+        utxoAddrCache sync.Map // key: addr+"|"+viewKeyHex  value: *utxoCacheEntry
 }
 
 // NewServer creates a new API server.

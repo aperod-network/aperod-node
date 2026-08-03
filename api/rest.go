@@ -482,6 +482,24 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
         if viewKeyHex == "" {
                 viewKeyHex = s.nodeViewKeyHex
         }
+
+        // Short-TTL response cache: restAddressUTXOs scans the entire UTXO set
+        // with Ed25519 point ops per entry (O(n), pins CPU for 20-30 s).
+        // The mint-UTXO monitor calls this every 5 min for each admin-mint address.
+        // A 90-second TTL lets the first call in each window do the scan;
+        // all subsequent calls within that window are served from cache in <1 ms.
+        cacheKey := addrStr + "|" + viewKeyHex
+        if raw, ok := s.utxoAddrCache.Load(cacheKey); ok {
+                e := raw.(*utxoCacheEntry)
+                if time.Now().Before(e.expiresAt) {
+                        w.Header().Set("Content-Type", "application/json")
+                        w.WriteHeader(http.StatusOK)
+                        _, _ = w.Write(e.body)
+                        return
+                }
+                s.utxoAddrCache.Delete(cacheKey) // expired, evict
+        }
+
         var viewPriv *crypto.Scalar32
         if viewKeyHex != "" {
                 raw, hexErr := hex.DecodeString(viewKeyHex)
@@ -555,11 +573,19 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 note = "includes stealth outputs discovered via view-key ECDH scan; amount_napr decoded inline for stealth outputs (transparent/mint outputs have null amount_napr)"
         }
 
-        writeJSON(w, http.StatusOK, map[string]interface{}{
+        // Store result in cache before writing response.
+        respPayload := map[string]interface{}{
                 "address": addrStr,
                 "utxos":   results,
                 "note":    note,
-        })
+        }
+        if body, marshalErr := json.Marshal(respPayload); marshalErr == nil {
+                s.utxoAddrCache.Store(cacheKey, &utxoCacheEntry{
+                        body:      body,
+                        expiresAt: time.Now().Add(utxoCacheTTL),
+                })
+        }
+        writeJSON(w, http.StatusOK, respPayload)
 }
 
 func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
