@@ -82,9 +82,11 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 	var mu sync.Mutex
 	var acceptedHeights []uint64
 
-	// snapshotHeights collects heights at which we actually write a snapshot,
-	// mirroring the production h%500==0 guard.
+	// snapCount counts how many snapshots were written.  The production guard
+	// now uses a configurable interval (default 10 000); in this test we use
+	// interval=2 so the snapshot fires at h==2 within our 3-block run.
 	var snapCount atomic.Int32
+	const testInterval uint64 = 2
 
 	eng := consensus.NewEngine(consensus.Config{
 		BlockTime:    20 * time.Millisecond,
@@ -97,8 +99,8 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 			acceptedHeights = append(acceptedHeights, h)
 			mu.Unlock()
 
-			// Mirror the production periodic-snapshot logic.
-			if h == 0 || h%500 != 0 {
+			// Mirror the production periodic-snapshot logic with testInterval.
+			if testInterval == 0 || h == 0 || h%testInterval != 0 {
 				return
 			}
 			snap := startupSnapshot{
@@ -168,10 +170,12 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 	}
 }
 
-// TestPeriodicSnapshot_EveryFiveHundredBlocks verifies the snapshot save/delete
-// contract: a snapshot file must exist at each 500-block boundary, and all
-// earlier 500-block files must be removed.
-func TestPeriodicSnapshot_EveryFiveHundredBlocks(t *testing.T) {
+// TestPeriodicSnapshot_SaveDeleteContract verifies the snapshot save/delete
+// contract: a snapshot file must exist at each interval boundary, and all
+// earlier snapshot files must be removed.  The interval size used here (500)
+// is arbitrary — the production value is now configurable via
+// SnapshotConfig.PeriodicSnapshotInterval (default 10 000).
+func TestPeriodicSnapshot_SaveDeleteContract(t *testing.T) {
 	dir := t.TempDir()
 
 	saveSnap := func(h uint64) {

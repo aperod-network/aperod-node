@@ -589,7 +589,9 @@ func run() error {
                 // including pure syncing nodes that never call OnBlockProduced.
                 OnBlockAccepted: func(block *core.Block) {
                         h := block.Header.Height
-                        if h == 0 || h%500 != 0 {
+                        interval := cfg.Snapshot.PeriodicSnapshotInterval
+                        // interval == 0 means periodic snapshots are disabled (shutdown-only).
+                        if interval == 0 || h == 0 || h%interval != 0 {
                                 return
                         }
                         var txTot int64
@@ -623,6 +625,14 @@ func run() error {
                                                         "height", height, "err", metaErr)
                                         }
                                 }
+                                // Explicitly release the deep-copy snapshot data so the GC can
+                                // reclaim it immediately rather than waiting for the next
+                                // scheduled collection.  The disk write above is complete at this
+                                // point, so there is no remaining reference to snap's slices.
+                                snap.UTXOs = core.UTXOSnapshot{}
+                                snap.Registry = core.RegistrySnapshot{}
+                                runtime.GC()
+                                debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
                         }(periodicSnap, h, periodicActive)
                 },
         }, chain, mempool, log)

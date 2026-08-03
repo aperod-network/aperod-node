@@ -26,6 +26,19 @@ type SnapshotConfig struct {
 	// concurrent writes during shutdown).  Set to 0 for an exact-count match.
 	// Default: 1.0.
 	UTXOCountTolerancePct float64 `yaml:"utxo_count_tolerance_pct"`
+
+	// PeriodicSnapshotInterval is the number of blocks between periodic
+	// in-process UTXO snapshots.  Taking a snapshot creates a full deep copy
+	// of the UTXO set and briefly doubles node RSS; on production nodes with a
+	// 4-5 GB UTXO set this can push memory past the GOMEMLIMIT ceiling.  A
+	// higher value reduces the frequency of those spikes.
+	//
+	// The shutdown snapshot (taken on clean exit) is unaffected by this
+	// setting; it remains the primary crash-recovery mechanism.
+	//
+	// Default: 10000.  Set to 0 to disable periodic snapshots entirely
+	// (shutdown snapshot only).
+	PeriodicSnapshotInterval uint64 `yaml:"periodic_snapshot_interval"`
 }
 
 // Config is the top-level node configuration.
@@ -143,7 +156,8 @@ func DefaultConfig() *Config {
 			KeepBlocks: 100_000,
 		},
 		Snapshot: SnapshotConfig{
-			UTXOCountTolerancePct: 1.0,
+			UTXOCountTolerancePct:    1.0,
+			PeriodicSnapshotInterval: 10_000,
 		},
 	}
 }
