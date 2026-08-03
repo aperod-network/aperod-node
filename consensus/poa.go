@@ -32,6 +32,11 @@ type Config struct {
         // OnBlockProduced is an optional callback called after each block is added
         // to the chain. Use it to persist blocks to durable storage.
         OnBlockProduced func(block *core.Block)
+        // OnBlockAccepted is an optional callback called after every canonical
+        // block is committed — whether produced locally by this node or received
+        // from a P2P peer.  Use it for work that must run regardless of the
+        // block source (e.g. periodic snapshots).
+        OnBlockAccepted func(block *core.Block)
         // RewardAddress is the APRO wallet address that receives block rewards.
         // If empty, no coinbase transaction is added to produced blocks.
         RewardAddress string
@@ -339,6 +344,10 @@ func (e *Engine) tick() error {
         // Persist block to durable storage (if callback configured)
         if e.cfg.OnBlockProduced != nil {
                 e.cfg.OnBlockProduced(block)
+        }
+        // Notify any block-source-agnostic listeners (e.g. periodic snapshotting).
+        if e.cfg.OnBlockAccepted != nil {
+                e.cfg.OnBlockAccepted(block)
         }
 
         // Broadcast to P2P
@@ -871,6 +880,11 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 
         // Remove included transactions from mempool
         e.pool.RemoveBlock(block)
+
+        // Notify any block-source-agnostic listeners (e.g. periodic snapshotting).
+        if e.cfg.OnBlockAccepted != nil {
+                e.cfg.OnBlockAccepted(block)
+        }
 
         // Cast finalization vote if we are a validator
         if e.cfg.MyKey != nil {

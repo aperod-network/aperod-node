@@ -637,36 +637,39 @@ func run() error {
                                         }
                                 }
                         }
-                        // ── Periodic mid-operation snapshot ──────────────────────────
-                        // Write a snapshot every 500 blocks so an OOM kill during
-                        // normal operation does not force the full 5-6 h startup scan
-                        // on the next restart.  TakeSnapshot is a read lock + deep
-                        // copy; the goroutine does the slow file I/O off the critical
-                        // path.
-                        if h := block.Header.Height; h > 0 && h%500 == 0 {
-                                var txTot int64
-                                if apiSrv != nil {
-                                        txTot = apiSrv.TxTotal()
-                                }
-                                hash := block.Hash()
-                                periodicSnap := startupSnapshot{
-                                        Version:    snapVersion,
-                                        TipHeight:  h,
-                                        TipHashHex: fmt.Sprintf("%x", hash[:]),
-                                        TxTotal:    txTot,
-                                        UTXOs:      utxos.TakeSnapshot(),
-                                        Registry:   engine.Registry().TakeSnapshot(),
-                                }
-                                go func(snap startupSnapshot, height uint64) {
-                                        if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
-                                                log.Warn("failed to save periodic snapshot",
-                                                        "height", height, "err", saveErr)
-                                        } else {
-                                                log.Info("periodic snapshot saved", "height", height)
-                                                deleteOldSnapshots(cfg.DataDir, height)
-                                        }
-                                }(periodicSnap, h)
+                },
+                // OnBlockAccepted fires for every canonical block regardless of
+                // whether it was produced locally or received from a P2P peer.
+                // This is the correct place for the periodic snapshot: it guards
+                // against OOM kills during normal operation on any node type,
+                // including pure syncing nodes that never call OnBlockProduced.
+                OnBlockAccepted: func(block *core.Block) {
+                        h := block.Header.Height
+                        if h == 0 || h%500 != 0 {
+                                return
                         }
+                        var txTot int64
+                        if apiSrv != nil {
+                                txTot = apiSrv.TxTotal()
+                        }
+                        hash := block.Hash()
+                        periodicSnap := startupSnapshot{
+                                Version:    snapVersion,
+                                TipHeight:  h,
+                                TipHashHex: fmt.Sprintf("%x", hash[:]),
+                                TxTotal:    txTot,
+                                UTXOs:      utxos.TakeSnapshot(),
+                                Registry:   engine.Registry().TakeSnapshot(),
+                        }
+                        go func(snap startupSnapshot, height uint64) {
+                                if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
+                                        log.Warn("failed to save periodic snapshot",
+                                                "height", height, "err", saveErr)
+                                } else {
+                                        log.Info("periodic snapshot saved", "height", height)
+                                        deleteOldSnapshots(cfg.DataDir, height)
+                                }
+                        }(periodicSnap, h)
                 },
         }, chain, mempool, log)
 
