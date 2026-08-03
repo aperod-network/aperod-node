@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -41,6 +42,17 @@ type SnapshotConfig struct {
 	PeriodicSnapshotInterval uint64 `yaml:"periodic_snapshot_interval"`
 }
 
+// PprofConfig controls the Go pprof HTTP diagnostic endpoint.
+// The endpoint exposes CPU/heap/goroutine profiles and should only ever
+// bind to localhost (127.0.0.1).  It is disabled by default.
+type PprofConfig struct {
+	// Enabled turns the pprof HTTP server on.  Default: false.
+	Enabled bool `yaml:"enabled"`
+	// ListenAddr is the address the pprof server binds to.
+	// MUST be a loopback address.  Default: "127.0.0.1:8546".
+	ListenAddr string `yaml:"listen_addr"`
+}
+
 // Config is the top-level node configuration.
 type Config struct {
 	Network   Network         `yaml:"network"`
@@ -52,6 +64,7 @@ type Config struct {
 	Genesis   GenesisRef      `yaml:"genesis"`
 	Pruning   PruningConfig   `yaml:"pruning"`
 	Snapshot  SnapshotConfig  `yaml:"snapshot"`
+	Pprof     PprofConfig     `yaml:"pprof"`
 }
 
 // P2PConfig holds networking settings.
@@ -159,6 +172,10 @@ func DefaultConfig() *Config {
 			UTXOCountTolerancePct:    1.0,
 			PeriodicSnapshotInterval: 10_000,
 		},
+		Pprof: PprofConfig{
+			Enabled:    false,
+			ListenAddr: "127.0.0.1:8546",
+		},
 	}
 }
 
@@ -220,6 +237,24 @@ func (c *Config) Validate() error {
 	}
 	if c.Pruning.Mode != "" && c.Pruning.Mode != "archive" && c.Pruning.Mode != "light" {
 		return fmt.Errorf("pruning.mode must be \"archive\" or \"light\", got %q", c.Pruning.Mode)
+	}
+	if c.Pprof.Enabled {
+		addr := c.Pprof.ListenAddr
+		if addr == "" {
+			addr = "127.0.0.1:8546"
+		}
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			return fmt.Errorf("pprof.listen_addr %q is not a valid host:port address: %w", addr, splitErr)
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf(
+				"pprof.listen_addr %q must bind to a loopback address (127.x.x.x or ::1) — "+
+					"binding pprof to a non-loopback interface exposes unauthenticated runtime diagnostics",
+				addr,
+			)
+		}
 	}
 	return nil
 }

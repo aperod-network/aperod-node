@@ -34,3 +34,18 @@ genesis:
 pruning:
   mode: "archive"
   keep_blocks: 100000   # ~3.5 days at 3 s/block; ignored in archive mode
+
+# pprof — Go runtime profiling endpoint (CPU, heap, goroutine, trace).
+# Disabled by default.  Enable only when diagnosing a live CPU/memory incident;
+# disable again afterwards.  listen_addr MUST be a loopback address (127.0.0.1).
+#
+# Usage once enabled:
+#   # 30-second CPU flame graph
+#   go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30
+#   # heap snapshot
+#   go tool pprof http://127.0.0.1:8546/debug/pprof/heap
+#   # goroutine dump
+#   curl -s http://127.0.0.1:8546/debug/pprof/goroutine?debug=2
+#pprof:
+#  enabled: true
+#  listen_addr: "127.0.0.1:8546"

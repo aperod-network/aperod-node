@@ -6,6 +6,8 @@ import (
         "encoding/json"
         "fmt"
         "log/slog"
+        "net/http"
+        _ "net/http/pprof" // registers /debug/pprof/* handlers on http.DefaultServeMux
         "os"
         "os/signal"
         "path/filepath"
@@ -836,7 +838,36 @@ func run() error {
                 "p2p", cfg.P2P.ListenAddr,
         )
 
-        // ── 10. Background pruning worker (light mode only) ────────────────────────
+        // ── 10. pprof diagnostic endpoint (optional, localhost-only) ──────────────
+        // Exposes /debug/pprof/* on a dedicated port so operators can capture CPU
+        // and heap profiles without rebuilding the binary.  Disabled by default;
+        // set pprof.enabled: true in node.yaml to activate.
+        //
+        // Security: binds exclusively to the address in pprof.listen_addr, which
+        // MUST be a loopback address (127.0.0.1).  The handler is registered on a
+        // fresh http.ServeMux so it is entirely isolated from the API server mux.
+        if cfg.Pprof.Enabled {
+                pprofAddr := cfg.Pprof.ListenAddr
+                if pprofAddr == "" {
+                        pprofAddr = "127.0.0.1:8546"
+                }
+                go func() {
+                        // The `_ "net/http/pprof"` import registers all /debug/pprof/*
+                        // handlers on http.DefaultServeMux as a side effect; we serve
+                        // that mux here on its own dedicated port.
+                        pprofSrv := &http.Server{
+                                Addr:    pprofAddr,
+                                Handler: http.DefaultServeMux,
+                        }
+                        log.Info("pprof endpoint started", "addr", pprofAddr,
+                                "hint", "go tool pprof http://"+pprofAddr+"/debug/pprof/profile?seconds=30")
+                        if serveErr := pprofSrv.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+                                log.Warn("pprof server stopped", "err", serveErr)
+                        }
+                }()
+        }
+
+        // ── 11. Background pruning worker (light mode only) ────────────────────────
         // Strips RingCT/Bulletproof tx data from blocks older than KeepBlocks.
         // Fires once per epoch (~100 blocks × block_time).
         if cfg.Pruning.Mode == "light" {
@@ -866,7 +897,7 @@ func run() error {
                 log.Info("light pruning enabled", "keep_blocks", cfg.Pruning.KeepBlocks)
         }
 
-        // ── 11. Wait for signal ───────────────────────────────────────────────────
+        // ── 12. Wait for signal ───────────────────────────────────────────────────
         sig := make(chan os.Signal, 1)
         signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
         <-sig

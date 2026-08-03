@@ -366,10 +366,67 @@ make test-cover              # with HTML coverage report
 
 ---
 
+## 🔍 Diagnosing CPU / Memory Spikes (pprof)
+
+The node ships a built-in Go [pprof](https://pkg.go.dev/net/http/pprof) endpoint that lets you capture CPU flame graphs, heap snapshots, and goroutine dumps in seconds — no rebuild required.
+
+### Enable
+
+In `node.yaml` (or the production overlay), set:
+
+```yaml
+pprof:
+  enabled: true
+  listen_addr: "127.0.0.1:8546"   # loopback only — never expose publicly
+```
+
+Restart the node.  You will see:
+
+```
+{"level":"INFO","msg":"pprof endpoint started","addr":"127.0.0.1:8546","hint":"go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30"}
+```
+
+### Capture profiles (from the server)
+
+```bash
+# 30-second CPU flame graph
+go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30
+
+# Heap snapshot
+go tool pprof http://127.0.0.1:8546/debug/pprof/heap
+
+# Goroutine dump (text, great for deadlock diagnosis)
+curl -s "http://127.0.0.1:8546/debug/pprof/goroutine?debug=2"
+
+# Allocs, mutex, block profiles
+go tool pprof http://127.0.0.1:8546/debug/pprof/allocs
+go tool pprof http://127.0.0.1:8546/debug/pprof/mutex
+go tool pprof http://127.0.0.1:8546/debug/pprof/block
+```
+
+### Via SSH tunnel (remote server)
+
+```bash
+# On your laptop — forward remote 8546 to local 8546
+ssh -L 8546:127.0.0.1:8546 user@your-server
+
+# Then locally
+go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30
+```
+
+### Security notes
+
+- `listen_addr` **must** be `127.0.0.1:…` (loopback).  Never bind to `0.0.0.0`.
+- Disable (`enabled: false`) when not actively diagnosing — pprof exposes internal runtime metrics.
+- The endpoint runs on a **separate port** (default 8546) and is completely isolated from the public API (port 8545).
+
+---
+
 ## 🔒 Security
 
 - **Consensus key ≠ wallet key** — the key that signs blocks has no ability to move funds
 - **RPC (port 8545) binds to `127.0.0.1` by default** — never expose externally without a firewall
+- **pprof (port 8546) disabled by default** — enable only for active diagnosis, loopback only
 - **Consensus key stored with `chmod 640`** — readable only by the `aperod` system user
 - **Double-sign protection** — automatic on-chain slashing (10 % of stake, permanent ban from validator set)
 - **View key sharing** — share your view key for read-only auditing without granting spending ability
