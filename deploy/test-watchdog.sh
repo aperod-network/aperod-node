@@ -661,6 +661,94 @@ fi
 fi  # end of set-interval tests block (script exists guard)
 
 # =============================================================================
+# Test 13: restart event appended to watchdog-restart-events on probe failure
+# =============================================================================
+section "Test 13: restart event file is updated when probe fails"
+
+T13_DIR=$(mktemp -d "$TMPDIR_TEST/t13-XXXXXXXX")
+T13_SC_LOG="$T13_DIR/systemctl.log"
+T13_FAKE_SC=$(make_fake_bin "systemctl" "$T13_SC_LOG")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T13_DIR" \
+  TIMEOUT_SECS="1" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T13_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+T13_EXIT=$?
+
+if [[ $T13_EXIT -eq 0 ]]; then
+  pass "watchdog exited 0 after probe failure"
+else
+  fail "watchdog exited $T13_EXIT (expected 0)"
+fi
+
+T13_EVENTS="${T13_DIR}/watchdog-restart-events"
+if [[ -f "$T13_EVENTS" ]]; then
+  pass "watchdog-restart-events file was created on restart"
+else
+  fail "watchdog-restart-events file was NOT created (STATE_DIR=$T13_DIR)"
+fi
+
+T13_LINE_COUNT=$(wc -l < "$T13_EVENTS" 2>/dev/null || echo "0")
+if [[ "$T13_LINE_COUNT" -ge 1 ]]; then
+  pass "watchdog-restart-events contains at least 1 line after restart"
+else
+  fail "watchdog-restart-events is empty after restart"
+fi
+
+T13_TS=$(grep -E '^[0-9]+$' "$T13_EVENTS" 2>/dev/null | head -1 || true)
+if [[ -n "$T13_TS" && "$T13_TS" -gt 0 ]]; then
+  pass "restart-events entry is a positive integer (Unix-ms: $T13_TS)"
+else
+  fail "restart-events entry is not a positive integer (got: '$T13_TS')"
+fi
+
+# =============================================================================
+# Test 14: watchdog-restart-events NOT written when probe returns 200
+# =============================================================================
+section "Test 14: restart event file is NOT written when probe succeeds (200)"
+
+PORT14=$(find_free_port)
+SRV14_PID=$(start_mock_server "$PORT14" 200)
+
+if wait_for_server "$PORT14" 5; then
+  pass "mock HTTP server (200) is listening on port $PORT14"
+else
+  fail "mock HTTP server did not start on port $PORT14 within 5 s"
+fi
+
+T14_DIR=$(mktemp -d "$TMPDIR_TEST/t14-XXXXXXXX")
+T14_SC_LOG="$T14_DIR/systemctl.log"
+T14_FAKE_SC=$(make_fake_bin "systemctl" "$T14_SC_LOG")
+
+NODE_API_URL="http://127.0.0.1:${PORT14}" \
+  STATE_DIR="$T14_DIR" \
+  TIMEOUT_SECS="3" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T14_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+T14_EXIT=$?
+
+kill "$SRV14_PID" 2>/dev/null || true
+wait "$SRV14_PID" 2>/dev/null || true
+
+if [[ $T14_EXIT -eq 0 ]]; then
+  pass "watchdog exited 0 on healthy probe"
+else
+  fail "watchdog exited $T14_EXIT (expected 0)"
+fi
+
+T14_EVENTS="${T14_DIR}/watchdog-restart-events"
+if [[ ! -f "$T14_EVENTS" ]]; then
+  pass "watchdog-restart-events was NOT written for a 200 response"
+else
+  fail "watchdog-restart-events was unexpectedly written for a 200 response (content: $(cat "$T14_EVENTS"))"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

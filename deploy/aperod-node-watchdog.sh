@@ -24,11 +24,14 @@ STATUS_URL="${NODE_API_URL}/api/v1/status"
 ALERT_COOLDOWN_SECS="${ALERT_COOLDOWN_SECS:-3600}"
 
 # State files written every run so the Admin Panel can show watchdog status
-STATE_DIR="/var/lib/aperod"
+# STATE_DIR may be overridden by tests via the environment variable.
+STATE_DIR="${STATE_DIR:-/var/lib/aperod}"
 LAST_CHECK_FILE="${STATE_DIR}/watchdog-last-check"
 LAST_RESTART_FILE="${STATE_DIR}/watchdog-last-restart"
 RESTART_COUNT_FILE="${STATE_DIR}/watchdog-restarts"
 LAST_ALERT_FILE="${STATE_DIR}/watchdog-last-alert"
+# Individual restart timestamps for the 24-h crash-loop counter (one Unix-ms per line)
+RESTART_EVENTS_FILE="${STATE_DIR}/watchdog-restart-events"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,6 +65,24 @@ increment_restart_count() {
     count=$(cat "${RESTART_COUNT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
   fi
   echo $(( count + 1 )) > "${RESTART_COUNT_FILE}" || true
+}
+
+# Append a Unix-millisecond timestamp to the 24-h restart-events log and prune
+# entries older than 25 hours.  Using date +%s (seconds) * 1000 for portability
+# across GNU and BSD date; sub-second precision is not needed for 24-h tracking.
+append_restart_event() {
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  local ts_ms
+  ts_ms=$(( $(date +%s) * 1000 ))
+  echo "${ts_ms}" >> "${RESTART_EVENTS_FILE}" || true
+  # Prune events older than 25 h (90000 s) to keep the file small
+  if [[ -f "${RESTART_EVENTS_FILE}" ]]; then
+    local cutoff_ms
+    cutoff_ms=$(( ( $(date +%s) - 90000 ) * 1000 ))
+    awk -v c="${cutoff_ms}" '$1+0 >= c' "${RESTART_EVENTS_FILE}" \
+      > "${RESTART_EVENTS_FILE}.tmp" 2>/dev/null \
+      && mv "${RESTART_EVENTS_FILE}.tmp" "${RESTART_EVENTS_FILE}" 2>/dev/null || true
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -112,6 +133,7 @@ systemctl restart aperod-node
 # Record the restart event
 write_timestamp "${LAST_RESTART_FILE}"
 increment_restart_count
+append_restart_event
 
 log "aperod-node restarted"
 exit 0
