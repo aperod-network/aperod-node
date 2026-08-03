@@ -9,6 +9,7 @@ import (
         "os/signal"
         "path/filepath"
         "regexp"
+        "runtime"
         "syscall"
         "time"
 
@@ -391,9 +392,13 @@ func run() error {
                 // Single block scan for all three goals: active UTXO rebuild,
                 // key-image fallback, and stake replay.  One scan avoids decoding
                 // the full chain multiple times on restart.
+                var msScanStart runtime.MemStats
+                runtime.ReadMemStats(&msScanStart)
+                scanStart := time.Now()
                 log.Info("running startup block scan",
                         "tip_height", tipHeight,
-                        "ki_from_index", kiFromIndex)
+                        "ki_from_index", kiFromIndex,
+                        "heap_sys_mib_before", msScanStart.Sys/(1024*1024))
                 var txCount int64 = 0
                 blocksWithStake := 0
                 const syncProgressInterval = uint64(1000) // report every 1 000 blocks
@@ -497,6 +502,24 @@ func run() error {
                                 "key_images_marked", kiCount,
                                 "blocks_scanned", tipHeight,
                                 "total_txs_counted", txCount)
+                }
+                // ── Startup scan instrumentation ─────────────────────────────────
+                // Logs wall-clock time, key-image count, and peak heap usage so that
+                // operators can track growth and validate the key-image store design.
+                // heap_sys_mib is the total bytes mapped from the OS (a reliable
+                // proxy for peak RSS — it never decreases within a process lifetime).
+                {
+                        scanElapsed := time.Since(scanStart)
+                        var msScanEnd runtime.MemStats
+                        runtime.ReadMemStats(&msScanEnd)
+                        log.Info("startup scan metrics",
+                                "elapsed_sec", fmt.Sprintf("%.2f", scanElapsed.Seconds()),
+                                "key_images_loaded", kiCount,
+                                "heap_sys_mib_before", msScanStart.Sys/(1024*1024),
+                                "heap_sys_mib_after", msScanEnd.Sys/(1024*1024),
+                                "heap_alloc_mib", msScanEnd.HeapAlloc/(1024*1024),
+                                "heap_sys_delta_mib", (msScanEnd.Sys-msScanStart.Sys)/(1024*1024),
+                        )
                 }
                 {
                         active, total := registry.Count()
