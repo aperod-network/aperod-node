@@ -415,233 +415,27 @@ func run() error {
                         kiCount = 0
                 }
 
-                // ── Partial snapshot resume ───────────────────────────────────
-                // If an exact-tip snapshot was not found above, look for the most
-                // recent intermediate checkpoint (saved every 50K blocks during the
-                // previous scan).  Restoring from it means we only need to replay
-                // the blocks since the checkpoint, not all 900K+ blocks.
-                scanFrom := uint64(1)
-                if partial := findLatestSnapshot(cfg.DataDir, tipHeight); partial != nil {
-                        utxos.RestoreFromSnapshot(partial.UTXOs)
-                        registry.RestoreFromSnapshot(partial.Registry)
-                        registry.SetUTXOSet(utxos)
-                        if partial.TxTotal > 0 {
-                                initialTxTotal = partial.TxTotal
-                        }
-                        scanFrom = partial.TipHeight + 1
-                        log.Info("partial snapshot loaded — resuming scan from checkpoint",
-                                "snapshot_height", partial.TipHeight,
-                                "resume_from", scanFrom,
-                                "tip_height", tipHeight,
-                                "blocks_to_scan", tipHeight-partial.TipHeight,
-                        )
-                        runtime.GC()
-                        debug.FreeOSMemory()
+                var setSyncProgress func(uint64, uint64)
+                if apiSrv != nil {
+                        setSyncProgress = apiSrv.SetSyncProgress
                 }
-
-                // Single block scan for all three goals: active UTXO rebuild,
-                // key-image fallback, and stake replay.  One scan avoids decoding
-                // the full chain multiple times on restart.
-                var msScanStart runtime.MemStats
-                runtime.ReadMemStats(&msScanStart)
-                scanStart := time.Now()
-                log.Info("running startup block scan",
-                        "tip_height", tipHeight,
-                        "scan_from", scanFrom,
-                        "ki_from_index", kiFromIndex,
-                        "heap_sys_mib_before", msScanStart.Sys/(1024*1024))
-                var txCount int64 = 0
-                blocksWithStake := 0
-                const syncProgressInterval    = uint64(1000)  // report every 1 000 blocks
-                const gcInterval              = uint64(10000) // force GC every 10 000 blocks to keep scan RSS flat
-                const checkpointInterval      = uint64(50000) // save intermediate snapshot every 50 000 blocks
-                for h := scanFrom; h <= tipHeight; h++ {
-                        // Update syncing progress so /api/v1/status can report it.
-                        if apiSrv != nil && h%syncProgressInterval == 0 {
-                                apiSrv.SetSyncProgress(h, tipHeight)
-                        }
-                        // Force a GC cycle periodically so that the decoded block
-                        // objects from previous iterations are collected before the
-                        // next batch is allocated.  Without this the Go GC is too
-                        // lazy during a tight allocation loop and RSS grows linearly
-                        // with the number of blocks scanned.
-                        if h%gcInterval == 0 {
-                                runtime.GC()
-                        }
-
-                        raw, fetchErr := db.GetRawBlockByHeight(h)
-                        if fetchErr != nil || raw == nil {
-                                return fmt.Errorf(
-                                        "startup scan: block at height %d missing from store (%v) — "+
-                                                "node cannot start safely; repair the store and restart",
-                                        h, fetchErr)
-                        }
-                        var b core.Block
-                        if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
-                                return fmt.Errorf(
-                                        "startup scan: cannot decode block at height %d: %w — "+
-                                                "node cannot start safely; repair the store and restart",
-                                        h, parseErr)
-                        }
-
-                        // Goal 2: Rebuild active UTXO set.
-                        //
-                        // ApplyBlock adds outputs and removes spent inputs by TxHash+OutIdx.
-                        // Stake txs have no regular inputs, so their burn UTXOs remain in
-                        // the active set here and are moved to stakedUTXOs by the
-                        // ReplayBlockStakeTxs call below.  MarkStakedKnown prefers the
-                        // active-set entry (correct OneTimePub) over the reconstructed
-                        // descriptor from the v2 payload.
-                        if applyErr := utxos.ApplyBlock(&b); applyErr != nil {
-                                log.Warn("startup scan: ApplyBlock failed (continuing)",
-                                        "height", h, "err", applyErr)
-                        }
-
-                        // UTXO index backfill: persist records for every output in this
-                        // block so that api.utxoMissingReason can distinguish "spent or
-                        // burned" from "originated in a pruned block" from "never existed".
-                        // For pruned blocks b.Txs is empty (TxData stripped), so no
-                        // records are written — which is correct because we cannot recover
-                        // the data anyway.  Records are never deleted, so this is safe to
-                        // run on every restart; PutUTXO is idempotent (overwrites same key).
-                        for _, tx := range b.Txs {
-                                txHash := tx.Hash()
-                                for i, out := range tx.Outputs {
-                                        su := &store.StoredUTXO{
-                                                TxHash:       txHash,
-                                                OutputIndex:  uint32(i),
-                                                OneTimePub:   out.OneTimePub,
-                                                TxPubKey:     out.TxPubKey,
-                                                AmountCommit: out.AmountCommit,
-                                                EncAmount:    out.EncAmount,
-                                                BlockHeight:  b.Header.Height,
-                                        }
-                                        _ = db.PutUTXO(txHash, uint32(i), su) // best-effort; non-fatal
-                                }
-                        }
-
-                        // Goal 1 (fallback): mark spent key images and backfill the index.
-                        if !kiFromIndex {
-                                for txIdx, tx := range b.Txs {
-                                        for _, inp := range tx.Inputs {
-                                                utxos.MarkSpent(inp.KeyImage)
-                                                kiCount++
-                                                _ = db.MarkKeyImageSpent(inp.KeyImage)
-                                        }
-                                        if !(txIdx == 0 && tx.IsCoinbase()) {
-                                                txCount++
-                                        }
-                                }
-                        }
-
-                        // Goal 3+4: Replay stake txs — restore registry entries and move
-                        // burn UTXOs from the just-rebuilt active set into stakedUTXOs.
-                        hasStake := false
-                        for _, tx := range b.Txs {
-                                if tx.IsStake() {
-                                        hasStake = true
-                                        break
-                                }
-                        }
-                        if hasStake {
-                                if replayErr := registry.ReplayBlockStakeTxs(b.Txs, b.Header.Height); replayErr != nil {
-                                        return fmt.Errorf(
-                                                "stake replay failed at height %d: %w — "+
-                                                        "node cannot start safely; repair the store and restart",
-                                                h, replayErr)
-                                }
-                                blocksWithStake++
-                        }
-
-                        // Save an intermediate checkpoint every 50K blocks so that a
-                        // crash during the scan resumes from the checkpoint rather than
-                        // restarting from block 1.  TakeSnapshot is a deep copy under
-                        // RLock, so it is safe to call while the loop continues.
-                        if h%checkpointInterval == 0 && h < tipHeight {
-                                cpSnap := startupSnapshot{
-                                        Version:    snapVersion,
-                                        TipHeight:  h,
-                                        TipHashHex: func() string { h := b.Header.Hash(); return fmt.Sprintf("%x", h[:]) }(),
-                                        TxTotal:    func() int64 {
-                                                if kiFromIndex {
-                                                        return initialTxTotal
-                                                }
-                                                return txCount
-                                        }(),
-                                        UTXOs:    utxos.TakeSnapshot(),
-                                        Registry: registry.TakeSnapshot(),
-                                }
-                                go func(s startupSnapshot) {
-                                        if cpErr := saveStartupSnapshot(cfg.DataDir, s); cpErr != nil {
-                                                log.Warn("scan checkpoint save failed", "height", s.TipHeight, "err", cpErr)
-                                        } else {
-                                                log.Info("scan checkpoint saved", "height", s.TipHeight)
-                                                deleteOldSnapshots(cfg.DataDir, s.TipHeight)
-                                        }
-                                }(cpSnap)
-                        }
+                scanResult, scanErr := runStartupScan(startupScanParams{
+                        DataDir:         cfg.DataDir,
+                        TipHeight:       tipHeight,
+                        TipHashHex:      fmt.Sprintf("%x", tipHash[:]),
+                        DB:              db,
+                        UTXOs:           utxos,
+                        Registry:        registry,
+                        KiFromIndex:     kiFromIndex,
+                        InitTxTotal:     initialTxTotal,
+                        Log:             log,
+                        SetSyncProgress: setSyncProgress,
+                })
+                if scanErr != nil {
+                        return scanErr
                 }
-
-                if !kiFromIndex {
-                        if err := db.StoreTxTotal(txCount); err != nil {
-                                log.Warn("failed to persist tx total after block scan", "err", err)
-                        }
-                        initialTxTotal = txCount
-                        log.Info("spent key-image set rebuilt (full block scan)",
-                                "key_images_marked", kiCount,
-                                "blocks_scanned", tipHeight,
-                                "total_txs_counted", txCount)
-                }
-                // ── Startup scan instrumentation ─────────────────────────────────
-                // Logs wall-clock time, key-image count, and peak heap usage so that
-                // operators can track growth and validate the key-image store design.
-                // heap_sys_mib is the total bytes mapped from the OS (a reliable
-                // proxy for peak RSS — it never decreases within a process lifetime).
-                {
-                        scanElapsed := time.Since(scanStart)
-                        var msScanEnd runtime.MemStats
-                        runtime.ReadMemStats(&msScanEnd)
-                        log.Info("startup scan metrics",
-                                "elapsed_sec", fmt.Sprintf("%.2f", scanElapsed.Seconds()),
-                                "key_images_loaded", kiCount,
-                                "heap_sys_mib_before", msScanStart.Sys/(1024*1024),
-                                "heap_sys_mib_after", msScanEnd.Sys/(1024*1024),
-                                "heap_alloc_mib", msScanEnd.HeapAlloc/(1024*1024),
-                                "heap_sys_delta_mib", (msScanEnd.Sys-msScanStart.Sys)/(1024*1024),
-                        )
-                }
-                {
-                        active, total := registry.Count()
-                        log.Info("startup scan complete",
-                                "tip_height", tipHeight,
-                                "blocks_with_stake_txs", blocksWithStake,
-                                "active_validators", active,
-                                "total_registered", total,
-                                "unspent_outputs", utxos.Count(),
-                        )
-                }
-
-                // ── Save snapshot for fast startup on the next restart ─────────
-                // TakeSnapshot deep-copies the maps; the goroutine writes the
-                // file without blocking consensus engine startup.
-                {
-                        snapToSave := startupSnapshot{
-                                Version:    snapVersion,
-                                TipHeight:  tipHeight,
-                                TipHashHex: fmt.Sprintf("%x", tipHash[:]),
-                                TxTotal:    initialTxTotal,
-                                UTXOs:      utxos.TakeSnapshot(),
-                                Registry:   registry.TakeSnapshot(),
-                        }
-                        go func() {
-                                if saveErr := saveStartupSnapshot(cfg.DataDir, snapToSave); saveErr != nil {
-                                        log.Warn("failed to save startup snapshot", "err", saveErr)
-                                } else {
-                                        log.Info("startup snapshot saved", "tip_height", tipHeight)
-                                        deleteOldSnapshots(cfg.DataDir, tipHeight)
-                                }
-                        }()
-                }
+                initialTxTotal = scanResult.TxTotal
+                _ = kiCount // already logged above; kept for the key-image index path
                 } // end !snapLoaded
         }
 

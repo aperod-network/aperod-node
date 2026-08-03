@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,6 +77,9 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 	chain := makeGenesis(t, priv, pub)
 
 	// acceptedHeights collects every height at which OnBlockAccepted fires.
+	// Protected by mu because OnBlockAccepted fires on the engine goroutine
+	// while the test reads acceptedHeights on its own goroutine.
+	var mu sync.Mutex
 	var acceptedHeights []uint64
 
 	// snapshotHeights collects heights at which we actually write a snapshot,
@@ -89,7 +93,9 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 		MyKey:        nil, // not a producing validator in this test
 		OnBlockAccepted: func(block *core.Block) {
 			h := block.Header.Height
+			mu.Lock()
 			acceptedHeights = append(acceptedHeights, h)
+			mu.Unlock()
 
 			// Mirror the production periodic-snapshot logic.
 			if h == 0 || h%500 != 0 {
@@ -147,10 +153,15 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 	}
 
 	// All 3 incoming blocks must have triggered OnBlockAccepted.
-	if len(acceptedHeights) != 3 {
-		t.Errorf("OnBlockAccepted fired %d times, want 3; heights=%v", len(acceptedHeights), acceptedHeights)
+	mu.Lock()
+	gotHeights := make([]uint64, len(acceptedHeights))
+	copy(gotHeights, acceptedHeights)
+	mu.Unlock()
+
+	if len(gotHeights) != 3 {
+		t.Errorf("OnBlockAccepted fired %d times, want 3; heights=%v", len(gotHeights), gotHeights)
 	}
-	for i, h := range acceptedHeights {
+	for i, h := range gotHeights {
 		if h != uint64(i+1) {
 			t.Errorf("acceptedHeights[%d] = %d, want %d", i, h, i+1)
 		}

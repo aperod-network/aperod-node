@@ -1,0 +1,378 @@
+package main
+
+// Integration test: partial-snapshot resume after a crash mid-scan.
+//
+// Covers the four requirements from task #1048:
+//  1. A snapshot saved at block N (the "crash point") is found by
+//     findLatestSnapshot when the chain tip is > N.
+//  2. The startup path (runStartupScan) logs
+//     "partial snapshot loaded — resuming scan from checkpoint".
+//  3. runStartupScan returns ScanFrom == N+1, not 1.
+//  4. The final UTXOSet state matches a node that scanned all blocks from 1.
+//
+// All main-path assertions are driven through runStartupScan (the production
+// function), not through a hand-rolled re-implementation in test code.
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
+)
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+// buildChainResume creates a genesis + nBlocks chain in a fresh SQLite store.
+// Returns the open store, all blocks (genesis first), and the validator keys.
+func buildChainResume(t *testing.T, dir string, nBlocks int) (*store.DB, []*core.Block, crypto.ValidatorPrivKey, crypto.ValidatorPubKey) {
+	t.Helper()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	makeBlk := func(height uint64, prev crypto.Hash32) *core.Block {
+		hdr := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prev,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(nil),
+		}
+		if err := hdr.Sign(priv); err != nil {
+			t.Fatalf("Sign h=%d: %v", height, err)
+		}
+		return &core.Block{Header: hdr}
+	}
+
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var blocks []*core.Block
+	genesis := makeBlk(0, crypto.Hash32{})
+	blocks = append(blocks, genesis)
+
+	putBlk := func(b *core.Block) {
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("marshal h=%d: %v", b.Header.Height, err)
+		}
+		h := b.Hash()
+		if err := db.PutRawBlock(h, b.Header.Height, raw); err != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, err)
+		}
+	}
+	putBlk(genesis)
+
+	parent := genesis
+	for i := 1; i <= nBlocks; i++ {
+		blk := makeBlk(uint64(i), parent.Hash())
+		putBlk(blk)
+		blocks = append(blocks, blk)
+		parent = blk
+	}
+
+	tip := blocks[len(blocks)-1]
+	if err := db.PutTip(tip.Hash(), tip.Header.Height); err != nil {
+		t.Fatalf("PutTip: %v", err)
+	}
+
+	return db, blocks, priv, pub
+}
+
+// applyBlockRange applies blocks[lo:hi+1] (inclusive, zero-based) to utxos.
+func applyBlockRange(t *testing.T, utxos *core.UTXOSet, blocks []*core.Block, lo, hi int) {
+	t.Helper()
+	for i := lo; i <= hi; i++ {
+		if err := utxos.ApplyBlock(blocks[i]); err != nil {
+			t.Fatalf("ApplyBlock h=%d: %v", blocks[i].Header.Height, err)
+		}
+	}
+}
+
+// ─── Test 1: end-to-end mid-scan resume via runStartupScan ───────────────────
+
+// TestPartialSnapshotResume is the main integration test for task #1048.
+//
+// Scenario:
+//   - Chain has 10 blocks (heights 0–10).
+//   - The node crashed mid-scan at block 5: a partial checkpoint was written at
+//     height 5 but the scan never reached the tip (height 10).
+//   - On restart, runStartupScan (the production function) must:
+//       (a) find the height-5 checkpoint via findLatestSnapshot,
+//       (b) log "partial snapshot loaded — resuming scan from checkpoint",
+//       (c) return ScanFrom == 6 (not 1),
+//       (d) leave p.UTXOs with the same count as a full scan from block 1.
+func TestPartialSnapshotResume(t *testing.T) {
+	const totalBlocks = 10 // heights 1–10 plus genesis at 0
+	const checkpointAt = 5 // "crash" height: partial checkpoint saved here
+
+	dir := t.TempDir()
+	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height // 10
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	// ── Reference: apply all blocks to get the expected UTXO count.
+	refUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, refUTXOs, blocks, 0, len(blocks)-1)
+	refCount := refUTXOs.Count()
+
+	// ── Simulate the crash: scan up to block 5, save a checkpoint, then stop.
+	cpUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, cpUTXOs, blocks, 0, checkpointAt)
+	cpRegistry := core.NewValidatorRegistry()
+	cpRegistry.SetUTXOSet(cpUTXOs)
+	cpRegistry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	cpBlock := blocks[checkpointAt]
+	cpHashArr := cpBlock.Hash()
+	cpSnap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  uint64(checkpointAt),
+		TipHashHex: fmt.Sprintf("%x", cpHashArr[:]),
+		TxTotal:    int64(checkpointAt),
+		UTXOs:      cpUTXOs.TakeSnapshot(),
+		Registry:   cpRegistry.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, cpSnap); err != nil {
+		t.Fatalf("saveStartupSnapshot(checkpoint): %v", err)
+	}
+
+	// Sanity: the checkpoint file must exist before we test the resume path.
+	if _, err := os.Stat(snapshotPath(dir, uint64(checkpointAt))); os.IsNotExist(err) {
+		t.Fatalf("checkpoint snapshot file not created: %s",
+			snapshotPath(dir, uint64(checkpointAt)))
+	}
+
+	// ── Simulate restart: fresh UTXOSet + registry (nothing pre-loaded).
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	// ── Call the production function under test.
+	var wg sync.WaitGroup
+	result, err := runStartupScan(startupScanParams{
+		DataDir:     dir,
+		TipHeight:   tipHeight,
+		TipHashHex:  tipHashHex,
+		DB:          db,
+		UTXOs:       utxos,
+		Registry:    registry,
+		KiFromIndex: false, // fresh start — no index pre-loaded
+		InitTxTotal: 0,
+		Log:         log,
+		SnapshotWg:  &wg,
+	})
+	if err != nil {
+		t.Fatalf("runStartupScan: %v", err)
+	}
+	// Wait for all snapshot goroutines to finish before asserting on log output
+	// or allowing t.TempDir() cleanup.  Without this the goroutines race with
+	// directory removal and write to the log buffer after the test reads it.
+	wg.Wait()
+
+	// ── Assertion 1: production code logged the partial-snapshot message.
+	if !logContainsMsg(&logBuf, "partial snapshot loaded — resuming scan from checkpoint") {
+		t.Errorf("expected log \"partial snapshot loaded — resuming scan from checkpoint\" was not emitted\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Assertion 2: scan started from checkpoint+1, not from block 1.
+	wantScanFrom := uint64(checkpointAt + 1)
+	if result.ScanFrom != wantScanFrom {
+		t.Errorf("ScanFrom = %d, want %d (checkpoint height %d + 1)",
+			result.ScanFrom, wantScanFrom, checkpointAt)
+	}
+
+	// ── Assertion 3: final UTXO count equals the full-scan reference.
+	if got := utxos.Count(); got != refCount {
+		t.Errorf("UTXOSet.Count() after partial resume = %d, want %d (full-scan reference)",
+			got, refCount)
+	}
+}
+
+// ─── Test 2: no checkpoint → runStartupScan scans from block 1 ───────────────
+
+// TestNoPartialSnapshot_ScanFromOne verifies that when no intermediate
+// checkpoint exists, runStartupScan scans from height 1, logs
+// "running startup block scan", and does NOT log the partial-snapshot message.
+func TestNoPartialSnapshot_ScanFromOne(t *testing.T) {
+	const totalBlocks = 5
+
+	dir := t.TempDir() // empty — no checkpoint files at all
+	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	var wg sync.WaitGroup
+	result, err := runStartupScan(startupScanParams{
+		DataDir:     dir,
+		TipHeight:   tipHeight,
+		TipHashHex:  tipHashHex,
+		DB:          db,
+		UTXOs:       utxos,
+		Registry:    registry,
+		KiFromIndex: false,
+		InitTxTotal: 0,
+		Log:         log,
+		SnapshotWg:  &wg,
+	})
+	if err != nil {
+		t.Fatalf("runStartupScan: %v", err)
+	}
+	wg.Wait() // ensure all snapshot goroutines finish before asserting
+
+	if logContainsMsg(&logBuf, "partial snapshot loaded — resuming scan from checkpoint") {
+		t.Error("partial-snapshot log must NOT appear when no checkpoint exists")
+	}
+	if !logContainsMsg(&logBuf, "running startup block scan") {
+		t.Error("block-scan log must appear when no partial snapshot exists")
+	}
+	if result.ScanFrom != 1 {
+		t.Errorf("ScanFrom = %d, want 1 when no checkpoint exists", result.ScanFrom)
+	}
+}
+
+// ─── Test 3: findLatestSnapshot honours limitHeight ──────────────────────────
+
+// TestFindLatestSnapshot_LimitHeight verifies that findLatestSnapshot returns
+// the highest checkpoint strictly below limitHeight and never at or above it.
+func TestFindLatestSnapshot_LimitHeight(t *testing.T) {
+	dir := t.TempDir()
+
+	save := func(h uint64) {
+		snap := startupSnapshot{
+			Version:    snapVersion,
+			TipHeight:  h,
+			TipHashHex: fmt.Sprintf("%016x", h),
+			TxTotal:    int64(h),
+			UTXOs:      core.UTXOSnapshot{},
+			Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+		}
+		if err := saveStartupSnapshot(dir, snap); err != nil {
+			t.Fatalf("saveStartupSnapshot(%d): %v", h, err)
+		}
+	}
+
+	save(100)
+	save(200)
+	save(300)
+
+	tests := []struct {
+		limit   uint64
+		wantH   uint64
+		wantNil bool
+	}{
+		{limit: 400, wantH: 300},
+		{limit: 301, wantH: 300},
+		{limit: 300, wantH: 200}, // 300 not strictly below 300
+		{limit: 200, wantH: 100},
+		{limit: 100, wantNil: true},
+		{limit: 1, wantNil: true},
+	}
+
+	for _, tc := range tests {
+		got := findLatestSnapshot(dir, tc.limit)
+		if tc.wantNil {
+			if got != nil {
+				t.Errorf("findLatestSnapshot(%d) = height %d, want nil",
+					tc.limit, got.TipHeight)
+			}
+		} else {
+			if got == nil {
+				t.Errorf("findLatestSnapshot(%d) = nil, want height %d",
+					tc.limit, tc.wantH)
+			} else if got.TipHeight != tc.wantH {
+				t.Errorf("findLatestSnapshot(%d).TipHeight = %d, want %d",
+					tc.limit, got.TipHeight, tc.wantH)
+			}
+		}
+	}
+}
+
+// ─── Test 4: corrupt partial snapshot is skipped ─────────────────────────────
+
+// TestFindLatestSnapshot_CorruptFile verifies that findLatestSnapshot skips a
+// snapshot file whose JSON is truncated/corrupt and returns nil rather than
+// returning a broken struct.
+func TestFindLatestSnapshot_CorruptFile(t *testing.T) {
+	dir := t.TempDir()
+
+	corruptPath := snapshotPath(dir, 50)
+	if err := os.WriteFile(corruptPath, []byte(`{"v":1,"tip_height":50,"tip_hash":"abc`), 0644); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+
+	got := findLatestSnapshot(dir, 100)
+	if got != nil {
+		t.Errorf("findLatestSnapshot returned height=%d for a corrupt file, want nil",
+			got.TipHeight)
+	}
+}
+
+// ─── Test 5: multiple checkpoints — highest eligible is chosen ───────────────
+
+// TestFindLatestSnapshot_MultipleCheckpoints saves several checkpoints and
+// confirms findLatestSnapshot always picks the highest one strictly below
+// limitHeight, which also sets the correct scanFrom.
+func TestFindLatestSnapshot_MultipleCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+
+	heights := []uint64{50_000, 100_000, 150_000}
+	for _, h := range heights {
+		snap := startupSnapshot{
+			Version:    snapVersion,
+			TipHeight:  h,
+			TipHashHex: fmt.Sprintf("%016x", h),
+			TxTotal:    int64(h),
+			UTXOs:      core.UTXOSnapshot{},
+			Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+		}
+		if err := saveStartupSnapshot(dir, snap); err != nil {
+			t.Fatalf("saveStartupSnapshot(%d): %v", h, err)
+		}
+	}
+
+	// Chain crashed mid-scan at height 180 000.
+	got := findLatestSnapshot(dir, 180_000)
+	if got == nil {
+		t.Fatal("findLatestSnapshot(180000) = nil, want height 150000")
+	}
+	if got.TipHeight != 150_000 {
+		t.Errorf("findLatestSnapshot(180000).TipHeight = %d, want 150000", got.TipHeight)
+	}
+
+	// scanFrom would be 150 001.
+	if scanFrom := got.TipHeight + 1; scanFrom != 150_001 {
+		t.Errorf("scanFrom = %d, want 150001", scanFrom)
+	}
+}
