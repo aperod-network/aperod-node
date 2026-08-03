@@ -1,0 +1,24 @@
+network: testnet
+data_dir: ./data/testnet
+log_level: info
+
+p2p:
+  listen_addr: "/ip4/0.0.0.0/tcp/30303"
+  bootnodes: []
+  max_peers: 50
+  min_peers: 4
+
+consensus:
+  validator_key: "./data/testnet/validator.key"
+  reward_address: "aproegZMzXpwdq4q72SZ4Wih2Li9H8eXE5q71MUabckAfaXrnDCZvBuGp547ozRMNTFpUMnrW1DQzQb5kYUdRLnCHxWHYGTFnC"
+  block_reward_napro: 10000000
+  block_time: "3s"
+
+api:
+  enabled: true
+  listen_addr: "127.0.0.1:8545"
+  cors:
+    - "https://aperod.com"
+
+genesis:
+  file: "config/genesis-testnet.yaml"
