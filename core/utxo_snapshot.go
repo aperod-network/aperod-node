@@ -51,10 +51,8 @@ func (s *UTXOSet) TakeSnapshot() UTXOSnapshot {
 		cp := *u
 		decoys = append(decoys, &cp)
 	}
-	kis := make([]crypto.KeyImage, 0, len(s.keyImages))
-	for ki := range s.keyImages {
-		kis = append(kis, ki)
-	}
+	// toSlice returns a sorted copy — no additional sort needed on restore.
+	kis := s.keyImages.toSlice()
 
 	// Serialise the rollback journal as a flat slice (JSON map keys must be
 	// strings; using a slice with an explicit Height field avoids that limit).
@@ -105,10 +103,10 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 		s.spentPubKeys[u.OneTimePub] = u
 	}
 
-	s.keyImages = make(map[crypto.KeyImage]struct{}, len(snap.KeyImages))
-	for _, ki := range snap.KeyImages {
-		s.keyImages[ki] = struct{}{}
-	}
+	// restoreFromSlice copies the slice and sorts it once (O(n log n)) rather
+	// than building a map entry-by-entry; this is also the primary RAM saving:
+	// the sorted-slice approach needs 32 B/entry vs ~150 B/entry for a Go map.
+	s.keyImages.restoreFromSlice(snap.KeyImages)
 
 	// Rebuild the rollback journal from the snapshot.  Old snapshots that
 	// predate this field will have an empty slice here, which is safe: any
