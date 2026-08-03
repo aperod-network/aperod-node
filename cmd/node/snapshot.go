@@ -119,6 +119,43 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	return nil
 }
 
+// loadPrevBackupSnapshot reads and validates the "-prev.json" backup file for
+// a given primary snapshot path.  It applies the same checks as
+// loadStartupSnapshot — schema version, tip height, and tip hash — so a future
+// recovery fallback cannot silently bypass any of them.
+//
+// Returns os.ErrNotExist when the prev file does not exist.
+// Returns a descriptive error (not os.ErrNotExist) when the file exists but
+// fails a validation check, so callers can distinguish "no backup available"
+// from "backup is corrupt or mismatched".
+func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*startupSnapshot, error) {
+	primaryPath := snapshotPath(dataDir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+
+	f, err := os.Open(prevPath)
+	if err != nil {
+		return nil, err // os.IsNotExist check by caller
+	}
+	defer f.Close()
+
+	var snap startupSnapshot
+	if err := json.NewDecoder(f).Decode(&snap); err != nil {
+		return nil, fmt.Errorf("decode prev snapshot: %w", err)
+	}
+	if snap.Version != snapVersion {
+		return nil, fmt.Errorf("prev snapshot version mismatch: got %d want %d",
+			snap.Version, snapVersion)
+	}
+	if snap.TipHeight != tipHeight {
+		return nil, fmt.Errorf("prev snapshot height mismatch: got %d want %d",
+			snap.TipHeight, tipHeight)
+	}
+	if snap.TipHashHex != tipHashHex {
+		return nil, fmt.Errorf("prev snapshot hash mismatch at height %d", tipHeight)
+	}
+	return &snap, nil
+}
+
 // loadStartupSnapshot reads and validates a snapshot for the given tip.
 // Returns os.ErrNotExist when no snapshot file exists for the height.
 func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*startupSnapshot, error) {

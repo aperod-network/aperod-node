@@ -660,3 +660,106 @@ func TestExactTipFastPathHashMismatchDiscard(t *testing.T) {
 		t.Logf("captured log:\n%s", logBuf.String())
 	}
 }
+
+// ─── Test 7: prev-backup snapshot hash check ──────────────────────────────────
+
+// TestPrevBackupHashMismatchRejected confirms that loadPrevBackupSnapshot — the
+// production recovery helper in snapshot.go — rejects the prev-backup file when
+// the caller-supplied tip hash (sourced from the DB tip record) does not match
+// the hash stored inside the file.
+//
+// Scenario:
+//   - A valid snapshot is saved at height H (primary).
+//   - A second save at height H+1 promotes the H primary to H-prev.json via
+//     the existing backup logic in saveStartupSnapshot.
+//   - loadPrevBackupSnapshot is called with the correct height but a corrupted
+//     expected hash: it must return a non-nil error (not os.ErrNotExist).
+//   - loadPrevBackupSnapshot is called again with the correct hash: it must
+//     succeed and return the decoded snapshot.
+//
+// This test exercises the production loadPrevBackupSnapshot code path end-to-end
+// so that any future change that removes or weakens the hash check will be
+// caught immediately.
+func TestPrevBackupHashMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// ── Step 1: build two tip blocks so we have two distinct hashes.
+	_, blocks := buildChainInStore(t, dir, 1) // genesis (h=0) + 1 block (h=1)
+
+	blk0 := blocks[0]
+	blk1 := blocks[1]
+	hash0 := blk0.Hash()
+	hash1 := blk1.Hash()
+	hexH0 := fmt.Sprintf("%x", hash0[:])
+	hexH1 := fmt.Sprintf("%x", hash1[:])
+
+	// ── Step 2: first save at height 0 → creates primary snapshot-v1-0.json.
+	snap0 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  0,
+		TipHashHex: hexH0,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap0); err != nil {
+		t.Fatalf("first saveStartupSnapshot: %v", err)
+	}
+	primaryH0 := snapshotPath(dir, 0)
+	if _, err := os.Stat(primaryH0); os.IsNotExist(err) {
+		t.Fatalf("primary snapshot-v1-0.json not created")
+	}
+
+	// ── Step 3: second save at height 1 → saveStartupSnapshot backs up the
+	// height-0 primary to snapshot-v1-0-prev.json before writing the new one.
+	snap1 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  1,
+		TipHashHex: hexH1,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap1); err != nil {
+		t.Fatalf("second saveStartupSnapshot: %v", err)
+	}
+	prevPath := snapshotPrevPath(primaryH0) // snapshot-v1-0-prev.json
+	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
+		t.Fatalf("prev backup %s was not created by the second save", prevPath)
+	}
+
+	// ── Step 4: corrupt expected hash → loadPrevBackupSnapshot must reject.
+	var corruptArr crypto.Hash32
+	for i := range corruptArr {
+		corruptArr[i] = 0xde
+	}
+	corruptHex := fmt.Sprintf("%x", corruptArr[:])
+	if corruptHex == hexH0 {
+		t.Fatal("test setup error: corrupt hash equals correct hash")
+	}
+
+	_, mismatchErr := loadPrevBackupSnapshot(dir, 0, corruptHex)
+	if mismatchErr == nil {
+		t.Error("loadPrevBackupSnapshot: expected hash mismatch error; got nil")
+	}
+	if os.IsNotExist(mismatchErr) {
+		// Must be a validation error, not a missing-file error, so callers can
+		// distinguish "no backup available" from "backup is mismatched".
+		t.Errorf("loadPrevBackupSnapshot: got os.ErrNotExist but wanted a validation error; err=%v", mismatchErr)
+	}
+
+	// ── Step 5: correct expected hash → loadPrevBackupSnapshot must succeed.
+	loaded, goodErr := loadPrevBackupSnapshot(dir, 0, hexH0)
+	if goodErr != nil {
+		t.Errorf("loadPrevBackupSnapshot with correct hash: unexpected error: %v", goodErr)
+	}
+	if loaded == nil {
+		t.Fatal("loadPrevBackupSnapshot with correct hash: returned nil snapshot")
+	}
+	if loaded.TipHeight != 0 {
+		t.Errorf("loaded.TipHeight: got %d want 0", loaded.TipHeight)
+	}
+	if loaded.TipHashHex != hexH0 {
+		t.Errorf("loaded.TipHashHex mismatch")
+	}
+}
