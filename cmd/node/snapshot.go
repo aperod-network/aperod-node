@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -77,8 +78,8 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	//     the in-place overwrite.
 	// If the copy fails the original primary remains on disk and the save
 	// proceeds normally (no worse than the pre-backup behaviour).
-	// NOTE: prev files are not consulted by the current load path; automatic
-	// fallback to a prev backup on a corrupt primary is intentionally deferred.
+	// The prev file is consulted by loadStartupSnapshotWithFallback when the
+	// primary is corrupt or unreadable, enabling automatic recovery at startup.
 	if entries, err := os.ReadDir(dataDir); err == nil {
 		prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
 		for _, e := range entries {
@@ -112,6 +113,18 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 		os.Remove(tmp)
 		return fmt.Errorf("close snapshot tmp: %w", err)
 	}
+
+	// Write a same-height "-prev.json" backup from the validated tmp content
+	// before promoting tmp to the primary.  This is a required precondition: if
+	// the copy fails we abort the save (remove tmp and return the error) so the
+	// caller's old primary — if any — is left intact and the node can still
+	// recover on its next start.  Silently skipping this step would leave the
+	// fallback absent on the very failure modes where recovery matters most.
+	if err := copyFile(tmp, snapshotPrevPath(path)); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write same-height prev backup: %w", err)
+	}
+
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("rename snapshot: %w", err)
@@ -182,6 +195,45 @@ func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*
 		return nil, fmt.Errorf("snapshot hash mismatch at height %d", tipHeight)
 	}
 	return &snap, nil
+}
+
+// loadStartupSnapshotWithFallback is the production entry point for the startup
+// fast path.  It first tries the primary snapshot; if that fails with a
+// non-NotExist error (corrupt JSON, truncation, version mismatch, …) it
+// automatically falls back to the "-prev.json" backup, applying the same
+// version + hash validation.  A distinct log line is emitted when the fallback
+// is used so operators can see the recovery event in node logs.
+//
+// Returns os.ErrNotExist when no primary file is present (caller treats this as
+// "no fast path available").
+// Returns a wrapped descriptive error when the primary exists but is unreadable
+// and the prev-backup is also unavailable or corrupt.
+func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHex string, log *slog.Logger) (*startupSnapshot, error) {
+	snap, err := loadStartupSnapshot(dataDir, tipHeight, tipHashHex)
+	if err == nil {
+		return snap, nil
+	}
+	if os.IsNotExist(err) {
+		// No primary snapshot present at all — caller handles this gracefully.
+		return nil, err
+	}
+
+	// Primary exists but is unreadable — attempt recovery from prev-backup.
+	log.Warn("snapshot primary corrupt or unreadable, trying prev-backup", "err", err)
+
+	prevSnap, prevErr := loadPrevBackupSnapshot(dataDir, tipHeight, tipHashHex)
+	if prevErr != nil {
+		if os.IsNotExist(prevErr) {
+			// No prev backup available; surface the original primary error.
+			return nil, fmt.Errorf("primary corrupt (%w) and no prev-backup available", err)
+		}
+		// Prev backup exists but also failed validation.
+		return nil, fmt.Errorf("primary corrupt (%v); prev-backup also failed: %w", err, prevErr)
+	}
+
+	log.Warn("startup fast path — loaded prev-backup snapshot; primary was unreadable",
+		"tip_height", tipHeight)
+	return prevSnap, nil
 }
 
 // findLatestSnapshot returns the highest-height valid snapshot in dataDir that

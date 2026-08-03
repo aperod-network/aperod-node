@@ -10,9 +10,10 @@ package main
 //      alongside the current primary.
 //   4. findLatestSnapshot is unaffected by prev files (they are skipped).
 //
-// NOTE: prev files are not consulted by the current load path.  Automatic
-// fallback to a prev backup on a corrupt primary is intentionally deferred
-// (see task #1055).
+// NOTE: loadStartupSnapshotWithFallback consults the prev file when the primary
+// fails with a non-NotExist error.  saveStartupSnapshot now also writes a
+// same-height "-prev.json" from the validated tmp content so the fallback is
+// always available at the exact current tip (see snapshot_restart_test.go).
 
 import (
 	"encoding/json"
@@ -60,20 +61,31 @@ func writeSnapFile(t *testing.T, path string, snap startupSnapshot) {
 func TestBackup_DifferentHeight(t *testing.T) {
 	dir := t.TempDir()
 
-	// First save: height 100.  No prior primary → no backup yet.
+	// First save: height 100.  No prior primary → no prior-height backup, but
+	// saveStartupSnapshot now writes a same-height "-prev.json" from the
+	// validated tmp content so there is always a recovery floor at the current tip.
 	if err := saveStartupSnapshot(dir, makeSnap(100)); err != nil {
 		t.Fatalf("saveStartupSnapshot(100): %v", err)
 	}
-	if _, err := os.Stat(prevPath(dir, 100)); err == nil {
-		t.Error("no backup expected after the first ever save")
+	if _, err := os.Stat(prevPath(dir, 100)); os.IsNotExist(err) {
+		t.Error("expected same-height backup snapshot-v1-100-prev.json after first save")
+	}
+	// The primary must also exist.
+	if _, err := os.Stat(snapshotPath(dir, 100)); os.IsNotExist(err) {
+		t.Errorf("primary at height 100 missing after first save")
 	}
 
-	// Second save: height 200.  The height-100 primary should be backed up.
+	// Second save: height 200.  The height-100 primary is copied to
+	// snapshot-v1-100-prev.json (prior-height backup), and a new
+	// snapshot-v1-200-prev.json is written as the same-height backup.
 	if err := saveStartupSnapshot(dir, makeSnap(200)); err != nil {
 		t.Fatalf("saveStartupSnapshot(200): %v", err)
 	}
 	if _, err := os.Stat(prevPath(dir, 100)); os.IsNotExist(err) {
-		t.Errorf("expected backup %s after saving height 200", prevPath(dir, 100))
+		t.Errorf("expected prior-height backup %s after saving height 200", prevPath(dir, 100))
+	}
+	if _, err := os.Stat(prevPath(dir, 200)); os.IsNotExist(err) {
+		t.Errorf("expected same-height backup %s after saving height 200", prevPath(dir, 200))
 	}
 	// The height-100 primary must still exist (copy, not rename).
 	if _, err := os.Stat(snapshotPath(dir, 100)); os.IsNotExist(err) {
@@ -151,7 +163,56 @@ func TestDeleteOldSnapshots_KeepsMostRecentPrev(t *testing.T) {
 	}
 }
 
-// ─── Test 4: findLatestSnapshot ignores prev files ───────────────────────────
+// ─── Test 4: prev-copy failure aborts primary rename ─────────────────────────
+
+// TestSaveSnapshot_PrevCopyFailureAbortsRename confirms that when the required
+// same-height prev-backup copy fails, saveStartupSnapshot returns a non-nil
+// error AND the prior primary is left intact (the failed save never promotes
+// the tmp file to primary).
+//
+// Failure is injected by pre-creating the target prev-backup path as a
+// directory: copyFile's internal rename over a directory is rejected by the OS
+// (EISDIR on Linux), simulating an I/O failure on the backup write.
+func TestSaveSnapshot_PrevCopyFailureAbortsRename(t *testing.T) {
+	dir := t.TempDir()
+
+	// ── Step 1: establish a valid primary at height 10.
+	if err := saveStartupSnapshot(dir, makeSnap(10)); err != nil {
+		t.Fatalf("initial save h=10: %v", err)
+	}
+	primaryH10 := snapshotPath(dir, 10)
+	if _, err := os.Stat(primaryH10); err != nil {
+		t.Fatalf("primary h=10 not found after initial save: %v", err)
+	}
+
+	// ── Step 2: block the same-height prev-backup target for height 20 by
+	// placing a directory at that path.  copyFile cannot rename a regular file
+	// over a directory (EISDIR), so the copy will fail.
+	primaryH20 := snapshotPath(dir, 20)
+	prevH20 := snapshotPrevPath(primaryH20)
+	if err := os.MkdirAll(prevH20, 0755); err != nil {
+		t.Fatalf("mkdir prev path: %v", err)
+	}
+
+	// ── Step 3: attempt to save at height 20 — must fail.
+	saveErr := saveStartupSnapshot(dir, makeSnap(20))
+	if saveErr == nil {
+		t.Fatal("expected error when same-height prev backup cannot be written; got nil")
+	}
+
+	// ── Step 4: the prior primary at height 10 must still be intact.
+	if _, statErr := os.Stat(primaryH10); os.IsNotExist(statErr) {
+		t.Error("prior primary at height 10 was lost after a failed save at height 20")
+	}
+
+	// ── Step 5: the new primary at height 20 must NOT exist — the tmp rename
+	// was aborted so a later restart does not load a partially-written file.
+	if _, statErr := os.Stat(primaryH20); statErr == nil {
+		t.Error("new primary at height 20 was created despite the failed prev-backup write")
+	}
+}
+
+// ─── Test 5: findLatestSnapshot ignores prev files ───────────────────────────
 
 // TestFindLatestSnapshot_IgnoresPrevFiles verifies that prev backup files do
 // not influence findLatestSnapshot — only primary files are considered.

@@ -875,7 +875,116 @@ func TestPrevBackupTruncatedDecodeError(t *testing.T) {
 	assertRejected("invalid JSON")
 }
 
-// ─── Test 9: truncated snapshot falls back to block scan ──────────────────────
+// ─── Test 9: corrupt primary falls back to prev-backup ────────────────────────
+
+// TestCorruptPrimaryFallsBackToPrev confirms that when the primary snapshot is
+// truncated (simulating a mid-write crash) and a valid same-height prev-backup
+// was written by saveStartupSnapshot, loadStartupSnapshotWithFallback recovers
+// via the prev file and emits the distinct fallback log lines.
+//
+// This exercises the typical different-height scenario: a first save at height
+// H-1 establishes an older checkpoint, then a second save at height H creates
+// the current primary and its same-height prev-backup.  Corrupting the H
+// primary must recover from the H prev-backup — not fall back to a full scan.
+func TestCorruptPrimaryFallsBackToPrev(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 3) // genesis + 3 blocks → height 0..3
+
+	// blk2 is the "previous tip" (H-1 = 2); blk3 is the "current tip" (H = 3).
+	blk2 := blocks[2]
+	blk3 := blocks[3]
+	hash2 := blk2.Hash()
+	hash3 := blk3.Hash()
+	hexH2 := fmt.Sprintf("%x", hash2[:])
+	hexH3 := fmt.Sprintf("%x", hash3[:])
+
+	// ── First save at height 2 — creates snapshot-v1-2.json (primary).
+	snap2 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  2,
+		TipHashHex: hexH2,
+		TxTotal:    2,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap2); err != nil {
+		t.Fatalf("first saveStartupSnapshot (h=2): %v", err)
+	}
+
+	// ── Second save at height 3 — saveStartupSnapshot:
+	//    • promotes snapshot-v1-2.json → snapshot-v1-2-prev.json   (prior backup)
+	//    • writes snapshot-v1-3.json.tmp, copies it to snapshot-v1-3-prev.json
+	//    • renames tmp → snapshot-v1-3.json (primary)
+	//
+	// After this call the directory contains:
+	//   snapshot-v1-2-prev.json  (prior height backup)
+	//   snapshot-v1-3-prev.json  (same-height backup — the recovery floor)
+	//   snapshot-v1-3.json       (current primary)
+	snap3 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  3,
+		TipHashHex: hexH3,
+		TxTotal:    7,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap3); err != nil {
+		t.Fatalf("second saveStartupSnapshot (h=3): %v", err)
+	}
+
+	// Confirm the same-height prev-backup exists.
+	primaryPath := snapshotPath(dir, 3)
+	prevPath3 := snapshotPrevPath(primaryPath)
+	if _, err := os.Stat(prevPath3); os.IsNotExist(err) {
+		t.Fatalf("same-height prev backup %s was not created by saveStartupSnapshot", prevPath3)
+	}
+
+	// ── Corrupt the primary by truncating it to half its size (simulates a
+	// power-loss or process kill during a disk flush).
+	info, err := os.Stat(primaryPath)
+	if err != nil {
+		t.Fatalf("stat primary: %v", err)
+	}
+	if err := os.Truncate(primaryPath, info.Size()/2); err != nil {
+		t.Fatalf("truncate primary: %v", err)
+	}
+
+	// ── loadStartupSnapshotWithFallback must succeed via the H-prev backup.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	loaded, loadErr := loadStartupSnapshotWithFallback(dir, 3, hexH3, log)
+	if loadErr != nil {
+		t.Fatalf("loadStartupSnapshotWithFallback: expected success via prev-backup, got: %v", loadErr)
+	}
+	if loaded == nil {
+		t.Fatal("loadStartupSnapshotWithFallback: returned nil snapshot")
+	}
+
+	// Content must match the originally saved snapshot at height 3.
+	if loaded.TipHeight != 3 {
+		t.Errorf("loaded.TipHeight = %d, want 3", loaded.TipHeight)
+	}
+	if loaded.TipHashHex != hexH3 {
+		t.Errorf("loaded.TipHashHex mismatch: got %s want %s", loaded.TipHashHex, hexH3)
+	}
+	if loaded.TxTotal != 7 {
+		t.Errorf("loaded.TxTotal = %d, want 7", loaded.TxTotal)
+	}
+
+	// Both the corrupt-primary warning and the distinct fallback success line
+	// must be present so operators can see the recovery event in node logs.
+	const corruptMsg = "snapshot primary corrupt or unreadable, trying prev-backup"
+	if !logContainsMsg(&logBuf, corruptMsg) {
+		t.Errorf("expected corrupt-primary warning %q was not emitted\nlog:\n%s", corruptMsg, logBuf.String())
+	}
+	const fallbackMsg = "startup fast path — loaded prev-backup snapshot; primary was unreadable"
+	if !logContainsMsg(&logBuf, fallbackMsg) {
+		t.Errorf("expected fallback log %q was not emitted\nlog:\n%s", fallbackMsg, logBuf.String())
+	}
+}
+
+// ─── Test 10: truncated snapshot falls back to block scan ─────────────────────
 
 // TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
 // a non-nil error and that snapLoaded remains false when the snapshot file is

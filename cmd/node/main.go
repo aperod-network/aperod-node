@@ -358,7 +358,7 @@ func run() error {
                 snapLoaded := false
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
-                        if snap, serr := loadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex); serr == nil {
+                        if snap, serr := loadStartupSnapshotWithFallback(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
                                 // ── UTXO count divergence check ──────────────────────────────────
                                 // Before restoring, compare the snapshot's active (unspent) UTXO
                                 // count against the durable active count written to DB metadata the
