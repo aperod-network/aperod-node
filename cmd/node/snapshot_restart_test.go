@@ -574,3 +574,89 @@ func TestRealSnapshotPipeline(t *testing.T) {
 		t.Error("fast-path log message missing")
 	}
 }
+
+// ─── Test 6: exact-tip fast path discards snapshot on DB tip hash mismatch ───
+
+// TestExactTipFastPathHashMismatchDiscard confirms that the exact-tip snapshot
+// fast path in main.go falls back to the block scan when the DB tip record
+// contains a hash that does not match the hash stored inside the snapshot file.
+//
+// Scenario:
+//   - A valid snapshot is saved at height H with the true block hash (correctHex).
+//   - The DB tip record is then "corrupted": it claims the same height H but a
+//     different hash (corruptHex).
+//   - The startup fast path passes corruptHex to loadStartupSnapshot; the
+//     function returns a "snapshot hash mismatch" error (not os.ErrNotExist).
+//   - snapLoaded must remain false and the warning
+//     "snapshot load error, falling back to block scan" must be logged.
+//
+// This guards the invariant described in task 1056: a corrupt tip record cannot
+// bypass the hash cross-check and cause stale UTXO/registry state to be loaded.
+func TestExactTipFastPathHashMismatchDiscard(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 4) // genesis + 4 blocks → tip height 4
+
+	tip := blocks[len(blocks)-1]
+	correctHash := tip.Hash()
+	tipHeight := tip.Header.Height           // 4
+	correctHex := fmt.Sprintf("%x", correctHash[:])
+
+	// Save a valid snapshot using the correct block hash.
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: correctHex,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry: core.RegistrySnapshot{
+			Validators: map[string]*core.ValidatorEntry{},
+		},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// Construct a hash that is different from the correct one (simulate a
+	// corrupt or mismatched DB tip record).
+	var corruptArr crypto.Hash32
+	for i := range corruptArr {
+		corruptArr[i] = 0xff // all 0xff — guaranteed to differ from a real block hash
+	}
+	corruptHex := fmt.Sprintf("%x", corruptArr[:])
+	if corruptHex == correctHex {
+		t.Fatal("test setup error: corrupt hash equals correct hash")
+	}
+
+	// ── Simulate the exact-tip fast path from main.go (lines ~358-384) using
+	// the DB-supplied (corrupted) hash instead of the real block hash.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	if _, serr := loadStartupSnapshot(dir, tipHeight, corruptHex); serr == nil {
+		snapLoaded = true
+		log.Info("startup fast path complete — snapshot loaded", "tip_height", tipHeight)
+	} else if !os.IsNotExist(serr) {
+		// Hash mismatch is a non-NotExist error → log warning and fall back.
+		log.Warn("snapshot load error, falling back to block scan", "err", serr)
+	}
+
+	// ── Assertions.
+
+	// snapLoaded must remain false: the mismatch must have prevented the fast path.
+	if snapLoaded {
+		t.Error("snapLoaded should be false when DB tip hash does not match snapshot hash")
+	}
+
+	// The warning must be logged so operators can diagnose the mismatch.
+	if !logContainsMsg(&logBuf, "snapshot load error, falling back to block scan") {
+		t.Error("expected warning \"snapshot load error, falling back to block scan\" was not logged")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+
+	// The fast-path success message must NOT appear.
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path success log must NOT appear when hash mismatch discards the snapshot")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
