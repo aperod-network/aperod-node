@@ -10,6 +10,7 @@ import (
         "path/filepath"
         "regexp"
         "runtime"
+        "runtime/debug"
         "syscall"
         "time"
 
@@ -357,6 +358,7 @@ func run() error {
                                 // deserialised snapshot and the in-memory maps coexist until the
                                 // next automatic collection, doubling peak RSS on load.
                                 runtime.GC()
+                                debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
                         } else if !os.IsNotExist(serr) {
                                 log.Warn("snapshot load error, falling back to block scan", "err", serr)
                         }
@@ -575,6 +577,7 @@ func run() error {
         // startup, so without this call the decoded block tree stays live and
         // inflates RSS until the first scheduled collection.
         runtime.GC()
+        debug.FreeOSMemory() // aggressively return freed pages to OS so GOMEMLIMIT has headroom for normal operation
 
         // initialTxTotal is populated by the scan above (genesis path stays 0).
 
