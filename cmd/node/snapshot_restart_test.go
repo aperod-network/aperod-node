@@ -875,7 +875,135 @@ func TestPrevBackupTruncatedDecodeError(t *testing.T) {
 	assertRejected("invalid JSON")
 }
 
-// ─── Test 9: corrupt primary falls back to prev-backup ────────────────────────
+// ─── Test 9: both snapshots corrupt → falls back to block scan ───────────────
+
+// TestBothSnapshotsCorruptFallsBackToScan confirms that when BOTH the primary
+// snapshot (truncated) and the same-height prev-backup (invalid JSON) are
+// unreadable, loadStartupSnapshotWithFallback returns a non-nil error and the
+// caller's startup logic correctly falls back to a full block scan instead of
+// crashing.
+//
+// Scenario:
+//   - A valid snapshot is saved at height H (primary + same-height prev-backup
+//     both written atomically by saveStartupSnapshot).
+//   - The primary snapshot file is truncated to half its size (simulates a
+//     mid-write power-loss or process kill during a disk flush).
+//   - The prev-backup file is overwritten with the literal string "not json"
+//     (simulates independent corruption of the recovery floor).
+//   - loadStartupSnapshotWithFallback is called: it tries the primary (fails
+//     on decode), then tries the prev-backup (fails on decode), and returns a
+//     non-nil, non-ErrNotExist error.
+//   - The caller's startup logic mirrors main.go: snapLoaded stays false and
+//     the "snapshot load error, falling back to block scan" warning is logged.
+//   - The fast-path success message must NOT appear.
+//
+// This is the integration-level complement to TestPrevBackupTruncatedDecodeError
+// (which exercises loadPrevBackupSnapshot in isolation).  Together they close
+// the gap identified in task 1068: both failure modes must be handled without
+// panicking or crashing the node.
+func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 3) // genesis + 3 blocks → height 0..3
+
+	tip := blocks[len(blocks)-1]
+	tipHash := tip.Hash()
+	tipHeight := tip.Header.Height           // 3
+	tipHashHex := fmt.Sprintf("%x", tipHash[:])
+
+	// ── Save a valid snapshot at the current tip.
+	// saveStartupSnapshot writes both:
+	//   • snapshot-v1-3.json         (primary)
+	//   • snapshot-v1-3-prev.json    (same-height recovery floor)
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	primaryPath := snapshotPath(dir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+
+	// Confirm both files were created before we corrupt them.
+	if _, err := os.Stat(primaryPath); os.IsNotExist(err) {
+		t.Fatalf("primary snapshot not created: %s", primaryPath)
+	}
+	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
+		t.Fatalf("same-height prev-backup not created: %s", prevPath)
+	}
+
+	// ── Corrupt the primary snapshot: truncate to half its size.
+	info, err := os.Stat(primaryPath)
+	if err != nil {
+		t.Fatalf("stat primary: %v", err)
+	}
+	fullSize := info.Size()
+	if fullSize < 2 {
+		t.Fatalf("primary snapshot unexpectedly tiny (%d bytes) — test setup error", fullSize)
+	}
+	if err := os.Truncate(primaryPath, fullSize/2); err != nil {
+		t.Fatalf("os.Truncate primary: %v", err)
+	}
+
+	// ── Corrupt the prev-backup: overwrite with invalid JSON.
+	if err := os.WriteFile(prevPath, []byte("not json"), 0644); err != nil {
+		t.Fatalf("WriteFile prev-backup (invalid JSON): %v", err)
+	}
+
+	// ── Simulate the startup fast-path from main.go using the production helper.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	if loadErr == nil {
+		// Both files are corrupt — this branch must NOT be taken.
+		snapLoaded = true
+		log.Info("startup fast path complete — snapshot loaded",
+			"tip_height", tipHeight,
+			"active_utxos", len(loaded.UTXOs.ActiveUTXOs),
+		)
+	} else if !os.IsNotExist(loadErr) {
+		// Both files failed with non-ErrNotExist errors — this branch MUST be
+		// taken; the caller logs the warning and falls back to a block scan.
+		log.Warn("snapshot load error, falling back to block scan", "err", loadErr)
+	}
+
+	// ── Assertions.
+
+	// snapLoaded must remain false: neither corrupt file must be accepted.
+	if snapLoaded {
+		t.Error("snapLoaded should be false when both primary and prev-backup are corrupt")
+	}
+
+	// loadErr must be non-nil and not os.ErrNotExist (both files exist but are
+	// unreadable — this is distinct from "no snapshot available").
+	if loadErr == nil {
+		t.Error("loadStartupSnapshotWithFallback: expected non-nil error when both snapshots are corrupt; got nil")
+	}
+	if os.IsNotExist(loadErr) {
+		t.Errorf("loadStartupSnapshotWithFallback: got os.ErrNotExist but both files exist and are corrupt; err=%v", loadErr)
+	}
+
+	// The fallback warning must be logged so operators can diagnose the failure.
+	if !logContainsMsg(&logBuf, "snapshot load error, falling back to block scan") {
+		t.Error("expected warning \"snapshot load error, falling back to block scan\" was not logged")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+
+	// The fast-path success message must NOT appear.
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path success log must NOT appear when both snapshots are corrupt")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
+
+// ─── Test 10: corrupt primary falls back to prev-backup ────────────────────────
 
 // TestCorruptPrimaryFallsBackToPrev confirms that when the primary snapshot is
 // truncated (simulating a mid-write crash) and a valid same-height prev-backup
