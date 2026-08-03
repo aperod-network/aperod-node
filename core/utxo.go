@@ -45,27 +45,46 @@ type UTXOKey struct {
 // dropped (the pool already has enough decoys; dropping older ones has no
 // security impact because spent outputs cannot be double-spent regardless).
 // This cap prevents unbounded memory growth on long-running chains.
-const maxSpentDecoys = 50_000
+//
+// Exposed as a var (not const) so that regression tests can temporarily lower
+// the cap without needing to pre-fill 50 000 entries.
+var maxSpentDecoys = 50_000
+
+// maxRollbackDepth is the number of recent block heights kept in the rollback
+// journal.  Any chain reorganisation deeper than this cannot be reversed in
+// memory.  On a PoA chain such deep reorgs are operationally impossible.
+const maxRollbackDepth = 256
+
+// rollbackEntry records one spent UTXO for the per-block rollback journal.
+// It is kept independent of the capped spentPubKeys decoy pool so that
+// RollbackBlock can always restore a UTXO even when the decoy pool was
+// already at capacity when ApplyBlock ran.
+type rollbackEntry struct {
+	ringMember crypto.Point32 // key that was deleted from byPubKey
+	utxo       *UTXO          // full data needed to restore both indexes
+}
 
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
-	mu           sync.RWMutex
-	utxos        map[UTXOKey]*UTXO
-	keyImages    map[crypto.KeyImage]struct{} // spent key images
-	byPubKey     map[crypto.Point32]*UTXO     // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
-	stakedUTXOs  map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
-	spentPubKeys map[crypto.Point32]*UTXO     // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
+	mu              sync.RWMutex
+	utxos           map[UTXOKey]*UTXO
+	keyImages       map[crypto.KeyImage]struct{} // spent key images
+	byPubKey        map[crypto.Point32]*UTXO     // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
+	stakedUTXOs     map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	spentPubKeys    map[crypto.Point32]*UTXO     // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
+	rollbackJournal map[uint64][]rollbackEntry   // height → UTXOs spent at that height (for RollbackBlock)
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
 func NewUTXOSet() *UTXOSet {
 	return &UTXOSet{
-		utxos:        make(map[UTXOKey]*UTXO),
-		keyImages:    make(map[crypto.KeyImage]struct{}),
-		byPubKey:     make(map[crypto.Point32]*UTXO),
-		stakedUTXOs:  make(map[UTXOKey]*UTXO),
-		spentPubKeys: make(map[crypto.Point32]*UTXO),
+		utxos:           make(map[UTXOKey]*UTXO),
+		keyImages:       make(map[crypto.KeyImage]struct{}),
+		byPubKey:        make(map[crypto.Point32]*UTXO),
+		stakedUTXOs:     make(map[UTXOKey]*UTXO),
+		spentPubKeys:    make(map[crypto.Point32]*UTXO),
+		rollbackJournal: make(map[uint64][]rollbackEntry),
 	}
 }
 
@@ -202,6 +221,26 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 						// grows proportionally to the total number of outputs ever created
 						// rather than only the currently-unspent set.
 						delete(s.utxos, UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex})
+						// Always record in the rollback journal, independent of the decoy
+						// pool cap.  RollbackBlock reads from here, not from spentPubKeys,
+						// so that a UTXO spent when the decoy pool is full can still be
+						// restored on a chain reorganisation.
+						s.rollbackJournal[block.Header.Height] = append(
+							s.rollbackJournal[block.Header.Height],
+							rollbackEntry{ringMember: member, utxo: utxo},
+						)
+						// Prune the journal once it exceeds maxRollbackDepth distinct
+						// heights, evicting the oldest entry to keep memory bounded.
+						if len(s.rollbackJournal) > maxRollbackDepth {
+							var oldest uint64 = ^uint64(0)
+							for h := range s.rollbackJournal {
+								if h < oldest {
+									oldest = h
+								}
+							}
+							delete(s.rollbackJournal, oldest)
+						}
+						// Conditionally add to the ring-decoy pool (capped).
 						if len(s.spentPubKeys) < maxSpentDecoys {
 							s.spentPubKeys[member] = utxo
 						}
@@ -238,12 +277,34 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 // images spent by its inputs, restoring the UTXO set to the state before the
 // block was applied.
 //
+// Spent UTXO data is sourced from the rollback journal (populated by ApplyBlock
+// independently of the capped spentPubKeys decoy pool) so that restoration
+// works correctly even when the decoy pool was full at apply time.  As a safety
+// net, any input whose journal entry is missing (e.g. journal pruned for a
+// deep reorg beyond maxRollbackDepth) is also looked up in spentPubKeys.
+//
 // Caution: this is an in-memory rollback only.  The persistent store (LevelDB)
 // is not touched here; durable reorg recovery requires the store's revert journal.
 func (s *UTXOSet) RollbackBlock(block *Block) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	height := block.Header.Height
+
+	// ── Step 1: restore spent inputs from the rollback journal ───────────────
+	// Build a set of ring members restored from the journal so we can skip
+	// the spentPubKeys fallback for those that were already handled.
+	journalRestored := make(map[crypto.Point32]struct{})
+	for _, entry := range s.rollbackJournal[height] {
+		s.utxos[UTXOKey{TxHash: entry.utxo.TxHash, OutputIndex: entry.utxo.OutputIndex}] = entry.utxo
+		s.byPubKey[entry.ringMember] = entry.utxo
+		// Remove from decoy pool — the UTXO is unspent again after rollback.
+		delete(s.spentPubKeys, entry.ringMember)
+		journalRestored[entry.ringMember] = struct{}{}
+	}
+	delete(s.rollbackJournal, height)
+
+	// ── Step 2: per-transaction cleanup ──────────────────────────────────────
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
 		// Remove outputs that this block created — both from the primary index
@@ -253,17 +314,23 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 			delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: uint32(i)})
 			delete(s.byPubKey, out.OneTimePub)
 		}
-		// Restore inputs: un-mark key images and move the real spent UTXO
-		// from spentPubKeys back to byPubKey and the primary utxos index
-		// (reverting ApplyBlock's move and primary-index delete).
 		for _, inp := range tx.Inputs {
-			delete(s.keyImages, inp.KeyImage)
+			// Un-mark key images using the canonical form that ApplyBlock stored.
+			if canonical, cerr := crypto.CanonicalKeyImage(inp.KeyImage); cerr == nil {
+				delete(s.keyImages, canonical)
+			} else {
+				delete(s.keyImages, inp.KeyImage) // fallback: remove raw
+			}
+			// Safety-net fallback: if the journal was pruned (reorg deeper than
+			// maxRollbackDepth) try spentPubKeys as a last resort.
 			for _, member := range inp.Ring {
+				if _, alreadyRestored := journalRestored[member]; alreadyRestored {
+					break
+				}
 				if utxo, ok := s.spentPubKeys[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.spentPubKeys, member)
 						s.byPubKey[member] = utxo
-						// Restore to primary index to mirror the delete in ApplyBlock.
 						s.utxos[UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex}] = utxo
 						break
 					}
