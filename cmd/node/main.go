@@ -345,7 +345,50 @@ func run() error {
                         }
                         recentBlocks = append(recentBlocks, &b)
                 }
-                chain.FastForward(recentBlocks)
+
+                // Fast-forward the in-memory chain.  If the persistent tx-index
+                // exists we use FastForwardWithIndex, which skips the expensive
+                // tx.Hash() recomputation (saves ~5-6 min of CPU at startup).
+                // On the very first restart after upgrade the index is empty and
+                // we fall back to FastForward; after that first boot every
+                // subsequent start is instant.
+                dbTxIdx, txIdxErr := db.LoadTxIndex(startLoad)
+                if txIdxErr == nil && dbTxIdx != nil {
+                        // Convert store entries to core entries.
+                        coreTxIdx := make(map[crypto.Hash32]core.TxIndexEntry, len(dbTxIdx))
+                        for h, e := range dbTxIdx {
+                                coreTxIdx[h] = core.TxIndexEntry{Height: e.Height, TxIdx: e.TxIdx}
+                        }
+                        chain.FastForwardWithIndex(recentBlocks, coreTxIdx)
+                        log.Info("tx index restored from db (fast path)",
+                                "entries", len(coreTxIdx),
+                        )
+                } else {
+                        // Slow path: compute tx.Hash() for every transaction.
+                        // Also write index entries to DB so next restart is fast.
+                        chain.FastForward(recentBlocks)
+                        var backfillErr error
+                        for _, blk := range recentBlocks {
+                                for i, tx := range blk.Txs {
+                                        txHash := tx.Hash()
+                                        if err := db.PutTxIdx(txHash, blk.Header.Height, i); err != nil {
+                                                backfillErr = err
+                                                break
+                                        }
+                                }
+                                if backfillErr != nil {
+                                        break
+                                }
+                        }
+                        if backfillErr != nil {
+                                log.Warn("tx index backfill failed; next restart will recompute",
+                                        "err", backfillErr)
+                        } else {
+                                log.Info("tx index backfilled for future fast-path restarts",
+                                        "blocks", len(recentBlocks))
+                        }
+                }
+
                 log.Info("chain restored from storage",
                         "tip_height", tipHeight,
                         "blocks_loaded_in_memory", len(recentBlocks),
@@ -1267,8 +1310,14 @@ func storeBlock(db *store.DB, b *core.Block) error {
         if err := db.PutRawBlock(hash, b.Header.Height, data); err != nil {
                 return err
         }
-        for _, tx := range b.Txs {
+        for i, tx := range b.Txs {
                 txHash := tx.Hash()
+                // Persist tx location so FastForwardWithIndex can restore the
+                // in-memory tx index at startup without recomputing tx.Hash().
+                if err := db.PutTxIdx(txHash, b.Header.Height, i); err != nil {
+                        return fmt.Errorf("put tx index (height %d, tx %x): %w",
+                                b.Header.Height, txHash[:4], err)
+                }
                 for i, out := range tx.Outputs {
                         su := &store.StoredUTXO{
                                 TxHash:       txHash,

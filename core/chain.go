@@ -157,6 +157,44 @@ func (c *Chain) FastForward(blocks []*Block) {
         }
 }
 
+// TxIndexEntry is a pre-built tx location record used by FastForwardWithIndex
+// to avoid recomputing tx.Hash() at startup.
+type TxIndexEntry struct {
+        Height uint64
+        TxIdx  int
+}
+
+// FastForwardWithIndex is like FastForward but skips the expensive tx.Hash()
+// recomputation. It accepts a pre-built index (txHash → TxIndexEntry) loaded
+// from the persistent store, resolving each entry to a Block pointer from the
+// blocks being loaded. Entries that don't resolve (height outside the window)
+// are silently skipped.
+func (c *Chain) FastForwardWithIndex(blocks []*Block, txEntries map[crypto.Hash32]TxIndexEntry) {
+        if len(blocks) == 0 {
+                return
+        }
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        // First pass: populate blocks and byHeight maps.
+        for _, b := range blocks {
+                h := b.Hash()
+                c.blocks[h] = b
+                c.byHeight[b.Header.Height] = b
+                c.tip = b
+        }
+        // Second pass: populate tx index from pre-built entries.
+        for txHash, entry := range txEntries {
+                blk := c.byHeight[entry.Height]
+                if blk == nil {
+                        continue
+                }
+                if entry.TxIdx < 0 || entry.TxIdx >= len(blk.Txs) {
+                        continue
+                }
+                c.txIndex[txHash] = TxLocation{Block: blk, TxIndex: entry.TxIdx}
+        }
+}
+
 // indexTxs adds all transactions in b to the tx index. Caller must hold mu.
 func (c *Chain) indexTxs(b *Block) {
         for i, tx := range b.Txs {

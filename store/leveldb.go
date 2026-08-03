@@ -20,6 +20,7 @@ var (
         prefixUTXO     = []byte("u/") // u/<txhash>/<outIdx> → UTXO JSON
         prefixKeyImage = []byte("k/") // k/<keyimage> → 0x01 (spent)
         prefixMeta     = []byte("m/") // m/<key> → value (metadata)
+        prefixTxIdx    = []byte("t/") // t/<txhash32> → height[8] + txIdx[4] (tx location index)
 )
 
 // DB wraps a LevelDB database with typed methods for blockchain data.
@@ -348,6 +349,61 @@ func (d *DB) IterKeyImages(fn func(crypto.KeyImage) error) error {
                 }
         }
         return iter.Error()
+}
+
+// ─── Tx location index ────────────────────────────────────────────────────────
+
+// TxIdxEntry is the stored location for a transaction hash.
+type TxIdxEntry struct {
+        Height uint64
+        TxIdx  int
+}
+
+// PutTxIdx persists the canonical location (block height, tx position) for a
+// transaction hash.  Called by storeBlock so that FastForwardWithIndex can
+// restore the in-memory tx index at startup without recomputing tx.Hash().
+func (d *DB) PutTxIdx(txHash crypto.Hash32, height uint64, txIdx int) error {
+        val := make([]byte, 12)
+        binary.BigEndian.PutUint64(val[:8], height)
+        binary.BigEndian.PutUint32(val[8:], uint32(txIdx))
+        key := append([]byte(nil), prefixTxIdx...)
+        key = append(key, txHash[:]...)
+        return d.put(key, val)
+}
+
+// LoadTxIndex loads all tx-index entries whose block height is >= minHeight.
+// Returns (nil, nil) when no entries exist yet (node predates this feature).
+func (d *DB) LoadTxIndex(minHeight uint64) (map[crypto.Hash32]TxIdxEntry, error) {
+        iter := d.db.NewIterator(util.BytesPrefix(prefixTxIdx), nil)
+        defer iter.Release()
+
+        result := make(map[crypto.Hash32]TxIdxEntry)
+        prefixLen := len(prefixTxIdx)
+        for iter.Next() {
+                key := iter.Key()
+                if len(key) < prefixLen+32 {
+                        continue
+                }
+                val := iter.Value()
+                if len(val) < 12 {
+                        continue
+                }
+                height := binary.BigEndian.Uint64(val[:8])
+                if height < minHeight {
+                        continue
+                }
+                txIdx := int(binary.BigEndian.Uint32(val[8:]))
+                var hash crypto.Hash32
+                copy(hash[:], key[prefixLen:])
+                result[hash] = TxIdxEntry{Height: height, TxIdx: txIdx}
+        }
+        if err := iter.Error(); err != nil {
+                return nil, err
+        }
+        if len(result) == 0 {
+                return nil, nil // index not yet populated
+        }
+        return result, nil
 }
 
 // ─── Key builders ─────────────────────────────────────────────────────────────
