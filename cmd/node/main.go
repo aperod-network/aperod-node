@@ -150,13 +150,19 @@ func run() error {
 
         log.Info("starting Aperod node", "network", cfg.Network, "data_dir", cfg.DataDir)
 
-        // Guard: warn early if the systemd override does not give the node
-        // enough time to flush a snapshot on graceful stop.  A TimeoutStopSec
-        // below 240 s risks a SIGKILL arriving before saveStartupSnapshot
-        // finishes, forcing a full block scan on the next restart and
-        // potentially causing an OOM loop.
+        // Guard: warn early if the effective systemd TimeoutStopSec is below the
+        // safe threshold.  A value below 240 s risks a SIGKILL arriving before
+        // saveStartupSnapshot finishes, forcing a multi-hour block scan on the
+        // next restart and potentially triggering an OOM loop.
+        //
+        // The drop-in file is checked first (it takes precedence over the main
+        // unit), then the main unit itself.  When systemd appears to be running
+        // but no TimeoutStopSec is configured anywhere, a warning is emitted
+        // because the systemd default is 90 s.
         checkSystemdTimeout(
                 "/etc/systemd/system/aperod-node.service.d/timeout.conf",
+                "/etc/systemd/system/aperod-node.service",
+                "/run/systemd/system",
                 log,
         )
 
@@ -1043,55 +1049,103 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
         return lk, nil
 }
 
-// checkSystemdTimeout reads path (the systemd service drop-in that sets
-// TimeoutStopSec) and emits a warning when the value is below 240 seconds.
+// checkSystemdTimeout validates the effective TimeoutStopSec for the
+// aperod-node service and logs a warning when it is below the safe threshold.
 //
-// A value below 240 s means systemd may send SIGKILL before the shutdown
-// snapshot goroutine finishes writing, which forces a full block scan on the
-// next restart and risks an OOM loop on large chains.
+// Parameters (all overridable in tests via temp-dir paths):
 //
-// The function is a no-op when the file is absent (e.g. non-systemd systems or
-// development environments); that case produces no log output.
-func checkSystemdTimeout(path string, log *slog.Logger) {
-        f, err := os.Open(path)
-        if err != nil {
-                // File absent is not an error — the node may not be running under
-                // systemd, or the operator has not created the override yet.
-                return
-        }
-        defer f.Close()
-
+//	dropinPath   – drop-in override file, e.g.
+//	               /etc/systemd/system/aperod-node.service.d/timeout.conf
+//	               (takes precedence over the main unit when present)
+//	servicePath  – main unit file, e.g.
+//	               /etc/systemd/system/aperod-node.service
+//	systemdDir   – runtime directory that exists only under systemd, e.g.
+//	               /run/systemd/system
+//
+// Logic:
+//  1. Scan the drop-in file for TimeoutStopSec= (highest precedence).
+//  2. If absent, scan the main unit file.
+//  3. If neither contains TimeoutStopSec and systemd appears to be active
+//     (systemdDir exists), warn that the 90-second default is in effect.
+//
+// A value below minSec (240 s) risks SIGKILL before saveStartupSnapshot
+// finishes, forcing a multi-hour block scan on the next restart.
+func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.Logger) {
         const minSec = 240
-        sc := bufio.NewScanner(f)
-        for sc.Scan() {
-                line := strings.TrimSpace(sc.Text())
-                after, ok := strings.CutPrefix(line, "TimeoutStopSec=")
-                if !ok {
-                        continue
+        const warnMsg = "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart"
+
+        // scanForTimeout reads a unit/drop-in file and returns (seconds, found, error).
+        // "infinity" maps to a very large number so the ≥ minSec check passes.
+        scanForTimeout := func(path string) (float64, bool, error) {
+                f, err := os.Open(path)
+                if err != nil {
+                        return 0, false, err
                 }
-                val := strings.TrimSpace(after)
-                if strings.EqualFold(val, "infinity") {
-                        return // infinity is safe
+                defer f.Close()
+                sc := bufio.NewScanner(f)
+                for sc.Scan() {
+                        line := strings.TrimSpace(sc.Text())
+                        after, ok := strings.CutPrefix(line, "TimeoutStopSec=")
+                        if !ok {
+                                continue
+                        }
+                        val := strings.TrimSpace(after)
+                        if strings.EqualFold(val, "infinity") {
+                                return 1e18, true, nil // effectively unlimited — safe
+                        }
+                        secs, parseErr := strconv.ParseFloat(val, 64)
+                        if parseErr != nil {
+                                return 0, true, fmt.Errorf("cannot parse TimeoutStopSec=%q in %s", val, path)
+                        }
+                        return secs, true, nil
                 }
-                secs, parseErr := strconv.ParseFloat(val, 64)
-                if parseErr != nil {
-                        log.Warn("systemd TimeoutStopSec: could not parse value",
-                                "path", path, "value", val)
-                        return
-                }
+                return 0, false, nil // file exists but no TimeoutStopSec line
+        }
+
+        // 1. Try the drop-in first.
+        if secs, found, err := scanForTimeout(dropinPath); err != nil && !os.IsNotExist(err) {
+                log.Warn("systemd TimeoutStopSec: could not read drop-in", "path", dropinPath, "err", err)
+                return
+        } else if found {
                 if secs < minSec {
-                        log.Warn(
-                                "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart",
-                                "path", path,
+                        log.Warn(warnMsg,
+                                "source", dropinPath,
                                 "current_sec", secs,
                                 "minimum_sec", minSec,
-                                "fix", fmt.Sprintf(
-                                        "set TimeoutStopSec=%d in %s and run: systemctl daemon-reload",
-                                        minSec, path,
-                                ),
+                                "fix", fmt.Sprintf("set TimeoutStopSec=%d in %s and run: systemctl daemon-reload", minSec, dropinPath),
                         )
                 }
                 return
+        }
+
+        // 2. Try the main unit file.
+        if secs, found, err := scanForTimeout(servicePath); err != nil && !os.IsNotExist(err) {
+                log.Warn("systemd TimeoutStopSec: could not read service file", "path", servicePath, "err", err)
+                return
+        } else if found {
+                if secs < minSec {
+                        log.Warn(warnMsg,
+                                "source", servicePath,
+                                "current_sec", secs,
+                                "minimum_sec", minSec,
+                                "fix", fmt.Sprintf("set TimeoutStopSec=%d in %s and run: systemctl daemon-reload", minSec, servicePath),
+                        )
+                }
+                return
+        }
+
+        // 3. No explicit TimeoutStopSec found anywhere.  Warn only when systemd
+        // is active so we don't produce noise in non-systemd environments.
+        if _, statErr := os.Stat(systemdDir); statErr == nil {
+                log.Warn(warnMsg,
+                        "source", "systemd default (90 s) — no TimeoutStopSec found in unit or drop-in",
+                        "current_sec", 90,
+                        "minimum_sec", minSec,
+                        "fix", fmt.Sprintf(
+                                "add TimeoutStopSec=%d to %s or %s and run: systemctl daemon-reload",
+                                minSec, dropinPath, servicePath,
+                        ),
+                )
         }
 }
 

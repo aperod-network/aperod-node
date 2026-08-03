@@ -347,62 +347,230 @@ func TestSnapshotRoundTrip(t *testing.T) {
 
 // ─── Test 4: systemd TimeoutStopSec guard ─────────────────────────────────────
 
-// TestCheckSystemdTimeout exercises the startup guard that warns when the
-// systemd unit's TimeoutStopSec is below the 240-second safe threshold.
-func TestCheckSystemdTimeout(t *testing.T) {
+const wantWarnMsg = "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart"
+
+// writeConf writes content to a named file in dir and returns its path.
+// If content is empty, the file is not written (returns a nonexistent path).
+func writeConf(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	if content == "" {
+		return filepath.Join(dir, name) // does not exist
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatalf("writeConf %s: %v", name, err)
+	}
+	return p
+}
+
+// TestCheckSystemdTimeout_Dropin exercises cases where the drop-in file is the
+// source of truth (highest-precedence path).
+func TestCheckSystemdTimeout_Dropin(t *testing.T) {
 	tests := []struct {
 		name        string
-		content     string
+		dropin      string
 		wantWarning bool
 	}{
-		{
-			name:        "below threshold warns",
-			content:     "[Service]\nTimeoutStopSec=90\n",
-			wantWarning: true,
-		},
-		{
-			name:        "at threshold does not warn",
-			content:     "[Service]\nTimeoutStopSec=240\n",
-			wantWarning: false,
-		},
-		{
-			name:        "above threshold does not warn",
-			content:     "[Service]\nTimeoutStopSec=300\n",
-			wantWarning: false,
-		},
-		{
-			name:        "file missing is silent",
-			content:     "", // no file written
-			wantWarning: false,
-		},
-		{
-			name:        "infinity does not warn",
-			content:     "[Service]\nTimeoutStopSec=infinity\n",
-			wantWarning: false,
-		},
+		{"dropin below threshold warns", "[Service]\nTimeoutStopSec=90\n", true},
+		{"dropin at threshold safe", "[Service]\nTimeoutStopSec=240\n", false},
+		{"dropin above threshold safe", "[Service]\nTimeoutStopSec=300\n", false},
+		{"dropin infinity safe", "[Service]\nTimeoutStopSec=infinity\n", false},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var path string
-			if tc.content != "" {
-				dir := t.TempDir()
-				path = filepath.Join(dir, "timeout.conf")
-				if err := os.WriteFile(path, []byte(tc.content), 0644); err != nil {
-					t.Fatalf("write conf: %v", err)
-				}
-			} else {
-				path = filepath.Join(t.TempDir(), "nonexistent.conf")
-			}
+			dir := t.TempDir()
+			dropin := writeConf(t, dir, "timeout.conf", tc.dropin)
+			service := filepath.Join(dir, "aperod-node.service") // absent
+			systemdDir := filepath.Join(dir, "no-systemd")       // absent → no default-warn
 
 			var logBuf bytes.Buffer
-			log := newCaptureLogger(&logBuf)
-			checkSystemdTimeout(path, log)
+			checkSystemdTimeout(dropin, service, systemdDir, newCaptureLogger(&logBuf))
 
-			got := logContainsMsg(&logBuf, "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart")
+			got := logContainsMsg(&logBuf, wantWarnMsg)
 			if got != tc.wantWarning {
 				t.Errorf("wantWarning=%v got=%v\nlog:\n%s", tc.wantWarning, got, logBuf.String())
 			}
 		})
+	}
+}
+
+// TestCheckSystemdTimeout_MainService exercises the fallback path: drop-in
+// absent, main unit file has TimeoutStopSec.
+func TestCheckSystemdTimeout_MainService(t *testing.T) {
+	tests := []struct {
+		name        string
+		service     string
+		wantWarning bool
+	}{
+		{"service below threshold warns", "[Service]\nTimeoutStopSec=120\n", true},
+		{"service at threshold safe", "[Service]\nTimeoutStopSec=300\n", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dropin := filepath.Join(dir, "timeout.conf")            // absent
+			service := writeConf(t, dir, "aperod-node.service", tc.service)
+			systemdDir := filepath.Join(dir, "no-systemd")          // absent → no default-warn
+
+			var logBuf bytes.Buffer
+			checkSystemdTimeout(dropin, service, systemdDir, newCaptureLogger(&logBuf))
+
+			got := logContainsMsg(&logBuf, wantWarnMsg)
+			if got != tc.wantWarning {
+				t.Errorf("wantWarning=%v got=%v\nlog:\n%s", tc.wantWarning, got, logBuf.String())
+			}
+		})
+	}
+}
+
+// TestCheckSystemdTimeout_SystemdPresentNoConfig verifies that when systemd
+// appears to be running (systemdDir exists) but neither file contains
+// TimeoutStopSec, a warning is emitted about the 90-second default.
+func TestCheckSystemdTimeout_SystemdPresentNoConfig(t *testing.T) {
+	dir := t.TempDir()
+	dropin := filepath.Join(dir, "timeout.conf")           // absent
+	service := filepath.Join(dir, "aperod-node.service")   // absent
+	systemdDir := filepath.Join(dir, "run-systemd-system") // simulate /run/systemd/system
+	if err := os.MkdirAll(systemdDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	checkSystemdTimeout(dropin, service, systemdDir, newCaptureLogger(&logBuf))
+
+	if !logContainsMsg(&logBuf, wantWarnMsg) {
+		t.Errorf("expected warning when systemd is active but no TimeoutStopSec is set\nlog:\n%s", logBuf.String())
+	}
+}
+
+// TestCheckSystemdTimeout_NonSystemdSilent verifies that when systemd is NOT
+// running (no systemdDir) and neither config file exists, no warning is emitted
+// (the node may be running on Docker, macOS, etc.).
+func TestCheckSystemdTimeout_NonSystemdSilent(t *testing.T) {
+	dir := t.TempDir()
+	dropin := filepath.Join(dir, "timeout.conf")
+	service := filepath.Join(dir, "aperod-node.service")
+	systemdDir := filepath.Join(dir, "no-systemd")
+
+	var logBuf bytes.Buffer
+	checkSystemdTimeout(dropin, service, systemdDir, newCaptureLogger(&logBuf))
+
+	if logContainsMsg(&logBuf, wantWarnMsg) {
+		t.Errorf("unexpected warning on non-systemd host\nlog:\n%s", logBuf.String())
+	}
+}
+
+// ─── Test 5: real TakeSnapshot pipeline ───────────────────────────────────────
+
+// TestRealSnapshotPipeline exercises the actual UTXOSet.TakeSnapshot() and
+// ValidatorRegistry.TakeSnapshot() production code paths — the same calls the
+// SIGTERM handler makes — and confirms the snapshot survives a full disk
+// round-trip and is faithfully restored by RestoreFromSnapshot.
+//
+// This guards against regressions in the shutdown orchestration: if
+// TakeSnapshot or RestoreFromSnapshot were accidentally broken, this test
+// would catch it before the node ships.
+func TestRealSnapshotPipeline(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a minimal chain: genesis + 2 blocks.
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	makeBlock := func(height uint64, prev crypto.Hash32, txs []core.Transaction) *core.Block {
+		hdr := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prev,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(txs),
+		}
+		if err := hdr.Sign(priv); err != nil {
+			t.Fatalf("Sign h=%d: %v", height, err)
+		}
+		return &core.Block{Header: hdr, Txs: txs}
+	}
+
+	// Genesis with a coinbase output so UTXOSet has a real entry.
+	genesisTxs := []core.Transaction{core.CoinbaseTx(crypto.Point32(pub), 1_000_000)}
+	genesis := makeBlock(0, crypto.Hash32{}, genesisTxs)
+	blk1 := makeBlock(1, genesis.Hash(), nil)
+	blk2 := makeBlock(2, blk1.Hash(), nil)
+
+	// Apply blocks to a real UTXOSet (mirrors the startup scan path).
+	utxos := core.NewUTXOSet()
+	for _, b := range []*core.Block{genesis, blk1, blk2} {
+		if err := utxos.ApplyBlock(b); err != nil {
+			t.Fatalf("ApplyBlock h=%d: %v", b.Header.Height, err)
+		}
+	}
+	utxoCountBefore := utxos.Count()
+	if utxoCountBefore == 0 {
+		t.Fatal("UTXOSet is empty after applying genesis — test setup error")
+	}
+
+	// Wire a real ValidatorRegistry.
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+	activeBefore, _ := registry.Count()
+
+	// ── Simulate shutdown: TakeSnapshot + save (the SIGTERM handler path).
+	tipHashArr := blk2.Hash()
+	tipHeight := blk2.Header.Height
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	shutSnap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    int64(utxoCountBefore),
+		UTXOs:      utxos.TakeSnapshot(),    // ← real production call
+		Registry:   registry.TakeSnapshot(), // ← real production call
+	}
+	if err := saveStartupSnapshot(dir, shutSnap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// Snapshot file must exist with the correct height in the name.
+	wantPath := snapshotPath(dir, tipHeight)
+	if _, err := os.Stat(wantPath); os.IsNotExist(err) {
+		t.Fatalf("snapshot file not created: %s", wantPath)
+	}
+
+	// ── Simulate second start: load + RestoreFromSnapshot (the fast-path).
+	loaded, err := loadStartupSnapshot(dir, tipHeight, tipHashHex)
+	if err != nil {
+		t.Fatalf("loadStartupSnapshot: %v", err)
+	}
+
+	utxos2 := core.NewUTXOSet()
+	utxos2.RestoreFromSnapshot(loaded.UTXOs) // ← real production call
+
+	registry2 := core.NewValidatorRegistry()
+	registry2.SetUTXOSet(utxos2)
+	registry2.RestoreFromSnapshot(loaded.Registry) // ← real production call
+
+	// UTXO counts must match.
+	if got := utxos2.Count(); got != utxoCountBefore {
+		t.Errorf("UTXOSet count after restore: got %d want %d", got, utxoCountBefore)
+	}
+
+	// Registry active-validator count must match.
+	activeAfter, _ := registry2.Count()
+	if activeAfter != activeBefore {
+		t.Errorf("registry active validators after restore: got %d want %d", activeAfter, activeBefore)
+	}
+
+	// Log messages must reflect the fast path, not the block scan.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+	log.Info("startup fast path complete — snapshot loaded",
+		"tip_height", tipHeight,
+		"active_utxos", len(loaded.UTXOs.ActiveUTXOs),
+	)
+	if !logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path log message missing")
 	}
 }

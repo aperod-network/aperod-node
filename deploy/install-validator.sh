@@ -328,6 +328,10 @@ LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=aperod-node
+# Must be ≥ 300 s so the shutdown snapshot goroutine can flush to disk before
+# systemd sends SIGKILL.  A shorter timeout causes OOM loops on the next
+# restart because the node always falls back to the multi-hour block scan.
+TimeoutStopSec=300
 
 # Hardening
 ProtectSystem=full
