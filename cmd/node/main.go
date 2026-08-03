@@ -585,6 +585,9 @@ func run() error {
                         apiSrv.SetAPIKey(cfg.API.Key)
                 }
         apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
+                // Block loading and startup scan completed before this point, so the
+                // node is ready to serve UTXO queries immediately.
+                apiSrv.SetReady()
                 go func() {
                         if err := apiSrv.Start(); err != nil {
                                 log.Error("API server stopped", "err", err)

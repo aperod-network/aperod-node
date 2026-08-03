@@ -62,6 +62,11 @@ type Server struct {
         // txTotal is an O(1) cached total non-coinbase tx count.
         // Updated atomically so no lock is needed in hot paths.
         txTotal int64
+
+        // syncing is 1 while the node is loading blocks from disk on startup,
+        // and 0 once it is fully ready.  Changed atomically — no lock needed.
+        // Default is 1 (syncing) so callers see the correct state before SetReady.
+        syncing int32
 }
 
 // NewServer creates a new API server.
@@ -75,10 +80,16 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
                 mux:         http.NewServeMux(),
                 hub:         NewHub(log),
                 rateLimiter: NewRateLimiter(),
+                syncing:     1, // syncing until SetReady() is called
         }
         s.registerRoutes()
         return s
 }
+
+// SetReady marks the node as fully loaded and no longer syncing.
+// Call this after all blocks have been replayed from disk so that
+// /api/v1/status reports syncing=false and UTXO supply queries proceed normally.
+func (s *Server) SetReady() { atomic.StoreInt32(&s.syncing, 0) }
 
 // SetRegistry wires the live PoS validator registry so the API can serve
 // /api/v1/validators and include validator_count in network stats.

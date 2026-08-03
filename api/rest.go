@@ -23,6 +23,7 @@ import (
         "net/http"
         "strconv"
         "strings"
+        "sync/atomic"
         "time"
 
         "github.com/aperod/aperod/core"
@@ -1993,8 +1994,10 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if tip := s.chain.Tip(); tip != nil {
 		height = tip.Header.Height
 	}
+	syncing := atomic.LoadInt32(&s.syncing) == 1
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":     true,
-		"height": height,
+		"ok":      true,
+		"height":  height,
+		"syncing": syncing,
 	})
 }
