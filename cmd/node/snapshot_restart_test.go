@@ -1112,6 +1112,108 @@ func TestCorruptPrimaryFallsBackToPrev(t *testing.T) {
 	}
 }
 
+// ─── Test 11: both snapshots have wrong hash → falls back to block scan ──────
+
+// TestBothSnapshotsHashMismatchFallsBackToScan confirms that when both the
+// primary snapshot and the same-height prev-backup contain valid JSON but an
+// incorrect TipHashHex, loadStartupSnapshotWithFallback returns a non-nil,
+// non-ErrNotExist error and the caller falls back to a full block scan.
+//
+// This is the complement to TestBothSnapshotsCorruptFallsBackToScan: that test
+// exercises truncated/invalid-JSON files; this test exercises files that are
+// structurally valid JSON but fail the hash cross-check.  Both failure modes
+// must result in the same safe outcome: no snapshot loaded, no crash.
+func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 2) // genesis + 2 blocks → height 0..2
+
+	tip := blocks[len(blocks)-1]
+	tipHash := tip.Hash()
+	tipHeight := tip.Header.Height           // 2
+	tipHashHex := fmt.Sprintf("%x", tipHash[:])
+
+	// Build a wrong hash that is guaranteed to differ from the real one.
+	var wrongArr crypto.Hash32
+	for i := range wrongArr {
+		wrongArr[i] = 0xba
+	}
+	wrongHex := fmt.Sprintf("%x", wrongArr[:])
+	if wrongHex == tipHashHex {
+		t.Fatal("test setup error: wrong hash equals correct hash")
+	}
+
+	// Write a structurally valid snapshot whose TipHashHex is wrong into the
+	// primary path.  We must not use saveStartupSnapshot here because it writes
+	// the correct hash; instead write the files directly.
+	primaryPath := snapshotPath(dir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+
+	badSnap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: wrongHex, // ← deliberate mismatch
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	writeSnapFile := func(path string) {
+		t.Helper()
+		data, err := json.Marshal(badSnap)
+		if err != nil {
+			t.Fatalf("marshal badSnap: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			t.Fatalf("WriteFile %s: %v", path, err)
+		}
+	}
+	writeSnapFile(primaryPath)
+	writeSnapFile(prevPath)
+
+	// ── Simulate the startup fast-path using the production helper.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	if loadErr == nil {
+		snapLoaded = true
+		log.Info("startup fast path complete — snapshot loaded",
+			"tip_height", tipHeight,
+			"active_utxos", len(loaded.UTXOs.ActiveUTXOs),
+		)
+	} else if !os.IsNotExist(loadErr) {
+		log.Warn("snapshot load error, falling back to block scan", "err", loadErr)
+	}
+
+	// ── Assertions.
+
+	// snapLoaded must remain false: a hash-mismatch must never be accepted.
+	if snapLoaded {
+		t.Error("snapLoaded should be false when both primary and prev-backup have wrong hash")
+	}
+
+	// loadErr must be non-nil and not os.ErrNotExist (both files exist but
+	// fail validation — distinct from "no snapshot available").
+	if loadErr == nil {
+		t.Error("loadStartupSnapshotWithFallback: expected non-nil error when both snapshots have wrong hash; got nil")
+	}
+	if os.IsNotExist(loadErr) {
+		t.Errorf("loadStartupSnapshotWithFallback: got os.ErrNotExist but both files exist; err=%v", loadErr)
+	}
+
+	// The fallback warning must be logged.
+	if !logContainsMsg(&logBuf, "snapshot load error, falling back to block scan") {
+		t.Error("expected warning \"snapshot load error, falling back to block scan\" was not logged")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+
+	// The fast-path success message must NOT appear.
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path success log must NOT appear when both snapshots have wrong hash")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
+
 // ─── Test 10: truncated snapshot falls back to block scan ─────────────────────
 
 // TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
