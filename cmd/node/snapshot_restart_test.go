@@ -460,6 +460,133 @@ func TestCheckSystemdTimeout_NonSystemdSilent(t *testing.T) {
 	}
 }
 
+// ─── Tests: parseGOMLEMLIMITBytes ─────────────────────────────────────────────
+
+func TestParseGOMLEMLIMITBytes(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantOK  bool
+		wantVal int64
+	}{
+		// absent / disabled (exact Go runtime grammar)
+		{"", false, 0},
+		{"off", false, 0},   // exact spelling required
+		{"OFF", false, 0},   // case-fold NOT accepted by runtime
+		{"Off", false, 0},
+		{"0", false, 0},
+		// plain byte counts
+		{"1", true, 1},
+		{"1073741824", true, 1073741824},
+		{"5368709120", true, 5368709120},
+		{"5905580032", true, 5905580032},
+		// B suffix (explicit bytes — runtime accepts this)
+		{"1B", true, 1},
+		{"5368709120B", true, 5368709120},
+		// IEC suffixes supported by the Go runtime (B KiB MiB GiB TiB only)
+		{"1KiB", true, 1 << 10},
+		{"512MiB", true, 512 << 20},
+		{"5GiB", true, 5 << 30},
+		{"1TiB", true, 1 << 40},
+		// PiB and EiB are NOT in the Go runtime grammar
+		{"1PiB", false, 0},
+		{"1EiB", false, 0},
+		// whitespace NOT accepted (runtime is strict)
+		{" 5GiB ", false, 0},
+		{" 5368709120 ", false, 0},
+		// malformed / SI units — treated as absent
+		{"garbage", false, 0},
+		{"5GB", false, 0},
+		{"5MB", false, 0},
+		{"-1", false, 0},
+		{"-1GiB", false, 0},
+		// overflow: 8388608 TiB = 2^23 * 2^40 = 2^63 bytes — overflows int64
+		{"8388608TiB", false, 0},
+	}
+	for _, tc := range tests {
+		gotVal, gotOK := parseGOMLEMLIMITBytes(tc.input)
+		if gotOK != tc.wantOK || (tc.wantOK && gotVal != tc.wantVal) {
+			t.Errorf("parseGOMLEMLIMITBytes(%q) = (%d, %v), want (%d, %v)",
+				tc.input, gotVal, gotOK, tc.wantVal, tc.wantOK)
+		}
+	}
+}
+
+// ─── Tests: checkGOMLEMLIMIT ──────────────────────────────────────────────────
+
+const dropin = "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf"
+
+// TestCheckGOMLEMLIMIT_WarnCases verifies that absent, zero, "off" (exact),
+// and unrecognised values all produce a warning and return nil in non-strict mode.
+func TestCheckGOMLEMLIMIT_WarnCases(t *testing.T) {
+	// All of these are effectively "no limit" — either unset, explicitly off,
+	// zero bytes, or unrecognised format that the runtime would reject anyway.
+	cases := []string{"", "0", "off", "OFF", "Off", "garbage", "5GB", "5MB", " 5GiB "}
+	for _, val := range cases {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, false, dropin, newCaptureLogger(&logBuf))
+		if err != nil {
+			t.Errorf("GOMEMLIMIT=%q: expected nil error in non-strict mode, got: %v", val, err)
+		}
+		if !logContainsMsg(&logBuf, "GOMEMLIMIT is not set — node may OOM under load") {
+			t.Errorf("GOMEMLIMIT=%q: expected warn log\nlog:\n%s", val, logBuf.String())
+		}
+	}
+}
+
+// TestCheckGOMLEMLIMIT_SilentWhenSet verifies that valid Go runtime GOMEMLIMIT
+// values produce no warning and no error (non-strict mode).
+// Accepted: bare integer, B suffix, KiB/MiB/GiB/TiB suffixes.
+func TestCheckGOMLEMLIMIT_SilentWhenSet(t *testing.T) {
+	validValues := []string{
+		"5368709120", "5905580032", "1073741824", // bare byte counts
+		"5368709120B",                             // explicit B suffix
+		"5B",                                      // small explicit byte count
+		"5GiB", "512MiB", "1TiB", "1KiB",         // IEC suffixes
+	}
+	for _, val := range validValues {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, false, dropin, newCaptureLogger(&logBuf))
+		if err != nil {
+			t.Errorf("GOMEMLIMIT=%q: unexpected error: %v", val, err)
+		}
+		if logContainsMsg(&logBuf, "GOMEMLIMIT is not set") {
+			t.Errorf("GOMEMLIMIT=%q: unexpected warning\nlog:\n%s", val, logBuf.String())
+		}
+	}
+}
+
+// TestCheckGOMLEMLIMIT_StrictModeErrorsOnMissing verifies that --strict-memlimit
+// returns a non-nil error for absent, zero, "off", malformed, and overflow values.
+func TestCheckGOMLEMLIMIT_StrictModeErrorsOnMissing(t *testing.T) {
+	cases := []string{"", "0", "off", "garbage", "5GB", "OFF", " 5GiB ", "8388608TiB"}
+	for _, val := range cases {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, true, dropin, newCaptureLogger(&logBuf))
+		if err == nil {
+			t.Errorf("GOMEMLIMIT=%q: expected error in strict mode, got nil", val)
+		}
+	}
+}
+
+// TestCheckGOMLEMLIMIT_StrictModeSilentWhenSet verifies that --strict-memlimit
+// does NOT error for valid plain-byte, B-suffix, or IEC-suffix values.
+func TestCheckGOMLEMLIMIT_StrictModeSilentWhenSet(t *testing.T) {
+	validValues := []string{
+		"5905580032", "5368709120B",
+		"5GiB", "512MiB", "1TiB",
+	}
+	for _, val := range validValues {
+		var logBuf bytes.Buffer
+		err := checkGOMLEMLIMIT(val, true, dropin, newCaptureLogger(&logBuf))
+		if err != nil {
+			t.Errorf("GOMEMLIMIT=%q: unexpected error in strict mode: %v", val, err)
+		}
+		if logContainsMsg(&logBuf, "GOMEMLIMIT is not set") {
+			t.Errorf("GOMEMLIMIT=%q: unexpected warning\nlog:\n%s", val, logBuf.String())
+		}
+	}
+}
+
 // ─── Test 5: real TakeSnapshot pipeline ───────────────────────────────────────
 
 // TestRealSnapshotPipeline exercises the actual UTXOSet.TakeSnapshot() and

@@ -106,6 +106,7 @@ func run() error {
         cfgPath := "config/testnet.yaml"
         resetP2PIdentity := false
         validateOnly := false
+        strictMemLimit := false
         for i, arg := range os.Args[1:] {
                 switch arg {
                 case "--config":
@@ -116,6 +117,8 @@ func run() error {
                         resetP2PIdentity = true
                 case "--validate-config":
                         validateOnly = true
+                case "--strict-memlimit":
+                        strictMemLimit = true
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
@@ -167,6 +170,19 @@ func run() error {
                 "/run/systemd/system",
                 log,
         )
+
+        // Guard: warn (or hard-fail in strict mode) when GOMEMLIMIT is unset or
+        // zero.  Without a memory limit the Go runtime can exhaust all available
+        // RAM — the exact OOM scenario the drop-in was introduced to prevent.
+        // Pass the drop-in path so the function can suggest the canonical fix.
+        if err := checkGOMLEMLIMIT(
+                os.Getenv("GOMEMLIMIT"),
+                strictMemLimit,
+                "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf",
+                log,
+        ); err != nil {
+                return err
+        }
 
         // Emit any non-fatal configuration warnings now that the logger is ready.
         for _, w := range cfg.Warnings() {
@@ -1006,6 +1022,112 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
         }
         log.Info("generated new validator key", "pub", lk.Public().ID(), "saved", keyPath)
         return lk, nil
+}
+
+// parseGOMLEMLIMITBytes parses a GOMEMLIMIT string using exactly the grammar
+// the Go runtime accepts.  No whitespace trimming or case-folding is applied —
+// the runtime itself is strict about these.
+//
+// Supported forms:
+//
+//	""           → 0, false  (unset — no limit)
+//	"off"        → 0, false  (exactly; runtime disables the limit)
+//	"5368709120" → 5368709120, true   (bare byte count)
+//	"5368709120B"→ 5368709120, true   (explicit byte suffix)
+//	"512MiB"     → 536870912, true
+//	"5GiB"       → 5368709120, true
+//	"1TiB"       → 1099511627776, true
+//
+// Returns (bytes, ok).  ok is false when the value is absent, "off",
+// parses to zero or negative, overflows int64, or uses an unrecognised format.
+//
+// Suffixes recognised by the Go 1.21+ runtime: B, KiB, MiB, GiB, TiB.
+// PiB and EiB are NOT in the runtime grammar and are rejected here.
+func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
+        if raw == "" || raw == "off" {
+                return 0, false
+        }
+
+        // The Go runtime recognises exactly these unit suffixes (longest first
+        // so that "KiB" is matched before the bare "B" suffix).
+        type unit struct {
+                suffix string
+                mult   int64
+        }
+        units := []unit{
+                {"TiB", 1 << 40},
+                {"GiB", 1 << 30},
+                {"MiB", 1 << 20},
+                {"KiB", 1 << 10},
+                {"B", 1},
+        }
+
+        numStr := raw
+        mult := int64(1)
+        for _, u := range units {
+                if strings.HasSuffix(raw, u.suffix) {
+                        numStr = raw[:len(raw)-len(u.suffix)]
+                        mult = u.mult
+                        break
+                }
+        }
+
+        n, err := strconv.ParseInt(numStr, 10, 64)
+        if err != nil || n <= 0 {
+                return 0, false
+        }
+
+        // Guard against multiplication overflow (e.g. very large TiB values).
+        const maxInt64 = 1<<63 - 1
+        if mult > 1 && n > maxInt64/mult {
+                return 0, false
+        }
+
+        return n * mult, true
+}
+
+// checkGOMLEMLIMIT inspects the GOMEMLIMIT environment variable and logs a
+// prominent warning when it is absent, explicitly disabled ("off"), set to
+// zero, or uses an unrecognised format.  If strictMode is true the function
+// returns an error so the node exits with a non-zero status, preventing a
+// silent start without a memory cap.
+//
+// Parameters:
+//
+//	gomlimitEnv – value of os.Getenv("GOMEMLIMIT") (injected for testability)
+//	strictMode  – when true, treat a missing/zero limit as a fatal error
+//	dropinPath  – canonical path of the systemd drop-in that sets GOMEMLIMIT;
+//	              included in the suggested fix message so operators know exactly
+//	              which file to recreate
+//	log         – structured logger
+func checkGOMLEMLIMIT(gomlimitEnv string, strictMode bool, dropinPath string, log *slog.Logger) error {
+        const warnMsg = "GOMEMLIMIT is not set — node may OOM under load"
+
+        _, ok := parseGOMLEMLIMITBytes(gomlimitEnv)
+        if ok {
+                return nil // limit is set and positive — nothing to do
+        }
+
+        fix := fmt.Sprintf(
+                "recreate the drop-in at %s with 'Environment=\"GOMEMLIMIT=<bytes>\"' and run: systemctl daemon-reload && systemctl restart aperod-node",
+                dropinPath,
+        )
+
+        if strictMode {
+                // Log at Error level so the journal captures the reason before exit.
+                log.Error(warnMsg,
+                        "gomemlimit_value", gomlimitEnv,
+                        "strict_mode", true,
+                        "fix", fix,
+                )
+                return fmt.Errorf("refusing to start without GOMEMLIMIT (--strict-memlimit is set): %s", fix)
+        }
+
+        log.Warn(warnMsg,
+                "gomemlimit_value", gomlimitEnv,
+                "fix", fix,
+        )
+        return nil
 }
 
 // checkSystemdTimeout validates the effective TimeoutStopSec for the
