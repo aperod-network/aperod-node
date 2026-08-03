@@ -85,7 +85,7 @@ _write_history_log() {
     echo "  Telegram failure alert sent to admin chat."
   fi
 }
-trap _write_history_log EXIT
+trap '_write_history_log; rm -rf "$BACKUP_DIR"' EXIT
 
 # ── Helper: write prometheus textfile ─────────────────────────────────────────
 write_metrics() {
@@ -152,10 +152,6 @@ RCLONE_REMOTE="s3backup:${S3_BUCKET}"
 PRUNE_AGE="${S3_RETENTION_DAYS}d"
 
 mkdir -p "$BACKUP_DIR"
-# Guarantee cleanup even when the script exits with an error.
-# Without this a failed run leaves gigabytes in /tmp and the next run fails
-# immediately with "No space left on device".
-trap 'rm -rf "$BACKUP_DIR"' EXIT
 echo "=== [1/4] Бэкап начат: ${TIMESTAMP} ==="
 
 # ── 1. PostgreSQL dump ─────────────────────────────────────────────────────────
