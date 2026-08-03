@@ -298,6 +298,34 @@ func run() error {
                 genesisStakeForReplay := core.MinStakeNAPR * 10 // must match consensus.NewEngine
                 registry.InitFromGenesis(validators, genesisStakeForReplay)
 
+                // ── Snapshot fast path ───────────────────────────────────────
+                // If a valid UTXOSet snapshot exists at the exact current tip,
+                // restore from it and skip both the key-image load and the
+                // full block scan.  Falls back gracefully when the snapshot is
+                // absent, stale, or corrupt.
+                snapLoaded := false
+                {
+                        tipHashHex := fmt.Sprintf("%x", tipHash[:])
+                        if snap, serr := loadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex); serr == nil {
+                                utxos.RestoreFromSnapshot(snap.UTXOs)
+                                registry.RestoreFromSnapshot(snap.Registry)
+                                registry.SetUTXOSet(utxos) // re-wire pointer (not serialised)
+                                if snap.TxTotal > 0 {
+                                        initialTxTotal = snap.TxTotal
+                                }
+                                log.Info("startup fast path complete — snapshot loaded",
+                                        "tip_height", tipHeight,
+                                        "active_utxos", len(snap.UTXOs.ActiveUTXOs),
+                                        "spent_decoys", len(snap.UTXOs.SpentDecoys),
+                                        "key_images", len(snap.UTXOs.KeyImages),
+                                )
+                                snapLoaded = true
+                        } else if !os.IsNotExist(serr) {
+                                log.Warn("snapshot load error, falling back to block scan", "err", serr)
+                        }
+                }
+
+                if !snapLoaded {
                 // Try the fast path for spent key images first.
                 log.Info("loading spent key-image set from database index",
                         "tip_height", tipHeight)
@@ -443,6 +471,29 @@ func run() error {
                                 "unspent_outputs", utxos.Count(),
                         )
                 }
+
+                // ── Save snapshot for fast startup on the next restart ─────────
+                // TakeSnapshot deep-copies the maps; the goroutine writes the
+                // file without blocking consensus engine startup.
+                {
+                        snapToSave := startupSnapshot{
+                                Version:    snapVersion,
+                                TipHeight:  tipHeight,
+                                TipHashHex: fmt.Sprintf("%x", tipHash[:]),
+                                TxTotal:    initialTxTotal,
+                                UTXOs:      utxos.TakeSnapshot(),
+                                Registry:   registry.TakeSnapshot(),
+                        }
+                        go func() {
+                                if saveErr := saveStartupSnapshot(cfg.DataDir, snapToSave); saveErr != nil {
+                                        log.Warn("failed to save startup snapshot", "err", saveErr)
+                                } else {
+                                        log.Info("startup snapshot saved", "tip_height", tipHeight)
+                                        deleteOldSnapshots(cfg.DataDir, tipHeight)
+                                }
+                        }()
+                }
+                } // end !snapLoaded
         }
 
         // initialTxTotal is populated by the scan above (genesis path stays 0).
@@ -773,6 +824,26 @@ func run() error {
         <-sig
 
         log.Info("shutting down...")
+        // Save a snapshot at the current tip so the next restart is instant.
+        if registry != nil {
+                if shutTipHash, shutTipHeight, stErr := db.GetTip(); stErr == nil && shutTipHeight > 0 {
+                        shutTxTotal, _ := db.LoadTxTotal()
+                        shutSnap := startupSnapshot{
+                                Version:    snapVersion,
+                                TipHeight:  shutTipHeight,
+                                TipHashHex: fmt.Sprintf("%x", shutTipHash[:]),
+                                TxTotal:    shutTxTotal,
+                                UTXOs:      utxos.TakeSnapshot(),
+                                Registry:   registry.TakeSnapshot(),
+                        }
+                        if saveErr := saveStartupSnapshot(cfg.DataDir, shutSnap); saveErr != nil {
+                                log.Warn("shutdown: failed to save snapshot", "err", saveErr)
+                        } else {
+                                log.Info("shutdown: snapshot saved", "tip_height", shutTipHeight)
+                                deleteOldSnapshots(cfg.DataDir, shutTipHeight)
+                        }
+                }
+        }
         close(stop)
         return nil
 }
