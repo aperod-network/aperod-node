@@ -150,7 +150,7 @@ Staked APRO is locked while the validator is active. To withdraw:
 | Step | Detail |
 |------|--------|
 | 1. Initiate unbonding | Send unbonding request via [@aperod_bot](https://t.me/aperod_bot) |
-| 2. Unbonding period | **7,200 blocks** (~6 hours) — node leaves active set |
+| 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
 | 3. Funds released | APRO returned to wallet after unbonding period |
 
 Partial unbonding is supported. If remaining stake drops below 100,000 APRO, the node exits the validator set.
