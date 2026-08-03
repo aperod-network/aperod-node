@@ -1440,6 +1440,122 @@ func TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact(t *testing.T) {
 	}
 }
 
+// ─── Test 13: rename failure leaves old primary intact ───────────────────────
+
+// TestSaveSnapshotRenameFailureLeavesOldPrimaryIntact confirms that when the
+// final os.Rename(tmp, path) step inside saveStartupSnapshot fails, the
+// function:
+//   (a) returns a non-nil error,
+//   (b) leaves no stale .tmp file in the data directory, and
+//   (c) leaves the pre-existing primary snapshot file untouched and readable
+//       with its original content.
+//
+// Scenario:
+//   - A valid snapshot is saved at height H, establishing an old primary
+//     (snapshot-v1-H.json) with a known TxTotal value.
+//   - A save is then attempted at height H+1.  Before the call, a directory is
+//     created at the destination path (snapshot-v1-(H+1).json).  On Linux
+//     os.Rename returns ENOTDIR or EISDIR when the destination is a directory
+//     and the source is a regular file, so the rename step returns an error
+//     after the prev-backup copy has already succeeded.
+//   - saveStartupSnapshot must remove the .tmp file and propagate the error.
+//   - The old primary at height H must still be readable with the original
+//     TxTotal value (i.e. the prior-height backup logic in saveStartupSnapshot
+//     copies rather than moves the existing primary, so it cannot destroy it).
+//   - No file matching "*.tmp" must remain in the data directory.
+//
+// This is the rename-failure complement to
+// TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact (Test 12), which covers
+// the earlier copyFile failure mode.
+func TestSaveSnapshotRenameFailureLeavesOldPrimaryIntact(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 5) // genesis + 5 blocks → height 0..5
+
+	blk4 := blocks[4]
+	blk5 := blocks[5]
+	hash4 := blk4.Hash()
+	hash5 := blk5.Hash()
+	hex4 := fmt.Sprintf("%x", hash4[:])
+	hex5 := fmt.Sprintf("%x", hash5[:])
+
+	// ── Step 1: write the initial snapshot at height 4 — establishes old primary.
+	const oldTxTotal int64 = 42
+	snap4 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  4,
+		TipHashHex: hex4,
+		TxTotal:    oldTxTotal,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap4); err != nil {
+		t.Fatalf("first saveStartupSnapshot (h=4): %v", err)
+	}
+
+	oldPrimaryPath := snapshotPath(dir, 4) // snapshot-v1-4.json
+	if _, err := os.Stat(oldPrimaryPath); os.IsNotExist(err) {
+		t.Fatalf("old primary not created: %s", oldPrimaryPath)
+	}
+
+	// ── Step 2: block the rename destination for the new height-5 primary.
+	//
+	// saveStartupSnapshot writes snapshot-v1-5.json.tmp and then renames it to
+	// snapshot-v1-5.json.  Pre-placing a directory at that path causes os.Rename
+	// to return an error (ENOTDIR on Linux) after the prev-backup copy has
+	// already succeeded, so this exercises exactly the rename-failure path.
+	newPrimaryPath := snapshotPath(dir, 5) // snapshot-v1-5.json
+	if err := os.MkdirAll(newPrimaryPath, 0755); err != nil {
+		t.Fatalf("MkdirAll rename-blocker %s: %v", newPrimaryPath, err)
+	}
+	t.Cleanup(func() { os.RemoveAll(newPrimaryPath) })
+
+	// ── Step 3: attempt the save at height 5 — must fail on rename.
+	const newTxTotal int64 = 99
+	snap5 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  5,
+		TipHashHex: hex5,
+		TxTotal:    newTxTotal,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	saveErr := saveStartupSnapshot(dir, snap5)
+	if saveErr == nil {
+		t.Fatal("saveStartupSnapshot: expected non-nil error when rename destination is a directory; got nil")
+	}
+
+	// ── Step 4: confirm the old primary at height 4 is still intact.
+
+	// The old primary file must still exist.
+	if _, statErr := os.Stat(oldPrimaryPath); os.IsNotExist(statErr) {
+		t.Fatalf("old primary %s was removed by the failed save", oldPrimaryPath)
+	}
+
+	// The old primary must still be parseable and carry the ORIGINAL TxTotal.
+	loaded, loadErr := loadStartupSnapshot(dir, 4, hex4)
+	if loadErr != nil {
+		t.Fatalf("old primary is unreadable after failed save: %v", loadErr)
+	}
+	if loaded.TxTotal != oldTxTotal {
+		t.Errorf("old primary TxTotal: got %d want %d — primary was corrupted by the failed save",
+			loaded.TxTotal, oldTxTotal)
+	}
+	if loaded.TipHashHex != hex4 {
+		t.Errorf("old primary TipHashHex mismatch after failed save")
+	}
+
+	// ── Step 5: confirm no stale .tmp files remain in the data directory.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("stale .tmp file left in data dir after failed save: %s", e.Name())
+		}
+	}
+}
+
 // ─── Test 10: truncated snapshot falls back to block scan ─────────────────────
 
 // TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
