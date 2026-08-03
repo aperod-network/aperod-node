@@ -21,6 +21,11 @@
 
 set -euo pipefail
 
+# Systemd runs services with LANG=C by default; without UTF-8 bash cannot
+# parse multi-byte characters (emoji, Cyrillic) in string literals.
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR="${DATA_DIR:-/opt/aperod/data}"
 SETTINGS_FILE="${DATA_DIR}/integration-settings.json"
@@ -69,11 +74,11 @@ _write_history_log() {
      && [ -n "${TELEGRAM_BOT_TOKEN:-}" ] \
      && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
     local tg_text
-    tg_text="❌ <b>Бэкап Aperod завершился с ошибкой</b>%0A%0A"
+    tg_text="[FAIL] <b>Бэкап Aperod завершился с ошибкой</b>%0A%0A"
     tg_text+="<b>Время:</b> ${ts_iso}%0A"
     tg_text+="<b>Длительность:</b> ${duration} сек%0A%0A"
-    tg_text+="⚠️ Данные могут быть непригодны для восстановления.%0A%0A"
-    tg_text+="📋 <b>Диагностика:</b>%0A"
+    tg_text+="[!] Данные могут быть непригодны для восстановления.%0A%0A"
+    tg_text+="[i] <b>Диагностика:</b>%0A"
     tg_text+="<code>journalctl -u aperod-backup.service -n 50</code>"
     curl -s --max-time 15 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
