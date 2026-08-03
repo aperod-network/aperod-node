@@ -83,6 +83,51 @@ func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*
 	return &snap, nil
 }
 
+// findLatestSnapshot returns the highest-height valid snapshot in dataDir that
+// is strictly below limitHeight, or nil if none exists.  Used to resume a
+// block scan from the most recent checkpoint instead of starting from block 1.
+func findLatestSnapshot(dataDir string, limitHeight uint64) *startupSnapshot {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil
+	}
+	prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
+	var bestHeight uint64
+	var bestName string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		rest := strings.TrimPrefix(name, prefix)
+		rest = strings.TrimSuffix(rest, ".json")
+		h, parseErr := strconv.ParseUint(rest, 10, 64)
+		if parseErr != nil || h == 0 || h >= limitHeight {
+			continue
+		}
+		if h > bestHeight {
+			bestHeight = h
+			bestName = name
+		}
+	}
+	if bestName == "" {
+		return nil
+	}
+	f, err := os.Open(filepath.Join(dataDir, bestName))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var snap startupSnapshot
+	if err := json.NewDecoder(f).Decode(&snap); err != nil {
+		return nil
+	}
+	if snap.Version != snapVersion || snap.TipHeight != bestHeight {
+		return nil
+	}
+	return &snap
+}
+
 // deleteOldSnapshots removes snapshot files whose height differs from keep.
 func deleteOldSnapshots(dataDir string, keep uint64) {
 	entries, err := os.ReadDir(dataDir)

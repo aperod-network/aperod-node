@@ -415,6 +415,30 @@ func run() error {
                         kiCount = 0
                 }
 
+                // ── Partial snapshot resume ───────────────────────────────────
+                // If an exact-tip snapshot was not found above, look for the most
+                // recent intermediate checkpoint (saved every 50K blocks during the
+                // previous scan).  Restoring from it means we only need to replay
+                // the blocks since the checkpoint, not all 900K+ blocks.
+                scanFrom := uint64(1)
+                if partial := findLatestSnapshot(cfg.DataDir, tipHeight); partial != nil {
+                        utxos.RestoreFromSnapshot(partial.UTXOs)
+                        registry.RestoreFromSnapshot(partial.Registry)
+                        registry.SetUTXOSet(utxos)
+                        if partial.TxTotal > 0 {
+                                initialTxTotal = partial.TxTotal
+                        }
+                        scanFrom = partial.TipHeight + 1
+                        log.Info("partial snapshot loaded — resuming scan from checkpoint",
+                                "snapshot_height", partial.TipHeight,
+                                "resume_from", scanFrom,
+                                "tip_height", tipHeight,
+                                "blocks_to_scan", tipHeight-partial.TipHeight,
+                        )
+                        runtime.GC()
+                        debug.FreeOSMemory()
+                }
+
                 // Single block scan for all three goals: active UTXO rebuild,
                 // key-image fallback, and stake replay.  One scan avoids decoding
                 // the full chain multiple times on restart.
@@ -423,13 +447,15 @@ func run() error {
                 scanStart := time.Now()
                 log.Info("running startup block scan",
                         "tip_height", tipHeight,
+                        "scan_from", scanFrom,
                         "ki_from_index", kiFromIndex,
                         "heap_sys_mib_before", msScanStart.Sys/(1024*1024))
                 var txCount int64 = 0
                 blocksWithStake := 0
-                const syncProgressInterval = uint64(1000)  // report every 1 000 blocks
-                const gcInterval            = uint64(10000) // force GC every 10 000 blocks to keep scan RSS flat
-                for h := uint64(1); h <= tipHeight; h++ {
+                const syncProgressInterval    = uint64(1000)  // report every 1 000 blocks
+                const gcInterval              = uint64(10000) // force GC every 10 000 blocks to keep scan RSS flat
+                const checkpointInterval      = uint64(50000) // save intermediate snapshot every 50 000 blocks
+                for h := scanFrom; h <= tipHeight; h++ {
                         // Update syncing progress so /api/v1/status can report it.
                         if apiSrv != nil && h%syncProgressInterval == 0 {
                                 apiSrv.SetSyncProgress(h, tipHeight)
@@ -525,6 +551,34 @@ func run() error {
                                                 h, replayErr)
                                 }
                                 blocksWithStake++
+                        }
+
+                        // Save an intermediate checkpoint every 50K blocks so that a
+                        // crash during the scan resumes from the checkpoint rather than
+                        // restarting from block 1.  TakeSnapshot is a deep copy under
+                        // RLock, so it is safe to call while the loop continues.
+                        if h%checkpointInterval == 0 && h < tipHeight {
+                                cpSnap := startupSnapshot{
+                                        Version:    snapVersion,
+                                        TipHeight:  h,
+                                        TipHashHex: func() string { h := b.Header.Hash(); return fmt.Sprintf("%x", h[:]) }(),
+                                        TxTotal:    func() int64 {
+                                                if kiFromIndex {
+                                                        return initialTxTotal
+                                                }
+                                                return txCount
+                                        }(),
+                                        UTXOs:    utxos.TakeSnapshot(),
+                                        Registry: registry.TakeSnapshot(),
+                                }
+                                go func(s startupSnapshot) {
+                                        if cpErr := saveStartupSnapshot(cfg.DataDir, s); cpErr != nil {
+                                                log.Warn("scan checkpoint save failed", "height", s.TipHeight, "err", cpErr)
+                                        } else {
+                                                log.Info("scan checkpoint saved", "height", s.TipHeight)
+                                                deleteOldSnapshots(cfg.DataDir, s.TipHeight)
+                                        }
+                                }(cpSnap)
                         }
                 }
 
