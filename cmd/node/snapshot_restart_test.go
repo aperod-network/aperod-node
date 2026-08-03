@@ -1328,6 +1328,118 @@ func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
 	}
 }
 
+// ─── Test 12: abort on copyFile failure leaves old primary intact ─────────────
+
+// TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact confirms that when the
+// required same-height prev-backup copy inside saveStartupSnapshot fails (e.g.
+// disk full), the function:
+//   (a) removes the .tmp file and returns a non-nil error, and
+//   (b) leaves the pre-existing primary snapshot file untouched so the node
+//       can still recover at startup.
+//
+// Scenario:
+//   - A valid snapshot is saved at height H, establishing an old primary
+//     (snapshot-v1-H.json) with known content.
+//   - A directory is created at the path copyFile would use for its own
+//     internal temp file (snapshotPrevPath(primary) + ".tmp").  On all
+//     supported platforms os.Create on a path that is an existing directory
+//     returns an error (EISDIR on Linux/macOS), which causes copyFile to fail
+//     before it writes any bytes.
+//   - saveStartupSnapshot is called again for the same height H.  It:
+//       1. writes the new primary .tmp (succeeds — a different path)
+//       2. calls copyFile(tmp, prevPath) — fails because prevPath+".tmp" is a dir
+//       3. removes tmp and returns a non-nil error
+//   - The test confirms the error is non-nil.
+//   - The test confirms the old primary is still readable and has the original
+//     TipHashHex / TxTotal values (i.e. no partial overwrite occurred).
+//
+// This guards the invariant that a copyFile failure during the required
+// prev-backup step aborts the save cleanly, leaving the recovery floor intact.
+func TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 4) // genesis + 4 blocks → height 0..4
+
+	tip := blocks[len(blocks)-1]
+	tipHash := tip.Hash()
+	tipHeight := tip.Header.Height // 4
+	tipHashHex := fmt.Sprintf("%x", tipHash[:])
+
+	// ── Step 1: write the initial snapshot — establishes the old primary.
+	const oldTxTotal int64 = 77
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    oldTxTotal,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("first saveStartupSnapshot: %v", err)
+	}
+
+	primaryPath := snapshotPath(dir, tipHeight) // snapshot-v1-4.json
+	if _, err := os.Stat(primaryPath); os.IsNotExist(err) {
+		t.Fatalf("primary snapshot not created: %s", primaryPath)
+	}
+
+	// ── Step 2: block the copyFile temp file that saveStartupSnapshot uses
+	// when writing the same-height prev-backup.
+	//
+	// copyFile(tmp, dst) creates dst+".tmp" internally before renaming to dst.
+	// Creating a directory at that path causes os.Create to return EISDIR,
+	// which propagates as a copyFile error → saveStartupSnapshot aborts.
+	prevPath := snapshotPrevPath(primaryPath)    // snapshot-v1-4-prev.json
+	blockPath := prevPath + ".tmp"               // snapshot-v1-4-prev.json.tmp
+	if err := os.MkdirAll(blockPath, 0755); err != nil {
+		t.Fatalf("MkdirAll blocker %s: %v", blockPath, err)
+	}
+	t.Cleanup(func() { os.RemoveAll(blockPath) })
+
+	// ── Step 3: attempt a second save at the same height.
+	// saveStartupSnapshot must fail because copyFile cannot create its temp file.
+	const newTxTotal int64 = 99
+	snap2 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    newTxTotal,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	saveErr := saveStartupSnapshot(dir, snap2)
+	if saveErr == nil {
+		t.Fatal("saveStartupSnapshot: expected non-nil error when copyFile is blocked; got nil")
+	}
+
+	// ── Step 4: confirm the old primary is still intact.
+
+	// The primary file must still exist.
+	if _, statErr := os.Stat(primaryPath); os.IsNotExist(statErr) {
+		t.Fatalf("old primary %s was removed by the failed save", primaryPath)
+	}
+
+	// The primary must still be parseable and carry the ORIGINAL content,
+	// not the new TxTotal that was written to the (now-removed) .tmp file.
+	loaded, loadErr := loadStartupSnapshot(dir, tipHeight, tipHashHex)
+	if loadErr != nil {
+		t.Fatalf("old primary is unreadable after failed save: %v", loadErr)
+	}
+	if loaded.TxTotal != oldTxTotal {
+		t.Errorf("old primary TxTotal: got %d want %d — primary was overwritten by a failed save",
+			loaded.TxTotal, oldTxTotal)
+	}
+	if loaded.TipHashHex != tipHashHex {
+		t.Errorf("old primary TipHashHex mismatch after failed save")
+	}
+
+	// The .tmp file that saveStartupSnapshot wrote must have been cleaned up.
+	tmpPath := primaryPath + ".tmp"
+	if _, statErr := os.Stat(tmpPath); !os.IsNotExist(statErr) {
+		t.Errorf("saveStartupSnapshot left stale .tmp file %s after aborting", tmpPath)
+	}
+}
+
 // ─── Test 10: truncated snapshot falls back to block scan ─────────────────────
 
 // TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
