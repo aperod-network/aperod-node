@@ -36,12 +36,12 @@ DB_USER="${APEROD_DB_USER:-postgres}"
 ENCRYPTION_PASSWORD="${APEROD_BACKUP_PASSWORD:?Задайте APEROD_BACKUP_PASSWORD в /etc/environment}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 BACKUP_NAME="aperod_backup_${TIMESTAMP}"
-TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+TEXTFILE_DIR="${APEROD_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 TEXTFILE="${TEXTFILE_DIR}/aperod_backup.prom"
 START_TS=$(date +%s)
 
 # ── Run-history log (parsed by Admin Panel /api/admin/backup/history) ─────────
-HISTORY_LOG="/var/log/aperod_backup.log"
+HISTORY_LOG="${APEROD_HISTORY_LOG:-/var/log/aperod_backup.log}"
 _BACKUP_FINAL_STATUS="fail"
 _BACKUP_FILE_BYTES=0
 _BACKUP_FILE_NAME=""
