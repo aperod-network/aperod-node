@@ -1003,7 +1003,121 @@ func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
 	}
 }
 
-// ─── Test 10: corrupt primary falls back to prev-backup ────────────────────────
+// ─── Test 10: missing primary with valid prev-backup → os.ErrNotExist ────────
+
+// TestMissingPrimaryWithValidPrevReturnsNotExist confirms that when the primary
+// snapshot file has been deleted (os.ErrNotExist) but a valid same-height
+// prev-backup exists on disk, loadStartupSnapshotWithFallback returns
+// os.ErrNotExist rather than attempting recovery from the prev-backup.
+//
+// This is intentional design: a missing primary means "no snapshot was written
+// for this tip", not "the snapshot is corrupt".  Treating absence as corruption
+// would hide the case where an operator accidentally deleted the snapshot — or
+// where the node simply never reached a checkpoint at this height — and would
+// silently load state from an older backup instead of triggering a clean scan.
+//
+// Assertions:
+//   - loadStartupSnapshotWithFallback returns a non-nil error.
+//   - The error satisfies os.IsNotExist (so the caller treats it as "no fast
+//     path available" and starts a full block scan).
+//   - snapLoaded stays false.
+//   - The "startup fast path complete" log line is NOT emitted.
+func TestMissingPrimaryWithValidPrevReturnsNotExist(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 3) // genesis + 3 blocks → height 0..3
+
+	tip := blocks[len(blocks)-1]
+	tipHash := tip.Hash()
+	tipHeight := tip.Header.Height // 3
+	tipHashHex := fmt.Sprintf("%x", tipHash[:])
+
+	// ── Save a valid snapshot so both primary and prev-backup are created.
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	primaryPath := snapshotPath(dir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+
+	// Confirm both files exist before removing the primary.
+	if _, err := os.Stat(primaryPath); os.IsNotExist(err) {
+		t.Fatalf("primary snapshot not created: %s", primaryPath)
+	}
+	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
+		t.Fatalf("same-height prev-backup not created: %s", prevPath)
+	}
+
+	// Confirm the prev-backup is valid (sanity-check for the test setup).
+	validPrev, prevErr := loadPrevBackupSnapshot(dir, tipHeight, tipHashHex)
+	if prevErr != nil {
+		t.Fatalf("test setup: prev-backup should be valid before primary removal; err=%v", prevErr)
+	}
+	if validPrev == nil {
+		t.Fatal("test setup: prev-backup returned nil before primary removal")
+	}
+
+	// ── Remove the primary snapshot file (simulates operator deletion or a
+	// failure mode where the temp→primary rename never completed).
+	if err := os.Remove(primaryPath); err != nil {
+		t.Fatalf("os.Remove primary: %v", err)
+	}
+	if _, err := os.Stat(primaryPath); !os.IsNotExist(err) {
+		t.Fatalf("primary snapshot still exists after removal — test setup error")
+	}
+
+	// ── Call the production entry point.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	if loadErr == nil {
+		snapLoaded = true
+		log.Info("startup fast path complete — snapshot loaded",
+			"tip_height", tipHeight,
+			"active_utxos", len(loaded.UTXOs.ActiveUTXOs),
+		)
+	} else if os.IsNotExist(loadErr) {
+		// Expected branch: caller treats missing primary as "no fast path".
+		// No log line here — mirrors the main.go behaviour for os.ErrNotExist.
+		_ = loadErr
+	} else {
+		log.Warn("snapshot load error, falling back to block scan", "err", loadErr)
+	}
+
+	// ── Assertions.
+
+	// The error must be non-nil and must satisfy os.IsNotExist so the caller
+	// correctly falls back to a full block scan without treating absence as
+	// corruption.
+	if loadErr == nil {
+		t.Error("loadStartupSnapshotWithFallback: expected non-nil error when primary is absent; got nil")
+	}
+	if loadErr != nil && !os.IsNotExist(loadErr) {
+		t.Errorf("loadStartupSnapshotWithFallback: expected os.ErrNotExist for missing primary; got: %v", loadErr)
+	}
+
+	// snapLoaded must remain false.
+	if snapLoaded {
+		t.Error("snapLoaded should be false when primary is absent (even though prev-backup is valid)")
+	}
+
+	// The fast-path success message must NOT appear.
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path success log must NOT appear when primary snapshot is missing")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
+
+// ─── Test 11: corrupt primary falls back to prev-backup ────────────────────────
 
 // TestCorruptPrimaryFallsBackToPrev confirms that when the primary snapshot is
 // truncated (simulating a mid-write crash) and a valid same-height prev-backup
