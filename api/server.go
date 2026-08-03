@@ -67,6 +67,13 @@ type Server struct {
         // and 0 once it is fully ready.  Changed atomically — no lock needed.
         // Default is 1 (syncing) so callers see the correct state before SetReady.
         syncing int32
+
+        // syncingHeight and tipHeight track startup block-scan progress so that
+        // /api/v1/status can report how far along the replay is.
+        // syncingHeight is the last block processed; tipHeight is the total to load.
+        // Both are updated atomically by SetSyncProgress in cmd/node/main.go.
+        syncingHeight int64
+        tipHeight     int64
 }
 
 // NewServer creates a new API server.
@@ -90,6 +97,21 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
 // Call this after all blocks have been replayed from disk so that
 // /api/v1/status reports syncing=false and UTXO supply queries proceed normally.
 func (s *Server) SetReady() { atomic.StoreInt32(&s.syncing, 0) }
+
+// SetSyncProgress records how far the startup block scan has progressed.
+// current is the height of the last block processed; tip is the chain tip height.
+// Call this periodically inside the startup scan loop so /api/v1/status can
+// report meaningful progress to operators while the node is still loading.
+func (s *Server) SetSyncProgress(current, tip uint64) {
+        atomic.StoreInt64(&s.syncingHeight, int64(current))
+        atomic.StoreInt64(&s.tipHeight, int64(tip))
+}
+
+// SyncingHeight returns the last block height processed by the startup scan.
+func (s *Server) SyncingHeight() int64 { return atomic.LoadInt64(&s.syncingHeight) }
+
+// TipHeight returns the chain tip height that the startup scan is working toward.
+func (s *Server) TipHeight() int64 { return atomic.LoadInt64(&s.tipHeight) }
 
 // SetRegistry wires the live PoS validator registry so the API can serve
 // /api/v1/validators and include validator_count in network stats.

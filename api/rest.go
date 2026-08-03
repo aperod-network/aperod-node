@@ -1995,9 +1995,13 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		height = tip.Header.Height
 	}
 	syncing := atomic.LoadInt32(&s.syncing) == 1
+	syncingHeight := atomic.LoadInt64(&s.syncingHeight)
+	tipHeight := atomic.LoadInt64(&s.tipHeight)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":      true,
-		"height":  height,
-		"syncing": syncing,
+		"ok":             true,
+		"height":         height,
+		"syncing":        syncing,
+		"syncing_height": syncingHeight,
+		"tip_height":     tipHeight,
 	})
 }

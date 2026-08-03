@@ -197,6 +197,37 @@ func run() error {
         // The resume path initialises it inside the startup scan below.
         var registry *core.ValidatorRegistry
 
+        // ── Early API server (syncing phase) ─────────────────────────────────────
+        // Create and start the API server before the startup block scan so that
+        // operators can query /api/v1/status and see syncing progress while the
+        // node replays blocks from disk (which can take hours on large chains).
+        // The server starts with syncing=1 (default); SetReady() is called after
+        // the scan and engine setup so UTXO queries remain blocked until then.
+        // The remaining configuration (SetRegistry, SetValidatorKey, etc.) that
+        // depends on the consensus engine is applied later in step 9 below.
+        var apiSrv *api.Server
+        if cfg.API.Enabled && cfg.API.ListenAddr != "" {
+                apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
+                apiSrv.SetAllowedOrigins(cfg.API.CORS)
+                apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
+                apiSrv.SetStore(db)
+                apiSrv.SetPruningMode(cfg.Pruning.Mode)
+                apiSrv.SetKeepBlocks(cfg.Pruning.KeepBlocks)
+                if cfg.API.Key != "" {
+                        apiSrv.SetAPIKey(cfg.API.Key)
+                }
+                // Seed tip so the first /api/v1/status call has a meaningful tip_height.
+                if tipHeight > 0 {
+                        apiSrv.SetSyncProgress(0, tipHeight)
+                }
+                go func() {
+                        if err := apiSrv.Start(); err != nil {
+                                log.Error("API server stopped", "err", err)
+                        }
+                }()
+                log.Info("API server started (syncing phase)", "addr", cfg.API.ListenAddr)
+        }
+
         if tipHash == (crypto.Hash32{}) {
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
@@ -365,7 +396,13 @@ func run() error {
                         "ki_from_index", kiFromIndex)
                 var txCount int64 = 0
                 blocksWithStake := 0
+                const syncProgressInterval = uint64(1000) // report every 1 000 blocks
                 for h := uint64(1); h <= tipHeight; h++ {
+                        // Update syncing progress so /api/v1/status can report it.
+                        if apiSrv != nil && h%syncProgressInterval == 0 {
+                                apiSrv.SetSyncProgress(h, tipHeight)
+                        }
+
                         raw, fetchErr := db.GetRawBlockByHeight(h)
                         if fetchErr != nil || raw == nil {
                                 return fmt.Errorf(
@@ -510,10 +547,10 @@ func run() error {
         )
 
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
-        // host and apiSrv are declared here so OnBlockProduced can reference them
-        // (both are assigned after engine creation, but closures capture by reference).
+        // host is declared here so OnBlockProduced can reference it
+        // (assigned after engine creation; closure captures by reference).
+        // apiSrv was declared above and started in the early API server section.
         var host *p2p.Host
-        var apiSrv *api.Server
 
         // For the resume path, registry is already created and seeded inside the
         // startup scan above.  For genesis, it is nil here; NewEngine creates it.
@@ -621,29 +658,15 @@ func run() error {
                 }
         }()
 
-        if cfg.API.Enabled && cfg.API.ListenAddr != "" {
-                apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
-                apiSrv.SetAllowedOrigins(cfg.API.CORS)
+        if apiSrv != nil {
+                // Wire engine-dependent options now that the consensus engine exists.
                 apiSrv.SetRegistry(engine.Registry())
                 apiSrv.SetValidatorKey(myKey)
-                apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey) // enables inline UTXO amount decryption when view_key set in node.yaml
                 apiSrv.SetTxTotal(initialTxTotal)
-                apiSrv.SetStore(db)                       // enables pruned-block fallback in the REST API
-                apiSrv.SetPruningMode(cfg.Pruning.Mode)   // lets stake endpoints detect pruned UTXOs
-                apiSrv.SetKeepBlocks(cfg.Pruning.KeepBlocks) // enables blocks_until_pruned warning in restUTXO
-                // F-5 fix: wire API key so apr_sendRawTransaction requires auth in production.
-                if cfg.API.Key != "" {
-                        apiSrv.SetAPIKey(cfg.API.Key)
-                }
-        apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
-                // Block loading and startup scan completed before this point, so the
-                // node is ready to serve UTXO queries immediately.
+                apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
+                // Startup scan is complete — mark the node ready for UTXO queries.
                 apiSrv.SetReady()
-                go func() {
-                        if err := apiSrv.Start(); err != nil {
-                                log.Error("API server stopped", "err", err)
-                        }
-                }()
+                log.Info("API server ready (startup scan complete)")
         }
 
         // ── 9. Start P2P networking ───────────────────────────────────────────────
