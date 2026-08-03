@@ -229,7 +229,7 @@ func TestFindLatestSnapshot_IgnoresPrevFiles(t *testing.T) {
 
 	// findLatestSnapshot with limit > 999 must return the primary at 100, not
 	// the prev-only height 999.
-	got := findLatestSnapshot(dir, 2000)
+	got := findLatestSnapshot(dir, 2000, nil)
 	if got == nil {
 		t.Fatal("findLatestSnapshot returned nil, want height 100")
 	}

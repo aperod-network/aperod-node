@@ -80,7 +80,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	// from it means we only need to replay blocks since that checkpoint.
 	scanFrom := uint64(1)
 	txTotal := p.InitTxTotal
-	if partial := findLatestSnapshot(p.DataDir, p.TipHeight); partial != nil {
+	if partial := findLatestSnapshot(p.DataDir, p.TipHeight, p.Log); partial != nil {
 		// Cross-check: verify the snapshot's recorded TipHashHex against the
 		// actual block stored in the DB at that height.  A mismatch means the
 		// block was reorganised (e.g. in dev/test) after the checkpoint was

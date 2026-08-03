@@ -301,7 +301,7 @@ func TestFindLatestSnapshot_LimitHeight(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := findLatestSnapshot(dir, tc.limit)
+		got := findLatestSnapshot(dir, tc.limit, nil)
 		if tc.wantNil {
 			if got != nil {
 				t.Errorf("findLatestSnapshot(%d) = height %d, want nil",
@@ -332,10 +332,74 @@ func TestFindLatestSnapshot_CorruptFile(t *testing.T) {
 		t.Fatalf("write corrupt file: %v", err)
 	}
 
-	got := findLatestSnapshot(dir, 100)
+	got := findLatestSnapshot(dir, 100, nil)
 	if got != nil {
 		t.Errorf("findLatestSnapshot returned height=%d for a corrupt file, want nil",
 			got.TipHeight)
+	}
+}
+
+// ─── Test 4b: corrupt primary recovered from prev-backup ─────────────────────
+
+// TestFindLatestSnapshot_CorruptPrimaryRecoveredFromPrev verifies that when a
+// candidate primary is corrupt (truncated JSON), findLatestSnapshot falls back
+// to the adjacent "-prev.json" backup for the same height instead of discarding
+// the checkpoint entirely and returning nil (or an older checkpoint).
+//
+// Setup:
+//   - height-50 snapshot saved normally via saveStartupSnapshot (creates both
+//     primary and prev-backup as a side-effect of the production save path).
+//   - Primary at height 50 is then overwritten with corrupt bytes.
+//   - findLatestSnapshot(dir, 100, log) must return a snapshot at height 50
+//     recovered from the prev-backup, not nil.
+//   - A warning log must be emitted to notify the operator.
+func TestFindLatestSnapshot_CorruptPrimaryRecoveredFromPrev(t *testing.T) {
+	dir := t.TempDir()
+
+	// Save a valid snapshot at height 50.  saveStartupSnapshot writes both
+	// the primary and a same-height "-prev.json" backup atomically.
+	snap50 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  50,
+		TipHashHex: fmt.Sprintf("%016x", uint64(50)),
+		TxTotal:    50,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap50); err != nil {
+		t.Fatalf("saveStartupSnapshot(50): %v", err)
+	}
+
+	// Verify the prev-backup was created (precondition for the test to be meaningful).
+	prevP := snapshotPrevPath(snapshotPath(dir, 50))
+	if _, err := os.Stat(prevP); os.IsNotExist(err) {
+		t.Fatalf("prev-backup at height 50 not created by saveStartupSnapshot — precondition failed")
+	}
+
+	// Corrupt the primary at height 50 (truncated JSON).
+	if err := os.WriteFile(snapshotPath(dir, 50), []byte(`{"v":1,"tip_height":50,"tip_hash":"ab`), 0644); err != nil {
+		t.Fatalf("corrupt primary at height 50: %v", err)
+	}
+
+	// Capture log output so we can assert the recovery warning was emitted.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	got := findLatestSnapshot(dir, 100, log)
+
+	// ── Assertion 1: a snapshot was returned (not nil).
+	if got == nil {
+		t.Fatal("findLatestSnapshot returned nil — expected recovery from prev-backup at height 50")
+	}
+
+	// ── Assertion 2: the recovered snapshot is at the right height.
+	if got.TipHeight != 50 {
+		t.Errorf("recovered snapshot TipHeight = %d, want 50", got.TipHeight)
+	}
+
+	// ── Assertion 3: operator-visible warning was logged.
+	if !logContainsMsg(&logBuf, "checkpoint recovery — primary corrupt, loaded prev-backup") {
+		t.Errorf("expected recovery warning log was not emitted\nlog:\n%s", logBuf.String())
 	}
 }
 
@@ -456,7 +520,7 @@ func TestFindLatestSnapshot_MultipleCheckpoints(t *testing.T) {
 	}
 
 	// Chain crashed mid-scan at height 180 000.
-	got := findLatestSnapshot(dir, 180_000)
+	got := findLatestSnapshot(dir, 180_000, nil)
 	if got == nil {
 		t.Fatal("findLatestSnapshot(180000) = nil, want height 150000")
 	}

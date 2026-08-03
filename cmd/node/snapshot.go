@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -236,37 +237,11 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 	return prevSnap, nil
 }
 
-// findLatestSnapshot returns the highest-height valid snapshot in dataDir that
-// is strictly below limitHeight, or nil if none exists.  Used to resume a
-// block scan from the most recent checkpoint instead of starting from block 1.
-func findLatestSnapshot(dataDir string, limitHeight uint64) *startupSnapshot {
-	entries, err := os.ReadDir(dataDir)
-	if err != nil {
-		return nil
-	}
-	prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
-	var bestHeight uint64
-	var bestName string
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, ".tmp") {
-			continue
-		}
-		rest := strings.TrimPrefix(name, prefix)
-		rest = strings.TrimSuffix(rest, ".json")
-		h, parseErr := strconv.ParseUint(rest, 10, 64)
-		if parseErr != nil || h == 0 || h >= limitHeight {
-			continue
-		}
-		if h > bestHeight {
-			bestHeight = h
-			bestName = name
-		}
-	}
-	if bestName == "" {
-		return nil
-	}
-	f, err := os.Open(filepath.Join(dataDir, bestName))
+// tryLoadSnapshotFile opens path, decodes the JSON, and validates the schema
+// version and recorded tip height against wantHeight.  Returns nil on any
+// error so callers can unconditionally check for nil without error handling.
+func tryLoadSnapshotFile(path string, wantHeight uint64) *startupSnapshot {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
@@ -275,10 +250,77 @@ func findLatestSnapshot(dataDir string, limitHeight uint64) *startupSnapshot {
 	if err := json.NewDecoder(f).Decode(&snap); err != nil {
 		return nil
 	}
-	if snap.Version != snapVersion || snap.TipHeight != bestHeight {
+	if snap.Version != snapVersion || snap.TipHeight != wantHeight {
 		return nil
 	}
 	return &snap
+}
+
+// findLatestSnapshot returns the highest-height valid snapshot in dataDir that
+// is strictly below limitHeight, or nil if none exists.  Used to resume a
+// block scan from the most recent checkpoint instead of starting from block 1.
+//
+// When the primary snapshot for a candidate height is corrupt or unreadable the
+// function falls back to the adjacent "-prev.json" backup before discarding
+// that height and trying older checkpoints.  This mirrors the recovery logic in
+// loadStartupSnapshotWithFallback so that intermediate checkpoints benefit from
+// the same protection.  A warning is logged (when log is non-nil) whenever a
+// checkpoint is recovered this way so operators can see the event in node logs.
+func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *startupSnapshot {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil
+	}
+	prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
+
+	type candidate struct {
+		height uint64
+		name   string
+	}
+	var candidates []candidate
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, "-prev.json") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		rest := strings.TrimPrefix(name, prefix)
+		rest = strings.TrimSuffix(rest, ".json")
+		h, parseErr := strconv.ParseUint(rest, 10, 64)
+		if parseErr != nil || h == 0 || h >= limitHeight {
+			continue
+		}
+		candidates = append(candidates, candidate{h, name})
+	}
+
+	// Try candidates from highest to lowest so the most recent checkpoint is
+	// preferred and we only fall back to older ones when both the primary and
+	// its prev-backup are unreadable at the best height.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].height > candidates[j].height
+	})
+
+	for _, c := range candidates {
+		primaryPath := filepath.Join(dataDir, c.name)
+
+		if snap := tryLoadSnapshotFile(primaryPath, c.height); snap != nil {
+			return snap
+		}
+
+		// Primary failed — attempt recovery from the adjacent prev-backup
+		// before discarding this height and trying an older checkpoint.
+		prevPath := snapshotPrevPath(primaryPath)
+		if snap := tryLoadSnapshotFile(prevPath, c.height); snap != nil {
+			if log != nil {
+				log.Warn("checkpoint recovery — primary corrupt, loaded prev-backup",
+					"height", c.height)
+			}
+			return snap
+		}
+	}
+	return nil
 }
 
 // deleteOldSnapshots removes snapshot files whose height differs from keep.
