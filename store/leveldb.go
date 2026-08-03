@@ -284,6 +284,37 @@ func (d *DB) GetRawBlockByHeight(height uint64) ([]byte, error) {
 
 // ─── Iteration helpers ────────────────────────────────────────────────────────
 
+// StoreActiveUTXOCount persists the number of currently-active (unspent)
+// UTXOs for the snapshot identified by tipHashHex.  Keying by the block hash
+// ensures that concurrent goroutines saving snapshots at different heights
+// write to separate DB entries and cannot overwrite each other.  The value is
+// used by the startup divergence check to compare the snapshot's declared
+// active UTXO count against an authoritative count recorded at save time.
+func (d *DB) StoreActiveUTXOCount(tipHashHex string, n int) error {
+        buf := make([]byte, 8)
+        binary.LittleEndian.PutUint64(buf, uint64(n))
+        return d.PutMeta("active_utxo_count/"+tipHashHex, buf)
+}
+
+// LoadActiveUTXOCount returns the active (unspent) UTXO count that was stored
+// for the snapshot identified by tipHashHex.  ok is false when no entry exists
+// for this specific hash (e.g. the process crashed before the metadata write,
+// or the snapshot pre-dates this feature); the caller should skip the
+// divergence check in that case rather than treating zero as a valid count.
+func (d *DB) LoadActiveUTXOCount(tipHashHex string) (n int, ok bool, err error) {
+        v, err := d.GetMeta("active_utxo_count/" + tipHashHex)
+        if err != nil {
+                return 0, false, err
+        }
+        if v == nil {
+                return 0, false, nil
+        }
+        if len(v) != 8 {
+                return 0, false, fmt.Errorf("store: active_utxo_count metadata corrupted (got %d bytes, want 8)", len(v))
+        }
+        return int(binary.LittleEndian.Uint64(v)), true, nil
+}
+
 // IterUTXOs calls fn for every UTXO in the database (for scanning).
 func (d *DB) IterUTXOs(fn func(*StoredUTXO) error) error {
         iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)

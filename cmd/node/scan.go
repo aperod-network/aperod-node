@@ -40,6 +40,12 @@ type startupScanParams struct {
 	InitTxTotal int64 // pre-loaded tx total (used when KiFromIndex is true)
 	Log         *slog.Logger
 
+	// UTXOCountTolerancePct is the maximum allowed percentage difference
+	// between a checkpoint's active UTXO count and the count stored in the DB
+	// before the checkpoint is rejected and the scan starts from block 1.
+	// Mirrors cfg.Snapshot.UTXOCountTolerancePct.  0 means exact match required.
+	UTXOCountTolerancePct float64
+
 	// SetSyncProgress may be nil; when non-nil it is called every 1 000 blocks
 	// so that callers can report syncing progress to external consumers.
 	SetSyncProgress func(syncing, tip uint64)
@@ -105,21 +111,67 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			}
 		}
 		if hashOK {
-			p.UTXOs.RestoreFromSnapshot(partial.UTXOs)
-			p.Registry.RestoreFromSnapshot(partial.Registry)
-			p.Registry.SetUTXOSet(p.UTXOs)
-			if partial.TxTotal > 0 {
-				txTotal = partial.TxTotal
+			// ── UTXO count divergence check (partial checkpoint) ─────────────
+			// Compare the checkpoint's active UTXO count against the hash-keyed
+			// metadata written when this checkpoint was saved.  A mismatch beyond
+			// tolerance indicates a stale or partially-written checkpoint and
+			// causes the resume path to fall back to a full scan from block 1.
+			// The check is skipped when no metadata exists for this hash (e.g.
+			// the checkpoint pre-dates this feature or the process crashed before
+			// the metadata write) — the safe direction is to accept.
+			utxoCountOK := true
+			partialSnapCount := len(partial.UTXOs.ActiveUTXOs)
+			if dbActiveCount, dbHasCount, countErr := p.DB.LoadActiveUTXOCount(partial.TipHashHex); countErr != nil {
+				p.Log.Warn("partial snapshot UTXO count check skipped — db metadata error",
+					"snapshot_height", partial.TipHeight, "err", countErr)
+			} else if dbHasCount {
+				diff := partialSnapCount - dbActiveCount
+				if diff < 0 {
+					diff = -diff
+				}
+				larger := dbActiveCount
+				if partialSnapCount > larger {
+					larger = partialSnapCount
+				}
+				var diffPct float64
+				if larger > 0 {
+					diffPct = float64(diff) / float64(larger) * 100.0
+				}
+				if diffPct > p.UTXOCountTolerancePct {
+					p.Log.Warn("partial snapshot discarded — active UTXO count diverges from saved count; scanning from block 1",
+						"snapshot_height", partial.TipHeight,
+						"snapshot_active_utxos", partialSnapCount,
+						"db_last_active_utxos", dbActiveCount,
+						"diff_pct", fmt.Sprintf("%.2f%%", diffPct),
+						"tolerance_pct", p.UTXOCountTolerancePct,
+					)
+					utxoCountOK = false
+				} else {
+					p.Log.Info("partial snapshot UTXO count check passed",
+						"snapshot_height", partial.TipHeight,
+						"snapshot_active_utxos", partialSnapCount,
+						"db_last_active_utxos", dbActiveCount,
+						"diff_pct", fmt.Sprintf("%.2f%%", diffPct),
+					)
+				}
 			}
-			scanFrom = partial.TipHeight + 1
-			p.Log.Info("partial snapshot loaded — resuming scan from checkpoint",
-				"snapshot_height", partial.TipHeight,
-				"resume_from", scanFrom,
-				"tip_height", p.TipHeight,
-				"blocks_to_scan", p.TipHeight-partial.TipHeight,
-			)
-			runtime.GC()
-			debug.FreeOSMemory()
+			if utxoCountOK {
+				p.UTXOs.RestoreFromSnapshot(partial.UTXOs)
+				p.Registry.RestoreFromSnapshot(partial.Registry)
+				p.Registry.SetUTXOSet(p.UTXOs)
+				if partial.TxTotal > 0 {
+					txTotal = partial.TxTotal
+				}
+				scanFrom = partial.TipHeight + 1
+				p.Log.Info("partial snapshot loaded — resuming scan from checkpoint",
+					"snapshot_height", partial.TipHeight,
+					"resume_from", scanFrom,
+					"tip_height", p.TipHeight,
+					"blocks_to_scan", p.TipHeight-partial.TipHeight,
+				)
+				runtime.GC()
+				debug.FreeOSMemory()
+			}
 		}
 	}
 
@@ -231,10 +283,11 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				UTXOs:      p.UTXOs.TakeSnapshot(),
 				Registry:   p.Registry.TakeSnapshot(),
 			}
+			cpActiveCount := len(cpSnap.UTXOs.ActiveUTXOs)
 			if p.SnapshotWg != nil {
 				p.SnapshotWg.Add(1)
 			}
-			go func(s startupSnapshot) {
+			go func(s startupSnapshot, activeCount int) {
 				if p.SnapshotWg != nil {
 					defer p.SnapshotWg.Done()
 				}
@@ -243,8 +296,14 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				} else {
 					p.Log.Info("scan checkpoint saved", "height", s.TipHeight)
 					deleteOldSnapshots(p.DataDir, s.TipHeight)
+					// Persist the active UTXO count keyed by this checkpoint's
+					// tip hash so the resume-path divergence check can validate it.
+					if metaErr := p.DB.StoreActiveUTXOCount(s.TipHashHex, activeCount); metaErr != nil {
+						p.Log.Warn("scan checkpoint: failed to persist active_utxo_count metadata",
+							"height", s.TipHeight, "err", metaErr)
+					}
 				}
-			}(cpSnap)
+			}(cpSnap, cpActiveCount)
 		}
 	}
 
@@ -298,7 +357,8 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		if p.SnapshotWg != nil {
 			p.SnapshotWg.Add(1)
 		}
-		go func() {
+		activeCount := len(snapToSave.UTXOs.ActiveUTXOs)
+	go func() {
 			if p.SnapshotWg != nil {
 				defer p.SnapshotWg.Done()
 			}
@@ -307,6 +367,13 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			} else {
 				p.Log.Info("startup snapshot saved", "tip_height", p.TipHeight)
 				deleteOldSnapshots(p.DataDir, p.TipHeight)
+				// Persist the active UTXO count keyed by tip hash alongside the
+				// snapshot so the startup divergence check has an active-only
+				// reference count that cannot be overwritten by a concurrent
+				// goroutine saving a snapshot at a different height.
+				if metaErr := p.DB.StoreActiveUTXOCount(snapToSave.TipHashHex, activeCount); metaErr != nil {
+					p.Log.Warn("failed to persist active_utxo_count metadata", "err", metaErr)
+				}
 			}
 		}()
 	}

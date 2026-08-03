@@ -359,25 +359,78 @@ func run() error {
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
                         if snap, serr := loadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex); serr == nil {
-                                utxos.RestoreFromSnapshot(snap.UTXOs)
-                                registry.RestoreFromSnapshot(snap.Registry)
-                                registry.SetUTXOSet(utxos) // re-wire pointer (not serialised)
-                                if snap.TxTotal > 0 {
-                                        initialTxTotal = snap.TxTotal
+                                // ── UTXO count divergence check ──────────────────────────────────
+                                // Before restoring, compare the snapshot's active (unspent) UTXO
+                                // count against the durable active count written to DB metadata the
+                                // last time a snapshot was saved.  A mismatch beyond the configured
+                                // tolerance indicates a stale or partially-written snapshot (e.g.
+                                // written mid-crash, or produced by a binary with a different UTXO
+                                // schema).
+                                //
+                                // The check is gated on the metadata value being present.  On a
+                                // node that has never completed a successful snapshot save the key
+                                // does not exist and the check is skipped rather than treating a
+                                // missing count as zero.
+                                utxoCountOK := true
+                                snapUTXOCount := len(snap.UTXOs.ActiveUTXOs)
+                                dbActiveCount, dbHasCount, countErr := db.LoadActiveUTXOCount(tipHashHex)
+                                if countErr != nil {
+                                        log.Warn("snapshot UTXO count check skipped — db metadata error", "err", countErr)
+                                } else if !dbHasCount {
+                                        log.Info("snapshot UTXO count check skipped — no prior active count in db (first snapshot)")
+                                } else {
+                                        diff := snapUTXOCount - dbActiveCount
+                                        if diff < 0 {
+                                                diff = -diff
+                                        }
+                                        larger := dbActiveCount
+                                        if snapUTXOCount > larger {
+                                                larger = snapUTXOCount
+                                        }
+                                        // Protect against both counts being 0 (genesis edge case).
+                                        var diffPct float64
+                                        if larger > 0 {
+                                                diffPct = float64(diff) / float64(larger) * 100.0
+                                        }
+                                        tolerancePct := cfg.Snapshot.UTXOCountTolerancePct
+                                        if diffPct > tolerancePct {
+                                                log.Warn("snapshot rejected — active UTXO count diverges from last-saved count; falling back to block scan",
+                                                        "snapshot_active_utxos", snapUTXOCount,
+                                                        "db_last_active_utxos", dbActiveCount,
+                                                        "diff_pct", fmt.Sprintf("%.2f%%", diffPct),
+                                                        "tolerance_pct", tolerancePct,
+                                                )
+                                                utxoCountOK = false
+                                        } else {
+                                                log.Info("snapshot UTXO count check passed",
+                                                        "snapshot_active_utxos", snapUTXOCount,
+                                                        "db_last_active_utxos", dbActiveCount,
+                                                        "diff_pct", fmt.Sprintf("%.2f%%", diffPct),
+                                                )
+                                        }
                                 }
-                                log.Info("startup fast path complete — snapshot loaded",
-                                        "tip_height", tipHeight,
-                                        "active_utxos", len(snap.UTXOs.ActiveUTXOs),
-                                        "spent_decoys", len(snap.UTXOs.SpentDecoys),
-                                        "key_images", len(snap.UTXOs.KeyImages),
-                                )
-                                snapLoaded = true
-                                // Release the raw snapshot struct now that its contents have been
-                                // copied into the UTXOSet maps.  Without an explicit GC the
-                                // deserialised snapshot and the in-memory maps coexist until the
-                                // next automatic collection, doubling peak RSS on load.
-                                runtime.GC()
-                                debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
+
+                                if utxoCountOK {
+                                        utxos.RestoreFromSnapshot(snap.UTXOs)
+                                        registry.RestoreFromSnapshot(snap.Registry)
+                                        registry.SetUTXOSet(utxos) // re-wire pointer (not serialised)
+                                        if snap.TxTotal > 0 {
+                                                initialTxTotal = snap.TxTotal
+                                        }
+                                        log.Info("startup fast path complete — snapshot loaded",
+                                                "tip_height", tipHeight,
+                                                "active_utxos", snapUTXOCount,
+                                                "spent_decoys", len(snap.UTXOs.SpentDecoys),
+                                                "key_images", len(snap.UTXOs.KeyImages),
+                                        )
+                                        snapLoaded = true
+                                        // Release the raw snapshot struct now that its contents have been
+                                        // copied into the UTXOSet maps.  Without an explicit GC the
+                                        // deserialised snapshot and the in-memory maps coexist until the
+                                        // next automatic collection, doubling peak RSS on load.
+                                        runtime.GC()
+                                        debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
+                                }
                         } else if !os.IsNotExist(serr) {
                                 log.Warn("snapshot load error, falling back to block scan", "err", serr)
                         }
@@ -420,16 +473,17 @@ func run() error {
                         setSyncProgress = apiSrv.SetSyncProgress
                 }
                 scanResult, scanErr := runStartupScan(startupScanParams{
-                        DataDir:         cfg.DataDir,
-                        TipHeight:       tipHeight,
-                        TipHashHex:      fmt.Sprintf("%x", tipHash[:]),
-                        DB:              db,
-                        UTXOs:           utxos,
-                        Registry:        registry,
-                        KiFromIndex:     kiFromIndex,
-                        InitTxTotal:     initialTxTotal,
-                        Log:             log,
-                        SetSyncProgress: setSyncProgress,
+                        DataDir:               cfg.DataDir,
+                        TipHeight:             tipHeight,
+                        TipHashHex:            fmt.Sprintf("%x", tipHash[:]),
+                        DB:                    db,
+                        UTXOs:                 utxos,
+                        Registry:              registry,
+                        KiFromIndex:           kiFromIndex,
+                        InitTxTotal:           initialTxTotal,
+                        Log:                   log,
+                        UTXOCountTolerancePct: cfg.Snapshot.UTXOCountTolerancePct,
+                        SetSyncProgress:       setSyncProgress,
                 })
                 if scanErr != nil {
                         return scanErr
@@ -551,15 +605,25 @@ func run() error {
                                 UTXOs:      utxos.TakeSnapshot(),
                                 Registry:   engine.Registry().TakeSnapshot(),
                         }
-                        go func(snap startupSnapshot, height uint64) {
+                        periodicActive := len(periodicSnap.UTXOs.ActiveUTXOs)
+                        go func(snap startupSnapshot, height uint64, activeCount int) {
                                 if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
                                         log.Warn("failed to save periodic snapshot",
                                                 "height", height, "err", saveErr)
                                 } else {
                                         log.Info("periodic snapshot saved", "height", height)
                                         deleteOldSnapshots(cfg.DataDir, height)
+                                        // Persist the active UTXO count keyed by tip hash so the
+                                        // next restart's divergence check has an active-only
+                                        // reference count that is specific to this snapshot and
+                                        // cannot be overwritten by a concurrent goroutine saving
+                                        // a snapshot at a different height.
+                                        if metaErr := db.StoreActiveUTXOCount(snap.TipHashHex, activeCount); metaErr != nil {
+                                                log.Warn("failed to persist active_utxo_count metadata",
+                                                        "height", height, "err", metaErr)
+                                        }
                                 }
-                        }(periodicSnap, h)
+                        }(periodicSnap, h, periodicActive)
                 },
         }, chain, mempool, log)
 
@@ -815,6 +879,12 @@ func run() error {
                         } else {
                                 log.Info("shutdown: snapshot saved", "tip_height", shutTipHeight)
                                 deleteOldSnapshots(cfg.DataDir, shutTipHeight)
+                                // Persist the active UTXO count keyed by tip hash so the
+                                // next restart's divergence check has an active-only reference
+                                // count specific to this snapshot.
+                                if metaErr := db.StoreActiveUTXOCount(shutSnap.TipHashHex, len(shutSnap.UTXOs.ActiveUTXOs)); metaErr != nil {
+                                        log.Warn("shutdown: failed to persist active_utxo_count metadata", "err", metaErr)
+                                }
                         }
                 }
         }

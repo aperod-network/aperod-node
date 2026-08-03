@@ -17,6 +17,17 @@ const (
 	Devnet  Network = "devnet"
 )
 
+// SnapshotConfig controls snapshot integrity-check behaviour.
+type SnapshotConfig struct {
+	// UTXOCountTolerancePct is the maximum allowed percentage difference
+	// between the snapshot's active UTXO count and the count stored in the
+	// DB before the snapshot is rejected and a full block scan is triggered.
+	// A value of 1.0 means up to 1 % divergence is tolerated (e.g. due to
+	// concurrent writes during shutdown).  Set to 0 for an exact-count match.
+	// Default: 1.0.
+	UTXOCountTolerancePct float64 `yaml:"utxo_count_tolerance_pct"`
+}
+
 // Config is the top-level node configuration.
 type Config struct {
 	Network   Network         `yaml:"network"`
@@ -27,6 +38,7 @@ type Config struct {
 	API       APIConfig       `yaml:"api"`
 	Genesis   GenesisRef      `yaml:"genesis"`
 	Pruning   PruningConfig   `yaml:"pruning"`
+	Snapshot  SnapshotConfig  `yaml:"snapshot"`
 }
 
 // P2PConfig holds networking settings.
@@ -129,6 +141,9 @@ func DefaultConfig() *Config {
 		Pruning: PruningConfig{
 			Mode:       "archive",
 			KeepBlocks: 100_000,
+		},
+		Snapshot: SnapshotConfig{
+			UTXOCountTolerancePct: 1.0,
 		},
 	}
 }
