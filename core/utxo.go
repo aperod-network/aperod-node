@@ -183,7 +183,9 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 		//
 		// Identification: in a validated transaction the C-0 invariant guarantees
 		// exactly one ring member in byPubKey has AmountCommit == inp.AmountCommit
-		// (the real spent UTXO).  We find it, move it to spentPubKeys, and break.
+		// (the real spent UTXO).  We find it, remove it from the primary utxos
+		// index (critical for memory: prevents unbounded growth of s.utxos),
+		// move it to spentPubKeys (capped ring-decoy pool), and break.
 		for _, inp := range tx.Inputs {
 			if canonical, cerr := crypto.CanonicalKeyImage(inp.KeyImage); cerr == nil {
 				s.keyImages[canonical] = struct{}{}
@@ -194,6 +196,12 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
+						// Remove from the primary utxos index so that spent UTXOs do not
+						// accumulate in memory indefinitely.  This is the critical fix for
+						// OOM kills during normal operation: without this delete, s.utxos
+						// grows proportionally to the total number of outputs ever created
+						// rather than only the currently-unspent set.
+						delete(s.utxos, UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex})
 						if len(s.spentPubKeys) < maxSpentDecoys {
 							s.spentPubKeys[member] = utxo
 						}
@@ -246,7 +254,8 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 			delete(s.byPubKey, out.OneTimePub)
 		}
 		// Restore inputs: un-mark key images and move the real spent UTXO
-		// from spentPubKeys back to byPubKey (reverting ApplyBlock's move).
+		// from spentPubKeys back to byPubKey and the primary utxos index
+		// (reverting ApplyBlock's move and primary-index delete).
 		for _, inp := range tx.Inputs {
 			delete(s.keyImages, inp.KeyImage)
 			for _, member := range inp.Ring {
@@ -254,6 +263,8 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.spentPubKeys, member)
 						s.byPubKey[member] = utxo
+						// Restore to primary index to mirror the delete in ApplyBlock.
+						s.utxos[UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex}] = utxo
 						break
 					}
 				}
@@ -415,6 +426,10 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
+						// Mirror the primary-index delete from ApplyBlock so that the
+						// startup spent-decoy rebuild does not leave s.utxos inflated
+						// with spent outputs when called during a full block scan.
+						delete(s.utxos, UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex})
 						if len(s.spentPubKeys) < maxSpentDecoys {
 							s.spentPubKeys[member] = utxo
 						}

@@ -680,6 +680,11 @@ func run() error {
                                         log.Info("periodic snapshot saved", "height", height)
                                         deleteOldSnapshots(cfg.DataDir, height)
                                 }
+                                // Free the snapshot struct (deep copy of all UTXO data) eagerly.
+                                // Without an explicit collection the snapshot and the live maps
+                                // coexist until the next GC cycle, doubling peak RSS.
+                                snap = startupSnapshot{} //nolint:ineffassign
+                                runtime.GC()
                         }(periodicSnap, h)
                 },
         }, chain, mempool, log)
