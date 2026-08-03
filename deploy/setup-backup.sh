@@ -166,6 +166,47 @@ if systemctl is-active --quiet "${API_UNIT}" 2>/dev/null; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
+step "8b. Создание /etc/aperod/api.env для Telegram-уведомлений бэкапа"
+# The backup service (running as root) needs TELEGRAM_BOT_TOKEN and
+# ADMIN_TELEGRAM_CHAT_ID to send failure alerts directly from the bash exit trap.
+# We copy these from the API service's environment (aperod-api.service) if
+# they are already configured there; otherwise we leave the file empty so the
+# backup script silently skips the notification.
+
+API_ENV_FILE="${SECRETS_DIR}/api.env"
+
+# Read Telegram credentials from /etc/environment (the standard place for
+# systemd services on this server — aperod-api.service loads it via EnvironmentFile).
+# We do NOT call systemctl show-environment because that only returns the systemd
+# manager's DefaultEnvironment, not per-service overrides.
+TG_BOT_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=)\S+' /etc/environment 2>/dev/null | head -1 || true)
+TG_ADMIN_CHAT=$(grep -oP '(?<=^ADMIN_TELEGRAM_CHAT_ID=)\S+' /etc/environment 2>/dev/null | head -1 || true)
+
+# Also check the existing api.env (idempotent re-run preserves values)
+if [ -f "${API_ENV_FILE}" ]; then
+  [ -z "${TG_BOT_TOKEN}" ] && TG_BOT_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=)\S+' "${API_ENV_FILE}" 2>/dev/null | head -1 || true)
+  [ -z "${TG_ADMIN_CHAT}" ] && TG_ADMIN_CHAT=$(grep -oP '(?<=^ADMIN_TELEGRAM_CHAT_ID=)\S+' "${API_ENV_FILE}" 2>/dev/null | head -1 || true)
+fi
+
+(umask 077 && cat > "${API_ENV_FILE}" <<APIENV
+# Telegram credentials for aperod-backup failure notifications.
+# Created by blockchain/deploy/setup-backup.sh — do not edit manually.
+# Re-run setup-backup.sh after rotating the bot token.
+TELEGRAM_BOT_TOKEN=${TG_BOT_TOKEN}
+ADMIN_TELEGRAM_CHAT_ID=${TG_ADMIN_CHAT}
+APIENV
+)
+chown root:root "${API_ENV_FILE}"
+chmod 600 "${API_ENV_FILE}"
+
+if [ -n "${TG_BOT_TOKEN}" ] && [ -n "${TG_ADMIN_CHAT}" ]; then
+  ok "Telegram credentials written to ${API_ENV_FILE} — backup failures will alert admin chat"
+else
+  warn "Telegram credentials not found — backup failure Telegram alerts will be silent."
+  warn "  Set TELEGRAM_BOT_TOKEN and ADMIN_TELEGRAM_CHAT_ID, then re-run this script."
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 step "9. Cron-задание бэкапа (каждые 12 часов)"
 
 CRON_FILE="/etc/cron.d/aperod-backup"

@@ -42,6 +42,8 @@ _BACKUP_FILE_BYTES=0
 _BACKUP_FILE_NAME=""
 
 # Write one JSON line to the history log on every exit (success or failure).
+# Also sends a Telegram failure alert if TELEGRAM_BOT_TOKEN + ADMIN_TELEGRAM_CHAT_ID
+# are available in the environment (loaded from /etc/aperod/api.env by the service).
 _write_history_log() {
   local end_ts
   end_ts=$(date +%s)
@@ -58,6 +60,29 @@ _write_history_log() {
   if [ -f "$HISTORY_LOG" ]; then
     local tmp
     tmp=$(tail -n 100 "$HISTORY_LOG") && echo "$tmp" > "$HISTORY_LOG" || true
+  fi
+
+  # ── Telegram failure alert ───────────────────────────────────────────────────
+  # Fires only on failure; success is tracked by the API server's backup monitor.
+  # Requires TELEGRAM_BOT_TOKEN and ADMIN_TELEGRAM_CHAT_ID in the environment.
+  if [ "${_BACKUP_FINAL_STATUS}" = "fail" ] \
+     && [ -n "${TELEGRAM_BOT_TOKEN:-}" ] \
+     && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
+    local tg_text
+    tg_text="❌ <b>Бэкап Aperod завершился с ошибкой</b>%0A%0A"
+    tg_text+="<b>Время:</b> ${ts_iso}%0A"
+    tg_text+="<b>Длительность:</b> ${duration} сек%0A%0A"
+    tg_text+="⚠️ Данные могут быть непригодны для восстановления.%0A%0A"
+    tg_text+="📋 <b>Диагностика:</b>%0A"
+    tg_text+="<code>journalctl -u aperod-backup.service -n 50</code>"
+    curl -s --max-time 15 -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${ADMIN_TELEGRAM_CHAT_ID}" \
+      -d "text=${tg_text}" \
+      -d "parse_mode=HTML" \
+      -d "disable_web_page_preview=true" \
+      >/dev/null 2>&1 || true
+    echo "  Telegram failure alert sent to admin chat."
   fi
 }
 trap _write_history_log EXIT
