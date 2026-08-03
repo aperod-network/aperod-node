@@ -45,6 +45,9 @@ HISTORY_LOG="/var/log/aperod_backup.log"
 _BACKUP_FINAL_STATUS="fail"
 _BACKUP_FILE_BYTES=0
 _BACKUP_FILE_NAME=""
+_BACKUP_SKIP_REASON=""
+_BACKUP_DISK_PATH=""
+_BACKUP_DISK_FREE_GB=""
 
 # Write one JSON line to the history log on every exit (success or failure).
 # Also sends a Telegram failure alert if TELEGRAM_BOT_TOKEN + ADMIN_TELEGRAM_CHAT_ID
@@ -57,7 +60,12 @@ _write_history_log() {
   ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   # Escape double-quotes in filename (should never happen, but be safe)
   local safe_file="${_BACKUP_FILE_NAME//\"/\\\"}"
-  local entry="{\"ts\":\"${ts_iso}\",\"status\":\"${_BACKUP_FINAL_STATUS}\",\"duration\":${duration},\"sizeBytes\":${_BACKUP_FILE_BYTES},\"file\":\"${safe_file}\"}"
+  local skip_fields=""
+  if [ "${_BACKUP_FINAL_STATUS}" = "skipped" ] && [ -n "${_BACKUP_SKIP_REASON}" ]; then
+    local safe_disk_path="${_BACKUP_DISK_PATH//\"/\\\"}"
+    skip_fields=",\"skipReason\":\"${_BACKUP_SKIP_REASON}\",\"diskPath\":\"${safe_disk_path}\",\"diskFreeGB\":\"${_BACKUP_DISK_FREE_GB}\""
+  fi
+  local entry="{\"ts\":\"${ts_iso}\",\"status\":\"${_BACKUP_FINAL_STATUS}\",\"duration\":${duration},\"sizeBytes\":${_BACKUP_FILE_BYTES},\"file\":\"${safe_file}\"${skip_fields}}"
   # Append to log; create file + dir if they don't exist yet
   mkdir -p "$(dirname "$HISTORY_LOG")" 2>/dev/null || true
   echo "$entry" >> "$HISTORY_LOG" 2>/dev/null || true
@@ -95,6 +103,7 @@ trap '_write_history_log; rm -rf "$BACKUP_DIR"' EXIT
 # ── Helper: write prometheus textfile ─────────────────────────────────────────
 write_metrics() {
   local success=$1
+  local skipped=${2:-0}
   local end_ts
   end_ts=$(date +%s)
   local duration=$((end_ts - START_TS))
@@ -103,6 +112,9 @@ write_metrics() {
 # HELP aperod_backup_last_success 1 if the last backup completed successfully.
 # TYPE aperod_backup_last_success gauge
 aperod_backup_last_success ${success}
+# HELP aperod_backup_skipped_low_disk 1 if the most recent backup attempt was skipped due to low disk space.
+# TYPE aperod_backup_skipped_low_disk gauge
+aperod_backup_skipped_low_disk ${skipped}
 # HELP aperod_backup_last_success_timestamp_seconds Unix timestamp of the last backup run.
 # TYPE aperod_backup_last_success_timestamp_seconds gauge
 aperod_backup_last_success_timestamp_seconds ${START_TS}
@@ -157,6 +169,59 @@ RCLONE_REMOTE="s3backup:${S3_BUCKET}"
 PRUNE_AGE="${S3_RETENTION_DAYS}d"
 
 mkdir -p "$BACKUP_DIR"
+
+# ── Pre-flight: disk space check (5 GB minimum on each relevant filesystem) ──
+# If either BACKUP_DIR or NODE_DATA_DIR has less than 5 GB free, send a
+# Telegram alert and exit 0 ("skipped") so Prometheus records skipped_low_disk=1
+# rather than a failure, giving admins time to free space before data is lost.
+MIN_AVAIL_KB=$(( 5 * 1024 * 1024 ))   # 5 GiB in kibibytes
+
+_disk_preflight() {
+  local path="$1"
+  local label="$2"
+  local avail_kb
+  avail_kb=$(df --output=avail "$path" 2>/dev/null | awk 'NR==2{print $1}')
+  [ -z "$avail_kb" ] && avail_kb=0
+  if [ "$avail_kb" -lt "$MIN_AVAIL_KB" ]; then
+    local free_gb
+    free_gb=$(awk "BEGIN{printf \"%.1f\", ${avail_kb}/1024/1024}")
+    echo "=== ВНИМАНИЕ: мало свободного места на диске ==="
+    echo "  Раздел : ${label}"
+    echo "  Свободно: ${free_gb} ГБ — требуется минимум 5 ГБ"
+    echo "  Бэкап пропущен."
+    # ── Telegram low-disk alert ──────────────────────────────────────────────
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
+      local ts_iso
+      ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      local tg_text
+      tg_text="⚠️ <b>Бэкап Aperod пропущен — мало места на диске</b>%0A%0A"
+      tg_text+="<b>Раздел:</b> ${label}%0A"
+      tg_text+="<b>Свободно:</b> ${free_gb} ГБ%0A"
+      tg_text+="<b>Требуется:</b> минимум 5 ГБ%0A"
+      tg_text+="<b>Время:</b> ${ts_iso}%0A%0A"
+      tg_text+="💡 Освободите место — бэкап возобновится на следующем расписании."
+      curl -s --max-time 15 -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${ADMIN_TELEGRAM_CHAT_ID}" \
+        -d "text=${tg_text}" \
+        -d "parse_mode=HTML" \
+        -d "disable_web_page_preview=true" \
+        >/dev/null 2>&1 || true
+      echo "  Telegram low-disk alert sent to admin chat."
+    fi
+    # Record skipped status (EXIT trap will call _write_history_log)
+    _BACKUP_FINAL_STATUS="skipped"
+    _BACKUP_SKIP_REASON="low_disk"
+    _BACKUP_DISK_PATH="${label}"
+    _BACKUP_DISK_FREE_GB="${free_gb}"
+    write_metrics 0 1
+    exit 0
+  fi
+}
+
+_disk_preflight "$BACKUP_DIR" "BACKUP_DIR (/tmp)"
+[ -d "$NODE_DATA_DIR" ] && _disk_preflight "$NODE_DATA_DIR" "NODE_DATA_DIR (${NODE_DATA_DIR})"
+
 echo "=== [1/4] Бэкап начат: ${TIMESTAMP} ==="
 
 # ── 1. PostgreSQL dump ─────────────────────────────────────────────────────────
