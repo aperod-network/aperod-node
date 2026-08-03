@@ -319,6 +319,13 @@ func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *s
 			}
 			return snap
 		}
+
+		// Both primary and prev-backup are unreadable at this height — warn
+		// the operator and fall through to the next (older) candidate.
+		if log != nil {
+			log.Warn("skipping checkpoint — both primary and prev-backup unreadable",
+				"height", c.height)
+		}
 	}
 	return nil
 }

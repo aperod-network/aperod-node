@@ -628,6 +628,79 @@ func TestCorruptCheckpointRunStartupScan_PrevBackupAccepted(t *testing.T) {
 	}
 }
 
+// ─── Test 4c: both primary and prev-backup corrupt → height skipped, warn logged ─
+
+// TestFindLatestSnapshot_BothCorrupt verifies that when both the primary
+// snapshot and its "-prev.json" backup are corrupt at the best candidate
+// height, findLatestSnapshot:
+//   - emits a "skipping checkpoint — both primary and prev-backup unreadable"
+//     warning so the operator can diagnose the multi-corrupt scenario, and
+//   - falls back to the next-lower valid checkpoint rather than returning nil.
+func TestFindLatestSnapshot_BothCorrupt(t *testing.T) {
+	dir := t.TempDir()
+
+	// Save a valid snapshot at height 50 (lower fallback).
+	snap50 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  50,
+		TipHashHex: fmt.Sprintf("%016x", uint64(50)),
+		TxTotal:    50,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap50); err != nil {
+		t.Fatalf("saveStartupSnapshot(50): %v", err)
+	}
+
+	// Save a valid snapshot at height 100 so both primary and prev-backup
+	// files exist on disk before we corrupt them.
+	snap100 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  100,
+		TipHashHex: fmt.Sprintf("%016x", uint64(100)),
+		TxTotal:    100,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap100); err != nil {
+		t.Fatalf("saveStartupSnapshot(100): %v", err)
+	}
+
+	// Precondition: prev-backup for height 100 must exist.
+	prevP100 := snapshotPrevPath(snapshotPath(dir, 100))
+	if _, err := os.Stat(prevP100); os.IsNotExist(err) {
+		t.Fatalf("prev-backup at height 100 not created — precondition failed")
+	}
+
+	// Corrupt both the primary and prev-backup at height 100.
+	corrupt := []byte(`{"v":1,"tip_height":100,"tip_hash":"truncated`)
+	if err := os.WriteFile(snapshotPath(dir, 100), corrupt, 0644); err != nil {
+		t.Fatalf("corrupt primary at height 100: %v", err)
+	}
+	if err := os.WriteFile(prevP100, corrupt, 0644); err != nil {
+		t.Fatalf("corrupt prev-backup at height 100: %v", err)
+	}
+
+	// Capture log output.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	got := findLatestSnapshot(dir, 200, log)
+
+	// ── Assertion 1: operator-visible warning about both files being unreadable.
+	if !logContainsMsg(&logBuf, "skipping checkpoint — both primary and prev-backup unreadable") {
+		t.Errorf("expected skip-warning log was not emitted\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Assertion 2: function returned the next-lower valid checkpoint (height 50).
+	if got == nil {
+		t.Fatal("findLatestSnapshot returned nil — expected fallback to height 50")
+	}
+	if got.TipHeight != 50 {
+		t.Errorf("fallback snapshot TipHeight = %d, want 50", got.TipHeight)
+	}
+}
+
 // ─── Test 8: multiple checkpoints — highest eligible is chosen ───────────────
 
 // TestFindLatestSnapshot_MultipleCheckpoints saves several checkpoints and
