@@ -120,6 +120,24 @@ ok "Бинарники установлены: /usr/local/bin/aperod-node, /usr/
 # ── 5. Создаём директории ─────────────────────────────────
 mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${WALLET_DIR}"
 
+# ── 5b. Системный пользователь aperod ────────────────────
+# Сервис запускается от имени непривилегированного пользователя aperod.
+# Создаём его, если он ещё не существует.
+if ! id aperod &>/dev/null; then
+  useradd --system \
+          --no-create-home \
+          --shell /usr/sbin/nologin \
+          --home-dir "${DATA_DIR}" \
+          aperod
+  ok "Системный пользователь aperod создан"
+else
+  ok "Пользователь aperod уже существует — пропускаем"
+fi
+# Директория данных должна принадлежать aperod, чтобы сервис мог писать
+# snapshot'ы и цепочку блоков (ReadWritePaths в unit-файле).
+chown -R aperod:aperod "${DATA_DIR}"
+chmod 750 "${DATA_DIR}"
+
 # ── 6. Кошелёк ────────────────────────────────────────────
 echo
 echo -e "${BOLD}═══════════════════════════════════════════════"
