@@ -2,14 +2,31 @@ package core
 
 import "github.com/aperod/aperod/crypto"
 
+// RollbackJournalEntry is the serialisable form of one rollbackEntry.
+// Exported fields allow JSON round-trips in UTXOSnapshot.
+// The rollback journal is bounded to maxRollbackDepth distinct heights, so
+// the total serialised size is small relative to the full UTXO set.
+type RollbackJournalEntry struct {
+	Height     uint64         `json:"height"`
+	RingMember crypto.Point32 `json:"ring_member"`
+	UTXO       *UTXO          `json:"utxo"`
+}
+
 // UTXOSnapshot is a point-in-time serialisable image of the entire in-memory
 // UTXOSet.  It is used to persist the set after the startup scan so that
 // subsequent restarts can skip the expensive block replay.
 type UTXOSnapshot struct {
-	ActiveUTXOs []*UTXO           // utxos map — byPubKey is rebuilt on restore
-	StakedUTXOs []*UTXO           // stakedUTXOs map
-	SpentDecoys []*UTXO           // spentPubKeys (Phase-2 decoy pool)
-	KeyImages   []crypto.KeyImage // keyImages set
+	ActiveUTXOs    []*UTXO                `json:"active_utxos"`
+	StakedUTXOs    []*UTXO                `json:"staked_utxos"`
+	SpentDecoys    []*UTXO                `json:"spent_decoys"`
+	KeyImages      []crypto.KeyImage      `json:"key_images"`
+	// RollbackJournal carries the bounded per-block rollback state so that
+	// after a snapshot restore the node can roll back a newly applied block
+	// even when the spentPubKeys decoy pool is already at capacity.
+	// Omitted from old snapshots (treated as empty on restore — safe because
+	// post-restore rollback is only ever needed for blocks applied after the
+	// restore, which always populate the journal via ApplyBlock).
+	RollbackJournal []RollbackJournalEntry `json:"rollback_journal,omitempty"`
 }
 
 // TakeSnapshot captures the current in-memory state of the UTXOSet.
@@ -38,17 +55,33 @@ func (s *UTXOSet) TakeSnapshot() UTXOSnapshot {
 	for ki := range s.keyImages {
 		kis = append(kis, ki)
 	}
+
+	// Serialise the rollback journal as a flat slice (JSON map keys must be
+	// strings; using a slice with an explicit Height field avoids that limit).
+	var journal []RollbackJournalEntry
+	for height, entries := range s.rollbackJournal {
+		for _, e := range entries {
+			cp := *e.utxo // deep copy so snapshot is independent of live maps
+			journal = append(journal, RollbackJournalEntry{
+				Height:     height,
+				RingMember: e.ringMember,
+				UTXO:       &cp,
+			})
+		}
+	}
+
 	return UTXOSnapshot{
-		ActiveUTXOs: active,
-		StakedUTXOs: staked,
-		SpentDecoys: decoys,
-		KeyImages:   kis,
+		ActiveUTXOs:     active,
+		StakedUTXOs:     staked,
+		SpentDecoys:     decoys,
+		KeyImages:       kis,
+		RollbackJournal: journal,
 	}
 }
 
 // RestoreFromSnapshot replaces the UTXOSet content with the provided snapshot.
 // It rebuilds both primary (utxos) and secondary (byPubKey, spentPubKeys,
-// stakedUTXOs, keyImages) indexes from the snapshot data.
+// stakedUTXOs, keyImages, rollbackJournal) indexes from the snapshot data.
 func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -75,5 +108,16 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 	s.keyImages = make(map[crypto.KeyImage]struct{}, len(snap.KeyImages))
 	for _, ki := range snap.KeyImages {
 		s.keyImages[ki] = struct{}{}
+	}
+
+	// Rebuild the rollback journal from the snapshot.  Old snapshots that
+	// predate this field will have an empty slice here, which is safe: any
+	// block applied after the restore will populate the journal via ApplyBlock.
+	s.rollbackJournal = make(map[uint64][]rollbackEntry, len(snap.RollbackJournal))
+	for _, e := range snap.RollbackJournal {
+		s.rollbackJournal[e.Height] = append(s.rollbackJournal[e.Height], rollbackEntry{
+			ringMember: e.RingMember,
+			utxo:       e.UTXO,
+		})
 	}
 }

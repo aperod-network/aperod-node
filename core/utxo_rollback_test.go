@@ -185,3 +185,166 @@ func TestRollbackBlock_FullDecoyPool(t *testing.T) {
 
 	t.Log("TestRollbackBlock_FullDecoyPool: journal correctly restores UTXO absent from capped decoy pool ✓")
 }
+
+// TestRollbackBlock_AfterSnapshotRestore verifies that a snapshot round-trip
+// preserves the rollback journal so that RollbackBlock works correctly when:
+//  1. The decoy pool is full after restore (from SpentDecoys in the snapshot).
+//  2. A new block is applied and then rolled back.
+//
+// This guards the specific failure mode the code-review raised: a node that
+// restores from a periodic snapshot, finds its decoy pool full, accepts a
+// block that would normally put the new spent UTXO in the journal (not the
+// pool), then needs to roll back — and must be able to restore the UTXO.
+func TestRollbackBlock_AfterSnapshotRestore(t *testing.T) {
+	// Temporarily lower the decoy cap so the pool saturates cheaply.
+	origMax := maxSpentDecoys
+	maxSpentDecoys = 3
+	defer func() { maxSpentDecoys = origMax }()
+
+	// ── Validator + Alice ─────────────────────────────────────────────────────
+	valPriv, valPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	alice, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys (alice): %v", err)
+	}
+
+	// ── Block 0: coinbase to Alice ────────────────────────────────────────────
+	cb0 := CoinbaseTx(alice.Spend.Public, 100_000_000)
+	txs0 := []Transaction{cb0}
+	hdr0 := BlockHeader{
+		Height:       0,
+		Timestamp:    1_000_000_000,
+		ValidatorPub: valPub,
+		MerkleRoot:   MerkleRoot(txs0),
+	}
+	if err := hdr0.Sign(valPriv); err != nil {
+		t.Fatalf("Sign block 0: %v", err)
+	}
+	b0 := &Block{Header: hdr0, Txs: txs0}
+
+	utxos := NewUTXOSet()
+	if err := utxos.ApplyBlock(b0); err != nil {
+		t.Fatalf("ApplyBlock(0): %v", err)
+	}
+	cb0Hash := cb0.Hash()
+	aliceUTXO := utxos.Get(cb0Hash, 0)
+	if aliceUTXO == nil {
+		t.Fatal("Alice's coinbase UTXO not found after block 0")
+	}
+
+	// ── Saturate decoy pool with 3 dummy entries, then snapshot ───────────────
+	for i := 0; i < 3; i++ {
+		dummy, dErr := crypto.GenerateWalletKeys()
+		if dErr != nil {
+			t.Fatalf("GenerateWalletKeys (dummy %d): %v", i, dErr)
+		}
+		utxos.mu.Lock()
+		utxos.spentPubKeys[dummy.Spend.Public] = &UTXO{OneTimePub: dummy.Spend.Public}
+		utxos.mu.Unlock()
+	}
+
+	// Take a snapshot and restore into a fresh UTXOSet — simulating a node
+	// restart that loads the periodic snapshot from disk.
+	snap := utxos.TakeSnapshot()
+	restored := NewUTXOSet()
+	restored.RestoreFromSnapshot(snap)
+
+	// Verify Alice's UTXO survived the snapshot round-trip.
+	if restored.Get(cb0Hash, 0) == nil {
+		t.Fatal("Alice's UTXO missing from restored UTXOSet")
+	}
+	if restored.SpentDecoyCount() != 3 {
+		t.Fatalf("expected 3 decoys after restore, got %d", restored.SpentDecoyCount())
+	}
+
+	// ── Apply block 1 on the RESTORED set ────────────────────────────────────
+	// Decoy pool is already full (3/3) — Alice's spent UTXO must go to the
+	// journal, not the pool.
+	ring := make([]crypto.RingMember, crypto.RingSize)
+	ring[0] = crypto.RingMember(alice.Spend.Public)
+	for i := 1; i < crypto.RingSize; i++ {
+		d, dErr := crypto.GenerateWalletKeys()
+		if dErr != nil {
+			t.Fatalf("GenerateWalletKeys (ring %d): %v", i, dErr)
+		}
+		ring[i] = crypto.RingMember(d.Spend.Public)
+	}
+	var msg crypto.Hash32
+	msg[0] = 0xCD
+	sig, sigErr := crypto.MLSAGSign(msg, ring, 0, alice.Spend.Private)
+	if sigErr != nil {
+		t.Fatalf("MLSAGSign: %v", sigErr)
+	}
+	bob, bErr := crypto.GenerateWalletKeys()
+	if bErr != nil {
+		t.Fatalf("GenerateWalletKeys (bob): %v", bErr)
+	}
+
+	// Get aliceUTXO from the restored set (commit may differ due to round-trip).
+	restoredAlice := restored.Get(cb0Hash, 0)
+	spendTx := Transaction{
+		Inputs: []RingInput{
+			{
+				KeyImage:     sig.KeyImage,
+				Ring:         ring,
+				AmountCommit: restoredAlice.AmountCommit,
+			},
+		},
+		Outputs: []Output{
+			{
+				OneTimePub:   bob.Spend.Public,
+				AmountCommit: restoredAlice.AmountCommit,
+			},
+		},
+		Signatures: []*crypto.MLSAGSignature{sig},
+	}
+	txs1 := []Transaction{spendTx}
+	hdr1 := BlockHeader{
+		Height:       1,
+		Timestamp:    1_000_000_001,
+		ValidatorPub: valPub,
+		MerkleRoot:   MerkleRoot(txs1),
+	}
+	if err := hdr1.Sign(valPriv); err != nil {
+		t.Fatalf("Sign block 1: %v", err)
+	}
+	b1 := &Block{Header: hdr1, Txs: txs1}
+
+	if err := restored.ApplyBlock(b1); err != nil {
+		t.Fatalf("ApplyBlock(1) on restored set: %v", err)
+	}
+
+	// Alice's UTXO must be absent after spend.
+	if restored.Get(cb0Hash, 0) != nil {
+		t.Error("Alice's UTXO should be absent after spend on restored set")
+	}
+	// Decoy pool stays at 3 — pool was full.
+	if restored.SpentDecoyCount() != 3 {
+		t.Errorf("expected decoy pool to stay at 3, got %d", restored.SpentDecoyCount())
+	}
+	// Journal must have an entry for height 1.
+	restored.mu.RLock()
+	jlen := len(restored.rollbackJournal[1])
+	restored.mu.RUnlock()
+	if jlen == 0 {
+		t.Fatal("no rollback journal entry for height 1 on restored set")
+	}
+
+	// ── Roll back block 1 ─────────────────────────────────────────────────────
+	if err := restored.RollbackBlock(b1); err != nil {
+		t.Fatalf("RollbackBlock(1) on restored set: %v", err)
+	}
+
+	// Both Get() and GetByPubKey() must recover Alice's UTXO.
+	if restored.Get(cb0Hash, 0) == nil {
+		t.Error("Get(): Alice's UTXO not restored after rollback on snapshot-restored set")
+	}
+	if restored.GetByPubKey(restoredAlice.OneTimePub) == nil {
+		t.Error("GetByPubKey(): Alice's UTXO not restored after rollback on snapshot-restored set")
+	}
+
+	t.Log("TestRollbackBlock_AfterSnapshotRestore: snapshot round-trip preserves rollback capability ✓")
+}
