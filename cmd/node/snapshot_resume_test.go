@@ -498,6 +498,138 @@ func TestPartialSnapshot_HashMismatch(t *testing.T) {
 
 // ─── Test 6: multiple checkpoints — highest eligible is chosen ───────────────
 
+// ─── Test 7: corrupt primary → runStartupScan accepts prev-backup via DB hash cross-check ──
+
+// TestCorruptCheckpointRunStartupScan_PrevBackupAccepted is the end-to-end
+// integration test for task #1075.
+//
+// It confirms that the two recovery layers compose correctly:
+//
+//  1. findLatestSnapshot (inner layer) falls back to the "-prev.json" backup
+//     and returns a snapshot struct for the corrupt-primary height.
+//  2. runStartupScan (outer layer) then cross-checks that struct's TipHashHex
+//     against the actual DB block at that height.  Because the prev-backup was
+//     written from the same valid checkpoint data, the hashes match and the
+//     resume path is accepted — not discarded.
+//
+// Scenario:
+//   - Chain: heights 0–10 (genesis + 10 blocks).
+//   - Checkpoint saved at height 5 via saveStartupSnapshot (writes both the
+//     primary file and a same-height "-prev.json" backup atomically).
+//   - Primary at height 5 is then overwritten with truncated/corrupt bytes.
+//   - runStartupScan is called with tip == height 10.
+//
+// Expected outcome:
+//   - "checkpoint recovery — primary corrupt, loaded prev-backup" warning is logged.
+//   - "partial snapshot loaded — resuming scan from checkpoint" is logged.
+//   - result.ScanFrom == 6 (prev-backup checkpoint accepted by both layers).
+//   - Final UTXOSet count matches the full-scan reference.
+func TestCorruptCheckpointRunStartupScan_PrevBackupAccepted(t *testing.T) {
+	const totalBlocks = 10 // heights 1–10 plus genesis at 0
+	const checkpointAt = 5 // height at which the checkpoint is saved
+
+	dir := t.TempDir()
+	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height // 10
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	// ── Reference: apply all blocks to get the expected UTXO count.
+	refUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, refUTXOs, blocks, 0, len(blocks)-1)
+	refCount := refUTXOs.Count()
+
+	// ── Save a valid checkpoint at height 5.
+	// saveStartupSnapshot writes both the primary and a same-height "-prev.json"
+	// backup atomically.  The prev-backup will be the recovery target.
+	cpUTXOs := core.NewUTXOSet()
+	applyBlockRange(t, cpUTXOs, blocks, 0, checkpointAt)
+	cpRegistry := core.NewValidatorRegistry()
+	cpRegistry.SetUTXOSet(cpUTXOs)
+	cpRegistry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	cpBlock := blocks[checkpointAt]
+	cpHashArr := cpBlock.Hash()
+	cpSnap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  uint64(checkpointAt),
+		TipHashHex: fmt.Sprintf("%x", cpHashArr[:]),
+		TxTotal:    int64(checkpointAt),
+		UTXOs:      cpUTXOs.TakeSnapshot(),
+		Registry:   cpRegistry.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, cpSnap); err != nil {
+		t.Fatalf("saveStartupSnapshot(checkpoint): %v", err)
+	}
+
+	// ── Precondition: prev-backup must exist before we corrupt the primary.
+	prevP := snapshotPrevPath(snapshotPath(dir, uint64(checkpointAt)))
+	if _, err := os.Stat(prevP); os.IsNotExist(err) {
+		t.Fatalf("prev-backup at height %d not created by saveStartupSnapshot — precondition failed", checkpointAt)
+	}
+
+	// ── Corrupt the primary at height 5 (truncated JSON).
+	if err := os.WriteFile(snapshotPath(dir, uint64(checkpointAt)),
+		[]byte(`{"v":1,"tip_height":5,"tip_hash":"bad`), 0644); err != nil {
+		t.Fatalf("corrupt primary at height %d: %v", checkpointAt, err)
+	}
+
+	// ── Simulate restart: fresh UTXOSet + registry.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	// ── Call the production function under test.
+	var wg sync.WaitGroup
+	result, err := runStartupScan(startupScanParams{
+		DataDir:     dir,
+		TipHeight:   tipHeight,
+		TipHashHex:  tipHashHex,
+		DB:          db,
+		UTXOs:       utxos,
+		Registry:    registry,
+		KiFromIndex: false,
+		InitTxTotal: 0,
+		Log:         log,
+		SnapshotWg:  &wg,
+	})
+	if err != nil {
+		t.Fatalf("runStartupScan: %v", err)
+	}
+	wg.Wait() // ensure all snapshot goroutines finish before asserting
+
+	// ── Assertion 1: findLatestSnapshot logged the recovery warning.
+	if !logContainsMsg(&logBuf, "checkpoint recovery — primary corrupt, loaded prev-backup") {
+		t.Errorf("expected recovery warning log was not emitted\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Assertion 2: runStartupScan accepted the prev-backup and logged resume.
+	if !logContainsMsg(&logBuf, "partial snapshot loaded — resuming scan from checkpoint") {
+		t.Errorf("expected partial-resume log was not emitted (DB hash cross-check may have rejected the prev-backup)\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Assertion 3: scan started from checkpoint+1 (prev-backup accepted).
+	wantScanFrom := uint64(checkpointAt + 1)
+	if result.ScanFrom != wantScanFrom {
+		t.Errorf("ScanFrom = %d, want %d (prev-backup checkpoint height %d + 1)\nlog:\n%s",
+			result.ScanFrom, wantScanFrom, checkpointAt, logBuf.String())
+	}
+
+	// ── Assertion 4: final UTXO count equals the full-scan reference.
+	if got := utxos.Count(); got != refCount {
+		t.Errorf("UTXOSet.Count() after corrupt-primary recovery = %d, want %d (full-scan reference)",
+			got, refCount)
+	}
+}
+
+// ─── Test 8: multiple checkpoints — highest eligible is chosen ───────────────
+
 // TestFindLatestSnapshot_MultipleCheckpoints saves several checkpoints and
 // confirms findLatestSnapshot always picks the highest one strictly below
 // limitHeight, which also sets the correct scanFrom.
