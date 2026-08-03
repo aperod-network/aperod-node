@@ -580,6 +580,132 @@ func TestTxVerifier_RangeProofCommitmentMismatch_Rejected(t *testing.T) {
 	t.Logf("matching proof-and-output commitment correctly accepted")
 }
 
+// TestTxVerifier_C0a_FabricatedInputAllAbsent (task-934) — VerifyTx must reject
+// a transaction whose entire ring consists of freshly generated keys that are
+// absent from the UTXO set (C-0a fabricated-input inflation attack guard).
+//
+// Attack: an attacker signs with a key pair that never appeared on-chain.  All
+// 16 ring members are absent from byPubKey → the old code skipped C-0 entirely
+// → inp.AmountCommit was unconstrained → attacker could commit to an arbitrary
+// large value and inflate outputs.
+//
+// Fix (C-0a): if presentCount == 0 after iterating the ring, reject immediately
+// with a "fabricated-input" error before MLSAG is checked.
+//
+// Counterpart: a ring where exactly one member IS in the UTXO set (with a
+// matching commit) must NOT trigger C-0a.  The counterpart will still fail at
+// MLSAG (dummy sig), but the error must not cite "C-0a" or "fabricated-input".
+func TestTxVerifier_C0a_FabricatedInputAllAbsent(t *testing.T) {
+	// ── Attack case: ALL ring members absent ─────────────────────────────────
+	const amount uint64 = 5_000
+
+	var blind crypto.BlindFactor
+	blind[0] = 0x99
+	commit, err := crypto.Commit(amount, blind)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Build a ring of RingSize freshly-generated keys, none added to the UTXO set.
+	ring := make([]crypto.RingMember, crypto.RingSize)
+	for i := 0; i < crypto.RingSize; i++ {
+		kp, e := crypto.GenerateWalletKeys()
+		if e != nil {
+			t.Fatalf("GenerateWalletKeys ring[%d]: %v", i, e)
+		}
+		ring[i] = kp.Spend.Public
+	}
+
+	utxos := core.NewUTXOSet()
+	// Intentionally empty — no ring member is registered.
+
+	ki := makeKeyImage(700)
+	txAttack := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{{
+			KeyImage:     ki,
+			Ring:         ring,
+			AmountCommit: commit,
+		}},
+		Outputs: []core.Output{{
+			OneTimePub:   crypto.Point32{0xFA, 0xB0},
+			AmountCommit: crypto.Commitment{},
+		}},
+		Fee:         1,
+		Signatures:  []*crypto.MLSAGSignature{{}},
+		RangeProofs: []*crypto.RangeProof{{}},
+	}
+
+	v := core.NewTxVerifier(utxos)
+	errAttack := v.VerifyTx(&txAttack)
+	if errAttack == nil {
+		t.Fatal("VerifyTx must reject a tx with all ring members absent (C-0a), got nil error")
+	}
+	if !strings.Contains(errAttack.Error(), "C-0a") && !strings.Contains(errAttack.Error(), "fabricated-input") {
+		t.Errorf("error must cite C-0a or fabricated-input, got: %v", errAttack)
+	}
+	t.Logf("fabricated-input correctly rejected: %v", errAttack)
+
+	// ── Counterpart: exactly one ring member IS in the UTXO set ──────────────
+	// The single present member's commit must match inp.AmountCommit so C-0
+	// commitment binding also passes.  C-0a (presentCount == 0) must NOT fire.
+	// The tx will still fail at MLSAG (dummy sig), but the error must not cite
+	// "C-0a" or "fabricated-input".
+	var blindOK crypto.BlindFactor
+	blindOK[0] = 0x77
+	commitOK, err := crypto.Commit(amount, blindOK)
+	if err != nil {
+		t.Fatalf("Commit OK: %v", err)
+	}
+
+	kpReal, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys real: %v", err)
+	}
+
+	ringOK := make([]crypto.RingMember, crypto.RingSize)
+	ringOK[0] = kpReal.Spend.Public // the one present member
+	for i := 1; i < crypto.RingSize; i++ {
+		kp, e := crypto.GenerateWalletKeys()
+		if e != nil {
+			t.Fatalf("GenerateWalletKeys decoy %d: %v", i, e)
+		}
+		ringOK[i] = kp.Spend.Public
+	}
+
+	utxosOK := core.NewUTXOSet()
+	utxosOK.Add(makeUTXO(crypto.Hash32{0xE1}, 0, kpReal.Spend.Public, commitOK))
+
+	kiOK := makeKeyImage(701)
+	txOK := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{{
+			KeyImage:     kiOK,
+			Ring:         ringOK,
+			AmountCommit: commitOK, // matches the UTXO in the set → C-0 passes
+		}},
+		Outputs: []core.Output{{
+			OneTimePub:   crypto.Point32{0xFC, 0xD0},
+			AmountCommit: crypto.Commitment{},
+		}},
+		Fee:         1,
+		Signatures:  []*crypto.MLSAGSignature{{}},
+		RangeProofs: []*crypto.RangeProof{{}},
+	}
+
+	vOK := core.NewTxVerifier(utxosOK)
+	errOK := vOK.VerifyTx(&txOK)
+	// The tx is expected to fail (dummy sig / range proof), but NOT due to C-0a.
+	if errOK != nil {
+		if strings.Contains(errOK.Error(), "C-0a") || strings.Contains(errOK.Error(), "fabricated-input") {
+			t.Errorf("ring with one present member must not trigger C-0a, got: %v", errOK)
+		}
+		t.Logf("counterpart failed at later check (expected): %v", errOK)
+	} else {
+		t.Log("counterpart passed VerifyTx entirely")
+	}
+}
+
 // TestMempool_DoubleSpendKeyImage_Rejected (#487) — pool.Add() must return an
 // error when the verifier has the key image marked spent.
 func TestMempool_DoubleSpendKeyImage_Rejected(t *testing.T) {
