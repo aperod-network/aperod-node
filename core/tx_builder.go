@@ -422,9 +422,11 @@ func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMembe
 const (
         // txOverheadBytes: version(1) + fee(8) + feeCommit(32).
         txOverheadBytes = 41
-        // txBytesPerInput: keyImage(32) + ring(16×32) + amountCommit(32)
-        //                  + MLSAG c0(32) + MLSAG ss(11×32) + MLSAG keyImage(32).
-        txBytesPerInput = 832
+        // txBytesPerInput: input body: keyImage(32) + ring(16×32) + amountCommit(32) = 576
+        //                  MLSAG sig:  c0(32) + ss(16×32) + keyImage(32)          = 576
+        //                  Total per input: 576 + 576 = 1152.
+        // Must stay in sync with Transaction.Size() in transaction.go.
+        txBytesPerInput = 1152
         // txBytesPerOutput: oneTimePub(32) + txPubKey(32) + amountCommit(32)
         //                   + encAmount(8) + rangeProof(675).
         txBytesPerOutput = 779
