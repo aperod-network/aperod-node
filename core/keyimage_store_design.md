@@ -182,7 +182,34 @@ At 5 M blocks, the binary snapshot encoding (§6 item 4) becomes necessary to ke
 
 ---
 
-## 8. Summary
+## 8. Soak Tests (memory regression guards)
+
+Two soak tests guard the key-image memory fix introduced in Task #1080 (map → compact sorted slice).  Both carry the `soak` build tag and are excluded from regular `go test ./...` runs.
+
+### TestKeyImageSet_MemoryCeiling_1M  (`key_image_soak_test.go`)
+
+Directly inserts 1 M synthetic key images into a `compactKeyImageSet` and asserts that heap growth stays below **50 MiB**.
+
+```
+go test -tags soak -run ^TestKeyImageSet_MemoryCeiling_1M$ -v ./core/
+```
+
+Expected output:
+- `set entries: 1000000`
+- `heap growth ≈ 32–40 MiB` (32 B/entry × 1 M, plus ≤25% Go append over-allocation)
+- A regression to `map[KeyImage]struct{}` (~150 B/entry) would produce ~143 MiB growth and **fail** the assertion.
+
+### TestUTXOSet_MemoryGrowth_10KBlocks  (`utxo_soak_test.go`)
+
+Applies 10 000 spend+create blocks and asserts live heap growth stays below 50 MiB.  Guards the `ApplyBlock` OOM regression (unbounded `s.utxos` accumulation).
+
+```
+go test -tags soak -run ^TestUTXOSet_MemoryGrowth_10KBlocks$ -v ./core/
+```
+
+---
+
+## 9. Summary
 
 | Question | Answer |
 |---|---|

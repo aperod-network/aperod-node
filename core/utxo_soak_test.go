@@ -220,7 +220,7 @@ func TestUTXOSet_MemoryGrowth_10KBlocks(t *testing.T) {
 	// Diagnostic counters help pinpoint the source of any regression.
 	utxos.mu.RLock()
 	utxosLen := len(utxos.utxos)
-	keyImagesLen := len(utxos.keyImages)
+	keyImagesLen := utxos.keyImages.length()
 	spentPubKeysLen := len(utxos.spentPubKeys)
 	rollbackJournalLen := len(utxos.rollbackJournal)
 	utxos.mu.RUnlock()
@@ -381,5 +381,5 @@ func BenchmarkUTXOSet_ApplyBlock_SoakChain(b *testing.B) {
 
 	// Report the final utxos map size so go test -v output is informative.
 	b.ReportMetric(float64(len(utxos.utxos)), "utxos")
-	b.ReportMetric(float64(len(utxos.keyImages)), "keyImages")
+	b.ReportMetric(float64(utxos.keyImages.length()), "keyImages")
 }
