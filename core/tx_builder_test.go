@@ -240,6 +240,49 @@ func TestTxBuilder_InsufficientFunds(t *testing.T) {
         }
 }
 
+// TestFeeEstimateMatchesTransactionSize asserts that ExportedEstimateFee(1,2,r)/r
+// equals the byte count returned by Transaction.Size() for a canonical
+// 1-input 2-output transaction.  The test fails immediately if the constants
+// in tx_builder.go (txBytesPerInput / txBytesPerOutput / txOverheadBytes)
+// drift from the formula in transaction.go, which is the root cause of every
+// "fee too low" rejection on mainnet.
+func TestFeeEstimateMatchesTransactionSize(t *testing.T) {
+	const feePerByte = 200
+
+	// Build a canonical transaction shell.  We only care about the shapes
+	// (slice lengths / ring size) — actual crypto values are zeroed out, which
+	// is fine because Transaction.Size() never dereferences field contents.
+	ring := make([]crypto.RingMember, crypto.RingSize)
+	tx := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{
+			{Ring: ring},
+		},
+		Outputs: []core.Output{
+			{}, // payment output
+			{}, // change output
+		},
+		Signatures:  []*crypto.MLSAGSignature{{}},
+		RangeProofs: []*crypto.RangeProof{{}, {}},
+	}
+
+	// ExportedEstimateFee(1, 2, feePerByte) / feePerByte gives the estimated
+	// byte count.  Transaction.Size() gives the actual byte count for the same
+	// shape.  They must be equal.
+	wantBytes := int(core.ExportedEstimateFee(1, 2, feePerByte) / feePerByte)
+	gotBytes := tx.Size()
+
+	if gotBytes != wantBytes {
+		t.Errorf(
+			"constant drift detected: Transaction.Size() = %d bytes, "+
+				"ExportedEstimateFee(1,2,%d)/%d = %d bytes; "+
+				"update txBytesPerInput/txBytesPerOutput/txOverheadBytes in tx_builder.go "+
+				"to match the Size() formula in transaction.go",
+			gotBytes, feePerByte, feePerByte, wantBytes,
+		)
+	}
+}
+
 // TestTxBuilder_ZeroAmount verifies that Build rejects a zero-amount transaction.
 func TestTxBuilder_ZeroAmount(t *testing.T) {
         aliceKeys, _ := crypto.GenerateWalletKeys()
