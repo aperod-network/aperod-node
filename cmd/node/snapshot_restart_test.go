@@ -763,3 +763,92 @@ func TestPrevBackupHashMismatchRejected(t *testing.T) {
 		t.Errorf("loaded.TipHashHex mismatch")
 	}
 }
+
+// ─── Test 8: truncated snapshot falls back to block scan ──────────────────────
+
+// TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
+// a non-nil error and that snapLoaded remains false when the snapshot file is
+// truncated mid-JSON (simulating a power-loss or partial write).
+//
+// Scenario:
+//   - A valid snapshot is saved at height H.
+//   - The snapshot file is truncated to half its size before the node restarts.
+//   - loadStartupSnapshot must return a non-nil, non-ErrNotExist error because
+//     the file exists but its JSON is malformed.
+//   - snapLoaded must stay false; the warning
+//     "snapshot load error, falling back to block scan" must be logged.
+func TestTruncatedSnapshotFallsBackToScan(t *testing.T) {
+	dir := t.TempDir()
+	_, blocks := buildChainInStore(t, dir, 3) // genesis + 3 blocks → tip height 3
+
+	tip := blocks[len(blocks)-1]
+	tipHash := tip.Hash()
+	tipHeight := tip.Header.Height
+	tipHashHex := fmt.Sprintf("%x", tipHash[:])
+
+	// Save a valid snapshot (mirrors the SIGTERM shutdown handler).
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry: core.RegistrySnapshot{
+			Validators: map[string]*core.ValidatorEntry{},
+		},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// Confirm the file exists and has non-zero size.
+	snapFile := snapshotPath(dir, tipHeight)
+	info, err := os.Stat(snapFile)
+	if err != nil {
+		t.Fatalf("snapshot file not found after save: %v", err)
+	}
+	fullSize := info.Size()
+	if fullSize < 2 {
+		t.Fatalf("snapshot file unexpectedly tiny (%d bytes) — test setup error", fullSize)
+	}
+
+	// Truncate the file to half its size, simulating a partial write due to
+	// a power-loss or crash mid-flush.
+	truncSize := fullSize / 2
+	if err := os.Truncate(snapFile, truncSize); err != nil {
+		t.Fatalf("os.Truncate: %v", err)
+	}
+
+	// ── Simulate the exact-tip fast-path from main.go.
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	if _, serr := loadStartupSnapshot(dir, tipHeight, tipHashHex); serr == nil {
+		snapLoaded = true
+		log.Info("startup fast path complete — snapshot loaded", "tip_height", tipHeight)
+	} else if !os.IsNotExist(serr) {
+		// Truncation produces a JSON decode error — a non-ErrNotExist error —
+		// so this branch must be taken and the warning must be logged.
+		log.Warn("snapshot load error, falling back to block scan", "err", serr)
+	}
+
+	// ── Assertions.
+
+	// snapLoaded must stay false: a truncated file must never be accepted.
+	if snapLoaded {
+		t.Error("snapLoaded should be false when snapshot file is truncated")
+	}
+
+	// The fallback warning must be logged so operators can diagnose the issue.
+	if !logContainsMsg(&logBuf, "snapshot load error, falling back to block scan") {
+		t.Error("expected warning \"snapshot load error, falling back to block scan\" was not logged for truncated snapshot")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+
+	// The fast-path success message must NOT appear.
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path success log must NOT appear when snapshot is truncated")
+		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
