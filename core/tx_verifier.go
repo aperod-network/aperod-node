@@ -219,12 +219,14 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // first so that locked-genesis errors surface before C-0 fires.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
+                        presentCount := 0
                         for _, member := range inp.Ring {
                                 utxo := v.utxos.GetByPubKey(member)
                                 if utxo == nil {
                                         // Absent: Phase 1 random key or Phase 2 spent decoy — skip.
                                         continue
                                 }
+                                presentCount++
                                 // Member is in byPubKey (active unspent UTXO).
                                 // Its on-chain commitment must equal inp.AmountCommit.
                                 if utxo.AmountCommit != inp.AmountCommit {
@@ -233,6 +235,29 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                                                 txHashPrefix[:8], i, member[:8],
                                                 utxo.AmountCommit[:8], inp.AmountCommit[:8])
                                 }
+                        }
+
+                        // C-0a: fabricated-input guard.
+                        //
+                        // In a legitimate transaction the real spender's UTXO is
+                        // unspent, so it is always present in byPubKey regardless of
+                        // pruning mode (pruning strips old block data, not the live
+                        // UTXO set).  Decoys may be absent (Phase 1 random keys or
+                        // Phase 2 spent UTXOs), but the real one must be there.
+                        //
+                        // An attacker can sign with a freshly-generated key pair that
+                        // never appeared on-chain.  All 16 ring members are absent →
+                        // the old code skipped the C-0 check entirely → inp.AmountCommit
+                        // was unconstrained → attacker could commit to an arbitrary
+                        // large value and inflate outputs (1 APRO in → ∞ APRO out).
+                        //
+                        // Fix: reject any input whose entire ring is absent.  A valid
+                        // real spender is always present; if none is, the tx has no
+                        // real input and must be treated as fraudulent.
+                        if presentCount == 0 {
+                                return fmt.Errorf("tx %x: input %d all %d ring members are absent "+
+                                        "from the UTXO set — fabricated-input inflation attack blocked (C-0a check)",
+                                        txHashPrefix[:8], i, len(inp.Ring))
                         }
                 }
         }

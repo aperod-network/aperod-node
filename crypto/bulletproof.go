@@ -242,13 +242,13 @@ func pointSlice(arr [bpBits]*edwards25519.Point) []*edwards25519.Point {
 func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
         // 1. Value commitment V = γ·G + v·BpH ────────────────────────────────
         v := scalarFromUint64(value)
+        // H-2 fix: clampScalar fallback removed — Ed25519 clamping has no meaning
+        // for Bulletproof blinding scalars and could silently mutate the scalar.
+        // All production callers (NewBlindFactor, DeterministicMintBlind,
+        // DeterministicPaymentBlind, BlindSum) use SetUniformBytes → always canonical.
         gamma, err := ScalarFromBytes(blind[:])
         if err != nil {
-                clamped := clampScalar(blind)
-                gamma, err = ScalarFromBytes(clamped[:])
-                if err != nil {
-                        return nil, fmt.Errorf("bulletproof: invalid blind: %w", err)
-                }
+                return nil, fmt.Errorf("bulletproof: invalid blind (non-canonical scalar): %w", err)
         }
         V := new(edwards25519.Point).Add(
                 new(edwards25519.Point).ScalarBaseMult(gamma),

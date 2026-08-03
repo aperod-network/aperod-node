@@ -32,14 +32,16 @@ func init() {
 // Commit creates a Pedersen commitment to value v with blinding factor r.
 // C = r·G + v·H
 func Commit(value uint64, blind BlindFactor) (Commitment, error) {
+        // H-2 fix: non-canonical blinding factors are rejected outright.
+        // The old clampScalar fallback silently mutated blind to an Ed25519-signing-key
+        // clamped form — an operation with no meaning for Pedersen scalars that could
+        // produce a different commitment than intended and undermine binding.  All
+        // production callers (NewBlindFactor, DeterministicMintBlind,
+        // DeterministicPaymentBlind, BlindSum, and the zero-blind fee path) use
+        // SetUniformBytes or SetCanonicalBytes and always produce canonical scalars.
         rScalar, err := ScalarFromBytes(blind[:])
         if err != nil {
-                // Try clamping
-                clamped := clampScalar(blind)
-                rScalar, err = ScalarFromBytes(clamped[:])
-                if err != nil {
-                        return Commitment{}, fmt.Errorf("invalid blinding factor: %w", err)
-                }
+                return Commitment{}, fmt.Errorf("invalid blinding factor (non-canonical scalar): %w", err)
         }
 
         vScalar := scalarFromUint64(value)
@@ -190,11 +192,7 @@ func scalarFromUint64(v uint64) *edwards25519.Scalar {
         return s
 }
 
-// clampScalar applies Ed25519 clamping to ensure a valid scalar.
-func clampScalar(b BlindFactor) BlindFactor {
-        out := b
-        out[0] &= 248
-        out[31] &= 127
-        out[31] |= 64
-        return out
-}
+// clampScalar was removed (H-2 fix): Ed25519 signing-key clamping has no
+// meaning for Pedersen blinding scalars and could silently produce a different
+// commitment than intended.  All callers of Commit() use SetUniformBytes or
+// SetCanonicalBytes and always produce canonical scalars.

@@ -45,15 +45,21 @@ func minimalRingCTTx(ring []crypto.Point32, commit crypto.Commitment) core.Trans
 
 // ─── C-0: ring-member UTXO presence check ─────────────────────────────────────
 
-// TestC0_Phase1CompatModeSkipsAbsentMembers verifies that a non-strict verifier
-// (Phase 1 compat mode, the default) accepts a transaction whose ring contains
-// keys not present in the UTXO set.
+// TestC0a_FabricatedInput_AllAbsent_Rejected verifies that a transaction whose
+// entire ring is absent from byPubKey is rejected by the C-0a fabricated-input
+// guard.
 //
-// Phase 1 wallets generate random decoy keys.  Without strict mode enabled the
-// C-0 check skips absent members so in-flight Phase 1 transactions are not
-// orphaned during migration.  The MLSAG ring signature still proves knowledge
-// of the real spending key, so no inflation is possible.
-func TestC0_Phase1CompatModeSkipsAbsentMembers(t *testing.T) {
+// Attack scenario: an attacker generates a fresh key pair (not on-chain), fills
+// a ring of 16 with random/spent keys, signs the MLSAG with their fabricated
+// key, and sets inp.AmountCommit freely.  Before the C-0a fix, the C-0 check
+// skipped every ring member (all absent) leaving AmountCommit unconstrained —
+// 1 APRO in could produce ∞ APRO out.
+//
+// The fix: when the UTXO set is available, at least one ring member per input
+// must be present in byPubKey.  A genuinely unspent real UTXO is always present
+// regardless of pruning mode (pruning strips old block data, not the live UTXO
+// set).  All-absent rings have no real on-chain input and must be rejected.
+func TestC0a_FabricatedInput_AllAbsent_Rejected(t *testing.T) {
 	utxos := core.NewUTXOSet()
 
 	blind, err := crypto.NewBlindFactor()
@@ -65,24 +71,24 @@ func TestC0_Phase1CompatModeSkipsAbsentMembers(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	// Build a ring with 16 random pub keys, none present in the UTXO set
-	// (mimicking txBuildRing Phase 1 behaviour).
+	// Build a ring with 16 fabricated pub keys — none present in the UTXO set.
 	ring := make([]crypto.Point32, crypto.RingSize)
 	for i := range ring {
 		ring[i][0] = byte(i + 1)
 	}
 
 	tx := minimalRingCTTx(ring, commit)
-	verifier := core.NewTxVerifier(utxos) // default: strictRingMembers = false
+	verifier := core.NewTxVerifier(utxos)
 	err = verifier.VerifyTx(&tx)
 
-	// Phase 1 compat mode: absent ring members must NOT trigger a C-0 error.
-	// The tx may still fail at a later stage (e.g. MLSAG nil signature in this
-	// test), but it must pass the ring-member UTXO existence check.
-	if err != nil && strings.Contains(err.Error(), "C-0") {
-		t.Fatalf("Phase 1 compat mode: absent ring member incorrectly rejected by C-0: %v", err)
+	// C-0a must fire: all ring members are absent → fabricated-input attack.
+	if err == nil {
+		t.Fatal("expected C-0a rejection of all-absent ring, got nil error")
 	}
-	t.Logf("Phase 1 compat: absent member correctly skipped (later stage: %v)", err)
+	if !strings.Contains(err.Error(), "C-0a") {
+		t.Fatalf("expected C-0a error, got: %v", err)
+	}
+	t.Logf("C-0a correctly rejected all-absent fabricated ring: %v", err)
 }
 
 // TestC0_AllMembersInUTXOSet_SameCommit verifies that a ring where every member
