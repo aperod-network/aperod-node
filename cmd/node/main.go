@@ -2,6 +2,7 @@
 package main
 
 import (
+        "bufio"
         "encoding/json"
         "fmt"
         "log/slog"
@@ -11,6 +12,8 @@ import (
         "regexp"
         "runtime"
         "runtime/debug"
+        "strconv"
+        "strings"
         "syscall"
         "time"
 
@@ -146,6 +149,16 @@ func run() error {
         slog.SetDefault(log)
 
         log.Info("starting Aperod node", "network", cfg.Network, "data_dir", cfg.DataDir)
+
+        // Guard: warn early if the systemd override does not give the node
+        // enough time to flush a snapshot on graceful stop.  A TimeoutStopSec
+        // below 240 s risks a SIGKILL arriving before saveStartupSnapshot
+        // finishes, forcing a full block scan on the next restart and
+        // potentially causing an OOM loop.
+        checkSystemdTimeout(
+                "/etc/systemd/system/aperod-node.service.d/timeout.conf",
+                log,
+        )
 
         // Emit any non-fatal configuration warnings now that the logger is ready.
         for _, w := range cfg.Warnings() {
@@ -1028,6 +1041,58 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
         }
         log.Info("generated new validator key", "pub", lk.Public().ID(), "saved", keyPath)
         return lk, nil
+}
+
+// checkSystemdTimeout reads path (the systemd service drop-in that sets
+// TimeoutStopSec) and emits a warning when the value is below 240 seconds.
+//
+// A value below 240 s means systemd may send SIGKILL before the shutdown
+// snapshot goroutine finishes writing, which forces a full block scan on the
+// next restart and risks an OOM loop on large chains.
+//
+// The function is a no-op when the file is absent (e.g. non-systemd systems or
+// development environments); that case produces no log output.
+func checkSystemdTimeout(path string, log *slog.Logger) {
+        f, err := os.Open(path)
+        if err != nil {
+                // File absent is not an error — the node may not be running under
+                // systemd, or the operator has not created the override yet.
+                return
+        }
+        defer f.Close()
+
+        const minSec = 240
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+                line := strings.TrimSpace(sc.Text())
+                after, ok := strings.CutPrefix(line, "TimeoutStopSec=")
+                if !ok {
+                        continue
+                }
+                val := strings.TrimSpace(after)
+                if strings.EqualFold(val, "infinity") {
+                        return // infinity is safe
+                }
+                secs, parseErr := strconv.ParseFloat(val, 64)
+                if parseErr != nil {
+                        log.Warn("systemd TimeoutStopSec: could not parse value",
+                                "path", path, "value", val)
+                        return
+                }
+                if secs < minSec {
+                        log.Warn(
+                                "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart",
+                                "path", path,
+                                "current_sec", secs,
+                                "minimum_sec", minSec,
+                                "fix", fmt.Sprintf(
+                                        "set TimeoutStopSec=%d in %s and run: systemctl daemon-reload",
+                                        minSec, path,
+                                ),
+                        )
+                }
+                return
+        }
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.
