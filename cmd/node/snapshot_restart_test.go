@@ -764,7 +764,118 @@ func TestPrevBackupHashMismatchRejected(t *testing.T) {
 	}
 }
 
-// ─── Test 8: truncated snapshot falls back to block scan ──────────────────────
+// ─── Test 8: truncated / invalid-JSON prev-backup is discarded ───────────────
+
+// TestPrevBackupTruncatedDecodeError confirms that loadPrevBackupSnapshot
+// returns a non-nil error (not os.ErrNotExist) and does not load any UTXO
+// state when the prev-backup file exists but contains truncated or invalid JSON.
+//
+// Scenario A — truncated file:
+//   - A valid snapshot is saved at height H (primary).
+//   - A second save at H+1 promotes H-primary to H-prev.json.
+//   - The prev file is truncated to half its size (simulates a mid-write crash).
+//   - loadPrevBackupSnapshot(dir, H, correctHex) must return a non-nil,
+//     non-ErrNotExist error; snapLoaded must stay false.
+//
+// Scenario B — invalid JSON:
+//   - The prev file is overwritten with the literal string "not json".
+//   - Same assertions: non-nil error, not ErrNotExist, snapLoaded false.
+//
+// Together these cover the failure mode described in task 1062: a decode error
+// occurring before the hash check must be caught and reported, never silently
+// ignored.
+func TestPrevBackupTruncatedDecodeError(t *testing.T) {
+	dir := t.TempDir()
+
+	// ── Build two blocks so we have two distinct heights.
+	_, blocks := buildChainInStore(t, dir, 1) // genesis (h=0) + block (h=1)
+
+	blk0 := blocks[0]
+	blk1 := blocks[1]
+	hash0 := blk0.Hash()
+	hash1 := blk1.Hash()
+	hexH0 := fmt.Sprintf("%x", hash0[:])
+	hexH1 := fmt.Sprintf("%x", hash1[:])
+
+	// ── Save primary at h=0.
+	snap0 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  0,
+		TipHashHex: hexH0,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap0); err != nil {
+		t.Fatalf("first saveStartupSnapshot: %v", err)
+	}
+
+	primaryH0 := snapshotPath(dir, 0)
+	prevPath := snapshotPrevPath(primaryH0) // will be created by next save
+
+	// ── Save at h=1; this promotes snapshot-v1-0.json → snapshot-v1-0-prev.json.
+	snap1 := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  1,
+		TipHashHex: hexH1,
+		TxTotal:    0,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap1); err != nil {
+		t.Fatalf("second saveStartupSnapshot: %v", err)
+	}
+	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
+		t.Fatalf("prev backup %s was not created by the second save", prevPath)
+	}
+
+	// ── Helper: assert loadPrevBackupSnapshot rejects the (now-corrupt) prev file.
+	assertRejected := func(label string) {
+		t.Helper()
+		snapLoaded := false
+		loaded, err := loadPrevBackupSnapshot(dir, 0, hexH0)
+		if err == nil {
+			snapLoaded = true
+			_ = loaded
+		}
+
+		if err == nil {
+			t.Errorf("[%s] loadPrevBackupSnapshot: expected non-nil error; got nil (snapLoaded=%v)", label, snapLoaded)
+		}
+		if os.IsNotExist(err) {
+			// Must be a decode / validation error, not a missing-file error.
+			t.Errorf("[%s] loadPrevBackupSnapshot: got os.ErrNotExist; wanted a decode error (file exists but is corrupt)", label)
+		}
+		if snapLoaded {
+			t.Errorf("[%s] snapLoaded should remain false when prev backup is corrupt", label)
+		}
+		if loaded != nil {
+			t.Errorf("[%s] loaded snapshot should be nil when prev backup is corrupt; got %+v", label, loaded)
+		}
+	}
+
+	// ── Scenario A: truncate the prev file to half its size.
+	info, err := os.Stat(prevPath)
+	if err != nil {
+		t.Fatalf("stat prev backup: %v", err)
+	}
+	fullSize := info.Size()
+	if fullSize < 2 {
+		t.Fatalf("prev backup too small (%d bytes) — test setup error", fullSize)
+	}
+	if err := os.Truncate(prevPath, fullSize/2); err != nil {
+		t.Fatalf("os.Truncate prev backup: %v", err)
+	}
+	assertRejected("truncated")
+
+	// ── Scenario B: overwrite the prev file with invalid JSON.
+	if err := os.WriteFile(prevPath, []byte("not json"), 0644); err != nil {
+		t.Fatalf("WriteFile prev backup (invalid JSON): %v", err)
+	}
+	assertRejected("invalid JSON")
+}
+
+// ─── Test 9: truncated snapshot falls back to block scan ──────────────────────
 
 // TestTruncatedSnapshotFallsBackToScan confirms that loadStartupSnapshot returns
 // a non-nil error and that snapLoaded remains false when the snapshot file is
