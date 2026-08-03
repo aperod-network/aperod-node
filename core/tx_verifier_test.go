@@ -366,6 +366,220 @@ func TestTxVerifier_NegativeFeeInflationAttack_Rejected(t *testing.T) {
 	t.Logf("valid tx with Commit(fee, 0) correctly accepted")
 }
 
+// TestTxVerifier_RangeProofCommitmentMismatch_Rejected (task-933 regression) —
+// VerifyTx must reject a transaction where proof.ValueCommit covers 1,000 nAPRO
+// but tx.Outputs[0].AmountCommit covers 999,000 nAPRO (range-proof bypass attack).
+//
+// Attack surface: an attacker produces a valid Bulletproof range proof for a
+// small amount X, but submits an output commitment for a much larger amount Y.
+// Without check 5 the verifier would accept the range proof (✓) and never
+// notice that the output's AmountCommit was not the one the proof covers.
+//
+// Fix (already present in tx_verifier.go check 5):
+//
+//	if proof.ValueCommit != tx.Outputs[i].AmountCommit { reject }
+//
+// A valid counterpart where proof and output cover the same amount must pass
+// VerifyTx up through that check.
+func TestTxVerifier_RangeProofCommitmentMismatch_Rejected(t *testing.T) {
+	const (
+		proofAmount    uint64 = 1_000
+		inflatedAmount uint64 = 999_000
+		feeAmount      uint64 = 1
+	)
+
+	// ── Spender key pair ─────────────────────────────────────────────────────
+	kp, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	ki, err := crypto.ComputeKeyImage(kp.Spend.Private, kp.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage: %v", err)
+	}
+
+	// ── Output blind and commitment (inflatedAmount = 999,000 nAPRO) ─────────
+	// r_fee = 0, so blind balance requires r_in = r_out.
+	// We use rOut as both the output blind AND the input blind so that:
+	//   C_in = C_out + C_fee  →  Commit(999001, rOut) = Commit(999000, rOut) + Commit(1, 0)
+	// The commitment balance check (step 6) therefore passes.
+	rOut, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor rOut: %v", err)
+	}
+	commitInflated, err := crypto.Commit(inflatedAmount, rOut)
+	if err != nil {
+		t.Fatalf("Commit inflated: %v", err)
+	}
+
+	// Input commitment: inflatedAmount + feeAmount, same blind as output (r_fee=0).
+	commitIn, err := crypto.Commit(inflatedAmount+feeAmount, rOut)
+	if err != nil {
+		t.Fatalf("Commit in: %v", err)
+	}
+
+	// ── Range proof: valid for proofAmount (1,000 nAPRO) using a DIFFERENT blind
+	// This makes proof.ValueCommit = Commit(1000, rProof) ≠ Commit(999000, rOut)
+	// = commitInflated, so only check 5 fires.  All other checks pass because the
+	// transaction is otherwise commitment-balanced and properly signed.
+	rProof, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor rProof: %v", err)
+	}
+	proofSmall, err := crypto.ProveRange(proofAmount, rProof)
+	if err != nil {
+		t.Fatalf("ProveRange small: %v", err)
+	}
+	// proofSmall.ValueCommit = Commit(1_000, rProof)  ≠  commitInflated
+
+	// ── Fee commit: honest Commit(fee, 0) ────────────────────────────────────
+	var zeroBlind crypto.BlindFactor
+	commitFee, err := crypto.Commit(feeAmount, zeroBlind)
+	if err != nil {
+		t.Fatalf("Commit fee: %v", err)
+	}
+
+	// ── Build ring: real key at 0, random decoys (absent from UTXO set) ──────
+	ring := make([]crypto.RingMember, crypto.RingSize)
+	ring[0] = kp.Spend.Public
+	for i := 1; i < crypto.RingSize; i++ {
+		decoy, e := crypto.GenerateWalletKeys()
+		if e != nil {
+			t.Fatalf("GenerateWalletKeys decoy %d: %v", i, e)
+		}
+		ring[i] = decoy.Spend.Public
+	}
+
+	utxos := core.NewUTXOSet()
+	utxos.Add(makeUTXO(crypto.Hash32{0xC1}, 0, kp.Spend.Public, commitIn))
+
+	// ── Assemble attack transaction ───────────────────────────────────────────
+	txAttack := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{{
+			KeyImage:     ki,
+			Ring:         ring,
+			AmountCommit: commitIn,
+		}},
+		Outputs: []core.Output{{
+			OneTimePub:   crypto.Point32{0xAB},
+			AmountCommit: commitInflated, // 999,000 — mismatches proof.ValueCommit
+		}},
+		Fee:         feeAmount,
+		FeeCommit:   commitFee,
+		Signatures:  make([]*crypto.MLSAGSignature, 1),
+		RangeProofs: []*crypto.RangeProof{proofSmall}, // valid proof for 1,000 only
+	}
+
+	txHash := txAttack.Hash()
+	msg := core.RingSignMessage(txHash, 0)
+	sig, err := crypto.MLSAGSign(msg, ring, 0, kp.Spend.Private)
+	if err != nil {
+		t.Fatalf("MLSAGSign attack: %v", err)
+	}
+	txAttack.Signatures[0] = sig
+	txAttack.Inputs[0].KeyImage = sig.KeyImage
+
+	// ── Must be rejected with "range proof commitment mismatch" ──────────────
+	v := core.NewTxVerifier(utxos)
+	errAttack := v.VerifyTx(&txAttack)
+	if errAttack == nil {
+		t.Fatal("VerifyTx must reject range-proof commitment mismatch, got nil error")
+	}
+	if !strings.Contains(errAttack.Error(), "range proof commitment mismatch") {
+		t.Errorf("expected 'range proof commitment mismatch' error, got: %v", errAttack)
+	}
+	t.Logf("range-proof commitment mismatch correctly rejected: %v", errAttack)
+
+	// ─── Positive case: proof and output commit to the same amount ────────────
+	// Balance: inAmount (1001) = outAmount (1000) + fee (1)
+	// Blind balance: r_fee = 0  →  r_out = r_in  (standard construction)
+	const (
+		inAmountOK  uint64 = 1_001
+		outAmountOK uint64 = 1_000
+		feeOK       uint64 = 1
+	)
+
+	kpOK, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys OK: %v", err)
+	}
+	kiOK, err := crypto.ComputeKeyImage(kpOK.Spend.Private, kpOK.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage OK: %v", err)
+	}
+
+	rInOK, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor rInOK: %v", err)
+	}
+	commitInOK, err := crypto.Commit(inAmountOK, rInOK)
+	if err != nil {
+		t.Fatalf("Commit inOK: %v", err)
+	}
+	// r_fee = 0  →  r_out = r_in so blind balance holds
+	commitOutOK, err := crypto.Commit(outAmountOK, rInOK)
+	if err != nil {
+		t.Fatalf("Commit outOK: %v", err)
+	}
+	var zeroBlindOK crypto.BlindFactor
+	commitFeeOK, err := crypto.Commit(feeOK, zeroBlindOK)
+	if err != nil {
+		t.Fatalf("Commit feeOK: %v", err)
+	}
+	// ProveRange uses the same blind as the output → proof.ValueCommit == commitOutOK
+	proofOK, err := crypto.ProveRange(outAmountOK, rInOK)
+	if err != nil {
+		t.Fatalf("ProveRange OK: %v", err)
+	}
+
+	ringOK := make([]crypto.RingMember, crypto.RingSize)
+	ringOK[0] = kpOK.Spend.Public
+	for i := 1; i < crypto.RingSize; i++ {
+		decoy, e := crypto.GenerateWalletKeys()
+		if e != nil {
+			t.Fatalf("GenerateWalletKeys decoy OK %d: %v", i, e)
+		}
+		ringOK[i] = decoy.Spend.Public
+	}
+
+	utxosOK := core.NewUTXOSet()
+	utxosOK.Add(makeUTXO(crypto.Hash32{0xD1}, 0, kpOK.Spend.Public, commitInOK))
+
+	txOK := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{{
+			KeyImage:     kiOK,
+			Ring:         ringOK,
+			AmountCommit: commitInOK,
+		}},
+		Outputs: []core.Output{{
+			OneTimePub:   crypto.Point32{0x77},
+			AmountCommit: commitOutOK,
+		}},
+		Fee:         feeOK,
+		FeeCommit:   commitFeeOK,
+		Signatures:  make([]*crypto.MLSAGSignature, 1),
+		RangeProofs: []*crypto.RangeProof{proofOK},
+	}
+
+	txHashOK := txOK.Hash()
+	msgOK := core.RingSignMessage(txHashOK, 0)
+	sigOK, err := crypto.MLSAGSign(msgOK, ringOK, 0, kpOK.Spend.Private)
+	if err != nil {
+		t.Fatalf("MLSAGSign OK: %v", err)
+	}
+	txOK.Signatures[0] = sigOK
+	txOK.Inputs[0].KeyImage = sigOK.KeyImage
+
+	vOK := core.NewTxVerifier(utxosOK)
+	errOK := vOK.VerifyTx(&txOK)
+	if errOK != nil {
+		t.Errorf("valid tx where proof.ValueCommit == output.AmountCommit must pass VerifyTx, got: %v", errOK)
+	}
+	t.Logf("matching proof-and-output commitment correctly accepted")
+}
+
 // TestMempool_DoubleSpendKeyImage_Rejected (#487) — pool.Add() must return an
 // error when the verifier has the key image marked spent.
 func TestMempool_DoubleSpendKeyImage_Rejected(t *testing.T) {
