@@ -401,11 +401,13 @@ exit 0
 STUB
 chmod +x "$T9_FAKE_DF_DIR/df"
 
+T9_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t9-XXXXXXXX")
 T9_EXIT=0
 APEROD_BACKUP_PASSWORD="test-password-success" \
   DATA_DIR="$T9_DIR/data" \
   APEROD_TEXTFILE_DIR="$T9_DIR/metrics" \
   APEROD_HISTORY_LOG="$T9_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T9_BACKUP_DIR" \
   TELEGRAM_BOT_TOKEN="tok-success" \
   ADMIN_TELEGRAM_CHAT_ID="12345678" \
   PATH="$T9_FAKE_CURL:$T9_FAKE_SUDO_DIR:$T9_FAKE_PGDUMP:$T9_FAKE_GPG_DIR:$T9_FAKE_TAR_DIR:$T9_FAKE_RCLONE_DIR:$T9_FAKE_DF_DIR:$PATH" \
@@ -416,6 +418,240 @@ if [[ ! -f "$T9_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T9_CURL_LOG" 2>/d
   pass "Telegram failure alert was NOT sent on successful backup"
 else
   fail "Telegram failure alert was unexpectedly sent on a successful run (log: $(cat "$T9_CURL_LOG" 2>/dev/null))"
+fi
+
+# =============================================================================
+# Test 10: Low-disk preflight → exits 0, aperod_backup_skipped_low_disk=1
+# =============================================================================
+section "Test 10: low-disk preflight → exit 0 and skipped_low_disk=1 in Prometheus"
+
+T10_DIR=$(mktemp -d "$TMPDIR_TEST/run-t10-XXXXXXXX")
+make_settings_json "$T10_DIR/data"
+mkdir -p "$T10_DIR/metrics"
+T10_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t10-XXXXXXXX")
+
+T10_CURL_LOG="$T10_DIR/curl.log"
+T10_FAKE_CURL=$(make_fake_curl "$T10_CURL_LOG")
+
+# df stub: return only 1 MB free (far below 5 GB minimum)
+T10_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t10-XXXXXXXX")
+cat >"$T10_FAKE_DF_DIR/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "1024"
+exit 0
+STUB
+chmod +x "$T10_FAKE_DF_DIR/df"
+
+# sudo stub (pg_dump path — should never be reached after preflight bails)
+T10_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t10-XXXXXXXX")
+cat >"$T10_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T10_FAKE_SUDO_DIR/sudo"
+
+T10_FAKE_RCLONE=$(make_fake_bin "rclone" "$T10_DIR/rclone.log" 0)
+T10_FAKE_GPG=$(make_fake_bin "gpg"    "$T10_DIR/gpg.log"    0)
+
+T10_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t10-XXXXXXXX")
+cat >"$T10_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T10_FAKE_TAR_DIR/tar"
+
+T10_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t10" \
+  DATA_DIR="$T10_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T10_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T10_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T10_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t10" \
+  ADMIN_TELEGRAM_CHAT_ID="10000001" \
+  PATH="$T10_FAKE_CURL:$T10_FAKE_DF_DIR:$T10_FAKE_SUDO_DIR:$T10_FAKE_RCLONE:$T10_FAKE_GPG:$T10_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T10_EXIT=$?
+[[ "$T10_EXIT" -eq 99 ]] && T10_EXIT=0  # bash "$BACKUP_SH" returned 0
+
+if [[ "$T10_EXIT" -eq 0 ]]; then
+  pass "low-disk preflight exits 0 (skipped, not failed)"
+else
+  fail "low-disk preflight exited $T10_EXIT — expected 0"
+fi
+
+T10_PROM="$T10_DIR/metrics/aperod_backup.prom"
+if [[ -f "$T10_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T10_PROM"; then
+  pass "Prometheus: aperod_backup_skipped_low_disk=1 written on low-disk skip"
+else
+  fail "Prometheus: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T10_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T10_PROM" ]] && grep -q "^aperod_backup_last_success 0" "$T10_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=0 on low-disk skip"
+else
+  fail "Prometheus: aperod_backup_last_success=0 NOT found on low-disk skip"
+fi
+
+if [[ -f "$T10_CURL_LOG" ]] && grep -q "api.telegram.org" "$T10_CURL_LOG"; then
+  pass "Telegram low-disk alert was sent when tokens are set"
+else
+  fail "Telegram low-disk alert was NOT sent (log: $(cat "$T10_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 11: Recovery — after space freed the next run succeeds (skipped_low_disk=0)
+# =============================================================================
+section "Test 11: recovery — next cycle with sufficient space exits 0, skipped_low_disk=0"
+
+T11_DIR=$(mktemp -d "$TMPDIR_TEST/run-t11-XXXXXXXX")
+make_settings_json "$T11_DIR/data"
+mkdir -p "$T11_DIR/metrics"
+T11_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t11-XXXXXXXX")
+
+T11_CURL_LOG="$T11_DIR/curl.log"
+T11_FAKE_CURL=$(make_fake_curl "$T11_CURL_LOG")
+
+# ── Run A: low disk ──────────────────────────────────────────────────────────
+T11_FAKE_DF_LOW=$(mktemp -d "$TMPDIR_TEST/fake-df-t11-low-XXXXXXXX")
+cat >"$T11_FAKE_DF_LOW/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "512"
+exit 0
+STUB
+chmod +x "$T11_FAKE_DF_LOW/df"
+
+T11_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t11-XXXXXXXX")
+cat >"$T11_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T11_FAKE_SUDO_DIR/sudo"
+
+T11A_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t11" \
+  DATA_DIR="$T11_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T11_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T11_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T11_BACKUP_DIR" \
+  PATH="$T11_FAKE_CURL:$T11_FAKE_DF_LOW:$T11_FAKE_SUDO_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T11A_EXIT=$?
+[[ "$T11A_EXIT" -eq 99 ]] && T11A_EXIT=0
+
+T11_PROM="$T11_DIR/metrics/aperod_backup.prom"
+if [[ "$T11A_EXIT" -eq 0 ]] && [[ -f "$T11_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T11_PROM"; then
+  pass "Run A (low disk): exit 0 and skipped_low_disk=1 confirmed"
+else
+  fail "Run A (low disk): exit=$T11A_EXIT; prom=$(cat "$T11_PROM" 2>/dev/null || echo '<missing>')"
+fi
+
+# ── Run B: sufficient disk — full success stubs ──────────────────────────────
+T11_FAKE_DF_OK=$(mktemp -d "$TMPDIR_TEST/fake-df-t11-ok-XXXXXXXX")
+cat >"$T11_FAKE_DF_OK/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "20971520"
+exit 0
+STUB
+chmod +x "$T11_FAKE_DF_OK/df"
+
+T11_FAKE_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t11-XXXXXXXX")
+cat >"$T11_FAKE_GPG_DIR/gpg" <<'STUB'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then touch "$2"; shift 2; else shift; fi
+done
+exit 0
+STUB
+chmod +x "$T11_FAKE_GPG_DIR/gpg"
+
+T11_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t11-XXXXXXXX")
+cat >"$T11_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-f" || "$1" == *f* ]]; then
+    shift; [[ "${1:-}" != -* ]] && touch "$1" 2>/dev/null || true; break
+  fi
+  shift
+done
+exit 0
+STUB
+chmod +x "$T11_FAKE_TAR_DIR/tar"
+
+T11_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t11-XXXXXXXX")
+cat >"$T11_FAKE_RCLONE_DIR/rclone" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "size" ]]; then echo '{"count":1,"bytes":2048}'; fi
+exit 0
+STUB
+chmod +x "$T11_FAKE_RCLONE_DIR/rclone"
+
+# Re-create backup dir (previous run may have cleaned it up via EXIT trap)
+mkdir -p "$T11_BACKUP_DIR"
+
+T11B_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t11" \
+  DATA_DIR="$T11_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T11_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T11_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T11_BACKUP_DIR" \
+  PATH="$T11_FAKE_CURL:$T11_FAKE_DF_OK:$T11_FAKE_SUDO_DIR:$T11_FAKE_GPG_DIR:$T11_FAKE_TAR_DIR:$T11_FAKE_RCLONE_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T11B_EXIT=$?
+[[ "$T11B_EXIT" -eq 99 ]] && T11B_EXIT=0
+
+if [[ "$T11B_EXIT" -eq 0 ]]; then
+  pass "Run B (disk freed): exits 0 — backup succeeded"
+else
+  fail "Run B (disk freed): exited $T11B_EXIT — expected 0"
+fi
+
+if [[ -f "$T11_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 0" "$T11_PROM"; then
+  pass "Prometheus: aperod_backup_skipped_low_disk reset to 0 after successful run"
+else
+  fail "Prometheus: aperod_backup_skipped_low_disk NOT reset to 0 (file: $(cat "$T11_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T11_PROM" ]] && grep -q "^aperod_backup_last_success 1" "$T11_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=1 after recovery run"
+else
+  fail "Prometheus: aperod_backup_last_success=1 NOT found after recovery run"
+fi
+
+# =============================================================================
+# Test 12: Static — BACKUP_DIR preflight checks /opt/aperod partition, not /tmp
+# =============================================================================
+section "Test 12: static analysis — BACKUP_DIR preflight checks /opt/aperod, not /tmp"
+
+# The hardcoded default inside the variable expansion must point to /opt/aperod.
+# The assignment looks like: BACKUP_DIR="${APEROD_BACKUP_DIR_OVERRIDE:-/opt/aperod/...}"
+BACKUP_DIR_LINE=$(grep 'BACKUP_DIR=' "$BACKUP_SH" | grep -v '^\s*#' | head -1 || true)
+
+if echo "$BACKUP_DIR_LINE" | grep -q ':-/opt/aperod'; then
+  pass "BACKUP_DIR default (after :-) contains /opt/aperod (not /tmp)"
+else
+  fail "BACKUP_DIR default does NOT contain /opt/aperod: $BACKUP_DIR_LINE"
+fi
+
+if echo "$BACKUP_DIR_LINE" | grep -qv ':-/tmp'; then
+  pass "BACKUP_DIR default does not fall back to /tmp"
+else
+  fail "BACKUP_DIR default uses /tmp — preflight would check the wrong partition"
+fi
+
+# The _disk_preflight call for BACKUP_DIR must pass a label containing opt/aperod
+PREFLIGHT_CALL=$(grep '_disk_preflight.*BACKUP_DIR' "$BACKUP_SH" | grep -v '^\s*#' | head -1 || true)
+if echo "$PREFLIGHT_CALL" | grep -q 'opt/aperod'; then
+  pass "_disk_preflight for BACKUP_DIR passes an /opt/aperod label"
+else
+  fail "_disk_preflight BACKUP_DIR label does not reference /opt/aperod: $PREFLIGHT_CALL"
+fi
+
+# Confirm there is NO _disk_preflight call that hardcodes /tmp
+TMP_PREFLIGHT=$(grep '_disk_preflight' "$BACKUP_SH" | grep '/tmp' | grep -v '^\s*#' || true)
+if [[ -z "$TMP_PREFLIGHT" ]]; then
+  pass "No _disk_preflight call hardcodes /tmp as the checked partition"
+else
+  fail "_disk_preflight found with /tmp reference: $TMP_PREFLIGHT"
 fi
 
 # =============================================================================

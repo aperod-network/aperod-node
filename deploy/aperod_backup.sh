@@ -29,7 +29,7 @@ export LANG=en_US.UTF-8
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR="${DATA_DIR:-/opt/aperod/data}"
 SETTINGS_FILE="${DATA_DIR}/integration-settings.json"
-BACKUP_DIR="/opt/aperod/backup-tmp/aperod_backups_$$"
+BACKUP_DIR="${APEROD_BACKUP_DIR_OVERRIDE:-/opt/aperod/backup-tmp/aperod_backups_$$}"
 NODE_DATA_DIR="/opt/aperod/data"
 DB_NAME="${APEROD_DB_NAME:-barboskin}"
 DB_USER="${APEROD_DB_USER:-postgres}"
