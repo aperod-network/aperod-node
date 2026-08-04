@@ -30,7 +30,7 @@ export LANG=en_US.UTF-8
 DATA_DIR="${DATA_DIR:-/opt/aperod/data}"
 SETTINGS_FILE="${DATA_DIR}/integration-settings.json"
 BACKUP_DIR="${APEROD_BACKUP_DIR_OVERRIDE:-/opt/aperod/backup-tmp/aperod_backups_$$}"
-NODE_DATA_DIR="/opt/aperod/data"
+NODE_DATA_DIR="${APEROD_NODE_DATA_DIR_OVERRIDE:-/opt/aperod/data}"
 DB_NAME="${APEROD_DB_NAME:-barboskin}"
 DB_USER="${APEROD_DB_USER:-postgres}"
 ENCRYPTION_PASSWORD="${APEROD_BACKUP_PASSWORD:?Задайте APEROD_BACKUP_PASSWORD в /etc/environment}"
@@ -222,6 +222,62 @@ _disk_preflight() {
 _disk_preflight "$BACKUP_DIR" "BACKUP_DIR (/opt/aperod/backup-tmp)"
 [ -d "$NODE_DATA_DIR" ] && _disk_preflight "$NODE_DATA_DIR" "NODE_DATA_DIR (${NODE_DATA_DIR})"
 
+# ── Scaled preflight: BACKUP_DIR must fit one full encrypted copy of node data ──
+# With streaming (tar|gpg), only the GPG output file exists on disk at a time,
+# so the required headroom equals the raw node data size (pre-compression worst
+# case) plus 1 GiB of buffer for the DB dump and filesystem overhead.
+_disk_preflight_scaled() {
+  [ -d "$NODE_DATA_DIR" ] || return 0
+  local data_kb
+  data_kb=$(du -sk "$NODE_DATA_DIR" 2>/dev/null | awk '{print $1}')
+  [ -z "$data_kb" ] && data_kb=0
+  local buffer_kb=$(( 1 * 1024 * 1024 ))   # 1 GiB buffer
+  local required_kb=$(( data_kb + buffer_kb ))
+  local avail_kb
+  avail_kb=$(df --output=avail "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $1}')
+  [ -z "$avail_kb" ] && avail_kb=0
+  if [ "$avail_kb" -lt "$required_kb" ]; then
+    local free_gb need_gb
+    free_gb=$(awk "BEGIN{printf \"%.1f\", ${avail_kb}/1024/1024}")
+    need_gb=$(awk "BEGIN{printf \"%.1f\", ${required_kb}/1024/1024}")
+    echo "=== ВНИМАНИЕ: мало свободного места на диске ==="
+    echo "  Раздел : BACKUP_DIR (/opt/aperod/backup-tmp)"
+    echo "  Свободно: ${free_gb} ГБ — требуется ~${need_gb} ГБ (размер ноды + 1 ГБ буфер)"
+    echo "  Бэкап пропущен."
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
+      local ts_iso
+      ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      local tg_text
+      tg_text="⚠️ <b>Бэкап Aperod пропущен — мало места на диске</b>%0A%0A"
+      tg_text+="<b>Раздел:</b> BACKUP_DIR (/opt/aperod/backup-tmp)%0A"
+      tg_text+="<b>Свободно:</b> ${free_gb} ГБ%0A"
+      tg_text+="<b>Требуется:</b> ~${need_gb} ГБ (размер данных ноды + 1 ГБ)%0A"
+      tg_text+="<b>Время:</b> ${ts_iso}%0A%0A"
+      tg_text+="💡 Освободите место — бэкап возобновится на следующем расписании."
+      curl -s --max-time 15 -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${ADMIN_TELEGRAM_CHAT_ID}" \
+        -d "text=${tg_text}" \
+        -d "parse_mode=HTML" \
+        -d "disable_web_page_preview=true" \
+        >/dev/null 2>&1 || true
+      echo "  Telegram low-disk alert sent to admin chat."
+    fi
+    _BACKUP_FINAL_STATUS="skipped"
+    _BACKUP_SKIP_REASON="low_disk"
+    _BACKUP_DISK_PATH="BACKUP_DIR (/opt/aperod/backup-tmp)"
+    _BACKUP_DISK_FREE_GB="${free_gb}"
+    write_metrics 0 1
+    exit 0
+  fi
+  local data_gb
+  data_gb=$(awk "BEGIN{printf \"%.1f\", ${data_kb}/1024/1024}")
+  local need_gb
+  need_gb=$(awk "BEGIN{printf \"%.1f\", ${required_kb}/1024/1024}")
+  echo "  Данные ноды: ${data_gb} ГБ → требуется ~${need_gb} ГБ на BACKUP_DIR — OK"
+}
+_disk_preflight_scaled
+
 echo "=== [1/4] Бэкап начат: ${TIMESTAMP} ==="
 
 # ── 1. PostgreSQL dump ─────────────────────────────────────────────────────────
@@ -231,27 +287,30 @@ echo "  Дамп PostgreSQL: ${DB_NAME} (user=${DB_USER}) ..."
 sudo -u "$DB_USER" pg_dump -F c -b "$DB_NAME" > "${BACKUP_DIR}/explorer_db.dump"
 echo "  Дамп БД: $(du -sh "${BACKUP_DIR}/explorer_db.dump" | cut -f1)"
 
-# ── 2. Blockchain node data ────────────────────────────────────────────────────
+# ── 2+3. Stream all sources directly into GPG (no intermediate tar/tar.gz) ──────
+# Previous approach: node_chain_data.tar.gz  +  backup.tar  +  backup.tar.gpg
+#   existed simultaneously → up to 3× chain size of temp disk usage.
+# New approach: tar stdout piped to gpg stdin → only one output file ever written.
+#   Peak temp usage = GPG archive (~= compressed chain size) + small DB dump.
+#
+# --ignore-failed-read prevents tar from dying when LevelDB compaction removes
+# an SST file mid-archive (safe: the DB remains consistent).
+echo "=== [2/4] Архивирование + шифрование AES-256 (потоковый режим) ==="
+TAR_ARGS=( --ignore-failed-read --warning=no-file-removed -czf -
+           -C "$BACKUP_DIR" explorer_db.dump )
 if [ -d "$NODE_DATA_DIR" ]; then
-  echo "  Архивируем данные ноды (${NODE_DATA_DIR})..."
-  # --ignore-failed-read prevents tar from dying when LevelDB compaction
-  # deletes an SST file mid-archive (this is safe: the DB remains consistent).
-  tar --ignore-failed-read --warning=no-file-removed \
-    -czf "${BACKUP_DIR}/node_chain_data.tar.gz" -C "$NODE_DATA_DIR" . || true
-  echo "  Архив ноды: $(du -sh "${BACKUP_DIR}/node_chain_data.tar.gz" | cut -f1)"
+  echo "  Включаем данные ноды (${NODE_DATA_DIR}) в поток архива..."
+  TAR_ARGS+=( -C "$NODE_DATA_DIR" . )
 else
   echo "  ПРЕДУПРЕЖДЕНИЕ: NODE_DATA_DIR=${NODE_DATA_DIR} не найден, пропускаем."
 fi
-
-# ── 3. Pack + encrypt (AES-256 via GnuPG) ─────────────────────────────────────
-echo "=== [2/4] Шифрование AES-256 ==="
-cd "$BACKUP_DIR"
-tar -cf "${BACKUP_NAME}.tar" *.dump *.tar.gz 2>/dev/null || tar -cf "${BACKUP_NAME}.tar" *.dump
-
-echo "$ENCRYPTION_PASSWORD" | gpg --batch --yes --passphrase-fd 0 \
-  --symmetric --cipher-algo AES256 \
-  -o "${BACKUP_NAME}.tar.gpg" "${BACKUP_NAME}.tar"
-echo "  Зашифровано: $(du -sh "${BACKUP_NAME}.tar.gpg" | cut -f1)"
+# Decrypt+extract: gpg -d <file>.tar.gpg | tar -xzf -
+tar "${TAR_ARGS[@]}" \
+  | gpg --batch --yes --passphrase-fd 3 \
+      --symmetric --cipher-algo AES256 \
+      -o "${BACKUP_DIR}/${BACKUP_NAME}.tar.gpg" - \
+    3< <(echo "$ENCRYPTION_PASSWORD")
+echo "  Зашифровано: $(du -sh "${BACKUP_DIR}/${BACKUP_NAME}.tar.gpg" | cut -f1)"
 
 # ── 4. Upload to S3 via rclone ─────────────────────────────────────────────────
 echo "=== [3/4] Загрузка в ${RCLONE_REMOTE} ==="
