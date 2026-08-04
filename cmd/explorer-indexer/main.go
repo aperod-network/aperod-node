@@ -8,10 +8,12 @@
 //	POLL_INTERVAL — seconds between tip polls after catch-up (default: 5)
 //	BATCH_SIZE    — blocks per batch during initial catch-up (default: 50)
 //
-// On startup the indexer reads chain_stats.last_indexed_height to resume where
-// it left off.  After the initial catch-up it polls for new blocks at the
-// configured interval.  All block indexing is idempotent — restarting the
-// process is always safe.
+// Startup behaviour:
+//   - Waits for the Go node to report ok:true and syncing:false before indexing.
+//     This prevents indexing a partial window while the node replays its chain.
+//   - Reads chain_stats.last_indexed_height to resume where it left off.
+//   - After initial catch-up polls every POLL_INTERVAL seconds for new blocks.
+//   - All indexing is idempotent — restarting is always safe.
 package main
 
 import (
@@ -79,10 +81,26 @@ func run() error {
 
 	client := &nodeClient{base: nodeURL, http: &http.Client{Timeout: 30 * time.Second}}
 
+	// ── Wait for Go node to be fully ready ────────────────────────────────────
+	// The node REST API is reachable during startup replay/sync, so we must
+	// wait until it reports ok:true AND syncing:false before indexing.
+	// Otherwise we may record last_indexed_height against a partial chain window.
+	log.Info("waiting for Go node to finish syncing…")
+	for {
+		ready, err := client.isNodeReady()
+		if err != nil {
+			log.Warn("node not reachable yet", "err", err)
+		} else if ready {
+			log.Info("Go node is ready — starting catch-up")
+			break
+		} else {
+			log.Info("Go node still syncing — waiting")
+		}
+		time.Sleep(10 * time.Second)
+	}
+
 	// ── Initial catch-up ───────────────────────────────────────────────────────
-	// Resume from where we left off.  Retries indefinitely on node-unavailable.
 	if err := catchUp(idx, client, batchSize, log); err != nil {
-		// catchUp only returns an unrecoverable error (not transient node errors).
 		return fmt.Errorf("initial catch-up failed: %w", err)
 	}
 
@@ -90,7 +108,6 @@ func run() error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	// Update TPS stats on every other tick (every ~10 s at default interval).
 	tpsTick := 0
 	for range ticker.C {
 		if err := catchUp(idx, client, batchSize, log); err != nil {
@@ -108,8 +125,8 @@ func run() error {
 }
 
 // catchUp indexes all blocks from last_indexed_height+1 up to the current
-// node tip.  Returns nil when fully caught up, or when the node is temporarily
-// unreachable (logs a warning and returns nil so the caller can retry).
+// node tip.  Returns nil when the node is temporarily unreachable (logs warning
+// and defers to the next tick) to avoid crashing the polling loop.
 func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *slog.Logger) error {
 	stats, err := idx.GetStats()
 	if err != nil {
@@ -121,7 +138,6 @@ func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *s
 		startHeight = uint64(stats.LastIndexedHeight) + 1
 	}
 
-	// Ask the node for the current tip height.
 	tipHeight, err := client.getTipHeight()
 	if err != nil {
 		log.Warn("node unreachable — will retry on next tick", "err", err)
@@ -148,11 +164,10 @@ func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *s
 			if err := indexBlock(idx, client, bh, log); err != nil {
 				log.Warn("failed to index block — stopping batch",
 					"height", bh, "err", err)
-				return nil // let the next tick retry from this height
+				return nil // next tick retries from the persisted height
 			}
 			indexed++
 		}
-		// Brief yield between batches to keep the connection pool healthy.
 		if end < tipHeight {
 			time.Sleep(20 * time.Millisecond)
 		}
@@ -164,8 +179,10 @@ func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *s
 	return nil
 }
 
-// indexBlock fetches a single block and its transactions from the Go node and
-// writes them to PostgreSQL via the Indexer.
+// indexBlock fetches a block, its transactions, and its outputs from the Go node
+// and writes them atomically to PostgreSQL.  address_txs rows are keyed by
+// one_time_pub_hex — the canonical identifier for a transaction output that is
+// derivable without a view key.
 func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *slog.Logger) error {
 	blockResp, err := client.getBlock(height)
 	if err != nil {
@@ -180,6 +197,11 @@ func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *s
 		return fmt.Errorf("get txs for block %d: %w", height, err)
 	}
 
+	outResp, err := client.getBlockOutputs(height)
+	if err != nil {
+		return fmt.Errorf("get outputs for block %d: %w", height, err)
+	}
+
 	bd := explorer.BlockData{
 		Height:       height,
 		Hash:         blockResp.Hash,
@@ -191,7 +213,6 @@ func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *s
 	}
 
 	blockHash := blockResp.Hash
-
 	txs := make([]explorer.TxData, 0, len(txResp.Transactions))
 	for _, t := range txResp.Transactions {
 		txs = append(txs, explorer.TxData{
@@ -208,11 +229,30 @@ func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *s
 		})
 	}
 
-	if err := idx.IndexBlock(bd, txs, nil); err != nil {
+	// Build address_txs rows from the output list.
+	// one_time_pub_hex is used as the address key: it uniquely identifies the
+	// output recipient and is stable across restarts.  For transparent outputs
+	// (admin mints, coinbase) one_time_pub_hex == spend_pub_hex, so lookups by
+	// the recipient's spend key will find these records.
+	addr := make([]explorer.AddrTxData, 0, len(outResp.Outputs))
+	for _, o := range outResp.Outputs {
+		if o.OneTimePubHex == "" {
+			continue
+		}
+		addr = append(addr, explorer.AddrTxData{
+			Address:     o.OneTimePubHex,
+			TxHash:      o.TxHash,
+			BlockHeight: height,
+			TxIndex:     o.TxIndex,
+			OutputIndex: o.OutputIndex,
+		})
+	}
+
+	if err := idx.IndexBlock(bd, txs, addr); err != nil {
 		return fmt.Errorf("index block %d: %w", height, err)
 	}
 
-	log.Debug("indexed block", "height", height, "txs", len(txs))
+	log.Debug("indexed block", "height", height, "txs", len(txs), "outputs", len(addr))
 	return nil
 }
 
@@ -223,7 +263,14 @@ type nodeClient struct {
 	http *http.Client
 }
 
-// blockAPIResponse maps the Go node's GET /api/v1/blocks/{height} JSON.
+// nodeStatusResponse maps GET /api/v1/status.
+type nodeStatusResponse struct {
+	OK      bool  `json:"ok"`
+	Syncing bool  `json:"syncing"`
+	Height  int64 `json:"height"`
+}
+
+// blockAPIResponse maps GET /api/v1/blocks/{height}.
 type blockAPIResponse struct {
 	Hash         string `json:"hash"`
 	Height       uint64 `json:"height"`
@@ -235,11 +282,11 @@ type blockAPIResponse struct {
 	TxCount      int    `json:"tx_count"`
 }
 
-// blockTxsAPIResponse maps the Go node's GET /api/v1/blocks/{height}/transactions JSON.
+// blockTxsAPIResponse maps GET /api/v1/blocks/{height}/transactions.
 type blockTxsAPIResponse struct {
-	BlockHash   string    `json:"block_hash"`
-	BlockHeight uint64    `json:"block_height"`
-	TxCount     int       `json:"tx_count"`
+	BlockHash    string   `json:"block_hash"`
+	BlockHeight  uint64   `json:"block_height"`
+	TxCount      int      `json:"tx_count"`
 	Transactions []txItem `json:"transactions"`
 }
 
@@ -253,22 +300,59 @@ type txItem struct {
 	Size       int    `json:"size"`
 }
 
+// blockOutputsAPIResponse maps GET /api/v1/blocks/{height}/outputs.
+type blockOutputsAPIResponse struct {
+	BlockHash   string       `json:"block_hash"`
+	BlockHeight uint64       `json:"block_height"`
+	OutputCount int          `json:"output_count"`
+	Outputs     []outputItem `json:"outputs"`
+}
+
+type outputItem struct {
+	TxHash        string `json:"tx_hash"`
+	TxIndex       int    `json:"tx_index"`
+	OutputIndex   int    `json:"output_index"`
+	OneTimePubHex string `json:"one_time_pub_hex"`
+	IsCoinbase    bool   `json:"is_coinbase"`
+}
+
+// blocksListResponse maps GET /api/v1/blocks?limit=1.
 type blocksListResponse struct {
 	Total uint64 `json:"total"`
 }
 
-func (c *nodeClient) getTipHeight() (uint64, error) {
-	resp, err := c.http.Get(c.base + "/api/v1/blocks?limit=1")
+func (c *nodeClient) get(url string) ([]byte, int, error) {
+	resp, err := c.http.Get(url)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	return body, resp.StatusCode, err
+}
+
+func (c *nodeClient) isNodeReady() (bool, error) {
+	body, status, err := c.get(c.base + "/api/v1/status")
+	if err != nil {
+		return false, err
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("status endpoint returned %d", status)
+	}
+	var r nodeStatusResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		return false, fmt.Errorf("parse status: %w", err)
+	}
+	return r.OK && !r.Syncing, nil
+}
+
+func (c *nodeClient) getTipHeight() (uint64, error) {
+	body, status, err := c.get(c.base + "/api/v1/blocks?limit=1")
 	if err != nil {
 		return 0, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("node returned %d", resp.StatusCode)
+	if status != http.StatusOK {
+		return 0, fmt.Errorf("node returned %d", status)
 	}
 	var r blocksListResponse
 	if err := json.Unmarshal(body, &r); err != nil {
@@ -281,27 +365,20 @@ func (c *nodeClient) getTipHeight() (uint64, error) {
 }
 
 func (c *nodeClient) getBlock(height uint64) (*blockAPIResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/blocks/%d", c.base, height)
-	resp, err := c.http.Get(url)
+	body, status, err := c.get(fmt.Sprintf("%s/api/v1/blocks/%d", c.base, height))
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
+	if status == http.StatusNotFound {
 		return nil, nil // beyond tip
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("node returned %d for block %d", resp.StatusCode, height)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("node returned %d for block %d", status, height)
 	}
 	var r blockAPIResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("parse block %d: %w", height, err)
 	}
-	// Convert RFC3339 timestamp to nanoseconds.
 	if r.TimestampRFC != "" {
 		if t, err := time.Parse(time.RFC3339, r.TimestampRFC); err == nil {
 			r.TimestampNs = t.UnixNano()
@@ -311,22 +388,35 @@ func (c *nodeClient) getBlock(height uint64) (*blockAPIResponse, error) {
 }
 
 func (c *nodeClient) getBlockTxs(height uint64) (*blockTxsAPIResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/blocks/%d/transactions", c.base, height)
-	resp, err := c.http.Get(url)
+	body, status, err := c.get(fmt.Sprintf("%s/api/v1/blocks/%d/transactions", c.base, height))
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("node returned %d for block %d txs", resp.StatusCode, height)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("node returned %d for block %d txs", status, height)
 	}
 	var r blockTxsAPIResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("parse block %d txs: %w", height, err)
+	}
+	return &r, nil
+}
+
+func (c *nodeClient) getBlockOutputs(height uint64) (*blockOutputsAPIResponse, error) {
+	body, status, err := c.get(fmt.Sprintf("%s/api/v1/blocks/%d/outputs", c.base, height))
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		// Pruned block — no outputs available; return empty list gracefully.
+		return &blockOutputsAPIResponse{BlockHeight: height, Outputs: nil}, nil
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("node returned %d for block %d outputs", status, height)
+	}
+	var r blockOutputsAPIResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("parse block %d outputs: %w", height, err)
 	}
 	return &r, nil
 }

@@ -133,6 +133,7 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 // restBlockByIDOrTxs dispatches:
 //   GET /api/v1/blocks/{id}              → block detail
 //   GET /api/v1/blocks/{id}/transactions → transactions in block
+//   GET /api/v1/blocks/{id}/outputs      → all outputs (one_time_pub_hex) for the explorer indexer
 func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet {
                 writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -141,6 +142,33 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
         tail := pathSuffix("/api/v1/blocks/", r.URL.Path)
         if tail == "" {
                 s.restBlocks(w, r)
+                return
+        }
+
+        // Check for /outputs suffix — used by the standalone explorer indexer to
+        // populate address_txs.  Returns one record per output, keyed by
+        // one_time_pub_hex, so the indexer can build the address→tx mapping
+        // without requiring a view key.  Pruned blocks return an empty list
+        // (outputs are stripped by the pruner) rather than 404.
+        const outputsSuffix = "/outputs"
+        if strings.HasSuffix(tail, outputsSuffix) {
+                id := strings.TrimSuffix(tail, outputsSuffix)
+                if b := s.lookupBlockMem(id); b != nil {
+                        s.writeBlockOutputs(w, b)
+                        return
+                }
+                if !isValidBlockID(id) {
+                        writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
+                        return
+                }
+                if s.blockStore != nil {
+                        fullBlock, _, _ := s.lookupBlockFromDisk(id)
+                        if fullBlock != nil {
+                                s.writeBlockOutputs(w, fullBlock)
+                                return
+                        }
+                }
+                writeJSONError(w, http.StatusNotFound, "block not found")
                 return
         }
 
@@ -368,6 +396,46 @@ func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
                 "block_height": b.Header.Height,
                 "tx_count":     len(txs),
                 "transactions": txs,
+        })
+}
+
+// BlockOutputItem is one transaction output entry returned by the /outputs endpoint.
+// one_time_pub_hex is the canonical output identifier used by the explorer indexer
+// to populate the address_txs table — it uniquely identifies the output recipient
+// without requiring a view-key scan.
+type BlockOutputItem struct {
+        TxHash        string `json:"tx_hash"`
+        TxIndex       int    `json:"tx_index"`
+        OutputIndex   int    `json:"output_index"`
+        OneTimePubHex string `json:"one_time_pub_hex"`
+        IsCoinbase    bool   `json:"is_coinbase"`
+}
+
+// writeBlockOutputs writes all outputs of a block as JSON for the explorer indexer.
+// Each output is identified by its one_time_pub_hex.  Pruned blocks (nil Txs) return
+// an empty list with pruned:true so the indexer can skip them gracefully.
+func (s *Server) writeBlockOutputs(w http.ResponseWriter, b *core.Block) {
+        bHash := b.Hash()
+        items := make([]BlockOutputItem, 0)
+        for i, tx := range b.Txs {
+                txH := tx.Hash()
+                txHashHex := fmt.Sprintf("%x", txH[:])
+                isCoinbase := i == 0 && tx.IsCoinbase()
+                for j, out := range tx.Outputs {
+                        items = append(items, BlockOutputItem{
+                                TxHash:        txHashHex,
+                                TxIndex:       i,
+                                OutputIndex:   j,
+                                OneTimePubHex: fmt.Sprintf("%x", out.OneTimePub[:]),
+                                IsCoinbase:    isCoinbase,
+                        })
+                }
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{
+                "block_hash":   fmt.Sprintf("%x", bHash[:]),
+                "block_height": b.Header.Height,
+                "output_count": len(items),
+                "outputs":      items,
         })
 }
 
