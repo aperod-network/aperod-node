@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -1795,5 +1796,96 @@ func TestTruncatedSnapshotFallsBackToScan(t *testing.T) {
 	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
 		t.Error("fast-path success log must NOT appear when snapshot is truncated")
 		t.Logf("captured log:\n%s", logBuf.String())
+	}
+}
+
+// ─── Tests: memory_limit_bytes config integration ─────────────────────────────
+
+// TestMemoryLimitBytes_ConfigPath_SilencesGOMLEMLIMITWarning is an end-to-end
+// integration test for the config load → configLimitApplied → checkGOMLEMLIMIT
+// path introduced in run().
+//
+// It writes a minimal node.yaml with memory_limit_bytes set to a positive
+// value, loads the config with config.Load, replicates the run() guard logic,
+// and asserts that checkGOMLEMLIMIT emits NO warning and returns nil — because
+// the in-process limit from node.yaml satisfies the check.
+func TestMemoryLimitBytes_ConfigPath_SilencesGOMLEMLIMITWarning(t *testing.T) {
+	// Ensure GOMEMLIMIT env is absent for the duration of this test so the
+	// config-path branch (not the env-var branch) is exercised.
+	t.Setenv("GOMEMLIMIT", "")
+
+	// Write a minimal node.yaml with a positive memory_limit_bytes.
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "node.yaml")
+	yamlContent := "memory_limit_bytes: 5368709120\n" // 5 GiB
+	if err := os.WriteFile(yamlPath, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write node.yaml: %v", err)
+	}
+
+	// Load config — exercises config.Load YAML parsing of MemoryLimitBytes.
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if cfg.MemoryLimitBytes != 5368709120 {
+		t.Fatalf("expected MemoryLimitBytes=5368709120, got %d", cfg.MemoryLimitBytes)
+	}
+
+	// Replicate the run() guard logic exactly.
+	// debug.SetMemoryLimit is intentionally NOT called here to avoid side-effects
+	// on the test process; configLimitApplied is derived from the same condition.
+	configLimitApplied := cfg.MemoryLimitBytes > 0 && os.Getenv("GOMEMLIMIT") == ""
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	err = checkGOMLEMLIMIT(os.Getenv("GOMEMLIMIT"), configLimitApplied, false, dropin, log)
+	if err != nil {
+		t.Errorf("checkGOMLEMLIMIT returned unexpected error: %v", err)
+	}
+	if logContainsMsg(&logBuf, "GOMEMLIMIT is not set — node may OOM under load") {
+		t.Errorf("unexpected GOMEMLIMIT warning logged — memory_limit_bytes should silence it\nlog:\n%s", logBuf.String())
+	}
+}
+
+// TestMemoryLimitBytes_Zero_EmitsGOMLEMLIMITWarning confirms that when
+// memory_limit_bytes is absent (zero, the default) and GOMEMLIMIT is also
+// unset, checkGOMLEMLIMIT still emits the OOM warning.
+//
+// This acts as a regression guard: if the "no config, no env" branch were
+// accidentally silenced, operators would lose the warning that protects them
+// from silent OOM kills.
+func TestMemoryLimitBytes_Zero_EmitsGOMLEMLIMITWarning(t *testing.T) {
+	// Ensure GOMEMLIMIT env is absent so neither branch silences the warning.
+	t.Setenv("GOMEMLIMIT", "")
+
+	// Write a minimal node.yaml with no memory_limit_bytes (defaults to 0).
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "node.yaml")
+	yamlContent := "memory_limit_bytes: 0\n"
+	if err := os.WriteFile(yamlPath, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write node.yaml: %v", err)
+	}
+
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if cfg.MemoryLimitBytes != 0 {
+		t.Fatalf("expected MemoryLimitBytes=0, got %d", cfg.MemoryLimitBytes)
+	}
+
+	// Replicate the run() guard logic: zero value → configLimitApplied=false.
+	configLimitApplied := cfg.MemoryLimitBytes > 0 && os.Getenv("GOMEMLIMIT") == ""
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	err = checkGOMLEMLIMIT(os.Getenv("GOMEMLIMIT"), configLimitApplied, false, dropin, log)
+	if err != nil {
+		t.Errorf("checkGOMLEMLIMIT returned unexpected error in non-strict mode: %v", err)
+	}
+	if !logContainsMsg(&logBuf, "GOMEMLIMIT is not set — node may OOM under load") {
+		t.Errorf("expected GOMEMLIMIT warning was not logged when memory_limit_bytes=0 and GOMEMLIMIT is absent\nlog:\n%s", logBuf.String())
 	}
 }
