@@ -8,19 +8,83 @@ import (
 
 // banEntry records why and until when a peer is banned.
 type banEntry struct {
-	reason  string
-	until   time.Time
+	reason string
+	until  time.Time
 }
 
-// PeerMgr tracks the ban list and enforces peer limits.
-// It is embedded in Host to separate concern from connection logic.
+// dialState tracks consecutive dial failures for exponential back-off.
+type dialState struct {
+	failures int
+	nextDial time.Time
+}
+
+// backoffDuration returns the delay before the next dial attempt.
+// Progression: 5 s, 10 s, 20 s, 40 s, 80 s, … capped at 5 minutes.
+func backoffDuration(failures int) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+	const base = 5 * time.Second
+	const cap_ = 5 * time.Minute
+	d := base
+	for i := 1; i < failures; i++ {
+		d *= 2
+		if d > cap_ {
+			return cap_
+		}
+	}
+	if d > cap_ {
+		return cap_
+	}
+	return d
+}
+
+// PeerMgr tracks the ban list, enforces peer limits, and applies
+// per-peer exponential back-off on repeated dial failures.
 type PeerMgr struct {
-	mu      sync.Mutex
-	banned  map[string]banEntry // addr → ban
+	mu         sync.Mutex
+	banned     map[string]banEntry  // addr → ban
+	dialStates map[string]dialState // addr → backoff state
 }
 
 func newPeerMgr() *PeerMgr {
-	return &PeerMgr{banned: make(map[string]banEntry)}
+	return &PeerMgr{
+		banned:     make(map[string]banEntry),
+		dialStates: make(map[string]dialState),
+	}
+}
+
+// CanDial returns true when addr is not banned and its back-off window has
+// elapsed.  Always returns true for addresses with no recorded failures.
+func (pm *PeerMgr) CanDial(addr string) bool {
+	if pm.IsBanned(addr) {
+		return false
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st, ok := pm.dialStates[addr]
+	if !ok {
+		return true
+	}
+	return time.Now().After(st.nextDial)
+}
+
+// OnDialFail records a failed dial attempt and advances the back-off window.
+func (pm *PeerMgr) OnDialFail(addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.dialStates[addr]
+	st.failures++
+	st.nextDial = time.Now().Add(backoffDuration(st.failures))
+	pm.dialStates[addr] = st
+}
+
+// OnDialSuccess resets the back-off state for addr after a successful
+// connection that has been established (call when handleConn exits cleanly).
+func (pm *PeerMgr) OnDialSuccess(addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.dialStates, addr)
 }
 
 // Ban adds addr to the ban list for duration d with a human-readable reason.

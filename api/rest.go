@@ -55,6 +55,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
         s.mux.HandleFunc("/api/v1/status", s.restStatus)
+        s.mux.HandleFunc("/health", s.restHealth)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -2084,6 +2085,13 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 // Returns 200 {"ok":true,"height":N} as long as the HTTP server is responsive.
 // No authentication required. Exempted from the per-IP rate-limit bucket — see
 // rateLimitExempt in middleware.go — so watchdog probes can never be throttled.
+
+// restHealth is a lightweight liveness probe used by external health-checkers
+// and the API-server circuit breaker.  It always returns 200 OK as long as the
+// HTTP server is accepting connections — no chain state is required.
+func (s *Server) restHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+}
 
 func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

@@ -429,8 +429,9 @@ func (h *Host) dialPeer(addr string) {
         if already || count >= h.cfg.MaxPeers {
                 return
         }
-        if h.mgr.IsBanned(addr) {
-                h.log.Debug("dialPeer: addr is banned", "addr", addr)
+        // Respect ban list and exponential back-off window.
+        if !h.mgr.CanDial(addr) {
+                h.log.Debug("dialPeer: addr is banned or in back-off window", "addr", addr)
                 return
         }
 
@@ -446,6 +447,7 @@ func (h *Host) dialPeer(addr string) {
                 )
                 if err != nil {
                         h.log.Debug("tls dial failed", "addr", addr, "err", err)
+                        h.mgr.OnDialFail(addr)
                         return
                 }
                 conn = tlsConn
@@ -454,6 +456,7 @@ func (h *Host) dialPeer(addr string) {
                 conn, err = net.DialTimeout("tcp", addr, DialTimeout)
                 if err != nil {
                         h.log.Debug("dial failed", "addr", addr, "err", err)
+                        h.mgr.OnDialFail(addr)
                         return
                 }
         }
@@ -617,6 +620,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // Initiate header sync if peer is ahead
         if peerHeight > h.handler.CurrentHeight() {
                 h.requestHeaders(peer)
+        }
+
+        // Successful handshake — reset any dial back-off for this peer so that
+        // a future reconnect is not penalised for an earlier transient failure.
+        if outbound {
+                h.mgr.OnDialSuccess(addr)
         }
 
         // Message loop
