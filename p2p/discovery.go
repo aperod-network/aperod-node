@@ -72,7 +72,7 @@ func (d *Discovery) round() {
 	h.mu.RUnlock()
 
 	if len(peers) == 0 {
-		h.log.Debug("discovery: no peers, re-dialling bootnodes")
+		h.log.Info("discovery: no peers, re-dialling bootnodes")
 		for _, addr := range h.cfg.Bootnodes {
 			go func(a string) {
 				resolved, err := resolveBootnode(a)

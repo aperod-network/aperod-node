@@ -446,7 +446,7 @@ func (h *Host) dialPeer(addr string) {
                         "tcp", addr, h.cfg.TLSConfig,
                 )
                 if err != nil {
-                        h.log.Debug("tls dial failed", "addr", addr, "err", err)
+                        h.log.Warn("tls dial failed", "addr", addr, "err", err)
                         h.mgr.OnDialFail(addr)
                         return
                 }
@@ -455,7 +455,7 @@ func (h *Host) dialPeer(addr string) {
                 var err error
                 conn, err = net.DialTimeout("tcp", addr, DialTimeout)
                 if err != nil {
-                        h.log.Debug("dial failed", "addr", addr, "err", err)
+                        h.log.Warn("dial failed", "addr", addr, "err", err)
                         h.mgr.OnDialFail(addr)
                         return
                 }
