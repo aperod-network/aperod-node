@@ -59,6 +59,14 @@ type Server struct {
         // Stored so /api/v1/status can report them to operators.
         peerWhitelist []string
 
+        // whitelistGetFn / whitelistAddFn / whitelistRemoveFn are wired to
+        // p2p.Host.GetPeerWhitelist / AddToWhitelist / RemoveFromWhitelist by
+        // cmd/node after the P2P layer is started.  Optional — the whitelist
+        // endpoints return 503 when not wired.
+        whitelistGetFn    func() []string
+        whitelistAddFn    func(string) error
+        whitelistRemoveFn func(string) bool
+
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
@@ -229,6 +237,19 @@ func (s *Server) SetPeerWhitelist(entries []string) {
 // SetTimestampRejectedCounter wires a function returning the live count of blocks
 // rejected by the timejacking guard.  Optional — reports 0 when unset.
 func (s *Server) SetTimestampRejectedCounter(f func() int64) { s.tsRejectedCounter = f }
+
+// SetWhitelistGetFunc wires a function returning the current peer whitelist entries.
+// Optional — GET /api/v1/network/whitelist returns 503 when not wired.
+func (s *Server) SetWhitelistGetFunc(f func() []string) { s.whitelistGetFn = f }
+
+// SetWhitelistAddFunc wires a function that adds one IP or CIDR to the live whitelist.
+// Optional — POST /api/v1/network/whitelist returns 503 when not wired.
+func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = f }
+
+// SetWhitelistRemoveFunc wires a function that removes one IP or CIDR from the
+// live whitelist.  Returns true when the entry was found and removed.
+// Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
+func (s *Server) SetWhitelistRemoveFunc(f func(string) bool) { s.whitelistRemoveFn = f }
 
 // SetNodeIdentity stores the P2P TLS fingerprint, listen address, and node ID
 // so they can be returned by GET /api/v1/network/identity.

@@ -2,9 +2,12 @@ package p2p
 
 import (
         "crypto/tls"
+        "encoding/json"
         "fmt"
         "log/slog"
         "net"
+        "os"
+        "path/filepath"
         "runtime/debug"
         "sync"
         "sync/atomic"
@@ -72,6 +75,12 @@ type Config struct {
         // explicitly disable persistence.  The file is written atomically (tmp +
         // rename) so a crash during a write never corrupts the previous snapshot.
         BanFile string
+        // WhitelistFile is the path to a JSON file used to persist the peer IP
+        // whitelist across node restarts.  When non-empty, SetPeerWhitelist writes
+        // the full list atomically; on Start() the file is loaded and merged with
+        // cfg.PeerWhitelist.  When empty, whitelist changes are lost on restart.
+        // Set to "-" to explicitly disable persistence.
+        WhitelistFile string
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -180,12 +189,22 @@ type Host struct {
         badBlockMu     sync.Mutex
         badBlockCounts map[string]badBlockStrike // bare IP → strike record
 
+        // wlMu guards wlNets, wlIPs, and cfg.PeerWhitelist so that
+        // SetPeerWhitelist can swap the whitelist atomically while acceptLoop
+        // reads it without holding h.mu (the main peer-table lock).
+        wlMu sync.RWMutex
+
         // wlNets and wlIPs hold the parsed form of cfg.PeerWhitelist so that
         // acceptLoop can check each inbound IP with a net.IPNet.Contains call
         // rather than re-parsing the CIDR strings on every connection.
         // Both are nil when cfg.PeerWhitelist is empty (open network).
         wlNets []*net.IPNet
         wlIPs  []net.IP
+
+        // wlPersistMu serialises the snapshot+write+rename sequence for the
+        // whitelist file so concurrent SetPeerWhitelist calls never interleave
+        // two partial writes.
+        wlPersistMu sync.Mutex
 }
 
 // NewHost creates a new p2p host.
@@ -236,6 +255,205 @@ func (h *Host) SetHeaderProvider(hp HeaderProvider) {
         h.headers = hp
 }
 
+// GetPeerWhitelist returns a snapshot of the current peer IP whitelist entries.
+// Thread-safe; safe to call concurrently with SetPeerWhitelist.
+func (h *Host) GetPeerWhitelist() []string {
+        h.wlMu.RLock()
+        defer h.wlMu.RUnlock()
+        cp := make([]string, len(h.cfg.PeerWhitelist))
+        copy(cp, h.cfg.PeerWhitelist)
+        return cp
+}
+
+// SetPeerWhitelist atomically replaces the peer IP whitelist with entries and
+// persists the new list to cfg.WhitelistFile (if configured).  Each element
+// must be either a bare IP address ("1.2.3.4") or a CIDR range ("10.0.0.0/8");
+// invalid entries are logged and silently skipped.
+// The change takes effect immediately for all new inbound connections.
+func (h *Host) SetPeerWhitelist(entries []string) {
+        var nets []*net.IPNet
+        var ips []net.IP
+        valid := entries[:0:0] // re-use allocation; built below with only valid entries
+        for _, entry := range entries {
+                if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+                        nets = append(nets, ipNet)
+                        valid = append(valid, entry)
+                } else if ip := net.ParseIP(entry); ip != nil {
+                        ips = append(ips, ip)
+                        valid = append(valid, entry)
+                } else {
+                        h.log.Warn("SetPeerWhitelist: ignoring unparseable entry", "entry", entry)
+                }
+        }
+
+        h.wlMu.Lock()
+        h.wlNets = nets
+        h.wlIPs = ips
+        cp := make([]string, len(valid))
+        copy(cp, valid)
+        h.cfg.PeerWhitelist = cp
+        h.wlMu.Unlock()
+
+        h.log.Info("p2p: peer whitelist updated", "entries", len(valid))
+        h.saveWhitelistToFile(valid)
+}
+
+// AddToWhitelist adds a single IP or CIDR to the peer whitelist.
+// Returns an error if the entry is not a valid IP or CIDR.
+// No-op when the entry is already in the list.
+func (h *Host) AddToWhitelist(entry string) error {
+        // Validate the entry first.
+        if _, _, err := net.ParseCIDR(entry); err != nil {
+                if net.ParseIP(entry) == nil {
+                        return fmt.Errorf("invalid IP or CIDR: %q", entry)
+                }
+        }
+
+        h.wlMu.RLock()
+        current := make([]string, len(h.cfg.PeerWhitelist))
+        copy(current, h.cfg.PeerWhitelist)
+        h.wlMu.RUnlock()
+
+        for _, e := range current {
+                if e == entry {
+                        return nil // already present
+                }
+        }
+        h.SetPeerWhitelist(append(current, entry))
+        return nil
+}
+
+// RemoveFromWhitelist removes a single IP or CIDR from the peer whitelist.
+// Returns true when the entry was found and removed, false when not found.
+func (h *Host) RemoveFromWhitelist(entry string) bool {
+        h.wlMu.RLock()
+        current := make([]string, len(h.cfg.PeerWhitelist))
+        copy(current, h.cfg.PeerWhitelist)
+        h.wlMu.RUnlock()
+
+        var updated []string
+        found := false
+        for _, e := range current {
+                if e == entry {
+                        found = true
+                        continue
+                }
+                updated = append(updated, e)
+        }
+        if !found {
+                return false
+        }
+        if updated == nil {
+                updated = []string{}
+        }
+        h.SetPeerWhitelist(updated)
+        return true
+}
+
+// loadWhitelistFromFile reads the sidecar whitelist file (if it exists and is
+// readable) and merges those entries with the entries already in cfg.PeerWhitelist.
+// Duplicate entries are de-duplicated.  A missing file is silently ignored.
+func (h *Host) loadWhitelistFromFile() {
+        if h.cfg.WhitelistFile == "" || h.cfg.WhitelistFile == "-" {
+                return
+        }
+        data, err := os.ReadFile(h.cfg.WhitelistFile)
+        if os.IsNotExist(err) {
+                return
+        }
+        if err != nil {
+                h.log.Warn("p2p: whitelist file read failed", "file", h.cfg.WhitelistFile, "err", err)
+                return
+        }
+        var fileEntries []string
+        if err := json.Unmarshal(data, &fileEntries); err != nil {
+                h.log.Warn("p2p: whitelist file parse failed", "file", h.cfg.WhitelistFile, "err", err)
+                return
+        }
+
+        // Merge file entries with static cfg entries, de-duping.
+        seen := make(map[string]bool)
+        merged := make([]string, 0, len(h.cfg.PeerWhitelist)+len(fileEntries))
+        for _, e := range h.cfg.PeerWhitelist {
+                if !seen[e] {
+                        seen[e] = true
+                        merged = append(merged, e)
+                }
+        }
+        for _, e := range fileEntries {
+                if !seen[e] {
+                        seen[e] = true
+                        merged = append(merged, e)
+                }
+        }
+
+        // Re-parse the merged list into wlNets/wlIPs.
+        var nets []*net.IPNet
+        var ips []net.IP
+        valid := make([]string, 0, len(merged))
+        for _, entry := range merged {
+                if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+                        nets = append(nets, ipNet)
+                        valid = append(valid, entry)
+                } else if ip := net.ParseIP(entry); ip != nil {
+                        ips = append(ips, ip)
+                        valid = append(valid, entry)
+                } else {
+                        h.log.Warn("p2p: whitelist file: ignoring unparseable entry", "entry", entry)
+                }
+        }
+
+        h.wlMu.Lock()
+        h.wlNets = nets
+        h.wlIPs = ips
+        h.cfg.PeerWhitelist = valid
+        h.wlMu.Unlock()
+
+        if len(valid) > 0 {
+                h.log.Info("p2p: peer whitelist loaded from file", "entries", len(valid), "file", h.cfg.WhitelistFile)
+        }
+}
+
+// saveWhitelistToFile atomically writes entries to cfg.WhitelistFile so the
+// list survives a node restart.  A no-op when WhitelistFile is empty or "-".
+func (h *Host) saveWhitelistToFile(entries []string) {
+        if h.cfg.WhitelistFile == "" || h.cfg.WhitelistFile == "-" {
+                return
+        }
+        h.wlPersistMu.Lock()
+        defer h.wlPersistMu.Unlock()
+
+        data, err := json.MarshalIndent(entries, "", "  ")
+        if err != nil {
+                h.log.Warn("p2p: whitelist persist: marshal failed", "err", err)
+                return
+        }
+        dir := filepath.Dir(h.cfg.WhitelistFile)
+        tmp, err := os.CreateTemp(dir, ".p2p_whitelist_*.tmp")
+        if err != nil {
+                h.log.Warn("p2p: whitelist persist: create temp failed", "err", err)
+                return
+        }
+        tmpName := tmp.Name()
+        if _, err := tmp.Write(data); err != nil {
+                h.log.Warn("p2p: whitelist persist: write failed", "file", tmpName, "err", err)
+                tmp.Close()
+                os.Remove(tmpName)
+                return
+        }
+        if err := tmp.Close(); err != nil {
+                h.log.Warn("p2p: whitelist persist: close failed", "file", tmpName, "err", err)
+                os.Remove(tmpName)
+                return
+        }
+        if err := os.Rename(tmpName, h.cfg.WhitelistFile); err != nil {
+                h.log.Warn("p2p: whitelist persist: rename failed", "tmp", tmpName, "dst", h.cfg.WhitelistFile, "err", err)
+                os.Remove(tmpName)
+                return
+        }
+        h.log.Debug("p2p: whitelist persisted", "entries", len(entries), "file", h.cfg.WhitelistFile)
+}
+
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is
 // closed immediately and future dial/accept attempts from that address are
 // rejected.
@@ -256,6 +474,10 @@ func (h *Host) Start() error {
         // previously-banned peers are blocked immediately on restart — without
         // waiting for them to accumulate 10 strikes again.
         h.mgr.LoadBansFromFile()
+
+        // Merge the sidecar whitelist file (if any) with the static entries
+        // from cfg.PeerWhitelist so admin-added entries survive restarts.
+        h.loadWhitelistFromFile()
         if n := h.mgr.BannedCount(); n > 0 {
                 h.log.Info("p2p: restored bans from file", "count", n, "file", h.cfg.BanFile)
         }
@@ -411,15 +633,16 @@ func (h *Host) acceptLoop() {
                 // cause zero resource usage beyond one Accept() call.
                 // Outbound dials are never subject to this check.
                 //
-                // IMPORTANT: enforcement is gated on len(cfg.PeerWhitelist) > 0
-                // (the raw string slice), NOT on the parsed slices.  Config
-                // validation rejects malformed entries so the parsed slices
-                // always reflect the full whitelist; using the raw count here
-                // ensures fail-closed behaviour even if parsing somehow yields
-                // empty slices (defensive belt-and-suspenders).
-                if len(h.cfg.PeerWhitelist) > 0 {
+                // wlMu is taken for a snapshot read so that SetPeerWhitelist
+                // can swap the list atomically without blocking Accept().
+                h.wlMu.RLock()
+                wlNets := h.wlNets
+                wlIPs := h.wlIPs
+                wlLen := len(h.cfg.PeerWhitelist)
+                h.wlMu.RUnlock()
+                if wlLen > 0 {
                         remoteIP := net.ParseIP(connIP(conn.RemoteAddr().String()))
-                        if remoteIP == nil || !ipInWhitelist(remoteIP, h.wlNets, h.wlIPs) {
+                        if remoteIP == nil || !ipInWhitelist(remoteIP, wlNets, wlIPs) {
                                 h.log.Info("inbound connection rejected: IP not in peer_whitelist",
                                         "addr", conn.RemoteAddr().String())
                                 conn.Close()

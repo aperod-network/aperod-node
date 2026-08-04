@@ -130,6 +130,11 @@ type P2PConfig struct {
 	// persisted across restarts.  When empty, defaults to
 	// <data_dir>/p2p_bans.json.  Set to "-" to disable persistence.
 	BanFile string `yaml:"ban_file"`
+	// WhitelistFile is the path to a JSON file where admin-added peer
+	// whitelist entries are persisted across restarts.  When empty,
+	// defaults to <data_dir>/p2p_whitelist.json.  Set to "-" to disable
+	// persistence (whitelist changes via Admin Panel are lost on restart).
+	WhitelistFile string `yaml:"whitelist_file"`
 }
 
 // ConsensusConfig holds PoA settings.

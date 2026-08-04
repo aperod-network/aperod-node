@@ -51,6 +51,8 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.restNetworkBans))
         s.mux.HandleFunc("/api/v1/network/bans/", s.localOnly(s.restNetworkBanByAddr))
+        s.mux.HandleFunc("/api/v1/network/whitelist", s.localOnly(s.restNetworkWhitelist))
+        s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.restNetworkWhitelistByEntry))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
@@ -971,6 +973,87 @@ func (s *Server) restNetworkBanByAddr(w http.ResponseWriter, r *http.Request) {
                 return
         }
         writeJSON(w, http.StatusOK, map[string]string{"message": "ban lifted", "addr": addr})
+}
+
+// ─── GET /api/v1/network/whitelist ───────────────────────────────────────────
+//
+// Returns the current peer IP whitelist entries.
+// Requires the whitelist-get function to be wired via SetWhitelistGetFunc.
+//
+// POST /api/v1/network/whitelist
+//
+// Adds one entry (IP or CIDR) to the live whitelist.  JSON body: {"entry":"1.2.3.4"}
+//
+// DELETE /api/v1/network/whitelist/:entry
+//
+// Removes one entry from the live whitelist.
+
+// whitelistAddRequest is the JSON body for POST /api/v1/network/whitelist.
+type whitelistAddRequest struct {
+        Entry string `json:"entry"`
+}
+
+func (s *Server) restNetworkWhitelist(w http.ResponseWriter, r *http.Request) {
+        switch r.Method {
+        case http.MethodGet:
+                if s.whitelistGetFn == nil {
+                        writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                        return
+                }
+                entries := s.whitelistGetFn()
+                if entries == nil {
+                        entries = []string{}
+                }
+                writeJSON(w, http.StatusOK, map[string]interface{}{"entries": entries})
+
+        case http.MethodPost:
+                if s.whitelistAddFn == nil {
+                        writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                        return
+                }
+                var req whitelistAddRequest
+                if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+                        return
+                }
+                if req.Entry == "" {
+                        writeJSONError(w, http.StatusBadRequest, "entry is required")
+                        return
+                }
+                if err := s.whitelistAddFn(req.Entry); err != nil {
+                        writeJSONError(w, http.StatusBadRequest, err.Error())
+                        return
+                }
+                writeJSON(w, http.StatusCreated, map[string]string{
+                        "message": "entry added",
+                        "entry":   req.Entry,
+                })
+
+        default:
+                writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+        }
+}
+
+func (s *Server) restNetworkWhitelistByEntry(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodDelete {
+                writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+                return
+        }
+        if s.whitelistRemoveFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+        entry := pathSuffix("/api/v1/network/whitelist/", r.URL.Path)
+        if entry == "" {
+                writeJSONError(w, http.StatusBadRequest, "entry is required")
+                return
+        }
+        removed := s.whitelistRemoveFn(entry)
+        if !removed {
+                writeJSONError(w, http.StatusNotFound, "entry not found in whitelist")
+                return
+        }
+        writeJSON(w, http.StatusOK, map[string]string{"message": "entry removed", "entry": entry})
 }
 
 // ─── GET /api/v1/fee-estimate ────────────────────────────────────────────────

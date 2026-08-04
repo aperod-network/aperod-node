@@ -865,6 +865,12 @@ func run() error {
                         if banFilePath == "" {
                                 banFilePath = filepath.Join(cfg.DataDir, "p2p_bans.json")
                         }
+                        // Default the whitelist-file path to <data_dir>/p2p_whitelist.json.
+                        // An explicit "-" disables persistence.
+                        whitelistFilePath := cfg.P2P.WhitelistFile
+                        if whitelistFilePath == "" {
+                                whitelistFilePath = filepath.Join(cfg.DataDir, "p2p_whitelist.json")
+                        }
                         host = p2p.NewHost(p2p.Config{
                                 ListenAddr:           tcpAddr,
                                 Bootnodes:            bootnodes,
@@ -882,6 +888,7 @@ func run() error {
                                 BadBlockBanThreshold: cfg.P2P.BadBlockBanThreshold,
                                 BadBlockBanDuration:  cfg.P2P.BadBlockBanDuration,
                                 BanFile:              banFilePath,
+                                WhitelistFile:        whitelistFilePath,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
@@ -915,7 +922,13 @@ func run() error {
                                 })
                                 apiSrv.SetBanLiftFunc(host.LiftBan)
                                 apiSrv.SetBanAddFunc(host.BanPeer)
-                                apiSrv.SetPeerWhitelist(cfg.P2P.PeerWhitelist)
+                                // Wire the live-reload whitelist functions so the Admin
+                                // Panel can add/remove entries without a node restart.
+                                apiSrv.SetWhitelistGetFunc(host.GetPeerWhitelist)
+                                apiSrv.SetWhitelistAddFunc(host.AddToWhitelist)
+                                apiSrv.SetWhitelistRemoveFunc(host.RemoveFromWhitelist)
+                                // Seed the static /api/v1/status display from current live list.
+                                apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
                                 // Background goroutine: if an allow-list is active and no peers
                                 // connect after 2×block_time, the list may be misconfigured
