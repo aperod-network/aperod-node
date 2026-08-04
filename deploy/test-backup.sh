@@ -1822,6 +1822,70 @@ else
 fi
 
 # =============================================================================
+# Test 20c: sha256sum match — simulated deploy produces identical checksums
+#
+# This is the canonical acceptance check called out in the task spec:
+#   sha256sum /usr/local/bin/aperod_backup.sh blockchain/deploy/aperod_backup.sh
+# should print the same hash after every git pull + update script run.
+#
+# We simulate the deploy by:
+#   1. Writing an "old" installed copy (different content).
+#   2. Running _sync_backup_script with the repo copy as source.
+#   3. Computing sha256sum of both files and asserting they match.
+# =============================================================================
+section "Test 20c: sha256sum — installed copy matches repo copy after simulated deploy"
+
+T20C2_DIR=$(mktemp -d "$TMPDIR_TEST/run-t20c2-XXXXXXXX")
+T20C2_INSTALLED="$T20C2_DIR/aperod_backup_installed.sh"
+T20C2_REPO="$T20C2_DIR/aperod_backup_repo.sh"
+
+# Write distinct contents so the sync is forced to overwrite.
+printf '#!/bin/bash\n# OLD VERSION — should be replaced\necho old-backup\n' \
+  > "$T20C2_INSTALLED"
+chmod 700 "$T20C2_INSTALLED"
+
+# Use the actual aperod_backup.sh from the repo as the authoritative source.
+cp "$BACKUP_SH" "$T20C2_REPO"
+chmod 700 "$T20C2_REPO"
+
+# Run the sync (already sourced above in Test 20b).
+_sync_backup_script "$T20C2_INSTALLED" "$T20C2_REPO" >/dev/null 2>&1 || true
+
+# sha256sum comparison — the core of the acceptance criterion.
+if command -v sha256sum >/dev/null 2>&1; then
+  T20C2_HASH_INSTALLED=$(sha256sum "$T20C2_INSTALLED" | awk '{print $1}')
+  T20C2_HASH_REPO=$(sha256sum "$T20C2_REPO" | awk '{print $1}')
+  if [[ "$T20C2_HASH_INSTALLED" == "$T20C2_HASH_REPO" ]]; then
+    pass "sha256sum match after simulated deploy: installed == repo ($T20C2_HASH_REPO)"
+  else
+    fail "sha256sum MISMATCH after simulated deploy: installed=$T20C2_HASH_INSTALLED repo=$T20C2_HASH_REPO"
+  fi
+elif command -v shasum >/dev/null 2>&1; then
+  # macOS fallback
+  T20C2_HASH_INSTALLED=$(shasum -a 256 "$T20C2_INSTALLED" | awk '{print $1}')
+  T20C2_HASH_REPO=$(shasum -a 256 "$T20C2_REPO" | awk '{print $1}')
+  if [[ "$T20C2_HASH_INSTALLED" == "$T20C2_HASH_REPO" ]]; then
+    pass "sha256sum (shasum -a 256) match after simulated deploy: installed == repo"
+  else
+    fail "sha256sum MISMATCH after simulated deploy (shasum): installed=$T20C2_HASH_INSTALLED repo=$T20C2_HASH_REPO"
+  fi
+else
+  # Neither tool available — fall back to diff (already verified above in 20b Scenario A).
+  if diff -q "$T20C2_INSTALLED" "$T20C2_REPO" >/dev/null 2>&1; then
+    pass "sha256sum: tool unavailable; diff confirms installed == repo after simulated deploy"
+  else
+    fail "sha256sum: tool unavailable; diff reports installed != repo after simulated deploy"
+  fi
+fi
+
+# Also confirm the old content is gone.
+if ! grep -q 'OLD VERSION' "$T20C2_INSTALLED" 2>/dev/null; then
+  pass "old backup script content replaced — installed copy is no longer stale"
+else
+  fail "old backup script content still present — sync did not overwrite the installed copy"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
