@@ -10,9 +10,6 @@ import "time"
 // available to package p2p_test.
 const BadBlockMaxTrackedIPs = badBlockMaxTrackedIPs
 
-// BadBlockBanThreshold is the exported alias for badBlockBanThreshold.
-const BadBlockBanThreshold = badBlockBanThreshold
-
 // BadBlockStrikeCount returns the current number of IPs tracked in the
 // bad-block strike map.  Exported for testing only.
 func (h *Host) BadBlockStrikeCount() int {

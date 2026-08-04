@@ -388,5 +388,162 @@ func TestBadBlockBan_ValidBlockResetsCounter(t *testing.T) {
 	}
 }
 
+// ─── Test: custom BadBlockBanThreshold is honoured ───────────────────────────
+
+// TestBadBlockBan_CustomThreshold configures a ban threshold of 3 (not the
+// default 10) and verifies the peer is banned after exactly 3 bad blocks.
+func TestBadBlockBan_CustomThreshold(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-custom-threshold",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: 3,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	// Send 2 bad blocks — below the custom threshold of 3; must not ban.
+	sendBlockAtHeight(t, conn, 5000)
+	sendBlockAtHeight(t, conn, 5000)
+	time.Sleep(100 * time.Millisecond)
+	if len(h.ListBans()) != 0 {
+		t.Errorf("peer was banned after only 2 bad blocks with threshold=3")
+	}
+
+	// Send the 3rd bad block — at the custom threshold; must ban.
+	sendBlockAtHeight(t, conn, 5000)
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("peer was NOT disconnected after 3 bad blocks with threshold=3")
+	}
+	bans := h.ListBans()
+	found := false
+	for _, b := range bans {
+		if b.Addr == peerIP {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ban entry for bare IP %q not found after custom threshold=3; all bans: %v", peerIP, bans)
+	}
+}
+
+// ─── Test: custom BadBlockHeightLead is honoured ─────────────────────────────
+
+// TestBadBlockBan_CustomHeightLead configures a height lead of 50 (not the
+// default 1000) and verifies that a block at ourTip+51 triggers a strike.
+func TestBadBlockBan_CustomHeightLead(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-custom-lead",
+		UserAgent:            "aperod/test",
+		BadBlockHeightLead:   50,
+		BadBlockBanThreshold: 3,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	// ourTip=0, lead=50 → threshold is 50. Height 51 is out-of-range; 50 is not.
+	// A block at height 50 should NOT count as a strike.
+	sendBlockAtHeight(t, conn, 50)
+	time.Sleep(80 * time.Millisecond)
+	if len(h.ListBans()) != 0 {
+		t.Errorf("peer was banned for block at exactly the height lead (height=50, lead=50)")
+	}
+
+	// A block at height 51 IS out-of-range → strike.  Send 3 to trigger the ban.
+	sendBlockAtHeight(t, conn, 51)
+	sendBlockAtHeight(t, conn, 51)
+	sendBlockAtHeight(t, conn, 51)
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("peer was NOT disconnected; custom height lead 50 may not be in effect")
+	}
+	bans := h.ListBans()
+	found := false
+	for _, b := range bans {
+		if b.Addr == peerIP {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ban entry for %q not found; bans: %v", peerIP, bans)
+	}
+}
+
+// ─── Test: custom BadBlockBanDuration is honoured ────────────────────────────
+
+// TestBadBlockBan_CustomBanDuration verifies that the ban's expiry time
+// reflects the configured duration (5 minutes here) rather than the 24h default.
+func TestBadBlockBan_CustomBanDuration(t *testing.T) {
+	const customDuration = 5 * time.Minute
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-custom-duration",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: 3,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  customDuration,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	for i := 0; i < 3; i++ {
+		sendBlockAtHeight(t, conn, 9000)
+	}
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Fatalf("peer was NOT disconnected after 3 bad blocks")
+	}
+
+	bans := h.ListBans()
+	for _, b := range bans {
+		if b.Addr == peerIP {
+			remaining := time.Until(b.ExpiresAt)
+			// Should be within [customDuration-5s, customDuration+5s].
+			if remaining < customDuration-5*time.Second || remaining > customDuration+5*time.Second {
+				t.Errorf("ban duration mismatch: got remaining=%v, want ~%v", remaining, customDuration)
+			} else {
+				t.Logf("ban duration correct: remaining=%v (want ~%v)", remaining, customDuration)
+			}
+			return
+		}
+	}
+	t.Errorf("ban entry for bare IP %q not found; all bans: %v", peerIP, bans)
+}
+
 // Keep the import used via fmt.Sprintf in future tests.
 var _ = fmt.Sprintf

@@ -7,6 +7,10 @@ p2p:
   bootnodes: []
   max_peers: 50
   min_peers: 4
+  # Rogue-peer / wrong-fork ban knobs (all optional — defaults shown below).
+  # bad_block_height_lead: 1000   # how many blocks ahead of our tip triggers a strike
+  # bad_block_ban_threshold: 10   # strikes within the TTL window before the IP is banned
+  # bad_block_ban_duration: 24h   # how long the ban lasts
 
 consensus:
   validator_key: "./data/testnet/validator.key"

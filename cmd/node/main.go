@@ -863,6 +863,9 @@ func run() error {
                                 TLSConfig:            tlsCfg,
                                 AllowedPeers:         cfg.P2P.AllowedPeers,
                                 MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
+                                BadBlockHeightLead:   cfg.P2P.BadBlockHeightLead,
+                                BadBlockBanThreshold: cfg.P2P.BadBlockBanThreshold,
+                                BadBlockBanDuration:  cfg.P2P.BadBlockBanDuration,
                         }, handler, log)
                         if len(cfg.P2P.AllowedPeers) > 0 {
                                 log.Info("allow-list active",

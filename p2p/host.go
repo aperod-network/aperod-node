@@ -51,6 +51,15 @@ type Config struct {
         // the blast radius to MaxPendingHandshakes goroutines.
         // 0 = no limit (not recommended for production).  Default: 20.
         MaxPendingHandshakes int
+        // BadBlockHeightLead is how many blocks ahead of the node's tip a block
+        // must be before it counts as a rogue-fork strike.  Default: 1000.
+        BadBlockHeightLead uint64
+        // BadBlockBanThreshold is the number of rogue-fork strikes that trigger a
+        // temporary ban of the remote IP.  Default: 10.
+        BadBlockBanThreshold int
+        // BadBlockBanDuration is how long the ban lasts after the threshold is
+        // exceeded.  Default: 24h.
+        BadBlockBanDuration time.Duration
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -89,14 +98,6 @@ func (p *Peer) Send(msgType MessageType, payload interface{}) error {
         p.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
         return writeMsg(p.conn, msgType, payload)
 }
-
-// badBlockBanThreshold is the number of out-of-range blocks a peer may send
-// before it is banned for 24 hours.
-const badBlockBanThreshold = 10
-
-// badBlockHeightLead is how many blocks ahead of our tip a block height
-// must be before it is counted as out of range.
-const badBlockHeightLead = 1000
 
 // badBlockStrikeTTL is how long a strike record lives without activity before
 // it is discarded.  An attacker that sends one bad block per hour from a unique
@@ -147,6 +148,17 @@ type Host struct {
 
 // NewHost creates a new p2p host.
 func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
+        // Apply defaults for rogue-peer ban parameters so callers that do not
+        // set these fields (e.g. unit tests) get safe, production-grade behaviour.
+        if cfg.BadBlockHeightLead == 0 {
+                cfg.BadBlockHeightLead = 1000
+        }
+        if cfg.BadBlockBanThreshold == 0 {
+                cfg.BadBlockBanThreshold = 10
+        }
+        if cfg.BadBlockBanDuration == 0 {
+                cfg.BadBlockBanDuration = 24 * time.Hour
+        }
         return &Host{
                 cfg:            cfg,
                 handler:        handler,
@@ -748,7 +760,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         // source port does not bypass the enforcement.
                         ourTip := h.handler.CurrentHeight()
                         peerIP := connIP(peer.addr)
-                        if block.Header.Height > ourTip+badBlockHeightLead {
+                        if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead {
                                 h.badBlockMu.Lock()
                                 strike := h.badBlockCounts[peerIP]
                                 // Reset stale strikes so a long-dormant IP starts fresh.
@@ -771,11 +783,11 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                                         "block_height", block.Header.Height,
                                         "our_tip", ourTip,
                                         "count", count)
-                                if count >= badBlockBanThreshold {
+                                if count >= h.cfg.BadBlockBanThreshold {
                                         // Ban by bare IP so reconnects on new source ports are
                                         // also rejected.  IsBanned checks both IP:port and bare
                                         // IP, so this blocks all future connections from the host.
-                                        const banDuration = 24 * time.Hour
+                                        banDuration := h.cfg.BadBlockBanDuration
                                         h.mgr.Ban(peerIP, "repeated out-of-range blocks (wrong fork)", banDuration)
                                         // Close ALL currently established connections from the
                                         // same IP, not just the one that triggered the threshold.

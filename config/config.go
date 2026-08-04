@@ -107,6 +107,18 @@ type P2PConfig struct {
 	// fingerprint stays stable across restarts.  Pass --reset-p2p-identity on
 	// the command line to force regeneration (e.g. after a key compromise).
 	IdentityKey string `yaml:"identity_key"`
+	// BadBlockHeightLead is how many blocks ahead of our current tip a peer's
+	// advertised block height must be before it is counted as an out-of-range
+	// (wrong-fork) strike.  Larger values tolerate faster-syncing peers but
+	// reduce sensitivity to rogue-fork spam.  Default: 1000.
+	BadBlockHeightLead uint64 `yaml:"bad_block_height_lead"`
+	// BadBlockBanThreshold is the number of out-of-range blocks a peer may send
+	// (within the strike TTL window) before it is temporarily banned.
+	// Default: 10.
+	BadBlockBanThreshold int `yaml:"bad_block_ban_threshold"`
+	// BadBlockBanDuration is how long a peer IP is banned after exceeding
+	// BadBlockBanThreshold.  Default: 24h.
+	BadBlockBanDuration time.Duration `yaml:"bad_block_ban_duration"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -160,6 +172,9 @@ func DefaultConfig() *Config {
 			MaxPeersPerIP:        3,  // eclipse/partition guard: max 3 connections per source IP
 			MinOutbound:          4,  // always keep 4 slots free for outbound dial-outs
 			MaxPendingHandshakes: 20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
+			BadBlockHeightLead:   1000,
+			BadBlockBanThreshold: 10,
+			BadBlockBanDuration:  24 * time.Hour,
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
@@ -259,6 +274,34 @@ func (c *Config) Validate() error {
 			"memory_limit_bytes (%d) is below the safe floor of %d (512 MiB) — "+
 				"values this small cause instant GC thrash; set 0 to disable or use >= 512 MiB",
 			c.MemoryLimitBytes, minSafeMemoryLimit,
+		)
+	}
+	// Rogue-peer ban knob validation.  Zero means "use the built-in default"
+	// (applied in p2p.NewHost); only explicit non-default values are validated.
+	if c.P2P.BadBlockBanThreshold < 0 {
+		return fmt.Errorf(
+			"p2p.bad_block_ban_threshold (%d) must not be negative — "+
+				"negative values ban peers on the very first strike; use 0 for the default (10)",
+			c.P2P.BadBlockBanThreshold,
+		)
+	}
+	if c.P2P.BadBlockBanDuration < 0 {
+		return fmt.Errorf(
+			"p2p.bad_block_ban_duration (%v) must not be negative — "+
+				"negative durations create instantly-expired bans; use 0 for the default (24h)",
+			c.P2P.BadBlockBanDuration,
+		)
+	}
+	// A height lead above 1 billion blocks would overflow the uint64 tip+lead
+	// comparison in p2p.Host, wrapping to a small value and silently disabling
+	// the rogue-fork ban.  Cap at a value that is orders of magnitude above any
+	// realistic chain height.
+	const maxSafeHeightLead uint64 = 1_000_000_000
+	if c.P2P.BadBlockHeightLead > maxSafeHeightLead {
+		return fmt.Errorf(
+			"p2p.bad_block_height_lead (%d) exceeds the safe maximum of %d — "+
+				"values this large can overflow the tip+lead comparison and disable the rogue-fork ban",
+			c.P2P.BadBlockHeightLead, maxSafeHeightLead,
 		)
 	}
 	if c.Pprof.Enabled {
