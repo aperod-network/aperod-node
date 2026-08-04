@@ -90,6 +90,30 @@ func (p *Peer) Send(msgType MessageType, payload interface{}) error {
         return writeMsg(p.conn, msgType, payload)
 }
 
+// badBlockBanThreshold is the number of out-of-range blocks a peer may send
+// before it is banned for 24 hours.
+const badBlockBanThreshold = 10
+
+// badBlockHeightLead is how many blocks ahead of our tip a block height
+// must be before it is counted as out of range.
+const badBlockHeightLead = 1000
+
+// badBlockStrikeTTL is how long a strike record lives without activity before
+// it is discarded.  An attacker that sends one bad block per hour from a unique
+// IP can only grow the strike map by badBlockMaxTrackedIPs entries; older
+// records are pruned in maintainLoop.
+const badBlockStrikeTTL = time.Hour
+
+// badBlockMaxTrackedIPs caps the number of distinct IPs in badBlockCounts so a
+// distributed attacker cannot exhaust node memory by registering many unique IPs.
+const badBlockMaxTrackedIPs = 1024
+
+// badBlockStrike records the misbehaviour history for one remote IP.
+type badBlockStrike struct {
+        count    int
+        lastSeen time.Time
+}
+
 // Host is the p2p networking host.
 type Host struct {
         cfg     Config
@@ -113,6 +137,12 @@ type Host struct {
         // holding h.mu.
         pendingHandshakes atomic.Int64
 
+        // badBlockCounts tracks out-of-range-block strikes per remote IP.
+        // Entries expire after badBlockStrikeTTL and the map is capped at
+        // badBlockMaxTrackedIPs to prevent memory exhaustion by distributed
+        // attackers.  Guarded by badBlockMu.
+        badBlockMu     sync.Mutex
+        badBlockCounts map[string]badBlockStrike // bare IP → strike record
 }
 
 // NewHost creates a new p2p host.
@@ -123,8 +153,9 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 log:            log,
                 peers:          make(map[string]*Peer),
                 done:           make(chan struct{}),
-                mgr:    newPeerMgr(),
-                gossip: NewGossipFilter(),
+                mgr:            newPeerMgr(),
+                gossip:         NewGossipFilter(),
+                badBlockCounts: make(map[string]badBlockStrike),
         }
 }
 
@@ -390,6 +421,17 @@ func (h *Host) maintainLoop() {
                 case <-ticker.C:
                         // Prune expired bans
                         h.mgr.Prune()
+
+                        // Prune stale bad-block strike records so the map stays bounded
+                        // even when a distributed attacker registers many unique IPs.
+                        h.badBlockMu.Lock()
+                        now := time.Now()
+                        for ip, s := range h.badBlockCounts {
+                                if now.Sub(s.lastSeen) > badBlockStrikeTTL {
+                                        delete(h.badBlockCounts, ip)
+                                }
+                        }
+                        h.badBlockMu.Unlock()
 
                         h.mu.RLock()
                         count := len(h.peers)
@@ -700,6 +742,66 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 }
                 block := msgToBlock(msg)
                 if block != nil {
+                        // Rogue-fork spam protection: ban peers that repeatedly send
+                        // blocks far ahead of our tip (wrong-fork / CPU-waste attack).
+                        // Counter and ban are keyed by bare IP so a reconnect on a new
+                        // source port does not bypass the enforcement.
+                        ourTip := h.handler.CurrentHeight()
+                        peerIP := connIP(peer.addr)
+                        if block.Header.Height > ourTip+badBlockHeightLead {
+                                h.badBlockMu.Lock()
+                                strike := h.badBlockCounts[peerIP]
+                                // Reset stale strikes so a long-dormant IP starts fresh.
+                                if !strike.lastSeen.IsZero() && time.Since(strike.lastSeen) > badBlockStrikeTTL {
+                                        strike.count = 0
+                                }
+                                // Only track if below the per-map cap or already present.
+                                _, alreadyTracked := h.badBlockCounts[peerIP]
+                                if alreadyTracked || len(h.badBlockCounts) < badBlockMaxTrackedIPs {
+                                        strike.count++
+                                        strike.lastSeen = time.Now()
+                                        h.badBlockCounts[peerIP] = strike
+                                }
+                                count := strike.count
+                                h.badBlockMu.Unlock()
+
+                                h.log.Debug("out-of-range block from peer",
+                                        "peer", peer.addr,
+                                        "ip", peerIP,
+                                        "block_height", block.Header.Height,
+                                        "our_tip", ourTip,
+                                        "count", count)
+                                if count >= badBlockBanThreshold {
+                                        // Ban by bare IP so reconnects on new source ports are
+                                        // also rejected.  IsBanned checks both IP:port and bare
+                                        // IP, so this blocks all future connections from the host.
+                                        const banDuration = 24 * time.Hour
+                                        h.mgr.Ban(peerIP, "repeated out-of-range blocks (wrong fork)", banDuration)
+                                        // Close ALL currently established connections from the
+                                        // same IP, not just the one that triggered the threshold.
+                                        h.mu.Lock()
+                                        for addr, p := range h.peers {
+                                                if connIP(addr) == peerIP {
+                                                        p.conn.Close()
+                                                        delete(h.peers, addr)
+                                                }
+                                        }
+                                        h.mu.Unlock()
+                                        // Remove the now-banned IP from the strike map.
+                                        h.badBlockMu.Lock()
+                                        delete(h.badBlockCounts, peerIP)
+                                        h.badBlockMu.Unlock()
+                                        h.log.Info("peer IP banned for wrong-fork blocks",
+                                                "ip", peerIP, "addr", peer.addr, "duration", banDuration)
+                                        return nil
+                                }
+                                return nil
+                        }
+                        // Valid-height block: reset the bad-block counter for this IP.
+                        h.badBlockMu.Lock()
+                        delete(h.badBlockCounts, peerIP)
+                        h.badBlockMu.Unlock()
+
                         // Gossip relay: forward to all other peers the first time we see this block.
                         blockHash := block.Hash()
                         isNew := h.gossip.MarkAndCheck(blockHash)
