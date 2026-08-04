@@ -44,6 +44,13 @@ type Config struct {
         // immediately after the TLS handshake with a clear log entry.
         // An empty slice means open network (default behaviour).
         AllowedPeers []string
+        // PeerWhitelist is an optional list of IP addresses and/or CIDR
+        // ranges (e.g. "1.2.3.4", "10.0.0.0/8") that are allowed to
+        // connect inbound.  When non-empty, any inbound connection whose
+        // source IP is not covered by an entry is dropped immediately —
+        // before any P2P handshake.  Outbound dial-outs are not affected.
+        // An empty slice means all source IPs are accepted (default).
+        PeerWhitelist []string
         // MaxPendingHandshakes limits the number of inbound TCP connections
         // that are concurrently in the TLS handshake phase.  A peer that
         // opens many connections but never completes the handshake would
@@ -69,6 +76,23 @@ func connIP(addr string) string {
                 return addr
         }
         return host
+}
+
+// ipInWhitelist reports whether ip is covered by any entry in the whitelist.
+// wlNets is the list of parsed CIDRs; wlIPs is the list of individual IPs.
+// Returns true immediately when both slices are nil (open network).
+func ipInWhitelist(ip net.IP, wlNets []*net.IPNet, wlIPs []net.IP) bool {
+        for _, n := range wlNets {
+                if n.Contains(ip) {
+                        return true
+                }
+        }
+        for _, a := range wlIPs {
+                if a.Equal(ip) {
+                        return true
+                }
+        }
+        return false
 }
 
 // Handler is the callback interface for handling incoming p2p messages.
@@ -144,6 +168,13 @@ type Host struct {
         // attackers.  Guarded by badBlockMu.
         badBlockMu     sync.Mutex
         badBlockCounts map[string]badBlockStrike // bare IP → strike record
+
+        // wlNets and wlIPs hold the parsed form of cfg.PeerWhitelist so that
+        // acceptLoop can check each inbound IP with a net.IPNet.Contains call
+        // rather than re-parsing the CIDR strings on every connection.
+        // Both are nil when cfg.PeerWhitelist is empty (open network).
+        wlNets []*net.IPNet
+        wlIPs  []net.IP
 }
 
 // NewHost creates a new p2p host.
@@ -159,6 +190,21 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.BadBlockBanDuration == 0 {
                 cfg.BadBlockBanDuration = 24 * time.Hour
         }
+
+        // Parse PeerWhitelist entries once at construction time so acceptLoop
+        // can do cheap net.IPNet.Contains checks without re-parsing strings.
+        var wlNets []*net.IPNet
+        var wlIPs []net.IP
+        for _, entry := range cfg.PeerWhitelist {
+                if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+                        wlNets = append(wlNets, ipNet)
+                } else if ip := net.ParseIP(entry); ip != nil {
+                        wlIPs = append(wlIPs, ip)
+                } else {
+                        log.Warn("peer_whitelist: ignoring unparseable entry", "entry", entry)
+                }
+        }
+
         return &Host{
                 cfg:            cfg,
                 handler:        handler,
@@ -168,6 +214,8 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 mgr:            newPeerMgr(),
                 gossip:         NewGossipFilter(),
                 badBlockCounts: make(map[string]badBlockStrike),
+                wlNets:         wlNets,
+                wlIPs:          wlIPs,
         }
 }
 
@@ -333,6 +381,29 @@ func (h *Host) acceptLoop() {
                                 return
                         default:
                                 h.log.Warn("accept error", "err", err)
+                                continue
+                        }
+                }
+
+                // IP whitelist: when peer_whitelist is non-empty, reject any
+                // inbound connection whose source IP is not covered by the list.
+                // This is the earliest possible rejection point — before TLS
+                // handshake, MaxPeers check, or per-IP limit — so unknown nodes
+                // cause zero resource usage beyond one Accept() call.
+                // Outbound dials are never subject to this check.
+                //
+                // IMPORTANT: enforcement is gated on len(cfg.PeerWhitelist) > 0
+                // (the raw string slice), NOT on the parsed slices.  Config
+                // validation rejects malformed entries so the parsed slices
+                // always reflect the full whitelist; using the raw count here
+                // ensures fail-closed behaviour even if parsing somehow yields
+                // empty slices (defensive belt-and-suspenders).
+                if len(h.cfg.PeerWhitelist) > 0 {
+                        remoteIP := net.ParseIP(connIP(conn.RemoteAddr().String()))
+                        if remoteIP == nil || !ipInWhitelist(remoteIP, h.wlNets, h.wlIPs) {
+                                h.log.Info("inbound connection rejected: IP not in peer_whitelist",
+                                        "addr", conn.RemoteAddr().String())
+                                conn.Close()
                                 continue
                         }
                 }

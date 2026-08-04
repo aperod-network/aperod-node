@@ -82,6 +82,74 @@ func TestValidate_BadBlockKnobs(t *testing.T) {
 	}
 }
 
+func TestValidate_PeerWhitelist(t *testing.T) {
+	tests := []struct {
+		name      string
+		list      []string
+		wantError bool
+	}{
+		{
+			name:      "empty whitelist is accepted (open network)",
+			list:      nil,
+			wantError: false,
+		},
+		{
+			name:      "single valid IPv4 is accepted",
+			list:      []string{"1.2.3.4"},
+			wantError: false,
+		},
+		{
+			name:      "single valid IPv6 is accepted",
+			list:      []string{"2001:db8::1"},
+			wantError: false,
+		},
+		{
+			name:      "valid CIDR range is accepted",
+			list:      []string{"10.0.0.0/8"},
+			wantError: false,
+		},
+		{
+			name:      "multiple valid entries are accepted",
+			list:      []string{"1.2.3.4", "10.0.0.0/24", "192.168.1.100"},
+			wantError: false,
+		},
+		{
+			name:      "malformed entry is rejected",
+			list:      []string{"not-an-ip"},
+			wantError: true,
+		},
+		{
+			name:      "hostname without port is rejected (not an IP)",
+			list:      []string{"validator.example.com"},
+			wantError: true,
+		},
+		{
+			name:      "valid entry mixed with malformed entry is rejected",
+			list:      []string{"1.2.3.4", "bad-entry"},
+			wantError: true,
+		},
+		{
+			name:      "IP with port is rejected (must be bare IP)",
+			list:      []string{"1.2.3.4:30303"},
+			wantError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.P2P.PeerWhitelist = tc.list
+			err := cfg.Validate()
+			if tc.wantError && err == nil {
+				t.Errorf("Validate() returned nil, want error for peer_whitelist=%v", tc.list)
+			}
+			if !tc.wantError && err != nil {
+				t.Errorf("Validate() returned unexpected error for peer_whitelist=%v: %v", tc.list, err)
+			}
+		})
+	}
+}
+
 func TestValidate_MemoryLimitBytes(t *testing.T) {
 	const mib512 = 512 * 1024 * 1024 // 536870912
 

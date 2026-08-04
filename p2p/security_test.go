@@ -359,3 +359,168 @@ func TestMaliciousPacket_NodeStaysAlive(t *testing.T) {
         pc := host.PeerCount()
         t.Logf("3.5.7 ✓ host alive after malicious packet, peerCount=%d", pc)
 }
+
+// ─── Peer IP whitelist ────────────────────────────────────────────────────────
+
+// TestPeerWhitelist_EmptyAllowsAll verifies that an empty peer_whitelist leaves
+// the network open: connections from any IP are accepted (existing behaviour).
+func TestPeerWhitelist_EmptyAllowsAll(t *testing.T) {
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr: "127.0.0.1:0",
+                MaxPeers:   10,
+                NodeID:     "wl-open-host",
+                UserAgent:  "aperod/test",
+                // PeerWhitelist intentionally empty
+        }, &stubHandler{}, newTestLogger())
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        conn, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+        if err != nil {
+                t.Fatalf("dial failed (should be open): %v", err)
+        }
+        defer conn.Close()
+
+        // Perform the Aperod inbound handshake so the connection is accepted into
+        // the peer table.
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+        if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+        }); err != nil {
+                t.Fatalf("write ping: %v", err)
+        }
+        if _, _, err := p2p.ReadMsg(conn); err != nil {
+                t.Fatalf("read pong: %v", err)
+        }
+
+        time.Sleep(50 * time.Millisecond)
+        if host.PeerCount() == 0 {
+                t.Error("peer_whitelist=empty: expected connection to be accepted, but PeerCount=0")
+        } else {
+                t.Logf("whitelist=empty ✓ connection accepted, peerCount=%d", host.PeerCount())
+        }
+}
+
+// TestPeerWhitelist_ExactIPAccepted verifies that a whitelisted IP can connect.
+func TestPeerWhitelist_ExactIPAccepted(t *testing.T) {
+        // 127.0.0.1 is the loopback — our test dialer always comes from this IP.
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr:    "127.0.0.1:0",
+                MaxPeers:      10,
+                NodeID:        "wl-exact-host",
+                UserAgent:     "aperod/test",
+                PeerWhitelist: []string{"127.0.0.1"},
+        }, &stubHandler{}, newTestLogger())
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        conn, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+        if err != nil {
+                t.Fatalf("dial failed: %v", err)
+        }
+        defer conn.Close()
+
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+        if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+        }); err != nil {
+                t.Fatalf("write ping: %v", err)
+        }
+        if _, _, err := p2p.ReadMsg(conn); err != nil {
+                t.Fatalf("read pong: %v", err)
+        }
+
+        time.Sleep(50 * time.Millisecond)
+        if host.PeerCount() == 0 {
+                t.Error("whitelisted IP should be accepted, but PeerCount=0")
+        } else {
+                t.Logf("whitelist=127.0.0.1 ✓ whitelisted IP accepted, peerCount=%d", host.PeerCount())
+        }
+}
+
+// TestPeerWhitelist_CIDRAccepted verifies that an IP within a whitelisted CIDR
+// range is accepted.
+func TestPeerWhitelist_CIDRAccepted(t *testing.T) {
+        // 127.0.0.0/8 covers all loopback addresses including 127.0.0.1.
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr:    "127.0.0.1:0",
+                MaxPeers:      10,
+                NodeID:        "wl-cidr-host",
+                UserAgent:     "aperod/test",
+                PeerWhitelist: []string{"127.0.0.0/8"},
+        }, &stubHandler{}, newTestLogger())
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        conn, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+        if err != nil {
+                t.Fatalf("dial failed: %v", err)
+        }
+        defer conn.Close()
+
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+        if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+        }); err != nil {
+                t.Fatalf("write ping: %v", err)
+        }
+        if _, _, err := p2p.ReadMsg(conn); err != nil {
+                t.Fatalf("read pong: %v", err)
+        }
+
+        time.Sleep(50 * time.Millisecond)
+        if host.PeerCount() == 0 {
+                t.Error("CIDR-whitelisted IP should be accepted, but PeerCount=0")
+        } else {
+                t.Logf("whitelist=127.0.0.0/8 ✓ CIDR-whitelisted IP accepted, peerCount=%d", host.PeerCount())
+        }
+}
+
+// TestPeerWhitelist_NonMatchingIPRejected verifies that an inbound connection
+// from an IP not on the whitelist is rejected before any handshake.
+func TestPeerWhitelist_NonMatchingIPRejected(t *testing.T) {
+        // Whitelist an IP that our loopback dialer will NOT be coming from.
+        // The dialer uses 127.0.0.1; we whitelist a different, non-loopback IP.
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr:    "127.0.0.1:0",
+                MaxPeers:      10,
+                NodeID:        "wl-reject-host",
+                UserAgent:     "aperod/test",
+                PeerWhitelist: []string{"192.0.2.1"}, // TEST-NET-1 — never comes from loopback
+        }, &stubHandler{}, newTestLogger())
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        // Connect from 127.0.0.1 — not on the whitelist.
+        conn, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+        if err != nil {
+                // Connection refused counts as rejection — pass.
+                t.Logf("whitelist reject ✓ connection refused by OS")
+                return
+        }
+        defer conn.Close()
+
+        // The host should close the connection immediately without replying.
+        conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+        _ = p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "intruder", Height: 0, UserAgent: "evil", Timestamp: time.Now().Unix(),
+        })
+        _, _, readErr := p2p.ReadMsg(conn)
+
+        time.Sleep(50 * time.Millisecond)
+
+        if readErr == nil && host.PeerCount() > 0 {
+                t.Errorf("non-whitelisted IP should be rejected, but PeerCount=%d", host.PeerCount())
+        } else {
+                t.Logf("whitelist reject ✓ non-whitelisted IP rejected (readErr=%v, peers=%d)",
+                        readErr, host.PeerCount())
+        }
+}

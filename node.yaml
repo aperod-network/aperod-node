@@ -7,6 +7,12 @@ p2p:
   bootnodes: []
   max_peers: 50
   min_peers: 4
+  # Peer IP whitelist (optional). When set, only inbound connections from
+  # the listed IPs / CIDR ranges are accepted. Outbound dials to bootnodes
+  # are not affected. Leave empty (default) for an open network.
+  # peer_whitelist:
+  #   - "1.2.3.4"          # single validator IP
+  #   - "10.0.0.0/8"       # private network range
   # Rogue-peer / wrong-fork ban knobs (all optional — defaults shown below).
   # bad_block_height_lead: 1000   # how many blocks ahead of our tip triggers a strike
   # bad_block_ban_threshold: 10   # strikes within the TTL window before the IP is banned

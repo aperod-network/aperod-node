@@ -95,6 +95,13 @@ type P2PConfig struct {
 	// TLS fingerprint is not on the list is disconnected immediately after the
 	// TLS handshake.  An empty list means open network (default behaviour).
 	AllowedPeers []string `yaml:"allowed_peers"`
+	// PeerWhitelist is an optional list of IP addresses and/or CIDR ranges
+	// (e.g. "1.2.3.4", "10.0.0.0/8") whose inbound connections are accepted.
+	// When non-empty, any inbound TCP connection whose source IP is not covered
+	// by an entry is rejected immediately — before any P2P handshake occurs.
+	// Outbound dial-outs to bootnodes and discovery peers are not affected.
+	// An empty list means all source IPs are allowed (default behaviour).
+	PeerWhitelist []string `yaml:"peer_whitelist"`
 	// MaxPendingHandshakes caps the number of inbound connections that are
 	// concurrently executing the TLS handshake.  A peer that opens many TCP
 	// connections but never sends a ClientHello holds one goroutine each for
@@ -276,6 +283,22 @@ func (c *Config) Validate() error {
 			c.MemoryLimitBytes, minSafeMemoryLimit,
 		)
 	}
+	// Peer whitelist: every entry must be a valid IP address or CIDR range.
+	// A single malformed entry would silently fail-open (the entry is ignored
+	// at runtime but the operator believes the whitelist is active), so we
+	// refuse to start rather than silently degrading to an open network.
+	for _, entry := range c.P2P.PeerWhitelist {
+		if net.ParseIP(entry) == nil {
+			if _, _, err := net.ParseCIDR(entry); err != nil {
+				return fmt.Errorf(
+					"p2p.peer_whitelist entry %q is not a valid IP address or CIDR range — "+
+						"fix or remove this entry; the node will not start with a malformed whitelist",
+					entry,
+				)
+			}
+		}
+	}
+
 	// Rogue-peer ban knob validation.  Zero means "use the built-in default"
 	// (applied in p2p.NewHost); only explicit non-default values are validated.
 	if c.P2P.BadBlockBanThreshold < 0 {

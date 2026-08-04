@@ -862,11 +862,16 @@ func run() error {
                                 UserAgent:            "aperod-node/1.0",
                                 TLSConfig:            tlsCfg,
                                 AllowedPeers:         cfg.P2P.AllowedPeers,
+                                PeerWhitelist:        cfg.P2P.PeerWhitelist,
                                 MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
                                 BadBlockHeightLead:   cfg.P2P.BadBlockHeightLead,
                                 BadBlockBanThreshold: cfg.P2P.BadBlockBanThreshold,
                                 BadBlockBanDuration:  cfg.P2P.BadBlockBanDuration,
                         }, handler, log)
+                        if len(cfg.P2P.PeerWhitelist) > 0 {
+                                log.Info("peer IP whitelist active — only listed IPs may connect inbound",
+                                        "entries", len(cfg.P2P.PeerWhitelist))
+                        }
                         if len(cfg.P2P.AllowedPeers) > 0 {
                                 log.Info("allow-list active",
                                         "allowed_peers", len(cfg.P2P.AllowedPeers))
