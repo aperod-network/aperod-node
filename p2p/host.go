@@ -379,21 +379,25 @@ func (h *Host) RemoveFromWhitelist(entry string) bool {
 }
 
 // loadWhitelistFromFile establishes the authoritative whitelist on startup.
+// It returns an error when the sidecar file exists but cannot be read or
+// decoded — the caller (Start) must abort rather than continue, because
+// continuing with a degraded or empty whitelist would allow inbound peers
+// that should be blocked (fail-open access control).
 //
 // Sidecar-as-authoritative semantics:
-//   - If the sidecar file exists → use its entries exclusively, ignoring
-//     cfg.PeerWhitelist.  This preserves admin-made removals of node.yaml
-//     entries across restarts: once the sidecar exists it is the sole source
-//     of truth.
-//   - If the file does not exist and cfg.PeerWhitelist is non-empty → seed
-//     the sidecar from cfg and save it so future restarts are consistent.
-//   - If neither → no-op (open network).
+//   - Sidecar exists and is valid → use its entries exclusively; ignore
+//     cfg.PeerWhitelist.  Admin-made removals of node.yaml entries therefore
+//     survive restarts: once the sidecar exists it is the sole source of truth.
+//   - Sidecar exists but cannot be read or parsed → return a fatal error so
+//     Start() aborts.  The operator must repair or remove the file.
+//   - Sidecar does not exist and cfg.PeerWhitelist non-empty → seed the sidecar
+//     from cfg so future restarts are consistent; return nil.
+//   - Neither → open network; no-op; return nil.
 //
-// loadWhitelistFromFile is called once in Start() before the listener opens.
-// No lock is needed; no connections exist yet.
-func (h *Host) loadWhitelistFromFile() {
+// Called once inside Start() before the listener opens; no lock required.
+func (h *Host) loadWhitelistFromFile() error {
         if h.cfg.WhitelistFile == "" || h.cfg.WhitelistFile == "-" {
-                return
+                return nil
         }
 
         data, err := os.ReadFile(h.cfg.WhitelistFile)
@@ -402,9 +406,8 @@ func (h *Host) loadWhitelistFromFile() {
                 // Sidecar exists — it is authoritative; ignore cfg.PeerWhitelist.
                 var fileEntries []string
                 if jsonErr := json.Unmarshal(data, &fileEntries); jsonErr != nil {
-                        h.log.Warn("p2p: whitelist file parse failed — keeping cfg entries",
-                                "file", h.cfg.WhitelistFile, "err", jsonErr)
-                        return
+                        return fmt.Errorf("p2p: whitelist sidecar %q is corrupt (JSON parse error): %w — "+
+                                "repair or remove the file to restart the node", h.cfg.WhitelistFile, jsonErr)
                 }
                 var nets []*net.IPNet
                 var ips []net.IP
@@ -417,10 +420,10 @@ func (h *Host) loadWhitelistFromFile() {
                                 ips = append(ips, ip)
                                 valid = append(valid, entry)
                         } else {
-                                h.log.Warn("p2p: whitelist file: ignoring unparseable entry", "entry", entry)
+                                h.log.Warn("p2p: whitelist sidecar: ignoring unparseable entry", "entry", entry)
                         }
                 }
-                // Overwrite the in-memory state entirely (no merge).
+                // Overwrite the in-memory state entirely (no merge with cfg).
                 h.wlNets = nets
                 h.wlIPs = ips
                 h.cfg.PeerWhitelist = valid
@@ -431,16 +434,20 @@ func (h *Host) loadWhitelistFromFile() {
                 // First boot — seed the sidecar from cfg so future restarts are
                 // consistent and admin removals of cfg entries persist correctly.
                 if len(h.cfg.PeerWhitelist) == 0 {
-                        return // open network; nothing to seed
+                        return nil // open network; nothing to seed
                 }
                 h.saveWhitelistToFile(h.cfg.PeerWhitelist)
                 h.log.Info("p2p: seeded whitelist sidecar from node.yaml",
                         "entries", len(h.cfg.PeerWhitelist), "file", h.cfg.WhitelistFile)
 
         default:
-                h.log.Warn("p2p: whitelist file read failed — keeping cfg entries",
-                        "file", h.cfg.WhitelistFile, "err", err)
+                // The file exists (or the path is unreadable for another reason).
+                // Fail-closed: return an error so Start() aborts rather than
+                // allowing inbound connections that the sidecar was meant to block.
+                return fmt.Errorf("p2p: whitelist sidecar %q cannot be read: %w — "+
+                        "check permissions or remove the file to restart the node", h.cfg.WhitelistFile, err)
         }
+        return nil
 }
 
 // saveWhitelistToFile atomically writes entries to cfg.WhitelistFile so the
@@ -504,9 +511,13 @@ func (h *Host) Start() error {
         // waiting for them to accumulate 10 strikes again.
         h.mgr.LoadBansFromFile()
 
-        // Merge the sidecar whitelist file (if any) with the static entries
-        // from cfg.PeerWhitelist so admin-added entries survive restarts.
-        h.loadWhitelistFromFile()
+        // Load the sidecar whitelist file (if configured).  loadWhitelistFromFile
+        // returns a fatal error when the file exists but is unreadable or corrupt;
+        // abort startup in that case rather than running fail-open (all IPs would
+        // be accepted, defeating the whitelist's access-control purpose).
+        if err := h.loadWhitelistFromFile(); err != nil {
+                return err
+        }
         if n := h.mgr.BannedCount(); n > 0 {
                 h.log.Info("p2p: restored bans from file", "count", n, "file", h.cfg.BanFile)
         }

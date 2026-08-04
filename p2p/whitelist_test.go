@@ -177,7 +177,9 @@ func TestWhitelist_Persistence(t *testing.T) {
 		cfg.PeerWhitelist = []string{"5.5.5.5"}
 		cfg.WhitelistFile = wlFile
 	})
-	h1.loadWhitelistFromFile() // simulates Start()
+	if err := h1.loadWhitelistFromFile(); err != nil { // simulates Start()
+		t.Fatalf("loadWhitelistFromFile (first boot): %v", err)
+	}
 
 	// Sidecar should have been seeded from cfg.
 	if _, err := os.Stat(wlFile); err != nil {
@@ -196,11 +198,17 @@ func TestWhitelist_Persistence(t *testing.T) {
 		cfg.PeerWhitelist = []string{"5.5.5.5"}
 		cfg.WhitelistFile = wlFile
 	})
-	h2.loadWhitelistFromFile()
+	if err := h2.loadWhitelistFromFile(); err != nil {
+		t.Fatalf("loadWhitelistFromFile (restart): %v", err)
+	}
 
 	got := h2.GetPeerWhitelist()
 	has := func(s string) bool {
-		for _, e := range got { if e == s { return true } }
+		for _, e := range got {
+			if e == s {
+				return true
+			}
+		}
 		return false
 	}
 	if !has("5.5.5.5") {
@@ -219,7 +227,9 @@ func TestWhitelist_Persistence(t *testing.T) {
 		cfg.PeerWhitelist = []string{"5.5.5.5"} // still in node.yaml
 		cfg.WhitelistFile = wlFile
 	})
-	h3.loadWhitelistFromFile()
+	if err := h3.loadWhitelistFromFile(); err != nil {
+		t.Fatalf("loadWhitelistFromFile (after removal): %v", err)
+	}
 
 	got3 := h3.GetPeerWhitelist()
 	for _, e := range got3 {
@@ -227,8 +237,82 @@ func TestWhitelist_Persistence(t *testing.T) {
 			t.Errorf("restart after removal: 5.5.5.5 should NOT be in whitelist (cfg entry removed by admin)")
 		}
 	}
-	if !func() bool { for _, e := range got3 { if e == "9.9.9.9" { return true } }; return false }() {
+	hasEntry := func(sl []string, s string) bool {
+		for _, e := range sl {
+			if e == s {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasEntry(got3, "9.9.9.9") {
 		t.Errorf("restart after removal: 9.9.9.9 should still be in whitelist, got %v", got3)
+	}
+}
+
+// TestWhitelist_CorruptSidecarFails verifies that a corrupt (unparseable JSON)
+// sidecar causes loadWhitelistFromFile to return a non-nil error so that
+// Start() aborts rather than running fail-open.
+func TestWhitelist_CorruptSidecarFails(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	// Write truncated / corrupt JSON.
+	if err := os.WriteFile(wlFile, []byte(`["1.1.1.1", "2.2`), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.PeerWhitelist = []string{"3.3.3.3"} // cfg has an entry — must not be used
+		cfg.WhitelistFile = wlFile
+	})
+	if err := h.loadWhitelistFromFile(); err == nil {
+		t.Fatal("expected error for corrupt sidecar, got nil")
+	}
+}
+
+// TestWhitelist_UnreadableSidecarFails verifies that a sidecar that exists but
+// cannot be read (e.g. permission denied) causes loadWhitelistFromFile to return
+// a non-nil error so that Start() aborts (fail-closed).
+func TestWhitelist_UnreadableSidecarFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root; permission checks do not apply")
+	}
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	if err := os.WriteFile(wlFile, []byte(`["1.1.1.1"]`), 0o000); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.PeerWhitelist = []string{"3.3.3.3"}
+		cfg.WhitelistFile = wlFile
+	})
+	if err := h.loadWhitelistFromFile(); err == nil {
+		t.Fatal("expected error for unreadable sidecar, got nil")
+	}
+}
+
+// TestWhitelist_EmptyYAMLFirstBoot verifies that when cfg.PeerWhitelist is
+// empty and no sidecar exists, loadWhitelistFromFile succeeds without creating
+// a sidecar file (open-network case).
+func TestWhitelist_EmptyYAMLFirstBoot(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		// cfg.PeerWhitelist deliberately empty (no whitelist configured).
+		cfg.WhitelistFile = wlFile
+	})
+	if err := h.loadWhitelistFromFile(); err != nil {
+		t.Fatalf("unexpected error for empty cfg + no sidecar: %v", err)
+	}
+	if _, err := os.Stat(wlFile); !os.IsNotExist(err) {
+		t.Fatal("sidecar must NOT be created for an open-network (empty) whitelist")
+	}
+	if n := len(h.GetPeerWhitelist()); n != 0 {
+		t.Fatalf("expected empty whitelist, got %d entries", n)
 	}
 }
 
