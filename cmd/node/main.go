@@ -429,6 +429,10 @@ func run() error {
                 // restore from it and skip both the key-image load and the
                 // full block scan.  Falls back gracefully when the snapshot is
                 // absent, stale, or corrupt.
+                //
+                // Clean up any orphaned .tmp files left by a previous crash
+                // BEFORE the load so the directory contains only complete files.
+                cleanStaleSnapshotTmpFiles(cfg.DataDir, log)
                 snapLoaded := false
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])

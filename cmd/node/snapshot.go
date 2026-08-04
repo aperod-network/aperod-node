@@ -11,9 +11,81 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aperod/aperod/core"
 )
+
+// staleTmpMaxAge is the age after which a leftover .tmp file from an atomic
+// write is considered orphaned (i.e. not in progress) and safe to delete.
+// Five minutes is long enough to never race a healthy write, and short enough
+// to catch files left behind by an OOM-kill or power-loss crash.
+const snapshotStaleTmpMaxAge = 5 * time.Minute
+
+// cleanStaleTmpFile removes the file at path if it exists and is older than
+// maxAge.  It is intentionally non-fatal: a stat or remove failure is logged
+// and the function returns so startup can continue.  Call it before loading any
+// file produced by an atomic-rename write to avoid indefinite disk accumulation
+// across many crash cycles.
+func cleanStaleTmpFile(path string, maxAge time.Duration, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		// File does not exist or is not accessible — nothing to clean up.
+		return
+	}
+	age := time.Since(info.ModTime())
+	if age < maxAge {
+		// Recent enough that it might belong to a concurrent write in progress.
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		log.Warn("snapshot: failed to remove stale tmp file (ignoring)",
+			"path", path,
+			"age", age.Round(time.Second).String(),
+			"err", err,
+		)
+		return
+	}
+	log.Info("snapshot: removed stale tmp file from previous crash",
+		"path", path,
+		"age", age.Round(time.Second).String(),
+	)
+}
+
+// cleanStaleSnapshotTmpFiles scans dataDir for any orphaned .tmp files left
+// behind by a crashed saveStartupSnapshot or copyFile call and removes those
+// older than snapshotStaleTmpMaxAge.
+//
+// Affected patterns (both use atomic rename):
+//   - snapshot-v2-<height>.json.gz.tmp  (primary snapshot write)
+//   - snapshot-v2-<height>-prev.json.gz.tmp  (prev-backup copy)
+//
+// Must be called BEFORE loadStartupSnapshotWithFallback so the load path never
+// encounters a partially-written .tmp alongside the final .json.gz files.
+func cleanStaleSnapshotTmpFiles(dataDir string, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		log.Warn("snapshot: cannot read data dir for stale-tmp scan (ignoring)",
+			"dir", dataDir,
+			"err", err,
+		)
+		return
+	}
+	prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		cleanStaleTmpFile(filepath.Join(dataDir, name), snapshotStaleTmpMaxAge, log)
+	}
+}
 
 // snapVersion must be bumped whenever the snapshot schema changes incompatibly.
 // v2: gzip-compressed JSON (previously v1 was plain JSON).
