@@ -1296,6 +1296,254 @@ else
 fi
 
 # =============================================================================
+# Test 19: stale-backup-dir cleanup runs BEFORE NODE_DATA_DIR preflight
+#
+# Scenario A — stale dir found + cleaned:
+#   df returns 4 GiB (below 5 GiB floor) for NODE_DATA_DIR UNTIL the rm -rf of
+#   the stale dir sets a marker file; after that it returns 6 GiB (above the
+#   floor).  Because _cleanup_stale_backup_dirs() runs before _disk_preflight(),
+#   the cleanup fires first → marker is set → df returns sufficient space →
+#   backup proceeds past the preflight and reaches pg_dump.
+#
+# Scenario B — no stale dir (cleanup finds nothing, no space freed):
+#   df returns 4 GiB throughout → NODE_DATA_DIR preflight triggers → backup
+#   is skipped with skipped_low_disk=1 (confirms the A result is non-trivial).
+# =============================================================================
+section "Test 19: stale-backup-dir cleanup runs before NODE_DATA_DIR preflight (ordering guard)"
+
+T19_DIR=$(mktemp -d "$TMPDIR_TEST/run-t19-XXXXXXXX")
+T19_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t19-XXXXXXXX")
+echo "blockdata" > "$T19_NODE_DATA_DIR/block.bin"
+make_settings_json "$T19_DIR/data"
+mkdir -p "$T19_DIR/metrics"
+
+# The backup dir parent is T19_DIR/backup-parent; cleanup scans that dir.
+T19_BACKUP_PARENT=$(mktemp -d "$TMPDIR_TEST/backup-parent-t19-XXXXXXXX")
+T19_BACKUP_DIR="$T19_BACKUP_PARENT/aperod_backups_$$"
+
+# Stale backup dir that the find stub will report
+T19_STALE_DIR="$T19_BACKUP_PARENT/aperod_backups_99999"
+mkdir -p "$T19_STALE_DIR"
+
+# Marker written by rm stub when it removes the stale dir
+T19_RM_MARKER="$T19_DIR/cleanup-ran.marker"
+
+# ── Scenario A stubs ─────────────────────────────────────────────────────────
+
+T19_CURL_LOG="$T19_DIR/curl.log"
+T19_FAKE_CURL=$(make_fake_curl "$T19_CURL_LOG")
+
+# find stub: when called looking for aperod_backups_* dirs, print the stale dir.
+# Pattern uses unquoted glob (*aperod_backups_*) so bash [[ ]] treats it as a
+# wildcard match against $* (which contains "-name aperod_backups_*" literally).
+T19_FAKE_FIND_DIR=$(mktemp -d "$TMPDIR_TEST/fake-find-t19-XXXXXXXX")
+cat >"$T19_FAKE_FIND_DIR/find" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == *-name*aperod_backups_* ]]; then
+  printf '%s\0' "$T19_STALE_DIR"
+else
+  /usr/bin/find "\$@"
+fi
+STUB
+chmod +x "$T19_FAKE_FIND_DIR/find"
+
+# du stub: return 2 GiB for any path (stale dir size + scaled preflight)
+T19_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t19-XXXXXXXX")
+cat >"$T19_FAKE_DU_DIR/du" <<'STUB'
+#!/usr/bin/env bash
+echo "2097152	${@: -1}"
+exit 0
+STUB
+chmod +x "$T19_FAKE_DU_DIR/du"
+
+# rm stub: touch the marker when removing the stale dir, then run real rm
+T19_FAKE_RM_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rm-t19-XXXXXXXX")
+cat >"$T19_FAKE_RM_DIR/rm" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == *"$T19_STALE_DIR"* ]]; then
+  touch "$T19_RM_MARKER"
+fi
+/bin/rm "\$@"
+STUB
+chmod +x "$T19_FAKE_RM_DIR/rm"
+
+# df stub: BACKUP_DIR always returns 20 GiB; NODE_DATA_DIR returns 4 GiB
+# (below 5 GiB floor) unless the rm marker exists, in which case 6 GiB (above).
+T19_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t19-XXXXXXXX")
+cat >"$T19_FAKE_DF_DIR/df" <<STUB
+#!/usr/bin/env bash
+last_arg="\${@: -1}"
+echo "Avail"
+if [[ "\$last_arg" == "$T19_NODE_DATA_DIR"* ]]; then
+  if [[ -f "$T19_RM_MARKER" ]]; then
+    echo "6291456"   # 6 GiB — cleanup freed space, preflight passes
+  else
+    echo "4194304"   # 4 GiB — insufficient, preflight would skip
+  fi
+else
+  echo "20971520"    # 20 GiB — BACKUP_DIR always passes
+fi
+exit 0
+STUB
+chmod +x "$T19_FAKE_DF_DIR/df"
+
+# sudo stub: fails immediately (simulates pg_dump stage — if reached, preflight passed)
+T19_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t19-XXXXXXXX")
+cat >"$T19_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$T19_FAKE_SUDO_DIR/sudo"
+
+T19_RCLONE=$(make_fake_bin "rclone" "$T19_DIR/rclone.log" 0)
+T19_GPG=$(make_fake_bin "gpg"    "$T19_DIR/gpg.log"    0)
+T19_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t19-XXXXXXXX")
+cat >"$T19_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T19_FAKE_TAR_DIR/tar"
+
+# Create backup dir so the mkdir guard passes
+mkdir -p "$T19_BACKUP_DIR"
+
+T19A_EXIT=0
+APEROD_BACKUP_PASSWORD="test-pass-t19" \
+  DATA_DIR="$T19_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T19_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T19_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T19_BACKUP_DIR" \
+  APEROD_NODE_DATA_DIR_OVERRIDE="$T19_NODE_DATA_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t19" \
+  ADMIN_TELEGRAM_CHAT_ID="19000001" \
+  PATH="$T19_FAKE_FIND_DIR:$T19_FAKE_RM_DIR:$T19_FAKE_DU_DIR:$T19_FAKE_DF_DIR:$T19_FAKE_CURL:$T19_FAKE_SUDO_DIR:$T19_RCLONE:$T19_GPG:$T19_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T19A_EXIT=$?
+
+# Scenario A checks
+if [[ -f "$T19_RM_MARKER" ]]; then
+  pass "Scenario A: cleanup ran — stale backup dir was removed (rm marker set)"
+else
+  fail "Scenario A: cleanup did NOT run — rm marker was never set"
+fi
+
+# pg_dump stage was reached (sudo stub exits 1 → script exits non-zero)
+# If preflight skipped the backup, script exits 0; non-zero means it proceeded.
+if [[ "$T19A_EXIT" -ne 0 ]]; then
+  pass "Scenario A: backup proceeded past NODE_DATA_DIR preflight (reached pg_dump, exited non-zero)"
+else
+  # Exit 0 could mean skipped — check prom to distinguish success from skip
+  T19_PROM="$T19_DIR/metrics/aperod_backup.prom"
+  if [[ -f "$T19_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T19_PROM"; then
+    fail "Scenario A: backup was SKIPPED (skipped_low_disk=1) — cleanup did not free space before preflight ran"
+  else
+    pass "Scenario A: backup proceeded past NODE_DATA_DIR preflight (exit 0, no low-disk skip metric)"
+  fi
+fi
+
+T19_PROM="$T19_DIR/metrics/aperod_backup.prom"
+if [[ ! -f "$T19_PROM" ]] || ! grep -q "^aperod_backup_skipped_low_disk 1" "$T19_PROM"; then
+  pass "Scenario A: aperod_backup_skipped_low_disk NOT set to 1 — preflight passed after cleanup"
+else
+  fail "Scenario A: aperod_backup_skipped_low_disk=1 found — preflight incorrectly skipped after cleanup freed space"
+fi
+
+if [[ ! -f "$T19_CURL_LOG" ]] || ! grep -q "мало места\|low.disk\|NODE_DATA_DIR" "$T19_CURL_LOG" 2>/dev/null; then
+  pass "Scenario A: no low-disk Telegram alert — NODE_DATA_DIR preflight passed"
+else
+  fail "Scenario A: low-disk Telegram alert fired — preflight triggered despite cleanup freeing space"
+fi
+
+# ── Scenario B: no stale dir found → no space freed → preflight skips ────────
+
+T19B_DIR=$(mktemp -d "$TMPDIR_TEST/run-t19b-XXXXXXXX")
+T19B_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t19b-XXXXXXXX")
+make_settings_json "$T19B_DIR/data"
+mkdir -p "$T19B_DIR/metrics"
+T19B_BACKUP_PARENT=$(mktemp -d "$TMPDIR_TEST/backup-parent-t19b-XXXXXXXX")
+T19B_BACKUP_DIR="$T19B_BACKUP_PARENT/aperod_backups_$$"
+mkdir -p "$T19B_BACKUP_DIR"
+
+T19B_CURL_LOG="$T19B_DIR/curl.log"
+T19B_FAKE_CURL=$(make_fake_curl "$T19B_CURL_LOG")
+
+# find stub: returns nothing (no stale dirs) — cleanup frees no space
+T19B_FAKE_FIND_DIR=$(mktemp -d "$TMPDIR_TEST/fake-find-t19b-XXXXXXXX")
+cat >"$T19B_FAKE_FIND_DIR/find" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *-name*aperod_backups_* ]]; then
+  : # print nothing — no stale dirs found
+else
+  /usr/bin/find "$@"
+fi
+STUB
+chmod +x "$T19B_FAKE_FIND_DIR/find"
+
+# df stub: BACKUP_DIR returns 20 GiB; NODE_DATA_DIR returns 4 GiB (insufficient, no cleanup)
+T19B_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t19b-XXXXXXXX")
+cat >"$T19B_FAKE_DF_DIR/df" <<STUB
+#!/usr/bin/env bash
+last_arg="\${@: -1}"
+echo "Avail"
+if [[ "\$last_arg" == "$T19B_NODE_DATA_DIR"* ]]; then
+  echo "4194304"   # 4 GiB — insufficient, preflight should skip
+else
+  echo "20971520"  # 20 GiB — BACKUP_DIR passes
+fi
+exit 0
+STUB
+chmod +x "$T19B_FAKE_DF_DIR/df"
+
+T19B_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t19b-XXXXXXXX")
+cat >"$T19B_FAKE_DU_DIR/du" <<'STUB'
+#!/usr/bin/env bash
+echo "2097152	${@: -1}"
+exit 0
+STUB
+chmod +x "$T19B_FAKE_DU_DIR/du"
+
+T19B_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t19b-XXXXXXXX")
+cat >"$T19B_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$T19B_FAKE_SUDO_DIR/sudo"
+
+T19B_RCLONE=$(make_fake_bin "rclone" "$T19B_DIR/rclone.log" 0)
+T19B_GPG=$(make_fake_bin "gpg"    "$T19B_DIR/gpg.log"    0)
+T19B_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t19b-XXXXXXXX")
+cat >"$T19B_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T19B_FAKE_TAR_DIR/tar"
+
+T19B_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t19b" \
+  DATA_DIR="$T19B_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T19B_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T19B_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T19B_BACKUP_DIR" \
+  APEROD_NODE_DATA_DIR_OVERRIDE="$T19B_NODE_DATA_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t19b" \
+  ADMIN_TELEGRAM_CHAT_ID="19000002" \
+  PATH="$T19B_FAKE_FIND_DIR:$T19B_FAKE_DU_DIR:$T19B_FAKE_DF_DIR:$T19B_FAKE_CURL:$T19B_FAKE_SUDO_DIR:$T19B_RCLONE:$T19B_GPG:$T19B_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T19B_EXIT=$?
+[[ "$T19B_EXIT" -eq 99 ]] && T19B_EXIT=0  # script returned 0
+
+if [[ "$T19B_EXIT" -eq 0 ]]; then
+  pass "Scenario B: exits 0 (skipped) when no stale dir is cleaned and NODE_DATA_DIR has 4 GiB"
+else
+  fail "Scenario B: exited $T19B_EXIT — expected 0 (skip)"
+fi
+
+T19B_PROM="$T19B_DIR/metrics/aperod_backup.prom"
+if [[ -f "$T19B_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T19B_PROM"; then
+  pass "Scenario B: aperod_backup_skipped_low_disk=1 — NODE_DATA_DIR preflight correctly triggered without cleanup"
+else
+  fail "Scenario B: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T19B_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
