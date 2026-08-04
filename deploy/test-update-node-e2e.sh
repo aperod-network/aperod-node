@@ -768,6 +768,146 @@ fi
 HARNESS
 chmod +x "$CTX/test-harness-peer-check.sh"
 
+# ── Scenario 4: fresh server — no prior binary, no service file ───────────────
+# Expected outcomes:
+#   F1. update-node.sh exits NON-ZERO (fast-fail before touching the service).
+#   F2. Combined stdout+stderr contains "Fresh-server detected".
+#   F3. /usr/local/bin/aperod-node does NOT exist (script stopped before install).
+#   F4. /etc/systemd/system/aperod-node.service does NOT exist.
+#   F5. fake-systemctl log does NOT contain "stop aperod-node" (service was
+#       never touched — the guard fired before Step 3).
+
+cat > "$CTX/test-harness-fresh-server.sh" << 'HARNESS'
+#!/usr/bin/env bash
+# Scenario 4 — fresh server: no prior binary and no service file installed.
+#
+# update-node.sh must detect the missing state and exit 1 immediately,
+# without stopping a non-existent service or leaving the system in a broken
+# state (no half-installed binary, no zombie PID file).
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
+PASS=0; FAIL=0
+
+pass_assert() { echo -e "${GREEN}  PASS${NC}  $*"; ((PASS++)); }
+fail_assert() { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
+
+# Stubs take priority over system binaries
+export PATH="/stubs:$PATH"
+
+# ── Step 1: Minimal environment — no binary, no service file ─────────────────
+# We still need the aperod user (update-node.sh runs sudo -u aperod …) and the
+# source directory (git pull, make build stubs need a target), but we
+# deliberately omit /usr/local/bin/aperod-node and the service unit file.
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 4] Setting up fresh-server state"
+echo "══════════════════════════════════════════════════"
+
+useradd --system --no-create-home --shell /usr/sbin/nologin aperod 2>/dev/null || true
+
+mkdir -p /opt/aperod/blockchain/build
+mkdir -p /opt/aperod/blockchain/deploy
+mkdir -p /etc/aperod
+mkdir -p /etc/systemd/system
+mkdir -p /run/fake-systemd
+mkdir -p /var/log/aperod
+
+chown aperod:aperod /opt/aperod 2>/dev/null || true
+
+git init /opt/aperod/blockchain >/dev/null 2>&1 || true
+git -C /opt/aperod/blockchain config user.email "test@test.com" 2>/dev/null || true
+git -C /opt/aperod/blockchain config user.name  "Test"         2>/dev/null || true
+
+cp /deploy/* /opt/aperod/blockchain/deploy/ 2>/dev/null || true
+
+# Confirm the "fresh" conditions hold before running the script.
+if [[ -f /usr/local/bin/aperod-node ]]; then
+  echo "[scenario4-setup] ERROR: /usr/local/bin/aperod-node already exists — test invalid" >&2
+  exit 1
+fi
+if [[ -f /etc/systemd/system/aperod-node.service ]]; then
+  echo "[scenario4-setup] ERROR: service file already exists — test invalid" >&2
+  exit 1
+fi
+
+echo "[scenario4-setup] Confirmed: no binary, no service file — fresh server state."
+
+# ── Step 2: Run update-node.sh — it must fail fast ───────────────────────────
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 4] Running update-node.sh on fresh server"
+echo "══════════════════════════════════════════════════"
+
+SKIP_PEER_CHECK=1 \
+HEALTH_MAX_ATTEMPTS=3 \
+HEALTH_WAIT_SECS=1 \
+  bash /deploy/update-node.sh > /tmp/scenario4-output.txt 2>&1
+UPDATE_EXIT=$?
+
+# Show the output for debugging convenience.
+cat /tmp/scenario4-output.txt
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 4] Assertions"
+echo "══════════════════════════════════════════════════"
+
+OUTPUT=$(cat /tmp/scenario4-output.txt)
+
+# F1: update-node.sh must exit NON-ZERO.
+if [[ $UPDATE_EXIT -ne 0 ]]; then
+  pass_assert "F1: update-node.sh exited $UPDATE_EXIT (non-zero — fresh-server guard fired)"
+else
+  fail_assert "F1: update-node.sh exited 0 (expected non-zero — fresh-server guard did NOT fire)"
+fi
+
+# F2: output must contain the guard's sentinel phrase.
+if echo "$OUTPUT" | grep -q "Fresh-server detected"; then
+  pass_assert "F2: 'Fresh-server detected' found in output"
+else
+  fail_assert "F2: 'Fresh-server detected' NOT found — guard message is missing or changed"
+  echo "     --- captured output ---" >&2
+  echo "$OUTPUT" >&2
+  echo "     --- end of output ---" >&2
+fi
+
+# F3: binary must NOT exist (script stopped before the install step).
+if [[ ! -f /usr/local/bin/aperod-node ]]; then
+  pass_assert "F3: /usr/local/bin/aperod-node does NOT exist (script exited before install)"
+else
+  fail_assert "F3: /usr/local/bin/aperod-node exists — script ran the install step when it should have exited"
+fi
+
+# F4: service file must NOT exist (script stopped before creating one).
+if [[ ! -f /etc/systemd/system/aperod-node.service ]]; then
+  pass_assert "F4: /etc/systemd/system/aperod-node.service does NOT exist"
+else
+  fail_assert "F4: /etc/systemd/system/aperod-node.service was created — script ran further than expected"
+fi
+
+# F5: fake-systemctl log must NOT contain "stop aperod-node" (service never touched).
+SYSCTL_LOG=/tmp/fake-systemctl.log
+if ! grep -q "stop aperod-node" "$SYSCTL_LOG" 2>/dev/null; then
+  pass_assert "F5: fake-systemctl log has no 'stop aperod-node' (guard fired before Step 3)"
+else
+  fail_assert "F5: 'stop aperod-node' found in fake-systemctl log — script reached Step 3 before aborting"
+  echo "     fake-systemctl log contents:" >&2
+  cat "$SYSCTL_LOG" >&2
+fi
+
+echo ""
+echo "──────────────────────────────────────────────────"
+TOTAL=$((PASS + FAIL))
+if [[ $FAIL -eq 0 ]]; then
+  echo -e "${GREEN}All $TOTAL fresh-server assertions passed.${NC}"
+  exit 0
+else
+  echo -e "${RED}$FAIL of $TOTAL fresh-server assertions FAILED.${NC}"
+  exit 1
+fi
+HARNESS
+chmod +x "$CTX/test-harness-fresh-server.sh"
+
 # ── Dockerfile ────────────────────────────────────────────────────────────────
 cat > "$CTX/Dockerfile" << 'DOCKER'
 FROM ubuntu:22.04
@@ -803,7 +943,8 @@ COPY deploy/         /deploy/
 COPY preseed.sh                  /preseed.sh
 COPY test-harness.sh             /test-harness.sh
 COPY test-harness-rollback.sh    /test-harness-rollback.sh
-COPY test-harness-peer-check.sh  /test-harness-peer-check.sh
+COPY test-harness-peer-check.sh   /test-harness-peer-check.sh
+COPY test-harness-fresh-server.sh /test-harness-fresh-server.sh
 
 # Pre-create standard system directories
 RUN mkdir -p /etc/systemd/system /run/fake-systemd /etc/aperod /var/log/aperod
@@ -863,9 +1004,23 @@ else
   echo -e "${RED}${BOLD}Scenario 3 (peer-check warning) FAILED.${NC}"
 fi
 
+# ── Run scenario 4: fresh server — no prior binary, no service file ───────────
+echo -e "\n${BOLD}[Scenario 4] Running fresh-server guard test…${NC}"
+echo "────────────────────────────────────────────────────"
+
+S4_PASS=false
+if docker run --rm "$IMAGE_TAG" bash /test-harness-fresh-server.sh; then
+  echo "────────────────────────────────────────────────────"
+  echo -e "${GREEN}${BOLD}Scenario 4 (fresh-server guard) PASSED.${NC}"
+  S4_PASS=true
+else
+  echo "────────────────────────────────────────────────────"
+  echo -e "${RED}${BOLD}Scenario 4 (fresh-server guard) FAILED.${NC}"
+fi
+
 # ── Overall result ────────────────────────────────────────────────────────────
 echo ""
-if [[ "$S1_PASS" == "true" && "$S2_PASS" == "true" && "$S3_PASS" == "true" ]]; then
+if [[ "$S1_PASS" == "true" && "$S2_PASS" == "true" && "$S3_PASS" == "true" && "$S4_PASS" == "true" ]]; then
   echo -e "${GREEN}${BOLD}All update-node.sh e2e scenarios PASSED.${NC}"
   exit 0
 else

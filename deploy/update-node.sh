@@ -187,6 +187,31 @@ if [[ ! -d /var/log/aperod ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Pre-flight: Refuse to run on a server where the node has never been
+# installed.  If neither the target binary nor the service unit file exists
+# this is almost certainly a fresh machine where install-node.sh should be
+# run first.  Proceeding would stop a non-existent service, build a new
+# binary with no backup to roll back to, and silently leave the service
+# offline if anything goes wrong.
+# ---------------------------------------------------------------------------
+if [[ ! -f "${BINARY_DST}" && ! -f "${SERVICE_FILE}" ]]; then
+  echo "" >&2
+  echo "✗ Fresh-server detected — aborting." >&2
+  echo "  No binary found at    : ${BINARY_DST}" >&2
+  echo "  No service file found : ${SERVICE_FILE}" >&2
+  echo "" >&2
+  echo "  update-node.sh is for upgrading an already-running Aperod node." >&2
+  echo "  For a first-time installation run install-node.sh instead." >&2
+
+  send_telegram_alert "⚠️ <b>aperod-node update ABORTED</b>
+Server: $(hostname)
+No binary at <code>${BINARY_DST}</code> and no service file at <code>${SERVICE_FILE}</code>.
+This looks like a fresh server — run <code>install-node.sh</code> instead of <code>update-node.sh</code>."
+
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1: Pull latest source
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Pulling latest source as aperod..."
