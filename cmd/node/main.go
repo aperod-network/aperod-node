@@ -741,6 +741,10 @@ func run() error {
         // (C-0 / C-1 fix: prevents inflation via forged commitments or unbound stake).
         mempool.SetVerifier(txVerifier)
 
+        // Remove any stale mempool.json.tmp left by a previous OOM-kill crash.
+        // Must run BEFORE Load so the final path is clean when Load reads it.
+        core.CleanStaleTmpFiles(cfg.DataDir, log)
+
         // Restore any transactions that were pending when the node last stopped.
         // Must run AFTER SetVerifier so full RingCT re-verification is active.
         // Invalid or double-spent entries are silently dropped.

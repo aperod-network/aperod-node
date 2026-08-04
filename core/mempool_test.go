@@ -15,6 +15,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -391,6 +392,51 @@ func TestMempool_BytesTrackedCorrectlyAfterRemove(t *testing.T) {
 	}
 	if afterBytes < 0 {
 		t.Fatalf("TotalBytes went negative: %d", afterBytes)
+	}
+}
+
+// ─── Task #1224: CleanStaleTmpFiles removes old .tmp, ignores recent ones ─────
+//
+// Verifies the three cases:
+//  1. A .tmp file older than 5 minutes is deleted and the node starts cleanly.
+//  2. A .tmp file younger than 5 minutes is left alone.
+//  3. No .tmp file present — function is a no-op.
+func TestCleanStaleTmpFiles(t *testing.T) {
+	dir := t.TempDir()
+	tmp := dir + "/mempool.json.tmp"
+	log := silentLogger()
+
+	// Case 3: no .tmp — should not panic or error.
+	core.CleanStaleTmpFiles(dir, log)
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("case 3: expected no .tmp file, got err=%v", err)
+	}
+
+	// Case 2: fresh .tmp (mtime = now) — must NOT be removed.
+	if err := os.WriteFile(tmp, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write fresh tmp: %v", err)
+	}
+	core.CleanStaleTmpFiles(dir, log)
+	if _, err := os.Stat(tmp); err != nil {
+		t.Fatalf("case 2: fresh .tmp was incorrectly removed: %v", err)
+	}
+
+	// Case 1: back-date the .tmp to 10 minutes ago — must be removed.
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(tmp, staleTime, staleTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	core.CleanStaleTmpFiles(dir, log)
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("case 1: stale .tmp was NOT removed (err=%v)", err)
+	}
+
+	// Confirm that a normal mempool Load still works after the cleanup ran
+	// (i.e. the absence of the .tmp does not break anything).
+	pool := core.NewMempool(core.DefaultMempoolConfig(), log)
+	n := pool.Load(dir, log)
+	if n != 0 {
+		t.Fatalf("expected 0 restored txs after cleanup, got %d", n)
 	}
 }
 

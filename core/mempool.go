@@ -492,6 +492,48 @@ func mempoolPath(dataDir string) string {
 	return filepath.Join(dataDir, "mempool.json")
 }
 
+// staleTmpMaxAge is the threshold after which a leftover mempool.json.tmp file
+// is considered stale and safe to delete on startup.
+const staleTmpMaxAge = 5 * time.Minute
+
+// CleanStaleTmpFiles removes any mempool.json.tmp file in dataDir that is
+// older than staleTmpMaxAge (5 minutes).  This handles the rare case where an
+// OOM kill interrupted Save() between WriteFile and Rename, leaving an orphaned
+// .tmp file on disk.  The function is intentionally non-fatal: a failure to
+// stat or remove the file is logged and ignored so node startup continues.
+//
+// Call this BEFORE Load() so Load never sees a half-written .tmp as a valid
+// mempool.json (Load reads only the final path, so the .tmp is never read, but
+// cleaning it up prevents indefinite disk accumulation over many crash cycles).
+func CleanStaleTmpFiles(dataDir string, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	tmp := mempoolPath(dataDir) + ".tmp"
+	info, err := os.Stat(tmp)
+	if err != nil {
+		// File does not exist or is not accessible — nothing to clean up.
+		return
+	}
+	age := time.Since(info.ModTime())
+	if age < staleTmpMaxAge {
+		// File is recent enough that it might belong to a concurrent Save().
+		return
+	}
+	if err := os.Remove(tmp); err != nil {
+		log.Warn("mempool: failed to remove stale tmp file (ignoring)",
+			"path", tmp,
+			"age", age.Round(time.Second).String(),
+			"err", err,
+		)
+		return
+	}
+	log.Info("mempool: removed stale tmp file from previous crash",
+		"path", tmp,
+		"age", age.Round(time.Second).String(),
+	)
+}
+
 // Save atomically persists all current mempool entries to dataDir/mempool.json.
 // Entries older than TTL are skipped — they would be evicted on Load anyway.
 // Non-fatal: caller may log and continue on error.
