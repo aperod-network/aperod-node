@@ -858,6 +858,13 @@ func run() error {
                                 db:     db,
                                 log:    log,
                         }
+                        // Default the ban-file path to <data_dir>/p2p_bans.json when
+                        // the operator has not set p2p.ban_file in node.yaml.
+                        // An explicit "-" disables persistence (useful for unit tests).
+                        banFilePath := cfg.P2P.BanFile
+                        if banFilePath == "" {
+                                banFilePath = filepath.Join(cfg.DataDir, "p2p_bans.json")
+                        }
                         host = p2p.NewHost(p2p.Config{
                                 ListenAddr:           tcpAddr,
                                 Bootnodes:            bootnodes,
@@ -874,6 +881,7 @@ func run() error {
                                 BadBlockHeightLead:   cfg.P2P.BadBlockHeightLead,
                                 BadBlockBanThreshold: cfg.P2P.BadBlockBanThreshold,
                                 BadBlockBanDuration:  cfg.P2P.BadBlockBanDuration,
+                                BanFile:              banFilePath,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",

@@ -1,7 +1,11 @@
 package p2p
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -45,6 +49,14 @@ type PeerMgr struct {
 	mu         sync.Mutex
 	banned     map[string]banEntry  // addr → ban
 	dialStates map[string]dialState // addr → backoff state
+
+	// banFile is the path to the JSON persistence file; "" or "-" = disabled.
+	banFile string
+	// persistMu serializes the snapshot+write+rename sequence so that
+	// concurrent Ban/LiftBan calls never interleave their writes.  The mutex
+	// is acquired before the snapshot to guarantee the last writer wins with a
+	// fully-consistent view of the ban map.
+	persistMu sync.Mutex
 }
 
 func newPeerMgr() *PeerMgr {
@@ -52,6 +64,124 @@ func newPeerMgr() *PeerMgr {
 		banned:     make(map[string]banEntry),
 		dialStates: make(map[string]dialState),
 	}
+}
+
+// newPeerMgrWithFile creates a PeerMgr that persists its ban list to banFile
+// on every change.  An empty banFile or "-" disables persistence.
+func newPeerMgrWithFile(banFile string) *PeerMgr {
+	return &PeerMgr{
+		banned:     make(map[string]banEntry),
+		dialStates: make(map[string]dialState),
+		banFile:    banFile,
+	}
+}
+
+// persistedBan is the on-disk representation of one ban entry.
+type persistedBan struct {
+	Addr   string    `json:"addr"`
+	Reason string    `json:"reason"`
+	Until  time.Time `json:"until"`
+}
+
+// persistBans writes the current active ban list to pm.banFile atomically.
+//
+// Concurrency contract:
+//   - persistMu is acquired BEFORE the snapshot so that the serialized order
+//     of writes reflects the serialized order of map mutations.  Two concurrent
+//     Ban/LiftBan calls therefore cannot reorder their writes — the second
+//     always snapshots after the first has finished its rename.
+//   - pm.mu is held only for the duration of the map copy; disk I/O happens
+//     outside pm.mu so the ban-check hot path is never blocked by I/O.
+//
+// A no-op when pm.banFile is empty or "-".
+func (pm *PeerMgr) persistBans() {
+	if pm.banFile == "" || pm.banFile == "-" {
+		return
+	}
+
+	// Serialize the complete snapshot+write+rename so concurrent callers
+	// see a consistent final file — the last mutation's snapshot wins.
+	pm.persistMu.Lock()
+	defer pm.persistMu.Unlock()
+
+	// Snapshot the ban map under pm.mu.  Disk I/O happens after unlock.
+	pm.mu.Lock()
+	now := time.Now()
+	out := make([]persistedBan, 0, len(pm.banned))
+	for addr, e := range pm.banned {
+		if now.Before(e.until) {
+			out = append(out, persistedBan{Addr: addr, Reason: e.reason, Until: e.until})
+		}
+	}
+	pm.mu.Unlock()
+
+	encoded, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		// Should never happen for this simple struct.
+		slog.Default().Error("p2p: ban persistence: marshal failed", "err", err)
+		return
+	}
+
+	// Write to a unique temp file in the same directory so the final rename
+	// is an atomic in-directory move (no cross-device rename).
+	dir := filepath.Dir(pm.banFile)
+	tmp, err := os.CreateTemp(dir, ".p2p_bans_*.tmp")
+	if err != nil {
+		slog.Default().Warn("p2p: ban persistence: create temp file failed",
+			"dir", dir, "err", err)
+		return
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(encoded); err != nil {
+		slog.Default().Warn("p2p: ban persistence: write failed", "file", tmpName, "err", err)
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		slog.Default().Warn("p2p: ban persistence: close failed", "file", tmpName, "err", err)
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, pm.banFile); err != nil {
+		slog.Default().Warn("p2p: ban persistence: rename failed",
+			"tmp", tmpName, "dst", pm.banFile, "err", err)
+		os.Remove(tmpName)
+	}
+}
+
+// LoadBansFromFile restores ban entries persisted by a previous run.
+// Entries that expired while the node was down are silently discarded.
+// A missing file is not an error (first boot).  A corrupt file is logged
+// and treated as empty — the node starts with a clean ban list rather than
+// refusing to start.
+func (pm *PeerMgr) LoadBansFromFile() {
+	if pm.banFile == "" || pm.banFile == "-" {
+		return
+	}
+	data, err := os.ReadFile(pm.banFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Default().Warn("p2p: ban persistence: read failed — starting with empty ban list",
+				"file", pm.banFile, "err", err)
+		}
+		return
+	}
+	var entries []persistedBan
+	if err := json.Unmarshal(data, &entries); err != nil {
+		slog.Default().Warn("p2p: ban persistence: corrupt file — starting with empty ban list",
+			"file", pm.banFile, "err", err)
+		return
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	for _, e := range entries {
+		if now.Before(e.Until) {
+			pm.banned[e.Addr] = banEntry{reason: e.Reason, until: e.Until}
+		}
+	}
+	pm.mu.Unlock()
 }
 
 // CanDial returns true when addr is not banned and its back-off window has
@@ -88,10 +218,13 @@ func (pm *PeerMgr) OnDialSuccess(addr string) {
 }
 
 // Ban adds addr to the ban list for duration d with a human-readable reason.
+// The updated ban list is persisted to disk (when a ban file is configured)
+// after the mutex is released so disk I/O never blocks the caller.
 func (pm *PeerMgr) Ban(addr, reason string, d time.Duration) {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	pm.banned[addr] = banEntry{reason: reason, until: time.Now().Add(d)}
+	pm.mu.Unlock()
+	pm.persistBans()
 }
 
 // IsBanned returns true if addr is currently banned.
@@ -176,12 +309,17 @@ func (pm *PeerMgr) ListBans() []BanInfo {
 
 // LiftBan removes the ban for addr (exact match only).
 // Returns true when a ban was found and removed; false when addr was not banned.
+// The updated ban list is persisted to disk (when a ban file is configured)
+// after the mutex is released.
 func (pm *PeerMgr) LiftBan(addr string) bool {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	if _, ok := pm.banned[addr]; ok {
+	_, ok := pm.banned[addr]
+	if ok {
 		delete(pm.banned, addr)
-		return true
 	}
-	return false
+	pm.mu.Unlock()
+	if ok {
+		pm.persistBans()
+	}
+	return ok
 }

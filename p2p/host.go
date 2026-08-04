@@ -67,6 +67,11 @@ type Config struct {
         // BadBlockBanDuration is how long the ban lasts after the threshold is
         // exceeded.  Default: 24h.
         BadBlockBanDuration time.Duration
+        // BanFile is the path to the JSON file used to persist active bans across
+        // node restarts.  When empty, ban persistence is disabled.  Set to "-" to
+        // explicitly disable persistence.  The file is written atomically (tmp +
+        // rename) so a crash during a write never corrupts the previous snapshot.
+        BanFile string
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -217,7 +222,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 log:            log,
                 peers:          make(map[string]*Peer),
                 done:           make(chan struct{}),
-                mgr:            newPeerMgr(),
+                mgr:            newPeerMgrWithFile(cfg.BanFile),
                 gossip:         NewGossipFilter(),
                 badBlockCounts: make(map[string]badBlockStrike),
                 wlNets:         wlNets,
@@ -247,6 +252,14 @@ func (h *Host) BanPeer(addr, reason string, d time.Duration) {
 
 // Start binds the listener and begins accepting connections.
 func (h *Host) Start() error {
+        // Restore persisted bans from disk before accepting any connections so
+        // previously-banned peers are blocked immediately on restart — without
+        // waiting for them to accumulate 10 strikes again.
+        h.mgr.LoadBansFromFile()
+        if n := h.mgr.BannedCount(); n > 0 {
+                h.log.Info("p2p: restored bans from file", "count", n, "file", h.cfg.BanFile)
+        }
+
         ln, err := net.Listen("tcp", h.cfg.ListenAddr)
         if err != nil {
                 return fmt.Errorf("listen %s: %w", h.cfg.ListenAddr, err)

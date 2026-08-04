@@ -126,6 +126,10 @@ type P2PConfig struct {
 	// BadBlockBanDuration is how long a peer IP is banned after exceeding
 	// BadBlockBanThreshold.  Default: 24h.
 	BadBlockBanDuration time.Duration `yaml:"bad_block_ban_duration"`
+	// BanFile is the path to the JSON file where active P2P bans are
+	// persisted across restarts.  When empty, defaults to
+	// <data_dir>/p2p_bans.json.  Set to "-" to disable persistence.
+	BanFile string `yaml:"ban_file"`
 }
 
 // ConsensusConfig holds PoA settings.
