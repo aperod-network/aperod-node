@@ -489,6 +489,18 @@ else
   fail "Telegram low-disk alert was NOT sent (log: $(cat "$T10_CURL_LOG" 2>/dev/null || echo '<empty>'))"
 fi
 
+if [[ -f "$T10_CURL_LOG" ]] && grep -q "BACKUP_DIR" "$T10_CURL_LOG"; then
+  pass "Telegram low-disk alert contains partition label (BACKUP_DIR (/opt/aperod/backup-tmp))"
+else
+  fail "Telegram low-disk alert does NOT contain partition label (log: $(cat "$T10_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T10_CURL_LOG" ]] && grep -qE '[0-9]+\.[0-9]' "$T10_CURL_LOG"; then
+  pass "Telegram low-disk alert contains numeric free-space value"
+else
+  fail "Telegram low-disk alert does NOT contain numeric free-space value (log: $(cat "$T10_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
 # =============================================================================
 # Test 11: Recovery — after space freed the next run succeeds (skipped_low_disk=0)
 # =============================================================================
