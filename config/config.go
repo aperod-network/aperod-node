@@ -245,6 +245,22 @@ func (c *Config) Validate() error {
 	if c.Pruning.Mode != "" && c.Pruning.Mode != "archive" && c.Pruning.Mode != "light" {
 		return fmt.Errorf("pruning.mode must be \"archive\" or \"light\", got %q", c.Pruning.Mode)
 	}
+	// memory_limit_bytes = 0 means "not set"; negative values panic debug.SetMemoryLimit;
+	// values below 512 MiB cause immediate GC thrash before the UTXO set can load.
+	const minSafeMemoryLimit int64 = 512 * 1024 * 1024 // 512 MiB
+	if c.MemoryLimitBytes < 0 {
+		return fmt.Errorf(
+			"memory_limit_bytes (%d) must not be negative — use 0 to disable or set a value >= %d (512 MiB)",
+			c.MemoryLimitBytes, minSafeMemoryLimit,
+		)
+	}
+	if c.MemoryLimitBytes > 0 && c.MemoryLimitBytes < minSafeMemoryLimit {
+		return fmt.Errorf(
+			"memory_limit_bytes (%d) is below the safe floor of %d (512 MiB) — "+
+				"values this small cause instant GC thrash; set 0 to disable or use >= 512 MiB",
+			c.MemoryLimitBytes, minSafeMemoryLimit,
+		)
+	}
 	if c.Pprof.Enabled {
 		addr := c.Pprof.ListenAddr
 		if addr == "" {
