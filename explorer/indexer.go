@@ -53,9 +53,17 @@ type TxData struct {
         Version     int
 }
 
-// AddrTxData links an address to a transaction output.
+// AddrTxData links a one-time output key to a transaction in address_txs.
+//
+// Address stores the one_time_pub_hex of the output (32-byte compressed Ed25519
+// point encoded as 64 lowercase hex chars).  For transparent / admin-mint
+// outputs the one_time_pub IS the recipient's spend key, so lookups by spend
+// key work directly.  For standard stealth outputs the one_time_pub is an
+// ephemeral Diffie-Hellman key (P = H(rV)G + S) that cannot be linked back to
+// a wallet address without the view key; those rows are useful for TX-by-hash
+// existence checks and output provenance, not wallet-address history.
 type AddrTxData struct {
-        Address     string
+        Address     string // one_time_pub_hex — NOT a wallet address for stealth outputs
         TxHash      string
         BlockHeight uint64
         TxIndex     int
@@ -144,6 +152,12 @@ func (idx *Indexer) migrate(ctx context.Context) error {
                 CREATE INDEX IF NOT EXISTS addr_txs_address_idx ON address_txs (address);
                 CREATE INDEX IF NOT EXISTS addr_txs_tx_idx      ON address_txs (tx_hash);
 
+                -- address_txs.address stores one_time_pub_hex values (not wallet addresses).
+                -- For transparent / admin-mint outputs one_time_pub == spend_pub so wallet
+                -- key lookups find them.  For standard stealth outputs only TX-by-hash
+                -- existence checks and output provenance are supported without the view key.
+                COMMENT ON COLUMN address_txs.address IS 'one_time_pub_hex — 32-byte Ed25519 point as 64 lower-hex chars; equals spend_pub for transparent outputs only';
+
                 CREATE TABLE IF NOT EXISTS chain_stats (
                         id                   INTEGER PRIMARY KEY DEFAULT 1,
                         last_indexed_height  INTEGER NOT NULL DEFAULT -1,
@@ -154,6 +168,28 @@ func (idx *Indexer) migrate(ctx context.Context) error {
                         updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 INSERT INTO chain_stats (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+        `)
+        if err != nil {
+                return err
+        }
+
+        // Idempotent schema migration: rename size_bytes → size for deployments
+        // that ran an earlier version of the indexer which created transactions with
+        // a "size_bytes" column.  The Drizzle-managed schema uses "size", so all
+        // INSERT/SELECT statements reference "size".
+        // This is safe to run on every startup — it is a no-op when size_bytes
+        // does not exist (i.e., the table was created by Drizzle or the current
+        // version of this migrate() function).
+        _, err = idx.db.ExecContext(ctx, `
+                DO $$ BEGIN
+                        IF EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name='transactions' AND column_name='size_bytes'
+                                  AND table_schema=current_schema()
+                        ) THEN
+                                ALTER TABLE transactions RENAME COLUMN size_bytes TO size;
+                        END IF;
+                END $$;
         `)
         return err
 }
