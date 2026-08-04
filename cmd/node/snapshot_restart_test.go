@@ -1848,6 +1848,59 @@ func TestMemoryLimitBytes_ConfigPath_SilencesGOMLEMLIMITWarning(t *testing.T) {
 	}
 }
 
+// TestStrictMemLimit_ConfigPath_Succeeds confirms that --strict-memlimit
+// (strictMode=true) does NOT return an error when memory_limit_bytes is set in
+// node.yaml and GOMEMLIMIT is absent.
+//
+// This is the integration path exercised by run() when an operator sets
+// memory_limit_bytes in their node.yaml and starts the node with
+// --strict-memlimit.  Without the guard in checkGOMLEMLIMIT that short-circuits
+// on configLimitApplied, the node would refuse to start even though a hard
+// memory cap is already in effect via debug.SetMemoryLimit.
+func TestStrictMemLimit_ConfigPath_Succeeds(t *testing.T) {
+	// Ensure GOMEMLIMIT env is absent so the config-path branch is the only
+	// possible source of a memory cap.
+	t.Setenv("GOMEMLIMIT", "")
+
+	// Write a minimal node.yaml with a positive memory_limit_bytes.
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "node.yaml")
+	yamlContent := "memory_limit_bytes: 5368709120\n" // 5 GiB
+	if err := os.WriteFile(yamlPath, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write node.yaml: %v", err)
+	}
+
+	// Load config — exercises config.Load YAML parsing of MemoryLimitBytes.
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if cfg.MemoryLimitBytes != 5368709120 {
+		t.Fatalf("expected MemoryLimitBytes=5368709120, got %d", cfg.MemoryLimitBytes)
+	}
+
+	// Replicate the run() guard logic exactly.
+	// debug.SetMemoryLimit is intentionally NOT called here to avoid
+	// side-effects on the test process; configLimitApplied is derived from the
+	// same condition run() uses.
+	configLimitApplied := cfg.MemoryLimitBytes > 0 && os.Getenv("GOMEMLIMIT") == ""
+	if !configLimitApplied {
+		t.Fatal("expected configLimitApplied=true but it was false")
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// strictMode=true — this is the path exercised by --strict-memlimit.
+	err = checkGOMLEMLIMIT(os.Getenv("GOMEMLIMIT"), configLimitApplied, true, dropin, log)
+	if err != nil {
+		t.Errorf("checkGOMLEMLIMIT returned unexpected error in strict mode with memory_limit_bytes set: %v", err)
+	}
+	if logContainsMsg(&logBuf, "GOMEMLIMIT is not set — node may OOM under load") {
+		t.Errorf("unexpected GOMEMLIMIT warning logged — memory_limit_bytes should silence it even in strict mode\nlog:\n%s", logBuf.String())
+	}
+}
+
 // TestMemoryLimitBytes_Zero_EmitsGOMLEMLIMITWarning confirms that when
 // memory_limit_bytes is absent (zero, the default) and GOMEMLIMIT is also
 // unset, checkGOMLEMLIMIT still emits the OOM warning.
