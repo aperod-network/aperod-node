@@ -1265,3 +1265,271 @@ func TestPhase2Transfer_WithDecoySet_EndToEnd(t *testing.T) {
 	}
 	t.Log("Phase 2 transfer with WithDecoySet passed full TxVerifier ✓")
 }
+
+// TestPhase2Privacy_SurvivesNodeRestart is the authoritative end-to-end test
+// that Phase 2 ring privacy is preserved across a node restart.
+//
+// Problem being guarded: spentPubKeys is in-memory only.  After a restart the
+// pool is empty, so TxBuilder.Build falls back to randomly-generated Phase 1
+// keys for ring decoy slots.  Phase 1 decoys are detectable on-chain (they
+// are never present in the UTXO set), degrading privacy.
+//
+// Fix: ApplyBlockForSpentDecoys rebuilds spentPubKeys by replaying spending
+// blocks against the post-snapshot active UTXO set.  This test proves that
+// after the replay the decoy pool is large enough to fill every ring slot with
+// a real on-chain spent UTXO (FallbackDecoyCount == 0).
+//
+// Lifecycle simulated:
+//
+//  1. Pre-snapshot state: Alice's mint UTXO + 20 victim UTXOs are all active
+//     in the UTXO set.  TakeSnapshot() captures them; spentPubKeys is empty.
+//
+//  2. Post-snapshot spending: 20 blocks each spend one victim UTXO.  These
+//     blocks are NOT applied to the pre-snapshot set — they represent chain
+//     activity that occurred between the snapshot and the restart.
+//
+//  3. Node restart: RestoreFromSnapshot loads the 21 active UTXOs, spentPubKeys
+//     is still empty (as it was at snapshot time).
+//
+//  4. Decoy-pool rebuild: ApplyBlockForSpentDecoys is called for each of the
+//     20 spending blocks.  Each block's ring contains the victim's pub key;
+//     its AmountCommit matches the victim's on-chain commitment.  The method
+//     finds the victim in byPubKey and moves it to spentPubKeys.
+//
+//  5. Phase 2 spend: TxBuilder.Build with WithDecoySet samples 15 decoys from
+//     spentPubKeys (≥ RingSize-1 = 15 entries available).  FallbackDecoyCount
+//     must be 0 — no Phase 1 random keys used.
+//
+//  6. TxVerifier passes the built transaction (C-0 check + full MLSAG + range
+//     proof verification).
+func TestPhase2Privacy_SurvivesNodeRestart(t *testing.T) {
+	const numVictims = 20 // must be ≥ crypto.RingSize-1 = 15 to fill all decoy slots
+
+	// ── 1. Alice's wallet keys and mint UTXO ────────────────────────────────
+	aliceKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys alice: %v", err)
+	}
+	aliceAddr := crypto.AddressFromKeys(crypto.MainnetByte, aliceKeys)
+	_, aliceSpendPub, _, err := crypto.DecodeAddress(aliceAddr)
+	if err != nil {
+		t.Fatalf("DecodeAddress alice: %v", err)
+	}
+
+	const aliceHeight = uint64(1)
+	const aliceAmount = uint64(500_000_000_000) // 5000 APRO
+	mintTx, err := core.BuildMintTx(aliceAddr, aliceAmount, aliceHeight)
+	if err != nil {
+		t.Fatalf("BuildMintTx: %v", err)
+	}
+	mintOut := mintTx.Outputs[0]
+
+	// ── 2. Create 20 victim UTXOs using real wallet key pairs ────────────────
+	// Each victim uses a real crypto.GenerateWalletKeys() pub key so that
+	// ApplyBlockForSpentDecoys can treat it as a valid ring member.  The
+	// commitment is computed with a real blinding factor and a distinct amount
+	// per victim so that each inp.AmountCommit is uniquely matchable.
+	type victimData struct {
+		pub    crypto.Point32
+		commit crypto.Commitment
+		utxo   core.UTXO
+	}
+	victims := make([]victimData, numVictims)
+	for i := range victims {
+		vKeys, kerr := crypto.GenerateWalletKeys()
+		if kerr != nil {
+			t.Fatalf("GenerateWalletKeys victim[%d]: %v", i, kerr)
+		}
+		vBlind, berr := crypto.NewBlindFactor()
+		if berr != nil {
+			t.Fatalf("NewBlindFactor victim[%d]: %v", i, berr)
+		}
+		vAmount := uint64((i+1) * 1_000_000_000) // 10..200 APRO (distinct per victim)
+		vCommit, cerr := crypto.Commit(vAmount, vBlind)
+		if cerr != nil {
+			t.Fatalf("Commit victim[%d]: %v", i, cerr)
+		}
+		victims[i] = victimData{
+			pub:    vKeys.Spend.Public,
+			commit: vCommit,
+			utxo: core.UTXO{
+				TxHash:       crypto.Hash32{byte(i + 10), 0xAA},
+				OutputIndex:  0,
+				OneTimePub:   vKeys.Spend.Public,
+				AmountCommit: vCommit,
+				BlockHeight:  uint64(i + 2),
+			},
+		}
+	}
+
+	// ── 3. Build the pre-snapshot UTXOSet (all 21 UTXOs active) ─────────────
+	// This represents the state captured by TakeSnapshot() before any of the
+	// 20 spending transactions were applied to the chain.
+	preSnapSet := core.NewUTXOSet()
+	preSnapSet.Add(&core.UTXO{
+		TxHash:       mintTx.Hash(),
+		OutputIndex:  0,
+		OneTimePub:   mintOut.OneTimePub,
+		TxPubKey:     mintOut.TxPubKey,
+		AmountCommit: mintOut.AmountCommit,
+		BlockHeight:  aliceHeight,
+	})
+	for i := range victims {
+		v := victims[i]
+		preSnapSet.Add(&core.UTXO{
+			TxHash:       v.utxo.TxHash,
+			OutputIndex:  v.utxo.OutputIndex,
+			OneTimePub:   v.pub,
+			AmountCommit: v.commit,
+			BlockHeight:  v.utxo.BlockHeight,
+		})
+	}
+
+	snapshot := preSnapSet.TakeSnapshot()
+	if len(snapshot.SpentDecoys) != 0 {
+		t.Fatalf("pre-snapshot: expected 0 spent decoys, got %d", len(snapshot.SpentDecoys))
+	}
+	if len(snapshot.ActiveUTXOs) != numVictims+1 {
+		t.Fatalf("pre-snapshot: expected %d active UTXOs, got %d",
+			numVictims+1, len(snapshot.ActiveUTXOs))
+	}
+
+	// ── 4. Build 20 spending blocks (post-snapshot chain activity) ───────────
+	// Each block spends one victim UTXO.  The ring places the victim's pub key
+	// at index 0 and fills remaining slots with unique off-chain byte patterns
+	// (absent from byPubKey — ApplyBlockForSpentDecoys skips them).
+	// inp.AmountCommit == victim.commit allows the method to identify and move
+	// the victim from byPubKey → spentPubKeys during replay.
+	spendingBlocks := make([]*core.Block, numVictims)
+	for i, v := range victims {
+		ring := make([]crypto.Point32, crypto.RingSize)
+		ring[0] = v.pub // real member at index 0 — matches commit below
+		for j := 1; j < crypto.RingSize; j++ {
+			// Off-chain dummy key (not in any UTXO set) — uniquely encoded so
+			// no two blocks accidentally share a ring member.
+			ring[j][0] = byte(200 + i)
+			ring[j][1] = byte(j)
+			ring[j][2] = 0xDE // marker byte distinguishing dummy entries
+		}
+		spendingBlocks[i] = &core.Block{
+			Header: core.BlockHeader{Height: uint64(i + 22)},
+			Txs: []core.Transaction{
+				{
+					Version: core.TxVersionBase,
+					Inputs: []core.RingInput{
+						{
+							Ring:         ring,
+							AmountCommit: v.commit,
+							// KeyImage uses a simple non-zero pattern; not checked by
+							// ApplyBlockForSpentDecoys (only the ring + commit matter).
+							KeyImage: crypto.KeyImage{byte(i + 1), 0xAB},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// ── 5. Simulate node restart: restore from pre-snapshot state ────────────
+	freshUTXOs := core.NewUTXOSet()
+	freshUTXOs.RestoreFromSnapshot(snapshot)
+
+	if freshUTXOs.SpentDecoyCount() != 0 {
+		t.Fatalf("after RestoreFromSnapshot: expected 0 spent decoys, got %d",
+			freshUTXOs.SpentDecoyCount())
+	}
+	// All 20 victims must be in byPubKey (they were active at snapshot time).
+	for i, v := range victims {
+		if freshUTXOs.GetByPubKey(v.pub) == nil {
+			t.Fatalf("after restore: victim[%d] pub not in byPubKey (required for decoy replay)", i)
+		}
+	}
+	t.Log("restart: pre-snapshot state restored — 0 spent decoys, all victims active")
+
+	// ── 6. Replay 20 spending blocks via ApplyBlockForSpentDecoys ───────────
+	// This is the fast decoy-pool rebuild path executed at node startup after
+	// the active UTXO set is loaded from the snapshot.
+	for _, blk := range spendingBlocks {
+		freshUTXOs.ApplyBlockForSpentDecoys(blk)
+	}
+
+	got := freshUTXOs.SpentDecoyCount()
+	if got != numVictims {
+		t.Fatalf("after replay: expected %d spent decoys, got %d (decoy pool under-populated)",
+			numVictims, got)
+	}
+	t.Logf("restart: decoy pool rebuilt — %d entries after replaying %d spending blocks",
+		got, numVictims)
+
+	// Victims must no longer be in byPubKey (moved to spentPubKeys by replay).
+	for i, v := range victims {
+		if freshUTXOs.GetByPubKey(v.pub) != nil {
+			t.Fatalf("after replay: victim[%d] still in byPubKey — should have been moved to spentPubKeys", i)
+		}
+	}
+
+	// ── 7. Recover Alice's blind and build OwnedUTXO ────────────────────────
+	aliceBlind, err := crypto.DeterministicMintBlind(aliceSpendPub, aliceAmount)
+	if err != nil {
+		t.Fatalf("DeterministicMintBlind: %v", err)
+	}
+	aliceHsScalar := crypto.ScalarFromUint64(aliceHeight)
+
+	ownedUTXO := core.OwnedUTXO{
+		UTXO: core.UTXO{
+			TxHash:       mintTx.Hash(),
+			OutputIndex:  0,
+			OneTimePub:   mintOut.OneTimePub,
+			TxPubKey:     mintOut.TxPubKey,
+			AmountCommit: mintOut.AmountCommit,
+		},
+		HsScalar: aliceHsScalar,
+		Amount:   aliceAmount,
+		Blind:    aliceBlind,
+	}
+
+	// ── 8. Build Phase 2 spend with WithDecoySet ─────────────────────────────
+	bobKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys bob: %v", err)
+	}
+	bobAddr := crypto.AddressFromKeys(crypto.MainnetByte, bobKeys)
+
+	const sendAmount = uint64(10_000_000_000) // 100 APRO
+
+	builder := core.NewTxBuilder(
+		aliceKeys.Spend.Private,
+		aliceKeys.View.Private,
+		aliceSpendPub,
+		[]core.OwnedUTXO{ownedUTXO},
+		0,
+	).WithDecoySet(freshUTXOs) // Phase 2: rebuilt post-restart spent decoy pool
+
+	result, err := builder.Build(sendAmount, bobAddr, aliceAddr)
+	if err != nil {
+		t.Fatalf("TxBuilder.Build with WithDecoySet: %v", err)
+	}
+	t.Logf("Phase 2 tx: inputs=%d outputs=%d realDecoys=%d fallback=%d fee=%d",
+		result.InputCount, result.OutputCount,
+		result.RealDecoyCount, result.FallbackDecoyCount, result.TotalFee)
+
+	// ── 9. Core assertion: 0 Phase 1 fallback slots ──────────────────────────
+	// A non-zero FallbackDecoyCount means the decoy pool did not survive the
+	// restart — the ring contains provably fake members that degrade privacy.
+	if result.FallbackDecoyCount != 0 {
+		t.Fatalf("Phase 2 ring privacy degraded after restart: "+
+			"FallbackDecoyCount=%d (want 0); RealDecoyCount=%d",
+			result.FallbackDecoyCount, result.RealDecoyCount)
+	}
+	expectedRealDecoys := crypto.RingSize - 1 // 15 real decoys for 1 input
+	if result.RealDecoyCount != expectedRealDecoys {
+		t.Fatalf("RealDecoyCount=%d, want %d", result.RealDecoyCount, expectedRealDecoys)
+	}
+
+	// ── 10. Full TxVerifier pass ──────────────────────────────────────────────
+	verifier := core.NewTxVerifier(freshUTXOs)
+	if err := verifier.VerifyTx(&result.Tx); err != nil {
+		t.Fatalf("VerifyTx after restart: %v", err)
+	}
+	t.Log("Phase 2 ring privacy survives node restart: 15 real decoys, 0 fallback slots ✓")
+}
