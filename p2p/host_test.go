@@ -3,10 +3,13 @@ package p2p_test
 // Tests for p2p Host: lifecycle, broadcast with 0 peers, full handshake over net.Pipe.
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -622,6 +625,226 @@ func TestHost_ValidatorHeightDivergence_NoBan(t *testing.T) {
 		t.Error("hA's handler received 0 blocks from hB — normal block exchange broken after height-divergence episode")
 	}
 	t.Logf("✓ both validators stayed connected after %d far-ahead blocks; hA handler received %d block(s)", msgCount, gotBlocks)
+}
+
+// ─── Peer whitelist tests ─────────────────────────────────────────────────────
+
+// TestHost_PeerWhitelist_AllowsWhitelistedIP verifies that a connection from
+// an IP that is listed in PeerWhitelist completes the full P2P handshake and
+// is registered as a peer.
+func TestHost_PeerWhitelist_AllowsWhitelistedIP(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "wl-allow-host",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{"127.0.0.1"}, // loopback is explicitly allowed
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	addr := h.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr not exposed — skipping")
+	}
+
+	// Dial from 127.0.0.1 and complete the asymmetric P2P handshake, keeping
+	// the connection open through the PeerCount assertion.  The connection is
+	// closed only after the assertion so the host cannot remove the peer before
+	// we observe it.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// Asymmetric handshake: dialer (us) sends Ping first, host replies Pong.
+	if wErr := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "wl-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); wErr != nil {
+		conn.Close()
+		t.Fatalf("write Ping: %v", wErr)
+	}
+	msgType, _, rErr := p2p.ReadMsg(conn)
+	if rErr != nil || msgType != p2p.MsgPong {
+		conn.Close()
+		t.Fatalf("expected MsgPong from whitelisted host, got type=%v err=%v", msgType, rErr)
+	}
+
+	// Clear the deadline so the host keeps the peer registered while we poll.
+	conn.SetDeadline(time.Time{})
+
+	// Poll until the host registers the peer (handshake completes async).
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if h.PeerCount() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Assert PeerCount while the connection is still open.
+	count := h.PeerCount()
+	conn.Close() // now safe to close
+
+	if count < 1 {
+		t.Errorf("PeerCount = %d after whitelisted connection; want ≥ 1 — whitelist may be incorrectly blocking loopback", count)
+	} else {
+		t.Logf("✓ whitelisted IP accepted and registered as peer (PeerCount=%d)", count)
+	}
+}
+
+// TestHost_PeerWhitelist_BlocksNonWhitelistedIP verifies that a connection
+// from an IP that is NOT in PeerWhitelist is closed immediately — before any
+// P2P handshake bytes are exchanged.
+func TestHost_PeerWhitelist_BlocksNonWhitelistedIP(t *testing.T) {
+	// Whitelist a private range that the loopback (127.0.0.1) is not part of.
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "wl-block-host",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{"192.168.99.0/24"}, // loopback not in this range
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	addr := h.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr not exposed — skipping")
+	}
+
+	// Dial from loopback — the host must close the connection immediately.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a Ping so the host receives at least one byte and still must close,
+	// ruling out the case where the host simply ignores silent connections.
+	// We intentionally do not check the write error — the host may already have
+	// closed the conn by the time we write.
+	_ = p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "blocked-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	})
+
+	// The host's acceptLoop closes the connection before any handshake, so a
+	// read must return a definitive close error (EOF or connection reset) within
+	// the deadline — NOT a timeout.  A timeout would mean the host left the
+	// connection open, which is the exact regression we are guarding against.
+	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1)
+	n, readErr := conn.Read(buf)
+	if n > 0 {
+		t.Errorf("non-whitelisted connection was NOT closed: host sent %d byte(s)", n)
+	} else if readErr == nil {
+		t.Error("non-whitelisted connection was NOT closed: Read returned nil error (connection still open)")
+	} else {
+		// Distinguish a deadline timeout (regression) from a genuine close.
+		var netErr net.Error
+		if errors.As(readErr, &netErr) && netErr.Timeout() {
+			t.Errorf("non-whitelisted connection timed out instead of being closed: the host left the connection open (whitelist enforcement regression)")
+		} else if errors.Is(readErr, io.EOF) ||
+			strings.Contains(readErr.Error(), "connection reset") ||
+			strings.Contains(readErr.Error(), "use of closed network connection") ||
+			strings.Contains(readErr.Error(), "broken pipe") {
+			t.Logf("✓ non-whitelisted IP's connection definitively closed before handshake (err: %v)", readErr)
+		} else {
+			// Any other non-timeout error also indicates the connection was closed.
+			t.Logf("✓ non-whitelisted IP's connection closed (err: %v)", readErr)
+		}
+	}
+
+	// The host must not have registered any peer.
+	if h.PeerCount() != 0 {
+		t.Errorf("PeerCount = %d; want 0 — non-whitelisted peer was incorrectly registered", h.PeerCount())
+	}
+}
+
+// TestHost_PeerWhitelist_OutboundDialUnaffected verifies that a host with a
+// restrictive PeerWhitelist (that would reject an inbound 127.0.0.1 connection)
+// can still successfully complete an *outbound* dial-out, because the whitelist
+// only gates acceptLoop, not dialPeer.
+func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
+	// The host's whitelist deliberately excludes 127.0.0.1 so any inbound
+	// connection from loopback would be rejected.  Outbound dials must still
+	// work regardless.
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "wl-outbound-host",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{"10.0.0.0/8"}, // 127.0.0.1 not included
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	// Set up a raw TCP server that acts as a trusted outbound target.
+	// It reads the MsgPing sent by the host and replies with MsgPong so the
+	// asymmetric handshake completes and the peer is registered.
+	peerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("peer listener: %v", err)
+	}
+	defer peerLn.Close()
+
+	peerConnected := make(chan struct{})
+	go func() {
+		conn, acceptErr := peerLn.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		close(peerConnected) // signal: TCP connection received
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		// Read Ping from the host (outbound dialer goes first).
+		msgType, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || msgType != p2p.MsgPing {
+			return
+		}
+		// Reply with Pong to complete the handshake.
+		_ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "trusted-peer", Height: 0, UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		})
+		// Keep connection open so the host registers the peer.
+		time.Sleep(2 * time.Second)
+	}()
+
+	// Trigger an outbound dial despite the restrictive whitelist.
+	h.DialPeer(peerLn.Addr().String())
+
+	// Wait for the TCP-level connection to arrive at the peer server.
+	select {
+	case <-peerConnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outbound dial did not reach the peer server within 2 s — whitelist may be incorrectly blocking outbound connections")
+	}
+
+	// Give the handshake goroutine time to register the peer.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if h.PeerCount() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if h.PeerCount() < 1 {
+		t.Errorf("PeerCount = %d after outbound dial; want ≥ 1 — whitelist incorrectly blocked outbound connection", h.PeerCount())
+	} else {
+		t.Logf("✓ outbound dial succeeded despite restrictive inbound whitelist (PeerCount=%d)", h.PeerCount())
+	}
 }
 
 // TestHost_DialPeer_BackoffAfterHandshakeDrop verifies that when an outbound
