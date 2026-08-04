@@ -132,11 +132,17 @@ run_backup_fail() {
   local fake_gpg
   fake_gpg=$(make_fake_bin "gpg" "$gpg_log" 0)
 
+  # Provide a writable backup dir so the new mkdir guard passes and the
+  # script reaches the pg_dump stage (where the sudo stub fails as intended).
+  local backup_dir="$run_dir/backup-tmp"
+  mkdir -p "$backup_dir"
+
   local exit_code=0
   APEROD_BACKUP_PASSWORD="test-password-123" \
     DATA_DIR="$run_dir/data" \
     APEROD_TEXTFILE_DIR="$metrics_dir" \
     APEROD_HISTORY_LOG="$run_dir/backup.log" \
+    APEROD_BACKUP_DIR_OVERRIDE="$backup_dir" \
     TELEGRAM_BOT_TOKEN="$bot_token" \
     ADMIN_TELEGRAM_CHAT_ID="$chat_id" \
     PATH="$fake_curl_dir:$fake_sudo:$fake_rclone:$fake_gpg:$PATH" \
@@ -1178,6 +1184,115 @@ if [[ -f "$T17_PROM" ]] && grep -q "^aperod_backup_last_success 1" "$T17_PROM"; 
   pass "Prometheus: aperod_backup_last_success=1 after NODE_DATA_DIR recovery run"
 else
   fail "Prometheus: aperod_backup_last_success=1 NOT found after NODE_DATA_DIR recovery run"
+fi
+
+# =============================================================================
+# Test 18: mkdir -p BACKUP_DIR fails → exit 0, skipped metric with backup_dir_unavailable
+# =============================================================================
+section "Test 18: mkdir BACKUP_DIR failure → exit 0 + aperod_backup_skipped_low_disk=1"
+
+T18_DIR=$(mktemp -d "$TMPDIR_TEST/run-t18-XXXXXXXX")
+make_settings_json "$T18_DIR/data"
+mkdir -p "$T18_DIR/metrics"
+
+# Use a sentinel keyword in the backup dir path so the mkdir stub can identify
+# exactly which mkdir call to fail without interfering with other mkdir calls
+# (metrics dir, history log dir, etc.).
+T18_BACKUP_DIR="$T18_DIR/FAILMKDIR/aperod_backups_test"
+
+# Build a mkdir stub that:
+#   - fails (exit 1) when the last argument contains "FAILMKDIR"
+#   - delegates everything else to the real /bin/mkdir
+T18_FAKE_MKDIR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-mkdir-t18-XXXXXXXX")
+cat >"$T18_FAKE_MKDIR_DIR/mkdir" <<STUB
+#!/usr/bin/env bash
+last_arg="\${@: -1}"
+if [[ "\$last_arg" == *"FAILMKDIR"* ]]; then
+  exit 1
+fi
+/bin/mkdir "\$@"
+STUB
+chmod +x "$T18_FAKE_MKDIR_DIR/mkdir"
+
+# Stub curl so we can check Telegram (no alerts expected since status is "skipped")
+T18_CURL_LOG="$T18_DIR/curl.log"
+T18_FAKE_CURL=$(make_fake_curl "$T18_CURL_LOG")
+
+# Stub sudo/rclone/gpg/tar/df — none should be reached before the mkdir guard fires
+T18_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t18-XXXXXXXX")
+cat >"$T18_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T18_FAKE_SUDO_DIR/sudo"
+
+T18_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t18-XXXXXXXX")
+cat >"$T18_FAKE_DF_DIR/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "20971520"
+exit 0
+STUB
+chmod +x "$T18_FAKE_DF_DIR/df"
+
+T18_RCLONE=$(make_fake_bin "rclone" "$T18_DIR/rclone.log" 0)
+T18_GPG=$(make_fake_bin "gpg"    "$T18_DIR/gpg.log"    0)
+T18_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t18-XXXXXXXX")
+cat >"$T18_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T18_FAKE_TAR_DIR/tar"
+
+T18_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t18" \
+  DATA_DIR="$T18_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T18_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T18_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T18_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="" \
+  ADMIN_TELEGRAM_CHAT_ID="" \
+  PATH="$T18_FAKE_MKDIR_DIR:$T18_FAKE_CURL:$T18_FAKE_DF_DIR:$T18_FAKE_SUDO_DIR:$T18_RCLONE:$T18_GPG:$T18_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T18_EXIT=$?
+[[ "$T18_EXIT" -eq 99 ]] && T18_EXIT=0  # script returned 0
+
+if [[ "$T18_EXIT" -eq 0 ]]; then
+  pass "mkdir BACKUP_DIR failure: script exits 0 (skipped, not failed)"
+else
+  fail "mkdir BACKUP_DIR failure: script exited $T18_EXIT — expected 0"
+fi
+
+T18_PROM="$T18_DIR/metrics/aperod_backup.prom"
+if [[ -f "$T18_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T18_PROM"; then
+  pass "Prometheus: aperod_backup_skipped_low_disk=1 written when backup dir is unavailable"
+else
+  fail "Prometheus: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T18_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T18_PROM" ]] && grep -q "^aperod_backup_last_success 0" "$T18_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=0 when backup dir is unavailable"
+else
+  fail "Prometheus: aperod_backup_last_success=0 NOT found (file: $(cat "$T18_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+T18_HIST="$T18_DIR/backup.log"
+if [[ -f "$T18_HIST" ]] && grep -q '"skipReason":"backup_dir_unavailable"' "$T18_HIST"; then
+  pass "History log records skipReason=backup_dir_unavailable"
+else
+  fail "History log does NOT record skipReason=backup_dir_unavailable (log: $(cat "$T18_HIST" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T18_HIST" ]] && grep -q '"status":"skipped"' "$T18_HIST"; then
+  pass "History log records status=skipped (not fail)"
+else
+  fail "History log does NOT record status=skipped (log: $(cat "$T18_HIST" 2>/dev/null || echo '<missing>'))"
+fi
+
+# Confirm Telegram failure alert was NOT sent (it's a skip, not a failure)
+if [[ ! -f "$T18_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T18_CURL_LOG" 2>/dev/null; then
+  pass "Telegram failure alert NOT sent on backup_dir_unavailable skip (correct — it is a skip)"
+else
+  fail "Telegram failure alert was unexpectedly sent on backup_dir_unavailable skip"
 fi
 
 # =============================================================================

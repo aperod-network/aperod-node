@@ -233,7 +233,23 @@ _cleanup_stale_backup_dirs() {
 }
 _cleanup_stale_backup_dirs
 
-mkdir -p "$BACKUP_DIR"
+# ── Guard: BACKUP_DIR must be creatable ───────────────────────────────────────
+# With set -euo pipefail a failed mkdir would fire the EXIT trap with status
+# "fail" — giving Prometheus a spurious failure metric and Telegram a noisy alert
+# with no actionable context.  Catch it explicitly so admins see a clear "skipped"
+# with reason backup_dir_unavailable instead.
+if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
+  echo "ОШИБКА: не удалось создать директорию для бэкапа: ${BACKUP_DIR}"
+  echo "  Возможные причины: неверные права доступа к $(dirname "$BACKUP_DIR")"
+  echo "  или отсутствует родительская директория."
+  echo "  Бэкап пропущен (причина: backup_dir_unavailable)."
+  _BACKUP_FINAL_STATUS="skipped"
+  _BACKUP_SKIP_REASON="backup_dir_unavailable"
+  _BACKUP_DISK_PATH="${BACKUP_DIR}"
+  _BACKUP_DISK_FREE_GB="N/A"
+  write_metrics 0 1
+  exit 0
+fi
 
 # ── Pre-flight: disk space check (5 GB minimum on each relevant filesystem) ──
 # If either BACKUP_DIR or NODE_DATA_DIR has less than 5 GB free, send a
