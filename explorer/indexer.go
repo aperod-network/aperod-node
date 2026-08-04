@@ -126,7 +126,7 @@ func (idx *Indexer) migrate(ctx context.Context) error {
                         inputs       INTEGER NOT NULL DEFAULT 0,
                         outputs      INTEGER NOT NULL DEFAULT 1,
                         fee          BIGINT  NOT NULL DEFAULT 0,
-                        size_bytes   INTEGER NOT NULL DEFAULT 0,
+                        size         INTEGER NOT NULL DEFAULT 0,
                         version      INTEGER NOT NULL DEFAULT 1,
                         indexed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -188,7 +188,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
         // Insert transactions
         for _, tx := range txs {
                 _, err = dbTx.ExecContext(ctx, `
-                        INSERT INTO transactions (hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size_bytes, version)
+                        INSERT INTO transactions (hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size, version)
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                         ON CONFLICT (hash) DO NOTHING`,
                         tx.Hash, tx.BlockHash, int64(tx.BlockHeight), tx.TxIndex,
@@ -354,7 +354,7 @@ func (idx *Indexer) GetTxByHash(hash string) (*TxRow, error) {
 
         r := &TxRow{}
         err := idx.db.QueryRowContext(ctx,
-                `SELECT hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size_bytes, version
+                `SELECT hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size, version
                  FROM transactions WHERE hash=$1`, hash,
         ).Scan(&r.Hash, &r.BlockHash, &r.BlockHeight, &r.TxIndex, &r.IsCoinbase,
                 &r.Inputs, &r.Outputs, &r.Fee, &r.SizeBytes, &r.Version)
