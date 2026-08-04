@@ -30,13 +30,22 @@ type walletSendParams struct {
 }
 
 type walletSendResult struct {
-        TxHash          string `json:"tx_hash"`
-        ChangeAmtNAPR   uint64 `json:"change_amount_napr"`
-        ChangeOutIdx    int    `json:"change_out_idx"`
-        ChangeBlindHex  string `json:"change_blind_hex"`
-        PayBlindHex     string `json:"payment_blind_hex"`
-        PayOutIdx       int    `json:"payment_out_idx"`
-        PayAmtNAPR      uint64 `json:"payment_amount_napr"`
+        TxHash             string `json:"tx_hash"`
+        ChangeAmtNAPR      uint64 `json:"change_amount_napr"`
+        ChangeOutIdx       int    `json:"change_out_idx"`
+        ChangeBlindHex     string `json:"change_blind_hex"`
+        PayBlindHex        string `json:"payment_blind_hex"`
+        PayOutIdx          int    `json:"payment_out_idx"`
+        PayAmtNAPR         uint64 `json:"payment_amount_napr"`
+        // DecoyCount is the number of ring slots filled with real on-chain decoy
+        // UTXOs.  A value below (RingSize-1)×InputCount means some slots used
+        // randomly-generated Phase 1 fallback keys, which degrades privacy.
+        DecoyCount         int    `json:"decoy_count"`
+        // FallbackDecoyCount is the number of ring slots that could not be filled
+        // with real decoys and fell back to randomly-generated Phase 1 keys.
+        // Zero means full Phase 2 privacy.  Non-zero means the ring contains
+        // provably fake members that break anonymity.
+        FallbackDecoyCount int    `json:"fallback_decoy_count"`
 }
 
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
@@ -247,6 +256,15 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         if err != nil {
                 return nil, fmt.Errorf("build: %w", err)
         }
+        if result.FallbackDecoyCount > 0 {
+                s.log.Warn("privacy degraded: ring contains Phase 1 fallback decoys",
+                        "fallback_decoy_count", result.FallbackDecoyCount,
+                        "real_decoy_count", result.RealDecoyCount,
+                        "input_count", result.InputCount,
+                        "ring_size", "16",
+                        "reason", "spent-UTXO pool has fewer real decoys than required",
+                )
+        }
 
         // ── 6. Cryptographic verification ────────────────────────────────────────
         // Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
@@ -268,13 +286,15 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         }
 
         return walletSendResult{
-                TxHash:         fmt.Sprintf("%x", txHash[:]),
-                ChangeAmtNAPR:  result.ChangeAmount,
-                ChangeOutIdx:   result.ChangeOutIdx,
-                ChangeBlindHex: changeBlindHex,
-                PayBlindHex:    hex.EncodeToString(result.PayBlind[:]),
-                PayOutIdx:      result.PayOutIdx,
-                PayAmtNAPR:     p.AmountNAPR,
+                TxHash:             fmt.Sprintf("%x", txHash[:]),
+                ChangeAmtNAPR:      result.ChangeAmount,
+                ChangeOutIdx:       result.ChangeOutIdx,
+                ChangeBlindHex:     changeBlindHex,
+                PayBlindHex:        hex.EncodeToString(result.PayBlind[:]),
+                PayOutIdx:          result.PayOutIdx,
+                PayAmtNAPR:         p.AmountNAPR,
+                DecoyCount:         result.RealDecoyCount,
+                FallbackDecoyCount: result.FallbackDecoyCount,
         }, nil
 }
 

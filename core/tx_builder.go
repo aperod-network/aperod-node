@@ -74,6 +74,14 @@ type BuildResult struct {
         PayBlind  crypto.BlindFactor
         // PayOutIdx is the index of the payment output within Tx.Outputs (always 0).
         PayOutIdx int
+        // RealDecoyCount is the total number of ring slots filled with real
+        // on-chain UTXOs (Phase 2 decoys) across all inputs.
+        RealDecoyCount int
+        // FallbackDecoyCount is the total number of ring slots that could not be
+        // filled with real decoys and fell back to randomly-generated Phase 1 keys.
+        // A non-zero value means privacy is degraded: the ring contains provably
+        // fake members that can be distinguished from real UTXOs.
+        FallbackDecoyCount int
 }
 
 // Build constructs a signed RingCT transaction.
@@ -233,6 +241,8 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         inputs := make([]RingInput, len(selected))
         inputPrivKeys := make([]crypto.Scalar32, len(selected))
         inputRealIdxs := make([]int, len(selected))
+        var totalFallbackDecoys int
+        var totalRealDecoys int
 
         for i, u := range selected {
                 // one_time_priv = Hs + spend_priv
@@ -253,11 +263,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                         ringDecoys = allDecoys[start:end]
                 }
 
-                ring, realIdx, err := txBuildRing(u.OneTimePub, ringDecoys)
+                ring, realIdx, fallbacks, err := txBuildRing(u.OneTimePub, ringDecoys)
                 if err != nil {
                         return nil, fmt.Errorf("build ring [%d]: %w", i, err)
                 }
                 inputRealIdxs[i] = realIdx
+                totalFallbackDecoys += fallbacks
+                totalRealDecoys += (crypto.RingSize - 1) - fallbacks
 
                 ki, err := crypto.ComputeKeyImage(oneTimePriv, u.OneTimePub)
                 if err != nil {
@@ -307,15 +319,17 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         }
 
         return &BuildResult{
-                Tx:           tx,
-                ChangeAmount: changeAmount,
-                TotalFee:     estimatedFee,
-                InputCount:   len(inputs),
-                OutputCount:  len(outputs),
-                ChangeBlind:  changeBlindResult,
-                ChangeOutIdx: changeOutIdx,
-                PayBlind:     payBlindResult,
-                PayOutIdx:    0,
+                Tx:                 tx,
+                ChangeAmount:       changeAmount,
+                TotalFee:           estimatedFee,
+                InputCount:         len(inputs),
+                OutputCount:        len(outputs),
+                ChangeBlind:        changeBlindResult,
+                ChangeOutIdx:       changeOutIdx,
+                PayBlind:           payBlindResult,
+                PayOutIdx:          0,
+                RealDecoyCount:     totalRealDecoys,
+                FallbackDecoyCount: totalFallbackDecoys,
         }, nil
 }
 
@@ -392,11 +406,16 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
 // filled with randomly-generated keys (Phase 1 fallback for that slot).
 //
 // Phase 1 (decoys nil or empty): all decoy slots use randomly-generated keys.
-func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMember, int, error) {
+//
+// Returns (ring, realIdx, fallbackCount, error) where fallbackCount is the number
+// of slots that could not be filled with a real decoy and used a random key instead.
+// A non-zero fallbackCount means privacy is degraded for this ring.
+func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMember, int, int, error) {
         realIdx := int(realPub[0]) % crypto.RingSize
         ring := make([]crypto.RingMember, crypto.RingSize)
 
         di := 0
+        fallbackCount := 0
         for i := range ring {
                 if i == realIdx {
                         continue
@@ -408,13 +427,14 @@ func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMembe
                         // Phase 1 fallback: not enough real decoys — generate a random key.
                         fake, err := crypto.GenerateWalletKeys()
                         if err != nil {
-                                return nil, 0, err
+                                return nil, 0, 0, err
                         }
                         ring[i] = fake.Spend.Public
+                        fallbackCount++
                 }
         }
         ring[realIdx] = realPub
-        return ring, realIdx, nil
+        return ring, realIdx, fallbackCount, nil
 }
 
 // Estimated serialized byte sizes used for fee calculation.
