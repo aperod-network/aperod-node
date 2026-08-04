@@ -1901,6 +1901,174 @@ func TestStrictMemLimit_ConfigPath_Succeeds(t *testing.T) {
 	}
 }
 
+// ─── Test N: shutdown ordering regression ─────────────────────────────────────
+
+// TestShutdownSnapshotMatchesFinalDBTip is a regression test for the shutdown
+// ordering fix: close(stop) + <-engineDone BEFORE db.GetTip() + saveSnapshot.
+//
+// # The race
+//
+// Before the fix the shutdown path read the DB tip first:
+//
+//	db.GetTip()             → returns (hash H, height H)
+//	[engine produces H+1]   ← race window
+//	saveStartupSnapshot(H)  → snapshot at H, but DB tip is already H+1
+//
+// On the next restart the node looked for snapshot-v2-(H+1).json.gz, found
+// nothing, and fell back to a multi-hour block scan.
+//
+// # The fix
+//
+//	close(stop)             → engine receives shutdown signal
+//	<-engineDone            → wait until engine.Run() has fully returned
+//	db.GetTip()             → reads the final, stable tip (H+1)
+//	saveStartupSnapshot(H+1)→ snapshot height == DB tip height guaranteed
+//
+// # What this test does
+//
+// It uses performShutdown (the production function from main.go) with a
+// controlled fake engine that writes block H+1 to the DB AFTER receiving the
+// shutdown signal — exactly the scenario that caused the race.
+//
+// With the correct ordering (close(stop) → <-engineDone → GetTip):
+//   - performShutdown signals stop; fake engine writes block 6 and closes engineDone
+//   - performShutdown waits for engineDone, reads DB tip = 6, saves snapshot at 6
+//   - Next startup loads snapshot-v2-6.json.gz → fast path succeeds ✓
+//
+// If the ordering were reverted (GetTip before stop+wait):
+//   - performShutdown reads DB tip = 5 before the fake engine runs
+//   - Snapshot saved at 5; DB tip = 6 after the engine writes its final block
+//   - Next startup looks for snapshot-v2-6.json.gz, finds nothing, falls back
+//     to a block scan → this test fails ✗
+func TestShutdownSnapshotMatchesFinalDBTip(t *testing.T) {
+	dir := t.TempDir()
+	db, blocks := buildChainInStore(t, dir, 5) // genesis + 5 blocks, tip at H=5
+
+	tip5 := blocks[5]
+	hash5 := tip5.Hash()
+
+	// ── Build a real UTXOSet and ValidatorRegistry ──────────────────────────
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	utxos := core.NewUTXOSet()
+	for _, b := range blocks {
+		if err := utxos.ApplyBlock(b); err != nil {
+			t.Fatalf("ApplyBlock h=%d: %v", b.Header.Height, err)
+		}
+	}
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, core.MinStakeNAPR*10)
+
+	// ── Fake engine ─────────────────────────────────────────────────────────
+	// Simulates a real consensus engine that may be finishing a block when
+	// the shutdown signal arrives.
+	//
+	// Behaviour: upon receiving <-stop, it writes block H+1=6 to the DB (the
+	// "in-flight" block), then closes engineDone — just as the real engine.Run()
+	// finishes its current tick and returns after close(stop).
+	stop := make(chan struct{})
+	engineDone := make(chan struct{})
+
+	go func() {
+		defer close(engineDone)
+		<-stop // wait for shutdown signal from performShutdown
+
+		// Write the in-flight block (H+1=6) to the DB, mirroring OnBlockProduced.
+		hdr6 := core.BlockHeader{
+			Height:       6,
+			PrevHash:     hash5,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(nil),
+		}
+		if signErr := hdr6.Sign(priv); signErr != nil {
+			t.Errorf("fake engine: Sign block 6: %v", signErr)
+			return
+		}
+		blk6 := &core.Block{Header: hdr6}
+		raw6, marshalErr := json.Marshal(blk6)
+		if marshalErr != nil {
+			t.Errorf("fake engine: Marshal block 6: %v", marshalErr)
+			return
+		}
+		h6 := blk6.Hash()
+		if putErr := db.PutRawBlock(h6, 6, raw6); putErr != nil {
+			t.Errorf("fake engine: PutRawBlock block 6: %v", putErr)
+			return
+		}
+		if tipErr := db.PutTip(h6, 6); tipErr != nil {
+			t.Errorf("fake engine: PutTip block 6: %v", tipErr)
+		}
+	}()
+
+	// ── Call the production shutdown function ────────────────────────────────
+	// performShutdown (main.go) enforces the correct ordering:
+	//   1. close(stop)   → fake engine wakes up, writes block 6, closes engineDone
+	//   2. <-engineDone  → waits for fake engine to finish
+	//   3. db.GetTip()   → reads the final tip = 6
+	//   4. saveSnapshot  → snapshot written at height 6
+	var shutLog bytes.Buffer
+	performShutdown(stop, engineDone, db, utxos, registry, dir, newCaptureLogger(&shutLog))
+
+	// ── Assert: snapshot height == final DB tip (6, not 5) ──────────────────
+	dbTipHash, dbTipHeight, dbErr := db.GetTip()
+	if dbErr != nil {
+		t.Fatalf("db.GetTip after shutdown: %v", dbErr)
+	}
+	if dbTipHeight != 6 {
+		t.Fatalf("expected DB tip height 6 (fake engine wrote it); got %d", dbTipHeight)
+	}
+	dbTipHashHex := fmt.Sprintf("%x", dbTipHash[:])
+
+	// The snapshot must be at height 6.
+	// Under the pre-fix ordering the snapshot would be at height 5 (read before
+	// the engine committed its final block), making this call return an error.
+	loaded, snapLoadErr := loadStartupSnapshot(dir, dbTipHeight, dbTipHashHex)
+	if snapLoadErr != nil {
+		t.Errorf("snapshot must be at final DB tip (height %d) — load failed: %v\n"+
+			"hint: if snapshot-v2-5.json.gz exists but not snapshot-v2-6.json.gz, the "+
+			"shutdown read the tip before the engine quiesced (pre-fix race restored)",
+			dbTipHeight, snapLoadErr)
+		t.Logf("shutdown log:\n%s", shutLog.String())
+	}
+	if loaded != nil && loaded.TipHeight != dbTipHeight {
+		t.Errorf("snapshot TipHeight=%d != DB tip height=%d — shutdown ordering race detected",
+			loaded.TipHeight, dbTipHeight)
+	}
+
+	// ── Assert: next restart logs fast path, not block scan ─────────────────
+	var restartLog bytes.Buffer
+	log2 := newCaptureLogger(&restartLog)
+	snapLoaded := false
+	loaded2, loadErr2 := loadStartupSnapshotWithFallback(dir, dbTipHeight, dbTipHashHex, log2)
+	if loadErr2 == nil {
+		snapLoaded = true
+		log2.Info("startup fast path complete — snapshot loaded",
+			"tip_height", dbTipHeight,
+			"active_utxos", len(loaded2.UTXOs.ActiveUTXOs),
+		)
+	}
+	if !snapLoaded {
+		log2.Info("running startup block scan",
+			"tip_height", dbTipHeight,
+			"ki_from_index", false,
+			"heap_sys_mib_before", uint64(0),
+		)
+	}
+
+	if !logContainsMsg(&restartLog, "startup fast path complete — snapshot loaded") {
+		t.Error("node must take the fast path on restart after a correct shutdown — block scan triggered instead")
+		t.Logf("restart log:\n%s", restartLog.String())
+	}
+	if logContainsMsg(&restartLog, "running startup block scan") {
+		t.Error("block scan must NOT be triggered after a clean shutdown with correct ordering")
+		t.Logf("restart log:\n%s", restartLog.String())
+	}
+}
+
 // TestMemoryLimitBytes_Zero_EmitsGOMLEMLIMITWarning confirms that when
 // memory_limit_bytes is absent (zero, the default) and GOMEMLIMIT is also
 // unset, checkGOMLEMLIMIT still emits the OOM warning.

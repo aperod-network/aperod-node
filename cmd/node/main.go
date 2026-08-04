@@ -1001,43 +1001,7 @@ func run() error {
 
         log.Info("shutting down...")
 
-        // Stop the consensus engine FIRST, then save the snapshot.
-        //
-        // Critical ordering: if we read db.GetTip() before close(stop) the engine
-        // can produce block H+1 between the read and the rename, leaving a snapshot
-        // at height H while the DB tip says H+1.  The next startup looks for
-        // snapshot-v2-{H+1}.json.gz, finds nothing, and falls back to a full block
-        // scan (hours of 100 % CPU).  Closing stop and waiting for engineDone
-        // guarantees no further blocks are written before we capture the final tip.
-        close(stop)
-        <-engineDone // wait until engine.Run has fully returned
-
-        // Save a snapshot at the final tip so the next restart is instant.
-        if registry != nil {
-                if shutTipHash, shutTipHeight, stErr := db.GetTip(); stErr == nil && shutTipHeight > 0 {
-                        shutTxTotal, _ := db.LoadTxTotal()
-                        shutSnap := startupSnapshot{
-                                Version:    snapVersion,
-                                TipHeight:  shutTipHeight,
-                                TipHashHex: fmt.Sprintf("%x", shutTipHash[:]),
-                                TxTotal:    shutTxTotal,
-                                UTXOs:      utxos.TakeSnapshot(),
-                                Registry:   registry.TakeSnapshot(),
-                        }
-                        if saveErr := saveStartupSnapshot(cfg.DataDir, shutSnap); saveErr != nil {
-                                log.Warn("shutdown: failed to save snapshot", "err", saveErr)
-                        } else {
-                                log.Info("shutdown: snapshot saved", "tip_height", shutTipHeight)
-                                deleteOldSnapshots(cfg.DataDir, shutTipHeight)
-                                // Persist the active UTXO count keyed by tip hash so the
-                                // next restart's divergence check has an active-only reference
-                                // count specific to this snapshot.
-                                if metaErr := db.StoreActiveUTXOCount(shutSnap.TipHashHex, len(shutSnap.UTXOs.ActiveUTXOs)); metaErr != nil {
-                                        log.Warn("shutdown: failed to persist active_utxo_count metadata", "err", metaErr)
-                                }
-                        }
-                }
-        }
+        performShutdown(stop, engineDone, db, utxos, registry, cfg.DataDir, log)
 
         // Persist pending mempool transactions so they survive the restart.
         if mpErr := mempool.Save(cfg.DataDir); mpErr != nil {
@@ -1047,6 +1011,83 @@ func run() error {
         }
 
         return nil
+}
+
+// performShutdown stops the consensus engine and saves a startup snapshot so
+// the next restart can skip the full block scan.
+//
+// Ordering guarantee (MUST NOT be changed):
+//
+//  1. close(stop)   — signal engine.Run to return; no new blocks can start
+//  2. <-engineDone  — wait until engine.Run has fully returned and written its
+//                     last block to the DB
+//  3. db.GetTip()   — read the final, stable tip; safe because the engine is
+//                     quiescent
+//  4. save snapshot — snapshot height == DB tip height is now guaranteed
+//
+// If the ordering were reversed (GetTip before close+wait), the engine could
+// produce block H+1 between GetTip and the snapshot rename, writing a snapshot
+// at height H while the DB tip advances to H+1.  The next startup would find no
+// snapshot for H+1 and fall back to a multi-hour block scan.
+//
+// The function is extracted from run() so it can be tested in isolation with a
+// controllable fake engine (see snapshot_restart_test.go).
+func performShutdown(
+        stop chan struct{},
+        engineDone <-chan struct{},
+        db *store.DB,
+        utxos *core.UTXOSet,
+        registry *core.ValidatorRegistry,
+        dataDir string,
+        log *slog.Logger,
+) {
+        // Step 1 + 2: stop the engine and wait for full quiescence.
+        // GetTip MUST NOT be called before this point.
+        close(stop)
+        <-engineDone
+
+        // Step 3 + 4: read the final tip and save the snapshot.
+        saveShutdownSnapshot(db, utxos, registry, dataDir, log)
+}
+
+// saveShutdownSnapshot reads the current DB tip and writes a gzip-compressed
+// startup snapshot to dataDir.  The caller MUST have already stopped the engine
+// (close(stop) + <-engineDone) before calling this function; see performShutdown.
+func saveShutdownSnapshot(
+        db *store.DB,
+        utxos *core.UTXOSet,
+        registry *core.ValidatorRegistry,
+        dataDir string,
+        log *slog.Logger,
+) {
+        if registry == nil {
+                return
+        }
+        shutTipHash, shutTipHeight, stErr := db.GetTip()
+        if stErr != nil || shutTipHeight == 0 {
+                return
+        }
+        shutTxTotal, _ := db.LoadTxTotal()
+        shutSnap := startupSnapshot{
+                Version:    snapVersion,
+                TipHeight:  shutTipHeight,
+                TipHashHex: fmt.Sprintf("%x", shutTipHash[:]),
+                TxTotal:    shutTxTotal,
+                UTXOs:      utxos.TakeSnapshot(),
+                Registry:   registry.TakeSnapshot(),
+        }
+        if saveErr := saveStartupSnapshot(dataDir, shutSnap); saveErr != nil {
+                log.Warn("shutdown: failed to save snapshot", "err", saveErr)
+                return
+        }
+        log.Info("shutdown: snapshot saved", "tip_height", shutTipHeight)
+        deleteOldSnapshots(dataDir, shutTipHeight)
+        // Persist the active UTXO count keyed by tip hash so the
+        // next restart's divergence check has an active-only reference
+        // count specific to this snapshot.
+        if metaErr := db.StoreActiveUTXOCount(shutSnap.TipHashHex, len(shutSnap.UTXOs.ActiveUTXOs)); metaErr != nil {
+                log.Warn("shutdown: failed to persist active_utxo_count metadata", "err", metaErr)
+        }
 }
 
 // checkKeyFilePermissions returns an error if the key file has group- or
