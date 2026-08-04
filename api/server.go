@@ -65,7 +65,7 @@ type Server struct {
         // endpoints return 503 when not wired.
         whitelistGetFn    func() []string
         whitelistAddFn    func(string) error
-        whitelistRemoveFn func(string) bool
+        whitelistRemoveFn func(string) (bool, error)
 
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
@@ -247,9 +247,10 @@ func (s *Server) SetWhitelistGetFunc(f func() []string) { s.whitelistGetFn = f }
 func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = f }
 
 // SetWhitelistRemoveFunc wires a function that removes one IP or CIDR from the
-// live whitelist.  Returns true when the entry was found and removed.
+// live whitelist.  Returns (true, nil) when found and removed, (false, nil) when
+// not found, or (false, err) when persistence fails.
 // Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
-func (s *Server) SetWhitelistRemoveFunc(f func(string) bool) { s.whitelistRemoveFn = f }
+func (s *Server) SetWhitelistRemoveFunc(f func(string) (bool, error)) { s.whitelistRemoveFn = f }
 
 // SetNodeIdentity stores the P2P TLS fingerprint, listen address, and node ID
 // so they can be returned by GET /api/v1/network/identity.

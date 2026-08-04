@@ -272,10 +272,16 @@ func (h *Host) GetPeerWhitelist() []string {
         return cp
 }
 
-// applyWhitelistLocked parses entries, atomically swaps the in-memory
-// wlNets/wlIPs/cfg.PeerWhitelist, and persists to the sidecar file.
+// applyWhitelistLocked parses entries, persists to the sidecar file first,
+// and only swaps the in-memory state if persistence succeeded.
+//
+// Write-first design: the sidecar is the source of truth on restart; if we
+// swapped in-memory first and then failed to persist, the live whitelist and
+// the durable sidecar would diverge silently — the admin would receive a
+// success response for a change that is lost on restart.
+//
 // MUST be called while h.wlMutate is held; never call directly.
-func (h *Host) applyWhitelistLocked(entries []string) {
+func (h *Host) applyWhitelistLocked(entries []string) error {
         var nets []*net.IPNet
         var ips []net.IP
         valid := make([]string, 0, len(entries))
@@ -291,6 +297,12 @@ func (h *Host) applyWhitelistLocked(entries []string) {
                 }
         }
 
+        // Persist first.  If this fails the in-memory state is not touched so
+        // the live access-control list remains consistent with the on-disk copy.
+        if err := h.saveWhitelistToFile(valid); err != nil {
+                return err
+        }
+
         h.wlMu.Lock()
         h.wlNets = nets
         h.wlIPs = ips
@@ -300,7 +312,7 @@ func (h *Host) applyWhitelistLocked(entries []string) {
         h.wlMu.Unlock()
 
         h.log.Info("p2p: peer whitelist updated", "entries", len(valid))
-        h.saveWhitelistToFile(valid)
+        return nil
 }
 
 // SetPeerWhitelist atomically replaces the peer IP whitelist with entries and
@@ -308,16 +320,17 @@ func (h *Host) applyWhitelistLocked(entries []string) {
 // must be either a bare IP address ("1.2.3.4") or a CIDR range ("10.0.0.0/8");
 // invalid entries are logged and silently skipped.
 // The change takes effect immediately for all new inbound connections.
-// Concurrent SetPeerWhitelist / AddToWhitelist / RemoveFromWhitelist calls are
-// fully serialised via wlMutate; the last caller wins.
-func (h *Host) SetPeerWhitelist(entries []string) {
+// Returns an error if the sidecar file cannot be written; in that case the
+// in-memory whitelist is not modified.
+func (h *Host) SetPeerWhitelist(entries []string) error {
         h.wlMutate.Lock()
         defer h.wlMutate.Unlock()
-        h.applyWhitelistLocked(entries)
+        return h.applyWhitelistLocked(entries)
 }
 
 // AddToWhitelist adds a single IP or CIDR to the peer whitelist.
-// Returns an error if the entry is not a valid IP or CIDR.
+// Returns an error if the entry is not a valid IP or CIDR, or if the sidecar
+// file cannot be written (in which case the in-memory list is not modified).
 // No-op (returns nil) when the entry is already present.
 // The entire read-snapshot → append → apply → persist sequence is serialised
 // under wlMutate, preventing lost-update races with concurrent calls.
@@ -342,15 +355,17 @@ func (h *Host) AddToWhitelist(entry string) error {
                         return nil // already present; idempotent
                 }
         }
-        h.applyWhitelistLocked(append(current, entry))
-        return nil
+        return h.applyWhitelistLocked(append(current, entry))
 }
 
 // RemoveFromWhitelist removes a single IP or CIDR from the peer whitelist.
-// Returns true when the entry was found and removed, false when not found.
+// Returns (true, nil) when the entry was found and removed.
+// Returns (false, nil) when the entry was not found in the list.
+// Returns (false, err) when the entry was found but the sidecar file could
+// not be written; in that case the in-memory list is not modified.
 // The entire read-snapshot → filter → apply → persist sequence is serialised
 // under wlMutate, preventing lost-update races with concurrent calls.
-func (h *Host) RemoveFromWhitelist(entry string) bool {
+func (h *Host) RemoveFromWhitelist(entry string) (bool, error) {
         h.wlMutate.Lock()
         defer h.wlMutate.Unlock()
 
@@ -369,13 +384,15 @@ func (h *Host) RemoveFromWhitelist(entry string) bool {
                 updated = append(updated, e)
         }
         if !found {
-                return false
+                return false, nil
         }
         if updated == nil {
                 updated = []string{}
         }
-        h.applyWhitelistLocked(updated)
-        return true
+        if err := h.applyWhitelistLocked(updated); err != nil {
+                return false, err
+        }
+        return true, nil
 }
 
 // loadWhitelistFromFile establishes the authoritative whitelist on startup.
@@ -456,43 +473,43 @@ func (h *Host) loadWhitelistFromFile() error {
 }
 
 // saveWhitelistToFile atomically writes entries to cfg.WhitelistFile so the
-// list survives a node restart.  A no-op when WhitelistFile is empty or "-".
-func (h *Host) saveWhitelistToFile(entries []string) {
+// list survives a node restart.  Returns nil on success.
+// Returns an error when the file cannot be created or written; the caller
+// (applyWhitelistLocked) must treat any non-nil error as fatal and must NOT
+// update the in-memory whitelist, keeping live state consistent with the disk.
+// A no-op (returns nil) when WhitelistFile is empty or "-".
+func (h *Host) saveWhitelistToFile(entries []string) error {
         if h.cfg.WhitelistFile == "" || h.cfg.WhitelistFile == "-" {
-                return
+                return nil
         }
         h.wlPersistMu.Lock()
         defer h.wlPersistMu.Unlock()
 
         data, err := json.MarshalIndent(entries, "", "  ")
         if err != nil {
-                h.log.Warn("p2p: whitelist persist: marshal failed", "err", err)
-                return
+                return fmt.Errorf("p2p: whitelist persist: marshal failed: %w", err)
         }
         dir := filepath.Dir(h.cfg.WhitelistFile)
         tmp, err := os.CreateTemp(dir, ".p2p_whitelist_*.tmp")
         if err != nil {
-                h.log.Warn("p2p: whitelist persist: create temp failed", "err", err)
-                return
+                return fmt.Errorf("p2p: whitelist persist: create temp in %q failed: %w", dir, err)
         }
         tmpName := tmp.Name()
         if _, err := tmp.Write(data); err != nil {
-                h.log.Warn("p2p: whitelist persist: write failed", "file", tmpName, "err", err)
                 tmp.Close()
                 os.Remove(tmpName)
-                return
+                return fmt.Errorf("p2p: whitelist persist: write to %q failed: %w", tmpName, err)
         }
         if err := tmp.Close(); err != nil {
-                h.log.Warn("p2p: whitelist persist: close failed", "file", tmpName, "err", err)
                 os.Remove(tmpName)
-                return
+                return fmt.Errorf("p2p: whitelist persist: close %q failed: %w", tmpName, err)
         }
         if err := os.Rename(tmpName, h.cfg.WhitelistFile); err != nil {
-                h.log.Warn("p2p: whitelist persist: rename failed", "tmp", tmpName, "dst", h.cfg.WhitelistFile, "err", err)
                 os.Remove(tmpName)
-                return
+                return fmt.Errorf("p2p: whitelist persist: rename %q→%q failed: %w", tmpName, h.cfg.WhitelistFile, err)
         }
         h.log.Debug("p2p: whitelist persisted", "entries", len(entries), "file", h.cfg.WhitelistFile)
+        return nil
 }
 
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is

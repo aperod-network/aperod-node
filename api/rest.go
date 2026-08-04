@@ -1020,8 +1020,19 @@ func (s *Server) restNetworkWhitelist(w http.ResponseWriter, r *http.Request) {
                         writeJSONError(w, http.StatusBadRequest, "entry is required")
                         return
                 }
+                // Validate the IP/CIDR format here so we can return 400 (not 500) for
+                // malformed entries; any error from whitelistAddFn after this point is a
+                // persistence failure and deserves 500.
+                if net.ParseIP(req.Entry) == nil {
+                        if _, _, err := net.ParseCIDR(req.Entry); err != nil {
+                                writeJSONError(w, http.StatusBadRequest,
+                                        fmt.Sprintf("invalid IP or CIDR: %q", req.Entry))
+                                return
+                        }
+                }
                 if err := s.whitelistAddFn(req.Entry); err != nil {
-                        writeJSONError(w, http.StatusBadRequest, err.Error())
+                        writeJSONError(w, http.StatusInternalServerError,
+                                "whitelist persist failed: "+err.Error())
                         return
                 }
                 writeJSON(w, http.StatusCreated, map[string]string{
@@ -1048,7 +1059,12 @@ func (s *Server) restNetworkWhitelistByEntry(w http.ResponseWriter, r *http.Requ
                 writeJSONError(w, http.StatusBadRequest, "entry is required")
                 return
         }
-        removed := s.whitelistRemoveFn(entry)
+        removed, err := s.whitelistRemoveFn(entry)
+        if err != nil {
+                writeJSONError(w, http.StatusInternalServerError,
+                        "whitelist persist failed: "+err.Error())
+                return
+        }
         if !removed {
                 writeJSONError(w, http.StatusNotFound, "entry not found in whitelist")
                 return
@@ -2188,8 +2204,16 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"tip_height":       tipHeight,
 		"utxo_rebuilding":  atomic.LoadInt32(&s.utxoRebuilding) == 1,
 	}
-	if len(s.peerWhitelist) > 0 {
-		resp["peer_whitelist"] = s.peerWhitelist
+	// Use the live whitelist from the P2P layer when wired; fall back to the
+	// startup snapshot so /api/v1/status is never stale after live edits.
+	var wl []string
+	if s.whitelistGetFn != nil {
+		wl = s.whitelistGetFn()
+	} else {
+		wl = s.peerWhitelist
+	}
+	if len(wl) > 0 {
+		resp["peer_whitelist"] = wl
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

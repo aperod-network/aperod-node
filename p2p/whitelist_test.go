@@ -56,16 +56,16 @@ func TestWhitelist_AddRemove(t *testing.T) {
 	}
 
 	// Remove the bare IP.
-	if ok := h.RemoveFromWhitelist("1.2.3.4"); !ok {
-		t.Fatal("RemoveFromWhitelist: expected true, got false")
+	if ok, err := h.RemoveFromWhitelist("1.2.3.4"); err != nil || !ok {
+		t.Fatalf("RemoveFromWhitelist: expected (true, nil), got (%v, %v)", ok, err)
 	}
 	if got := h.GetPeerWhitelist(); len(got) != 1 || got[0] != "10.0.0.0/8" {
 		t.Fatalf("expected [10.0.0.0/8], got %v", got)
 	}
 
-	// Remove non-existent entry → false.
-	if ok := h.RemoveFromWhitelist("9.9.9.9"); ok {
-		t.Fatal("RemoveFromWhitelist of absent entry: expected false, got true")
+	// Remove non-existent entry → (false, nil).
+	if ok, err := h.RemoveFromWhitelist("9.9.9.9"); ok || err != nil {
+		t.Fatalf("RemoveFromWhitelist of absent entry: expected (false, nil), got (%v, %v)", ok, err)
 	}
 }
 
@@ -147,7 +147,7 @@ func TestWhitelist_ConcurrentAddRemove(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_ = h.RemoveFromWhitelist("10.1.1." + itoa(i%5+1))
+			_, _ = h.RemoveFromWhitelist("10.1.1." + itoa(i%5+1))
 		}()
 	}
 	wg.Wait()
@@ -220,8 +220,8 @@ func TestWhitelist_Persistence(t *testing.T) {
 
 	// Phase 3 — remove a cfg-sourced entry and restart again.
 	// The removed entry must NOT come back from cfg on restart.
-	if ok := h2.RemoveFromWhitelist("5.5.5.5"); !ok {
-		t.Fatal("RemoveFromWhitelist(5.5.5.5): expected true")
+	if ok, err := h2.RemoveFromWhitelist("5.5.5.5"); err != nil || !ok {
+		t.Fatalf("RemoveFromWhitelist(5.5.5.5): expected (true, nil), got (%v, %v)", ok, err)
 	}
 	h3 := newWLTestHost(t, func(cfg *Config) {
 		cfg.PeerWhitelist = []string{"5.5.5.5"} // still in node.yaml
@@ -353,7 +353,9 @@ func TestWhitelist_SidecarRoundtrip(t *testing.T) {
 	})
 
 	entries := []string{"1.1.1.1", "2.2.2.2", "10.0.0.0/8"}
-	h.SetPeerWhitelist(entries)
+	if err := h.SetPeerWhitelist(entries); err != nil {
+		t.Fatalf("SetPeerWhitelist: %v", err)
+	}
 
 	raw, err := os.ReadFile(wlFile)
 	if err != nil {
@@ -370,6 +372,42 @@ func TestWhitelist_SidecarRoundtrip(t *testing.T) {
 		if got[i] != e {
 			t.Errorf("sidecar[%d]: want %s, got %s", i, e, got[i])
 		}
+	}
+}
+
+// TestWhitelist_PersistFailureDoesNotModifyInMemory verifies that when the
+// sidecar file cannot be written (e.g. the parent directory does not exist),
+// AddToWhitelist and RemoveFromWhitelist return an error AND leave the
+// in-memory whitelist unchanged — no false-success, no silent divergence.
+func TestWhitelist_PersistFailureDoesNotModifyInMemory(t *testing.T) {
+	// Point WhitelistFile at a directory that does not exist so CreateTemp fails.
+	nonExistentDir := filepath.Join(t.TempDir(), "no-such-subdir", "whitelist.json")
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		// Seed with one valid IP so we can verify the list is unchanged after failure.
+		cfg.PeerWhitelist = []string{"1.1.1.1"}
+		cfg.WhitelistFile = nonExistentDir
+	})
+	// Don't call loadWhitelistFromFile — we only care about add/remove atomicity.
+
+	// AddToWhitelist must return a non-nil error.
+	if err := h.AddToWhitelist("2.2.2.2"); err == nil {
+		t.Fatal("AddToWhitelist: expected persist error, got nil")
+	}
+	// In-memory list must be unchanged (still the cfg seed value "1.1.1.1").
+	got := h.GetPeerWhitelist()
+	if len(got) != 1 || got[0] != "1.1.1.1" {
+		t.Fatalf("AddToWhitelist persist failure: in-memory list modified unexpectedly: %v", got)
+	}
+
+	// RemoveFromWhitelist must also return a non-nil error.
+	if ok, err := h.RemoveFromWhitelist("1.1.1.1"); err == nil {
+		t.Fatalf("RemoveFromWhitelist: expected persist error, got nil (ok=%v)", ok)
+	}
+	// In-memory list must still be unchanged.
+	got2 := h.GetPeerWhitelist()
+	if len(got2) != 1 || got2[0] != "1.1.1.1" {
+		t.Fatalf("RemoveFromWhitelist persist failure: in-memory list modified unexpectedly: %v", got2)
 	}
 }
 
