@@ -2032,8 +2032,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":             true,
 		"height":         height,
-		"syncing":        syncing,
-		"syncing_height": syncingHeight,
-		"tip_height":     tipHeight,
+		"syncing":          syncing,
+		"syncing_height":   syncingHeight,
+		"tip_height":       tipHeight,
+		"utxo_rebuilding":  atomic.LoadInt32(&s.utxoRebuilding) == 1,
 	})
 }

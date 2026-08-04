@@ -766,6 +766,14 @@ func run() error {
                 // Startup scan is complete — mark the node ready for UTXO queries.
                 apiSrv.SetReady()
                 log.Info("API server ready (startup scan complete)")
+                // Keep utxo_rebuilding=true for 90 s after the scan completes.
+                // Wallets see this flag and suppress false "0 balance" / "Потрачен"
+                // displays that occur when the UTXO index is still settling.
+                go func() {
+                        time.Sleep(90 * time.Second)
+                        apiSrv.SetUTXOReady()
+                        log.Info("UTXO rebuild window closed — live UTXO queries enabled")
+                }()
         }
 
         // ── 9. Start P2P networking ───────────────────────────────────────────────

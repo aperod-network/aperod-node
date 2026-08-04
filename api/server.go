@@ -82,6 +82,13 @@ type Server struct {
         // Default is 1 (syncing) so callers see the correct state before SetReady.
         syncing int32
 
+        // utxoRebuilding is 1 for ~90 s after startup to signal that the UTXO
+        // index is still settling even though block loading has completed.
+        // During this window wallets should not interpret a 0 balance or empty
+        // UTXO list as proof that funds are gone.  Cleared by SetUTXOReady().
+        // Default is 1 so every restart begins with the flag set.
+        utxoRebuilding int32
+
         // syncingHeight and tipHeight track startup block-scan progress so that
         // /api/v1/status can report how far along the replay is.
         // syncingHeight is the last block processed; tipHeight is the total to load.
@@ -107,7 +114,8 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
                 mux:         http.NewServeMux(),
                 hub:         NewHub(log),
                 rateLimiter: NewRateLimiter(),
-                syncing:     1, // syncing until SetReady() is called
+                syncing:        1, // syncing until SetReady() is called
+                utxoRebuilding: 1, // set until SetUTXOReady() is called ~90 s after startup
         }
         s.registerRoutes()
         return s
@@ -117,6 +125,11 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
 // Call this after all blocks have been replayed from disk so that
 // /api/v1/status reports syncing=false and UTXO supply queries proceed normally.
 func (s *Server) SetReady() { atomic.StoreInt32(&s.syncing, 0) }
+
+// SetUTXOReady signals that the UTXO index has fully settled after startup.
+// Call ~90 s after SetReady() to clear the utxo_rebuilding flag so wallets
+// resume showing live balance figures without the "rebuilding" banner.
+func (s *Server) SetUTXOReady() { atomic.StoreInt32(&s.utxoRebuilding, 0) }
 
 // SetSyncProgress records how far the startup block scan has progressed.
 // current is the height of the last block processed; tip is the chain tip height.
