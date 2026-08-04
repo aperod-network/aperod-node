@@ -17,15 +17,18 @@ build: build-node build-cli build-explorer-indexer
 
 build-node:
 	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NODE) ./cmd/node
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NODE).new ./cmd/node
+	mv -f $(BUILD_DIR)/$(BINARY_NODE).new $(BUILD_DIR)/$(BINARY_NODE)
 
 build-cli:
 	mkdir -p $(BUILD_DIR)
-	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI) ./cmd/cli
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI).new ./cmd/cli
+	mv -f $(BUILD_DIR)/$(BINARY_CLI).new $(BUILD_DIR)/$(BINARY_CLI)
 
 build-explorer-indexer:
 	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_INDEXER) ./cmd/explorer-indexer
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_INDEXER).new ./cmd/explorer-indexer
+	mv -f $(BUILD_DIR)/$(BINARY_INDEXER).new $(BUILD_DIR)/$(BINARY_INDEXER)
 
 test:
 	$(GO) test -v -race -count=1 ./...
