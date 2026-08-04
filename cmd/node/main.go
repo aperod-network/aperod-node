@@ -741,6 +741,13 @@ func run() error {
         // (C-0 / C-1 fix: prevents inflation via forged commitments or unbound stake).
         mempool.SetVerifier(txVerifier)
 
+        // Restore any transactions that were pending when the node last stopped.
+        // Must run AFTER SetVerifier so full RingCT re-verification is active.
+        // Invalid or double-spent entries are silently dropped.
+        if n := mempool.Load(cfg.DataDir, log); n > 0 {
+                log.Info("mempool: restored pending transactions from disk", "count", n)
+        }
+
         // ── 9. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
         go engine.Run(stop)
@@ -1009,6 +1016,14 @@ func run() error {
                         }
                 }
         }
+
+        // Persist pending mempool transactions so they survive the restart.
+        if mpErr := mempool.Save(cfg.DataDir); mpErr != nil {
+                log.Warn("shutdown: failed to save mempool", "err", mpErr)
+        } else {
+                log.Info("shutdown: mempool saved", "pending_txs", mempool.Count())
+        }
+
         close(stop)
         return nil
 }

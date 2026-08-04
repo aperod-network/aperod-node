@@ -1,14 +1,30 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/aperod/aperod/crypto"
 )
+
+// mempoolDumpEntry is the on-disk representation of one mempool entry.
+type mempoolDumpEntry struct {
+	Tx         Transaction `json:"tx"`
+	Received   time.Time   `json:"received"`
+	Privileged bool        `json:"privileged,omitempty"`
+}
+
+// mempoolDump is the top-level JSON written to mempool.json.
+type mempoolDump struct {
+	SavedAt time.Time          `json:"saved_at"`
+	Entries []mempoolDumpEntry `json:"entries"`
+}
 
 // MempoolConfig holds tuning parameters for the transaction pool.
 type MempoolConfig struct {
@@ -469,6 +485,119 @@ func (m *Mempool) evictOldest() bool {
 	}
 	delete(m.entries, oldest.Hash)
 	return true
+}
+
+// mempoolPath returns the canonical path for the persisted mempool file.
+func mempoolPath(dataDir string) string {
+	return filepath.Join(dataDir, "mempool.json")
+}
+
+// Save atomically persists all current mempool entries to dataDir/mempool.json.
+// Entries older than TTL are skipped — they would be evicted on Load anyway.
+// Non-fatal: caller may log and continue on error.
+func (m *Mempool) Save(dataDir string) error {
+	m.mu.RLock()
+	now := time.Now()
+	entries := make([]mempoolDumpEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		// Skip already-expired entries — no point persisting them.
+		if m.cfg.TTL > 0 && now.Sub(e.Received) >= m.cfg.TTL {
+			continue
+		}
+		entries = append(entries, mempoolDumpEntry{
+			Tx:         e.Tx,
+			Received:   e.Received,
+			Privileged: e.privileged,
+		})
+	}
+	m.mu.RUnlock()
+
+	dump := mempoolDump{SavedAt: now, Entries: entries}
+	data, err := json.Marshal(dump)
+	if err != nil {
+		return fmt.Errorf("mempool save: marshal: %w", err)
+	}
+
+	// Atomic write: temp file → rename.
+	path := mempoolPath(dataDir)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("mempool save: write temp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("mempool save: rename: %w", err)
+	}
+	return nil
+}
+
+// Load reads dataDir/mempool.json and re-adds surviving transactions.
+// Must be called AFTER SetVerifier so full cryptographic re-verification runs.
+// Expired, duplicate, or invalid entries are silently dropped.
+// Returns the number of transactions successfully restored.
+func (m *Mempool) Load(dataDir string, log *slog.Logger) int {
+	if log == nil {
+		log = slog.Default()
+	}
+	path := mempoolPath(dataDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("mempool load: read error (ignoring)", "err", err)
+		}
+		return 0
+	}
+
+	var dump mempoolDump
+	if err := json.Unmarshal(data, &dump); err != nil {
+		log.Warn("mempool load: unmarshal error (ignoring)", "err", err)
+		return 0
+	}
+
+	now := time.Now()
+	restored := 0
+	skipped := 0
+	for _, entry := range dump.Entries {
+		// Drop entries that expired while the node was down.
+		age := now.Sub(entry.Received)
+		if m.cfg.TTL > 0 && age >= m.cfg.TTL {
+			skipped++
+			continue
+		}
+
+		var addErr error
+		if entry.Privileged {
+			addErr = m.AddPrivileged(entry.Tx)
+		} else {
+			addErr = m.Add(entry.Tx)
+		}
+		if addErr != nil {
+			log.Debug("mempool load: skipping tx", "err", addErr)
+			skipped++
+			continue
+		}
+
+		// Restore original receive time so TTL eviction uses the real age.
+		m.mu.Lock()
+		h := entry.Tx.Hash()
+		if e, ok := m.entries[h]; ok {
+			e.Received = entry.Received
+		}
+		m.mu.Unlock()
+
+		restored++
+	}
+
+	log.Info("mempool restored from disk",
+		"restored", restored,
+		"skipped", skipped,
+		"saved_at", dump.SavedAt,
+	)
+	// Remove the file so a second restart with an empty chain does not replay
+	// already-confirmed transactions (they will be rejected as double-spends,
+	// but it is cleaner to delete it once it has been consumed).
+	_ = os.Remove(path)
+	return restored
 }
 
 // evictLowestFeeRate removes the lowest-fee-rate (fee/byte) non-system entry
