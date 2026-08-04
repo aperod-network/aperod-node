@@ -129,6 +129,12 @@ func (p *Peer) Send(msgType MessageType, payload interface{}) error {
 // records are pruned in maintainLoop.
 const badBlockStrikeTTL = time.Hour
 
+// stableConnTime is the minimum duration a peer must stay connected before its
+// dial back-off counter is reset.  Peers that connect and disconnect faster
+// than this threshold are considered flapping and keep their failure count so
+// that exponential back-off continues to throttle reconnect storms.
+const stableConnTime = 60 * time.Second
+
 // badBlockMaxTrackedIPs caps the number of distinct IPs in badBlockCounts so a
 // distributed attacker cannot exhaust node memory by registering many unique IPs.
 const badBlockMaxTrackedIPs = 1024
@@ -591,6 +597,12 @@ func (h *Host) dialPeer(addr string) {
 func (h *Host) handleConn(conn net.Conn, outbound bool) {
         addr := conn.RemoteAddr().String()
 
+        // connectedAt is set (to non-zero) only once the peer reaches the
+        // message loop (i.e. both the TCP dial and the P2P handshake succeeded).
+        // The back-off defer below uses it to decide the outcome on every exit
+        // path — including early returns from a failed handshake.
+        var connectedAt time.Time
+
         // Safety net: catch panics from malformed peer messages so a single
         // misbehaving peer cannot crash the node process.
         defer func() {
@@ -605,6 +617,23 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                         h.mu.Unlock()
                 }
         }()
+
+        // Back-off update for outbound connections — fires on EVERY exit path,
+        // covering TCP dial errors, TLS failures, P2P handshake failures, and
+        // session drops.  connectedAt is zero for pre-message-loop exits (treat
+        // as failure) and non-zero once the message loop starts.
+        //   • connectedAt is zero           → handshake failed   → OnDialFail
+        //   • lasted < stableConnTime       → peer flapped       → OnDialFail
+        //   • lasted ≥ stableConnTime       → healthy session    → OnDialSuccess
+        if outbound {
+                defer func() {
+                        if connectedAt.IsZero() || time.Since(connectedAt) < stableConnTime {
+                                h.mgr.OnDialFail(addr)
+                        } else {
+                                h.mgr.OnDialSuccess(addr)
+                        }
+                }()
+        }
 
         // Pending-handshake semaphore: the slot is acquired by acceptLoop for
         // every inbound TLS connection.  We must release it on ALL exit paths —
@@ -747,11 +776,10 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 h.requestHeaders(peer)
         }
 
-        // Successful handshake — reset any dial back-off for this peer so that
-        // a future reconnect is not penalised for an earlier transient failure.
-        if outbound {
-                h.mgr.OnDialSuccess(addr)
-        }
+        // Mark the connection as having reached the message loop.  The back-off
+        // defer registered at the top of handleConn reads this value to decide
+        // whether the session was healthy or should be counted as a failure.
+        connectedAt = time.Now()
 
         // Message loop
         defer func() {

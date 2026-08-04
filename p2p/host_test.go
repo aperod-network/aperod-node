@@ -477,3 +477,56 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 		t.Logf("✓ outbound dial succeeded after inbound flood: inbound=%d total=%d (+%d outbound)", preDial, afterDial, afterDial-preDial)
 	}
 }
+
+// TestHost_DialPeer_BackoffAfterHandshakeDrop verifies that when an outbound
+// TCP connection succeeds but the remote closes the socket before completing
+// the P2P handshake (no Pong), handleConn's back-off defer calls OnDialFail
+// so the address enters a back-off window and cannot be re-dialled immediately.
+// This covers the flapping-peer reconnect-storm case where the peer is
+// reachable at TCP level but never finishes the application handshake.
+func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
+	// Listener that accepts TCP connections and immediately closes them,
+	// simulating a peer that drops right after TCP connect.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close() // drop before any P2P handshake bytes
+		}
+	}()
+
+	target := ln.Addr().String()
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "backoff-test",
+		UserAgent:  "aperod-test",
+	}, &stubHandler{}, newTestLogger())
+
+	// First dial: TCP connects, listener drops connection, handleConn returns
+	// early with connectedAt still zero → back-off defer calls OnDialFail.
+	host.DialPeer(target)
+	// Allow the dial goroutine to complete and update the back-off state.
+	time.Sleep(300 * time.Millisecond)
+
+	// CanDial must be false: the back-off defer must have fired OnDialFail.
+	if p2p.HostCanDial(host, target) {
+		t.Error("CanDial must be false after a failed P2P handshake (remote dropped before Pong)")
+	}
+
+	// A second DialPeer call must be silently blocked by the CanDial guard.
+	host.DialPeer(target)
+	time.Sleep(100 * time.Millisecond)
+	if p2p.HostCanDial(host, target) {
+		t.Error("CanDial must remain false — blocked dial must not clear back-off")
+	}
+}

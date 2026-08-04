@@ -1,4 +1,4 @@
-// export_test.go — exposes internal Host methods for tests in package p2p_test.
+// export_test.go — exposes internal Host and PeerMgr methods for tests in package p2p_test.
 // This file is compiled only during `go test` because it lives in package p2p
 // (not p2p_test) alongside the implementation.
 
@@ -36,4 +36,12 @@ func (h *Host) RecordBadBlockStrike(ip string) int {
 		h.badBlockCounts[ip] = strike
 	}
 	return strike.count
+}
+
+// HostCanDial reports whether the host's PeerMgr would allow dialling addr
+// right now (not banned and back-off window has elapsed).  Exported for
+// integration tests that need to inspect dial-backoff state without going
+// through the network layer.
+func HostCanDial(h *Host, addr string) bool {
+	return h.mgr.CanDial(addr)
 }

@@ -63,6 +63,133 @@ func TestPeerMgr_MultiBan_SameAddr(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Back-off tests
+// ---------------------------------------------------------------------------
+
+func TestBackoffDuration_Progression(t *testing.T) {
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, 0},
+		{1, 5 * time.Second},
+		{2, 10 * time.Second},
+		{3, 20 * time.Second},
+		{4, 40 * time.Second},
+		{5, 80 * time.Second},
+		{6, 160 * time.Second},
+		{7, 5 * time.Minute}, // capped
+		{20, 5 * time.Minute},
+	}
+	for _, c := range cases {
+		got := backoffDuration(c.failures)
+		if got != c.want {
+			t.Errorf("backoffDuration(%d) = %v, want %v", c.failures, got, c.want)
+		}
+	}
+}
+
+func TestPeerMgr_CanDial_BackoffWindow(t *testing.T) {
+	pm := newPeerMgr()
+	addr := "1.2.3.4:9000"
+
+	// No failures yet — CanDial must be true.
+	if !pm.CanDial(addr) {
+		t.Fatal("CanDial must be true before any failures")
+	}
+
+	// Record one failure — back-off window starts (5 s).
+	pm.OnDialFail(addr)
+
+	// CanDial must be false immediately (window has not elapsed).
+	if pm.CanDial(addr) {
+		t.Fatal("CanDial must be false while inside back-off window")
+	}
+}
+
+func TestPeerMgr_OnDialSuccess_ResetsBackoff(t *testing.T) {
+	pm := newPeerMgr()
+	addr := "1.2.3.4:9000"
+
+	pm.OnDialFail(addr)
+	pm.OnDialFail(addr)
+	if pm.CanDial(addr) {
+		t.Fatal("should be in back-off after two failures")
+	}
+
+	// Success resets the state.
+	pm.OnDialSuccess(addr)
+	if !pm.CanDial(addr) {
+		t.Fatal("CanDial must be true after OnDialSuccess resets back-off")
+	}
+}
+
+// TestPeerMgr_RapidDisconnect_Throttled verifies that a peer whose connection
+// keeps dropping quickly (< stableConnTime) cannot be dialled more than a
+// small number of times within a short observation window.
+//
+// In the real host, OnDialFail is called both for TCP/TLS dial errors AND when
+// an outbound connection closes before stableConnTime has elapsed.  This test
+// exercises the failure-accumulation path directly.
+func TestPeerMgr_RapidDisconnect_Throttled(t *testing.T) {
+	pm := newPeerMgr()
+	addr := "5.5.5.5:9000"
+
+	// Accumulate 7 failures quickly (7th failure reaches the 5-minute cap).
+	// Failure progression: 5s, 10s, 20s, 40s, 80s, 160s, 5min (cap).
+	const rapidFails = 7
+	for i := 0; i < rapidFails; i++ {
+		pm.OnDialFail(addr)
+	}
+
+	// After 7 rapid failures the back-off is capped at 5 min.
+	// CanDial must be false immediately.
+	if pm.CanDial(addr) {
+		t.Fatal("after 7 rapid failures CanDial must be blocked (back-off not applied)")
+	}
+
+	// Further failures must not reset things.
+	pm.OnDialFail(addr)
+	if pm.CanDial(addr) {
+		t.Fatal("CanDial must remain blocked after further failure")
+	}
+}
+
+// TestPeerMgr_ShortConnection_IncreasesBackoff verifies the lifecycle used by
+// host.go: a peer that connects successfully at the TCP level but disconnects
+// before stableConnTime causes OnDialFail to be called (not OnDialSuccess),
+// so that repeated short connections progressively lengthen the back-off.
+func TestPeerMgr_ShortConnection_IncreasesBackoff(t *testing.T) {
+	pm := newPeerMgr()
+	addr := "7.7.7.7:9000"
+
+	// First attempt — no failures yet, CanDial is open.
+	if !pm.CanDial(addr) {
+		t.Fatal("CanDial must be true before any failures")
+	}
+
+	// Simulate 3 short-lived successful connections (connect, drop quickly).
+	// In host.go this path calls OnDialFail because time.Since(connectedAt) < stableConnTime.
+	pm.OnDialFail(addr) // short connection 1 → back-off 5 s
+	if pm.CanDial(addr) {
+		t.Fatal("CanDial must be blocked after 1st short connection")
+	}
+
+	pm.OnDialSuccess(addr) // pretend back-off elapsed (simulate host reset for test clarity)
+	pm.OnDialFail(addr)    // short connection 2 → back-off 5 s (counter reset by success)
+	pm.OnDialFail(addr)    // short connection 3 → back-off 10 s
+	if pm.CanDial(addr) {
+		t.Fatal("CanDial must be blocked after accumulated short connections")
+	}
+
+	// A stable connection (host calls OnDialSuccess) clears everything.
+	pm.OnDialSuccess(addr)
+	if !pm.CanDial(addr) {
+		t.Fatal("CanDial must be true after OnDialSuccess following a stable connection")
+	}
+}
+
 // TestPeerMgr_IPBan verifies that banning a bare IP address blocks any
 // "IP:port" connection from that host, regardless of source port.
 func TestPeerMgr_IPBan(t *testing.T) {
