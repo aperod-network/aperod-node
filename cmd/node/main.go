@@ -750,7 +750,17 @@ func run() error {
 
         // ── 9. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
-        go engine.Run(stop)
+        // engineDone is closed when engine.Run returns so the shutdown path can
+        // wait for the engine to fully stop before reading the DB tip and saving
+        // the snapshot.  Without this wait the engine can produce a block AFTER
+        // we read the tip but BEFORE close(stop), writing the snapshot at height H
+        // while the DB tip advances to H+1 — causing the next startup to reject
+        // the snapshot and fall back to a full block scan.
+        engineDone := make(chan struct{})
+        go func() {
+                engine.Run(stop)
+                close(engineDone)
+        }()
 
         // Drain ProducedCh so the consensus engine never blocks on a full channel.
         go func() {
@@ -990,7 +1000,19 @@ func run() error {
         <-sig
 
         log.Info("shutting down...")
-        // Save a snapshot at the current tip so the next restart is instant.
+
+        // Stop the consensus engine FIRST, then save the snapshot.
+        //
+        // Critical ordering: if we read db.GetTip() before close(stop) the engine
+        // can produce block H+1 between the read and the rename, leaving a snapshot
+        // at height H while the DB tip says H+1.  The next startup looks for
+        // snapshot-v2-{H+1}.json.gz, finds nothing, and falls back to a full block
+        // scan (hours of 100 % CPU).  Closing stop and waiting for engineDone
+        // guarantees no further blocks are written before we capture the final tip.
+        close(stop)
+        <-engineDone // wait until engine.Run has fully returned
+
+        // Save a snapshot at the final tip so the next restart is instant.
         if registry != nil {
                 if shutTipHash, shutTipHeight, stErr := db.GetTip(); stErr == nil && shutTipHeight > 0 {
                         shutTxTotal, _ := db.LoadTxTotal()
@@ -1024,7 +1046,6 @@ func run() error {
                 log.Info("shutdown: mempool saved", "pending_txs", mempool.Count())
         }
 
-        close(stop)
         return nil
 }
 
