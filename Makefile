@@ -1,10 +1,11 @@
 BINARY_NODE=aperod-node
 BINARY_CLI=aperod
+BINARY_INDEXER=aperod-explorer-indexer
 BUILD_DIR=build
 GO=go
 GOFLAGS=-ldflags="-s -w"
 
-.PHONY: all build build-node build-cli test lint fmt clean docker deps
+.PHONY: all build build-node build-cli build-explorer-indexer test lint fmt clean docker deps
 
 all: deps build test
 
@@ -12,7 +13,7 @@ deps:
 	$(GO) mod download
 	$(GO) mod tidy
 
-build: build-node build-cli
+build: build-node build-cli build-explorer-indexer
 
 build-node:
 	mkdir -p $(BUILD_DIR)
@@ -21,6 +22,10 @@ build-node:
 build-cli:
 	mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI) ./cmd/cli
+
+build-explorer-indexer:
+	mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_INDEXER) ./cmd/explorer-indexer
 
 test:
 	$(GO) test -v -race -count=1 ./...
