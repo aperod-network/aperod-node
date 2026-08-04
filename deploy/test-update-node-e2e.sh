@@ -116,14 +116,16 @@ cat > "$CTX/stubs/git" << 'STUB'
 exit 0
 STUB
 
-# make — simulate `make build` by copying the new stub binary into the build dir
+# make — simulate `make build` by copying the new stub binary into the build dir.
+# IMPORTANT: use /bin/cp (absolute path) so this stub works correctly even when
+# a failing cp stub is prepended to PATH for the Scenario 2 rollback test.
 cat > "$CTX/stubs/make" << 'STUB'
 #!/usr/bin/env bash
 # Handle "make build" (and "make deps") issued by update-node.sh.
 case "${*}" in
   *build*|*deps*)
     mkdir -p /opt/aperod/blockchain/build
-    cp /stubs-extra/aperod-node /opt/aperod/blockchain/build/aperod-node
+    /bin/cp /stubs-extra/aperod-node /opt/aperod/blockchain/build/aperod-node
     chmod +x /opt/aperod/blockchain/build/aperod-node
     echo "[stub-make] built /opt/aperod/blockchain/build/aperod-node"
     ;;
@@ -448,6 +450,206 @@ fi
 HARNESS
 chmod +x "$CTX/test-harness.sh"
 
+# ── Scenario 2: rollback test ─────────────────────────────────────────────────
+# A stub `cp` (placed in /stubs-rollback/) exits 1 whenever it is called.
+# update-node.sh uses /bin/cp explicitly for backup and restore, so those
+# succeed via the absolute path; only the plain `cp <src> <dst>` install call
+# goes through PATH and hits the stub, causing it to fail.
+# Expected outcome: update-node.sh exits non-zero, old binary is restored at
+# /usr/local/bin/aperod-node, and the service is back up (rollback restarted it).
+
+mkdir -p "$CTX/stubs-rollback"
+
+# cp stub — always fails (simulates disk-full / permission-denied mid-install)
+cat > "$CTX/stubs-rollback/cp" << 'STUB'
+#!/usr/bin/env bash
+# Simulate a failed binary copy (e.g. ETXTBSY, disk full, permission denied).
+echo "[stub-cp] cp $* → injected failure" >&2
+exit 1
+STUB
+chmod +x "$CTX/stubs-rollback/cp"
+
+cat > "$CTX/test-harness-rollback.sh" << 'HARNESS'
+#!/usr/bin/env bash
+# Scenario 2 — broken install: cp fails mid-install after service is stopped.
+#
+# The installed "old" binary is seeded with a DISTINCT version string
+# ("v1.0.0-OLD") different from the "new" build stub ("v0.0.0-stub"), so
+# assertions can prove the specific old binary was restored by rollback, not
+# just that any executable remains.
+#
+# Expected outcomes:
+#   R1. update-node.sh exits NON-ZERO (install failure detected).
+#   R2. /usr/local/bin/aperod-node --version reports "v1.0.0-OLD" (old binary
+#       content restored, not just any executable at that path).
+#   R3. systemctl is-active aperod-node returns 0 (service restarted by rollback).
+#   R4. /etc/systemd/system/aperod-node.service still exists.
+#   R5. fake-systemctl log records "stop aperod-node" (service was stopped).
+#   R6. fake-systemctl log records "start aperod-node" AFTER the stop
+#       (rollback code path restarted the service, not the normal install path).
+#   R7. Backup file /usr/local/bin/aperod-node.pre-update exists on disk
+#       (Step 4 was reached and the backup step ran before the install failed).
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
+PASS=0; FAIL=0
+
+pass_assert() { echo -e "${GREEN}  PASS${NC}  $*"; ((PASS++)); }
+fail_assert() { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
+
+# ── Step 1: Pre-seed the base "previously installed" state ────────────────────
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 2] Pre-seeding installed-node state"
+echo "══════════════════════════════════════════════════"
+# Run preseed without any stub interference — it uses plain cp internally.
+bash /preseed.sh
+
+# ── Step 2: Replace the installed binary with a DISTINCTLY MARKED old version ─
+# This lets the version-string assertion (R2) distinguish "old binary restored"
+# from "some binary happens to be executable at that path".
+# The new-build stub (/stubs-extra/aperod-node) reports "v0.0.0-stub"; this
+# one reports "v1.0.0-OLD".  Both serve HTTP on :8545 so health checks pass.
+# Overwrite the installed binary with a distinctly marked old version.
+# The preseed-started process is a Python interpreter that already read and
+# compiled the script file; overwriting the file on Linux leaves the running
+# process unaffected (it holds its own file descriptors / in-memory bytecode).
+# Step 3 of update-node.sh will stop that process normally.  After rollback,
+# a new process is forked from the v1.0.0-OLD file content.
+#
+# We write to a temp file first, then /bin/cp (atomic replace on most
+# filesystems) so the running process never reads a partial write.
+cat > /tmp/aperod-node-old-stub.py << 'OLDSTUB'
+#!/usr/bin/env python3
+"""OLD stub aperod-node: --version exit + health endpoints for rollback test."""
+import sys
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("aperod-node v1.0.0-OLD")
+    sys.exit(0)
+import http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true,"syncing":false,"height":1,"version":"v1.0.0-OLD"}')
+    def log_message(self, *a): pass
+try:
+    with socketserver.TCPServer(("127.0.0.1", 8545), Handler) as srv:
+        srv.serve_forever()
+except Exception as e:
+    print(f"old stub error: {e}", file=sys.stderr)
+    sys.exit(1)
+OLDSTUB
+/bin/cp /tmp/aperod-node-old-stub.py /usr/local/bin/aperod-node
+chmod +x /usr/local/bin/aperod-node
+echo "[scenario2-setup] /usr/local/bin/aperod-node replaced with v1.0.0-OLD marker."
+
+# ── Step 3: Inject the failing cp stub and run update-node.sh ─────────────────
+# /bin/cp is always the real binary (absolute path bypasses PATH lookup), so
+# backup and restore succeed.  Only the PATH-resolved `cp` in Step 4 fails.
+export PATH="/stubs-rollback:/stubs:$PATH"
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 2] Running update-node.sh with cp stub"
+echo "══════════════════════════════════════════════════"
+
+SKIP_PEER_CHECK=1 \
+HEALTH_MAX_ATTEMPTS=5 \
+HEALTH_WAIT_SECS=1 \
+  bash /deploy/update-node.sh
+UPDATE_EXIT=$?
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 2] Assertions"
+echo "══════════════════════════════════════════════════"
+
+# R1: update-node.sh must exit NON-ZERO (install failure)
+if [[ $UPDATE_EXIT -ne 0 ]]; then
+  pass_assert "R1: update-node.sh exited $UPDATE_EXIT (non-zero — install failure detected)"
+else
+  fail_assert "R1: update-node.sh exited 0 (expected non-zero — broken install was not caught)"
+fi
+
+# R2: the restored binary must report the OLD version string, not the new-build
+#     stub version — proving the specific pre-update binary was restored.
+RESTORED_VERSION=$(/usr/local/bin/aperod-node --version 2>/dev/null || echo "ERROR")
+if [[ "$RESTORED_VERSION" == *"v1.0.0-OLD"* ]]; then
+  pass_assert "R2: aperod-node --version reports '$RESTORED_VERSION' (old binary content restored)"
+else
+  fail_assert "R2: aperod-node --version reports '$RESTORED_VERSION' (expected 'v1.0.0-OLD' — wrong binary at destination)"
+fi
+
+# R3: service must be active (rollback restarted it with the old binary)
+if systemctl is-active --quiet aperod-node; then
+  pass_assert "R3: systemctl is-active aperod-node returned 0 (service restarted by rollback)"
+else
+  fail_assert "R3: systemctl is-active aperod-node returned non-zero (service left down)"
+  echo "     fake-systemctl log:" >&2
+  cat /tmp/fake-systemctl.log >&2 || true
+  echo "     aperod-node stub log:" >&2
+  cat /tmp/aperod-node-stub.log >&2 || true
+fi
+
+# R4: service file must still exist (the script must not remove it on failure)
+if [[ -f /etc/systemd/system/aperod-node.service ]]; then
+  pass_assert "R4: /etc/systemd/system/aperod-node.service still exists"
+else
+  fail_assert "R4: /etc/systemd/system/aperod-node.service was removed"
+fi
+
+# R5: fake-systemctl log must record a "stop aperod-node" call, proving the
+#     service was actually stopped before the install attempt — not left running
+#     in its pre-seeded state throughout.
+SYSCTL_LOG=/tmp/fake-systemctl.log
+if grep -q "stop aperod-node" "$SYSCTL_LOG" 2>/dev/null; then
+  pass_assert "R5: fake-systemctl log records 'stop aperod-node' (service was stopped)"
+else
+  fail_assert "R5: 'stop aperod-node' not found in fake-systemctl log — service may never have been stopped"
+  echo "     fake-systemctl log contents:" >&2
+  cat "$SYSCTL_LOG" >&2 || echo "     (log file missing)" >&2
+fi
+
+# R6: fake-systemctl log must record a "start aperod-node" call AFTER the stop,
+#     proving _rollback_install restarted the service rather than the normal
+#     install-success path.  We verify line ordering in the log file.
+if [[ -f "$SYSCTL_LOG" ]]; then
+  STOP_LINE=$(grep -n "stop aperod-node" "$SYSCTL_LOG" 2>/dev/null | tail -1 | cut -d: -f1)
+  START_LINE=$(grep -n "start aperod-node" "$SYSCTL_LOG" 2>/dev/null | tail -1 | cut -d: -f1)
+  if [[ -n "$STOP_LINE" && -n "$START_LINE" && "$START_LINE" -gt "$STOP_LINE" ]]; then
+    pass_assert "R6: fake-systemctl log records 'start aperod-node' after 'stop' (rollback restarted service)"
+  else
+    fail_assert "R6: 'start aperod-node' not found after 'stop' in fake-systemctl log — rollback may not have restarted the service"
+    echo "     fake-systemctl log contents:" >&2
+    cat "$SYSCTL_LOG" >&2 || echo "     (log file missing)" >&2
+  fi
+else
+  fail_assert "R6: fake-systemctl log file missing"
+fi
+
+# R7: backup file must exist on disk, confirming Step 4 was reached and the
+#     backup step ran before the install copy failed.
+BINARY_BACKUP="/usr/local/bin/aperod-node.pre-update"
+if [[ -f "$BINARY_BACKUP" ]]; then
+  pass_assert "R7: backup file $BINARY_BACKUP exists (Step 4 was reached; backup was created)"
+else
+  fail_assert "R7: backup file $BINARY_BACKUP not found — Step 4 may not have been reached"
+fi
+
+echo ""
+echo "──────────────────────────────────────────────────"
+TOTAL=$((PASS + FAIL))
+if [[ $FAIL -eq 0 ]]; then
+  echo -e "${GREEN}All $TOTAL rollback assertions passed.${NC}"
+  exit 0
+else
+  echo -e "${RED}$FAIL of $TOTAL rollback assertions FAILED.${NC}"
+  exit 1
+fi
+HARNESS
+chmod +x "$CTX/test-harness-rollback.sh"
+
 # ── Dockerfile ────────────────────────────────────────────────────────────────
 cat > "$CTX/Dockerfile" << 'DOCKER'
 FROM ubuntu:22.04
@@ -472,14 +674,17 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 # Stub commands — prepended to PATH inside the test harness
-COPY stubs/       /stubs/
+COPY stubs/          /stubs/
+# Rollback-scenario stubs: cp that always exits 1
+COPY stubs-rollback/ /stubs-rollback/
 # Pre-built stub binaries (the "new" aperod-node that make installs)
-COPY stubs-extra/ /stubs-extra/
+COPY stubs-extra/    /stubs-extra/
 # Real deploy directory — update-node.sh + peer-check.sh + all siblings
-COPY deploy/      /deploy/
+COPY deploy/         /deploy/
 # Pre-seed and test harness scripts
-COPY preseed.sh        /preseed.sh
-COPY test-harness.sh   /test-harness.sh
+COPY preseed.sh               /preseed.sh
+COPY test-harness.sh          /test-harness.sh
+COPY test-harness-rollback.sh /test-harness-rollback.sh
 
 # Pre-create standard system directories
 RUN mkdir -p /etc/systemd/system /run/fake-systemd /etc/aperod /var/log/aperod
@@ -497,16 +702,40 @@ if ! docker build --quiet -t "$IMAGE_TAG" "$CTX" 2>&1; then
 fi
 echo -e "${GREEN}[OK]${NC}   Image built: $IMAGE_TAG"
 
-# ── Run the test container ────────────────────────────────────────────────────
-echo -e "\n${BOLD}Running update-node.sh e2e test inside container…${NC}"
+# ── Run scenario 1: normal upgrade ───────────────────────────────────────────
+echo -e "\n${BOLD}[Scenario 1] Running normal upgrade test…${NC}"
 echo "────────────────────────────────────────────────────"
 
+S1_PASS=false
 if docker run --rm "$IMAGE_TAG" bash /test-harness.sh; then
   echo "────────────────────────────────────────────────────"
-  echo -e "${GREEN}${BOLD}update-node.sh e2e smoke test PASSED.${NC}"
-  exit 0
+  echo -e "${GREEN}${BOLD}Scenario 1 (normal upgrade) PASSED.${NC}"
+  S1_PASS=true
 else
   echo "────────────────────────────────────────────────────"
-  echo -e "${RED}${BOLD}update-node.sh e2e smoke test FAILED.${NC}"
+  echo -e "${RED}${BOLD}Scenario 1 (normal upgrade) FAILED.${NC}"
+fi
+
+# ── Run scenario 2: broken install → rollback ─────────────────────────────────
+echo -e "\n${BOLD}[Scenario 2] Running broken-install rollback test…${NC}"
+echo "────────────────────────────────────────────────────"
+
+S2_PASS=false
+if docker run --rm "$IMAGE_TAG" bash /test-harness-rollback.sh; then
+  echo "────────────────────────────────────────────────────"
+  echo -e "${GREEN}${BOLD}Scenario 2 (broken install → rollback) PASSED.${NC}"
+  S2_PASS=true
+else
+  echo "────────────────────────────────────────────────────"
+  echo -e "${RED}${BOLD}Scenario 2 (broken install → rollback) FAILED.${NC}"
+fi
+
+# ── Overall result ────────────────────────────────────────────────────────────
+echo ""
+if [[ "$S1_PASS" == "true" && "$S2_PASS" == "true" ]]; then
+  echo -e "${GREEN}${BOLD}All update-node.sh e2e scenarios PASSED.${NC}"
+  exit 0
+else
+  echo -e "${RED}${BOLD}One or more update-node.sh e2e scenarios FAILED.${NC}"
   exit 1
 fi

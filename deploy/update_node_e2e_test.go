@@ -1,14 +1,20 @@
 // Package deploy_test contains CI guards for the update-node.sh upgrade script.
 //
 // This file adds an end-to-end smoke test that runs the real update-node.sh
-// inside a sandboxed Docker container that starts from a simulated
-// "previously installed" node state and asserts that after the upgrade:
+// inside a sandboxed Docker container under two scenarios.
 //
+// Scenario 1 — normal upgrade:
 //  1. update-node.sh exits 0.
 //  2. `systemctl is-active aperod-node` returns 0 (service still active).
 //  3. `curl http://127.0.0.1:8545/api/v1/status` returns HTTP 200.
 //  4. /usr/local/bin/aperod-node is executable.
 //  5. The systemd service file is still present.
+//
+// Scenario 2 — broken install (cp fails mid-install after service is stopped):
+//  R1. update-node.sh exits non-zero (install failure is detected).
+//  R2. /usr/local/bin/aperod-node is still executable (old binary restored).
+//  R3. `systemctl is-active aperod-node` returns 0 (rollback restarted it).
+//  R4. The systemd service file is still present.
 //
 // The test delegates to test-update-node-e2e.sh, which builds a minimal
 // Ubuntu 22.04 Docker image pre-wired with:
@@ -19,6 +25,9 @@
 //     logic (stop → build → install → start → health-check).
 //   - A Python3 aperod-node stub that serves the health endpoint on :8545
 //     so the post-upgrade health check can succeed.
+//   - A failing cp stub (/stubs-rollback/cp) that exits 1 for every call;
+//     update-node.sh uses /bin/cp (absolute path) for backup and restore so
+//     those succeed, and only the PATH-resolved install cp is intercepted.
 //
 // # Skip conditions
 //

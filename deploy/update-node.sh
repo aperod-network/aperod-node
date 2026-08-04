@@ -230,11 +230,88 @@ sleep 1
 # The systemd service's ExecStart points to /usr/local/bin/aperod-node.
 # Building to /opt/aperod/data/ or any other path silently leaves the service
 # running the old code — this step ensures only the right path is updated.
+#
+# Rollback: we back up the old binary before overwriting it.  If the backup
+# itself fails we abort immediately and restart the service so the node is
+# never left offline without a recovery path.  If the `cp` or `chmod` install
+# step fails after a successful backup, the old binary is restored and the
+# service is restarted.  The Telegram alert reports the actual outcome of each
+# step rather than just the backup flag.
 # ---------------------------------------------------------------------------
 echo "==> [4/5] Installing binary to ${BINARY_DST}..."
-cp "${BINARY_SRC}" "${BINARY_DST}"
-chmod +x "${BINARY_DST}"
+
+# Back up the current binary so we can restore it on install failure.
+# Failure to create the backup is FATAL — abort now and restart the service
+# rather than proceeding without any rollback capability.
+BINARY_BACKUP="${BINARY_DST}.pre-update"
+_backed_up=false
+if [[ -f "${BINARY_DST}" ]]; then
+  if /bin/cp "${BINARY_DST}" "${BINARY_BACKUP}" 2>/dev/null; then
+    _backed_up=true
+    echo "  Backed up existing binary to ${BINARY_BACKUP}"
+  else
+    echo ""
+    echo "✗ Could not create backup at ${BINARY_BACKUP} — aborting install to protect the running service." >&2
+    echo "  The service was stopped; restarting it now." >&2
+    systemctl start "${SERVICE_NAME}" || true
+    send_telegram_alert "⚠️ <b>aperod-node install ABORTED</b>
+Server: $(hostname)
+Could not create backup at <code>${BINARY_BACKUP}</code> (storage full or permissions error).
+Install was aborted; the service has been restarted with the existing binary.
+Fix the issue and re-run <code>update-node.sh</code>."
+    exit 1
+  fi
+fi
+
+# Helper: undo a partial install and restart the old binary.
+# Tracks the actual outcome of each recovery step and reports it accurately.
+_rollback_install() {
+  local _restored=false _restarted=false _summary
+  echo "✗ Binary installation failed — attempting rollback..." >&2
+  if [[ "${_backed_up}" == "true" && -f "${BINARY_BACKUP}" ]]; then
+    if /bin/cp "${BINARY_BACKUP}" "${BINARY_DST}" && chmod +x "${BINARY_DST}"; then
+      _restored=true
+      if systemctl start "${SERVICE_NAME}" 2>/dev/null; then
+        _restarted=true
+        echo "  Rolled back to previous binary; service restarted." >&2
+        echo "  Service state: $(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo unknown)" >&2
+      else
+        echo "  Old binary restored but 'systemctl start' failed — service may be down." >&2
+        echo "  Manual recovery: systemctl start ${SERVICE_NAME}" >&2
+      fi
+    else
+      echo "  Rollback copy also failed — service remains stopped." >&2
+      echo "  Manual recovery: /bin/cp ${BINARY_BACKUP} ${BINARY_DST} && chmod +x ${BINARY_DST} && systemctl start ${SERVICE_NAME}" >&2
+    fi
+  else
+    echo "  No backup available — service remains stopped." >&2
+    echo "  Manual recovery: cp <new-binary> ${BINARY_DST} && chmod +x ${BINARY_DST} && systemctl start ${SERVICE_NAME}" >&2
+  fi
+  if [[ "${_restored}" == "true" && "${_restarted}" == "true" ]]; then
+    _summary="Old binary was restored and service restarted successfully."
+  elif [[ "${_restored}" == "true" ]]; then
+    _summary="Old binary was restored but service failed to start — check <code>journalctl -u ${SERVICE_NAME}</code>."
+  else
+    _summary="Rollback failed — service is DOWN. Manual recovery required."
+  fi
+  send_telegram_alert "🚨 <b>aperod-node install FAILED</b>
+Server: $(hostname)
+Binary copy to <code>${BINARY_DST}</code> failed.
+${_summary}"
+}
+
+# Install new binary; roll back and abort if anything goes wrong.
+if ! cp "${BINARY_SRC}" "${BINARY_DST}"; then
+  _rollback_install
+  exit 1
+fi
+if ! chmod +x "${BINARY_DST}"; then
+  _rollback_install
+  exit 1
+fi
+
 echo "  Installed: $(${BINARY_DST} --version 2>/dev/null || ls -lh "${BINARY_DST}" | awk '{print $5, $9}')"
+rm -f "${BINARY_BACKUP}" 2>/dev/null || true   # clean up backup on success
 
 # Start the service after the new binary is in place.
 systemctl start "${SERVICE_NAME}"
