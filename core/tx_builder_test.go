@@ -300,3 +300,76 @@ func TestTxBuilder_ZeroAmount(t *testing.T) {
                 t.Error("expected error for zero amount")
         }
 }
+
+// TestTxBuilder_FallbackDecoyCount_SparseUTXOSet verifies that when a live
+// UTXOSet is attached via WithDecoySet but it contains fewer spent decoys than
+// RingSize-1, BuildResult.FallbackDecoyCount is positive and
+// BuildResult.RealDecoyCount equals the number of available real decoys.
+//
+// Setup: Alice has one coinbase UTXO worth 1 APRO.  A UTXOSet is pre-loaded
+// with 3 spent-decoy entries (via AddSpentDecoyForTest).  Alice sends 30_000_000
+// base units to Bob.  Because only 1 input is selected and it needs RingSize-1 = 15
+// decoy slots, exactly 15-3 = 12 slots must fall back to Phase 1 random keys.
+func TestTxBuilder_FallbackDecoyCount_SparseUTXOSet(t *testing.T) {
+        const supply = 1_000_000_000 // 1 APRO
+
+        aliceKeys, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatal(err)
+        }
+        bobKeys, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatal(err)
+        }
+        net := crypto.TestnetByte
+        aliceAddr := crypto.AddressFromKeys(net, aliceKeys)
+        bobAddr := crypto.AddressFromKeys(net, bobKeys)
+
+        // Create a single-block chain with Alice's coinbase UTXO.
+        chain, _ := makeGenesisWithCoinbase(t, aliceKeys, supply)
+        scanner := core.NewWalletScanner(
+                aliceKeys.View.Private, aliceKeys.Spend.Public, aliceKeys.View.Public, net,
+        )
+        ownedByAlice := scanner.ScanChain(chain, 0, chain.Height())
+        if len(ownedByAlice) == 0 {
+                t.Fatal("Alice found no UTXOs")
+        }
+
+        // Build a UTXOSet with only 3 spent decoys — far fewer than RingSize-1 = 15.
+        const nSpentDecoys = 3
+        utxos := core.NewUTXOSet()
+        for i := 0; i < nSpentDecoys; i++ {
+                dk, err := crypto.GenerateWalletKeys()
+                if err != nil {
+                        t.Fatalf("GenerateWalletKeys decoy %d: %v", i, err)
+                }
+                utxos.AddSpentDecoyForTest(&core.UTXO{OneTimePub: dk.Spend.Public})
+        }
+
+        builder := core.NewTxBuilder(
+                aliceKeys.Spend.Private, aliceKeys.View.Private,
+                aliceKeys.Spend.Public, ownedByAlice, 1,
+        ).WithDecoySet(utxos)
+
+        result, err := builder.Build(30_000_000, bobAddr, aliceAddr)
+        if err != nil {
+                t.Fatalf("Build failed: %v", err)
+        }
+
+        // 1 input × (RingSize-1) = 15 decoy slots total.
+        // Only nSpentDecoys=3 could be filled with real on-chain UTXOs.
+        wantRealDecoys := nSpentDecoys
+        wantFallback := (crypto.RingSize - 1) - nSpentDecoys
+
+        if result.RealDecoyCount != wantRealDecoys {
+                t.Errorf("RealDecoyCount = %d, want %d", result.RealDecoyCount, wantRealDecoys)
+        }
+        if result.FallbackDecoyCount != wantFallback {
+                t.Errorf("FallbackDecoyCount = %d, want %d", result.FallbackDecoyCount, wantFallback)
+        }
+        if result.FallbackDecoyCount == 0 {
+                t.Error("FallbackDecoyCount must be > 0 when the decoy pool is sparse")
+        }
+        t.Logf("RealDecoyCount=%d FallbackDecoyCount=%d (RingSize-1=%d)",
+                result.RealDecoyCount, result.FallbackDecoyCount, crypto.RingSize-1)
+}
