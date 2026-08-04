@@ -137,6 +137,13 @@ type ConsensusConfig struct {
 	BlockTime          time.Duration `yaml:"block_time"`
 	OracleURL          string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
 	OracleMaxDeviation float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
+	// NonValidator, when true, disables block production on this node. The node
+	// still validates and relays all blocks, maintains a full chain copy, and
+	// participates in P2P gossip — it simply never proposes or signs blocks.
+	// Use this for sync/relay/RPC nodes that should not interfere with consensus.
+	// validator_key is still loaded for API identity if specified, but is not
+	// passed to the consensus engine.
+	NonValidator bool `yaml:"non_validator"`
 }
 
 // APIConfig holds RPC/REST settings.

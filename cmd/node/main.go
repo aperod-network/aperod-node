@@ -605,12 +605,20 @@ func run() error {
         // For the resume path, registry is already created and seeded inside the
         // startup scan above.  For genesis, it is nil here; NewEngine creates it.
 
+        // Non-validator mode: pass nil key to the engine so it never produces or
+        // signs blocks.  The key is still used for API identity and P2P NodeID.
+        consensusMyKey := myKey
+        if cfg.Consensus.NonValidator {
+                log.Info("non-validator mode — block production disabled; node will sync and relay only")
+                consensusMyKey = nil
+        }
+
         engine = consensus.NewEngine(consensus.Config{
                 BlockTime:          cfg.Consensus.BlockTime,
                 BFTThreshold:       genesisConfig.BFTThreshold,
                 Validators:         validators,
                 Registry:           registry,
-                MyKey:              myKey,
+                MyKey:              consensusMyKey,
                 RewardAddress:      cfg.Consensus.RewardAddress,
                 BlockRewardNAPR:    cfg.Consensus.BlockRewardNAPR,
                 OracleURL:          cfg.Consensus.OracleURL,
