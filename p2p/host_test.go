@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,17 +19,37 @@ import (
 // ─── Stub handler ─────────────────────────────────────────────────────────────
 
 type stubHandler struct {
+	mu     sync.Mutex
 	blocks []*core.Block
 	txs    []*core.Transaction
 	votes  []p2p.VoteMsg
 }
 
-func (s *stubHandler) OnBlock(b *core.Block)         { s.blocks = append(s.blocks, b) }
-func (s *stubHandler) OnTransaction(tx *core.Transaction) { s.txs = append(s.txs, tx) }
-func (s *stubHandler) OnVote(v p2p.VoteMsg)          { s.votes = append(s.votes, v) }
-func (s *stubHandler) CurrentHeight() uint64         { return 0 }
+func (s *stubHandler) OnBlock(b *core.Block) {
+	s.mu.Lock()
+	s.blocks = append(s.blocks, b)
+	s.mu.Unlock()
+}
+func (s *stubHandler) OnTransaction(tx *core.Transaction) {
+	s.mu.Lock()
+	s.txs = append(s.txs, tx)
+	s.mu.Unlock()
+}
+func (s *stubHandler) OnVote(v p2p.VoteMsg) {
+	s.mu.Lock()
+	s.votes = append(s.votes, v)
+	s.mu.Unlock()
+}
+func (s *stubHandler) CurrentHeight() uint64                    { return 0 }
 func (s *stubHandler) CurrentTailHashes(_ int) []crypto.Hash32 { return nil }
-func (s *stubHandler) GetBlock(_ crypto.Hash32) *core.Block   { return nil }
+func (s *stubHandler) GetBlock(_ crypto.Hash32) *core.Block    { return nil }
+
+// blockCount returns the number of blocks received so far, safe for concurrent use.
+func (s *stubHandler) blockCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.blocks)
+}
 
 func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -476,6 +497,131 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 	} else {
 		t.Logf("✓ outbound dial succeeded after inbound flood: inbound=%d total=%d (+%d outbound)", preDial, afterDial, afterDial-preDial)
 	}
+}
+
+// TestHost_ValidatorHeightDivergence_NoBan is a regression test for the
+// auto-ban bug that silently dropped the 2nd legitimate validator when its
+// tip height was far ahead of the local node's tip.
+//
+// Scenario: hA is a node at tip 0.  hB is a validator whose chain is 10 000
+// blocks ahead.  hB sends 20 MsgBlock messages — each with height ourTip +
+// 10 000 — which is above the BadBlockHeightLead window and therefore
+// increments the bad-block strike counter on hA.  With the post-fix
+// configuration (BadBlockBanThreshold set high enough that 20 strikes cannot
+// trigger a ban), hB must remain connected and normal block delivery must
+// continue to work.
+func TestHost_ValidatorHeightDivergence_NoBan(t *testing.T) {
+	const farAheadHeight = uint64(10_000)
+	const msgCount = 20 // intentionally > default BadBlockBanThreshold (10)
+
+	// hA: the "behind" node.  BadBlockBanThreshold is set high enough that
+	// msgCount strikes can never trigger a ban, representing the post-fix
+	// production configuration where legitimate ahead-validators are not
+	// silently dropped.
+	handlerA := &stubHandler{}
+	hA := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "node-a",
+		UserAgent:            "aperod/test",
+		BadBlockHeightLead:   1_000,
+		BadBlockBanThreshold: 10_000, // post-fix: threshold too high to trigger on a legitimate peer
+	}, handlerA, newTestLogger())
+	if err := hA.Start(); err != nil {
+		t.Fatalf("hA.Start: %v", err)
+	}
+	defer hA.Stop()
+
+	// hB: the "ahead" validator.  Default config is fine here.
+	hB := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "node-b",
+		UserAgent:  "aperod/test",
+	}, &stubHandler{}, newTestLogger())
+	if err := hB.Start(); err != nil {
+		t.Fatalf("hB.Start: %v", err)
+	}
+	defer hB.Stop()
+
+	addrA := hA.ListenAddr()
+	if addrA == "" {
+		t.Skip("ListenAddr not exposed — skipping")
+	}
+
+	// hB dials hA.  hB is outbound; hA accepts inbound.
+	// With the asymmetric handshake (outbound sends Ping, inbound waits) this
+	// succeeds cleanly without a deadlock.
+	hB.DialPeer(addrA)
+	time.Sleep(300 * time.Millisecond)
+
+	if hA.PeerCount() != 1 || hB.PeerCount() != 1 {
+		t.Fatalf("setup: expected 1 peer on each host; hA=%d hB=%d", hA.PeerCount(), hB.PeerCount())
+	}
+	t.Logf("setup ok: hA peers=%d hB peers=%d", hA.PeerCount(), hB.PeerCount())
+
+	// hB broadcasts msgCount blocks at height far ahead of hA's tip (0).
+	// Each block has height = farAheadHeight + i, which exceeds
+	// ourTip (0) + BadBlockHeightLead (1 000) and therefore increments hA's
+	// strike counter for hB's IP on every message.
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	for i := 0; i < msgCount; i++ {
+		hdr := core.BlockHeader{
+			Height:       farAheadHeight + uint64(i),
+			ValidatorPub: pub,
+			Timestamp:    time.Now().UnixNano(),
+		}
+		if signErr := hdr.Sign(priv); signErr != nil {
+			t.Fatalf("Sign block %d: %v", i, signErr)
+		}
+		hB.BroadcastBlock(&core.Block{Header: hdr})
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Allow hA's dispatch goroutine to process all messages.
+	time.Sleep(200 * time.Millisecond)
+
+	// ── Key assertions ──────────────────────────────────────────────────────
+	// 1. hA must NOT have banned or disconnected hB.
+	if hA.PeerCount() != 1 {
+		t.Errorf("hA dropped hB after %d far-ahead blocks: PeerCount=%d, want 1 (auto-ban regression)", msgCount, hA.PeerCount())
+	}
+	// 2. hB must still see hA as connected.
+	if hB.PeerCount() != 1 {
+		t.Errorf("hB lost connection to hA: PeerCount=%d, want 1", hB.PeerCount())
+	}
+
+	// 3. Normal block exchange still works after the divergence episode.
+	normalHdr := core.BlockHeader{
+		Height:       0,
+		ValidatorPub: pub,
+		Timestamp:    time.Now().UnixNano(),
+	}
+	if signErr := normalHdr.Sign(priv); signErr != nil {
+		t.Fatalf("Sign normal block: %v", signErr)
+	}
+	normalBlock := &core.Block{Header: normalHdr}
+	hB.BroadcastBlock(normalBlock)
+
+	// Poll for delivery instead of a fixed sleep to avoid false negatives
+	// and eliminate the data race between the dispatch goroutine writing
+	// handlerA.blocks and the test goroutine reading it.
+	var gotBlocks int
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if gotBlocks = handlerA.blockCount(); gotBlocks > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if gotBlocks == 0 {
+		t.Error("hA's handler received 0 blocks from hB — normal block exchange broken after height-divergence episode")
+	}
+	t.Logf("✓ both validators stayed connected after %d far-ahead blocks; hA handler received %d block(s)", msgCount, gotBlocks)
 }
 
 // TestHost_DialPeer_BackoffAfterHandshakeDrop verifies that when an outbound
