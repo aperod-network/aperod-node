@@ -261,7 +261,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"ok":true,"syncing":false,"height":1}')
+        # Return zero peers for the network/stats endpoint so that the
+        # peer-check scenario (Scenario 3) can exercise the warning path.
+        # Scenarios 1 and 2 use SKIP_PEER_CHECK=1 so this value is ignored.
+        if self.path == "/api/v1/network/stats":
+            self.wfile.write(b'{"peer_count":0,"peers":{"connected":0}}')
+        else:
+            self.wfile.write(b'{"ok":true,"syncing":false,"height":1}')
     def log_message(self, *a):
         pass  # suppress access log noise
 
@@ -650,6 +656,118 @@ fi
 HARNESS
 chmod +x "$CTX/test-harness-rollback.sh"
 
+# ── Scenario 3: peer-check warning ────────────────────────────────────────────
+# SKIP_PEER_CHECK is NOT set so aperod_peer_check() runs for real.
+# The stub binary returns peer_count=0 from /api/v1/network/stats.
+# Expected outcomes:
+#   P1. update-node.sh exits 0  (peer check is NON-FATAL).
+#   P2. Combined stdout+stderr contains the expected warning text
+#       ("WARNING: peer_count == 0"), confirming the warning code path ran.
+#   P3. systemctl is-active aperod-node returns 0 (service is up after update).
+#   P4. Combined output contains "==> [5b] Peer connectivity check"
+#       (confirming the peer-check step was not accidentally skipped).
+
+cat > "$CTX/test-harness-peer-check.sh" << 'HARNESS'
+#!/usr/bin/env bash
+# Scenario 3 — peer-check warning path.
+#
+# update-node.sh is run WITHOUT SKIP_PEER_CHECK so that peer-check.sh
+# is exercised.  The stub aperod-node returns peer_count=0 for
+# /api/v1/network/stats, so the warning branch fires.  The script must
+# still exit 0 (peer check is non-fatal).
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
+PASS=0; FAIL=0
+
+pass_assert() { echo -e "${GREEN}  PASS${NC}  $*"; ((PASS++)); }
+fail_assert() { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
+
+# Stubs take priority over system binaries
+export PATH="/stubs:$PATH"
+
+# ── Step 1: Pre-seed ──────────────────────────────────────────────────────────
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 3] Pre-seeding installed-node state"
+echo "══════════════════════════════════════════════════"
+bash /preseed.sh
+
+# ── Step 2: Run update-node.sh without SKIP_PEER_CHECK ───────────────────────
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 3] Running update-node.sh (peer check enabled)"
+echo "══════════════════════════════════════════════════"
+
+# PEER_WAIT_SECS=3  — short wait so the test doesn't stall 30 s in CI.
+# HEALTH_MAX_ATTEMPTS / HEALTH_WAIT_SECS — keep health check fast.
+# SKIP_PEER_CHECK is deliberately NOT set (must default to 0).
+PEER_WAIT_SECS=3 \
+HEALTH_MAX_ATTEMPTS=10 \
+HEALTH_WAIT_SECS=1 \
+  bash /deploy/update-node.sh > /tmp/scenario3-output.txt 2>&1
+UPDATE_EXIT=$?
+
+# Show the combined output for debugging convenience.
+cat /tmp/scenario3-output.txt
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  [Scenario 3] Assertions"
+echo "══════════════════════════════════════════════════"
+
+OUTPUT=$(cat /tmp/scenario3-output.txt)
+
+# P1: update-node.sh must exit 0 (peer check is NON-FATAL).
+if [[ $UPDATE_EXIT -eq 0 ]]; then
+  pass_assert "P1: update-node.sh exited 0 (peer check is non-fatal)"
+else
+  fail_assert "P1: update-node.sh exited $UPDATE_EXIT (expected 0 — peer check must be non-fatal)"
+fi
+
+# P2: the warning text must appear in the combined output.
+if echo "$OUTPUT" | grep -q "WARNING: peer_count == 0"; then
+  pass_assert "P2: warning 'WARNING: peer_count == 0' found in output"
+else
+  fail_assert "P2: warning 'WARNING: peer_count == 0' NOT found in output — peer-check warning did not fire"
+  echo "     --- captured output ---" >&2
+  echo "$OUTPUT" >&2
+  echo "     --- end of output ---" >&2
+fi
+
+# P3: service must still be active after the update completes.
+if systemctl is-active --quiet aperod-node; then
+  pass_assert "P3: systemctl is-active aperod-node returned 0 (service is up)"
+else
+  fail_assert "P3: systemctl is-active aperod-node returned non-zero (service is down)"
+  echo "     fake-systemctl log:" >&2
+  cat /tmp/fake-systemctl.log >&2 || true
+  echo "     aperod-node stub log:" >&2
+  cat /tmp/aperod-node-stub.log >&2 || true
+fi
+
+# P4: the peer-check step banner must appear, confirming it was not skipped.
+if echo "$OUTPUT" | grep -q "\[5b\] Peer connectivity check"; then
+  pass_assert "P4: '[5b] Peer connectivity check' banner found — step was not skipped"
+else
+  fail_assert "P4: '[5b] Peer connectivity check' banner NOT found — step may have been skipped"
+  echo "     --- captured output ---" >&2
+  echo "$OUTPUT" >&2
+  echo "     --- end of output ---" >&2
+fi
+
+echo ""
+echo "──────────────────────────────────────────────────"
+TOTAL=$((PASS + FAIL))
+if [[ $FAIL -eq 0 ]]; then
+  echo -e "${GREEN}All $TOTAL peer-check assertions passed.${NC}"
+  exit 0
+else
+  echo -e "${RED}$FAIL of $TOTAL peer-check assertions FAILED.${NC}"
+  exit 1
+fi
+HARNESS
+chmod +x "$CTX/test-harness-peer-check.sh"
+
 # ── Dockerfile ────────────────────────────────────────────────────────────────
 cat > "$CTX/Dockerfile" << 'DOCKER'
 FROM ubuntu:22.04
@@ -682,9 +800,10 @@ COPY stubs-extra/    /stubs-extra/
 # Real deploy directory — update-node.sh + peer-check.sh + all siblings
 COPY deploy/         /deploy/
 # Pre-seed and test harness scripts
-COPY preseed.sh               /preseed.sh
-COPY test-harness.sh          /test-harness.sh
-COPY test-harness-rollback.sh /test-harness-rollback.sh
+COPY preseed.sh                  /preseed.sh
+COPY test-harness.sh             /test-harness.sh
+COPY test-harness-rollback.sh    /test-harness-rollback.sh
+COPY test-harness-peer-check.sh  /test-harness-peer-check.sh
 
 # Pre-create standard system directories
 RUN mkdir -p /etc/systemd/system /run/fake-systemd /etc/aperod /var/log/aperod
@@ -730,9 +849,23 @@ else
   echo -e "${RED}${BOLD}Scenario 2 (broken install → rollback) FAILED.${NC}"
 fi
 
+# ── Run scenario 3: peer-check warning ───────────────────────────────────────
+echo -e "\n${BOLD}[Scenario 3] Running peer-check warning test…${NC}"
+echo "────────────────────────────────────────────────────"
+
+S3_PASS=false
+if docker run --rm "$IMAGE_TAG" bash /test-harness-peer-check.sh; then
+  echo "────────────────────────────────────────────────────"
+  echo -e "${GREEN}${BOLD}Scenario 3 (peer-check warning) PASSED.${NC}"
+  S3_PASS=true
+else
+  echo "────────────────────────────────────────────────────"
+  echo -e "${RED}${BOLD}Scenario 3 (peer-check warning) FAILED.${NC}"
+fi
+
 # ── Overall result ────────────────────────────────────────────────────────────
 echo ""
-if [[ "$S1_PASS" == "true" && "$S2_PASS" == "true" ]]; then
+if [[ "$S1_PASS" == "true" && "$S2_PASS" == "true" && "$S3_PASS" == "true" ]]; then
   echo -e "${GREEN}${BOLD}All update-node.sh e2e scenarios PASSED.${NC}"
   exit 0
 else
