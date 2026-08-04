@@ -75,9 +75,19 @@ ssh "root@${TARGET_IP}" "rm -f ${SECONDARY_DATA_DIR}/p2p_identity.key && echo 'r
 ok "p2p_identity.key удалён (новый будет создан при старте)"
 
 # ── Шаг 4: Права и запуск ─────────────────────────────────
-info "Шаг 4/5: Устанавливаем права и запускаем ноду…"
+info "Шаг 4/5: Устанавливаем права, drop-in конфиги и запускаем ноду…"
 ssh "root@${TARGET_IP}" "
   chown -R ${SECONDARY_USER}:${SECONDARY_USER} ${SECONDARY_DATA_DIR}/
+  mkdir -p /etc/systemd/system/aperod-node.service.d
+  cat > /etc/systemd/system/aperod-node.service.d/timeout.conf << 'DROPIN'
+[Service]
+TimeoutStopSec=300
+DROPIN
+  cat > /etc/systemd/system/aperod-node.service.d/gomemlimit.conf << 'DROPIN'
+[Service]
+Environment=\"GOMEMLIMIT=5368709120\"
+DROPIN
+  systemctl daemon-reload
   systemctl enable --now aperod-node
   echo 'started'
 "
