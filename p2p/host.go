@@ -420,7 +420,12 @@ func (h *Host) loadWhitelistFromFile() error {
                                 ips = append(ips, ip)
                                 valid = append(valid, entry)
                         } else {
-                                h.log.Warn("p2p: whitelist sidecar: ignoring unparseable entry", "entry", entry)
+                                // A corrupt/tampered sidecar with invalid entries must not
+                                // be silently ignored: if all entries are invalid, the node
+                                // would run as an open network.  Fail-closed instead.
+                                return fmt.Errorf("p2p: whitelist sidecar %q contains an invalid "+
+                                        "IP/CIDR entry %q — repair or remove the file to restart the node",
+                                        h.cfg.WhitelistFile, entry)
                         }
                 }
                 // Overwrite the in-memory state entirely (no merge with cfg).

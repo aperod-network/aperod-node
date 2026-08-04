@@ -271,6 +271,33 @@ func TestWhitelist_CorruptSidecarFails(t *testing.T) {
 	}
 }
 
+// TestWhitelist_ValidJSONInvalidEntriesFails verifies that a sidecar with
+// syntactically valid JSON but containing invalid IP/CIDR entries causes
+// loadWhitelistFromFile to return an error (fail-closed), not silently produce
+// an empty whitelist that admits all inbound peers.
+func TestWhitelist_ValidJSONInvalidEntriesFails(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	// Valid JSON array, but entries are garbage strings.
+	if err := os.WriteFile(wlFile, []byte(`["not-an-ip", "also-bad"]`), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.PeerWhitelist = []string{"3.3.3.3"} // cfg has an entry — must not be used
+		cfg.WhitelistFile = wlFile
+	})
+	if err := h.loadWhitelistFromFile(); err == nil {
+		t.Fatal("expected error for valid JSON sidecar with invalid IP entries, got nil")
+	}
+
+	// The in-memory whitelist must not be modified (stays at the cfg value or empty).
+	// Critically, it must NOT be set to an empty list that would allow all inbound peers.
+	// Since loadWhitelistFromFile errors out before overwriting, wlNets/wlIPs are whatever
+	// NewHost set from cfg.PeerWhitelist, which is fine — Start() would abort anyway.
+}
+
 // TestWhitelist_UnreadableSidecarFails verifies that a sidecar that exists but
 // cannot be read (e.g. permission denied) causes loadWhitelistFromFile to return
 // a non-nil error so that Start() aborts (fail-closed).
