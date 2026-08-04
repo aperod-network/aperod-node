@@ -15,213 +15,679 @@
   "schemaVersion": 39,
   "version": 4,
   "refresh": "15s",
-  "time": { "from": "now-6h", "to": "now" },
-  "templating": { "list": [] },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
   "panels": [
-
     {
       "id": 1,
       "title": "Высота цепочки",
       "type": "stat",
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_chain_height", "legendFormat": "высота" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_chain_height",
+          "legendFormat": "высота"
+        }
+      ]
     },
-
     {
       "id": 2,
       "title": "Размер мемпула",
       "type": "stat",
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 200 }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_mempool_size", "legendFormat": "мемпул" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_mempool_size",
+          "legendFormat": "мемпул"
+        }
+      ]
     },
-
     {
       "id": 3,
       "title": "Подключённые ноды",
       "type": "stat",
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 3 }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_peer_count", "legendFormat": "ноды" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_peer_count",
+          "legendFormat": "ноды"
+        }
+      ]
     },
-
     {
       "id": 4,
       "title": "Статус ноды",
       "type": "stat",
-      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "ВЫКЛ", "color": "red", "index": 0 }, "1": { "text": "ВКЛ", "color": "green", "index": 1 } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ВЫКЛ",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "ВКЛ",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
           ],
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_up", "legendFormat": "нода" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_up",
+          "legendFormat": "нода"
+        }
+      ]
     },
-
     {
       "id": 5,
       "title": "Высота цепочки (история)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "single" } },
-      "fieldConfig": { "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10 } }, "overrides": [] },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_chain_height", "legendFormat": "высота" }]
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_chain_height",
+          "legendFormat": "высота"
+        }
+      ]
     },
-
     {
       "id": 6,
       "title": "Валидаторы: активные / всего",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
-      "fieldConfig": { "defaults": { "custom": { "lineWidth": 2 } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_validator_count_active", "legendFormat": "активные" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_validator_count_total", "legendFormat": "всего" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_validator_count_active",
+          "legendFormat": "активные"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_validator_count_total",
+          "legendFormat": "всего"
+        }
       ]
     },
-
     {
       "id": 7,
       "title": "API-сервер — запросы/сек",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
-      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2, "fillOpacity": 8 } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aperod_api_http_requests_total[5m]))", "legendFormat": "всего" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aperod_api_http_requests_total{status=~\"2..\"}[5m]))", "legendFormat": "2xx" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aperod_api_http_requests_total{status=~\"4..\"}[5m]))", "legendFormat": "4xx" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aperod_api_http_requests_total{status=~\"5..\"}[5m]))", "legendFormat": "5xx" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(aperod_api_http_requests_total[5m]))",
+          "legendFormat": "всего"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(aperod_api_http_requests_total{status=~\"2..\"}[5m]))",
+          "legendFormat": "2xx"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(aperod_api_http_requests_total{status=~\"4..\"}[5m]))",
+          "legendFormat": "4xx"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(aperod_api_http_requests_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "5xx"
+        }
       ]
     },
-
     {
       "id": 8,
       "title": "Ежедневные выплаты — история",
       "type": "timeseries",
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 14 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "single" } },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "custom": { "lineWidth": 2 }, "mappings": [
-          { "type": "value", "options": { "0": { "text": "ОШИБКА" }, "1": { "text": "УСПЕХ" } } }
-        ] },
+        "defaults": {
+          "custom": {
+            "lineWidth": 2
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ОШИБКА"
+                },
+                "1": {
+                  "text": "УСПЕХ"
+                }
+              }
+            }
+          ]
+        },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_daily_payout_last_run_success", "legendFormat": "успех запуска (1/0)" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_daily_payout_last_run_success",
+          "legendFormat": "успех запуска (1/0)"
+        }
+      ]
     },
-
     {
       "id": 9,
       "title": "Ежедневные выплаты — детали",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 18 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_daily_payout_validators_paid", "legendFormat": "Валидаторов выплачено" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_daily_payout_total_reward_apr", "legendFormat": "APRO валидаторам" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_daily_payout_total_fees_apr", "legendFormat": "APRO комиссии" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_daily_payout_duration_seconds", "legendFormat": "Длительность, сек" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_daily_payout_validators_paid",
+          "legendFormat": "Валидаторов выплачено"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_daily_payout_total_reward_apr",
+          "legendFormat": "APRO валидаторам"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_daily_payout_total_fees_apr",
+          "legendFormat": "APRO комиссии"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_daily_payout_duration_seconds",
+          "legendFormat": "Длительность, сек"
+        }
       ]
     },
-
     {
       "id": 20,
       "title": "— Посещения (Nginx)",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": []
     },
-
     {
       "id": 21,
       "title": "Запросов в секунду (nginx)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "single" } },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "irate(nginx_http_requests_total[5m])", "legendFormat": "запросов/сек" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "irate(nginx_http_requests_total[5m])",
+          "legendFormat": "запросов/сек"
+        }
+      ]
     },
-
     {
       "id": 22,
       "title": "Активные соединения nginx",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 } },
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        },
         "overrides": []
       },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "nginx_connections_active", "legendFormat": "активные" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "nginx_connections_waiting", "legendFormat": "ожидание" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "nginx_connections_reading + nginx_connections_writing", "legendFormat": "чтение+запись" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "nginx_connections_active",
+          "legendFormat": "активные"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "nginx_connections_waiting",
+          "legendFormat": "ожидание"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "nginx_connections_reading + nginx_connections_writing",
+          "legendFormat": "чтение+запись"
+        }
       ]
     },
-
     {
       "id": 30,
       "title": "— Нагрузка сервера",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": []
     },
-
     {
       "id": 31,
       "title": "ЦП %",
       "type": "gauge",
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 32 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -229,21 +695,56 @@
           "max": 100,
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 85 }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
           }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "ЦП" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "ЦП"
+        }
+      ]
     },
-
     {
       "id": 32,
       "title": "ОЗУ %",
       "type": "gauge",
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 32 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -251,21 +752,56 @@
           "max": 100,
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
           }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "ОЗУ" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+          "legendFormat": "ОЗУ"
+        }
+      ]
     },
-
     {
       "id": 33,
       "title": "Диск %",
       "type": "gauge",
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 32 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -273,203 +809,655 @@
           "max": 100,
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
           }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "(1 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!=\"tmpfs\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!=\"tmpfs\"})) * 100", "legendFormat": "диск /" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "(1 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!=\"tmpfs\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!=\"tmpfs\"})) * 100",
+          "legendFormat": "диск /"
+        }
+      ]
     },
-
     {
       "id": 34,
       "title": "ЦП история",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "single" } },
-      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "lineWidth": 2, "fillOpacity": 10 } }, "overrides": [] },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "ЦП %" }]
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "ЦП %"
+        }
+      ]
     },
-
     {
       "id": 35,
       "title": "Сетевой трафик (входящий/исходящий)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
-      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 8 } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_receive_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])", "legendFormat": "входящий ({{device}})" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(node_network_transmit_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])", "legendFormat": "исходящий ({{device}})" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(node_network_receive_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])",
+          "legendFormat": "входящий ({{device}})"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(node_network_transmit_bytes_total{device=~\"eth0|net0|ens.*|enp.*\"}[5m])",
+          "legendFormat": "исходящий ({{device}})"
+        }
       ]
     },
-
     {
       "id": 40,
       "title": "— Безопасность",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": []
     },
-
     {
       "id": 41,
       "title": "HTTP 4xx (ошибки клиента) /сек",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "reqps", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2, "fillOpacity": 12 } },
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "fixedColor": "orange",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 12
+          }
+        },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(aperod_api_http_requests_total{status=~\"4..\"}[5m])", "legendFormat": "4xx {{route}}" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(aperod_api_http_requests_total{status=~\"4..\"}[5m])",
+          "legendFormat": "4xx {{route}}"
+        }
+      ]
     },
-
     {
       "id": 42,
       "title": "HTTP 5xx (ошибки сервера) /сек",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "reqps", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2, "fillOpacity": 15 } },
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "fixedColor": "red",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15
+          }
+        },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(aperod_api_http_requests_total{status=~\"5..\"}[5m])", "legendFormat": "5xx {{route}}" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(aperod_api_http_requests_total{status=~\"5..\"}[5m])",
+          "legendFormat": "5xx {{route}}"
+        }
+      ]
     },
-
     {
       "id": 43,
       "title": "Неудачные соединения nginx (dropped)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "single" } },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "single"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "short", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "red",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(nginx_connections_accepted[5m]) - rate(nginx_connections_handled[5m])", "legendFormat": "dropped/сек" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(nginx_connections_accepted[5m]) - rate(nginx_connections_handled[5m])",
+          "legendFormat": "dropped/сек"
+        }
+      ]
     },
-
     {
       "id": 44,
       "title": "Нагрузка (1м / 5м / 15м)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "tooltip": { "mode": "multi" } },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "node_load1", "legendFormat": "1 мин" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "node_load5", "legendFormat": "5 мин" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "node_load15", "legendFormat": "15 мин" }
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "node_load1",
+          "legendFormat": "1 мин"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "node_load5",
+          "legendFormat": "5 мин"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "node_load15",
+          "legendFormat": "15 мин"
+        }
       ]
     },
-
     {
       "id": 50,
       "title": "— Бэкап / Cron",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      },
       "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": []
     },
-
     {
       "id": 51,
       "title": "Бэкап (cron 12 ч) — статус последнего запуска",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 65 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value_and_name"
+      },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "ОШИБКА / не запускался", "color": "red", "index": 0 }, "1": { "text": "УСПЕХ", "color": "green", "index": 1 } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ОШИБКА / не запускался",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "УСПЕХ",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
           ],
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_backup_last_success", "legendFormat": "Последний бэкап" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_backup_last_success",
+          "legendFormat": "Последний бэкап"
+        }
+      ]
     },
-
     {
       "id": 52,
       "title": "Бэкап — детали",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 65 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
-      "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_backup_duration_seconds", "legendFormat": "Длительность, сек" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "time() - aperod_backup_last_success_timestamp_seconds", "legendFormat": "Сек с последнего бэкапа" }
-      ]
-    },
-
-    {
-      "id": 60,
-      "title": "— API Лог",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 69 },
-      "collapsed": false,
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "targets": []
-    },
-
-    {
-      "id": 61,
-      "title": "API Лог — запросы по маршруту и статусу",
-      "description": "Количество запросов с момента последнего рестарта API. Используйте для отслеживания ошибок и аномалий.",
-      "type": "table",
-      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 70 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "options": {
-        "sortBy": [{ "displayName": "Запросов", "desc": true }],
-        "footer": { "show": false },
-        "frameIndex": 0,
-        "showHeader": true
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value_and_name"
       },
       "fieldConfig": {
         "defaults": {
-          "custom": { "align": "left", "displayMode": "auto", "inspect": false }
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "Статус" },
+            "matcher": {
+              "id": "byName",
+              "options": "Минут до следующего бэкапа"
+            },
             "properties": [
-              { "id": "custom.width", "value": 90 },
-              { "id": "custom.displayMode", "value": "color-background" },
+              {
+                "id": "unit",
+                "value": "m"
+              },
               {
                 "id": "thresholds",
                 "value": {
                   "mode": "absolute",
                   "steps": [
-                    { "color": "green", "value": null },
-                    { "color": "yellow", "value": 400 },
-                    { "color": "red", "value": 500 }
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 30
+                    },
+                    {
+                      "color": "green",
+                      "value": 60
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Длительность, сек"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_backup_duration_seconds",
+          "legendFormat": "Длительность, сек"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "clamp_min((43200 - (time() - aperod_backup_last_success_timestamp_seconds)) / 60, 0)",
+          "legendFormat": "Минут до следующего бэкапа"
+        }
+      ]
+    },
+    {
+      "id": 60,
+      "title": "— API Лог",
+      "type": "row",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": []
+    },
+    {
+      "id": 61,
+      "title": "API Лог — запросы по маршруту и статусу",
+      "description": "Количество запросов с момента последнего рестарта API. Используйте для отслеживания ошибок и аномалий.",
+      "type": "table",
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Запросов",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        },
+        "frameIndex": 0,
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left",
+            "displayMode": "auto",
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Статус"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 400
+                    },
+                    {
+                      "color": "red",
+                      "value": 500
+                    }
                   ]
                 }
               }
             ]
           },
-          { "matcher": { "id": "byName", "options": "Запросов" }, "properties": [{ "id": "custom.width", "value": 120 }] },
-          { "matcher": { "id": "byName", "options": "Метод" }, "properties": [{ "id": "custom.width", "value": 90 }] },
-          { "matcher": { "id": "byName", "options": "Маршрут" }, "properties": [{ "id": "custom.width", "value": 320 }] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Запросов"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Метод"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Маршрут"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 320
+              }
+            ]
+          }
         ]
       },
       "transformations": [
-        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
         {
           "id": "organize",
           "options": {
@@ -495,44 +1483,135 @@
           }
         }
       ],
-      "targets": [{
-        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "expr": "aperod_api_http_requests_total",
-        "legendFormat": "",
-        "instant": true,
-        "format": "table",
-        "refId": "A"
-      }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_api_http_requests_total",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        }
+      ]
     },
-
     {
       "id": 70,
       "title": "API-сервер статус",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 84 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 84
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
       "fieldConfig": {
         "defaults": {
-          "mappings": [{ "type": "value", "options": { "0": { "text": "ВЫКЛ", "color": "red", "index": 0 }, "1": { "text": "ВКЛ", "color": "green", "index": 1 } } }],
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ВЫКЛ",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "ВКЛ",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_api_up", "legendFormat": "API" }]
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_api_up",
+          "legendFormat": "API"
+        }
+      ]
     },
-
     {
       "id": 71,
       "title": "API — время работы",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 84 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aperod_api_uptime_seconds", "legendFormat": "аптайм" }]
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 84
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_api_uptime_seconds",
+          "legendFormat": "аптайм"
+        }
+      ]
     }
-
   ]
 }
