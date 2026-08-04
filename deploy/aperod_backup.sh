@@ -168,6 +168,71 @@ export RCLONE_CONFIG_S3BACKUP_ACL="private"
 RCLONE_REMOTE="s3backup:${S3_BUCKET}"
 PRUNE_AGE="${S3_RETENTION_DAYS}d"
 
+# ── Clean up stale backup-tmp dirs from previous crashed runs ──────────────────
+# If the server was hard-killed (OOM, power loss), the EXIT trap never ran and
+# the temp dir remains, potentially consuming hundreds of MBs or more — which
+# can cause the disk-space preflight to skip the next backup (false low-disk).
+# Glob all aperod_backups_* dirs in the parent directory; remove any that are
+# older than 6 hours (safely past any legitimate running backup).
+_cleanup_stale_backup_dirs() {
+  local base_dir
+  base_dir=$(dirname "$BACKUP_DIR")
+  [ -d "$base_dir" ] || return 0
+
+  local stale_dirs=()
+  while IFS= read -r -d '' dir; do
+    stale_dirs+=("$dir")
+  done < <(find "$base_dir" -maxdepth 1 -type d -name 'aperod_backups_*' -mmin +360 -print0 2>/dev/null)
+
+  [ "${#stale_dirs[@]}" -eq 0 ] && return 0
+
+  echo "=== ПРЕДУПРЕЖДЕНИЕ: обнаружены устаревшие временные директории бэкапа ==="
+  echo "  Вероятно, предыдущий запуск завершился аварийно (OOM, аварийное отключение)."
+
+  local total_kb=0
+  for dir in "${stale_dirs[@]}"; do
+    local sz_kb
+    sz_kb=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+    [ -z "$sz_kb" ] && sz_kb=0
+    local sz_human
+    sz_human=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+    echo "  Удаляем устаревшую директорию: ${dir}  (${sz_human})"
+    rm -rf "$dir"
+    total_kb=$(( total_kb + sz_kb ))
+  done
+
+  local total_gb
+  total_gb=$(awk "BEGIN{printf \"%.2f\", ${total_kb}/1024/1024}")
+  echo "  Итого освобождено: ${total_gb} ГБ из ${#stale_dirs[@]} директорий."
+
+  # ── Telegram alert if stale dirs exceeded 1 GB ───────────────────────────────
+  local threshold_kb=$(( 1 * 1024 * 1024 ))  # 1 GiB in kibibytes
+  if [ "$total_kb" -gt "$threshold_kb" ] \
+     && [ -n "${TELEGRAM_BOT_TOKEN:-}" ] \
+     && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
+    local ts_iso
+    ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local tg_text
+    tg_text="⚠️ <b>Aperod Backup: устаревшие временные файлы удалены</b>%0A%0A"
+    tg_text+="<b>Директорий удалено:</b> ${#stale_dirs[@]}%0A"
+    tg_text+="<b>Освобождено:</b> ${total_gb} ГБ%0A"
+    tg_text+="<b>Время:</b> ${ts_iso}%0A%0A"
+    tg_text+="[!] Предыдущий запуск скрипта бэкапа завершился аварийно (OOM или%0A"
+    tg_text+="принудительное завершение процесса) — временные файлы остались на диске.%0A%0A"
+    tg_text+="[i] <b>Диагностика:</b>%0A"
+    tg_text+="<code>journalctl -u aperod-backup.service -n 50</code>"
+    curl -s --max-time 15 -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${ADMIN_TELEGRAM_CHAT_ID}" \
+      -d "text=${tg_text}" \
+      -d "parse_mode=HTML" \
+      -d "disable_web_page_preview=true" \
+      >/dev/null 2>&1 || true
+    echo "  Telegram stale-dir alert sent to admin chat."
+  fi
+}
+_cleanup_stale_backup_dirs
+
 mkdir -p "$BACKUP_DIR"
 
 # ── Pre-flight: disk space check (5 GB minimum on each relevant filesystem) ──
