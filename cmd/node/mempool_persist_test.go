@@ -351,6 +351,101 @@ func TestMempoolPersistExpiredTxDropped(t *testing.T) {
 	}
 }
 
+// ─── Test 5: confirmed txs are absent after RemoveBlock → Save → Load ────────
+
+// TestMempoolConfirmedTxNotReplayedAfterRestart verifies that a transaction
+// which was included in a block (and therefore removed from the mempool via
+// RemoveBlock) is NOT present in the pool after a save/load cycle.
+//
+// This is the complement of TestMempoolPersistProductionPath: where that test
+// confirms a pending tx survives a restart, this test confirms a confirmed tx
+// does NOT survive — preventing double-spend-rejection storms or ghost entries
+// from appearing after a node restart.
+//
+// Scenario:
+//  1. Add two transactions to the mempool (tx-confirmed, tx-pending).
+//  2. Simulate block confirmation: call RemoveBlock with a block containing
+//     only tx-confirmed.
+//  3. Verify the pool now holds exactly tx-pending (RemoveBlock worked).
+//  4. Save the mempool — tx-confirmed is already absent, so it cannot be persisted.
+//  5. Load into a fresh pool.
+//  6. Assert tx-confirmed is absent and tx-pending is present.
+//
+// This exercises the Remove/RemoveBlock → Save ordering confirmed in main.go's
+// shutdown sequence, and closes the replay-after-restart edge case.
+func TestMempoolConfirmedTxNotReplayedAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	pool := core.NewMempool(mempoolTestConfig(), discardLogger())
+
+	// Two structurally-valid transactions with distinct key-image indices.
+	txConfirmed := makeTestTx(2000, 70)
+	txPending := makeTestTx(2000, 71)
+
+	if err := pool.Add(txConfirmed); err != nil {
+		t.Fatalf("Add txConfirmed: %v", err)
+	}
+	if err := pool.Add(txPending); err != nil {
+		t.Fatalf("Add txPending: %v", err)
+	}
+	if pool.Count() != 2 {
+		t.Fatalf("pre-RemoveBlock count: got %d, want 2", pool.Count())
+	}
+
+	// Simulate block inclusion: build a minimal block containing only txConfirmed.
+	confirmedBlock := &core.Block{
+		Txs: []core.Transaction{txConfirmed},
+	}
+	pool.RemoveBlock(confirmedBlock)
+
+	// Immediately after RemoveBlock, only txPending should remain.
+	if pool.Count() != 1 {
+		t.Fatalf("post-RemoveBlock count: got %d, want 1", pool.Count())
+	}
+	if _, ok := pool.Get(txConfirmed.Hash()); ok {
+		t.Error("txConfirmed still in pool after RemoveBlock — double-spend risk")
+	}
+	if _, ok := pool.Get(txPending.Hash()); !ok {
+		t.Error("txPending missing from pool after RemoveBlock")
+	}
+
+	// Save — txConfirmed is already gone, so only txPending is written to disk.
+	if err := pool.Save(dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Load into a fresh pool and verify the confirmed tx does not resurface.
+	poolAfter := core.NewMempool(mempoolTestConfig(), discardLogger())
+	restored := poolAfter.Load(dir, discardLogger())
+	if restored != 1 {
+		t.Errorf("Load returned %d restored tx(s), want 1 (only txPending)", restored)
+	}
+	if poolAfter.Count() != 1 {
+		t.Errorf("post-load pool count: got %d, want 1", poolAfter.Count())
+	}
+
+	// The confirmed tx must be absent — it was removed before Save, so it can
+	// never appear in mempool.json and must not be replayed.
+	if _, ok := poolAfter.Get(txConfirmed.Hash()); ok {
+		t.Error("txConfirmed appeared in pool after restart — confirmed tx replayed (BUG)")
+	}
+
+	// The pending tx must be present and selectable for the next block.
+	if _, ok := poolAfter.Get(txPending.Hash()); !ok {
+		t.Error("txPending missing from pool after restart")
+	}
+	selected := poolAfter.SelectTxs(10)
+	if len(selected) != 1 {
+		t.Fatalf("SelectTxs returned %d tx(s), want 1", len(selected))
+	}
+	gotHash := selected[0].Hash()
+	wantHash := txPending.Hash()
+	if gotHash != wantHash {
+		t.Errorf("SelectTxs returned wrong tx: got %x, want %x",
+			gotHash[:8], wantHash[:8])
+	}
+}
+
 // ─── Test 4: SelectTxs orders restored txs by fee rate (descending) ──────────
 
 // TestMempoolPersistFeeRateOrderPreserved verifies that after a save/load cycle
