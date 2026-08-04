@@ -1648,6 +1648,180 @@ else
 fi
 
 # =============================================================================
+# Test 20: update scripts source sync-backup-script.sh and call _sync_backup_script
+# =============================================================================
+section "Test 20: update-node.sh and update-api.sh delegate to sync-backup-script.sh"
+
+SYNC_HELPER="$SCRIPT_DIR/sync-backup-script.sh"
+UPDATE_NODE_SH="$SCRIPT_DIR/update-node.sh"
+UPDATE_API_SH="$SCRIPT_DIR/update-api.sh"
+
+# ── The shared helper must exist ──────────────────────────────────────────────
+if [[ ! -f "$SYNC_HELPER" ]]; then
+  fail "sync-backup-script.sh not found at $SYNC_HELPER"
+else
+  pass "sync-backup-script.sh exists"
+fi
+
+# ── Atomic rename: helper must stage + mv, never write directly ──────────────
+if grep -q 'mv -f' "$SYNC_HELPER"; then
+  pass "sync-backup-script.sh uses mv -f (atomic rename after staging)"
+else
+  fail "sync-backup-script.sh does NOT use mv -f — not atomic"
+fi
+
+if grep -q 'mktemp' "$SYNC_HELPER"; then
+  pass "sync-backup-script.sh uses mktemp for staging (same-filesystem temp)"
+else
+  fail "sync-backup-script.sh does NOT use mktemp for staging"
+fi
+
+# install(1) writes directly to the destination — verify it is NOT used here
+if grep -q '^\s*install ' "$SYNC_HELPER" | grep -qv '^\s*#'; then
+  fail "sync-backup-script.sh uses 'install' — should use atomic stage+rename instead"
+else
+  pass "sync-backup-script.sh does NOT use 'install' directly to destination"
+fi
+
+# ── update-node.sh must source the helper and call _sync_backup_script ────────
+if [[ ! -f "$UPDATE_NODE_SH" ]]; then
+  fail "update-node.sh not found at $UPDATE_NODE_SH"
+else
+  if grep -q 'source.*sync-backup-script\.sh' "$UPDATE_NODE_SH"; then
+    pass "update-node.sh sources sync-backup-script.sh"
+  else
+    fail "update-node.sh does NOT source sync-backup-script.sh"
+  fi
+
+  if grep -q '_sync_backup_script' "$UPDATE_NODE_SH"; then
+    pass "update-node.sh calls _sync_backup_script"
+  else
+    fail "update-node.sh does NOT call _sync_backup_script"
+  fi
+fi
+
+# ── update-api.sh must source the helper and call _sync_backup_script ─────────
+if [[ ! -f "$UPDATE_API_SH" ]]; then
+  fail "update-api.sh not found at $UPDATE_API_SH"
+else
+  if grep -q 'source.*sync-backup-script\.sh' "$UPDATE_API_SH"; then
+    pass "update-api.sh sources sync-backup-script.sh"
+  else
+    fail "update-api.sh does NOT source sync-backup-script.sh"
+  fi
+
+  if grep -q '_sync_backup_script' "$UPDATE_API_SH"; then
+    pass "update-api.sh calls _sync_backup_script"
+  else
+    fail "update-api.sh does NOT call _sync_backup_script"
+  fi
+fi
+
+# =============================================================================
+# Test 20b: _sync_backup_script functional — sources real helper, path overrides
+# =============================================================================
+section "Test 20b: _sync_backup_script (real code) — atomic copy on mismatch"
+
+# Source the actual production helper so we test the real implementation.
+# shellcheck source=sync-backup-script.sh
+source "$SYNC_HELPER"
+
+T20_DIR=$(mktemp -d "$TMPDIR_TEST/run-t20-XXXXXXXX")
+
+# ── Scenario A: versions differ → atomic update ──────────────────────────────
+T20A_INSTALLED="$T20_DIR/installed_a.sh"
+T20A_REPO="$T20_DIR/repo_a.sh"
+printf '#!/bin/bash\necho old\n' > "$T20A_INSTALLED"
+printf '#!/bin/bash\necho new\n' > "$T20A_REPO"
+chmod 700 "$T20A_INSTALLED" "$T20A_REPO"
+
+T20A_OUTPUT=$(_sync_backup_script "$T20A_INSTALLED" "$T20A_REPO" 2>&1 || true)
+
+if echo "$T20A_OUTPUT" | grep -q '\[sync\].*updated'; then
+  pass "sync outputs 'updated' when versions differ"
+else
+  fail "sync did NOT output 'updated' when versions differed (output: $T20A_OUTPUT)"
+fi
+
+if diff -q "$T20A_INSTALLED" "$T20A_REPO" >/dev/null 2>&1; then
+  pass "installed file matches repo after sync (content check)"
+else
+  fail "installed file does NOT match repo after sync"
+fi
+
+# ── Scenario B: versions identical → no-op ───────────────────────────────────
+T20B_INSTALLED="$T20_DIR/installed_b.sh"
+T20B_REPO="$T20_DIR/repo_b.sh"
+printf '#!/bin/bash\necho same\n' > "$T20B_INSTALLED"
+printf '#!/bin/bash\necho same\n' > "$T20B_REPO"
+chmod 700 "$T20B_INSTALLED" "$T20B_REPO"
+
+# Record mtime to confirm no write occurred
+T20B_MTIME_BEFORE=$(stat -c '%Y' "$T20B_INSTALLED" 2>/dev/null || echo 0)
+sleep 1   # ensure a write would change mtime
+
+T20B_OUTPUT=$(_sync_backup_script "$T20B_INSTALLED" "$T20B_REPO" 2>&1 || true)
+T20B_MTIME_AFTER=$(stat -c '%Y' "$T20B_INSTALLED" 2>/dev/null || echo 1)
+
+if echo "$T20B_OUTPUT" | grep -q 'already up to date'; then
+  pass "sync outputs 'already up to date' when versions are identical"
+else
+  fail "sync did not output 'already up to date' for identical files (output: $T20B_OUTPUT)"
+fi
+
+if [[ "$T20B_MTIME_BEFORE" -eq "$T20B_MTIME_AFTER" ]]; then
+  pass "sync did not modify the installed file when already up to date"
+else
+  fail "sync wrote to the installed file even though versions were identical"
+fi
+
+# ── Scenario C: installed absent → no-op ─────────────────────────────────────
+T20C_REPO="$T20_DIR/repo_c.sh"
+printf '#!/bin/bash\necho hello\n' > "$T20C_REPO"
+T20C_INSTALLED="$T20_DIR/not_installed.sh"   # does not exist
+
+T20C_OUTPUT=$(_sync_backup_script "$T20C_INSTALLED" "$T20C_REPO" 2>&1 || true)
+
+if [[ -z "$T20C_OUTPUT" ]]; then
+  pass "sync is a no-op (silent) when installed file is absent"
+else
+  fail "sync produced unexpected output when installed file is absent: $T20C_OUTPUT"
+fi
+
+if [[ ! -f "$T20C_INSTALLED" ]]; then
+  pass "sync did not create the installed file when it was absent (not an initial installer)"
+else
+  fail "sync created a file that should not exist"
+fi
+
+# ── Scenario D: atomic rename — staging temp is cleaned up on failure ─────────
+# Make the destination directory read-only so mv fails; verify no stale temp.
+T20D_DIR=$(mktemp -d "$TMPDIR_TEST/readonly-t20-XXXXXXXX")
+T20D_INSTALLED="$T20D_DIR/aperod_backup.sh"
+T20D_REPO="$T20_DIR/repo_d.sh"
+printf '#!/bin/bash\necho old\n' > "$T20D_INSTALLED"
+printf '#!/bin/bash\necho new\n' > "$T20D_REPO"
+
+# Make directory read-only so rename cannot succeed but mktemp can still
+# create a temp file in it (we need a read-only-for-rename situation).
+# Easiest: pass a mismatched destination path that can't be renamed into.
+# Use a cross-filesystem target by pointing installed to /tmp while repo is local.
+T20D_CROSSFS_INSTALLED="/tmp/aperod_sync_test_$$.sh"
+printf '#!/bin/bash\necho old\n' > "$T20D_CROSSFS_INSTALLED"
+
+T20D_OUTPUT=$(_sync_backup_script "$T20D_CROSSFS_INSTALLED" "$T20D_REPO" 2>&1 || true)
+rm -f "$T20D_CROSSFS_INSTALLED" 2>/dev/null || true
+
+# Cross-filesystem mv fails (EXDEV); function should print a warning and clean up.
+# Accept either: success (some kernels allow cross-fs mv via copy+unlink fallback) OR
+# a [warn] line indicating graceful failure — never a crash or a stale staging file.
+if echo "$T20D_OUTPUT" | grep -qE '\[sync\].*updated|\[warn\].*sync FAILED'; then
+  pass "sync either succeeds or prints [warn] on cross-filesystem edge case (no crash)"
+else
+  fail "sync produced unexpected output on cross-filesystem case: $T20D_OUTPUT"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

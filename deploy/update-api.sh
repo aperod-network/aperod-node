@@ -70,6 +70,24 @@ echo "==> [1/4] Pulling latest source as aperod..."
 sudo -u aperod git -C "$APEROD_DIR" pull
 
 # ---------------------------------------------------------------------------
+# Step 1b: Keep /usr/local/bin/aperod_backup.sh in sync with the repo.
+#
+# setup-backup.sh installs the script once and never updates it again.
+# When git pull brings in changes to blockchain/deploy/aperod_backup.sh the
+# running installed copy would silently stay at the old version.  This step
+# detects a mismatch and atomically replaces the installed copy (stage in the
+# same directory, then rename(2)) so the next scheduled backup always uses the
+# current code without ever exposing a partially written file.
+#
+# Logic lives in sync-backup-script.sh (same directory) so it can be sourced
+# and tested independently.  See that file for full documentation.
+# ---------------------------------------------------------------------------
+# shellcheck source=sync-backup-script.sh
+source "${DEPLOY_DIR}/sync-backup-script.sh"
+echo "==> [1b] Syncing aperod_backup.sh..."
+_sync_backup_script
+
+# ---------------------------------------------------------------------------
 # Step 2: Rebuild TypeScript — if this fails, abort before touching pm2.
 # ---------------------------------------------------------------------------
 echo "==> [2/4] Rebuilding TypeScript as aperod..."
