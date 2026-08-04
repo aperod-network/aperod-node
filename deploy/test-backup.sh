@@ -1296,6 +1296,110 @@ else
 fi
 
 # =============================================================================
+# Test 18b: mkdir BACKUP_DIR fails + tokens SET → Telegram alert IS sent
+# =============================================================================
+section "Test 18b: mkdir BACKUP_DIR failure + tokens set → Telegram alert IS sent"
+
+T18B_DIR=$(mktemp -d "$TMPDIR_TEST/run-t18b-XXXXXXXX")
+make_settings_json "$T18B_DIR/data"
+mkdir -p "$T18B_DIR/metrics"
+
+# Same sentinel keyword trick as Test 18
+T18B_BACKUP_DIR="$T18B_DIR/FAILMKDIR/aperod_backups_test"
+
+T18B_FAKE_MKDIR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-mkdir-t18b-XXXXXXXX")
+cat >"$T18B_FAKE_MKDIR_DIR/mkdir" <<STUB
+#!/usr/bin/env bash
+last_arg="\${@: -1}"
+if [[ "\$last_arg" == *"FAILMKDIR"* ]]; then
+  exit 1
+fi
+/bin/mkdir "\$@"
+STUB
+chmod +x "$T18B_FAKE_MKDIR_DIR/mkdir"
+
+T18B_CURL_LOG="$T18B_DIR/curl.log"
+T18B_FAKE_CURL=$(make_fake_curl "$T18B_CURL_LOG")
+
+T18B_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t18b-XXXXXXXX")
+cat >"$T18B_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T18B_FAKE_SUDO_DIR/sudo"
+
+T18B_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t18b-XXXXXXXX")
+cat >"$T18B_FAKE_DF_DIR/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "20971520"
+exit 0
+STUB
+chmod +x "$T18B_FAKE_DF_DIR/df"
+
+T18B_RCLONE=$(make_fake_bin "rclone" "$T18B_DIR/rclone.log" 0)
+T18B_GPG=$(make_fake_bin "gpg"    "$T18B_DIR/gpg.log"    0)
+T18B_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t18b-XXXXXXXX")
+cat >"$T18B_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T18B_FAKE_TAR_DIR/tar"
+
+T18B_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t18b" \
+  DATA_DIR="$T18B_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T18B_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T18B_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T18B_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t18b-secret" \
+  ADMIN_TELEGRAM_CHAT_ID="18200001" \
+  PATH="$T18B_FAKE_MKDIR_DIR:$T18B_FAKE_CURL:$T18B_FAKE_DF_DIR:$T18B_FAKE_SUDO_DIR:$T18B_RCLONE:$T18B_GPG:$T18B_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T18B_EXIT=$?
+[[ "$T18B_EXIT" -eq 99 ]] && T18B_EXIT=0  # script returned 0
+
+if [[ "$T18B_EXIT" -eq 0 ]]; then
+  pass "mkdir BACKUP_DIR failure (tokens set): script still exits 0 (skipped, not failed)"
+else
+  fail "mkdir BACKUP_DIR failure (tokens set): script exited $T18B_EXIT — expected 0"
+fi
+
+if [[ -f "$T18B_CURL_LOG" ]] && grep -q "api.telegram.org" "$T18B_CURL_LOG"; then
+  pass "Telegram backup_dir_unavailable alert was sent when tokens are set"
+else
+  fail "Telegram backup_dir_unavailable alert was NOT sent when tokens are set (log: $(cat "$T18B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T18B_CURL_LOG" ]] && grep -q "sendMessage" "$T18B_CURL_LOG"; then
+  pass "Telegram sendMessage endpoint targeted for backup_dir_unavailable alert"
+else
+  fail "Telegram sendMessage NOT targeted for backup_dir_unavailable alert (log: $(cat "$T18B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T18B_CURL_LOG" ]] && grep -q "FAILMKDIR\|недоступна\|директория\|unavailable\|permission\|права" "$T18B_CURL_LOG"; then
+  pass "Telegram message text references the unavailable path or permissions"
+else
+  fail "Telegram message text does NOT reference path/permissions (log: $(cat "$T18B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T18B_CURL_LOG" ]] && grep -q "chat_id=18200001" "$T18B_CURL_LOG"; then
+  pass "Telegram backup_dir_unavailable alert sent to correct chat_id"
+else
+  fail "Telegram backup_dir_unavailable alert sent to wrong or no chat_id (log: $(cat "$T18B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T18B_CURL_LOG" ]] && grep -q "bot${TELEGRAM_BOT_TOKEN:-tok-t18b-secret}\|bottok-t18b-secret" "$T18B_CURL_LOG"; then
+  pass "Bot token embedded in Telegram API URL for backup_dir_unavailable alert"
+else
+  # Check for the token pattern another way since TELEGRAM_BOT_TOKEN is set as env during subshell
+  if grep -q "bottok-t18b-secret" "$T18B_CURL_LOG" 2>/dev/null; then
+    pass "Bot token embedded in Telegram API URL for backup_dir_unavailable alert"
+  else
+    fail "Bot token NOT found in Telegram API URL (log: $(cat "$T18B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+  fi
+fi
+
+# =============================================================================
 # Test 19: stale-backup-dir cleanup runs BEFORE NODE_DATA_DIR preflight
 #
 # Scenario A — stale dir found + cleaned:

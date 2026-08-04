@@ -247,6 +247,23 @@ if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
   _BACKUP_SKIP_REASON="backup_dir_unavailable"
   _BACKUP_DISK_PATH="${BACKUP_DIR}"
   _BACKUP_DISK_FREE_GB="N/A"
+  # ── Telegram backup_dir_unavailable alert ─────────────────────────────────
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ADMIN_TELEGRAM_CHAT_ID:-}" ]; then
+    _unavail_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    _unavail_text="⚠️ <b>Бэкап Aperod пропущен — директория недоступна</b>%0A%0A"
+    _unavail_text+="<b>Путь:</b> <code>${BACKUP_DIR}</code>%0A"
+    _unavail_text+="<b>Время:</b> ${_unavail_ts}%0A%0A"
+    _unavail_text+="[!] Создать директорию не удалось — проверьте права доступа к <code>$(dirname "$BACKUP_DIR")</code>.%0A%0A"
+    _unavail_text+="💡 Исправьте права (chown/chmod) — бэкап возобновится на следующем расписании."
+    curl -s --max-time 15 -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${ADMIN_TELEGRAM_CHAT_ID}" \
+      -d "text=${_unavail_text}" \
+      -d "parse_mode=HTML" \
+      -d "disable_web_page_preview=true" \
+      >/dev/null 2>&1 || true
+    echo "  Telegram backup_dir_unavailable alert sent to admin chat."
+  fi
   write_metrics 0 1
   exit 0
 fi
