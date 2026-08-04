@@ -90,6 +90,19 @@ func (p *Peer) Send(msgType MessageType, payload interface{}) error {
         return writeMsg(p.conn, msgType, payload)
 }
 
+// badBlockHeightLead is how many blocks ahead of our tip a peer's block must be
+// before it is treated as "from a wrong fork / spam".  In PoA with a 3-second
+// block time this corresponds to roughly 50 minutes of future blocks.
+const badBlockHeightLead = 1_000
+
+// badBlockBanThreshold is the number of consecutive out-of-range blocks from a
+// single peer that triggers an automatic ban.
+const badBlockBanThreshold = 10
+
+// badBlockBanDuration is how long a peer stays banned after exceeding the
+// bad-block threshold.
+const badBlockBanDuration = 24 * time.Hour
+
 // Host is the p2p networking host.
 type Host struct {
         cfg     Config
@@ -112,18 +125,25 @@ type Host struct {
         // uses atomic ops so acceptLoop and handleConn coordinate without
         // holding h.mu.
         pendingHandshakes atomic.Int64
+
+        // badBlockMu guards badBlockCounts.
+        badBlockMu sync.Mutex
+        // badBlockCounts tracks consecutive out-of-range blocks per peer addr.
+        // A peer that repeatedly sends blocks far ahead of our tip is auto-banned.
+        badBlockCounts map[string]int
 }
 
 // NewHost creates a new p2p host.
 func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         return &Host{
-                cfg:     cfg,
-                handler: handler,
-                log:     log,
-                peers:   make(map[string]*Peer),
-                done:    make(chan struct{}),
-                mgr:     newPeerMgr(),
-                gossip:  NewGossipFilter(),
+                cfg:            cfg,
+                handler:        handler,
+                log:            log,
+                peers:          make(map[string]*Peer),
+                done:           make(chan struct{}),
+                mgr:            newPeerMgr(),
+                gossip:         NewGossipFilter(),
+                badBlockCounts: make(map[string]int),
         }
 }
 
@@ -624,6 +644,11 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 h.mu.Lock()
                 delete(h.peers, addr)
                 h.mu.Unlock()
+                // Clean up any bad-block counter for this peer so the map does not grow
+                // unboundedly when peers churn.
+                h.badBlockMu.Lock()
+                delete(h.badBlockCounts, addr)
+                h.badBlockMu.Unlock()
                 h.log.Info("peer disconnected", "addr", addr)
         }()
 
@@ -690,6 +715,36 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 }
                 block := msgToBlock(msg)
                 if block != nil {
+                        // Out-of-range block guard: a peer whose blocks are far ahead of our
+                        // current tip is on a different fork or is actively spamming.  Track
+                        // consecutive out-of-range messages per peer and auto-ban after the
+                        // threshold is reached.  The block is dropped without forwarding to the
+                        // consensus engine — the engine would reject it anyway — so this also
+                        // reduces unnecessary CPU overhead.
+                        ourHeight := h.handler.CurrentHeight()
+                        if block.Header.Height > ourHeight+badBlockHeightLead {
+                                h.badBlockMu.Lock()
+                                h.badBlockCounts[peer.addr]++
+                                count := h.badBlockCounts[peer.addr]
+                                h.badBlockMu.Unlock()
+                                if count >= badBlockBanThreshold {
+                                        h.BanPeer(peer.addr,
+                                                fmt.Sprintf("repeated out-of-range blocks (peer height %d, our tip %d)",
+                                                        block.Header.Height, ourHeight),
+                                                badBlockBanDuration)
+                                        h.badBlockMu.Lock()
+                                        delete(h.badBlockCounts, peer.addr)
+                                        h.badBlockMu.Unlock()
+                                }
+                                return nil
+                        }
+                        // Valid-height block: reset bad-block counter for this peer.
+                        h.badBlockMu.Lock()
+                        if h.badBlockCounts[peer.addr] > 0 {
+                                delete(h.badBlockCounts, peer.addr)
+                        }
+                        h.badBlockMu.Unlock()
+
                         // Gossip relay: forward to all other peers the first time we see this block.
                         blockHash := block.Hash()
                         isNew := h.gossip.MarkAndCheck(blockHash)
