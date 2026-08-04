@@ -915,6 +915,7 @@ func run() error {
                                 })
                                 apiSrv.SetBanLiftFunc(host.LiftBan)
                                 apiSrv.SetBanAddFunc(host.BanPeer)
+                                apiSrv.SetPeerWhitelist(cfg.P2P.PeerWhitelist)
                                 }
                                 // Background goroutine: if an allow-list is active and no peers
                                 // connect after 2×block_time, the list may be misconfigured

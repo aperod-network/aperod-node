@@ -2097,12 +2097,16 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	syncing := atomic.LoadInt32(&s.syncing) == 1
 	syncingHeight := atomic.LoadInt64(&s.syncingHeight)
 	tipHeight := atomic.LoadInt64(&s.tipHeight)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"ok":             true,
 		"height":         height,
 		"syncing":          syncing,
 		"syncing_height":   syncingHeight,
 		"tip_height":       tipHeight,
 		"utxo_rebuilding":  atomic.LoadInt32(&s.utxoRebuilding) == 1,
-	})
+	}
+	if len(s.peerWhitelist) > 0 {
+		resp["peer_whitelist"] = s.peerWhitelist
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

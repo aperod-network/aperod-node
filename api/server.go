@@ -55,6 +55,10 @@ type Server struct {
         banLiftFn func(string) bool                         // optional; wired to p2p.Host.LiftBan by cmd/node
         banAddFn  func(addr, reason string, d time.Duration) // optional; wired to p2p.Host.Ban by cmd/node
 
+        // peerWhitelist holds the parsed peer_whitelist entries from node.yaml.
+        // Stored so /api/v1/status can report them to operators.
+        peerWhitelist []string
+
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
@@ -212,6 +216,15 @@ func (s *Server) SetBanLiftFunc(f func(string) bool) { s.banLiftFn = f }
 // SetBanAddFunc wires a function that adds a new P2P ban.
 // Optional — POST /api/v1/network/bans returns 503 when not wired.
 func (s *Server) SetBanAddFunc(f func(addr, reason string, d time.Duration)) { s.banAddFn = f }
+
+// SetPeerWhitelist stores the active peer IP whitelist entries from node.yaml
+// so /api/v1/status can return them to operators for verification.
+// Call after the p2p.Host is constructed in cmd/node.
+func (s *Server) SetPeerWhitelist(entries []string) {
+        cp := make([]string, len(entries))
+        copy(cp, entries)
+        s.peerWhitelist = cp
+}
 
 // SetTimestampRejectedCounter wires a function returning the live count of blocks
 // rejected by the timejacking guard.  Optional — reports 0 when unset.
