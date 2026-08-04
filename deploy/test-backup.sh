@@ -952,6 +952,235 @@ else
 fi
 
 # =============================================================================
+# Test 16: NODE_DATA_DIR low-disk → exits 0, skipped_low_disk=1, Telegram alert
+# =============================================================================
+section "Test 16: NODE_DATA_DIR low-disk → exit 0, skipped_low_disk=1, Telegram alert sent"
+
+T16_DIR=$(mktemp -d "$TMPDIR_TEST/run-t16-XXXXXXXX")
+T16_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t16-XXXXXXXX")
+echo "blockdata" > "$T16_NODE_DATA_DIR/block.bin"
+make_settings_json "$T16_DIR/data"
+mkdir -p "$T16_DIR/metrics"
+T16_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t16-XXXXXXXX")
+
+T16_CURL_LOG="$T16_DIR/curl.log"
+T16_FAKE_CURL=$(make_fake_curl "$T16_CURL_LOG")
+
+# df stub: first call (BACKUP_DIR) returns 20 GiB (passes the 5 GiB floor);
+# second call (NODE_DATA_DIR) returns 1 MB (below 5 GiB floor → triggers skip).
+# A counter file tracks invocation number.
+T16_DF_COUNTER="$T16_DIR/df-call-count"
+T16_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t16-XXXXXXXX")
+cat >"$T16_FAKE_DF_DIR/df" <<STUB
+#!/usr/bin/env bash
+count=0
+[[ -f "$T16_DF_COUNTER" ]] && count=\$(cat "$T16_DF_COUNTER")
+count=\$(( count + 1 ))
+echo "\$count" > "$T16_DF_COUNTER"
+echo "Avail"
+if [[ "\$count" -le 1 ]]; then
+  echo "20971520"   # 20 GiB — BACKUP_DIR passes
+else
+  echo "1024"       # 1 MB — NODE_DATA_DIR fails
+fi
+exit 0
+STUB
+chmod +x "$T16_FAKE_DF_DIR/df"
+
+T16_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t16-XXXXXXXX")
+cat >"$T16_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T16_FAKE_SUDO_DIR/sudo"
+
+T16_RCLONE=$(make_fake_bin "rclone" "$T16_DIR/rclone.log" 0)
+T16_GPG=$(make_fake_bin "gpg"    "$T16_DIR/gpg.log"    0)
+T16_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t16-XXXXXXXX")
+cat >"$T16_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T16_FAKE_TAR_DIR/tar"
+
+T16_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t16" \
+  DATA_DIR="$T16_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T16_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T16_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T16_BACKUP_DIR" \
+  APEROD_NODE_DATA_DIR_OVERRIDE="$T16_NODE_DATA_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t16" \
+  ADMIN_TELEGRAM_CHAT_ID="16000001" \
+  PATH="$T16_FAKE_CURL:$T16_FAKE_DF_DIR:$T16_FAKE_SUDO_DIR:$T16_RCLONE:$T16_GPG:$T16_FAKE_TAR_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T16_EXIT=$?
+[[ "$T16_EXIT" -eq 99 ]] && T16_EXIT=0  # script exited 0
+
+if [[ "$T16_EXIT" -eq 0 ]]; then
+  pass "NODE_DATA_DIR low-disk preflight exits 0 (skipped, not failed)"
+else
+  fail "NODE_DATA_DIR low-disk preflight exited $T16_EXIT — expected 0"
+fi
+
+T16_PROM="$T16_DIR/metrics/aperod_backup.prom"
+if [[ -f "$T16_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T16_PROM"; then
+  pass "Prometheus: aperod_backup_skipped_low_disk=1 written on NODE_DATA_DIR low-disk skip"
+else
+  fail "Prometheus: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T16_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T16_PROM" ]] && grep -q "^aperod_backup_last_success 0" "$T16_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=0 on NODE_DATA_DIR low-disk skip"
+else
+  fail "Prometheus: aperod_backup_last_success=0 NOT found on NODE_DATA_DIR low-disk skip"
+fi
+
+if [[ -f "$T16_CURL_LOG" ]] && grep -q "api.telegram.org" "$T16_CURL_LOG"; then
+  pass "Telegram low-disk alert was sent when NODE_DATA_DIR has insufficient space"
+else
+  fail "Telegram low-disk alert was NOT sent for NODE_DATA_DIR low-disk (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+if [[ -f "$T16_CURL_LOG" ]] && grep -q "NODE_DATA_DIR" "$T16_CURL_LOG"; then
+  pass "Telegram low-disk alert contains partition label NODE_DATA_DIR"
+else
+  fail "Telegram low-disk alert does NOT contain NODE_DATA_DIR label (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+T16_HIST="$T16_DIR/backup.log"
+if [[ -f "$T16_HIST" ]] && grep -q '"skipReason":"low_disk"' "$T16_HIST"; then
+  pass "History log records skipReason=low_disk for NODE_DATA_DIR skip"
+else
+  fail "History log does NOT record skipReason=low_disk for NODE_DATA_DIR skip (log: $(cat "$T16_HIST" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 17: NODE_DATA_DIR recovery — next run with enough space on both resets metric to 0
+# =============================================================================
+section "Test 17: NODE_DATA_DIR recovery — next cycle with sufficient space resets skipped_low_disk to 0"
+
+T17_DIR=$(mktemp -d "$TMPDIR_TEST/run-t17-XXXXXXXX")
+T17_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t17-XXXXXXXX")
+echo "blockdata" > "$T17_NODE_DATA_DIR/block.bin"
+make_settings_json "$T17_DIR/data"
+mkdir -p "$T17_DIR/metrics"
+T17_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t17-XXXXXXXX")
+
+T17_CURL_LOG="$T17_DIR/curl.log"
+T17_FAKE_CURL=$(make_fake_curl "$T17_CURL_LOG")
+
+# ── Run A: NODE_DATA_DIR low disk (reuse counter pattern) ───────────────────
+T17_DF_COUNTER_A="$T17_DIR/df-call-count-a"
+T17_FAKE_DF_LOW=$(mktemp -d "$TMPDIR_TEST/fake-df-t17-low-XXXXXXXX")
+cat >"$T17_FAKE_DF_LOW/df" <<STUB
+#!/usr/bin/env bash
+count=0
+[[ -f "$T17_DF_COUNTER_A" ]] && count=\$(cat "$T17_DF_COUNTER_A")
+count=\$(( count + 1 ))
+echo "\$count" > "$T17_DF_COUNTER_A"
+echo "Avail"
+if [[ "\$count" -le 1 ]]; then
+  echo "20971520"   # BACKUP_DIR passes
+else
+  echo "512"        # NODE_DATA_DIR fails
+fi
+exit 0
+STUB
+chmod +x "$T17_FAKE_DF_LOW/df"
+
+T17_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t17-XXXXXXXX")
+cat >"$T17_FAKE_SUDO_DIR/sudo" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T17_FAKE_SUDO_DIR/sudo"
+
+T17A_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t17" \
+  DATA_DIR="$T17_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T17_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T17_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T17_BACKUP_DIR" \
+  APEROD_NODE_DATA_DIR_OVERRIDE="$T17_NODE_DATA_DIR" \
+  PATH="$T17_FAKE_CURL:$T17_FAKE_DF_LOW:$T17_FAKE_SUDO_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T17A_EXIT=$?
+[[ "$T17A_EXIT" -eq 99 ]] && T17A_EXIT=0
+
+T17_PROM="$T17_DIR/metrics/aperod_backup.prom"
+if [[ "$T17A_EXIT" -eq 0 ]] && [[ -f "$T17_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T17_PROM"; then
+  pass "Run A (NODE_DATA_DIR low disk): exit 0 and skipped_low_disk=1 confirmed"
+else
+  fail "Run A (NODE_DATA_DIR low disk): exit=$T17A_EXIT; prom=$(cat "$T17_PROM" 2>/dev/null || echo '<missing>')"
+fi
+
+# ── Run B: sufficient disk on both — full success stubs ─────────────────────
+T17_FAKE_DF_OK=$(mktemp -d "$TMPDIR_TEST/fake-df-t17-ok-XXXXXXXX")
+cat >"$T17_FAKE_DF_OK/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "20971520"   # 20 GiB — passes for every partition
+exit 0
+STUB
+chmod +x "$T17_FAKE_DF_OK/df"
+
+T17_FAKE_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t17-XXXXXXXX")
+cat >"$T17_FAKE_GPG_DIR/gpg" <<'STUB'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then touch "$2"; shift 2; else shift; fi
+done
+exit 0
+STUB
+chmod +x "$T17_FAKE_GPG_DIR/gpg"
+
+T17_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t17-XXXXXXXX")
+cat >"$T17_FAKE_TAR_DIR/tar" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T17_FAKE_TAR_DIR/tar"
+
+T17_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t17-XXXXXXXX")
+cat >"$T17_FAKE_RCLONE_DIR/rclone" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "size" ]]; then echo '{"count":1,"bytes":2048}'; fi
+exit 0
+STUB
+chmod +x "$T17_FAKE_RCLONE_DIR/rclone"
+
+# Re-create backup dir (previous run cleaned it via EXIT trap)
+mkdir -p "$T17_BACKUP_DIR"
+
+T17B_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t17" \
+  DATA_DIR="$T17_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T17_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T17_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T17_BACKUP_DIR" \
+  APEROD_NODE_DATA_DIR_OVERRIDE="$T17_NODE_DATA_DIR" \
+  PATH="$T17_FAKE_CURL:$T17_FAKE_DF_OK:$T17_FAKE_SUDO_DIR:$T17_FAKE_GPG_DIR:$T17_FAKE_TAR_DIR:$T17_FAKE_RCLONE_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T17B_EXIT=$?
+[[ "$T17B_EXIT" -eq 99 ]] && T17B_EXIT=0
+
+if [[ "$T17B_EXIT" -eq 0 ]]; then
+  pass "Run B (both disks OK): exits 0 — backup succeeded after NODE_DATA_DIR was freed"
+else
+  fail "Run B (both disks OK): exited $T17B_EXIT — expected 0"
+fi
+
+if [[ -f "$T17_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 0" "$T17_PROM"; then
+  pass "Prometheus: aperod_backup_skipped_low_disk reset to 0 after NODE_DATA_DIR recovery"
+else
+  fail "Prometheus: aperod_backup_skipped_low_disk NOT reset to 0 after recovery (file: $(cat "$T17_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T17_PROM" ]] && grep -q "^aperod_backup_last_success 1" "$T17_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=1 after NODE_DATA_DIR recovery run"
+else
+  fail "Prometheus: aperod_backup_last_success=1 NOT found after NODE_DATA_DIR recovery run"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
