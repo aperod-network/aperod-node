@@ -567,7 +567,7 @@ func validateCoinbasePolicy(block *core.Block) error {
 
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
-        raw := e.pool.SelectTxs(500) // up to 500 txs per block
+        raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
 
         // Defense-in-depth: strip any NON-PRIVILEGED coinbase (zero-input) txs that
         // may have bypassed the mempool guard.  mempool.Add() already rejects

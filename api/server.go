@@ -419,6 +419,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, e
                 return s.aprEstimateFee(params)
         case "apr_walletSend":
                 return s.aprWalletSend(params)
+        case "apr_walletBatchSend":
+                return s.aprWalletBatchSend(params)
         case "apr_scanUTXOs":
                 return s.aprScanUTXOs(params)
         default:
