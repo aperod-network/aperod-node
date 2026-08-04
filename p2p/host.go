@@ -426,6 +426,14 @@ func (h *Host) loadWhitelistFromFile() error {
                         return fmt.Errorf("p2p: whitelist sidecar %q is corrupt (JSON parse error): %w — "+
                                 "repair or remove the file to restart the node", h.cfg.WhitelistFile, jsonErr)
                 }
+                // json.Unmarshal sets fileEntries to nil for a JSON null value.
+                // A null sidecar is not a valid empty list: it indicates a truncated or
+                // tampered file.  Fail-closed rather than opening inbound access.
+                if fileEntries == nil {
+                        return fmt.Errorf("p2p: whitelist sidecar %q contains JSON null (not a valid "+
+                                "entry array) — repair or remove the file to restart the node",
+                                h.cfg.WhitelistFile)
+                }
                 var nets []*net.IPNet
                 var ips []net.IP
                 valid := make([]string, 0, len(fileEntries))
@@ -458,7 +466,11 @@ func (h *Host) loadWhitelistFromFile() error {
                 if len(h.cfg.PeerWhitelist) == 0 {
                         return nil // open network; nothing to seed
                 }
-                h.saveWhitelistToFile(h.cfg.PeerWhitelist)
+                if seedErr := h.saveWhitelistToFile(h.cfg.PeerWhitelist); seedErr != nil {
+                        return fmt.Errorf("p2p: whitelist sidecar %q could not be created on first boot: %w — "+
+                                "check directory permissions or set whitelist_file to a writable path",
+                                h.cfg.WhitelistFile, seedErr)
+                }
                 h.log.Info("p2p: seeded whitelist sidecar from node.yaml",
                         "entries", len(h.cfg.PeerWhitelist), "file", h.cfg.WhitelistFile)
 

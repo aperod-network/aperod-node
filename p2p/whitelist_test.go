@@ -250,6 +250,43 @@ func TestWhitelist_Persistence(t *testing.T) {
 	}
 }
 
+// TestWhitelist_NullSidecarFails verifies that a sidecar containing JSON null
+// (which json.Unmarshal decodes into a nil []string) is treated as invalid and
+// causes loadWhitelistFromFile to return an error.  A null sidecar must not
+// silently produce an empty whitelist that admits all inbound peers.
+func TestWhitelist_NullSidecarFails(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	if err := os.WriteFile(wlFile, []byte("null"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.PeerWhitelist = []string{"3.3.3.3"} // cfg has an entry — must not be used
+		cfg.WhitelistFile = wlFile
+	})
+	if err := h.loadWhitelistFromFile(); err == nil {
+		t.Fatal("expected error for null sidecar, got nil")
+	}
+}
+
+// TestWhitelist_FirstBootSeedFailurePropagates verifies that when the sidecar
+// directory doesn't exist (so the first-boot seed write fails), Start() receives
+// a non-nil error rather than silently starting without durable whitelist state.
+func TestWhitelist_FirstBootSeedFailurePropagates(t *testing.T) {
+	// Point WhitelistFile at a path whose parent directory does not exist.
+	nonExistentDir := filepath.Join(t.TempDir(), "no-such-subdir", "whitelist.json")
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.PeerWhitelist = []string{"5.5.5.5"} // non-empty → seed is attempted
+		cfg.WhitelistFile = nonExistentDir
+	})
+	if err := h.loadWhitelistFromFile(); err == nil {
+		t.Fatal("expected error when first-boot sidecar seed fails, got nil")
+	}
+}
+
 // TestWhitelist_CorruptSidecarFails verifies that a corrupt (unparseable JSON)
 // sidecar causes loadWhitelistFromFile to return a non-nil error so that
 // Start() aborts rather than running fail-open.
