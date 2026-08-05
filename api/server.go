@@ -113,6 +113,11 @@ type Server struct {
         // for each admin-mint address; without caching each call does an O(n)
         // UTXO scan with Ed25519 point ops that pins all CPU cores for 20-30 s.
         utxoAddrCache sync.Map // key: addr+"|"+viewKeyHex  value: *utxoCacheEntry
+
+        // dataDir is the node's data directory (cfg.DataDir).  Set via SetDataDir
+        // after the API server is created; used by snapshot and chaindb export
+        // endpoints to locate files for the one-command node-join workflow.
+        dataDir string
 }
 
 // NewServer creates a new API server.
@@ -180,6 +185,11 @@ func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 // when looking up old or pruned blocks that have been evicted from memory.
 // Optional — endpoints return 404 for old blocks when no store is wired.
 func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
+
+// SetDataDir records the node's data directory so the snapshot and chaindb
+// export endpoints can locate files for the one-command node-join workflow.
+// Call immediately after NewServer, before Start().
+func (s *Server) SetDataDir(dir string) { s.dataDir = dir }
 
 // SetPruningMode records the node's pruning mode ("archive" or "light") so
 // stake endpoints can detect when a missing UTXO may have been pruned rather
