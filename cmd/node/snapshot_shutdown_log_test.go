@@ -251,3 +251,123 @@ func TestSaveShutdownSnapshot_NilRegistryNoOp(t *testing.T) {
 		}
 	}
 }
+
+// ─── loadStartupSnapshotWithFallback classification ───────────────────────────
+//
+// These tests verify the end-to-end chain from loadStartupSnapshotWithFallback
+// → logSnapshotStartupReason, confirming that the returned error correctly
+// drives startup_reason= in the structured log entry.
+
+// writeTruncatedGzip writes a file at path whose first byte is 0x1f (valid gzip
+// magic) but whose body is truncated so gzip.NewReader fails to decode it.
+func writeTruncatedGzip(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte{0x1f, 0x8b, 0x00}, 0o644); err != nil {
+		t.Fatalf("writeTruncatedGzip %s: %v", path, err)
+	}
+}
+
+// prevBackupPath returns the "-prev.json.gz" path for the v2 primary at height.
+func prevBackupPath(dataDir string, height uint64) string {
+	primary := filepath.Join(dataDir, fmt.Sprintf("snapshot-v2-%d.json.gz", height))
+	return strings.TrimSuffix(primary, ".json.gz") + "-prev.json.gz"
+}
+
+// TestFallbackClassification_PrimaryAbsentNoPrevBackup checks that when no
+// snapshot files exist at all the function returns os.ErrNotExist, causing
+// logSnapshotStartupReason to emit startup_reason=no_snapshot.
+func TestFallbackClassification_PrimaryAbsentNoPrevBackup(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	const height = uint64(5)
+	_, _, err := loadStartupSnapshotWithFallback(dir, height, "deadbeef", log)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected os.ErrNotExist, got %v", err)
+	}
+
+	// logSnapshotStartupReason must emit no_snapshot.
+	var reasonBuf bytes.Buffer
+	logSnapshotStartupReason(err, height, newCaptureLogger(&reasonBuf))
+
+	reason, ok := logFieldValue(&reasonBuf, "no snapshot found — full block scan required", "startup_reason")
+	if !ok || reason != "no_snapshot" {
+		t.Errorf("startup_reason = %q (ok=%v), want no_snapshot; log:\n%s",
+			reason, ok, reasonBuf.String())
+	}
+}
+
+// TestFallbackClassification_PrimaryAbsentCorruptPrevBackup checks that when
+// the primary is absent but the prev-backup exists and is corrupt (truncated
+// gzip), loadStartupSnapshotWithFallback returns a non-NotExist error, causing
+// logSnapshotStartupReason to emit startup_reason=corrupt_snapshot.
+func TestFallbackClassification_PrimaryAbsentCorruptPrevBackup(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	const height = uint64(7)
+	// Write a truncated gzip at the prev-backup path; leave the primary absent.
+	writeTruncatedGzip(t, prevBackupPath(dir, height))
+
+	_, _, err := loadStartupSnapshotWithFallback(dir, height, "deadbeef", log)
+	if err == nil {
+		t.Fatal("expected error when prev-backup is corrupt, got nil")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected non-NotExist error (corrupt signal), got os.ErrNotExist; full err: %v", err)
+	}
+
+	// logSnapshotStartupReason must emit corrupt_snapshot, not no_snapshot.
+	var reasonBuf bytes.Buffer
+	logSnapshotStartupReason(err, height, newCaptureLogger(&reasonBuf))
+
+	const wantMsg = "snapshot corrupt or unreadable — falling back to full block scan"
+	if !logContainsMsg(&reasonBuf, wantMsg) {
+		t.Fatalf("expected log %q, got:\n%s", wantMsg, reasonBuf.String())
+	}
+	reason, ok := logFieldValue(&reasonBuf, wantMsg, "startup_reason")
+	if !ok || reason != "corrupt_snapshot" {
+		t.Errorf("startup_reason = %q (ok=%v), want corrupt_snapshot", reason, ok)
+	}
+}
+
+// TestFallbackClassification_PrimaryAbsentCorruptLegacy verifies that a corrupt
+// legacy v1 snapshot (file exists, body is junk) is also classified as
+// corrupt_snapshot rather than no_snapshot.
+func TestFallbackClassification_PrimaryAbsentCorruptLegacy(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	const height = uint64(3)
+	// Write junk at the legacy v1 primary path; leave v2 files absent.
+	legacyPath := filepath.Join(dir, fmt.Sprintf("snapshot-v1-%d.json", height))
+	if err := os.WriteFile(legacyPath, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatalf("write legacy snapshot: %v", err)
+	}
+
+	_, _, err := loadStartupSnapshotWithFallback(dir, height, "deadbeef", log)
+	if err == nil {
+		t.Fatal("expected error when legacy snapshot is corrupt, got nil")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected non-NotExist error (corrupt signal), got os.ErrNotExist; full err: %v", err)
+	}
+
+	var reasonBuf bytes.Buffer
+	logSnapshotStartupReason(err, height, newCaptureLogger(&reasonBuf))
+
+	const wantMsg = "snapshot corrupt or unreadable — falling back to full block scan"
+	if !logContainsMsg(&reasonBuf, wantMsg) {
+		t.Fatalf("expected log %q, got:\n%s", wantMsg, reasonBuf.String())
+	}
+	reason, _ := logFieldValue(&reasonBuf, wantMsg, "startup_reason")
+	if reason != "corrupt_snapshot" {
+		t.Errorf("startup_reason = %q, want corrupt_snapshot", reason)
+	}
+}
