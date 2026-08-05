@@ -364,9 +364,14 @@ func run() error {
                 if indexedBlock == nil {
                         if cfg.Consensus.NonValidator {
                                 log.Warn("startup integrity check: height index has no entry for tip height — "+
-                                        "height index may be incomplete (rsync bootstrap?); non-validator mode, continuing",
+                                        "height index may be incomplete (rsync bootstrap?); repairing from tip pointer",
                                         "tip_height", tipHeight,
                                         "tip_hash", fmt.Sprintf("%x", tipHash[:8]))
+                                if repErr := db.RepairHeightIndex(tipHeight, tipHash); repErr != nil {
+                                        log.Warn("startup integrity: height index repair failed — continuing without repair", "err", repErr)
+                                } else {
+                                        log.Info("startup integrity: height index repaired", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
+                                }
                                 integrityOK = false
                         } else {
                                 return fmt.Errorf(
@@ -378,10 +383,15 @@ func run() error {
                 } else if indexedBlock.Hash != tipHash {
                         if cfg.Consensus.NonValidator {
                                 log.Warn("startup integrity check: tip pointer hash does not match height index — "+
-                                        "height index may be stale (rsync bootstrap?); non-validator mode, continuing",
+                                        "repairing height index from tip pointer",
                                         "tip_height", tipHeight,
                                         "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
                                         "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]))
+                                if repErr := db.RepairHeightIndex(tipHeight, tipHash); repErr != nil {
+                                        log.Warn("startup integrity: height index repair failed — continuing without repair", "err", repErr)
+                                } else {
+                                        log.Info("startup integrity: height index repaired", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
+                                }
                                 integrityOK = false
                         } else {
                                 return fmt.Errorf(
@@ -1136,9 +1146,20 @@ func run() error {
         }
 
         // ── 12. Wait for signal ───────────────────────────────────────────────────
+        // SIGHUP triggers a live config reload of snapshot.scan_checkpoint_interval
+        // so operators can tune memory vs. crash-recovery speed without restarting
+        // the node.  SIGINT / SIGTERM initiate a graceful shutdown as before.
         sig := make(chan os.Signal, 1)
-        signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-        <-sig
+        signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+        for {
+                s := <-sig
+                if s == syscall.SIGHUP {
+                        log.Info("SIGHUP received — reloading scan_checkpoint_interval from config", "config", cfgPath)
+                        reloadScanCheckpointInterval(cfgPath, cfg, log)
+                        continue
+                }
+                break
+        }
 
         log.Info("shutting down...")
 
