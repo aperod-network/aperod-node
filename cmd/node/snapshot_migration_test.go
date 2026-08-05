@@ -110,7 +110,7 @@ func TestMigration_V1PrimaryLoaded(t *testing.T) {
 	var logBuf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	got, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, log)
+	got, _, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestMigration_V1PrevFallback(t *testing.T) {
 	var logBuf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	got, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, log)
+	got, _, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestMigration_V1PrevFallback_CorruptPrimary(t *testing.T) {
 	// Write a valid v1 prev file.
 	writeLegacySnapFile(t, legacySnapshotPrevPath(dir, h), snap)
 
-	got, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, nullLogger())
+	got, _, err := loadStartupSnapshotWithFallback(dir, h, snap.TipHashHex, nullLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestMigration_NonePresent(t *testing.T) {
 	h := uint64(33)
 	hashHex := fmt.Sprintf("%064x", h)
 
-	_, err := loadStartupSnapshotWithFallback(dir, h, hashHex, nullLogger())
+	_, _, err := loadStartupSnapshotWithFallback(dir, h, hashHex, nullLogger())
 	if err == nil {
 		t.Fatal("expected error when no snapshot exists, got nil")
 	}
@@ -225,11 +225,15 @@ func TestMigration_V1HashMismatch(t *testing.T) {
 
 	wrongHash := fmt.Sprintf("%064x", uint64(9999))
 
-	_, err := loadStartupSnapshotWithFallback(dir, h, wrongHash, nullLogger())
+	_, _, err := loadStartupSnapshotWithFallback(dir, h, wrongHash, nullLogger())
 	if err == nil {
 		t.Fatal("expected error (hash mismatch), got nil")
 	}
-	if !os.IsNotExist(err) {
-		t.Errorf("expected os.ErrNotExist (no valid snapshot found), got: %v", err)
+	// The file EXISTS on disk but fails hash validation, so loadStartupSnapshotWithFallback
+	// must return a non-NotExist error.  This lets logSnapshotStartupReason emit
+	// startup_reason=corrupt_snapshot rather than startup_reason=no_snapshot,
+	// which would incorrectly imply no snapshot was ever written.
+	if os.IsNotExist(err) {
+		t.Errorf("expected non-NotExist error (file exists but invalid), got os.ErrNotExist; err: %v", err)
 	}
 }
