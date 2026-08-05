@@ -57,6 +57,9 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
         s.mux.HandleFunc("/api/v1/status", s.restStatus)
+        // Node-join workflow: export endpoints consumed by aperod-join.sh.
+        s.mux.HandleFunc("/api/v1/snapshot/export", s.restSnapshotExport)
+        s.mux.HandleFunc("/api/v1/chaindb/export", s.restChainDBExport)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
