@@ -470,7 +470,7 @@ func run() error {
                 snapLoaded := false
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
-                        if snap, serr := loadStartupSnapshotWithFallback(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
+                        if snap, snapIsRelaxed, serr := loadStartupSnapshotWithFallback(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
                                 // ── UTXO count divergence check ──────────────────────────────────
                                 // Before restoring, compare the snapshot's active (unspent) UTXO
                                 // count against the durable active count written to DB metadata the
@@ -505,6 +505,12 @@ func run() error {
                                                 diffPct = float64(diff) / float64(larger) * 100.0
                                         }
                                         tolerancePct := cfg.Snapshot.UTXOCountTolerancePct
+                                        if snapIsRelaxed {
+                                                // Relaxed-hash recovery path: the snapshot was written before
+                                                // recover-tip patched the DB tip, so UTXO count naturally
+                                                // diverges from DB metadata.  Skip the count check.
+                                                tolerancePct = 100.0
+                                        }
                                         if diffPct > tolerancePct {
                                                 log.Warn("snapshot rejected — active UTXO count diverges from last-saved count; falling back to block scan",
                                                         "snapshot_active_utxos", snapUTXOCount,
