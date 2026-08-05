@@ -38,7 +38,8 @@ log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [sched-restart] $*"; }
 send_telegram() {
   local msg="$1"
   if [[ -n "${SUPPORT_BOT_TOKEN:-}" && -n "${SUPPORT_ADMIN_CHAT_ID:-}" ]]; then
-    curl -s -X POST \
+    # --connect-timeout and --max-time ensure a stalled network never blocks the restart.
+    curl -s --connect-timeout 5 --max-time 10 -X POST \
       "https://api.telegram.org/bot${SUPPORT_BOT_TOKEN}/sendMessage" \
       -d chat_id="${SUPPORT_ADMIN_CHAT_ID}" \
       -d text="${msg}" \
@@ -68,9 +69,17 @@ send_telegram "⏱ <b>Плановый перезапуск ноды</b>
 Нода вернётся через ~30 с — это плановое обслуживание."
 
 # ---------------------------------------------------------------------------
-# Step 2 — Graceful restart
-# systemd sends SIGTERM; aperod-node saves snapshot; TimeoutStopSec=900 guard.
+# Step 2 — Pause the watchdog, then graceful restart
+# Stopping the watchdog timer prevents it from seeing the brief offline window
+# and triggering a competing restart during our planned shutdown.
 # ---------------------------------------------------------------------------
+WATCHDOG_WAS_ACTIVE=0
+if systemctl is-active --quiet aperod-node-watchdog.timer 2>/dev/null; then
+  systemctl stop aperod-node-watchdog.timer 2>/dev/null || true
+  WATCHDOG_WAS_ACTIVE=1
+  log "Watchdog таймер временно остановлен"
+fi
+
 log "Запускаем systemctl restart aperod-node…"
 systemctl restart aperod-node
 log "systemctl restart вернул управление"
@@ -99,6 +108,12 @@ done
 # ---------------------------------------------------------------------------
 # Step 4 — Post-restart notification
 # ---------------------------------------------------------------------------
+# Re-enable watchdog regardless of recovery outcome so health monitoring resumes.
+if [[ "${WATCHDOG_WAS_ACTIVE}" == "1" ]]; then
+  systemctl start aperod-node-watchdog.timer 2>/dev/null || true
+  log "Watchdog таймер возобновлён"
+fi
+
 if [[ "${RECOVERED}" == "1" ]]; then
   send_telegram "✅ <b>Нода перезапущена</b>
 Сервер: <code>${HOSTNAME_LABEL}</code>
