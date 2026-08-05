@@ -3,6 +3,7 @@ package main
 
 import (
         "bufio"
+        "encoding/hex"
         "encoding/json"
         "fmt"
         "log/slog"
@@ -235,8 +236,36 @@ func run() error {
                 return fmt.Errorf("load genesis: %w", err)
         }
 
-        // Override validator set with our own key so the node can always propose.
-        validators := []crypto.ValidatorPubKey{myKey.Public()}
+        // Build the initial validator set used to seed the registry and the
+        // consensus engine's static fallback list.
+        //
+        // Non-validator mode: use the public keys declared in the genesis config.
+        // This ensures handleIncomingBlock's isKnownValidator() and proposer-slot
+        // checks recognise the real network validators so the node can sync.
+        // Our own (P2P-identity) key must NOT be in this list or it would be
+        // treated as a genesis validator with stake, which could cause it to win
+        // a proposer slot even though MyKey is nil in the engine.
+        //
+        // Validator mode: override with our own key (single-validator / testnet
+        // design where this node IS the only proposer).
+        var validators []crypto.ValidatorPubKey
+        if cfg.Consensus.NonValidator {
+                for _, hexPub := range genesisConfig.Validators {
+                        pubBytes, hexErr := hex.DecodeString(hexPub)
+                        if hexErr != nil {
+                                return fmt.Errorf("parse genesis validator key %q: %w", hexPub, hexErr)
+                        }
+                        pub, pubErr := crypto.ValidatorPubKeyFromBytes(pubBytes)
+                        if pubErr != nil {
+                                return fmt.Errorf("invalid genesis validator key %q: %w", hexPub, pubErr)
+                        }
+                        validators = append(validators, pub)
+                }
+                log.Info("non-validator mode: registry seeded from genesis config",
+                        "genesis_validators", len(validators))
+        } else {
+                validators = []crypto.ValidatorPubKey{myKey.Public()}
+        }
 
         // ── 6. Initialize chain ───────────────────────────────────────────────────
         chain := core.NewChain()
@@ -601,6 +630,7 @@ func run() error {
                         InitTxTotal:           initialTxTotal,
                         Log:                   log,
                         UTXOCountTolerancePct: cfg.Snapshot.UTXOCountTolerancePct,
+                        CheckpointInterval:    cfg.Snapshot.ScanCheckpointInterval,
                         SetSyncProgress:       setSyncProgress,
                 })
                 if scanErr != nil {
