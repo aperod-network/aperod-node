@@ -53,6 +53,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/bans/", s.localOnly(s.restNetworkBanByAddr))
         s.mux.HandleFunc("/api/v1/network/whitelist", s.localOnly(s.restNetworkWhitelist))
         s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.restNetworkWhitelistByEntry))
+        s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
@@ -1073,6 +1074,41 @@ func (s *Server) restNetworkWhitelistByEntry(w http.ResponseWriter, r *http.Requ
                 return
         }
         writeJSON(w, http.StatusOK, map[string]string{"message": "entry removed", "entry": entry})
+}
+
+// ─── GET /api/v1/network/whitelist-exemptions ─────────────────────────────────
+//
+// Returns whitelist-exemption events recorded by the P2P layer: each entry is a
+// block that arrived from a whitelisted peer far ahead of the node's tip, so
+// the automatic ban strike was skipped.  Accepts an optional `since` query
+// parameter (Unix milliseconds) to fetch only events recorded after that time.
+//
+// Response: { "events": [ { ip, peer_addr, block_height, our_tip, at } ] }
+func (s *Server) restNetworkWhitelistExemptions(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.whitelistExemptFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+
+        var since time.Time
+        if raw := r.URL.Query().Get("since"); raw != "" {
+                ms, err := strconv.ParseInt(raw, 10, 64)
+                if err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "since must be a Unix-ms integer")
+                        return
+                }
+                since = time.UnixMilli(ms)
+        }
+
+        events := s.whitelistExemptFn(since)
+        if events == nil {
+                events = []WhitelistExemptionEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
 }
 
 // ─── GET /api/v1/fee-estimate ────────────────────────────────────────────────
