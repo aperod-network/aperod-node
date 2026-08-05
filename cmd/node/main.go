@@ -322,6 +322,19 @@ func run() error {
         }
 
         if tipHash == (crypto.Hash32{}) {
+                // Non-validator nodes must never create their own genesis block.
+                // CreateGenesisBlock embeds the caller's ValidatorPub, so a node
+                // that uses its P2P-identity key here ends up on a different fork
+                // than the real network with no visible error.
+                // Require an existing chain.db obtained from a validator node instead.
+                if cfg.Consensus.NonValidator {
+                        return fmt.Errorf(
+                                "non_validator mode requires an existing chain; "+
+                                        "copy chain.db from a validator node before starting "+
+                                        "(expected genesis config: %s)",
+                                cfg.Genesis.File,
+                        )
+                }
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
                 if err != nil {
