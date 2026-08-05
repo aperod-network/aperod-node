@@ -1109,6 +1109,37 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // whether the session was healthy or should be counted as a failure.
         connectedAt = time.Now()
 
+        // Keepalive: send a Ping to the remote peer every 3 s so that the
+        // peer's ReadTimeout (also 5 s) never fires due to silence from our
+        // side.  This is critical for relay/sync-only nodes that have no
+        // messages of their own to send once the initial GetHeaders exchange
+        // is complete.  The goroutine is stopped via keepaliveDone before the
+        // connection is closed (defers run LIFO, so close(keepaliveDone)
+        // fires before the conn.Close defer below).
+        keepaliveDone := make(chan struct{})
+        go func() {
+                t := time.NewTicker(3 * time.Second)
+                defer t.Stop()
+                for {
+                        select {
+                        case <-t.C:
+                                if err := peer.Send(MsgPing, PingMsg{
+                                        NodeID:    h.cfg.NodeID,
+                                        Height:    h.handler.CurrentHeight(),
+                                        UserAgent: h.cfg.UserAgent,
+                                        Timestamp: time.Now().UnixNano(),
+                                }); err != nil {
+                                        return // connection is gone; goroutine exits cleanly
+                                }
+                        case <-keepaliveDone:
+                                return
+                        case <-h.done:
+                                return
+                        }
+                }
+        }()
+        defer close(keepaliveDone)
+
         // Message loop
         defer func() {
                 conn.Close()
@@ -1151,6 +1182,22 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         UserAgent: h.cfg.UserAgent,
                         Timestamp: time.Now().UnixNano(),
                 })
+
+        case MsgPong:
+                // Keepalive pong: update the peer's reported height and return.
+                // No response needed.
+                var msg PingMsg // Pong reuses the same wire struct as Ping.
+                if err := unmarshal(data, &msg); err != nil {
+                        return err
+                }
+                if msg.Height > 0 {
+                        h.mu.Lock()
+                        if p, ok := h.peers[peer.addr]; ok {
+                                p.height = msg.Height
+                        }
+                        h.mu.Unlock()
+                }
+                return nil
 
         case MsgGetHeaders:
                 var msg GetHeadersMsg

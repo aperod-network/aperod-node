@@ -290,6 +290,53 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
         return nil
 }
 
+// HeadersFrom returns up to limit block headers that come after the highest
+// block in knownHashes that is present in the canonical chain.  This is the
+// standard blockchain sync handshake: the remote sends its tail hashes, we
+// find the common ancestor and return the headers they are missing.
+//
+// If none of the knownHashes are found the method returns headers from height 1
+// (skipping genesis, which both parties are expected to share).
+// Implements the p2p.HeaderProvider interface.
+func (c *Chain) HeadersFrom(knownHashes []crypto.Hash32, limit int) []BlockHeader {
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+
+        if c.tip == nil {
+                return nil
+        }
+
+        // Find the highest canonical height that matches any knownHash.
+        startHeight := uint64(1) // default: send from block 1 (skip genesis)
+        for _, h := range knownHashes {
+                if b, ok := c.blocks[h]; ok {
+                        // Confirm this block is on the canonical chain.
+                        if canon, ok2 := c.byHeight[b.Header.Height]; ok2 && canon.Hash() == h {
+                                next := b.Header.Height + 1
+                                if next > startHeight {
+                                        startHeight = next
+                                }
+                        }
+                }
+        }
+
+        if startHeight > c.tip.Header.Height {
+                return nil // already in sync
+        }
+
+        if limit <= 0 || limit > 500 {
+                limit = 500
+        }
+
+        headers := make([]BlockHeader, 0, limit)
+        for h := startHeight; h <= c.tip.Header.Height && len(headers) < limit; h++ {
+                if b, ok := c.byHeight[h]; ok {
+                        headers = append(headers, b.Header)
+                }
+        }
+        return headers
+}
+
 // TailHashes returns the hashes of the last n canonical blocks (for sync requests).
 func (c *Chain) TailHashes(n int) []crypto.Hash32 {
         c.mu.RLock()

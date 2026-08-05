@@ -903,6 +903,11 @@ func run() error {
                                 }
                         }
 
+                        // Wire the chain as the header provider so GetHeaders
+                        // requests from syncing peers return real block headers
+                        // instead of an empty response.
+                        host.SetHeaderProvider(chain)
+
                         if err := host.Start(); err != nil {
                                 log.Error("p2p failed to start", "err", err)
                                 // Non-fatal: node runs standalone if P2P fails.
