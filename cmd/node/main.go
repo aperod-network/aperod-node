@@ -347,6 +347,36 @@ func run() error {
         } else {
                 log.Info("resuming from stored chain", "height", tipHeight, "tip", fmt.Sprintf("%x", tipHash[:8]))
 
+                // ── Startup integrity check ──────────────────────────────────────────
+                // Cross-verify the tip pointer against the canonical height index.
+                // db.GetTip() returns the hash that was last written as the chain tip,
+                // while h/<tipHeight> in the height index records the canonical block
+                // hash accepted at that height. A mismatch means the tip pointer is
+                // stale or corrupt (e.g. after a chain-tip reset bug where c.tip was
+                // left at genesis while the DB tip had advanced to 973102, causing
+                // blocks to be silently overwritten). Hard-fail here so the operator
+                // can intervene before any block production begins.
+                indexedBlock, idxErr := db.GetBlockByHeight(tipHeight)
+                if idxErr != nil {
+                        return fmt.Errorf("startup integrity check: read height index at %d: %w", tipHeight, idxErr)
+                }
+                if indexedBlock == nil {
+                        return fmt.Errorf(
+                                "startup integrity check FAILED: height index has no entry for tip height %d "+
+                                        "(tip pointer hash %x); the height index may be corrupt — manual recovery required",
+                                tipHeight, tipHash[:8],
+                        )
+                }
+                if indexedBlock.Hash != tipHash {
+                        return fmt.Errorf(
+                                "startup integrity check FAILED: tip pointer records hash %x at height %d "+
+                                        "but height index points to %x; the stored tip is stale or corrupt — "+
+                                        "manual recovery required (e.g. run with --reset-tip or restore from backup)",
+                                tipHash[:8], tipHeight, indexedBlock.Hash[:8],
+                        )
+                }
+                log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
+
                 // Always load genesis (height 0).
                 genesisRaw, err := db.GetRawBlockByHeight(0)
                 if err != nil || genesisRaw == nil {
@@ -367,24 +397,34 @@ func run() error {
 
                 // Load only the most recent maxInMemoryBlocks blocks.
                 // Older blocks are kept in SQLite; the in-memory window is bounded.
-                const maxLoad = core.MaxInMemoryBlocks
+                // Uses loadRecentBlocksFromStore (resume.go) which continues past
+                // any missing heights rather than aborting early.
+                recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log)
                 startLoad := uint64(1)
-                if tipHeight >= maxLoad {
-                        startLoad = tipHeight - maxLoad + 1
+                if tipHeight >= core.MaxInMemoryBlocks {
+                        startLoad = tipHeight - core.MaxInMemoryBlocks + 1
                 }
-                recentBlocks := make([]*core.Block, 0, maxLoad)
-                for h := startLoad; h <= tipHeight; h++ {
-                        raw, err := db.GetRawBlockByHeight(h)
-                        if err != nil || raw == nil {
-                                log.Warn("block missing in store during resume", "height", h)
-                                continue // skip sparse gaps; don't abort the whole window
+
+                // ── Store integrity check (in-memory window) ──────────────────────
+                // Scan the same height window for missing LevelDB entries.
+                // Missing blocks are non-fatal at this stage — the startup scan has
+                // its own MaxMissingBlocks guard — but we emit a structured WARNING
+                // immediately so operators know the extent of any damage without
+                // waiting for the scan to reach the affected heights hours later.
+                // The count is also published on /api/v1/status so the admin panel
+                // can surface it without requiring log access.
+                {
+                        missingCount, firstMissing, lastMissing := countMissingBlocksInWindow(db, tipHeight)
+                        if missingCount > 0 {
+                                log.Warn("store integrity warning",
+                                        "missing_blocks", missingCount,
+                                        "first_missing", firstMissing,
+                                        "last_missing",  lastMissing,
+                                )
                         }
-                        var b core.Block
-                        if err := json.Unmarshal(raw, &b); err != nil {
-                                log.Warn("block unmarshal failed", "height", h, "err", err)
-                                continue
+                        if apiSrv != nil {
+                                apiSrv.SetStoreMissingBlocks(int64(missingCount))
                         }
-                        recentBlocks = append(recentBlocks, &b)
                 }
 
                 // Fast-forward the in-memory chain.  If the persistent tx-index
@@ -435,26 +475,10 @@ func run() error {
                         "blocks_loaded_in_memory", len(recentBlocks),
                 )
 
-                // Safety guard: if FastForward was a no-op (recentBlocks empty
-                // or all missing) the in-memory chain tip stays at genesis (height 0)
-                // while the DB tip is at tipHeight. Without this guard the consensus
-                // engine would produce blocks from height 1, silently overwriting the
-                // DB tip and destroying the canonical chain.
-                // Fix: always load the actual tip block so c.tip.Header.Height == tipHeight.
-                if chain.Tip().Header.Height < tipHeight {
-                        tipRaw, tipRawErr := db.GetRawBlockByHeight(tipHeight)
-                        if tipRawErr == nil && tipRaw != nil {
-                                var tipBlock core.Block
-                                if jsonErr := json.Unmarshal(tipRaw, &tipBlock); jsonErr == nil {
-                                        chain.FastForward([]*core.Block{&tipBlock})
-                                        log.Info("tip block loaded as in-memory anchor",
-                                                "height", tipHeight)
-                                } else {
-                                        return fmt.Errorf("unmarshal tip block at %d: %w", tipHeight, jsonErr)
-                                }
-                        } else {
-                                return fmt.Errorf("tip block missing from store at height %d — database may be corrupt", tipHeight)
-                        }
+                // Safety guard: delegate to anchorTipIfNeeded (resume.go) so the
+                // logic is unit-tested independently of the full node startup path.
+                if err := anchorTipIfNeeded(chain, db, tipHeight, log); err != nil {
+                        return err
                 }
 
                 // ── Unified startup scan ─────────────────────────────────────────────
@@ -501,61 +525,18 @@ func run() error {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
                         if snap, snapIsRelaxed, serr := loadStartupSnapshotWithFallback(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
                                 // ── UTXO count divergence check ──────────────────────────────────
-                                // Before restoring, compare the snapshot's active (unspent) UTXO
-                                // count against the durable active count written to DB metadata the
-                                // last time a snapshot was saved.  A mismatch beyond the configured
-                                // tolerance indicates a stale or partially-written snapshot (e.g.
-                                // written mid-crash, or produced by a binary with a different UTXO
-                                // schema).
-                                //
-                                // The check is gated on the metadata value being present.  On a
-                                // node that has never completed a successful snapshot save the key
-                                // does not exist and the check is skipped rather than treating a
-                                // missing count as zero.
-                                utxoCountOK := true
-                                snapUTXOCount := len(snap.UTXOs.ActiveUTXOs)
-                                dbActiveCount, dbHasCount, countErr := db.LoadActiveUTXOCount(tipHashHex)
-                                if countErr != nil {
-                                        log.Warn("snapshot UTXO count check skipped — db metadata error", "err", countErr)
-                                } else if !dbHasCount {
-                                        log.Info("snapshot UTXO count check skipped — no prior active count in db (first snapshot)")
-                                } else {
-                                        diff := snapUTXOCount - dbActiveCount
-                                        if diff < 0 {
-                                                diff = -diff
-                                        }
-                                        larger := dbActiveCount
-                                        if snapUTXOCount > larger {
-                                                larger = snapUTXOCount
-                                        }
-                                        // Protect against both counts being 0 (genesis edge case).
-                                        var diffPct float64
-                                        if larger > 0 {
-                                                diffPct = float64(diff) / float64(larger) * 100.0
-                                        }
-                                        tolerancePct := cfg.Snapshot.UTXOCountTolerancePct
-                                        if snapIsRelaxed {
-                                                // Relaxed-hash recovery path: the snapshot was written before
-                                                // recover-tip patched the DB tip, so UTXO count naturally
-                                                // diverges from DB metadata.  Skip the count check.
-                                                tolerancePct = 100.0
-                                        }
-                                        if diffPct > tolerancePct {
-                                                log.Warn("snapshot rejected — active UTXO count diverges from last-saved count; falling back to block scan",
-                                                        "snapshot_active_utxos", snapUTXOCount,
-                                                        "db_last_active_utxos", dbActiveCount,
-                                                        "diff_pct", fmt.Sprintf("%.2f%%", diffPct),
-                                                        "tolerance_pct", tolerancePct,
-                                                )
-                                                utxoCountOK = false
-                                        } else {
-                                                log.Info("snapshot UTXO count check passed",
-                                                        "snapshot_active_utxos", snapUTXOCount,
-                                                        "db_last_active_utxos", dbActiveCount,
-                                                        "diff_pct", fmt.Sprintf("%.2f%%", diffPct),
-                                                )
-                                        }
-                                }
+                                // See checkSnapshotUTXOCount in snapshot_utxo_check.go for the
+                                // full logic.  isRelaxed widens the tolerance to 100 % when the
+                                // snapshot was loaded via the relaxed-hash recovery path.
+                                utxoCountOK := checkSnapshotUTXOCount(
+                                        db,
+                                        len(snap.UTXOs.ActiveUTXOs),
+                                        tipHashHex,
+                                        cfg.Snapshot.UTXOCountTolerancePct,
+                                        snapIsRelaxed,
+                                        cfg.Consensus.NonValidator,
+                                        log,
+                                )
 
                                 if utxoCountOK {
                                         utxos.RestoreFromSnapshot(snap.UTXOs)
@@ -566,7 +547,7 @@ func run() error {
                                         }
                                         log.Info("startup fast path complete — snapshot loaded",
                                                 "tip_height", tipHeight,
-                                                "active_utxos", snapUTXOCount,
+                                                "active_utxos", len(snap.UTXOs.ActiveUTXOs),
                                                 "spent_decoys", len(snap.UTXOs.SpentDecoys),
                                                 "key_images", len(snap.UTXOs.KeyImages),
                                         )
