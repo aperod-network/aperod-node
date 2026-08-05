@@ -839,12 +839,30 @@ func (h *Host) maintainLoop() {
                         h.mu.RUnlock()
 
                         if count < h.cfg.MinPeers {
+                                // Re-dial known peers discovered via peer exchange.
                                 for _, addr := range known {
                                         h.mu.RLock()
                                         _, connected := h.peers[addr]
                                         h.mu.RUnlock()
                                         if !connected {
                                                 go h.dialPeer(addr)
+                                        }
+                                }
+                                // Always retry configured bootnodes when isolated — these
+                                // are the only anchors when peerList is empty (e.g. fresh
+                                // start or after a network partition).
+                                for _, raw := range h.cfg.Bootnodes {
+                                        resolved, err := resolveBootnode(raw)
+                                        if err != nil {
+                                                continue
+                                        }
+                                        for _, addr := range resolved {
+                                                h.mu.RLock()
+                                                _, connected := h.peers[addr]
+                                                h.mu.RUnlock()
+                                                if !connected {
+                                                        go h.dialPeer(addr)
+                                                }
                                         }
                                 }
                         }
