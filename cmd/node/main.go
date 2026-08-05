@@ -578,8 +578,12 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
                                 }
-                        } else if !os.IsNotExist(serr) {
-                                log.Warn("snapshot load error, falling back to block scan", "err", serr)
+                        } else {
+                                // Emit a structured log entry that distinguishes "no snapshot"
+                                // (first run / new install) from "corrupt snapshot" (SIGKILL
+                                // victim or truncated write).  Operators can filter journalctl
+                                // output by startup_reason= to see why a long scan was triggered.
+                                logSnapshotStartupReason(serr, tipHeight, log)
                         }
                 }
 
@@ -766,11 +770,15 @@ func run() error {
                         }
                         periodicActive := len(periodicSnap.UTXOs.ActiveUTXOs)
                         go func(snap startupSnapshot, height uint64, activeCount int) {
+                                periodicSaveStart := time.Now()
                                 if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
                                         log.Warn("failed to save periodic snapshot",
                                                 "height", height, "err", saveErr)
                                 } else {
-                                        log.Info("periodic snapshot saved", "height", height)
+                                        log.Info("periodic snapshot saved",
+                                                "height", height,
+                                                "save_duration", time.Since(periodicSaveStart).Round(time.Millisecond).String(),
+                                        )
                                         deleteOldSnapshots(cfg.DataDir, height)
                                         // Persist the active UTXO count keyed by tip hash so the
                                         // next restart's divergence check has an active-only
@@ -1209,11 +1217,16 @@ func saveShutdownSnapshot(
                 UTXOs:      utxos.TakeSnapshot(),
                 Registry:   registry.TakeSnapshot(),
         }
+        snapSaveStart := time.Now()
         if saveErr := saveStartupSnapshot(dataDir, shutSnap); saveErr != nil {
                 log.Warn("shutdown: failed to save snapshot", "err", saveErr)
                 return
         }
-        log.Info("shutdown: snapshot saved", "tip_height", shutTipHeight)
+        snapSaveDur := time.Since(snapSaveStart).Round(time.Millisecond)
+        log.Info("shutdown: snapshot saved",
+                "tip_height", shutTipHeight,
+                "save_duration", snapSaveDur.String(),
+        )
         deleteOldSnapshots(dataDir, shutTipHeight)
         // Persist the active UTXO count keyed by tip hash so the
         // next restart's divergence check has an active-only reference
