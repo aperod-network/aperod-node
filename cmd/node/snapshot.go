@@ -290,6 +290,45 @@ func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string)
 	return &snap, nil
 }
 
+// loadPrevBackupSnapshotRelaxed reads the "-prev.json.gz" backup, validating
+// only the schema version and tip height — not the tip hash.  This is used as
+// an emergency recovery path when the primary snapshot is absent and the DB tip
+// hash may have been repaired by an out-of-band tool (e.g. recover-tip).  The
+// caller is responsible for emitting a prominent warning and relying on the UTXO
+// count divergence check as the secondary trust signal.
+//
+// Returns os.ErrNotExist when the prev file does not exist.
+func loadPrevBackupSnapshotRelaxed(dataDir string, tipHeight uint64) (*startupSnapshot, error) {
+	primaryPath := snapshotPath(dataDir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+
+	f, gzr, err := openGzipSnapshotReader(prevPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("open prev snapshot (relaxed): %w", err)
+	}
+	defer f.Close()
+	defer gzr.Close()
+
+	var snap startupSnapshot
+	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
+		return nil, fmt.Errorf("decode prev snapshot (relaxed): %w", err)
+	}
+	if snap.Version != snapVersion {
+		return nil, fmt.Errorf("prev snapshot (relaxed) version mismatch: got %d want %d",
+			snap.Version, snapVersion)
+	}
+	if snap.TipHeight != tipHeight {
+		return nil, fmt.Errorf("prev snapshot (relaxed) height mismatch: got %d want %d",
+			snap.TipHeight, tipHeight)
+	}
+	// Hash not checked here — caller logs a warning and relies on UTXO count
+	// divergence check as the secondary integrity signal.
+	return &snap, nil
+}
+
 // loadStartupSnapshot reads and validates a gzip-compressed snapshot for the
 // given tip.
 // Returns os.ErrNotExist when no snapshot file exists for the height.
