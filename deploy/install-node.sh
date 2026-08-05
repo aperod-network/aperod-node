@@ -89,16 +89,81 @@ if ${need_go}; then
   ok "Go ${GO_VERSION} установлен"
 fi
 
+# ── 2b. Системный пользователь aperod ────────────────────
+# Created here — before the git clone — because the clone runs as `aperod`
+# (so the working tree is owned by the pull user from the start) and
+# `sudo -u aperod` requires the account to exist.
+if ! id aperod &>/dev/null; then
+  useradd --system \
+          --no-create-home \
+          --shell /usr/sbin/nologin \
+          --home-dir "${DATA_DIR}" \
+          aperod
+  ok "Системный пользователь aperod создан"
+else
+  ok "Пользователь aperod уже существует — пропускаем"
+fi
+
 # ── 3. Клонирование репозитория ───────────────────────────
-info "Получаем исходный код Aperod…"
-TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
+# We use `git clone` (not a tarball) so the install directory is a proper
+# git checkout.  This is required for two reasons:
+#
+#   a) `update-node.sh` later runs `git pull` to receive updates.
+#   b) The post-merge hook (step 12b) is installed into `.git/hooks/`.
+#      Without a git repo the hook directory does not exist and the hook
+#      cannot fire after bare `git pull` calls — which is the exact failure
+#      mode this task exists to prevent.
+#
+# Three cases handled explicitly:
+#   1. .git exists → pull (idempotent re-run or update).
+#   2. Directory is non-empty but has no .git → prior tarball install detected;
+#      print clear migration instructions and abort so the operator decides.
+#   3. Directory is absent or empty → fresh clone.
+info "Получаем исходный код Aperod (git clone)…"
+REPO_URL_GIT="https://github.com/aperod-network/aperod-node.git"
 mkdir -p "${INSTALL_DIR}"
-info "Скачиваем архив исходного кода…"
-wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
-  || die "Не удалось скачать ${TARBALL_URL}"
-tar -xzf /tmp/aperod-src.tar.gz -C "${INSTALL_DIR}" --strip-components=1
-rm -f /tmp/aperod-src.tar.gz
-ok "Исходный код получен в ${INSTALL_DIR}"
+
+if [[ -d "${INSTALL_DIR}/.git" ]]; then
+  # ── Case 1: existing git repo — pull latest ──────────────────────────────
+  info "  Репозиторий уже существует — обновляем через git pull…"
+  chown -R aperod:aperod "${INSTALL_DIR}"
+  sudo -u aperod git -C "${INSTALL_DIR}" pull --ff-only \
+    || die "git pull не удался. Проверьте подключение к GitHub."
+  ok "Репозиторий обновлён в ${INSTALL_DIR}"
+
+elif [[ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]]; then
+  # ── Case 2: non-empty directory without .git → prior tarball install ─────
+  # git clone would fail on a non-empty target.  Require the operator to
+  # convert explicitly so we never silently overwrite production data.
+  echo ""
+  echo -e "${RED}═══════════════════════════════════════════════════${NC}"
+  echo -e "${RED}  Обнаружена существующая установка (не git-репо)  ${NC}"
+  echo -e "${RED}═══════════════════════════════════════════════════${NC}"
+  echo ""
+  echo "  ${INSTALL_DIR} содержит файлы, но не является git-репозиторием."
+  echo "  Вероятно, это старая установка через тарбол."
+  echo ""
+  echo "  ── Как конвертировать в git-репозиторий ──────────────"
+  echo "  cd ${INSTALL_DIR}"
+  echo "  git init"
+  echo "  git remote add origin ${REPO_URL_GIT}"
+  echo "  git fetch --depth=1 origin main"
+  echo "  git reset --hard origin/main"
+  echo "  sudo bash deploy/install-node.sh   # повторный запуск"
+  echo "  ──────────────────────────────────────────────────────"
+  echo ""
+  die "Прервано. Выполните конвертацию выше, затем повторите запуск."
+
+else
+  # ── Case 3: fresh install — clone as aperod ──────────────────────────────
+  # Clone as the aperod user so the working tree and .git directory are owned
+  # by the pull user from the start.  The aperod account was created at step
+  # 2b; `sudo -u aperod` is now safe to use.
+  chown aperod:aperod "${INSTALL_DIR}"
+  sudo -u aperod git clone --depth=1 "${REPO_URL_GIT}" "${INSTALL_DIR}" \
+    || die "git clone не удался. Проверьте подключение к GitHub."
+  ok "Репозиторий клонирован в ${INSTALL_DIR}"
+fi
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
@@ -120,21 +185,10 @@ ok "Бинарники установлены: /usr/local/bin/aperod-node, /usr/
 # ── 5. Создаём директории ─────────────────────────────────
 mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${WALLET_DIR}"
 
-# ── 5b. Системный пользователь aperod ────────────────────
-# Сервис запускается от имени непривилегированного пользователя aperod.
-# Создаём его, если он ещё не существует.
-if ! id aperod &>/dev/null; then
-  useradd --system \
-          --no-create-home \
-          --shell /usr/sbin/nologin \
-          --home-dir "${DATA_DIR}" \
-          aperod
-  ok "Системный пользователь aperod создан"
-else
-  ok "Пользователь aperod уже существует — пропускаем"
-fi
-# Директория данных должна принадлежать aperod, чтобы сервис мог писать
-# snapshot'ы и цепочку блоков (ReadWritePaths в unit-файле).
+# ── 5b. Права директории данных ──────────────────────────
+# The aperod system account was already created at step 2b.
+# Assign ownership of the data directory to aperod so the service can write
+# snapshots and the block chain (ReadWritePaths in the unit file).
 chown -R aperod:aperod "${DATA_DIR}"
 chmod 750 "${DATA_DIR}"
 
@@ -379,6 +433,86 @@ chmod +x /usr/local/bin/aperod-watchdog-set-interval
 
 systemctl enable --now aperod-node-watchdog.timer
 ok "Watchdog установлен (aperod-node-watchdog.timer запущен)"
+
+# ── 11b. Scheduled RAM-prevention restart timer ───────────────────────────────
+# The Go node leaks ~1.3 GB/h.  A restart every 3 h keeps RAM well below the
+# GOMEMLIMIT ceiling and prevents GC thrash / watchdog crash-loops.
+# The interval is configurable via /etc/aperod/sched-restart.env without
+# editing any system files (run `sudo aperod-sched-restart-set-interval`).
+info "Устанавливаем таймер планового перезапуска (каждые 3 ч, защита от роста RAM)…"
+cp "${SCRIPT_DIR}/aperod-node-sched-restart.sh"      /usr/local/bin/aperod-node-sched-restart.sh
+chmod +x /usr/local/bin/aperod-node-sched-restart.sh
+cp "${SCRIPT_DIR}/aperod-node-sched-restart.service" /etc/systemd/system/
+cp "${SCRIPT_DIR}/aperod-node-sched-restart.timer"   /etc/systemd/system/
+
+# Create optional env file for interval and Telegram credentials
+mkdir -p /etc/aperod
+if [[ ! -f /etc/aperod/sched-restart.env ]]; then
+  cat > /etc/aperod/sched-restart.env <<SRENV
+# Aperod node scheduled-restart configuration
+# ─────────────────────────────────────────────────────────────────
+# Restart interval in seconds.  Default: 10800 (3 hours).
+# Valid range: 3600 (1 h) – 86400 (24 h).
+# To change without a redeploy:
+#   1. Edit this value.
+#   2. Run: sudo aperod-sched-restart-set-interval
+SCHED_RESTART_INTERVAL_SECS=10800
+
+# Telegram credentials — if blank, no notifications are sent.
+# (Shared with watchdog.env; fill in once and copy to both files.)
+# SUPPORT_BOT_TOKEN=
+# SUPPORT_ADMIN_CHAT_ID=
+SRENV
+  chmod 600 /etc/aperod/sched-restart.env
+fi
+
+# Install the interval-apply helper
+cp "${SCRIPT_DIR}/aperod-sched-restart-set-interval.sh" \
+   /usr/local/bin/aperod-sched-restart-set-interval
+chmod +x /usr/local/bin/aperod-sched-restart-set-interval
+
+# Apply the interval from sched-restart.env to the timer drop-in
+/usr/local/bin/aperod-sched-restart-set-interval
+
+systemctl enable --now aperod-node-sched-restart.timer
+ok "Таймер планового перезапуска установлен (aperod-node-sched-restart.timer, каждые 3 ч)"
+
+# ── 12. aperod_backup.sh ──────────────────────────────────────────────────
+# Install the backup script from the repo so the correct version is present
+# from day one.  setup-backup.sh (run separately) configures the schedule and
+# credentials; this step just ensures /usr/local/bin/aperod_backup.sh is never
+# stale if setup-backup.sh was run before a fresh install-node.sh deployment.
+info "Устанавливаем aperod_backup.sh…"
+if [[ -f "${SCRIPT_DIR}/aperod_backup.sh" ]]; then
+  cp "${SCRIPT_DIR}/aperod_backup.sh" /usr/local/bin/aperod_backup.sh
+  chmod 700 /usr/local/bin/aperod_backup.sh
+  ok "aperod_backup.sh установлен: /usr/local/bin/aperod_backup.sh"
+  info "  Для настройки резервного копирования запустите: sudo bash ${SCRIPT_DIR}/setup-backup.sh"
+else
+  warn "aperod_backup.sh не найден в ${SCRIPT_DIR} — пропускаем установку скрипта резервного копирования"
+fi
+
+# ── 12b. Install git post-merge hook ─────────────────────────────────────────
+# When operators run bare `git pull` (bypassing update-node.sh), the installed
+# /usr/local/bin/aperod_backup.sh can silently drift from the repo copy.
+# The hook detects this mismatch immediately and warns on stderr so the
+# operator knows to run sudo update-node.sh to perform the privileged sync.
+#
+# Security: the hook runs as the aperod user and performs NO writes to
+# root-owned paths.  It only reads and compares files, then prints warnings.
+# The actual privileged copy remains an explicit operator action (update-node.sh).
+#
+# Tarball installs have no .git directory — the step is a silent no-op.
+info "Устанавливаем git post-merge hook (оповещение о расхождении aperod_backup.sh)…"
+HOOK_SRC="${SCRIPT_DIR}/post-merge"
+GIT_HOOKS_DIR="${INSTALL_DIR}/.git/hooks"
+if [[ -d "${GIT_HOOKS_DIR}" && -f "${HOOK_SRC}" ]]; then
+  cp "${HOOK_SRC}" "${GIT_HOOKS_DIR}/post-merge"
+  chmod +x "${GIT_HOOKS_DIR}/post-merge"
+  ok "post-merge hook установлен: ${GIT_HOOKS_DIR}/post-merge"
+else
+  info "  .git/hooks не найден — пропускаем (установка через тарбол, без git)."
+fi
 
 # Проверяем что стартовал
 sleep 3
