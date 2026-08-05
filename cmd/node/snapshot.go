@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -507,6 +508,7 @@ func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *s
 		name   string
 	}
 	var candidates []candidate
+	covered := map[uint64]bool{} // heights already covered by a primary checkpoint
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, "-prev.json.gz") {
@@ -519,6 +521,25 @@ func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *s
 		rest = strings.TrimSuffix(rest, ".json.gz")
 		h, parseErr := strconv.ParseUint(rest, 10, 64)
 		if parseErr != nil || h == 0 || h >= limitHeight {
+			continue
+		}
+		candidates = append(candidates, candidate{h, name})
+		covered[h] = true
+	}
+	// Also consider orphaned shutdown prev-backup files (snapshot-v2-{height}-prev.json.gz)
+	// at heights not already covered by a primary scan checkpoint.  These are written on
+	// clean shutdown and are often the highest-height valid snapshot available after a
+	// crash that wiped later scan checkpoints.
+	const prevSuffix = "-prev.json.gz"
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, prevSuffix) {
+			continue
+		}
+		rest := strings.TrimPrefix(name, prefix)
+		rest = strings.TrimSuffix(rest, prevSuffix)
+		h, parseErr := strconv.ParseUint(rest, 10, 64)
+		if parseErr != nil || h == 0 || h >= limitHeight || covered[h] {
 			continue
 		}
 		candidates = append(candidates, candidate{h, name})
@@ -557,6 +578,37 @@ func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *s
 		}
 	}
 	return nil
+}
+
+// logSnapshotStartupReason emits the appropriate structured log entry explaining
+// why the full block scan is required.  It is called after
+// loadStartupSnapshotWithFallback returns an error so journalctl output clearly
+// distinguishes two distinct situations:
+//
+//   - startup_reason=no_snapshot — no snapshot file existed at all (first run,
+//     new install, or the file was manually deleted).  This is expected on a
+//     fresh node and requires only one full scan to create the first snapshot.
+//
+//   - startup_reason=corrupt_snapshot — a snapshot file was found but could not
+//     be decoded or failed a validation check (version mismatch, height/hash
+//     mismatch, truncated gzip).  This is the signature of a SIGKILL arriving
+//     mid-write; the atomic rename should have prevented it, but it is logged
+//     at Warn level so operators see it in monitoring.
+//
+// Extracting the decision into its own function makes it directly unit-testable
+// without running the full node startup path.
+func logSnapshotStartupReason(serr error, tipHeight uint64, log *slog.Logger) {
+	if errors.Is(serr, os.ErrNotExist) {
+		log.Info("no snapshot found — full block scan required",
+			"tip_height", tipHeight,
+			"startup_reason", "no_snapshot",
+		)
+	} else {
+		log.Warn("snapshot corrupt or unreadable — falling back to full block scan",
+			"err", serr,
+			"startup_reason", "corrupt_snapshot",
+		)
+	}
 }
 
 // deleteOldSnapshots removes snapshot files whose height differs from keep.
