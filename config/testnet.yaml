@@ -13,6 +13,11 @@ consensus:
   reward_address: ""         # APRO wallet address for block rewards — get yours at https://t.me/aperod_bot
   block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
   block_time: "3s"
+  # non_validator: true      # Set to true to run a sync-only / relay / RPC node.
+  #                          # The node validates and relays every block but never
+  #                          # proposes or signs blocks, so it cannot cause a chain
+  #                          # split.  validator_key is still loaded for P2P identity
+  #                          # if specified; omit it to auto-generate an ephemeral key.
   oracle_url: "http://localhost:8080/api/v1/oracle/price"  # APRO/USD price endpoint (Node.js API server).
                                                           # Production systemd unit (aperod-api.service) binds to port 8080.
                                                           # Dev: port 3000.  Empty = skip embedding.
