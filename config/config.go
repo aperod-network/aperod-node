@@ -40,6 +40,28 @@ type SnapshotConfig struct {
 	// Default: 10000.  Set to 0 to disable periodic snapshots entirely
 	// (shutdown snapshot only).
 	PeriodicSnapshotInterval uint64 `yaml:"periodic_snapshot_interval"`
+
+	// ScanCheckpointInterval is the number of blocks between intermediate
+	// checkpoints saved during the startup block scan.  A smaller value means
+	// the node can resume from a more recent checkpoint after a crash mid-scan
+	// (faster crash recovery) but takes more frequent TakeSnapshot() calls,
+	// each of which briefly doubles node RSS.  A larger value reduces peak
+	// memory pressure at the cost of replaying more blocks on restart.
+	//
+	// Default: 50000.  Must be > 0; a value of 0 is replaced by the default
+	// at runtime.
+	ScanCheckpointInterval uint64 `yaml:"scan_checkpoint_interval"`
+
+	// MaxMissingBlocks is the maximum number of individual blocks that may be
+	// absent from the LevelDB store before the startup block scan returns a
+	// fatal error.  Isolated store gaps (e.g. a single block lost during a
+	// hard-kill) are logged at ERROR level and skipped; the node still starts.
+	// If more than this many blocks are missing the node refuses to start so
+	// that severe store corruption is caught rather than silently producing a
+	// wrong UTXO set.
+	//
+	// Default: 10.  Set to 0 to use the default.
+	MaxMissingBlocks uint64 `yaml:"max_missing_blocks"`
 }
 
 // PprofConfig controls the Go pprof HTTP diagnostic endpoint.
@@ -216,6 +238,7 @@ func DefaultConfig() *Config {
 		Snapshot: SnapshotConfig{
 			UTXOCountTolerancePct:    1.0,
 			PeriodicSnapshotInterval: 10_000,
+			ScanCheckpointInterval:   50_000,
 		},
 		Pprof: PprofConfig{
 			Enabled:    false,
