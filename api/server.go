@@ -55,6 +55,10 @@ type Server struct {
         banLiftFn func(string) bool                         // optional; wired to p2p.Host.LiftBan by cmd/node
         banAddFn  func(addr, reason string, d time.Duration) // optional; wired to p2p.Host.Ban by cmd/node
 
+        // whitelistExemptFn returns whitelist-exemption events since a given time.
+        // Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
+        whitelistExemptFn func(since time.Time) []WhitelistExemptionEntry
+
         // peerWhitelist holds the parsed peer_whitelist entries from node.yaml.
         // Stored so /api/v1/status can report them to operators.
         peerWhitelist []string
@@ -215,6 +219,16 @@ func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
 // can report it (Task #504).
 func (s *Server) SetPendingHandshakeCounter(f func() int64) { s.pendingHandshakeCounter = f }
 
+// WhitelistExemptionEntry is one whitelist-exemption event returned by the REST API.
+// Mirrors p2p.WhitelistExemptionEvent; defined here to avoid an import cycle.
+type WhitelistExemptionEntry struct {
+        IP          string    `json:"ip"`
+        PeerAddr    string    `json:"peer_addr"`
+        BlockHeight uint64    `json:"block_height"`
+        OurTip      uint64    `json:"our_tip"`
+        At          time.Time `json:"at"`
+}
+
 // BanEntry is a snapshot of one active P2P ban entry, returned by the REST API.
 type BanEntry struct {
         Addr      string    `json:"addr"`
@@ -261,6 +275,13 @@ func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = 
 // not found, or (false, err) when persistence fails.
 // Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
 func (s *Server) SetWhitelistRemoveFunc(f func(string) (bool, error)) { s.whitelistRemoveFn = f }
+
+// SetWhitelistExemptFunc wires a function that returns whitelist-exemption events
+// recorded since a given time.  Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
+// Optional — GET /api/v1/network/whitelist-exemptions returns 503 when not wired.
+func (s *Server) SetWhitelistExemptFunc(f func(since time.Time) []WhitelistExemptionEntry) {
+        s.whitelistExemptFn = f
+}
 
 // SetNodeIdentity stores the P2P TLS fingerprint, listen address, and node ID
 // so they can be returned by GET /api/v1/network/identity.
