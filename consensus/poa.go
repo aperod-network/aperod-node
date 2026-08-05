@@ -683,17 +683,19 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("invalid block: %w", err)
         }
 
-        // Timejacking guard (#418): reject blocks whose timestamp deviates from
-        // local wall clock by more than ±15 seconds.
+        // Timejacking guard (#418): reject blocks whose timestamp is too far in
+        // the FUTURE relative to the local wall clock.  Only future timestamps
+        // are an attack vector — a malicious peer shifts the chain tip into the
+        // far future so that legitimate blocks produced at time.Now() are then
+        // rejected as "too old".  Historical sync blocks always have past
+        // timestamps and must never be rejected by this check; applying a ±
+        // window would prevent relay nodes from catching up after a gap.
         nowNs := time.Now().UTC().UnixNano()
-        skewNs := block.Header.Timestamp - nowNs
-        if skewNs < 0 {
-                skewNs = -skewNs
-        }
-        if skewNs > maxClockSkewNs {
+        futureSkewNs := block.Header.Timestamp - nowNs
+        if futureSkewNs > maxClockSkewNs {
                 atomic.AddInt64(&e.timestampRejected, 1)
-                return fmt.Errorf("block %d: timestamp too far from local clock (skew %dms, max %dms)",
-                        block.Header.Height, skewNs/1_000_000, maxClockSkewNs/1_000_000)
+                return fmt.Errorf("block %d: timestamp too far in the future (skew +%dms, max %dms)",
+                        block.Header.Height, futureSkewNs/1_000_000, maxClockSkewNs/1_000_000)
         }
 
         // Check proposer is a known validator
