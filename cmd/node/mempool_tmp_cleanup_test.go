@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -209,5 +210,72 @@ func TestMempoolStartupStaleTmpAlongsideSavedEntries(t *testing.T) {
 	}
 	if poolAfter.Count() != 1 {
 		t.Errorf("pool.Count() = %d after startupLoadMempool, want 1", poolAfter.Count())
+	}
+}
+
+// TestCleanStaleTmpFilesPermissionError verifies that CleanStaleTmpFiles emits
+// the "failed to remove stale tmp file" warning and leaves the file intact when
+// os.Remove fails due to a permissions error.
+//
+// The test is Linux-only (chmod semantics differ on other platforms) and is
+// skipped when running as root (root can remove files regardless of directory
+// permissions).
+func TestCleanStaleTmpFilesPermissionError(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping on non-Linux: chmod directory permissions may differ")
+	}
+	if os.Getuid() == 0 {
+		t.Skip("skipping when running as root: root ignores directory write permissions")
+	}
+
+	// Use a subdirectory as the data dir so we can revoke its write permission
+	// independently; the parent (t.TempDir()) retains full permissions so the
+	// test framework can still remove everything after the test.
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "data")
+	if err := os.Mkdir(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir dataDir: %v", err)
+	}
+
+	tmpPath := filepath.Join(dataDir, "mempool.json.tmp")
+
+	// Plant a stale .tmp file (10 minutes old — well past the 5-minute threshold).
+	if err := os.WriteFile(tmpPath, []byte(`{"saved_at":"2020-01-01T00:00:00Z","entries":[]}`), 0o600); err != nil {
+		t.Fatalf("write stale tmp: %v", err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(tmpPath, staleTime, staleTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Remove write permission from the data dir so os.Remove(tmpPath) fails
+	// with EACCES.  Restore it in a deferred call so t.TempDir() cleanup works.
+	if err := os.Chmod(dataDir, 0o555); err != nil {
+		t.Fatalf("chmod dataDir: %v", err)
+	}
+	defer func() {
+		// Restore write permission so the test framework can remove the dir.
+		_ = os.Chmod(dataDir, 0o755)
+	}()
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// Call CleanStaleTmpFiles directly — this is the function under test.
+	core.CleanStaleTmpFiles(dataDir, log)
+
+	// The warning log must be present: removal failed due to permissions.
+	// The exact msg value comes from CleanStaleTmpFiles in core/mempool.go.
+	const wantWarnMsg = "mempool: failed to remove stale tmp file (ignoring)"
+	if !logContainsMsg(&logBuf, wantWarnMsg) {
+		t.Errorf("warning log %q not found — error path not reached or not logged:\n%s",
+			wantWarnMsg, logBuf.String())
+	}
+
+	// The .tmp file must still exist: CleanStaleTmpFiles must not have removed it.
+	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+		t.Errorf("stale .tmp was unexpectedly removed despite permissions error")
+	} else if err != nil {
+		t.Errorf("unexpected stat error after failed removal: %v", err)
 	}
 }
