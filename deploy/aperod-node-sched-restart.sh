@@ -7,9 +7,14 @@
 #
 #  Sequence:
 #    1. Send "about to restart" Telegram notification
-#    2. systemctl restart aperod-node  (SIGTERM → snapshot saved → start)
-#    3. Wait up to 90 s for the API to return HTTP 200
-#    4. Send "back online" or "did not recover" Telegram notification
+#    2. Pause aperod-node-watchdog.timer (prevents competing health-probe restart)
+#    3. systemctl restart aperod-node  (SIGTERM → snapshot saved → start)
+#    4. Wait up to 90 s for the API to return HTTP 200
+#    5. Send "back online" or "did not recover" Telegram notification
+#    6. Resume watchdog timer (always, via EXIT trap)
+#
+#  The EXIT trap guarantees the watchdog is re-enabled no matter how the script
+#  exits — including early exits triggered by set -e on unexpected errors.
 #
 #  Optional env vars (set in /etc/aperod/sched-restart.env or in the
 #  .service unit):
@@ -30,6 +35,9 @@ INTERVAL_SECS="${SCHED_RESTART_INTERVAL_SECS:-10800}"
 INTERVAL_H=$(( INTERVAL_SECS / 3600 ))
 HOSTNAME_LABEL="$(hostname 2>/dev/null || echo unknown)"
 
+# Track whether we paused the watchdog so the EXIT trap knows what to restore.
+WATCHDOG_WAS_ACTIVE=0
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -38,7 +46,8 @@ log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [sched-restart] $*"; }
 send_telegram() {
   local msg="$1"
   if [[ -n "${SUPPORT_BOT_TOKEN:-}" && -n "${SUPPORT_ADMIN_CHAT_ID:-}" ]]; then
-    # --connect-timeout and --max-time ensure a stalled network never blocks the restart.
+    # --connect-timeout and --max-time bound every Telegram call so a stalled
+    # network path can never block the restart or disable the watchdog.
     curl -s --connect-timeout 5 --max-time 10 -X POST \
       "https://api.telegram.org/bot${SUPPORT_BOT_TOKEN}/sendMessage" \
       -d chat_id="${SUPPORT_ADMIN_CHAT_ID}" \
@@ -58,6 +67,18 @@ increment_restart_count() {
 }
 
 # ---------------------------------------------------------------------------
+# EXIT trap — always re-enable the watchdog if we paused it
+# This fires on every exit path: normal, set -e abort, signal, etc.
+# ---------------------------------------------------------------------------
+_cleanup() {
+  if [[ "${WATCHDOG_WAS_ACTIVE}" == "1" ]]; then
+    systemctl start aperod-node-watchdog.timer 2>/dev/null || true
+    log "Watchdog таймер возобновлён (EXIT trap)"
+  fi
+}
+trap '_cleanup' EXIT
+
+# ---------------------------------------------------------------------------
 # Step 1 — Pre-restart notification
 # ---------------------------------------------------------------------------
 log "Плановый перезапуск ноды (интервал: ${INTERVAL_H} ч) — отправляем уведомление"
@@ -69,19 +90,28 @@ send_telegram "⏱ <b>Плановый перезапуск ноды</b>
 Нода вернётся через ~30 с — это плановое обслуживание."
 
 # ---------------------------------------------------------------------------
-# Step 2 — Pause the watchdog, then graceful restart
-# Stopping the watchdog timer prevents it from seeing the brief offline window
-# and triggering a competing restart during our planned shutdown.
+# Step 2 — Pause the watchdog
 # ---------------------------------------------------------------------------
-WATCHDOG_WAS_ACTIVE=0
 if systemctl is-active --quiet aperod-node-watchdog.timer 2>/dev/null; then
   systemctl stop aperod-node-watchdog.timer 2>/dev/null || true
   WATCHDOG_WAS_ACTIVE=1
   log "Watchdog таймер временно остановлен"
 fi
 
+# ---------------------------------------------------------------------------
+# Step 3 — Graceful restart
+# systemd sends SIGTERM; aperod-node saves snapshot; TimeoutStopSec=900 guard.
+# If restart fails, send an alert and exit (EXIT trap re-enables watchdog).
+# ---------------------------------------------------------------------------
 log "Запускаем systemctl restart aperod-node…"
-systemctl restart aperod-node
+if ! systemctl restart aperod-node 2>/dev/null; then
+  log "ERROR: systemctl restart aperod-node вернул ошибку"
+  send_telegram "❌ <b>Ошибка планового перезапуска ноды</b>
+Сервер: <code>${HOSTNAME_LABEL}</code>
+<code>systemctl restart aperod-node</code> завершился с ошибкой.
+Проверьте: <code>journalctl -u aperod-node -n 30</code>"
+  exit 1
+fi
 log "systemctl restart вернул управление"
 
 # Record state
@@ -90,7 +120,7 @@ date -u '+%Y-%m-%dT%H:%M:%SZ' > "${SCHED_RESTART_LAST_FILE}" || true
 increment_restart_count
 
 # ---------------------------------------------------------------------------
-# Step 3 — Wait for node to come back (up to 90 s, polling every 3 s)
+# Step 4 — Wait for node to come back (up to 90 s, polling every 3 s)
 # ---------------------------------------------------------------------------
 log "Ожидаем запуска API ноды (до 90 с)…"
 STATUS_URL="${NODE_API_URL}/api/v1/status"
@@ -106,14 +136,9 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# Step 4 — Post-restart notification
+# Step 5 — Post-restart notification
+# (Watchdog is re-enabled by the EXIT trap after this function returns.)
 # ---------------------------------------------------------------------------
-# Re-enable watchdog regardless of recovery outcome so health monitoring resumes.
-if [[ "${WATCHDOG_WAS_ACTIVE}" == "1" ]]; then
-  systemctl start aperod-node-watchdog.timer 2>/dev/null || true
-  log "Watchdog таймер возобновлён"
-fi
-
 if [[ "${RECOVERED}" == "1" ]]; then
   send_telegram "✅ <b>Нода перезапущена</b>
 Сервер: <code>${HOSTNAME_LABEL}</code>
