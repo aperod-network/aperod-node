@@ -156,7 +156,54 @@ done
 exit 0
 STUB
 
-# make — delegates to the Makefile injected by the wget stub
+# sudo — strip `-u <user>` and execute the remainder as the current user.
+#        The test container runs as root so privilege switching is a no-op;
+#        this stub lets `sudo -u aperod git clone …` work without real sudo.
+cat > "$CTX/stubs/sudo" << 'STUB'
+#!/usr/bin/env bash
+args=()
+skip_next=false
+for arg in "$@"; do
+  if $skip_next; then skip_next=false; continue; fi
+  if [[ "$arg" == "-u" || "$arg" == "--user" ]]; then skip_next=true; continue; fi
+  # Drop bare `-u<user>` form as well
+  if [[ "$arg" =~ ^-u.+ ]]; then continue; fi
+  args+=("$arg")
+done
+exec "${args[@]}"
+STUB
+
+# git — stub for `git clone` and `git pull` used by install-node.sh step 3.
+#       `git clone --depth=1 <url> <destdir>` creates <destdir> with a
+#       Makefile (tabs via Python, same structure as the wget stub) plus a
+#       minimal .git/ so the post-merge hook check and `git -C ... pull` pass.
+cat > "$CTX/stubs/git" << 'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "clone" ]]; then
+  DEST="${!#}"   # last positional arg is the destination directory
+  mkdir -p "$DEST/.git"
+  python3 - "$DEST/Makefile" << 'PYEOF'
+import sys
+
+makefile = (
+    b".PHONY: deps build\n"
+    b"deps:\n"
+    b"\t@true\n"
+    b"build:\n"
+    b"\tmkdir -p build"
+    b" && cp /stubs-extra/aperod-node build/aperod-node"
+    b" && cp /stubs-extra/aperod build/aperod\n"
+)
+with open(sys.argv[1], "wb") as f:
+    f.write(makefile)
+PYEOF
+  exit 0
+fi
+# git -C <dir> pull --ff-only and everything else → no-op
+exit 0
+STUB
+
+# make — delegates to the Makefile injected by the git/wget stub
 cat > "$CTX/stubs/make" << 'STUB'
 #!/usr/bin/env bash
 /usr/bin/make "$@"
