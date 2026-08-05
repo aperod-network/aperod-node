@@ -41,6 +41,14 @@ type Config struct {
         // via PeerFingerprint(conn).
         // nil = plain TCP (unit tests only — never use nil in production).
         TLSConfig *tls.Config
+        // SelfFingerprint is the hex-encoded SHA-256 SPKI fingerprint of this
+        // node's own TLS identity key.  When non-empty, any peer that presents
+        // the same fingerprint is rejected immediately after the TLS handshake
+        // with a clear ERROR log and an actionable hint.  This guards against
+        // the "rsync copied p2p_identity.key" scenario where both nodes
+        // present identical certificates and silently fail to peer.
+        // Set by main.go from the fingerprint returned by LoadOrSaveP2PIdentity.
+        SelfFingerprint string
         // AllowedPeers is an optional list of hex-encoded SHA-256 SPKI
         // fingerprints that are permitted to connect.  When non-empty, any
         // peer whose TLS fingerprint is not on the list is disconnected
@@ -159,6 +167,20 @@ type badBlockStrike struct {
         lastSeen time.Time
 }
 
+// whitelistExemptMaxEvents caps the in-memory ring buffer for whitelist
+// exemption events so memory cannot grow unboundedly on a busy node.
+const whitelistExemptMaxEvents = 100
+
+// WhitelistExemptionEvent records a single "strike skipped due to whitelist"
+// event for the Admin Panel notification log.
+type WhitelistExemptionEvent struct {
+        IP          string    `json:"ip"`
+        PeerAddr    string    `json:"peer_addr"`
+        BlockHeight uint64    `json:"block_height"`
+        OurTip      uint64    `json:"our_tip"`
+        At          time.Time `json:"at"`
+}
+
 // Host is the p2p networking host.
 type Host struct {
         cfg     Config
@@ -212,6 +234,13 @@ type Host struct {
         // wlPersistMu serialises the snapshot+write+rename sequence for the
         // whitelist file so concurrent calls never interleave two partial writes.
         wlPersistMu sync.Mutex
+
+        // wlExemptMu guards wlExemptEvents so the block-processing loop can
+        // append events concurrently with the API server reading them.
+        wlExemptMu sync.Mutex
+        // wlExemptEvents is a ring buffer of whitelist-exemption events for
+        // the Admin Panel notification log.  Capped at whitelistExemptMaxEvents.
+        wlExemptEvents []WhitelistExemptionEvent
 }
 
 // NewHost creates a new p2p host.
@@ -260,6 +289,21 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 // Call this before Start() when the host is embedded in a full node.
 func (h *Host) SetHeaderProvider(hp HeaderProvider) {
         h.headers = hp
+}
+
+// GetWhitelistExemptions returns all whitelist-exemption events that occurred at or
+// after since.  Thread-safe; safe to call concurrently with block processing.
+// Returns an empty (non-nil) slice when no events match.
+func (h *Host) GetWhitelistExemptions(since time.Time) []WhitelistExemptionEvent {
+        h.wlExemptMu.Lock()
+        defer h.wlExemptMu.Unlock()
+        out := make([]WhitelistExemptionEvent, 0)
+        for _, e := range h.wlExemptEvents {
+                if !e.At.Before(since) {
+                        out = append(out, e)
+                }
+        }
+        return out
 }
 
 // GetPeerWhitelist returns a snapshot of the current peer IP whitelist entries.
@@ -1005,6 +1049,25 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 fp := PeerFingerprint(conn)
                 h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)
 
+                // Identity-conflict guard: reject any peer that presents the same
+                // TLS fingerprint as our own identity key.  This happens when a new
+                // node was bootstrapped by rsyncing chain data from an existing node
+                // and the p2p_identity.key file was copied along with the chain data.
+                // Both nodes then present identical TLS certificates and TLS rejects
+                // the handshake silently, leaving peer_count at 0 with no clear cause.
+                //
+                // Logging ERROR (not Warn) so operators notice immediately; the hint
+                // provides the exact remediation command.
+                if h.cfg.SelfFingerprint != "" && fp == h.cfg.SelfFingerprint {
+                        h.log.Error("p2p identity conflict detected — peer shares our TLS fingerprint",
+                                "addr", addr,
+                                "fingerprint", fp,
+                                "hint", "delete the p2p_identity.key file in your data directory and restart, or restart the node with --reset-p2p-identity",
+                        )
+                        conn.Close()
+                        return
+                }
+
                 // Validator allow-list: when AllowedPeers is non-empty, only
                 // fingerprints on the list may proceed.  An empty list means
                 // open network (no restriction).
@@ -1251,6 +1314,21 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                                                         "ip", peerIP,
                                                         "block_height", block.Header.Height,
                                                         "our_tip", ourTip)
+                                                // Record for the Admin Panel notification log so
+                                                // operators can confirm the whitelist exemption is
+                                                // working without SSH access.
+                                                h.wlExemptMu.Lock()
+                                                h.wlExemptEvents = append(h.wlExemptEvents, WhitelistExemptionEvent{
+                                                        IP:          peerIP,
+                                                        PeerAddr:    peer.addr,
+                                                        BlockHeight: block.Header.Height,
+                                                        OurTip:      ourTip,
+                                                        At:          time.Now(),
+                                                })
+                                                if len(h.wlExemptEvents) > whitelistExemptMaxEvents {
+                                                        h.wlExemptEvents = h.wlExemptEvents[len(h.wlExemptEvents)-whitelistExemptMaxEvents:]
+                                                }
+                                                h.wlExemptMu.Unlock()
                                                 // Fall through to normal block processing below.
                                                 goto processBlock
                                         }
