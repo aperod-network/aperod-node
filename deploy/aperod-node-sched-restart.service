@@ -1,0 +1,47 @@
+# =============================================================================
+#  aperod-node-sched-restart.service — one-shot planned restart of aperod-node
+#
+#  Triggered periodically by aperod-node-sched-restart.timer (default: 3 h).
+#  Sends a Telegram notification before and after the restart so operators
+#  are not alarmed by the brief downtime.
+#
+#  The graceful shutdown path (SIGTERM → snapshot saved → SIGKILL guard) is
+#  handled entirely by systemd via the existing TimeoutStopSec=900 drop-in on
+#  aperod-node.service.  No special action is needed here.
+#
+#  Configuration (all optional, set in /etc/aperod/sched-restart.env):
+#    SCHED_RESTART_INTERVAL_SECS  — interval in seconds (default: 10800 / 3 h)
+#    SUPPORT_BOT_TOKEN            — Telegram bot token
+#    SUPPORT_ADMIN_CHAT_ID        — Telegram chat ID
+#
+#  To change the interval without a redeploy:
+#    Edit /etc/aperod/sched-restart.env  →  set SCHED_RESTART_INTERVAL_SECS=<n>
+#    Then run: sudo aperod-sched-restart-set-interval
+# =============================================================================
+
+[Unit]
+Description=Aperod node planned RAM-prevention restart (one-shot)
+After=aperod-node.service
+IgnoreOnIsolate=yes
+
+[Service]
+Type=oneshot
+User=root
+
+# Load optional site-local overrides (bot token, chat ID, interval)
+EnvironmentFile=-/etc/aperod/sched-restart.env
+
+Environment=SCHED_RESTART_INTERVAL_SECS=10800
+
+ExecStart=/usr/local/bin/aperod-node-sched-restart.sh
+
+# Allow plenty of time: pre-notify + SIGTERM grace (up to 900 s) + post-check
+TimeoutStartSec=1200
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aperod-node-sched-restart
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
