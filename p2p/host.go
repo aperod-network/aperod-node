@@ -1172,16 +1172,16 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // whether the session was healthy or should be counted as a failure.
         connectedAt = time.Now()
 
-        // Keepalive: send a Ping to the remote peer every 3 s so that the
-        // peer's ReadTimeout (also 5 s) never fires due to silence from our
-        // side.  This is critical for relay/sync-only nodes that have no
-        // messages of their own to send once the initial GetHeaders exchange
-        // is complete.  The goroutine is stopped via keepaliveDone before the
-        // connection is closed (defers run LIFO, so close(keepaliveDone)
-        // fires before the conn.Close defer below).
+        // Keepalive: send a Ping to the remote peer every 10 s so that the
+        // peer's ReadTimeout (30 s) never fires due to silence from our side.
+        // This is critical for relay/sync-only nodes that have no messages of
+        // their own to send once the initial GetHeaders exchange is complete.
+        // The goroutine is stopped via keepaliveDone before the connection is
+        // closed (defers run LIFO, so close(keepaliveDone) fires before the
+        // conn.Close defer below).
         keepaliveDone := make(chan struct{})
         go func() {
-                t := time.NewTicker(3 * time.Second)
+                t := time.NewTicker(10 * time.Second)
                 defer t.Stop()
                 for {
                         select {
@@ -1391,6 +1391,15 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         blockHash := block.Hash()
                         isNew := h.gossip.MarkAndCheck(blockHash)
                         h.handler.OnBlock(block)
+                        // If this block extended our tip and we're still behind
+                        // this peer, immediately request the next header batch so
+                        // sync progresses without waiting for the next Pong cycle.
+                        // Without this, only the first block in a 500-header batch
+                        // gets applied (AddBlock requires strict ordering) and the
+                        // node stalls indefinitely when resyncing a large gap.
+                        if newTip := h.handler.CurrentHeight(); newTip > ourTip && newTip < peer.height {
+                                h.requestHeaders(peer)
+                        }
                         if isNew {
                                 sb := blockToMsg(block)
                                 fromAddr := peer.addr
@@ -1482,6 +1491,7 @@ func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
                 for _, ch := range coreHeaders {
                         headers = append(headers, SerializedHeader{
                                 Height:       ch.Height,
+                                Hash:         ch.Hash(),
                                 PrevHash:     ch.PrevHash,
                                 MerkleRoot:   ch.MerkleRoot,
                                 Timestamp:    ch.Timestamp,
