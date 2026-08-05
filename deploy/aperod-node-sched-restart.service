@@ -28,7 +28,10 @@ IgnoreOnIsolate=yes
 Type=oneshot
 User=root
 
-# Load optional site-local overrides (bot token, chat ID, interval)
+# Telegram credentials are shared with the watchdog — load watchdog.env first
+# so the admin panel only needs to configure them in one place.
+# sched-restart.env overrides the interval (and can override credentials too).
+EnvironmentFile=-/etc/aperod/watchdog.env
 EnvironmentFile=-/etc/aperod/sched-restart.env
 
 Environment=SCHED_RESTART_INTERVAL_SECS=10800
