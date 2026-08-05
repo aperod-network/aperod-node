@@ -410,12 +410,23 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 	}
 	if os.IsNotExist(err) {
 		// No v2 primary present — try fallbacks in priority order.
+		//
+		// firstFallbackErr records the first non-NotExist error from any
+		// candidate that EXISTS on disk but cannot be decoded or validated.
+		// If all fallbacks are exhausted and firstFallbackErr is set we return
+		// it instead of the original os.ErrNotExist so that the caller
+		// (logSnapshotStartupReason) can correctly emit startup_reason=corrupt_snapshot
+		// rather than startup_reason=no_snapshot.
+		var firstFallbackErr error
 
 		// 1. v2 prev-backup with exact hash.
 		if prevSnap, prevErr := loadPrevBackupSnapshot(dataDir, tipHeight, tipHashHex); prevErr == nil {
 			log.Warn("loaded v2 prev-backup snapshot (primary absent)",
 				"tip_height", tipHeight)
 			return prevSnap, false, nil
+		} else if !os.IsNotExist(prevErr) {
+			// Backup file exists but failed validation or decoding.
+			firstFallbackErr = fmt.Errorf("v2 prev-backup corrupt or unreadable: %w", prevErr)
 		}
 
 		// 2. v2 prev-backup with relaxed hash (emergency recovery: primary
@@ -426,6 +437,8 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 				"(primary absent; DB tip hash may differ after recover-tip repair)",
 				"tip_height", tipHeight)
 			return relaxedSnap, true, nil
+		} else if !os.IsNotExist(relaxedErr) && firstFallbackErr == nil {
+			firstFallbackErr = fmt.Errorf("v2 prev-backup (relaxed) corrupt or unreadable: %w", relaxedErr)
 		}
 
 		// 3. Legacy v1 uncompressed primary.
@@ -434,6 +447,10 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 			log.Warn("loaded legacy uncompressed v1 snapshot; a compressed v2 snapshot will be written on next save",
 				"path", legacyPath, "tip_height", tipHeight)
 			return legacySnap, false, nil
+		} else if _, statErr := os.Stat(legacyPath); statErr == nil && firstFallbackErr == nil {
+			// File exists but loadLegacySnapshot returned nil (version/height/hash
+			// mismatch or decode error).
+			firstFallbackErr = fmt.Errorf("legacy v1 snapshot invalid or corrupt: %s", legacyPath)
 		}
 
 		// 4. Legacy v1 prev-backup.
@@ -442,9 +459,17 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 			log.Warn("loaded legacy uncompressed v1 prev-backup snapshot; primary was absent or invalid; a compressed v2 snapshot will be written on next save",
 				"path", legacyPrevPath, "tip_height", tipHeight)
 			return legacyPrevSnap, false, nil
+		} else if _, statErr := os.Stat(legacyPrevPath); statErr == nil && firstFallbackErr == nil {
+			firstFallbackErr = fmt.Errorf("legacy v1 prev-backup invalid or corrupt: %s", legacyPrevPath)
 		}
 
-		// No snapshot available at all — caller falls back to block scan.
+		// If any candidate was found on disk but unreadable, return that error
+		// so the caller can distinguish corruption from a clean first-run.
+		if firstFallbackErr != nil {
+			return nil, false, firstFallbackErr
+		}
+
+		// No snapshot files exist at all — clean first-run or all were deleted.
 		return nil, false, err
 	}
 
