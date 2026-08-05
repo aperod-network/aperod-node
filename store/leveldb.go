@@ -272,6 +272,14 @@ func (d *DB) GetRawBlock(hash crypto.Hash32) ([]byte, error) {
         return d.get(key)
 }
 
+// RepairHeightIndex overwrites the height → hash index entry for height with
+// the supplied hash.  Use this to correct a zeroed or missing height-index
+// entry that was detected by the startup integrity check; the block data
+// (stored under its hash key) is left untouched.
+func (d *DB) RepairHeightIndex(height uint64, hash crypto.Hash32) error {
+        return d.put(heightKey(height), hash[:])
+}
+
 // GetRawBlockByHeight returns the raw bytes for the canonical block at height h.
 func (d *DB) GetRawBlockByHeight(height uint64) ([]byte, error) {
         hashBytes, err := d.get(heightKey(height))
