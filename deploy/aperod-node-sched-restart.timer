@@ -1,0 +1,34 @@
+# =============================================================================
+#  aperod-node-sched-restart.timer — planned restart of aperod-node to prevent
+#  RAM exhaustion from the known Go heap leak (~1.3 GB/h).
+#
+#  Default interval: every 3 hours.  To change without editing this file:
+#
+#    1.  Edit /etc/aperod/sched-restart.env and set SCHED_RESTART_INTERVAL_SECS=<n>
+#    2.  Run:  sudo aperod-sched-restart-set-interval
+#
+#  The helper writes a systemd drop-in under
+#  /etc/systemd/system/aperod-node-sched-restart.timer.d/interval.conf and
+#  reloads the timer — no manual daemon-reload required.
+#
+#  Enabled by install-node.sh:
+#    sudo systemctl enable --now aperod-node-sched-restart.timer
+# =============================================================================
+
+[Unit]
+Description=Aperod node scheduled RAM-prevention restart (every 3 h by default)
+After=aperod-node.service
+
+[Timer]
+# First run 3 h after the timer unit activates (gives node time to stabilise).
+# Overridden by the drop-in written by aperod-sched-restart-set-interval.
+OnBootSec=10800
+# Repeat every 3 h thereafter.
+OnUnitActiveSec=10800
+# Catch up promptly if a run was missed (system suspend, etc.).
+AccuracySec=30
+# Persist last-fire timestamp across reboots.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
