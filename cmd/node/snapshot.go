@@ -396,30 +396,55 @@ func loadLegacySnapshot(path string, tipHeight uint64, tipHashHex string) *start
 // this as "no fast path available").
 // Returns a wrapped descriptive error when the primary exists but is unreadable
 // and the prev-backup is also unavailable or corrupt.
-func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHex string, log *slog.Logger) (*startupSnapshot, error) {
+// loadStartupSnapshotWithFallback tries to load the best available snapshot
+// for tipHeight.  The second return value (isRelaxed) is true when the
+// snapshot was loaded via the relaxed-hash recovery path — i.e. the primary
+// was absent and the prev-backup hash does not match because recover-tip
+// patched the DB tip after the snapshot was written.  Callers should widen
+// or skip any UTXO-count divergence check when isRelaxed is true.
+func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHex string, log *slog.Logger) (*startupSnapshot, bool, error) {
 	snap, err := loadStartupSnapshot(dataDir, tipHeight, tipHashHex)
 	if err == nil {
-		return snap, nil
+		return snap, false, nil
 	}
 	if os.IsNotExist(err) {
-		// No v2 primary present — check for a legacy v1 uncompressed snapshot.
+		// No v2 primary present — try fallbacks in priority order.
+
+		// 1. v2 prev-backup with exact hash.
+		if prevSnap, prevErr := loadPrevBackupSnapshot(dataDir, tipHeight, tipHashHex); prevErr == nil {
+			log.Warn("loaded v2 prev-backup snapshot (primary absent)",
+				"tip_height", tipHeight)
+			return prevSnap, false, nil
+		}
+
+		// 2. v2 prev-backup with relaxed hash (emergency recovery: primary
+		//    absent, DB tip hash was patched by recover-tip after the snapshot
+		//    was written, so the hashes naturally differ).
+		if relaxedSnap, relaxedErr := loadPrevBackupSnapshotRelaxed(dataDir, tipHeight); relaxedErr == nil {
+			log.Warn("RECOVERY: loaded v2 prev-backup snapshot with relaxed hash check "+
+				"(primary absent; DB tip hash may differ after recover-tip repair)",
+				"tip_height", tipHeight)
+			return relaxedSnap, true, nil
+		}
+
+		// 3. Legacy v1 uncompressed primary.
 		legacyPath := legacySnapshotPath(dataDir, tipHeight)
 		if legacySnap := loadLegacySnapshot(legacyPath, tipHeight, tipHashHex); legacySnap != nil {
 			log.Warn("loaded legacy uncompressed v1 snapshot; a compressed v2 snapshot will be written on next save",
 				"path", legacyPath, "tip_height", tipHeight)
-			return legacySnap, nil
+			return legacySnap, false, nil
 		}
-		// v1 primary absent or corrupt — try the v1 prev-backup so a node with
-		// a damaged v1 primary but valid v1 backup does not lose the fast path
-		// on upgrade.
+
+		// 4. Legacy v1 prev-backup.
 		legacyPrevPath := legacySnapshotPrevPath(dataDir, tipHeight)
 		if legacyPrevSnap := loadLegacySnapshot(legacyPrevPath, tipHeight, tipHashHex); legacyPrevSnap != nil {
 			log.Warn("loaded legacy uncompressed v1 prev-backup snapshot; primary was absent or invalid; a compressed v2 snapshot will be written on next save",
 				"path", legacyPrevPath, "tip_height", tipHeight)
-			return legacyPrevSnap, nil
+			return legacyPrevSnap, false, nil
 		}
-		// No primary snapshot present at all — caller handles this gracefully.
-		return nil, err
+
+		// No snapshot available at all — caller falls back to block scan.
+		return nil, false, err
 	}
 
 	// Primary exists but is unreadable — attempt recovery from prev-backup.
@@ -428,16 +453,14 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 	prevSnap, prevErr := loadPrevBackupSnapshot(dataDir, tipHeight, tipHashHex)
 	if prevErr != nil {
 		if os.IsNotExist(prevErr) {
-			// No prev backup available; surface the original primary error.
-			return nil, fmt.Errorf("primary corrupt (%w) and no prev-backup available", err)
+			return nil, false, fmt.Errorf("primary corrupt (%w) and no prev-backup available", err)
 		}
-		// Prev backup exists but also failed validation.
-		return nil, fmt.Errorf("primary corrupt (%v); prev-backup also failed: %w", err, prevErr)
+		return nil, false, fmt.Errorf("primary corrupt (%v); prev-backup also failed: %w", err, prevErr)
 	}
 
 	log.Warn("startup fast path — loaded prev-backup snapshot; primary was unreadable",
 		"tip_height", tipHeight)
-	return prevSnap, nil
+	return prevSnap, false, nil
 }
 
 // tryLoadSnapshotFile opens path, decodes the gzip-compressed JSON, and
