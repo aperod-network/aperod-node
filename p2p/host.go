@@ -1170,6 +1170,26 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         ourTip := h.handler.CurrentHeight()
                         peerIP := connIP(peer.addr)
                         if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead {
+                                // Whitelisted peers are trusted validators; skip the
+                                // strike counter entirely so a temporarily-ahead validator
+                                // is never auto-banned for being on a longer fork.
+                                // The block is still validated normally below.
+                                h.wlMu.RLock()
+                                wlNets := h.wlNets
+                                wlIPs := h.wlIPs
+                                wlLen := len(h.cfg.PeerWhitelist)
+                                h.wlMu.RUnlock()
+                                if wlLen > 0 {
+                                        if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
+                                                h.log.Debug("out-of-range block from whitelisted peer — strike skipped",
+                                                        "peer", peer.addr,
+                                                        "ip", peerIP,
+                                                        "block_height", block.Header.Height,
+                                                        "our_tip", ourTip)
+                                                // Fall through to normal block processing below.
+                                                goto processBlock
+                                        }
+                                }
                                 h.badBlockMu.Lock()
                                 strike := h.badBlockCounts[peerIP]
                                 // Reset stale strikes so a long-dormant IP starts fresh.
@@ -1223,6 +1243,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         delete(h.badBlockCounts, peerIP)
                         h.badBlockMu.Unlock()
 
+                processBlock:
                         // Gossip relay: forward to all other peers the first time we see this block.
                         blockHash := block.Hash()
                         isNew := h.gossip.MarkAndCheck(blockHash)
