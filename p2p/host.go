@@ -1181,11 +1181,13 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // conn.Close defer below).
         keepaliveDone := make(chan struct{})
         go func() {
-                t := time.NewTicker(10 * time.Second)
-                defer t.Stop()
+                ping := time.NewTicker(10 * time.Second)
+                sync := time.NewTicker(3 * time.Second)
+                defer ping.Stop()
+                defer sync.Stop()
                 for {
                         select {
-                        case <-t.C:
+                        case <-ping.C:
                                 if err := peer.Send(MsgPing, PingMsg{
                                         NodeID:    h.cfg.NodeID,
                                         Height:    h.handler.CurrentHeight(),
@@ -1193,6 +1195,15 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                                         Timestamp: time.Now().UnixNano(),
                                 }); err != nil {
                                         return // connection is gone; goroutine exits cleanly
+                                }
+                        case <-sync.C:
+                                // Re-request headers whenever we are still behind this peer.
+                                // The processBlock re-trigger relies on CurrentHeight() having
+                                // already advanced (async engine), so it is unreliable for
+                                // large sync gaps.  This periodic check fills that gap: every
+                                // 3 s we ask for the next header batch until we catch up.
+                                if h.handler.CurrentHeight() < peer.height {
+                                        h.requestHeaders(peer)
                                 }
                         case <-keepaliveDone:
                                 return
