@@ -360,22 +360,41 @@ func run() error {
                 if idxErr != nil {
                         return fmt.Errorf("startup integrity check: read height index at %d: %w", tipHeight, idxErr)
                 }
+                integrityOK := true
                 if indexedBlock == nil {
-                        return fmt.Errorf(
-                                "startup integrity check FAILED: height index has no entry for tip height %d "+
-                                        "(tip pointer hash %x); the height index may be corrupt — manual recovery required",
-                                tipHeight, tipHash[:8],
-                        )
+                        if cfg.Consensus.NonValidator {
+                                log.Warn("startup integrity check: height index has no entry for tip height — "+
+                                        "height index may be incomplete (rsync bootstrap?); non-validator mode, continuing",
+                                        "tip_height", tipHeight,
+                                        "tip_hash", fmt.Sprintf("%x", tipHash[:8]))
+                                integrityOK = false
+                        } else {
+                                return fmt.Errorf(
+                                        "startup integrity check FAILED: height index has no entry for tip height %d "+
+                                                "(tip pointer hash %x); the height index may be corrupt — manual recovery required",
+                                        tipHeight, tipHash[:8],
+                                )
+                        }
+                } else if indexedBlock.Hash != tipHash {
+                        if cfg.Consensus.NonValidator {
+                                log.Warn("startup integrity check: tip pointer hash does not match height index — "+
+                                        "height index may be stale (rsync bootstrap?); non-validator mode, continuing",
+                                        "tip_height", tipHeight,
+                                        "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
+                                        "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]))
+                                integrityOK = false
+                        } else {
+                                return fmt.Errorf(
+                                        "startup integrity check FAILED: tip pointer records hash %x at height %d "+
+                                                "but height index points to %x; the stored tip is stale or corrupt — "+
+                                                "manual recovery required (e.g. run with --reset-tip or restore from backup)",
+                                        tipHash[:8], tipHeight, indexedBlock.Hash[:8],
+                                )
+                        }
                 }
-                if indexedBlock.Hash != tipHash {
-                        return fmt.Errorf(
-                                "startup integrity check FAILED: tip pointer records hash %x at height %d "+
-                                        "but height index points to %x; the stored tip is stale or corrupt — "+
-                                        "manual recovery required (e.g. run with --reset-tip or restore from backup)",
-                                tipHash[:8], tipHeight, indexedBlock.Hash[:8],
-                        )
+                if integrityOK {
+                        log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
                 }
-                log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
 
                 // Always load genesis (height 0).
                 genesisRaw, err := db.GetRawBlockByHeight(0)
