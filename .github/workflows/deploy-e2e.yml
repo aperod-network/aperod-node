@@ -1,0 +1,57 @@
+name: Deploy E2E
+
+on:
+  push:
+    paths:
+      - 'deploy/**'
+    branches: [main, master, develop]
+  pull_request:
+    paths:
+      - 'deploy/**'
+
+jobs:
+  install-node-e2e:
+    name: install-node.sh e2e smoke test
+    runs-on: ubuntu-latest
+
+    # Docker is pre-installed on ubuntu-latest runners.
+    # The docker:dind service container is included here so the workflow is
+    # also compatible with self-hosted runners that run inside Docker, where
+    # the host daemon is not otherwise reachable.
+    services:
+      dind:
+        image: docker:dind
+        options: >-
+          --privileged
+          --shm-size=2g
+        env:
+          DOCKER_TLS_CERTDIR: ""
+        ports:
+          - 2375:2375
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go.sum
+
+      - name: Verify Docker is available
+        run: |
+          # Use the host Docker daemon when available (ubuntu-latest).
+          # On self-hosted container runners where the host daemon is absent,
+          # fall back to the DinD service and persist DOCKER_HOST so subsequent
+          # steps can reach it.
+          if docker info >/dev/null 2>&1; then
+            echo "Using host Docker daemon"
+          else
+            echo "Host daemon not reachable — switching to DinD service"
+            echo "DOCKER_HOST=tcp://localhost:2375" >> "$GITHUB_ENV"
+            timeout 30 bash -c 'until docker -H tcp://localhost:2375 info >/dev/null 2>&1; do sleep 1; done'
+            echo "DinD ready"
+          fi
+
+      - name: Run installer e2e test
+        run: go test ./deploy/... -run TestInstallNodeE2E -v -timeout 300s
