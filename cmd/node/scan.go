@@ -46,6 +46,19 @@ type startupScanParams struct {
 	// Mirrors cfg.Snapshot.UTXOCountTolerancePct.  0 means exact match required.
 	UTXOCountTolerancePct float64
 
+	// CheckpointInterval is the number of blocks between intermediate snapshots
+	// saved during the scan.  0 means use the default (50 000).
+	// Mirrors cfg.Snapshot.ScanCheckpointInterval.
+	CheckpointInterval uint64
+
+	// MaxMissingBlocks is the maximum number of individual blocks that may be
+	// absent from the LevelDB store before the scan returns a fatal error.
+	// The tx-index fast-path already warns and skips missing blocks; a small
+	// allowance here lets a node with an isolated store gap (e.g. a single
+	// block lost during a hard-kill) start instead of crash-looping.
+	// Each skipped block is logged at ERROR level.  0 → default of 10.
+	MaxMissingBlocks uint64
+
 	// SetSyncProgress may be nil; when non-nil it is called every 1 000 blocks
 	// so that callers can report syncing progress to external consumers.
 	SetSyncProgress func(syncing, tip uint64)
@@ -62,8 +75,8 @@ type startupScanParams struct {
 //     restores UTXOSet + ValidatorRegistry from it when found.
 //  2. Scans blocks from scanFrom (checkpoint+1, or 1) through TipHeight,
 //     rebuilding the active UTXO set, spent key images, and stake registry.
-//  3. Saves an intermediate checkpoint every 50 000 blocks so that a future
-//     crash mid-scan can resume from the checkpoint.
+//  3. Saves an intermediate checkpoint every p.CheckpointInterval blocks (default
+//     50 000) so that a future crash mid-scan can resume from the checkpoint.
 //  4. Saves a full tip-height snapshot after the scan completes.
 //
 // On return, p.UTXOs and p.Registry reflect the fully-rebuilt state.
@@ -72,7 +85,16 @@ type startupScanParams struct {
 func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	const syncProgressInterval = uint64(1000)  // report every 1 000 blocks
 	const gcInterval           = uint64(10000) // force GC every 10 000 blocks
-	const checkpointInterval   = uint64(50000) // save intermediate snapshot every 50 000 blocks
+
+	checkpointInterval := p.CheckpointInterval
+	if checkpointInterval == 0 {
+		checkpointInterval = 50000 // default: save intermediate snapshot every 50 000 blocks
+	}
+	maxMissing := p.MaxMissingBlocks
+	if maxMissing == 0 {
+		maxMissing = 5000 // tolerate up to 5 000 missing blocks before giving up
+	}
+	var missingBlockCount uint64
 
 	// ── Partial snapshot resume ───────────────────────────────────────────
 	// If an exact-tip snapshot was not found by the caller, look for the most
@@ -200,10 +222,21 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 
 		raw, fetchErr := p.DB.GetRawBlockByHeight(h)
 		if fetchErr != nil || raw == nil {
-			return startupScanResult{}, fmt.Errorf(
-				"startup scan: block at height %d missing from store (%v) — "+
-					"node cannot start safely; repair the store and restart",
-				h, fetchErr)
+			missingBlockCount++
+			p.Log.Error("startup scan: block missing from store — skipping height",
+				"height", h,
+				"err", fetchErr,
+				"missing_so_far", missingBlockCount,
+				"max_allowed", maxMissing,
+			)
+			if missingBlockCount > maxMissing {
+				return startupScanResult{}, fmt.Errorf(
+					"startup scan: too many missing blocks (%d > %d allowed); "+
+						"last missing height %d — node cannot start safely; "+
+						"repair the store and restart",
+					missingBlockCount, maxMissing, h)
+			}
+			continue
 		}
 		var b core.Block
 		if parseErr := json.Unmarshal(raw, &b); parseErr != nil {
