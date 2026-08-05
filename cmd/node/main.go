@@ -206,6 +206,17 @@ func run() error {
         if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
                 return fmt.Errorf("create data dir: %w", err)
         }
+
+        // Remove any orphaned snapshot .tmp files left by a previous crash
+        // regardless of which startup path follows (genesis or resume).
+        // It is safe to run here because:
+        //   • the data dir now exists (MkdirAll succeeded above)
+        //   • no snapshot read or write has started yet
+        //   • the genesis branch never called this, so a crash during genesis
+        //     initialisation would otherwise accumulate stale .tmp files that
+        //     are never removed.
+        cleanStaleSnapshotTmpFiles(cfg.DataDir, log)
+
         db, err := store.Open(cfg.DataDir + "/chain.db")
         if err != nil {
                 return fmt.Errorf("open store: %w", err)
@@ -263,6 +274,7 @@ func run() error {
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
                 apiSrv.SetStore(db)
+                apiSrv.SetDataDir(cfg.DataDir)
                 apiSrv.SetPruningMode(cfg.Pruning.Mode)
                 apiSrv.SetKeepBlocks(cfg.Pruning.KeepBlocks)
                 if cfg.API.Key != "" {
@@ -336,12 +348,12 @@ func run() error {
                         raw, err := db.GetRawBlockByHeight(h)
                         if err != nil || raw == nil {
                                 log.Warn("block missing in store during resume", "height", h)
-                                break
+                                continue // skip sparse gaps; don't abort the whole window
                         }
                         var b core.Block
                         if err := json.Unmarshal(raw, &b); err != nil {
                                 log.Warn("block unmarshal failed", "height", h, "err", err)
-                                break
+                                continue
                         }
                         recentBlocks = append(recentBlocks, &b)
                 }
@@ -393,6 +405,28 @@ func run() error {
                         "tip_height", tipHeight,
                         "blocks_loaded_in_memory", len(recentBlocks),
                 )
+
+                // Safety guard: if FastForward was a no-op (recentBlocks empty
+                // or all missing) the in-memory chain tip stays at genesis (height 0)
+                // while the DB tip is at tipHeight. Without this guard the consensus
+                // engine would produce blocks from height 1, silently overwriting the
+                // DB tip and destroying the canonical chain.
+                // Fix: always load the actual tip block so c.tip.Header.Height == tipHeight.
+                if chain.Tip().Header.Height < tipHeight {
+                        tipRaw, tipRawErr := db.GetRawBlockByHeight(tipHeight)
+                        if tipRawErr == nil && tipRaw != nil {
+                                var tipBlock core.Block
+                                if jsonErr := json.Unmarshal(tipRaw, &tipBlock); jsonErr == nil {
+                                        chain.FastForward([]*core.Block{&tipBlock})
+                                        log.Info("tip block loaded as in-memory anchor",
+                                                "height", tipHeight)
+                                } else {
+                                        return fmt.Errorf("unmarshal tip block at %d: %w", tipHeight, jsonErr)
+                                }
+                        } else {
+                                return fmt.Errorf("tip block missing from store at height %d — database may be corrupt", tipHeight)
+                        }
+                }
 
                 // ── Unified startup scan ─────────────────────────────────────────────
                 //
@@ -881,6 +915,7 @@ func run() error {
                                 NodeID:               myKey.Public().ID(),
                                 UserAgent:            "aperod-node/1.0",
                                 TLSConfig:            tlsCfg,
+                                SelfFingerprint:      nodeFingerprint,
                                 AllowedPeers:         cfg.P2P.AllowedPeers,
                                 PeerWhitelist:        cfg.P2P.PeerWhitelist,
                                 MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
