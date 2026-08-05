@@ -631,6 +631,7 @@ func run() error {
                         Log:                   log,
                         UTXOCountTolerancePct: cfg.Snapshot.UTXOCountTolerancePct,
                         CheckpointInterval:    cfg.Snapshot.ScanCheckpointInterval,
+                        MaxMissingBlocks:      cfg.Snapshot.MaxMissingBlocks,
                         SetSyncProgress:       setSyncProgress,
                 })
                 if scanErr != nil {
@@ -1003,6 +1004,21 @@ func run() error {
                                 apiSrv.SetWhitelistGetFunc(host.GetPeerWhitelist)
                                 apiSrv.SetWhitelistAddFunc(host.AddToWhitelist)
                                 apiSrv.SetWhitelistRemoveFunc(host.RemoveFromWhitelist)
+                                // Wire whitelist-exemption event log for the Admin Panel.
+                                apiSrv.SetWhitelistExemptFunc(func(since time.Time) []api.WhitelistExemptionEntry {
+                                        evts := host.GetWhitelistExemptions(since)
+                                        out := make([]api.WhitelistExemptionEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.WhitelistExemptionEntry{
+                                                        IP:          e.IP,
+                                                        PeerAddr:    e.PeerAddr,
+                                                        BlockHeight: e.BlockHeight,
+                                                        OurTip:      e.OurTip,
+                                                        At:          e.At,
+                                                }
+                                        }
+                                        return out
+                                })
                                 // Seed the static /api/v1/status display from current live list.
                                 apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
