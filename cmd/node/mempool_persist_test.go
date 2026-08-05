@@ -22,9 +22,11 @@ package main
 // main.go performs around lines 742-749.
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -493,5 +495,113 @@ func TestMempoolPersistFeeRateOrderPreserved(t *testing.T) {
 		if got := selected[i].Fee; got != want {
 			t.Errorf("SelectTxs[%d]: got fee=%d, want fee=%d", i, got, want)
 		}
+	}
+}
+
+// ─── Test 6: corrupt / truncated mempool.json returns 0 without panic ────────
+
+// TestMempoolLoadCorruptFileReturnsZero verifies that Load() handles a corrupt
+// or truncated mempool.json (invalid JSON) without panicking and returns 0,
+// leaving the pool empty.
+//
+// This guards the unmarshal-error path in Load() (mempool.go, ~line 594-597):
+//
+//	if err := json.Unmarshal(data, &dump); err != nil {
+//	    log.Warn("mempool load: unmarshal error (ignoring)", "err", err)
+//	    return 0
+//	}
+//
+// If that branch were accidentally deleted or broken, a corrupt file could
+// cause a panic or silently restore zero transactions without the operator
+// being notified.  Both the "returns 0" and "logs a warning" properties are
+// therefore tested — the former here, the latter in
+// TestMempoolLoadCorruptFileLogsWarning.
+//
+// Test cases:
+//   - Truncated JSON (simulates a mid-write OOM kill):  `{"saved_at":"2026`
+//   - Pure garbage bytes:                               `NOT JSON AT ALL`
+//   - Empty file (zero bytes):                          ``
+//   - Valid JSON but wrong schema (an array, not an object): `[]`
+func TestMempoolLoadCorruptFileReturnsZero(t *testing.T) {
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"truncated_json", []byte(`{"saved_at":"2026`)},
+		{"garbage_bytes", []byte("NOT JSON AT ALL \x00\xff\xfe")},
+		{"empty_file", []byte("")},
+		{"wrong_schema", []byte(`[]`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "mempool.json")
+
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			pool := core.NewMempool(mempoolTestConfig(), discardLogger())
+
+			// Must not panic; must return 0.
+			var restored int
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("Load() panicked with corrupt input %q: %v", tc.name, r)
+					}
+				}()
+				restored = pool.Load(dir, discardLogger())
+			}()
+
+			if restored != 0 {
+				t.Errorf("Load() returned %d for corrupt file %q, want 0", restored, tc.name)
+			}
+			if pool.Count() != 0 {
+				t.Errorf("pool.Count() = %d after loading corrupt file %q, want 0",
+					pool.Count(), tc.name)
+			}
+		})
+	}
+}
+
+// ─── Test 7: corrupt mempool.json emits a Warn log so the operator is notified ─
+
+// TestMempoolLoadCorruptFileLogsWarning verifies that Load() emits a slog Warn
+// message containing the text "unmarshal error" when mempool.json cannot be
+// parsed.  This confirms the operator-visible signal is not silently swallowed.
+//
+// Strategy: wire a *bytes.Buffer as the slog handler's output and assert the
+// expected string appears after Load() returns.
+func TestMempoolLoadCorruptFileLogsWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mempool.json")
+
+	// Write a clearly truncated JSON file.
+	truncated := []byte(`{"saved_at":"2026-08-05T12:00:00Z","entries":[{"tx":`)
+	if err := os.WriteFile(path, truncated, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Capture log output in a buffer.
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+
+	pool := core.NewMempool(mempoolTestConfig(), discardLogger())
+	restored := pool.Load(dir, logger)
+
+	if restored != 0 {
+		t.Errorf("Load() returned %d for truncated file, want 0", restored)
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "unmarshal error") {
+		t.Errorf("expected warning log to contain \"unmarshal error\"; got: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "WARN") {
+		t.Errorf("expected log level WARN in output; got: %q", logOutput)
 	}
 }
