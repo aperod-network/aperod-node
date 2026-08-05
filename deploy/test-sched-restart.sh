@@ -319,6 +319,55 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# S6. systemctl restart aperod-node returns non-zero →
+#     watchdog re-enabled + failure notification sent
+# ---------------------------------------------------------------------------
+section "S6: systemctl restart fails → watchdog re-enabled + failure notification"
+
+PORT_S6=$(find_free_port)
+SRV_S6=$(start_mock_server "$PORT_S6" 200)
+wait_for_server "$PORT_S6" 5 || fail "mock API server S6 did not start"
+
+BIN_S6=$(make_bindir s6)
+
+# Special systemctl: is-active → 0 (watchdog active), restart → 1 (fails), rest → 0
+SC_S6="$TMPDIR_TEST/systemctl_calls_s6"
+cat > "$BIN_S6/systemctl" <<'SCH6'
+#!/usr/bin/env bash
+echo "$*" >> "SC6_CALLS_PLACEHOLDER"
+case "$1" in
+  is-active)  exit 0 ;;
+  restart)    exit 1 ;;
+  *)          exit 0 ;;
+esac
+SCH6
+sed -i "s|SC6_CALLS_PLACEHOLDER|$SC_S6|g" "$BIN_S6/systemctl"
+chmod +x "$BIN_S6/systemctl"
+
+CL_S6=$(write_mock_curl "$BIN_S6" 0)   # Telegram succeeds
+
+run_script "$BIN_S6" \
+  NODE_API_URL="http://127.0.0.1:$PORT_S6" \
+  SUPPORT_BOT_TOKEN="tok" SUPPORT_ADMIN_CHAT_ID="123" \
+  SCHED_RESTART_INTERVAL_SECS=10800 >/dev/null 2>&1 || true
+kill "$SRV_S6" 2>/dev/null || true
+
+# Watchdog must be re-enabled via EXIT trap even though restart failed
+if grep -q "start aperod-node-watchdog.timer" "$SC_S6" 2>/dev/null; then
+  pass "Watchdog re-enabled via EXIT trap after failed systemctl restart"
+else
+  fail "Watchdog NOT re-enabled after failed systemctl restart"
+fi
+
+# Failure notification must be sent
+TG_S6=$(grep -c "api.telegram.org" "$CL_S6" 2>/dev/null || echo 0)
+if (( TG_S6 >= 2 )); then
+  pass "≥2 Telegram notifications sent (pre-restart + error alert)"
+else
+  fail "Expected ≥2 Telegram calls after restart failure, got ${TG_S6}"
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo
