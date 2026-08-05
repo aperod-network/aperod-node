@@ -174,18 +174,21 @@ func rawConnect(t *testing.T, addr string) net.Conn {
 }
 
 // rawHandshake performs the ping/pong handshake with host. Returns false on failure.
+// Uses the asymmetric protocol: dialer sends Ping first, host replies with Pong.
 func rawHandshake(t *testing.T, conn net.Conn) bool {
 	t.Helper()
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	msgType, _, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPing {
-		t.Logf("rawHandshake: expected ping, got %v err=%v", msgType, err)
-		return false
-	}
-	if err := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+	// Dialer goes first: send Ping to host.
+	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "raw-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	}); err != nil {
-		t.Logf("rawHandshake: write pong: %v", err)
+		t.Logf("rawHandshake: write ping: %v", err)
+		return false
+	}
+	// Host replies with Pong.
+	msgType, _, err := p2p.ReadMsg(conn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Logf("rawHandshake: expected pong, got %v err=%v", msgType, err)
 		return false
 	}
 	time.Sleep(30 * time.Millisecond)
