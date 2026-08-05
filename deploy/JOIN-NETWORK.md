@@ -4,15 +4,104 @@
 
 ---
 
-## Быстрый старт (один скрипт)
+## Быстрый старт — одна команда (рекомендуется)
 
-Запустите **на основном узле** (disturbing-blush / 89.169.53.128):
+Запустите **на НОВОМ сервере** (не на основном):
 
 ```bash
-sudo bash /opt/aperod/blockchain/deploy/join-network.sh <IP_НОВОГО_СЕРВЕРА>
+sudo bash /opt/aperod/deploy/aperod-join.sh <PRIMARY_IP>:<API_PORT>
 ```
 
-Скрипт сделает всё автоматически. Если хотите понять что происходит — читайте ниже.
+**Пример для тестнета:**
+
+```bash
+sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
+```
+
+Если основной узел настроен с API-ключом (`api.key` в `node.yaml`):
+
+```bash
+sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --api-key <ваш_api_key>
+```
+
+Скрипт сделает всё автоматически за 5–10 минут. Если хотите понять процесс — читайте ниже.
+
+---
+
+## Что делает aperod-join.sh
+
+| Шаг | Действие |
+|-----|----------|
+| 1 | Проверяет доступность основного узла по HTTP |
+| 2 | Останавливает `aperod-node` на **новом** сервере |
+| 3 | Очищает старые данные в `data_dir` |
+| 4 | Скачивает `chain.db` через `GET /api/v1/chaindb/export` (~1–2 ГБ) |
+| 5 | Скачивает UTXO-snapshot через `GET /api/v1/snapshot/export` |
+| 6 | Удаляет `p2p_identity.key` (нода генерирует новый при старте) |
+| 7 | Применяет drop-in конфиги systemd (TimeoutStopSec, GOMEMLIMIT) |
+| 8 | Запускает `aperod-node` и ждёт готовности API |
+
+---
+
+## Требования
+
+**На новом сервере:**
+- Ubuntu 22.04 / 24.04 или Debian 12
+- `aperod-node` уже установлен (`install-node.sh` запущен ранее)
+- Порт **30303/tcp** открыт в firewall
+- HTTP-доступ к API основного узла (порт 8545 по умолчанию)
+
+**На основном узле:**
+- Запущен `aperod-node` версии с поддержкой экспорта
+- Порт API (8545) доступен с нового сервера (или туннель)
+- API-ключ совпадает с `--api-key` в команде join (если настроен)
+
+---
+
+## Опции скрипта
+
+```
+aperod-join.sh <PRIMARY_IP>:<PORT> [OPTIONS]
+
+Опции:
+  --api-key  <key>   X-API-Key для аутентификации на основном узле
+  --data-dir <path>  Директория данных (по умолчанию: /var/lib/aperod)
+  --user     <name>  Пользователь-владелец данных (по умолчанию: aperod)
+  --skip-start       Не запускать ноду после загрузки (только данные)
+  --no-chaindb       Пропустить загрузку chain.db (только snapshot)
+```
+
+**Пример с нестандартными путями:**
+```bash
+sudo bash aperod-join.sh 89.169.53.128:8545 \
+  --api-key secret123 \
+  --data-dir /opt/aperod/data/testnet \
+  --user aperod
+```
+
+---
+
+## HTTP-эндпоинты экспорта (на основном узле)
+
+Скрипт использует два новых эндпоинта API основного узла:
+
+### `GET /api/v1/snapshot/export`
+
+Отдаёт последний UTXO-snapshot (файл `snapshot-v2-<height>.json.gz`).  
+Snapshot ускоряет запуск новой ноды — без него пересборка key-image индекса займёт 5–10 минут.
+
+Заголовки ответа:
+- `X-Snapshot-Height` — высота блока, для которого сделан snapshot
+- `X-Snapshot-Filename` — имя файла (`snapshot-v2-<height>.json.gz`)
+
+### `GET /api/v1/chaindb/export`
+
+Стримит директорию `chain.db` (LevelDB) как tar.gz-архив.  
+Распаковывается в `data_dir` командой `tar -xzf chaindb.tar.gz -C <data_dir>`.
+
+**Безопасность:**
+- Оба эндпоинта требуют `X-API-Key`, если в `node.yaml` настроен `api.key`
+- В dev-режиме (без ключа) — открыты
 
 ---
 
@@ -26,21 +115,11 @@ sudo bash /opt/aperod/blockchain/deploy/join-network.sh <IP_НОВОГО_СЕР�
 
 ---
 
-## Предварительные требования
-
-На новом сервере:
-- Ubuntu 22.04 / 24.04 или Debian 12
-- aperod-node уже установлен (`install-validator.sh` был запущен)
-- Порт **30303/tcp** открыт в firewall
-- SSH-доступ с основного узла без пароля (или с паролем — скрипт запросит)
-
----
-
 ## Почему нельзя просто запустить ноду?
 
 У Aperod есть особенность: **genesis-блок включает публичный ключ первого валидатора**. Если два сервера используют разные ключи, их genesis-хэши будут различаться, и они никогда не синхронизируются — даже если данные идентичны.
 
-**Решение:** Новый узел получает копию данных (`chain.db`) с существующего узла через rsync. Это гарантирует идентичный genesis-блок.
+**Решение:** Новый узел получает копию `chain.db` с существующего узла через HTTP. Это гарантирует идентичный genesis-блок.
 
 ---
 
@@ -51,49 +130,66 @@ sudo bash /opt/aperod/blockchain/deploy/join-network.sh <IP_НОВОГО_СЕР�
 ### Шаг 1: Остановить ноду на новом сервере
 
 ```bash
-# На НОВОМ сервере
 systemctl disable --now aperod-node
 ```
 
-> ⚠️ Используйте `disable --now`, а не просто `stop` — systemd автоматически перезапускает ноду после падения. `disable` отключает автозапуск до явного `enable`.
+> ⚠️ Используйте `disable --now`, а не просто `stop` — без этого systemd автоматически перезапустит ноду.
 
-### Шаг 2: Rsync данных с основного узла
+### Шаг 2: Скачать chain.db
 
 ```bash
-# На ОСНОВНОМ УЗЛЕ (89.169.53.128)
-rsync -az --delete --progress --ignore-errors \
-  /opt/aperod/data/testnet/ \
-  root@<IP_НОВОГО>:/var/lib/aperod/
+# Без API-ключа
+curl -f http://<PRIMARY_IP>:8545/api/v1/chaindb/export \
+  -o /tmp/chaindb.tar.gz
+
+# С API-ключом
+curl -f -H "X-API-Key: <key>" \
+  http://<PRIMARY_IP>:8545/api/v1/chaindb/export \
+  -o /tmp/chaindb.tar.gz
+
+# Распаковать
+tar -xzf /tmp/chaindb.tar.gz -C /var/lib/aperod/
+rm /tmp/chaindb.tar.gz
 ```
 
-> ⚠️ Флаг `--delete` обязателен. Без него старые SST-файлы LevelDB остаются на диске и вызывают ошибку `"block at height N missing from store"` при старте.
-
-### Шаг 3: Удалить скопированный p2p identity
+### Шаг 3: Скачать snapshot
 
 ```bash
-# На НОВОМ сервере
+# Определяем имя файла из заголовков
+SNAP_FILE=$(curl -sI -H "X-API-Key: <key>" \
+  http://<PRIMARY_IP>:8545/api/v1/snapshot/export \
+  | grep -i X-Snapshot-Filename | tr -d '\r' | awk '{print $2}')
+
+# Скачиваем
+curl -f -H "X-API-Key: <key>" \
+  http://<PRIMARY_IP>:8545/api/v1/snapshot/export \
+  -o "/var/lib/aperod/${SNAP_FILE}"
+```
+
+### Шаг 4: Удалить скопированный p2p identity
+
+```bash
 rm -f /var/lib/aperod/p2p_identity.key
 ```
 
-> ⚠️ rsync копирует `p2p_identity.key` с основного узла. Если оба сервера используют одинаковый TLS-ключ, P2P-соединение отклоняется как self-connection и peer_count остаётся 0 навсегда. Удаление файла заставляет ноду сгенерировать новый уникальный ключ при старте.
+> ⚠️ Без этого оба сервера используют одинаковый TLS-ключ и видят друг друга как self-connection. `peer_count` останется 0 навсегда.
 
-### Шаг 4: Настроить права и запустить
+### Шаг 5: Настроить права и запустить
 
 ```bash
-# На НОВОМ сервере
 chown -R aperod:aperod /var/lib/aperod/
 systemctl enable --now aperod-node
 ```
 
-### Шаг 5: Дождаться готовности (~5 минут)
-
-Нода перестраивает key-image индекс по всей цепи (~958K+ блоков). Это занимает ~5 минут.
+### Шаг 6: Дождаться готовности (~5 минут)
 
 ```bash
-# Проверить статус
+# Следить за логами
 journalctl -u aperod-node -f --no-pager
-# Искать строку: "spent key-image set rebuilt"
-# После неё появится: "p2p started" и "peer connected"
+# Искать: "API server ready" → "p2p started" → "peer connected"
+
+# Проверить статус
+curl -s http://127.0.0.1:8545/api/v1/network/stats | python3 -m json.tool
 ```
 
 ---
@@ -128,11 +224,12 @@ consensus:
 
 | Ошибка | Причина | Решение |
 |--------|---------|---------|
-| `permission denied` при старте | Файлы принадлежат root после rsync | `chown -R aperod:aperod /var/lib/aperod/` |
-| `block at height N missing from store` | rsync без `--delete` оставил старые файлы | Очистить: `rm -rf /var/lib/aperod/*`, rsync заново с `--delete` |
-| `peer_count: 0` навсегда | Скопированный `p2p_identity.key` (TLS-дубликат) | `rm /var/lib/aperod/p2p_identity.key`, restart |
-| Нода производит блоки, цепи расходятся | Нет `non_validator: true`, ключ не в validator set | Добавить `non_validator: true` в node.yaml |
-| `key-image rebuild failed` | Смешанный LevelDB (старые + новые блоки) | Полная очистка + rsync с `--delete` |
+| `403 Forbidden` при скачивании | API-ключ не совпадает | Добавьте `--api-key` или проверьте `node.yaml` |
+| `connection refused` | Основной узел недоступен | Откройте порт 8545 в firewall основного узла |
+| `permission denied` при старте | Файлы принадлежат root | `chown -R aperod:aperod /var/lib/aperod/` |
+| `block at height N missing` | Неполная загрузка chain.db | Запустите скрипт заново (он очищает старые данные) |
+| `peer_count: 0` навсегда | Скопированный `p2p_identity.key` | `rm /var/lib/aperod/p2p_identity.key`, restart |
+| Нода расходится с сетью | Нет `non_validator: true`, ключ не в validator set | Добавить `non_validator: true` в node.yaml |
 
 ---
 
@@ -140,10 +237,10 @@ consensus:
 
 Чтобы ваш узел производил блоки и получал награды:
 
-1. Получите APRO на reward_address (минимум **100 000 APRO**)
+1. Получите APRO на `reward_address` (минимум **100 000 APRO**)
 2. Отправьте **StakeTx** через кошелёк (Telegram Wallet → Staking)
 3. Дождитесь следующего epoch (~100 блоков ≈ 5 минут)
-4. Уберите `non_validator: true` из node.yaml (или убедитесь что он отсутствует)
+4. Уберите `non_validator: true` из `node.yaml` (или убедитесь что он отсутствует)
 5. Перезапустите ноду: `systemctl restart aperod-node`
 
 После включения в активный validator set нода начнёт получать задания на производство блоков.
@@ -161,9 +258,21 @@ curl -s http://127.0.0.1:8545/api/v1/network/stats | python3 -m json.tool
 # "height": 958XXX,     ← синхронизирован
 
 # Статус валидаторов
-curl -s http://127.0.0.1:8545/api/v1/network/validators 2>/dev/null || \
-  echo "Validator API not available in this version"
+curl -s http://127.0.0.1:8545/api/v1/validators
 ```
+
+---
+
+## Старый способ (rsync с основного узла)
+
+Если `aperod-join.sh` недоступен или нужен rsync:
+
+```bash
+# На ОСНОВНОМ УЗЛЕ (89.169.53.128)
+sudo bash /opt/aperod/deploy/join-network.sh <IP_НОВОГО_СЕРВЕРА>
+```
+
+Этот скрипт требует SSH-доступ с основного узла на новый. Используйте `aperod-join.sh` (HTTP) как предпочтительный метод.
 
 ---
 
