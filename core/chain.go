@@ -142,6 +142,10 @@ func (c *Chain) AddBlock(b *Block) error {
 // checking parent-hash contiguity. Used during startup to restore only the
 // recent window of blocks from the store, skipping the full historical replay.
 // Blocks must be sorted by ascending height; the last block becomes the tip.
+//
+// The same MaxInMemoryBlocks sliding-window eviction as AddBlock is applied so
+// that large catch-up batches (e.g. P2P sync of 10 000+ blocks) do not
+// accumulate unboundedly in RAM.
 func (c *Chain) FastForward(blocks []*Block) {
         if len(blocks) == 0 {
                 return
@@ -154,6 +158,18 @@ func (c *Chain) FastForward(blocks []*Block) {
                 c.byHeight[b.Header.Height] = b
                 c.tip = b
                 c.indexTxs(b)
+                // Evict the block that has fallen outside the sliding window,
+                // mirroring AddBlock so memory stays bounded during bulk loads.
+                if b.Header.Height >= MaxInMemoryBlocks {
+                        evictH := b.Header.Height - MaxInMemoryBlocks
+                        if old, ok := c.byHeight[evictH]; ok {
+                                delete(c.byHeight, evictH)
+                                delete(c.blocks, old.Hash())
+                                for _, tx := range old.Txs {
+                                        delete(c.txIndex, tx.Hash())
+                                }
+                        }
+                }
         }
 }
 
@@ -169,20 +185,34 @@ type TxIndexEntry struct {
 // from the persistent store, resolving each entry to a Block pointer from the
 // blocks being loaded. Entries that don't resolve (height outside the window)
 // are silently skipped.
+//
+// As with FastForward, the MaxInMemoryBlocks sliding-window eviction is applied
+// during the first pass so memory stays bounded.
 func (c *Chain) FastForwardWithIndex(blocks []*Block, txEntries map[crypto.Hash32]TxIndexEntry) {
         if len(blocks) == 0 {
                 return
         }
         c.mu.Lock()
         defer c.mu.Unlock()
-        // First pass: populate blocks and byHeight maps.
+        // First pass: populate blocks and byHeight maps with sliding-window eviction.
         for _, b := range blocks {
                 h := b.Hash()
                 c.blocks[h] = b
                 c.byHeight[b.Header.Height] = b
                 c.tip = b
+                if b.Header.Height >= MaxInMemoryBlocks {
+                        evictH := b.Header.Height - MaxInMemoryBlocks
+                        if old, ok := c.byHeight[evictH]; ok {
+                                delete(c.byHeight, evictH)
+                                delete(c.blocks, old.Hash())
+                                for _, tx := range old.Txs {
+                                        delete(c.txIndex, tx.Hash())
+                                }
+                        }
+                }
         }
         // Second pass: populate tx index from pre-built entries.
+        // Entries whose block was evicted above are silently skipped.
         for txHash, entry := range txEntries {
                 blk := c.byHeight[entry.Height]
                 if blk == nil {
@@ -280,11 +310,23 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
         }
 
         // Install new blocks and index their transactions so GetTransaction works.
+        // Apply the same MaxInMemoryBlocks sliding-window eviction as AddBlock so
+        // a reorg that brings in many blocks does not inflate the maps unboundedly.
         for _, b := range newBlocks {
                 h := b.Hash()
                 c.blocks[h] = b
                 c.byHeight[b.Header.Height] = b
                 c.indexTxs(b)
+                if b.Header.Height >= MaxInMemoryBlocks {
+                        evictH := b.Header.Height - MaxInMemoryBlocks
+                        if old, ok := c.byHeight[evictH]; ok {
+                                delete(c.byHeight, evictH)
+                                delete(c.blocks, old.Hash())
+                                for _, tx := range old.Txs {
+                                        delete(c.txIndex, tx.Hash())
+                                }
+                        }
+                }
         }
         c.tip = newBlocks[len(newBlocks)-1]
         return nil
