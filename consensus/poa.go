@@ -671,10 +671,11 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 
 // handleIncomingBlock processes a block received from P2P.
 // maxClockSkewNs is the maximum allowed difference (in nanoseconds) between a
-// peer-submitted block's timestamp and our local wall clock.  Blocks whose
-// timestamp drifts more than ±15 s are rejected to prevent timejacking attacks
-// where a malicious peer shifts the chain tip into the far future, causing
-// legitimate blocks to be rejected as "too old" (#418).
+// peer-submitted block's timestamp and our local wall clock.  Only blocks
+// whose timestamp is more than 15 s in the FUTURE are rejected to prevent
+// timejacking attacks where a malicious peer shifts the chain tip far ahead.
+// Past-timestamped blocks (e.g. historical sync blocks) are always accepted so
+// that a relay node can catch up after a restart without false positives.
 const maxClockSkewNs = int64(15 * 1_000_000_000)
 
 func (e *Engine) handleIncomingBlock(block *core.Block) error {
@@ -683,13 +684,12 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
                 return fmt.Errorf("invalid block: %w", err)
         }
 
-        // Timejacking guard (#418): reject blocks whose timestamp deviates from
-        // local wall clock by more than ±15 seconds.
+        // Timejacking guard: only reject blocks whose timestamp is more than
+        // 15 s in the FUTURE.  Past-timestamped sync blocks must be accepted
+        // so a restarting relay node can fill historical gaps.  A negative
+        // skewNs means the block is in the past — always safe to accept.
         nowNs := time.Now().UTC().UnixNano()
         skewNs := block.Header.Timestamp - nowNs
-        if skewNs < 0 {
-                skewNs = -skewNs
-        }
         if skewNs > maxClockSkewNs {
                 atomic.AddInt64(&e.timestampRejected, 1)
                 return fmt.Errorf("block %d: timestamp too far from local clock (skew %dms, max %dms)",
