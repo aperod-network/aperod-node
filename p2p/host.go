@@ -195,8 +195,10 @@ type Host struct {
         done     chan struct{}
 
         mgr     *PeerMgr       // ban list
-        gossip  *GossipFilter  // dedup filter for relay
-        headers HeaderProvider // optional: serves headers for sync
+        gossip      *GossipFilter  // dedup filter for relay
+        headers     HeaderProvider // optional: serves headers for sync
+        blockByHash   func(crypto.Hash32) *core.Block // optional: LevelDB fallback for GetBlock
+        blockByHeight func(uint64) *core.Block        // optional: LevelDB fallback for HeadersFrom
 
         // pendingHandshakes counts inbound connections that are currently
         // executing the TLS handshake.  Guarded by MaxPendingHandshakes;
@@ -289,6 +291,21 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 // Call this before Start() when the host is embedded in a full node.
 func (h *Host) SetHeaderProvider(hp HeaderProvider) {
         h.headers = hp
+}
+
+// SetBlockFetcher registers LevelDB-backed fallback functions used when a
+// requested block or header is not in the in-memory ring buffer.  Both
+// functions may return nil when the block is genuinely absent.
+//
+// byHash is used in handleGetBlock; byHeight is used in handleGetHeaders to
+// serve sync headers for blocks that have been evicted from the ring (i.e.
+// when the syncing peer is more than ringSize blocks behind the local tip).
+func (h *Host) SetBlockFetcher(
+        byHash func(crypto.Hash32) *core.Block,
+        byHeight func(uint64) *core.Block,
+) {
+        h.blockByHash = byHash
+        h.blockByHeight = byHeight
 }
 
 // GetWhitelistExemptions returns all whitelist-exemption events that occurred at or
@@ -1498,6 +1515,16 @@ func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
                         limit = 500
                 }
                 coreHeaders := h.headers.HeadersFrom(msg.KnownHashes, limit)
+
+                // When the in-memory ring doesn't reach back to the syncing peer's
+                // tip (gap > ringSize blocks), HeadersFrom finds no common ancestor
+                // and falls back to height 1, returning headers the peer can't use.
+                // In that case, try a LevelDB-backed lookup so we can serve any
+                // block we have persisted on disk, not just the recent ring.
+                if len(coreHeaders) == 0 && h.blockByHash != nil && h.blockByHeight != nil {
+                        coreHeaders = h.headersFromStore(msg.KnownHashes, limit)
+                }
+
                 headers = make([]SerializedHeader, 0, len(coreHeaders))
                 for _, ch := range coreHeaders {
                         headers = append(headers, SerializedHeader{
@@ -1517,6 +1544,35 @@ func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
         return peer.Send(MsgHeaders, HeadersMsg{Headers: headers})
 }
 
+// headersFromStore finds the highest common ancestor in the persistent store
+// (using blockByHash) and returns up to limit headers starting after it
+// (using blockByHeight).  This is the LevelDB fallback for handleGetHeaders
+// when knownHashes are outside the in-memory ring.
+func (h *Host) headersFromStore(knownHashes []crypto.Hash32, limit int) []core.BlockHeader {
+        // Find the highest block height we share with the syncing peer.
+        bestHeight := uint64(0)
+        for _, hash := range knownHashes {
+                if b := h.blockByHash(hash); b != nil {
+                        if b.Header.Height > bestHeight {
+                                bestHeight = b.Header.Height
+                        }
+                }
+        }
+        if bestHeight == 0 {
+                return nil // no common ancestor found even in persistent store
+        }
+        startH := bestHeight + 1
+        headers := make([]core.BlockHeader, 0, limit)
+        for i := 0; i < limit; i++ {
+                b := h.blockByHeight(startH + uint64(i))
+                if b == nil {
+                        break
+                }
+                headers = append(headers, b.Header)
+        }
+        return headers
+}
+
 func (h *Host) handleHeaders(peer *Peer, msg HeadersMsg) {
         if len(msg.Headers) == 0 {
                 return
@@ -1532,6 +1588,10 @@ func (h *Host) handleHeaders(peer *Peer, msg HeadersMsg) {
 
 func (h *Host) handleGetBlock(peer *Peer, msg GetBlockMsg) error {
         block := h.handler.GetBlock(msg.Hash)
+        if block == nil && h.blockByHash != nil {
+                // Fall back to persistent store for blocks outside the in-memory ring.
+                block = h.blockByHash(msg.Hash)
+        }
         if block == nil {
                 return nil // we don't have it
         }
