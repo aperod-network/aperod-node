@@ -778,6 +778,9 @@ func run() error {
                 MyKey:              consensusMyKey,
                 RewardAddress:      cfg.Consensus.RewardAddress,
                 BlockRewardNAPR:    cfg.Consensus.BlockRewardNAPR,
+                StakingPoolNAPR:    cfg.Consensus.StakingPoolNAPR,
+                TailRewardNAPR:     cfg.Consensus.TailRewardNAPR,
+                Store:              db,
                 OracleURL:          cfg.Consensus.OracleURL,
                 OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
                 OnBlockProduced: func(block *core.Block) {
@@ -842,6 +845,10 @@ func run() error {
                 // including pure syncing nodes that never call OnBlockProduced.
                 OnBlockAccepted: func(block *core.Block) {
                         h := block.Header.Height
+
+                        // Draw one block-reward from the staking pool so the balance
+                        // tracks the real chain state (runs for local + peer blocks).
+                        engine.DecrementPool(h)
 
                         // Periodically force GC and return freed pages to the OS so that
                         // RSS does not grow unboundedly between snapshot saves.  The Go
@@ -977,6 +984,9 @@ func run() error {
                 apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
+                apiSrv.SetStakingPoolFn(func() (uint64, uint64, string) {
+                        return engine.StakingPoolRemaining(), engine.StakingPoolInit(), engine.RewardMode()
+                })
                 // Startup scan is complete — mark the node ready for UTXO queries.
                 apiSrv.SetReady()
                 log.Info("API server ready (startup scan complete)")
