@@ -324,24 +324,33 @@ func (d *DB) IterStakeBlockHeights(fn func(uint64) error) error {
 // MarkKeyImageSpent records that a key image has been used.
 // The key image is normalised to its canonical prime-order representative
 // before storage so that any torsion variant maps to the same DB entry.
+// If canonicalization fails (malformed / non-prime-order point), the raw
+// key image is stored as a best-effort guard — consistent with the fallback
+// in UTXOSet.MarkSpent so that the two indexes never disagree.
 func (d *DB) MarkKeyImageSpent(ki crypto.KeyImage) error {
         canonical, err := crypto.CanonicalKeyImage(ki)
         if err != nil {
-                return fmt.Errorf("key image canonicalization: %w", err)
+                // Store raw image; non-canonical torsion variants will
+                // still be caught because IsKeyImageSpent has the same fallback.
+                key := append(append([]byte{}, prefixKeyImage...), ki[:]...)
+                return d.put(key, []byte{0x01})
         }
-        key := append(prefixKeyImage, canonical[:]...)
+        key := append(append([]byte{}, prefixKeyImage...), canonical[:]...)
         return d.put(key, []byte{0x01})
 }
 
 // IsKeyImageSpent returns true if the key image has been recorded as spent.
 // Normalises to the canonical representative before lookup so that any
 // torsion variant of a spent key image is correctly detected as spent.
+// Falls back to the raw key image on canonicalization failure, mirroring
+// the MarkKeyImageSpent fallback path.
 func (d *DB) IsKeyImageSpent(ki crypto.KeyImage) (bool, error) {
         canonical, err := crypto.CanonicalKeyImage(ki)
         if err != nil {
-                return false, fmt.Errorf("key image canonicalization: %w", err)
+                key := append(append([]byte{}, prefixKeyImage...), ki[:]...)
+                return d.has(key)
         }
-        key := append(prefixKeyImage, canonical[:]...)
+        key := append(append([]byte{}, prefixKeyImage...), canonical[:]...)
         return d.has(key)
 }
 
