@@ -3,7 +3,6 @@ package main
 
 import (
         "bufio"
-        "encoding/hex"
         "encoding/json"
         "fmt"
         "log/slog"
@@ -248,23 +247,13 @@ func run() error {
         //
         // Validator mode: override with our own key (single-validator / testnet
         // design where this node IS the only proposer).
-        var validators []crypto.ValidatorPubKey
+        validators, err := buildValidatorList(cfg.Consensus.NonValidator, genesisConfig.Validators, myKey)
+        if err != nil {
+                return fmt.Errorf("build validator list: %w", err)
+        }
         if cfg.Consensus.NonValidator {
-                for _, hexPub := range genesisConfig.Validators {
-                        pubBytes, hexErr := hex.DecodeString(hexPub)
-                        if hexErr != nil {
-                                return fmt.Errorf("parse genesis validator key %q: %w", hexPub, hexErr)
-                        }
-                        pub, pubErr := crypto.ValidatorPubKeyFromBytes(pubBytes)
-                        if pubErr != nil {
-                                return fmt.Errorf("invalid genesis validator key %q: %w", hexPub, pubErr)
-                        }
-                        validators = append(validators, pub)
-                }
                 log.Info("non-validator mode: registry seeded from genesis config",
                         "genesis_validators", len(validators))
-        } else {
-                validators = []crypto.ValidatorPubKey{myKey.Public()}
         }
 
         // ── 6. Initialize chain ───────────────────────────────────────────────────
@@ -1010,6 +999,34 @@ func run() error {
                         // requests from syncing peers return real block headers
                         // instead of an empty response.
                         host.SetHeaderProvider(chain)
+
+                        // Wire LevelDB-backed fallbacks so peers that are more
+                        // than ringSize blocks behind can still sync: blocks
+                        // evicted from the in-memory ring are served from disk.
+                        host.SetBlockFetcher(
+                                func(hash crypto.Hash32) *core.Block {
+                                        raw, err := db.GetRawBlock(hash)
+                                        if err != nil || raw == nil {
+                                                return nil
+                                        }
+                                        var b core.Block
+                                        if err := json.Unmarshal(raw, &b); err != nil {
+                                                return nil
+                                        }
+                                        return &b
+                                },
+                                func(height uint64) *core.Block {
+                                        raw, err := db.GetRawBlockByHeight(height)
+                                        if err != nil || raw == nil {
+                                                return nil
+                                        }
+                                        var b core.Block
+                                        if err := json.Unmarshal(raw, &b); err != nil {
+                                                return nil
+                                        }
+                                        return &b
+                                },
+                        )
 
                         if err := host.Start(); err != nil {
                                 log.Error("p2p failed to start", "err", err)
