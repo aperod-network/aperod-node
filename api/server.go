@@ -128,6 +128,10 @@ type Server struct {
         // after the API server is created; used by snapshot and chaindb export
         // endpoints to locate files for the one-command node-join workflow.
         dataDir string
+
+        // stakingPoolFn returns (remaining nAPRO, init nAPRO, reward mode string).
+        // Wired from consensus.Engine after startup.  nil = not wired.
+        stakingPoolFn func() (uint64, uint64, string)
 }
 
 // NewServer creates a new API server.
@@ -200,6 +204,12 @@ func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
 // export endpoints can locate files for the one-command node-join workflow.
 // Call immediately after NewServer, before Start().
 func (s *Server) SetDataDir(dir string) { s.dataDir = dir }
+
+// SetStakingPoolFn wires the staking pool status accessor from the consensus engine.
+// fn must return (remaining nAPRO, init nAPRO, reward mode string).
+func (s *Server) SetStakingPoolFn(fn func() (uint64, uint64, string)) {
+        s.stakingPoolFn = fn
+}
 
 // SetPruningMode records the node's pruning mode ("archive" or "light") so
 // stake endpoints can detect when a missing UTXO may have been pruned rather
