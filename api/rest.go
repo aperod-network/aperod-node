@@ -2259,5 +2259,14 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if len(wl) > 0 {
 		resp["peer_whitelist"] = wl
 	}
+	// Staking pool status — included only when the pool feature is enabled.
+	if s.stakingPoolFn != nil {
+		remaining, init, mode := s.stakingPoolFn()
+		if init > 0 {
+			resp["staking_pool_remaining_napro"] = remaining
+			resp["staking_pool_init_napro"] = init
+			resp["reward_mode"] = mode
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
