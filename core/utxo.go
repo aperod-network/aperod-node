@@ -166,6 +166,13 @@ type UTXOSet struct {
 	stakedUTXOs     map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
 	spentPubKeys    map[crypto.Point32]*UTXO     // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
 	rollbackJournal map[uint64][]rollbackEntry   // height → UTXOs spent at that height (for RollbackBlock)
+
+	// OnUTXOSpent, when non-nil, is called from ApplyBlock each time the
+	// real spending input for a ring transaction is identified and removed
+	// from the active UTXO set.  main.go wires this to db.MarkUTXOSpent so
+	// the persistent su/ index stays current during both the startup block
+	// scan and live block acceptance.  Tests leave it nil.
+	OnUTXOSpent func(txHash crypto.Hash32, outIdx uint32)
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set.
@@ -318,6 +325,11 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 						// grows proportionally to the total number of outputs ever created
 						// rather than only the currently-unspent set.
 						delete(s.utxos, UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex})
+						// Notify the persistent su/ index so future restarts can use
+						// IterActiveUTXOs instead of a full block scan.  Nil in tests.
+						if s.OnUTXOSpent != nil {
+							s.OnUTXOSpent(utxo.TxHash, utxo.OutputIndex)
+						}
 						// Always record in the rollback journal, independent of the decoy
 						// pool cap.  RollbackBlock reads from here, not from spentPubKeys,
 						// so that a UTXO spent when the decoy pool is full can still be
