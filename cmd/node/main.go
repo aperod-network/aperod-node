@@ -842,6 +842,21 @@ func run() error {
                 // including pure syncing nodes that never call OnBlockProduced.
                 OnBlockAccepted: func(block *core.Block) {
                         h := block.Header.Height
+
+                        // Periodically force GC and return freed pages to the OS so that
+                        // RSS does not grow unboundedly between snapshot saves.  The Go
+                        // runtime only returns heap pages on GC; without an explicit call
+                        // during steady-state sync, RSS drifts upward until GOMEMLIMIT
+                        // causes GC thrash.  Running in a goroutine keeps the block
+                        // acceptance path non-blocking.
+                        const gcEveryBlocks = uint64(5000) // ~83 min at 1 block/s
+                        if h > 0 && h%gcEveryBlocks == 0 {
+                                go func() {
+                                        runtime.GC()
+                                        debug.FreeOSMemory()
+                                }()
+                        }
+
                         interval := cfg.Snapshot.PeriodicSnapshotInterval
                         // interval == 0 means periodic snapshots are disabled (shutdown-only).
                         if interval == 0 || h == 0 || h%interval != 0 {
