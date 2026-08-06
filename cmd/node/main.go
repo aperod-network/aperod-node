@@ -107,6 +107,7 @@ func run() error {
         resetP2PIdentity := false
         validateOnly := false
         strictMemLimit := false
+        resetTip := false
         for i, arg := range os.Args[1:] {
                 switch arg {
                 case "--config":
@@ -119,6 +120,8 @@ func run() error {
                         validateOnly = true
                 case "--strict-memlimit":
                         strictMemLimit = true
+                case "--reset-tip":
+                        resetTip = true
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
@@ -373,7 +376,7 @@ func run() error {
                 }
                 integrityOK := true
                 if indexedBlock == nil {
-                        if cfg.Consensus.NonValidator {
+                        if cfg.Consensus.NonValidator || resetTip {
                                 log.Warn("startup integrity check: height index has no entry for tip height — "+
                                         "height index may be incomplete (rsync bootstrap?); repairing from tip pointer",
                                         "tip_height", tipHeight,
@@ -392,7 +395,7 @@ func run() error {
                                 )
                         }
                 } else if indexedBlock.Hash != tipHash {
-                        if cfg.Consensus.NonValidator {
+                        if cfg.Consensus.NonValidator || resetTip {
                                 log.Warn("startup integrity check: tip pointer hash does not match height index — "+
                                         "repairing height index from tip pointer",
                                         "tip_height", tipHeight,
