@@ -38,6 +38,13 @@ type startupScanParams struct {
 	Registry    *core.ValidatorRegistry
 	KiFromIndex bool  // true when key images were pre-loaded from the DB index
 	InitTxTotal int64 // pre-loaded tx total (used when KiFromIndex is true)
+
+	// UTXOFromIndex, when true together with KiFromIndex, means the active
+	// UTXO set was already loaded from db.IterActiveUTXOs by the caller.
+	// The full block scan is skipped; only stake blocks listed in
+	// StakeBlockHeights are fetched for registry replay.
+	UTXOFromIndex     bool
+	StakeBlockHeights []uint64 // heights of blocks that contain stake txs (ascending)
 	Log         *slog.Logger
 
 	// UTXOCountTolerancePct is the maximum allowed percentage difference
@@ -85,6 +92,68 @@ type startupScanParams struct {
 func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	const syncProgressInterval = uint64(1000)  // report every 1 000 blocks
 	const gcInterval           = uint64(10000) // force GC every 10 000 blocks
+
+	// ── DB-index fast path ────────────────────────────────────────────────
+	// When UTXOFromIndex is true, both the active UTXO set and the spent
+	// key-image set have already been loaded from LevelDB by the caller.
+	// Skip the full block scan; only replay stake transactions from the
+	// pre-indexed block heights so the ValidatorRegistry is up to date.
+	if p.UTXOFromIndex {
+		p.Log.Info("db-index fast path: replaying stake blocks only",
+			"stake_block_count", len(p.StakeBlockHeights),
+			"tip_height", p.TipHeight,
+		)
+		for _, h := range p.StakeBlockHeights {
+			if h > p.TipHeight {
+				break
+			}
+			raw, fetchErr := p.DB.GetRawBlockByHeight(h)
+			if fetchErr != nil || raw == nil {
+				p.Log.Warn("db-index fast path: stake block missing — skipped",
+					"height", h, "err", fetchErr)
+				continue
+			}
+			var b core.Block
+			if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
+				p.Log.Warn("db-index fast path: stake block decode error — skipped",
+					"height", h, "err", jsonErr)
+				continue
+			}
+			if replayErr := p.Registry.ReplayBlockStakeTxs(b.Txs, b.Header.Height); replayErr != nil {
+				return startupScanResult{}, fmt.Errorf(
+					"db-index fast path: stake replay at height %d: %w", h, replayErr)
+			}
+		}
+		p.Log.Info("db-index fast path complete",
+			"tip_height", p.TipHeight,
+			"stake_blocks_replayed", len(p.StakeBlockHeights),
+			"unspent_outputs", p.UTXOs.Count(),
+		)
+		// Save a tip snapshot so the next restart uses the snapshot path.
+		snapToSave := startupSnapshot{
+			Version:    snapVersion,
+			TipHeight:  p.TipHeight,
+			TipHashHex: p.TipHashHex,
+			TxTotal:    p.InitTxTotal,
+			UTXOs:      p.UTXOs.TakeSnapshot(),
+			Registry:   p.Registry.TakeSnapshot(),
+		}
+		if p.SnapshotWg != nil {
+			p.SnapshotWg.Add(1)
+		}
+		go func() {
+			if p.SnapshotWg != nil {
+				defer p.SnapshotWg.Done()
+			}
+			if saveErr := saveStartupSnapshot(p.DataDir, snapToSave); saveErr != nil {
+				p.Log.Warn("db-index fast path: failed to save snapshot", "err", saveErr)
+			} else {
+				p.Log.Info("startup snapshot saved after db-index fast path", "tip_height", p.TipHeight)
+				deleteOldSnapshots(p.DataDir, p.TipHeight)
+			}
+		}()
+		return startupScanResult{ScanFrom: p.TipHeight + 1, TxTotal: p.InitTxTotal}, nil
+	}
 
 	checkpointInterval := p.CheckpointInterval
 	if checkpointInterval == 0 {
@@ -298,6 +367,9 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 						"node cannot start safely; repair the store and restart",
 					h, replayErr)
 			}
+			// Backfill the sb/ index so future fast-path restarts know
+			// which blocks to replay for stake reconstruction.
+			_ = p.DB.PutStakeBlockHeight(h)
 			blocksWithStake++
 		}
 
