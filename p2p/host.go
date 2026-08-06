@@ -1509,20 +1509,27 @@ func (h *Host) requestHeaders(peer *Peer) {
 
 func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
         var headers []SerializedHeader
-        if h.headers != nil {
+        if h.headers != nil || (h.blockByHash != nil && h.blockByHeight != nil) {
                 limit := msg.Limit
                 if limit <= 0 || limit > 500 {
                         limit = 500
                 }
-                coreHeaders := h.headers.HeadersFrom(msg.KnownHashes, limit)
 
-                // When the in-memory ring doesn't reach back to the syncing peer's
-                // tip (gap > ringSize blocks), HeadersFrom finds no common ancestor
-                // and falls back to height 1, returning headers the peer can't use.
-                // In that case, try a LevelDB-backed lookup so we can serve any
-                // block we have persisted on disk, not just the recent ring.
-                if len(coreHeaders) == 0 && h.blockByHash != nil && h.blockByHeight != nil {
+                var coreHeaders []core.BlockHeader
+
+                // When a LevelDB fetcher is registered, prefer the store-backed
+                // lookup: it can locate common ancestors far outside the in-memory
+                // ring.  HeadersFrom falls back to height 1 when it finds no match,
+                // then returns headers from wherever the ring starts — skipping the
+                // entire gap a restarting relay node needs to fill.
+                if h.blockByHash != nil && h.blockByHeight != nil {
                         coreHeaders = h.headersFromStore(msg.KnownHashes, limit)
+                }
+
+                // Fall back to in-memory ring when the store lookup found nothing
+                // (no common ancestor in LevelDB, or fetcher not registered).
+                if len(coreHeaders) == 0 && h.headers != nil {
+                        coreHeaders = h.headers.HeadersFrom(msg.KnownHashes, limit)
                 }
 
                 headers = make([]SerializedHeader, 0, len(coreHeaders))
