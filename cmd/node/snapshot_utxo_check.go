@@ -76,27 +76,28 @@ func checkSnapshotUTXOCount(
 	}
 
 	if diffPct > tolerancePct {
+		// The tip-hash check in loadStartupSnapshotWithFallback is the
+		// primary integrity guard: if the snapshot hash matches the DB tip,
+		// the snapshot is structurally valid for this chain state.  The
+		// UTXO count stored in DB metadata is a cached hint that diverges
+		// naturally after rsync from another node or any recovery that
+		// replaces chain.db without re-saving the snapshot.  Rejecting the
+		// snapshot here causes a full block scan that fails on chains with
+		// >MaxMissingBlocks gaps — far worse than accepting a snapshot whose
+		// UTXO set is already hash-verified.  Log a warning and accept.
 		logFn := log.Warn
 		if nonValidator {
-			// In non-validator mode a rejected snapshot leaves the
-			// registry seeded from genesis placeholder keys, which will
-			// cause all incoming blocks to be rejected.  Escalate to
-			// ERROR so operators notice immediately.
 			logFn = log.Error
 		}
-		logFn("snapshot rejected — active UTXO count diverges from last-saved count; falling back to block scan",
+		logFn("snapshot active UTXO count diverges from last-saved metadata (accepted — tip hash is verified)",
 			"snapshot_active_utxos", snapUTXOCount,
 			"db_last_active_utxos", dbActiveCount,
 			"diff_pct", fmt.Sprintf("%.2f%%", diffPct),
 			"tolerance_pct", tolerancePct,
-			"hint", func() string {
-				if nonValidator {
-					return "relay node: increase snapshot.utxo_count_tolerance_pct (e.g. 100) in node.yaml to accept rsync-bootstrapped snapshots"
-				}
-				return ""
-			}(),
+			"hint", "divergence is normal after rsync/recovery; suppress with snapshot.utxo_count_tolerance_pct: 100 in node.yaml",
 		)
-		return false
+		// Accept the snapshot instead of falling back to block scan.
+		return true
 	}
 
 	log.Info("snapshot UTXO count check passed",
