@@ -15,6 +15,7 @@ import (
 
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/store"
 )
 
 // Config holds PoA consensus parameters.
@@ -53,6 +54,21 @@ type Config struct {
         // Incoming blocks whose price deviates beyond this are rejected.
         // Zero (default) disables the deviation check.
         OracleMaxDeviation float64
+
+        // StakingPoolNAPR is the total pre-allocated validator reward pool in nAPRO.
+        // When > 0, block rewards are drawn from this pool rather than minted as new
+        // tokens, keeping Total Supply at 10 B (deflationary from day 1).
+        // After exhaustion, TailRewardNAPR is minted per block instead.
+        // Set to 0 to disable pool-based rewards (legacy halving-mint behaviour).
+        StakingPoolNAPR uint64
+
+        // TailRewardNAPR is the per-block mint in nAPRO once the pool is exhausted.
+        // 0 defaults to defaultTailRewardNAPR (100_000_000 = 1 APRO/block).
+        TailRewardNAPR uint64
+
+        // Store is the LevelDB store used to persist the pool balance across restarts.
+        // When nil the pool state is held in memory only (lost on restart).
+        Store *store.DB
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -94,6 +110,17 @@ type Engine struct {
         // votes. Used to prune the votes map by height to prevent unbounded growth.
         pendingVoteHeight map[crypto.Hash32]uint64
 
+        // staking pool state ─────────────────────────────────────────────────────
+        // stakingPoolInit is the initial pool size in nAPRO (0 = pool disabled).
+        stakingPoolInit uint64
+        // stakingPoolRemaining is the current pool balance in nAPRO.
+        // Updated atomically; -1 means "pool disabled" (stakingPoolInit == 0).
+        stakingPoolRemaining int64
+        // tailRewardNAPR is the per-block mint once the pool is exhausted.
+        tailRewardNAPR uint64
+        // store is the LevelDB backing for pool persistence across restarts.
+        store *store.DB
+
         // timestampRejected counts how many incoming P2P blocks have been rejected by
         // the timejacking guard since node start.  Incremented atomically; safe to
         // read from outside the engine goroutine (e.g. the API server).
@@ -118,6 +145,12 @@ type Engine struct {
         producedCh chan *core.Block  // blocks produced by this node (for broadcast)
 }
 
+// defaultTailRewardNAPR is the per-block mint once the staking pool is exhausted.
+// 1 APRO = 100_000_000 nAPRO.  Chosen as a minimal tail emission that keeps
+// validators incentivised without significant inflationary pressure once
+// EIP-1559 fee burns are non-trivial.
+const defaultTailRewardNAPR uint64 = 100_000_000
+
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
         e := &Engine{
@@ -139,7 +172,118 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 genesisStake := core.MinStakeNAPR * 10 // genesis validators credited 10× min
                 cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
         }
+        // ── Staking pool initialisation ──────────────────────────────────────────
+        if cfg.StakingPoolNAPR > 0 {
+                e.stakingPoolInit = cfg.StakingPoolNAPR
+                e.tailRewardNAPR = cfg.TailRewardNAPR
+                if e.tailRewardNAPR == 0 {
+                        e.tailRewardNAPR = defaultTailRewardNAPR
+                }
+                e.store = cfg.Store
+                // Try to restore persisted pool balance from LevelDB so restarts
+                // do not re-initialise to the full 2 B.
+                if cfg.Store != nil {
+                        if rem, found, err := cfg.Store.LoadStakingPoolRemaining(); err != nil {
+                                log.Warn("staking pool: failed to load from store; using config value", "err", err)
+                                atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+                        } else if found {
+                                atomic.StoreInt64(&e.stakingPoolRemaining, int64(rem))
+                                log.Info("staking pool: restored from store",
+                                        "remaining_napro", rem,
+                                        "remaining_apro", float64(rem)/1e8,
+                                )
+                        } else {
+                                // First boot with pool enabled — persist initial balance.
+                                atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+                                _ = cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR)
+                                log.Info("staking pool: initialised",
+                                        "total_napro", cfg.StakingPoolNAPR,
+                                        "total_apro", float64(cfg.StakingPoolNAPR)/1e8,
+                                )
+                        }
+                } else {
+                        atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+                }
+        } else {
+                // Pool disabled — -1 signals legacy mint behaviour.
+                atomic.StoreInt64(&e.stakingPoolRemaining, -1)
+        }
         return e
+}
+
+// ─── Staking pool accessors ───────────────────────────────────────────────────
+
+// StakingPoolRemaining returns the current pool balance in nAPRO.
+// Returns math.MaxUint64 when the pool is disabled (legacy mint mode).
+func (e *Engine) StakingPoolRemaining() uint64 {
+        v := atomic.LoadInt64(&e.stakingPoolRemaining)
+        if v < 0 {
+                return math.MaxUint64
+        }
+        return uint64(v)
+}
+
+// StakingPoolInit returns the initial pool size in nAPRO (0 if disabled).
+func (e *Engine) StakingPoolInit() uint64 { return e.stakingPoolInit }
+
+// RewardMode returns "pool" when drawing from the pre-allocated staking pool,
+// "tail_emission" when the pool is exhausted and rewards are minted, or
+// "legacy_mint" when the pool feature is disabled entirely.
+func (e *Engine) RewardMode() string {
+        v := atomic.LoadInt64(&e.stakingPoolRemaining)
+        switch {
+        case v < 0:
+                return "legacy_mint"
+        case v == 0:
+                return "tail_emission"
+        default:
+                return "pool"
+        }
+}
+
+// DecrementPool draws one block-reward from the staking pool.
+// Must be called exactly once per accepted block (in OnBlockAccepted) so that
+// the pool balance tracks the real chain state regardless of whether the block
+// was produced locally or received from a peer.
+// Safe to call concurrently; uses atomic CAS.  Does nothing when pool is disabled.
+func (e *Engine) DecrementPool(height uint64) {
+        if e.stakingPoolInit == 0 {
+                return // pool disabled
+        }
+        baseReward := e.cfg.BlockRewardNAPR
+        if baseReward == 0 {
+                baseReward = defaultBlockRewardNAPR
+        }
+        amount := blockRewardAtHeight(baseReward, height)
+        if amount == 0 {
+                return
+        }
+        for {
+                cur := atomic.LoadInt64(&e.stakingPoolRemaining)
+                if cur <= 0 {
+                        return // already exhausted
+                }
+                deduct := amount
+                if uint64(cur) < deduct {
+                        deduct = uint64(cur) // clamp to remaining
+                }
+                next := int64(uint64(cur) - deduct)
+                if atomic.CompareAndSwapInt64(&e.stakingPoolRemaining, cur, next) {
+                        if e.store != nil {
+                                if err := e.store.StoreStakingPoolRemaining(uint64(next)); err != nil {
+                                        e.log.Warn("staking pool: failed to persist remaining", "height", height, "err", err)
+                                }
+                        }
+                        if next == 0 {
+                                e.log.Info("staking pool exhausted — tail emission now active",
+                                        "height", height,
+                                        "tail_reward_napro", e.tailRewardNAPR,
+                                        "tail_reward_apro", float64(e.tailRewardNAPR)/1e8,
+                                )
+                        }
+                        return
+                }
+        }
 }
 
 // TimestampRejectedCount returns the total number of incoming P2P blocks rejected
@@ -629,10 +773,31 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 if baseReward == 0 {
                         baseReward = defaultBlockRewardNAPR
                 }
-                // Apply halving schedule: reward halves every HalvingIntervalBlocks.
-                // See deploy/BURN_POLICY.md for the emission schedule table.
-                rewardNAPR := blockRewardAtHeight(baseReward, height)
-                // Validator earns block reward + priority tips from all txs in this block.
+
+                var rewardNAPR uint64
+                if e.stakingPoolInit > 0 {
+                        // Pool-based mode: check current balance.
+                        // DecrementPool() is called in OnBlockAccepted AFTER this block is
+                        // committed, so we read the balance before this block's deduction.
+                        remaining := atomic.LoadInt64(&e.stakingPoolRemaining)
+                        if remaining > 0 {
+                                // Pool phase — draw from pre-allocated staking pool.
+                                // Total Supply does NOT increase; 10 B stays constant.
+                                poolDraw := blockRewardAtHeight(baseReward, height)
+                                if poolDraw > uint64(remaining) {
+                                        poolDraw = uint64(remaining) // last partial draw
+                                }
+                                rewardNAPR = poolDraw
+                        } else {
+                                // Tail emission phase — mint minimal reward.
+                                rewardNAPR = e.tailRewardNAPR
+                        }
+                } else {
+                        // Legacy: halving-schedule mint (increases Total Supply).
+                        rewardNAPR = blockRewardAtHeight(baseReward, height)
+                }
+
+                // Validator earns base reward + priority tips from all txs in this block.
                 totalReward := rewardNAPR + tips
                 mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
                 if err != nil {
