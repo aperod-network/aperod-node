@@ -514,6 +514,22 @@ func (h *Host) loadWhitelistFromFile() error {
                                         h.cfg.WhitelistFile, entry)
                         }
                 }
+                // When the sidecar is empty but node.yaml still has peer_whitelist
+                // entries, retain the static config entries rather than transitioning
+                // to an open (unbounded) network.  This prevents an admin "clear-all"
+                // in the Admin Panel from accidentally removing ban-exemptions for
+                // trusted relay nodes defined in node.yaml.
+                // To fully disable the whitelist the operator must also clear
+                // peer_whitelist in node.yaml and restart.
+                if len(valid) == 0 && len(h.cfg.PeerWhitelist) > 0 {
+                        h.log.Info("p2p: whitelist sidecar is empty — retaining node.yaml peer_whitelist",
+                                "cfg_entries", len(h.cfg.PeerWhitelist),
+                                "file", h.cfg.WhitelistFile)
+                        // h.wlNets / h.wlIPs / h.cfg.PeerWhitelist were set by the
+                        // constructor from node.yaml; leave them intact.
+                        // The sidecar will be re-seeded on the next AddToWhitelist call.
+                        return nil
+                }
                 // Overwrite the in-memory state entirely (no merge with cfg).
                 h.wlNets = nets
                 h.wlIPs = ips
@@ -773,9 +789,8 @@ func (h *Host) acceptLoop() {
                 h.wlMu.RLock()
                 wlNets := h.wlNets
                 wlIPs := h.wlIPs
-                wlLen := len(h.cfg.PeerWhitelist)
                 h.wlMu.RUnlock()
-                if wlLen > 0 {
+                if len(wlNets) > 0 || len(wlIPs) > 0 {
                         remoteIP := net.ParseIP(connIP(conn.RemoteAddr().String()))
                         if remoteIP == nil || !ipInWhitelist(remoteIP, wlNets, wlIPs) {
                                 h.log.Info("inbound connection rejected: IP not in peer_whitelist",
@@ -1333,9 +1348,8 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                                 h.wlMu.RLock()
                                 wlNets := h.wlNets
                                 wlIPs := h.wlIPs
-                                wlLen := len(h.cfg.PeerWhitelist)
                                 h.wlMu.RUnlock()
-                                if wlLen > 0 {
+                                if len(wlNets) > 0 || len(wlIPs) > 0 {
                                         if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
                                                 h.log.Debug("out-of-range block from whitelisted peer — strike skipped",
                                                         "peer", peer.addr,
