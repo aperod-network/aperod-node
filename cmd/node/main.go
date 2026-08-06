@@ -386,6 +386,10 @@ func run() error {
                                 } else {
                                         log.Info("startup integrity: height index repaired", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
                                 }
+                                if resetTip {
+                                        fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip)\n", tipHeight)
+                                        return nil
+                                }
                                 integrityOK = false
                         } else {
                                 return fmt.Errorf(
@@ -406,6 +410,10 @@ func run() error {
                                 } else {
                                         log.Info("startup integrity: height index repaired", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
                                 }
+                                if resetTip {
+                                        fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip)\n", tipHeight)
+                                        return nil
+                                }
                                 integrityOK = false
                         } else {
                                 return fmt.Errorf(
@@ -415,6 +423,10 @@ func run() error {
                                         tipHash[:8], tipHeight, indexedBlock.Hash[:8],
                                 )
                         }
+                } else if resetTip {
+                        // Height index is already correct; nothing to repair.
+                        fmt.Printf("aperod-node: height index already consistent at height %d — start normally (without --reset-tip)\n", tipHeight)
+                        return nil
                 }
                 if integrityOK {
                         log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
