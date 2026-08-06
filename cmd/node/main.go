@@ -193,6 +193,22 @@ func run() error {
                         "memory_limit_bytes", cfg.MemoryLimitBytes,
                 )
         }
+
+        // Apply GC target percentage from config.  The Go runtime default is
+        // 100 (GC when heap doubles); 50 keeps peak RSS lower at the cost of
+        // ~10-15 % more GC CPU — an acceptable trade-off for a validator node
+        // that must stay below GOMEMLIMIT for many hours between restarts.
+        gcPct := cfg.GCPercent
+        if gcPct == 0 {
+                gcPct = 50 // production default; operators can override in node.yaml
+        }
+        if gcPct > 0 {
+                prev := debug.SetGCPercent(gcPct)
+                log.Info("GC target percentage set",
+                        "gc_percent", gcPct,
+                        "previous", prev,
+                )
+        }
         if err := checkGOMLEMLIMIT(
                 os.Getenv("GOMEMLIMIT"),
                 configMemLimitApplied,
@@ -884,11 +900,15 @@ func run() error {
                         // during steady-state sync, RSS drifts upward until GOMEMLIMIT
                         // causes GC thrash.  Running in a goroutine keeps the block
                         // acceptance path non-blocking.
-                        const gcEveryBlocks = uint64(5000) // ~83 min at 1 block/s
+                        //
+                        // 500 blocks ≈ 25 min at 1 block/3 s.  Previous value (5000)
+                        // fired every ~4.2 h, allowing 1–2 GB of RSS drift between
+                        // collections on a chain producing one block every 3 seconds.
+                        const gcEveryBlocks = uint64(500)
                         if h > 0 && h%gcEveryBlocks == 0 {
                                 go func() {
                                         runtime.GC()
-                                        debug.FreeOSMemory()
+                                        debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
                                 }()
                         }
 
