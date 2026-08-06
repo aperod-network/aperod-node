@@ -109,18 +109,20 @@ type StoredBlock struct {
 }
 
 // PutBlock persists a block.
+// The block body and height-index entry are written atomically in a single
+// fsynced batch so that a SIGKILL immediately after this call cannot leave
+// the height index pointing at a missing block or vice-versa.
 func (d *DB) PutBlock(hash crypto.Hash32, sb *StoredBlock) error {
         data, err := json.Marshal(sb)
         if err != nil {
                 return fmt.Errorf("marshal block: %w", err)
         }
-        key := append(prefixBlock, hash[:]...)
-        if err := d.put(key, data); err != nil {
-                return err
-        }
-        // Height index
+        blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)
         hKey := heightKey(sb.Height)
-        return d.put(hKey, hash[:])
+        batch := new(leveldb.Batch)
+        batch.Put(blockKey, data)
+        batch.Put(hKey, hash[:])
+        return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
 
 // GetBlock retrieves a block by hash.
@@ -409,13 +411,18 @@ func (d *DB) LoadTxTotal() (int64, error) {
 }
 
 // PutTip records the current canonical chain tip hash and height.
+// Both metadata keys are written atomically in a single fsynced batch so
+// that a SIGKILL cannot leave tip/hash and tip/height out of sync with
+// each other or with the block data written by PutBlock/PutRawBlock.
 func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
-        if err := d.PutMeta("tip/hash", hash[:]); err != nil {
-                return err
-        }
         var hb [8]byte
         binary.LittleEndian.PutUint64(hb[:], height)
-        return d.PutMeta("tip/height", hb[:])
+        hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
+        heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
+        batch := new(leveldb.Batch)
+        batch.Put(hashKey, hash[:])
+        batch.Put(heightKey2, hb[:])
+        return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
 
 // GetTip returns the stored tip hash and height. Returns zero values if not set.
@@ -437,12 +444,15 @@ func (d *DB) GetTip() (hash crypto.Hash32, height uint64, err error) {
 
 // PutRawBlock stores a fully-serialized block (as raw bytes) keyed by its hash,
 // and maintains the height → hash index. Used by node to persist core.Block data.
+// Both entries are written atomically in a single fsynced batch so that a SIGKILL
+// cannot leave a height-index entry pointing at a missing block or vice-versa.
 func (d *DB) PutRawBlock(hash crypto.Hash32, height uint64, data []byte) error {
-        key := append(prefixBlock, hash[:]...)
-        if err := d.put(key, data); err != nil {
-                return err
-        }
-        return d.put(heightKey(height), hash[:])
+        blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)
+        hKey := heightKey(height)
+        batch := new(leveldb.Batch)
+        batch.Put(blockKey, data)
+        batch.Put(hKey, hash[:])
+        return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
 
 // GetRawBlock returns the raw bytes for a block by hash. Returns nil if not found.
