@@ -326,7 +326,17 @@ func persistBlockToDB(db *store.DB, block *core.Block) error {
                 }
         }
 
-        // 3. Update chain tip pointer.
+        // 3. Index stake-bearing blocks for the db-index fast-path startup scan.
+        for _, tx := range block.Txs {
+                if tx.IsStake() {
+                        if sbErr := db.PutStakeBlockHeight(block.Header.Height); sbErr != nil {
+                                return fmt.Errorf("put stake block height: %w", sbErr)
+                        }
+                        break
+                }
+        }
+
+        // 4. Update chain tip pointer.
         if err := db.PutTip(blockHash, block.Header.Height); err != nil {
                 return fmt.Errorf("put tip: %w", err)
         }
