@@ -94,6 +94,20 @@ type Config struct {
 	// Recommended production value: 5905580032 (≈5.5 GB).
 	// Set to 0 (default) to rely solely on the GOMEMLIMIT env var.
 	MemoryLimitBytes int64 `yaml:"memory_limit_bytes"`
+
+	// GCPercent sets the Go garbage-collector target percentage via
+	// debug.SetGCPercent.  The runtime triggers a GC cycle when the live
+	// heap has grown by this percentage since the previous cycle.
+	// Lower values → more frequent GC → lower peak RSS, slightly higher CPU.
+	// Higher values → less frequent GC → higher peak RSS, lower CPU overhead.
+	//
+	// Default: 50.  The Go runtime default is 100 (heap may double between
+	// collections); 50 halves the maximum heap growth between GC cycles and
+	// is appropriate for long-running validator nodes where low memory
+	// variance matters more than minimal GC CPU.
+	// Set to -1 to disable the GC entirely (not recommended in production).
+	// Set to 0 to use the Go runtime default (100).
+	GCPercent int `yaml:"gc_percent"`
 }
 
 // P2PConfig holds networking settings.
