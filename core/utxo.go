@@ -10,21 +10,30 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-// compactKeyImageSet stores spent key images in a sorted []crypto.KeyImage
-// slice rather than a Go map.  A Go map[KeyImage]struct{} consumes ~150 bytes
-// per entry (bucket overhead, hash, alignment padding) for a 32-byte key;
-// the sorted slice needs exactly 32 bytes per entry.  On a chain with 1 M
-// spent key images this cuts key-image memory from ~150 MB to ~32 MB — a
-// ~5× reduction that is the dominant contributor to the post-snapshot RSS gap.
+// compactKeyImageSet stores spent key images using a two-tier design:
 //
-// Lookups use binary search (O(log n)).  Insertions maintain sorted order via
-// an in-place insert that copies the tail of the slice; on a PoA chain that
-// adds 1–10 key images per block this costs ~3 ms at 1 M entries — well within
-// a 1-second block time.
+//  1. sorted []crypto.KeyImage — a sorted, compact slice (32 B/entry) holding
+//     all historical key images loaded from LevelDB at startup.  Binary-search
+//     lookups are O(log n).  This slice is never mutated after restoreFromSlice
+//     builds it; it is read-only during normal node operation.
 //
-// The zero value (nil slice) is valid and represents an empty set.
+//  2. recent map[crypto.KeyImage]struct{} — a Go map for key images added at
+//     runtime (after the last snapshot restore).  Insertions are O(1) with no
+//     slice shifting, which eliminates the O(n) memmove that the old in-place
+//     sorted insertion caused.  At 982 K historical entries the old insert
+//     had to copy 31 MB of data per key image, saturating CPU at 255%+ during
+//     bulk sync from a peer node.
+//
+// Memory trade-off: 'recent' entries cost ~150 B each (map bucket overhead)
+// vs 32 B in the sorted slice.  Between restarts the node adds at most a few
+// thousand key images, so the extra ~120 B/entry costs < 1 MB in practice.
+// On restart LevelDB reloads all key images (including the recently added ones)
+// into a fresh sorted slice, restoring the compact representation.
+//
+// The zero value (nil slice, nil map) is valid and represents an empty set.
 type compactKeyImageSet struct {
-	sorted []crypto.KeyImage
+	sorted []crypto.KeyImage              // historical: compact, sorted, read-only after restore
+	recent map[crypto.KeyImage]struct{}   // runtime additions: O(1) insert, no memmove
 }
 
 // kiLess returns true when a < b in lexicographic byte order.
@@ -44,56 +53,76 @@ func (c *compactKeyImageSet) kiSearch(ki crypto.KeyImage) int {
 	})
 }
 
-// contains reports whether ki is present (O(log n) binary search).
+// contains reports whether ki is present.
+// Checks the 'recent' map first (O(1)), then falls back to binary search on
+// the historical 'sorted' slice (O(log n)).
 func (c *compactKeyImageSet) contains(ki crypto.KeyImage) bool {
+	if c.recent != nil {
+		if _, ok := c.recent[ki]; ok {
+			return true
+		}
+	}
 	idx := c.kiSearch(ki)
 	return idx < len(c.sorted) && c.sorted[idx] == ki
 }
 
-// insert adds ki maintaining sorted order.  No-op if already present.
-// O(n) due to the slice copy required to shift the tail.
+// insert records ki as spent.  No-op if already present.
+// New entries go into the 'recent' map (O(1), no slice shifting) to avoid
+// the O(n) memmove that in-place sorted insertion caused at large chain heights.
 func (c *compactKeyImageSet) insert(ki crypto.KeyImage) {
+	if c.contains(ki) {
+		return
+	}
+	if c.recent == nil {
+		c.recent = make(map[crypto.KeyImage]struct{})
+	}
+	c.recent[ki] = struct{}{}
+}
+
+// remove deletes ki from whichever tier holds it.  No-op if absent.
+func (c *compactKeyImageSet) remove(ki crypto.KeyImage) {
+	// Remove from recent map first (fast path for newly-added entries).
+	if c.recent != nil {
+		delete(c.recent, ki)
+	}
+	// Also remove from the historical sorted slice if present.
 	idx := c.kiSearch(ki)
 	if idx < len(c.sorted) && c.sorted[idx] == ki {
-		return // already present
+		c.sorted = append(c.sorted[:idx], c.sorted[idx+1:]...)
 	}
-	c.sorted = append(c.sorted, crypto.KeyImage{})
-	copy(c.sorted[idx+1:], c.sorted[idx:])
-	c.sorted[idx] = ki
 }
 
-// remove deletes ki if present.  No-op if absent.
-// O(n) due to the slice copy required to compact the tail.
-func (c *compactKeyImageSet) remove(ki crypto.KeyImage) {
-	idx := c.kiSearch(ki)
-	if idx >= len(c.sorted) || c.sorted[idx] != ki {
-		return // not found
-	}
-	c.sorted = append(c.sorted[:idx], c.sorted[idx+1:]...)
-}
+// length returns the total number of stored key images across both tiers.
+func (c *compactKeyImageSet) length() int { return len(c.sorted) + len(c.recent) }
 
-// length returns the number of stored key images.
-func (c *compactKeyImageSet) length() int { return len(c.sorted) }
-
-// toSlice returns a sorted copy of all key images (for snapshot serialisation).
+// toSlice returns a sorted copy of all key images from both tiers.
+// Used for snapshot serialisation; the caller must not mutate the result.
 func (c *compactKeyImageSet) toSlice() []crypto.KeyImage {
-	if len(c.sorted) == 0 {
+	total := len(c.sorted) + len(c.recent)
+	if total == 0 {
 		return nil
 	}
-	out := make([]crypto.KeyImage, len(c.sorted))
+	out := make([]crypto.KeyImage, len(c.sorted), total)
 	copy(out, c.sorted)
+	for ki := range c.recent {
+		out = append(out, ki)
+	}
+	// Sort the merged result so the snapshot is canonical and
+	// restoreFromSlice can binary-search it on next startup.
+	sort.Slice(out, func(i, j int) bool { return kiLess(out[i], out[j]) })
 	return out
 }
 
 // restoreFromSlice replaces the set's contents with a sorted copy of kis.
 // Called once during snapshot restore; pays the one-time O(n log n) sort cost
-// instead of O(n²) sequential insertions.
+// and resets the runtime 'recent' map to empty (all entries are now in 'sorted').
 func (c *compactKeyImageSet) restoreFromSlice(kis []crypto.KeyImage) {
 	c.sorted = make([]crypto.KeyImage, len(kis))
 	copy(c.sorted, kis)
 	sort.Slice(c.sorted, func(i, j int) bool {
 		return kiLess(c.sorted[i], c.sorted[j])
 	})
+	c.recent = nil // all entries now live in the compact sorted slice
 }
 
 // DecoyUTXO is a stripped UTXO descriptor used as a ring decoy in Phase 2.
