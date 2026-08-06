@@ -15,12 +15,14 @@ import (
 
 // Key prefixes separate different namespaces in the single LevelDB instance.
 var (
-        prefixBlock    = []byte("b/") // b/<hash32> → Block JSON
-        prefixHeight   = []byte("h/") // h/<uint64> → hash32 (canonical height index)
-        prefixUTXO     = []byte("u/") // u/<txhash>/<outIdx> → UTXO JSON
-        prefixKeyImage = []byte("k/") // k/<keyimage> → 0x01 (spent)
-        prefixMeta     = []byte("m/") // m/<key> → value (metadata)
-        prefixTxIdx    = []byte("t/") // t/<txhash32> → height[8] + txIdx[4] (tx location index)
+        prefixBlock      = []byte("b/")  // b/<hash32>              → Block JSON
+        prefixHeight     = []byte("h/")  // h/<uint64>              → hash32 (canonical height index)
+        prefixUTXO       = []byte("u/")  // u/<txhash32><outIdx4>   → UTXO JSON (all outputs ever created)
+        prefixKeyImage   = []byte("k/")  // k/<keyimage32>          → 0x01 (spent)
+        prefixMeta       = []byte("m/")  // m/<key>                 → value (metadata)
+        prefixTxIdx      = []byte("t/")  // t/<txhash32>            → height[8]+txIdx[4] (tx location)
+        prefixSpentUTXO  = []byte("su/") // su/<txhash32><outIdx4>  → 0x01 (spent-UTXO fast-start index)
+        prefixStakeBlock = []byte("sb/") // sb/<height8>            → 0x01 (block contains stake txs)
 )
 
 // DB wraps a LevelDB database with typed methods for blockchain data.
@@ -162,6 +164,133 @@ func (d *DB) GetUTXO(txHash crypto.Hash32, outIdx uint32) (*StoredUTXO, error) {
 // DeleteUTXO removes a UTXO (when spent).
 func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
         return d.del(utxoKey(txHash, outIdx))
+}
+
+// ─── Spent-UTXO fast-start index (su/) ───────────────────────────────────────
+//
+// The su/ namespace records which UTXOs have been spent so that
+// IterActiveUTXOs can reconstruct the active set without scanning blocks.
+// Entries are written by the OnUTXOSpent callback wired in main.go; they
+// are never deleted (spent UTXOs stay spent on a linear chain).
+
+// spentUTXOKey builds the su/ key for (txHash, outIdx).
+func spentUTXOKey(txHash crypto.Hash32, outIdx uint32) []byte {
+        key := make([]byte, len(prefixSpentUTXO)+32+4)
+        n := copy(key, prefixSpentUTXO)
+        copy(key[n:], txHash[:])
+        binary.BigEndian.PutUint32(key[n+32:], outIdx)
+        return key
+}
+
+// MarkUTXOSpent records that the output (txHash, outIdx) has been consumed by
+// a spending transaction.  Called from the OnUTXOSpent callback wired in
+// main.go; non-fatal on error (index is a startup-performance optimisation).
+func (d *DB) MarkUTXOSpent(txHash crypto.Hash32, outIdx uint32) error {
+        return d.put(spentUTXOKey(txHash, outIdx), []byte{0x01})
+}
+
+// SpentUTXOIndexSize returns the number of entries in the su/ index.
+// Used at startup to detect whether the index has been populated by at least
+// one previous full-scan run.
+func (d *DB) SpentUTXOIndexSize() (int, error) {
+        iter := d.db.NewIterator(util.BytesPrefix(prefixSpentUTXO), nil)
+        defer iter.Release()
+        n := 0
+        for iter.Next() {
+                n++
+        }
+        return n, iter.Error()
+}
+
+// IterActiveUTXOs calls fn for every UTXO that has NOT been marked spent.
+// Phase 1 collects the complete su/ spent-set (a sequential scan with good
+// locality); Phase 2 iterates u/ and skips any entry whose key appears in
+// the spent-set.  This avoids N random point-lookups while still being a
+// single linear pass over each namespace.
+func (d *DB) IterActiveUTXOs(fn func(*StoredUTXO) error) error {
+        // Phase 1: build in-memory spent-UTXO key set from su/.
+        const keyLen = 36 // 32-byte txHash + 4-byte outIdx
+        type utxoID [keyLen]byte
+        spent := make(map[utxoID]struct{})
+        spentIter := d.db.NewIterator(util.BytesPrefix(prefixSpentUTXO), nil)
+        for spentIter.Next() {
+                suffix := spentIter.Key()[len(prefixSpentUTXO):]
+                if len(suffix) == keyLen {
+                        var id utxoID
+                        copy(id[:], suffix)
+                        spent[id] = struct{}{}
+                }
+        }
+        spentIter.Release()
+        if err := spentIter.Error(); err != nil {
+                return fmt.Errorf("iter spent-utxo index: %w", err)
+        }
+
+        // Phase 2: iterate u/ and skip spent entries.
+        iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
+        defer iter.Release()
+        for iter.Next() {
+                var u StoredUTXO
+                if err := json.Unmarshal(iter.Value(), &u); err != nil {
+                        return err
+                }
+                var id utxoID
+                copy(id[:32], u.TxHash[:])
+                binary.BigEndian.PutUint32(id[32:], u.OutputIndex)
+                if _, isSpent := spent[id]; isSpent {
+                        continue
+                }
+                if err := fn(&u); err != nil {
+                        return err
+                }
+        }
+        return iter.Error()
+}
+
+// ─── Stake-block height index (sb/) ──────────────────────────────────────────
+//
+// The sb/ namespace records which block heights contain stake transactions.
+// Together with the su/ index it lets the startup fast-path replay only the
+// small fraction of blocks that carry stake logic, skipping the rest entirely.
+
+// stakeBlockKey builds the sb/ key for height h.
+func stakeBlockKey(h uint64) []byte {
+        key := make([]byte, len(prefixStakeBlock)+8)
+        n := copy(key, prefixStakeBlock)
+        binary.BigEndian.PutUint64(key[n:], h)
+        return key
+}
+
+// PutStakeBlockHeight records that height h contains stake transactions.
+func (d *DB) PutStakeBlockHeight(h uint64) error {
+        return d.put(stakeBlockKey(h), []byte{0x01})
+}
+
+// HasStakeBlockIndex returns true when the sb/ namespace has at least one
+// entry, meaning PutStakeBlockHeight has been called during a prior run.
+func (d *DB) HasStakeBlockIndex() (bool, error) {
+        iter := d.db.NewIterator(util.BytesPrefix(prefixStakeBlock), nil)
+        defer iter.Release()
+        has := iter.Next()
+        return has, iter.Error()
+}
+
+// IterStakeBlockHeights calls fn for every indexed stake-block height in
+// ascending order.
+func (d *DB) IterStakeBlockHeights(fn func(uint64) error) error {
+        iter := d.db.NewIterator(util.BytesPrefix(prefixStakeBlock), nil)
+        defer iter.Release()
+        for iter.Next() {
+                suffix := iter.Key()[len(prefixStakeBlock):]
+                if len(suffix) != 8 {
+                        continue
+                }
+                h := binary.BigEndian.Uint64(suffix)
+                if err := fn(h); err != nil {
+                        return err
+                }
+        }
+        return iter.Error()
 }
 
 // ─── Key Image tracking ───────────────────────────────────────────────────────
