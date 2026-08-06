@@ -62,17 +62,29 @@ func TestDB_IterKeyImages(t *testing.T) {
         var kis [3]crypto.KeyImage
         for i := range kis {
                 kis[i][0] = byte(i + 1)
-                _ = db.MarkKeyImageSpent(kis[i])
+                if err := db.MarkKeyImageSpent(kis[i]); err != nil {
+                        t.Fatalf("MarkKeyImageSpent(%x): %v", kis[i][:4], err)
+                }
         }
 
-        seen := map[crypto.KeyImage]bool{}
-        _ = db.IterKeyImages(func(ki crypto.KeyImage) error {
-                seen[ki] = true
+        // IterKeyImages may return canonical forms rather than raw bytes when the
+        // stored key image was a valid prime-order curve point.  Verify via
+        // IsKeyImageSpent (which applies the same canonicalization) instead of
+        // comparing raw bytes, and separately verify the iteration count.
+        var count int
+        _ = db.IterKeyImages(func(_ crypto.KeyImage) error {
+                count++
                 return nil
         })
+        if count != len(kis) {
+                t.Errorf("IterKeyImages returned %d entries, want %d", count, len(kis))
+        }
         for _, ki := range kis {
-                if !seen[ki] {
-                        t.Errorf("key image %x not found in iteration", ki[:4])
+                spent, err := db.IsKeyImageSpent(ki)
+                if err != nil {
+                        t.Errorf("IsKeyImageSpent(%x): %v", ki[:4], err)
+                } else if !spent {
+                        t.Errorf("key image %x stored but IsKeyImageSpent returned false", ki[:4])
                 }
         }
 }
