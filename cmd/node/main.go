@@ -264,6 +264,15 @@ func run() error {
         // can populate it from stored blocks, ensuring historical spent key
         // images are known to TxVerifier before the first peer block arrives.
         utxos := core.NewUTXOSet()
+        // Wire the spent-UTXO index callback so ApplyBlock (called during the
+        // startup scan and live block acceptance) keeps the su/ index current.
+        // Non-fatal on DB error — the index is a startup-performance optimisation.
+        utxos.OnUTXOSpent = func(txHash crypto.Hash32, outIdx uint32) {
+                if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
+                        log.Warn("failed to persist spent UTXO to index",
+                                "out_idx", outIdx, "err", spentErr)
+                }
+        }
 
         tipHash, tipHeight, err := db.GetTip()
         if err != nil {
@@ -631,6 +640,65 @@ func run() error {
                         kiCount = 0
                 }
 
+                // ── DB-index fast path (UTXOFromIndex) ──────────────────────────
+                // When the key-image index, spent-UTXO index (su/), and stake-block
+                // index (sb/) are all populated, rebuild the active UTXO set from
+                // the DB directly — no full block scan required.  On first startup
+                // after deploying this feature (no su/ or sb/ entries yet), the
+                // normal block scan runs and backfills both indexes for next time.
+                var (
+                        utxoFromIndex      bool
+                        stakeBlockHeights  []uint64
+                )
+                if kiFromIndex && tipHeight > 0 {
+                        suSize, suErr := db.SpentUTXOIndexSize()
+                        hasSb, sbErr := db.HasStakeBlockIndex()
+                        if suErr == nil && sbErr == nil && suSize > 0 && hasSb {
+                                // Load active UTXOs from DB (all u/ entries not in su/).
+                                activeCount := 0
+                                iterErr := db.IterActiveUTXOs(func(su *store.StoredUTXO) error {
+                                        utxos.Add(&core.UTXO{
+                                                TxHash:       su.TxHash,
+                                                OutputIndex:  su.OutputIndex,
+                                                OneTimePub:   su.OneTimePub,
+                                                TxPubKey:     su.TxPubKey,
+                                                AmountCommit: su.AmountCommit,
+                                                EncAmount:    su.EncAmount,
+                                                BlockHeight:  su.BlockHeight,
+                                        })
+                                        activeCount++
+                                        return nil
+                                })
+                                if iterErr == nil && activeCount > 0 {
+                                        // Collect stake block heights for registry replay.
+                                        sbErr2 := db.IterStakeBlockHeights(func(h uint64) error {
+                                                if h <= tipHeight {
+                                                        stakeBlockHeights = append(stakeBlockHeights, h)
+                                                }
+                                                return nil
+                                        })
+                                        if sbErr2 == nil {
+                                                utxoFromIndex = true
+                                                log.Info("active UTXO set loaded from db index",
+                                                        "active_utxos", activeCount,
+                                                        "stake_blocks", len(stakeBlockHeights),
+                                                )
+                                        }
+                                }
+                                if !utxoFromIndex {
+                                        // Partial load failed — clear and fall back to block scan.
+                                        utxos = core.NewUTXOSet()
+                                        utxos.OnUTXOSpent = func(txHash crypto.Hash32, outIdx uint32) {
+                                                if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
+                                                        log.Warn("failed to persist spent UTXO", "err", spentErr)
+                                                }
+                                        }
+                                        log.Warn("db-index fast path unavailable; falling back to block scan",
+                                                "tip_height", tipHeight)
+                                }
+                        }
+                }
+
                 var setSyncProgress func(uint64, uint64)
                 if apiSrv != nil {
                         setSyncProgress = apiSrv.SetSyncProgress
@@ -643,6 +711,8 @@ func run() error {
                         UTXOs:                 utxos,
                         Registry:              registry,
                         KiFromIndex:           kiFromIndex,
+                        UTXOFromIndex:         utxoFromIndex,
+                        StakeBlockHeights:     stakeBlockHeights,
                         InitTxTotal:           initialTxTotal,
                         Log:                   log,
                         UTXOCountTolerancePct: cfg.Snapshot.UTXOCountTolerancePct,
@@ -752,6 +822,16 @@ func run() error {
                                                 log.Warn("failed to persist key image",
                                                         "height", block.Header.Height, "err", kiErr)
                                         }
+                                }
+                        }
+                        // Index stake-bearing blocks for the db-index fast-path startup scan.
+                        for _, tx := range block.Txs {
+                                if tx.IsStake() {
+                                        if sbErr := db.PutStakeBlockHeight(block.Header.Height); sbErr != nil {
+                                                log.Warn("failed to index stake block",
+                                                        "height", block.Header.Height, "err", sbErr)
+                                        }
+                                        break
                                 }
                         }
                 },
