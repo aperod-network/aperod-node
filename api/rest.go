@@ -505,6 +505,7 @@ type AddressTx struct {
         BlockHeight uint64 `json:"block_height"`
         TxIndex     int    `json:"tx_index"`
         OutputIndex int    `json:"output_index"`
+        IsCoinbase  bool   `json:"is_coinbase"`
 }
 
 // AddressUTXO is a single unspent output returned by the address UTXO listing endpoint.
@@ -741,6 +742,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
                         }
                 }
                 for i, tx := range b.Txs {
+                        isCoinbase := tx.IsCoinbase()
                         for j, out := range tx.Outputs {
                                 if out.OneTimePub == spendPub || out.OneTimePub == expectedMintPub {
                                         results = append(results, AddressTx{
@@ -748,6 +750,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
                                                 BlockHeight: uint64(h),
                                                 TxIndex:     i,
                                                 OutputIndex: j,
+                                                IsCoinbase:  isCoinbase,
                                         })
                                 }
                         }
@@ -2235,13 +2238,15 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	syncing := atomic.LoadInt32(&s.syncing) == 1
 	syncingHeight := atomic.LoadInt64(&s.syncingHeight)
 	tipHeight := atomic.LoadInt64(&s.tipHeight)
+	storeMissing := atomic.LoadInt64(&s.storeMissingBlocks)
 	resp := map[string]interface{}{
-		"ok":             true,
-		"height":         height,
-		"syncing":          syncing,
-		"syncing_height":   syncingHeight,
-		"tip_height":       tipHeight,
-		"utxo_rebuilding":  atomic.LoadInt32(&s.utxoRebuilding) == 1,
+		"ok":                   true,
+		"height":               height,
+		"syncing":              syncing,
+		"syncing_height":       syncingHeight,
+		"tip_height":           tipHeight,
+		"utxo_rebuilding":      atomic.LoadInt32(&s.utxoRebuilding) == 1,
+		"store_missing_blocks": storeMissing,
 	}
 	// Use the live whitelist from the P2P layer when wired; fall back to the
 	// startup snapshot so /api/v1/status is never stale after live edits.
