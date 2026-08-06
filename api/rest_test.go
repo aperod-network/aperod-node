@@ -288,6 +288,50 @@ func TestREST_AddressTxs_CoinbaseMatch(t *testing.T) {
         }
 }
 
+// TestREST_AddressTxs_IsCoinbaseFlagged confirms that the address-transactions
+// endpoint sets is_coinbase=true on block-reward (coinbase) outputs.  This is
+// the regression guard for the "+0 APRO" wallet-history bug: the wallet filters
+// on this field so it must be present and accurate.
+func TestREST_AddressTxs_IsCoinbaseFlagged(t *testing.T) {
+        // Build a genesis block whose coinbase output.OneTimePub equals spendPt so
+        // the scanner matches it and returns it in the address-transactions list.
+        priv, pub, _ := crypto.GenerateValidatorKey()
+        spendPt := crypto.Point32(pub)
+        cb := core.CoinbaseTx(spendPt, 1_000_000)
+        txs := []core.Transaction{cb}
+        hdr := core.BlockHeader{
+                Height:       0,
+                Timestamp:    time.Now().UnixNano(),
+                ValidatorPub: pub,
+                MerkleRoot:   core.MerkleRoot(txs),
+        }
+        _ = hdr.Sign(priv)
+        genesis := &core.Block{Header: hdr, Txs: txs}
+        chain := core.NewChain()
+        _ = chain.SetGenesis(genesis)
+
+        mp := core.NewMempool(core.DefaultMempoolConfig())
+        utxos := core.NewUTXOSet()
+        srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+
+        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPt, spendPt)
+        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions")
+        if code != http.StatusOK {
+                t.Errorf("status = %d, want 200", code)
+        }
+        txList, _ := resp["transactions"].([]interface{})
+        if len(txList) == 0 {
+                t.Fatal("expected at least 1 matching transaction for the coinbase output")
+        }
+        first, ok := txList[0].(map[string]interface{})
+        if !ok {
+                t.Fatalf("transaction entry is not an object: %T", txList[0])
+        }
+        if first["is_coinbase"] != true {
+                t.Errorf("is_coinbase = %v, want true — coinbase block-reward outputs must be flagged so the wallet filter can exclude them", first["is_coinbase"])
+        }
+}
+
 func TestREST_AddressTxs_MethodNotAllowed(t *testing.T) {
         srv, _ := buildChainServer(t, 0)
         wk, _ := crypto.GenerateWalletKeys()
