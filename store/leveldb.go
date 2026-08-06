@@ -44,6 +44,24 @@ func Open(path string) (*DB, error) {
         return &DB{db: db}, nil
 }
 
+// Recover opens a LevelDB database using RecoverFile, which rebuilds the
+// on-disk SST files from the WAL and MANIFEST.  Use this when the normal
+// Open fails or when a startup integrity check detects that a putSync write
+// is not surviving reopen (symptom: corrupted SST entry overrides WAL).
+// After Recover returns the DB is fully consistent and can be used normally.
+func Recover(path string) (*DB, error) {
+        opts := &opt.Options{
+                BlockCacheCapacity:     32 * opt.MiB,
+                WriteBuffer:            16 * opt.MiB,
+                CompactionTableSize:    4 * opt.MiB,
+        }
+        db, err := leveldb.RecoverFile(path, opts)
+        if err != nil {
+                return nil, fmt.Errorf("recover leveldb %s: %w", path, err)
+        }
+        return &DB{db: db}, nil
+}
+
 // Close closes the database.
 func (d *DB) Close() error { return d.db.Close() }
 
