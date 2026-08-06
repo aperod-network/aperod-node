@@ -175,6 +175,19 @@ type ConsensusConfig struct {
 	// validator_key is still loaded for API identity if specified, but is not
 	// passed to the consensus engine.
 	NonValidator bool `yaml:"non_validator"`
+
+	// StakingPoolNAPR is the total pre-allocated validator reward pool in nAPRO.
+	// When > 0, block rewards are drawn from this pool instead of minting new
+	// tokens, keeping Total Supply at 10 B during the pool phase.  After the
+	// pool is exhausted, tail_reward_napro is minted per block instead.
+	// Default: 200_000_000_000_000_000 (= 2 000 000 000 APRO × 10^8 nAPRO/APRO).
+	// Set to 0 to disable pool-based rewards and use the legacy mint schedule.
+	StakingPoolNAPR uint64 `yaml:"staking_pool_napro"`
+
+	// TailRewardNAPR is the per-block mint amount in nAPRO once the staking pool
+	// is exhausted.  Unlike pool rewards, tail rewards ARE minted (create new
+	// supply).  0 uses the default: 100_000_000 nAPRO = 1 APRO/block.
+	TailRewardNAPR uint64 `yaml:"tail_reward_napro"`
 }
 
 // APIConfig holds RPC/REST settings.
