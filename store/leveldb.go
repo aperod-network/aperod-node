@@ -333,6 +333,32 @@ func (d *DB) GetMeta(key string) ([]byte, error) {
         return d.get(k)
 }
 
+// ─── Staking pool ─────────────────────────────────────────────────────────────
+
+// StoreStakingPoolRemaining persists the remaining staking reward pool in nAPRO.
+// Called after every block accepted so the balance survives a restart.
+func (d *DB) StoreStakingPoolRemaining(napro uint64) error {
+        buf := make([]byte, 8)
+        binary.LittleEndian.PutUint64(buf, napro)
+        return d.PutMeta("staking_pool_remaining", buf)
+}
+
+// LoadStakingPoolRemaining returns the stored staking pool balance in nAPRO.
+// Returns (0, false, nil) if the value has never been stored (first boot with pool enabled).
+func (d *DB) LoadStakingPoolRemaining() (napro uint64, found bool, err error) {
+        v, err := d.GetMeta("staking_pool_remaining")
+        if err != nil {
+                return 0, false, err
+        }
+        if v == nil {
+                return 0, false, nil
+        }
+        if len(v) != 8 {
+                return 0, false, fmt.Errorf("store: staking_pool_remaining corrupted (%d bytes, want 8)", len(v))
+        }
+        return binary.LittleEndian.Uint64(v), true, nil
+}
+
 // StoreTxTotal persists the cumulative non-coinbase transaction count as a
 // metadata value so the API server can restore the counter after a restart
 // without scanning all blocks.
