@@ -53,6 +53,12 @@ func (d *DB) put(key, val []byte) error {
         return d.db.Put(key, val, nil)
 }
 
+// putSync writes key/val with fsync so the entry survives a subsequent
+// process kill before a normal db.Close().  Use for critical repairs.
+func (d *DB) putSync(key, val []byte) error {
+        return d.db.Put(key, val, &opt.WriteOptions{Sync: true})
+}
+
 func (d *DB) get(key []byte) ([]byte, error) {
         val, err := d.db.Get(key, nil)
         if err == leveldb.ErrNotFound {
@@ -431,8 +437,10 @@ func (d *DB) GetRawBlock(hash crypto.Hash32) ([]byte, error) {
 // the supplied hash.  Use this to correct a zeroed or missing height-index
 // entry that was detected by the startup integrity check; the block data
 // (stored under its hash key) is left untouched.
+// putSync is used so the write is fsynced before returning — this guarantees
+// persistence even if the process is killed immediately after the call.
 func (d *DB) RepairHeightIndex(height uint64, hash crypto.Hash32) error {
-        return d.put(heightKey(height), hash[:])
+        return d.putSync(heightKey(height), hash[:])
 }
 
 // GetRawBlockByHeight returns the raw bytes for the canonical block at height h.
