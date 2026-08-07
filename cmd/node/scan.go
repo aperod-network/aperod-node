@@ -45,6 +45,13 @@ type startupScanParams struct {
 	// StakeBlockHeights are fetched for registry replay.
 	UTXOFromIndex     bool
 	StakeBlockHeights []uint64 // heights of blocks that contain stake txs (ascending)
+
+	// ResumeScanFrom, when non-zero, causes runStartupScan to start the
+	// block loop at ResumeScanFrom+1 instead of searching for a partial
+	// intermediate checkpoint.  Set this when the caller has already
+	// pre-seeded the UTXOSet and key-image set from a rescue snapshot so
+	// that only blocks after that snapshot height need processing.
+	ResumeScanFrom uint64
 	Log         *slog.Logger
 
 	// UTXOCountTolerancePct is the maximum allowed percentage difference
@@ -171,7 +178,17 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	// from it means we only need to replay blocks since that checkpoint.
 	scanFrom := uint64(1)
 	txTotal := p.InitTxTotal
-	if partial := findLatestSnapshot(p.DataDir, p.TipHeight, p.Log); partial != nil {
+	if p.ResumeScanFrom > 0 {
+		// Caller pre-seeded UTXOSet + key-image set from a rescue snapshot.
+		// Start the block loop immediately after that snapshot's tip height.
+		// Skip findLatestSnapshot: the rescue snapshot IS the checkpoint.
+		scanFrom = p.ResumeScanFrom + 1
+		p.Log.Info("scan resuming after rescue snapshot",
+			"resume_from", scanFrom,
+			"tip_height", p.TipHeight,
+			"blocks_to_scan", p.TipHeight-p.ResumeScanFrom,
+		)
+	} else if partial := findLatestSnapshot(p.DataDir, p.TipHeight, p.Log); partial != nil {
 		// Cross-check: verify the snapshot's recorded TipHashHex against the
 		// actual block stored in the DB at that height.  A mismatch means the
 		// block was reorganised (e.g. in dev/test) after the checkpoint was
