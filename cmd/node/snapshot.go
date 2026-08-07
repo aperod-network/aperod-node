@@ -164,16 +164,28 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	path := snapshotPath(dataDir, snap.TipHeight)
 	tmp := path + ".tmp"
 
-	// Copy the current primary snapshot to a "-prev.json.gz" backup before
-	// overwriting it (best-effort). This covers two cases:
-	//   • different-height replacement — new tip, old primary backed up
-	//   • same-height overwrite — e.g. shutdown snapshot taken at the same tip
-	//     as the last periodic checkpoint; the existing file is backed up before
-	//     the in-place overwrite.
-	// If the copy fails the original primary remains on disk and the save
-	// proceeds normally (no worse than the pre-backup behaviour).
-	// The prev file is consulted by loadStartupSnapshotWithFallback when the
-	// primary is corrupt or unreadable, enabling automatic recovery at startup.
+	// Same-height overwrite guard: when a primary already exists at this exact
+	// height (e.g. shutdown snapshot taken at the same tip as the last periodic
+	// checkpoint), copy the EXISTING PRIMARY to its "-prev.json.gz" backup
+	// BEFORE writing the new tmp.  A failure here aborts the save so the
+	// original primary is left intact and the node can recover on its next start.
+	//
+	// When no primary exists at this height yet (first checkpoint save at this
+	// height during a genesis scan), skip the copy entirely — there is nothing
+	// to preserve.  The previous code attempted an unconditional copy from the
+	// tmp file at this point, which failed with "no such file or directory" on
+	// every first-time checkpoint because no prior backup source existed,
+	// forcing a full rescan after any crash mid genesis scan.
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := copyFile(path, snapshotPrevPath(path)); err != nil {
+			return fmt.Errorf("write same-height prev backup: %w", err)
+		}
+	}
+
+	// Best-effort: copy any existing primary at a DIFFERENT height to its own
+	// prev backup so older checkpoints get a recovery floor before being
+	// superseded.  Errors are ignored — the old primary remains on disk
+	// regardless, so this step is strictly additive.
 	if entries, err := os.ReadDir(dataDir); err == nil {
 		prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
 		for _, e := range entries {
@@ -188,8 +200,11 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 				continue
 			}
 			full := filepath.Join(dataDir, name)
+			if full == path {
+				continue // same height already handled by the guard above
+			}
 			_ = copyFile(full, snapshotPrevPath(full))
-			break // only one primary should exist at a time
+			break // only one other primary should exist at a time
 		}
 	}
 
@@ -213,17 +228,6 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	if fCloseErr != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("close snapshot tmp: %w", fCloseErr)
-	}
-
-	// Write a same-height "-prev.json.gz" backup from the validated tmp content
-	// before promoting tmp to the primary.  This is a required precondition: if
-	// the copy fails we abort the save (remove tmp and return the error) so the
-	// caller's old primary — if any — is left intact and the node can still
-	// recover on its next start.  Silently skipping this step would leave the
-	// fallback absent on the very failure modes where recovery matters most.
-	if err := copyFile(tmp, snapshotPrevPath(path)); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("write same-height prev backup: %w", err)
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
