@@ -21,7 +21,7 @@
 #    5.  Custom GOMEMLIMIT_BYTES env override is respected (auto path skipped).
 #    6.  Auto-computed value is clamped to MIN_GOMEMLIMIT (1.5 GiB) when total
 #        RAM is tiny — exercised via a fake /proc/meminfo seam.
-#    7.  Auto-computed value is clamped to MAX_GOMEMLIMIT (5500 MiB) when
+#    7.  Auto-computed value is clamped to MAX_GOMEMLIMIT (6500 MiB) when
 #        total RAM is huge — same seam.
 #    8.  Static analysis: the drop-in creation block still exists in
 #        install-node.sh (guards against silent removal in a refactor).
@@ -212,14 +212,14 @@ else
 fi
 
 # =============================================================================
-# Test 4: TimeoutStopSec=900 is present
+# Test 4: TimeoutStopSec is NOT in gomemlimit.conf (moved to timeout.conf)
 # =============================================================================
-section "Test 4: TimeoutStopSec=900 is present in the generated drop-in"
+section "Test 4: TimeoutStopSec is NOT in gomemlimit.conf (lives in timeout.conf now)"
 
-if grep -q "^TimeoutStopSec=900$" "$T1_DROPIN" 2>/dev/null; then
-  pass "TimeoutStopSec=900 found"
+if grep -q "^TimeoutStopSec=" "$T1_DROPIN" 2>/dev/null; then
+  fail "TimeoutStopSec found in gomemlimit.conf — it should live in timeout.conf only"
 else
-  fail "TimeoutStopSec=900 NOT found (content: $(cat "$T1_DROPIN" 2>/dev/null || echo '<missing>'))"
+  pass "TimeoutStopSec is absent from gomemlimit.conf (correct — belongs in timeout.conf)"
 fi
 
 # =============================================================================
@@ -265,17 +265,17 @@ else
 fi
 
 # =============================================================================
-# Test 7: real computation block clamps to MAX (5500 MiB) for large RAM
+# Test 7: real computation block clamps to MAX (6500 MiB) for large RAM
 # =============================================================================
-section "Test 7: real installer computation clamps to MAX_GOMEMLIMIT (5500 MiB) for large RAM"
+section "Test 7: real installer computation clamps to MAX_GOMEMLIMIT (6500 MiB) for large RAM"
 
-LARGE_RAM_KB=$(( 64 * 1024 * 1024 ))   # 64 GiB → 75% = 48 GiB >> 5500 MiB
-MAX_EXPECTED=5905580032
+LARGE_RAM_KB=$(( 64 * 1024 * 1024 ))   # 64 GiB → 75% = 48 GiB >> 6500 MiB
+MAX_EXPECTED=6979321856
 
 CLAMPED_MAX=$(run_real_clamping_computation "$LARGE_RAM_KB" 2>/dev/null)
 
 if [[ "$CLAMPED_MAX" -eq "$MAX_EXPECTED" ]]; then
-  pass "installer computation clamped to MAX=${MAX_EXPECTED} for 64 GiB host (got: $CLAMPED_MAX)"
+  pass "installer computation clamped to MAX=${MAX_EXPECTED} for 64 GiB host (got: $CLAMPED_MAX)"  # 6500 MiB
 else
   fail "expected MAX clamp=${MAX_EXPECTED}, got '$CLAMPED_MAX'"
 fi
@@ -285,7 +285,7 @@ T7_DROPIN="$T7_DIR/gomemlimit.conf"
 run_real_dropin_block "$T7_DIR" "$CLAMPED_MAX" >/dev/null 2>&1
 
 if grep -q "^Environment=\"GOMEMLIMIT=${MAX_EXPECTED}\"$" "$T7_DROPIN" 2>/dev/null; then
-  pass "MAX-clamped value ${MAX_EXPECTED} written to drop-in"
+  pass "MAX-clamped value ${MAX_EXPECTED} written to drop-in"  # 6500 MiB
 else
   fail "MAX-clamped value ${MAX_EXPECTED} NOT found in drop-in"
 fi
@@ -293,7 +293,7 @@ fi
 # =============================================================================
 # Test 8: static analysis — drop-in creation block still exists in install-node.sh
 # =============================================================================
-section "Test 8: static analysis — drop-in block still present in install-node.sh"
+section "Test 8: static analysis — drop-in blocks still present in install-node.sh"
 
 if awk '/# ── 10b\. GOMEMLIMIT drop-in/{f=1} f{print} /^ok.*GOMEMLIMIT drop-in/{f=0}' "$INSTALL_SH" | \
     grep -q 'GOMEMLIMIT'; then
@@ -320,15 +320,95 @@ else
   fail "aperod-node.service.d NOT referenced in install-node.sh"
 fi
 
+# Static check: 10c block exists
+if awk '/# ── 10c\. TimeoutStopSec drop-in/{f=1} f{print} /^ok.*[Tt]imeout/{f=0}' "$INSTALL_SH" | \
+    grep -q 'timeout.conf'; then
+  pass "timeout.conf drop-in block (10c) extractable from install-node.sh"
+else
+  fail "timeout.conf drop-in block (10c) NOT extractable — it may have been renamed or removed"
+fi
+
 # =============================================================================
 # Test 9: install path comment in generated file matches real service drop-in path
 # =============================================================================
 section "Test 9: install-path comment in generated drop-in is correct"
 
 if grep -q "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf" "$T1_DROPIN" 2>/dev/null; then
-  pass "drop-in contains the correct install-path comment"
+  pass "gomemlimit.conf drop-in contains the correct install-path comment"
 else
-  fail "install-path comment NOT found in drop-in (content: $(cat "$T1_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "install-path comment NOT found in gomemlimit.conf drop-in (content: $(cat "$T1_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 10: timeout.conf drop-in is created with correct content
+# =============================================================================
+section "Test 10: timeout.conf drop-in is created by installer 10c block"
+
+# ---------------------------------------------------------------------------
+# run_real_timeout_block DROPIN_DIR
+#
+#   Extracts the timeout.conf creation block (10c) from install-node.sh and
+#   runs it against a controlled temp dir.
+# ---------------------------------------------------------------------------
+run_real_timeout_block() {
+  local dropin_dir="$1"
+
+  local fake_sc_log="$TMPDIR_TEST/sc-timeout.log"
+  local fake_sc_dir
+  fake_sc_dir=$(make_fake_bin "systemctl" "$fake_sc_log")
+
+  local block
+  block=$(awk '/# ── 10c\. TimeoutStopSec drop-in/{f=1} f{print} /^ok.*[Tt]imeout/{f=0}' "$INSTALL_SH")
+
+  if [[ -z "$block" ]]; then
+    echo "[ERR] Could not extract timeout.conf block from $INSTALL_SH" >&2
+    return 1
+  fi
+
+  # The 10c block uses DROPIN_DIR set by the 10b block; inject it directly
+  # since we're running the block in isolation.
+  PATH="$fake_sc_dir:$PATH" \
+  DROPIN_DIR="$dropin_dir" \
+  bash -s <<RUNNER
+set -euo pipefail
+ok()   { echo "[OK]   \$*"; }
+info() { echo "[INFO] \$*"; }
+DROPIN_DIR="${dropin_dir}"
+${block}
+RUNNER
+}
+
+T10_DIR=$(mktemp -d "$TMPDIR_TEST/t10-XXXXXXXX")
+T10_DROPIN="$T10_DIR/timeout.conf"
+
+if run_real_timeout_block "$T10_DIR" >/dev/null 2>&1; then
+  :
+else
+  fail "run_real_timeout_block exited non-zero"
+fi
+
+if [[ -f "$T10_DROPIN" ]]; then
+  pass "timeout.conf was created at $T10_DROPIN"
+else
+  fail "timeout.conf was NOT created at $T10_DROPIN"
+fi
+
+if grep -q "^\[Service\]$" "$T10_DROPIN" 2>/dev/null; then
+  pass "[Service] section header found in timeout.conf"
+else
+  fail "[Service] section header NOT found in timeout.conf (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T10_DROPIN" 2>/dev/null; then
+  pass "TimeoutStopSec=900 found in timeout.conf"
+else
+  fail "TimeoutStopSec=900 NOT found in timeout.conf (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q "/etc/systemd/system/aperod-node.service.d/timeout.conf" "$T10_DROPIN" 2>/dev/null; then
+  pass "timeout.conf contains the correct install-path comment"
+else
+  fail "install-path comment NOT found in timeout.conf (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
 # =============================================================================
