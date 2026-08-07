@@ -322,6 +322,52 @@ echo "==> [1/5] Pulling latest source as aperod..."
 sudo -u aperod git -C "$APEROD_DIR" pull
 
 # ---------------------------------------------------------------------------
+# Step 1a: Warn if node.yaml still carries dangerous ban-threshold defaults.
+#
+# Production nodes manually fixed to bad_block_ban_threshold=5 /
+# bad_block_height_lead=1000 in August 2026.  The install template now ships
+# those safe values, but operators who cloned before the fix may still have
+# the old permissive values (999 / 9999999) in their live node.yaml.
+# Those values effectively disable rogue-peer protection.
+#
+# The check is non-fatal — it never blocks an upgrade — but it prints a
+# prominent warning and sends a Telegram alert so the operator is not left
+# unknowingly unprotected.
+# ---------------------------------------------------------------------------
+NODE_YAML="${APEROD_DIR}/blockchain/node.yaml"
+if [[ -f "${NODE_YAML}" ]]; then
+  _ban_warn=false
+  _ban_threshold=$(grep -E '^[[:space:]]*bad_block_ban_threshold:' "${NODE_YAML}" 2>/dev/null | head -1 | awk -F: '{print $2}' | tr -d '[:space:]' || true)
+  _height_lead=$(grep -E '^[[:space:]]*bad_block_height_lead:' "${NODE_YAML}" 2>/dev/null | head -1 | awk -F: '{print $2}' | tr -d '[:space:]' || true)
+
+  # Dangerous values that were shipped before the August 2026 fix.
+  if [[ "${_ban_threshold}" == "999" || "${_height_lead}" == "9999999" ]]; then
+    _ban_warn=true
+  fi
+
+  if [[ "${_ban_warn}" == "true" ]]; then
+    echo ""
+    echo "⚠️  WARNING: ${NODE_YAML} has dangerous rogue-peer ban values:" >&2
+    [[ "${_ban_threshold}" == "999"     ]] && echo "     bad_block_ban_threshold: 999  (safe default: 5)"       >&2
+    [[ "${_height_lead}"   == "9999999" ]] && echo "     bad_block_height_lead:   9999999  (safe default: 1000)" >&2
+    echo "   These values effectively disable wrong-fork peer protection." >&2
+    echo "   Edit ${NODE_YAML} and set:" >&2
+    echo "     bad_block_ban_threshold: 5" >&2
+    echo "     bad_block_height_lead: 1000" >&2
+    echo "   Then restart the node for the change to take effect." >&2
+    echo ""
+    send_telegram_alert "⚠️ <b>aperod-node: dangerous ban defaults detected</b>
+Server: $(hostname)
+<code>${NODE_YAML}</code> still has the pre-August-2026 permissive values:
+bad_block_ban_threshold=${_ban_threshold:-&lt;not set&gt;}  (safe: 5)
+bad_block_height_lead=${_height_lead:-&lt;not set&gt;}  (safe: 1000)
+These disable rogue-peer protection. Edit node.yaml and restart the node."
+  else
+    echo "  [ok] node.yaml ban thresholds look safe (bad_block_ban_threshold=${_ban_threshold:-default}, bad_block_height_lead=${_height_lead:-default})."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1b: Keep /usr/local/bin/aperod_backup.sh in sync with the repo.
 #
 # setup-backup.sh installs the script once and never updates it again.
