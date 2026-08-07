@@ -645,8 +645,10 @@ func TestREST_AddressUTXOs_SpentRemoved(t *testing.T) {
                 t.Fatalf("pre-spend utxos = %d, want 1", len(beforeList))
         }
 
-        // Spend the UTXO (remove from set)
+        // Spend the UTXO (remove from set) and flush the response cache so the
+        // next request sees the updated UTXO set rather than the cached entry.
         utxos.Remove(txHash, 0)
+        srv.FlushUTXOCache()
 
         // Confirm it is gone
         code, after := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
@@ -826,9 +828,11 @@ func TestREST_AddressUTXOs_RollbackTransparent(t *testing.T) {
 	}
 
 	// Roll back the block — the output must disappear from the UTXO listing.
+	// Flush the response cache so the handler re-scans the live set.
 	if err := utxos.RollbackBlock(block); err != nil {
 		t.Fatalf("RollbackBlock: %v", err)
 	}
+	srv.FlushUTXOCache()
 	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
 	if code2 != http.StatusOK {
 		t.Fatalf("post-rollback: status = %d, want 200", code2)
@@ -899,9 +903,11 @@ func TestREST_AddressUTXOs_RollbackCoinbase(t *testing.T) {
 	}
 
 	// Roll back the block — the mint output must disappear from the UTXO listing.
+	// Flush the response cache so the handler re-scans the live set.
 	if err := utxos.RollbackBlock(block); err != nil {
 		t.Fatalf("RollbackBlock: %v", err)
 	}
+	srv.FlushUTXOCache()
 	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
 	if code2 != http.StatusOK {
 		t.Fatalf("post-rollback: status = %d, want 200", code2)
@@ -909,6 +915,89 @@ func TestREST_AddressUTXOs_RollbackCoinbase(t *testing.T) {
 	list2, _ := resp2["utxos"].([]interface{})
 	if len(list2) != 0 {
 		t.Errorf("post-rollback: utxos = %d, want 0 (rolled-back coinbase UTXO must not appear in listing)", len(list2))
+	}
+}
+
+// TestREST_AddressScan_IsCoinbaseFlagged verifies that POST /api/v1/address/{addr}/scan
+// sets is_coinbase=true on coinbase (height-offset mint) outputs and is_coinbase=false
+// on stealth outputs discovered by the view key.
+func TestREST_AddressScan_IsCoinbaseFlagged(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+	// Coinbase (mint) output: OneTimePub = spendPub + height*G
+	const mintHeight = uint64(12)
+	heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(mintHeight))
+	if err != nil {
+		t.Fatalf("ScalarMulBase: %v", err)
+	}
+	mintPub, err := crypto.AddPoints(wk.Spend.Public, heightPub)
+	if err != nil {
+		t.Fatalf("AddPoints: %v", err)
+	}
+	var coinbaseTxHash crypto.Hash32
+	coinbaseTxHash[0] = 0xC0
+	utxos.Add(&core.UTXO{
+		TxHash:      coinbaseTxHash,
+		OutputIndex: 0,
+		OneTimePub:  mintPub,
+		BlockHeight: mintHeight,
+	})
+
+	// Stealth output sent to this wallet: discovered via view key.
+	stealthOut, err := crypto.CreateStealthOutput(wk.Spend.Public, wk.View.Public)
+	if err != nil {
+		t.Fatalf("CreateStealthOutput: %v", err)
+	}
+	const stealthAmt = uint64(100_000_000)
+	encAmt := core.EncryptAmount(stealthAmt, &stealthOut.HsScalar)
+	var stealthTxHash crypto.Hash32
+	stealthTxHash[0] = 0x5C
+	utxos.Add(&core.UTXO{
+		TxHash:      stealthTxHash,
+		OutputIndex: 0,
+		OneTimePub:  stealthOut.OneTimePub,
+		TxPubKey:    stealthOut.TxPubKey,
+		EncAmount:   encAmt,
+		BlockHeight: 1,
+	})
+
+	viewKeyHex := hex.EncodeToString(wk.View.Private[:])
+	body := `{"view_key_hex":"` + viewKeyHex + `"}`
+	code, resp := restPostJSON(t, srv, "/api/v1/address/"+string(addr)+"/scan", []byte(body))
+	if code != http.StatusOK {
+		t.Fatalf("POST /scan status = %d, want 200: %v", code, resp)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 2 {
+		t.Fatalf("utxos count = %d, want 2 (coinbase + stealth)", len(list))
+	}
+
+	byHash := make(map[string]map[string]interface{}, 2)
+	for _, raw := range list {
+		e := raw.(map[string]interface{})
+		byHash[e["tx_hash"].(string)] = e
+	}
+
+	coinbaseEntry, ok := byHash[hex.EncodeToString(coinbaseTxHash[:])]
+	if !ok {
+		t.Fatal("coinbase UTXO not present in scan response")
+	}
+	if coinbaseEntry["is_coinbase"] != true {
+		t.Errorf("coinbase UTXO: is_coinbase = %v, want true", coinbaseEntry["is_coinbase"])
+	}
+
+	stealthEntry, ok := byHash[hex.EncodeToString(stealthTxHash[:])]
+	if !ok {
+		t.Fatal("stealth UTXO not present in scan response")
+	}
+	if stealthEntry["is_coinbase"] != false {
+		t.Errorf("stealth UTXO: is_coinbase = %v, want false", stealthEntry["is_coinbase"])
 	}
 }
 
