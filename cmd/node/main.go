@@ -912,6 +912,30 @@ func run() error {
                                 }()
                         }
 
+                        // Persist spent key images and stake-block heights for every
+                        // accepted canonical block.  OnBlockProduced does the same for
+                        // locally-produced blocks; this call covers blocks received via
+                        // P2P sync so that pure relay/sync nodes also populate the DB
+                        // indexes required by the fast-path startup (IterKeyImages /
+                        // HasStakeBlockIndex).  Non-fatal — the block is already committed.
+                        for _, tx := range block.Txs {
+                                for _, inp := range tx.Inputs {
+                                        if kiErr := db.MarkKeyImageSpent(inp.KeyImage); kiErr != nil {
+                                                log.Warn("failed to index key image",
+                                                        "height", h, "err", kiErr)
+                                        }
+                                }
+                        }
+                        for _, tx := range block.Txs {
+                                if tx.IsStake() {
+                                        if sbErr := db.PutStakeBlockHeight(h); sbErr != nil {
+                                                log.Warn("failed to index stake block",
+                                                        "height", h, "err", sbErr)
+                                        }
+                                        break
+                                }
+                        }
+
                         interval := cfg.Snapshot.PeriodicSnapshotInterval
                         // interval == 0 means periodic snapshots are disabled (shutdown-only).
                         if interval == 0 || h == 0 || h%interval != 0 {
