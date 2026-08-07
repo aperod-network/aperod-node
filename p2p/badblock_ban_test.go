@@ -895,5 +895,121 @@ func TestWhitelistSidecar_UnreadableAbortsStart(t *testing.T) {
 	t.Logf("Start() correctly returned error for unreadable sidecar: %v", err)
 }
 
+// ─── Test: whitelisted peer passes the inbound-IP gate after a restart ────────
+
+// TestWhitelistInboundGate_AllowsAfterRestart is the regression test for the
+// scenario where the acceptLoop drops a trusted validator because the sidecar
+// whitelist is loaded too late or not at all after a node restart.
+//
+// Unlike TestBadBlockBan_WhitelistPersistsAcrossRestart (which tests the
+// bad-block strike exemption), this test targets the acceptLoop IP gate:
+//
+//	acceptLoop checks wlNets/wlIPs and drops any inbound connection whose
+//	source IP is absent — before any handshake occurs.
+//
+// Sequence:
+//  1. Start Host1 with PeerWhitelist=["127.0.0.1"] + WhitelistFile.
+//     On Start() the sidecar is seeded from cfg.PeerWhitelist.
+//  2. Stop Host1 (simulating a node restart).
+//  3. Start Host2 with an EMPTY cfg.PeerWhitelist but the SAME WhitelistFile.
+//     loadWhitelistFromFile() must populate wlNets/wlIPs from the sidecar so
+//     that the acceptLoop gate allows 127.0.0.1 through.
+//  4. Dial the host and complete the Ping/Pong handshake.
+//  5. Assert PeerCount reaches 1 — the peer was not dropped at the accept gate.
+//
+// If the sidecar is ignored (regression), acceptLoop sees a non-empty wlNets/wlIPs
+// set (because the whitelist is empty and the gate is a no-op) — wait, actually
+// it sees an EMPTY whitelist meaning all IPs are allowed.  But then if somehow
+// the gate stays non-empty and the IP is absent, the peer is dropped.
+// The real regression scenario: wlNets and wlIPs remain as parsed from
+// cfg.PeerWhitelist (which is empty), so the gate is bypassed entirely — which
+// would PASS this test.  The meaningful regression is the opposite: loadWhitelistFromFile
+// runs but overwrites wlNets/wlIPs with the sidecar, correctly whitelisting 127.0.0.1.
+// We verify the peer actually connects (PeerCount==1) to confirm the sidecar was
+// loaded and the gate allowed the connection rather than silently dropping it.
+func TestWhitelistInboundGate_AllowsAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// ── Phase 1: first boot seeds the sidecar ───────────────────────────────
+
+	h1 := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-gate-restart-1",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{"127.0.0.1"},
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h1.Start(); err != nil {
+		t.Fatalf("h1.Start: %v", err)
+	}
+
+	// Verify the sidecar was written: 127.0.0.1 must appear in the whitelist.
+	wl1 := h1.GetPeerWhitelist()
+	found := false
+	for _, e := range wl1 {
+		if e == "127.0.0.1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		h1.Stop()
+		t.Fatalf("h1: 127.0.0.1 not in peer whitelist after Start(); got: %v", wl1)
+	}
+	t.Logf("h1: whitelist seeded and sidecar written: %v → %s", wl1, wlFile)
+
+	h1.Stop()
+
+	// ── Phase 2: simulated restart — only WhitelistFile, no cfg.PeerWhitelist ─
+
+	h2 := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "test-gate-restart-2",
+		UserAgent:  "aperod/test",
+		// Deliberately omit PeerWhitelist: the sidecar is the sole source of truth.
+		// If loadWhitelistFromFile() is broken, wlNets/wlIPs stay nil (open network)
+		// and the gate lets anyone in — the PeerCount==1 assertion still passes, but
+		// GetPeerWhitelist() will be empty, exposing the regression.
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h2.Start(); err != nil {
+		t.Fatalf("h2.Start (simulated restart): %v", err)
+	}
+	defer h2.Stop()
+
+	// The sidecar must have been loaded: 127.0.0.1 must be in the active whitelist.
+	wl2 := h2.GetPeerWhitelist()
+	sidecarLoaded := false
+	for _, e := range wl2 {
+		if e == "127.0.0.1" {
+			sidecarLoaded = true
+			break
+		}
+	}
+	if !sidecarLoaded {
+		t.Fatalf("h2 (post-restart): sidecar not loaded — 127.0.0.1 absent from whitelist; got: %v", wl2)
+	}
+	t.Logf("h2 (post-restart): whitelist loaded from sidecar: %v", wl2)
+
+	// Dial from 127.0.0.1 and complete the Ping/Pong handshake.
+	// If the acceptLoop gate drops the connection before the handshake, the
+	// MsgPong read will fail and the test will report the regression.
+	conn, peerIP := connectPeer(t, h2.ListenAddr())
+	defer conn.Close()
+
+	// PeerCount must reach 1: the whitelisted peer passed the inbound-IP gate
+	// and completed the handshake.
+	if !waitFor(500*time.Millisecond, func() bool { return h2.PeerCount() == 1 }) {
+		t.Fatalf("h2 (post-restart): peer %s did not register after handshake — "+
+			"likely dropped by the inbound-IP gate (sidecar whitelist not applied)", peerIP)
+	}
+	t.Logf("h2 (post-restart): peer %s connected successfully — inbound-IP gate allowed whitelisted peer", peerIP)
+}
+
 // Keep the import used via fmt.Sprintf in future tests.
 var _ = fmt.Sprintf
