@@ -264,7 +264,7 @@ func DefaultConfig() *Config {
 		},
 		Snapshot: SnapshotConfig{
 			UTXOCountTolerancePct:    1.0,
-			PeriodicSnapshotInterval: 10_000,
+			PeriodicSnapshotInterval: 500,
 			ScanCheckpointInterval:   50_000,
 		},
 		Pprof: PprofConfig{
