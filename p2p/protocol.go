@@ -37,11 +37,16 @@ const MaxMessageSize = 10 * 1024 * 1024
 const DialTimeout = 5 * time.Second
 
 // ReadTimeout for incoming messages.
-// ReadTimeout for incoming messages — tight to prevent Slowloris-style stalls.
-const ReadTimeout = 5 * time.Second
+// 30 s gives peers enough headroom to survive network jitter, a brief block
+// gap, or a short maintenance window without being disconnected.  The
+// keepalive goroutine in host.go sends a MsgPing every 10 s, so the deadline
+// is renewed well before it would fire during normal idle operation.
+// Slowloris-style stalls are still capped by the header read deadline applied
+// inside ReadMsg itself.
+const ReadTimeout = 30 * time.Second
 
 // WriteTimeout for outbound writes — prevents a slow peer from blocking the goroutine.
-const WriteTimeout = 5 * time.Second
+const WriteTimeout = 10 * time.Second
 
 // Envelope wraps every network message with a type tag and length-prefixed body.
 type Envelope struct {

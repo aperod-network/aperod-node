@@ -171,6 +171,13 @@ type P2PConfig struct {
 	// defaults to <data_dir>/p2p_whitelist.json.  Set to "-" to disable
 	// persistence (whitelist changes via Admin Panel are lost on restart).
 	WhitelistFile string `yaml:"whitelist_file"`
+	// KeepaliveInterval is how often the keepalive goroutine sends a MsgPing
+	// to each connected peer.  The peer's ReadTimeout (30 s) must never fire
+	// due to silence from our side; the interval must therefore be well below
+	// ReadTimeout.  Allowed range: [1s, 15s].  Default: 10s (0 = use default).
+	// Operators on high-latency links may lower this value; operators on fast
+	// LANs may raise it to reduce traffic.
+	KeepaliveInterval time.Duration `yaml:"keepalive_interval"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -391,6 +398,20 @@ func (c *Config) Validate() error {
 			"p2p.bad_block_height_lead (%d) exceeds the safe maximum of %d — "+
 				"values this large can overflow the tip+lead comparison and disable the rogue-fork ban",
 			c.P2P.BadBlockHeightLead, maxSafeHeightLead,
+		)
+	}
+	// KeepaliveInterval validation.  Zero means "use the built-in default (10s)"
+	// so it is accepted without complaint.  Explicit values must be in [1s, 15s]:
+	//   • < 1s would flood slow peers with pings and may saturate a CPU core.
+	//   • > 15s (ReadTimeout/2 = 15s) risks the peer's 30s ReadTimeout firing
+	//     during a quiet period before the next ping is sent.
+	const keepaliveMin = 1 * time.Second
+	const keepaliveMax = 15 * time.Second // ReadTimeout / 2
+	if c.P2P.KeepaliveInterval != 0 && (c.P2P.KeepaliveInterval < keepaliveMin || c.P2P.KeepaliveInterval > keepaliveMax) {
+		return fmt.Errorf(
+			"p2p.keepalive_interval (%v) is out of the allowed range [%v, %v] — "+
+				"values shorter than 1s flood peers; values longer than 15s risk the peer's 30s ReadTimeout firing; use 0 for the default (10s)",
+			c.P2P.KeepaliveInterval, keepaliveMin, keepaliveMax,
 		)
 	}
 	if c.Pprof.Enabled {

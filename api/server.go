@@ -118,6 +118,12 @@ type Server struct {
         // loadRecentBlocksFromStore; 0 means no gaps detected.
         storeMissingBlocks int64
 
+        // storeMissingFirstBlock and storeMissingLastBlock are the lowest and
+        // highest heights at which missing blocks were detected during the startup
+        // window scan. Both are 0 when storeMissingBlocks is 0.
+        storeMissingFirstBlock int64
+        storeMissingLastBlock  int64
+
         // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
         // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
         // for each admin-mint address; without caching each call does an O(n)
@@ -320,7 +326,9 @@ func (s *Server) TimestampRejectedCount() int64 {
 // in-memory window that had no block in the LevelDB store.
 // Call once after loadRecentBlocksFromStore completes in cmd/node.
 // 0 means no gaps were detected.
-func (s *Server) SetStoreMissingBlocks(n int64) { atomic.StoreInt64(&s.storeMissingBlocks, n) }
+func (s *Server) SetStoreMissingBlocks(n int64)      { atomic.StoreInt64(&s.storeMissingBlocks, n) }
+func (s *Server) SetStoreMissingFirstBlock(n int64)  { atomic.StoreInt64(&s.storeMissingFirstBlock, n) }
+func (s *Server) SetStoreMissingLastBlock(n int64)   { atomic.StoreInt64(&s.storeMissingLastBlock, n) }
 
 // SetTxTotal sets the initial total non-coinbase tx count (call once after
 // loading the chain from disk to avoid an O(n) scan on every stats request).

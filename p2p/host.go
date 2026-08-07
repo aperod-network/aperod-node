@@ -1548,6 +1548,15 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         }
                         h.mu.Unlock()
                 }
+                // If the peer is ahead of us, re-trigger header sync.  This self-heals
+                // the case where the initial requestHeaders fired during the UTXO-rebuild
+                // window (when AddBlock silently rejects incoming blocks because UTXO
+                // queries are not yet enabled).  On the next keepalive Pong the node
+                // detects the height gap and restarts the sync pipeline automatically,
+                // without requiring a manual restart.
+                if msg.Height > h.handler.CurrentHeight() {
+                        h.requestHeaders(peer)
+                }
                 return nil
 
         case MsgGetHeaders:

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
 )
 
@@ -299,6 +300,11 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	kiCount    := 0     // only used when !KiFromIndex
 	utxoCount  := uint64(0) // cumulative output count; drives periodic GC
 
+	// observedProducers collects every distinct ValidatorPub seen in block headers
+	// during this scan.  Used below to seed the registry when the partial snapshot
+	// pre-dates registry snapshotting and no stake txs appear in the scanned range.
+	observedProducers := make(map[string]crypto.ValidatorPubKey)
+
 	for h := scanFrom; h <= p.TipHeight; h++ {
 		if p.SetSyncProgress != nil && h%syncProgressInterval == 0 {
 			p.SetSyncProgress(h, p.TipHeight)
@@ -328,6 +334,18 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				"startup scan: cannot decode block at height %d: %w — "+
 					"node cannot start safely; repair the store and restart",
 				h, parseErr)
+		}
+
+		// Track block producer pubkeys so we can seed the registry later if
+		// the scanned range contained no stake transactions (e.g. a relay node
+		// bootstrapped from a partial snapshot that pre-dates registry snapshotting).
+		if len(b.Header.ValidatorPub) > 0 {
+			key := fmt.Sprintf("%x", []byte(b.Header.ValidatorPub))
+			if _, seen := observedProducers[key]; !seen {
+				pub := make(crypto.ValidatorPubKey, len(b.Header.ValidatorPub))
+				copy(pub, b.Header.ValidatorPub)
+				observedProducers[key] = pub
+			}
 		}
 
 		// Goal 2: rebuild the active UTXO set.
@@ -473,6 +491,34 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			"total_registered", total,
 			"unspent_outputs", p.UTXOs.Count(),
 		)
+
+		// ── Observed-producer fallback ────────────────────────────────────────
+		// If the scan found no active validators (the partial snapshot pre-dates
+		// registry snapshotting and the scanned range had no stake transactions),
+		// but we did observe block producers in the headers, seed those pubkeys as
+		// Active so the consensus engine does not fall back to the genesis zero-key
+		// and reject every incoming block as "block from unknown validator".
+		//
+		// We use MinStakeNAPR×10 as the seed stake — large enough that these
+		// entries survive any epoch churn until a real stake transaction is seen,
+		// but they will be overwritten/extended by genuine stake data on the next
+		// full scan or once a stake tx arrives.
+		if active == 0 && len(observedProducers) > 0 {
+			seedPubs := make([]crypto.ValidatorPubKey, 0, len(observedProducers))
+			for _, pub := range observedProducers {
+				seedPubs = append(seedPubs, pub)
+			}
+			seedStake := core.MinStakeNAPR * 10
+			p.Registry.InitFromGenesis(seedPubs, seedStake)
+			seedActive, _ := p.Registry.Count()
+			p.Log.Warn("startup scan: registry was empty after scan — seeded observed block producers as active validators",
+				"seeded_count", len(seedPubs),
+				"seed_stake_napro", seedStake,
+				"active_after_seed", seedActive,
+				"tip_height", p.TipHeight,
+				"note", "these entries will be replaced once a real stake transaction is replayed",
+			)
+		}
 	}
 
 	// Save a full tip-height snapshot for the next fast-start.

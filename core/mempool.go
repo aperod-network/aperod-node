@@ -564,6 +564,10 @@ func (m *Mempool) Save(dataDir string) error {
 	path := mempoolPath(dataDir)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		// Remove the temp file on write failure — a partial write (e.g. ENOSPC
+		// after the file was created) must never be left on disk, as it would
+		// confuse the next startup's CleanStaleTmpFiles / Load path.
+		_ = os.Remove(tmp)
 		return fmt.Errorf("mempool save: write temp: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -592,7 +596,18 @@ func (m *Mempool) Load(dataDir string, log *slog.Logger) int {
 
 	var dump mempoolDump
 	if err := json.Unmarshal(data, &dump); err != nil {
-		log.Warn("mempool load: unmarshal error (ignoring)", "err", err)
+		log.Warn("mempool load: corrupt file removed to allow clean restart",
+			"path", path,
+			"err", err,
+		)
+		// Remove the corrupt file so subsequent restarts don't re-emit this
+		// warning on every boot.  The node starts with an empty pool instead.
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Warn("mempool load: failed to remove corrupt file (ignoring)",
+				"path", path,
+				"err", removeErr,
+			)
+		}
 		return 0
 	}
 
