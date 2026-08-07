@@ -20,7 +20,13 @@ type banEntry struct {
 type dialState struct {
 	failures int
 	nextDial time.Time
+	lastFail time.Time // when the most recent failure was recorded
 }
+
+// maxDialStates is the cap on the number of dial-state entries kept in RAM.
+// Entries are also pruned when they have not seen a failure for dialStateTTL.
+const maxDialStates = 1_000
+const dialStateTTL = time.Hour
 
 // backoffDuration returns the delay before the next dial attempt.
 // Progression: 5 s, 10 s, 20 s, 40 s, 80 s, … capped at 5 minutes.
@@ -200,13 +206,37 @@ func (pm *PeerMgr) CanDial(addr string) bool {
 }
 
 // OnDialFail records a failed dial attempt and advances the back-off window.
+// It also prunes entries that have not seen a failure in dialStateTTL to keep
+// the map bounded.  If the map still exceeds maxDialStates after TTL pruning,
+// the oldest entries (by lastFail) are removed until it fits.
 func (pm *PeerMgr) OnDialFail(addr string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	now := time.Now()
 	st := pm.dialStates[addr]
 	st.failures++
-	st.nextDial = time.Now().Add(backoffDuration(st.failures))
+	st.nextDial = now.Add(backoffDuration(st.failures))
+	st.lastFail = now
 	pm.dialStates[addr] = st
+
+	// Prune expired entries first.
+	for a, s := range pm.dialStates {
+		if now.Sub(s.lastFail) > dialStateTTL {
+			delete(pm.dialStates, a)
+		}
+	}
+	// If still over the cap, evict the entry with the oldest lastFail.
+	for len(pm.dialStates) > maxDialStates {
+		var oldest string
+		var oldestTime time.Time
+		for a, s := range pm.dialStates {
+			if oldest == "" || s.lastFail.Before(oldestTime) {
+				oldest = a
+				oldestTime = s.lastFail
+			}
+		}
+		delete(pm.dialStates, oldest)
+	}
 }
 
 // OnDialSuccess resets the back-off state for addr after a successful
