@@ -618,6 +618,20 @@ func findLatestSnapshot(dataDir string, limitHeight uint64, log *slog.Logger) *s
 	return nil
 }
 
+// tryLoadStartupSnapshot calls loadStartupSnapshotWithFallback and, when the
+// load fails, immediately calls logSnapshotStartupReason so the structured
+// startup_reason= journal entry is always emitted from the same production
+// code path.  Extracting this two-call sequence into its own function creates
+// a unit-testable seam: tests call tryLoadStartupSnapshot directly, so if
+// logSnapshotStartupReason is ever removed from this function the tests fail.
+func tryLoadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string, log *slog.Logger) (*startupSnapshot, bool, error) {
+	snap, isRelaxed, err := loadStartupSnapshotWithFallback(dataDir, tipHeight, tipHashHex, log)
+	if err != nil {
+		logSnapshotStartupReason(err, tipHeight, log)
+	}
+	return snap, isRelaxed, err
+}
+
 // logSnapshotStartupReason emits the appropriate structured log entry explaining
 // why the full block scan is required.  It is called after
 // loadStartupSnapshotWithFallback returns an error so journalctl output clearly
