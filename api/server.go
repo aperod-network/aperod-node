@@ -55,6 +55,10 @@ type Server struct {
         banLiftFn func(string) bool                         // optional; wired to p2p.Host.LiftBan by cmd/node
         banAddFn  func(addr, reason string, d time.Duration) // optional; wired to p2p.Host.Ban by cmd/node
 
+        // banEventFn returns peer-ban events since a given time.
+        // Wired to p2p.Host.GetBanEvents by cmd/node.
+        banEventFn func(since time.Time) []BanEventEntry
+
         // whitelistExemptFn returns whitelist-exemption events since a given time.
         // Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
         whitelistExemptFn func(since time.Time) []WhitelistExemptionEntry
@@ -232,6 +236,16 @@ func (s *Server) SetKeepBlocks(n uint64) { s.keepBlocks = n }
 // caller to supply a view_key_hex query parameter.
 func (s *Server) SetNodeViewKey(hexKey string) { s.nodeViewKeyHex = hexKey }
 
+// FlushUTXOCache removes all cached /address/{addr}/utxos entries immediately.
+// Intended for use in tests that mutate the UTXO set and then require a fresh
+// response from the REST handler on the very next call, bypassing the normal TTL.
+func (s *Server) FlushUTXOCache() {
+        s.utxoAddrCache.Range(func(k, _ interface{}) bool {
+                s.utxoAddrCache.Delete(k)
+                return true
+        })
+}
+
 // SetPeerCounter wires a function returning the live P2P peer count so
 // /metrics can report it. Optional — /metrics reports 0 peers if unset.
 func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
@@ -240,6 +254,18 @@ func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
 // connections currently in the TLS handshake phase so /api/v1/network/stats
 // can report it (Task #504).
 func (s *Server) SetPendingHandshakeCounter(f func() int64) { s.pendingHandshakeCounter = f }
+
+// BanEventEntry is one peer-ban event returned by the REST API.
+// Mirrors p2p.BanEvent; defined here to avoid an import cycle.
+type BanEventEntry struct {
+        IP              string    `json:"ip"`
+        PeerAddr        string    `json:"peer_addr"`
+        PeerID          string    `json:"peer_id"`
+        Reason          string    `json:"reason"`
+        Violations      int       `json:"violations"`
+        BanDurationSecs int64     `json:"ban_duration_secs"`
+        At              time.Time `json:"at"`
+}
 
 // WhitelistExemptionEntry is one whitelist-exemption event returned by the REST API.
 // Mirrors p2p.WhitelistExemptionEvent; defined here to avoid an import cycle.
@@ -297,6 +323,13 @@ func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = 
 // not found, or (false, err) when persistence fails.
 // Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
 func (s *Server) SetWhitelistRemoveFunc(f func(string) (bool, error)) { s.whitelistRemoveFn = f }
+
+// SetBanEventFunc wires a function that returns peer-ban events recorded since a
+// given time.  Wired to p2p.Host.GetBanEvents by cmd/node.
+// Optional — GET /api/v1/network/ban-events returns 503 when not wired.
+func (s *Server) SetBanEventFunc(f func(since time.Time) []BanEventEntry) {
+        s.banEventFn = f
+}
 
 // SetWhitelistExemptFunc wires a function that returns whitelist-exemption events
 // recorded since a given time.  Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
