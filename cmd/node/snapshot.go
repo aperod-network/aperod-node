@@ -241,6 +241,19 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 	if err != nil {
 		return nil, nil, err
 	}
+	// Guard against mid-write truncation: a valid compressed snapshot always
+	// exceeds 100 bytes (the JSON header alone — version, height, hash — is
+	// larger than that when gzip-compressed).  A smaller file means the writer
+	// was interrupted before flushing, e.g. by a power loss or OOM-kill.
+	// Catching this here prevents json.Decode from blocking on an empty reader
+	// and produces a clear, actionable error message.  Task #1019.
+	if info, statErr := f.Stat(); statErr == nil && info.Size() < 100 {
+		f.Close()
+		return nil, nil, fmt.Errorf(
+			"snapshot file is truncated or empty (size=%d bytes, path=%s): "+
+				"likely interrupted mid-write — node will fall back to scan or prev backup",
+			info.Size(), path)
+	}
 	gzr, err = gzip.NewReader(f)
 	if err != nil {
 		f.Close()
@@ -678,6 +691,9 @@ func deleteOldSnapshots(dataDir string, keep uint64) {
 			}
 			if bestPrevName != "" && name == bestPrevName {
 				continue // keep the most recent prev backup
+			}
+			if strings.HasSuffix(name, ".tmp") {
+				continue // skip in-progress temp files written by concurrent goroutines
 			}
 			_ = os.Remove(filepath.Join(dataDir, name))
 			continue
