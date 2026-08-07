@@ -614,6 +614,28 @@ func (d *DB) LoadTxIndex(minHeight uint64) (map[crypto.Hash32]TxIdxEntry, error)
         return result, nil
 }
 
+// LookupTxIdx returns the persisted location (block height, tx position) for a
+// single transaction hash.  Returns (nil, nil) when the hash is not in the
+// index (e.g. the block predates the tx-index feature or has been pruned).
+// This is the point-lookup complement of LoadTxIndex (which scans a range).
+func (d *DB) LookupTxIdx(txHash crypto.Hash32) (*TxIdxEntry, error) {
+        key := append(append([]byte{}, prefixTxIdx...), txHash[:]...)
+        val, err := d.db.Get(key, nil)
+        if err == leveldb.ErrNotFound {
+                return nil, nil
+        }
+        if err != nil {
+                return nil, fmt.Errorf("tx index lookup %x: %w", txHash[:4], err)
+        }
+        if len(val) < 12 {
+                return nil, nil
+        }
+        return &TxIdxEntry{
+                Height: binary.BigEndian.Uint64(val[:8]),
+                TxIdx:  int(binary.BigEndian.Uint32(val[8:])),
+        }, nil
+}
+
 // CountMissingHeights returns the number of missing h/ height-index entries in
 // the range [1, tipHeight] by iterating the sorted height-prefix keys in one
 // pass.  It also returns the lowest missing height (firstMissing = 0 when
