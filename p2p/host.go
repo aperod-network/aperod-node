@@ -243,6 +243,26 @@ type Host struct {
         // wlExemptEvents is a ring buffer of whitelist-exemption events for
         // the Admin Panel notification log.  Capped at whitelistExemptMaxEvents.
         wlExemptEvents []WhitelistExemptionEvent
+
+        // bootnodeLastResolved maps each raw bootnode string (as it appears in
+        // cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
+        // Updated on every successful DNS resolution in Start() and maintainLoop.
+        // DNS failures leave the previous entry intact (retention behaviour).
+        // bootnodeSet is always rebuilt from this map so a bootnode that moves to
+        // a new IP loses its old address's privileged status on the next tick.
+        // Protected by h.mu (write-lock for mutations, read-lock for lookups).
+        bootnodeLastResolved map[string][]string
+
+        // bootnodeSet is the flat set of currently-privileged IP:port addresses,
+        // rebuilt from bootnodeLastResolved on every write.  Used by dialPeer to
+        // skip exponential back-off — only the ban list can block a bootnode.
+        // Protected by h.mu.
+        bootnodeSet map[string]struct{}
+
+        // maintainNow is an optional channel that tests can send on to trigger
+        // an immediate maintainLoop tick without waiting for the 10-second ticker.
+        // nil in production (Start always initialises it).
+        maintainNow chan struct{}
 }
 
 // NewHost creates a new p2p host.
@@ -284,7 +304,30 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 badBlockCounts: make(map[string]badBlockStrike),
                 wlNets:         wlNets,
                 wlIPs:          wlIPs,
+                bootnodeLastResolved: make(map[string][]string),
+                bootnodeSet:          make(map[string]struct{}),
+                maintainNow:          make(chan struct{}, 1),
         }
+}
+
+// rebuildBootnodeSet repopulates h.bootnodeSet from h.bootnodeLastResolved.
+// Must be called with h.mu held (write lock).
+func (h *Host) rebuildBootnodeSet() {
+        newSet := make(map[string]struct{})
+        for _, addrs := range h.bootnodeLastResolved {
+                for _, addr := range addrs {
+                        newSet[addr] = struct{}{}
+                }
+        }
+        h.bootnodeSet = newSet
+}
+
+// applyBootnodeResolution records the resolved addresses for a single raw
+// bootnode string and rebuilds bootnodeSet so retired addresses are removed
+// immediately.  Must be called with h.mu held (write lock).
+func (h *Host) applyBootnodeResolution(raw string, resolved []string) {
+        h.bootnodeLastResolved[raw] = resolved
+        h.rebuildBootnodeSet()
 }
 
 // SetHeaderProvider attaches a header provider used to serve GetHeaders requests.
@@ -652,6 +695,9 @@ func (h *Host) Start() error {
 
         // Dial bootnodes — resolve DNS hostnames before dialling so the
         // canonical peer key in h.peers is always an IP:port string.
+        // applyBootnodeResolution records each successful resolution in
+        // bootnodeLastResolved and rebuilds bootnodeSet so dialPeer can
+        // skip back-off before maintainLoop fires its first tick.
         for _, addr := range h.cfg.Bootnodes {
                 go func(a string) {
                         resolved, err := resolveBootnode(a)
@@ -659,6 +705,9 @@ func (h *Host) Start() error {
                                 h.log.Warn("bootnode dns resolve failed", "addr", a, "err", err)
                                 return
                         }
+                        h.mu.Lock()
+                        h.applyBootnodeResolution(a, resolved)
+                        h.mu.Unlock()
                         for _, r := range resolved {
                                 h.dialPeer(r)
                         }
@@ -890,60 +939,105 @@ func (h *Host) maintainLoop() {
         ticker := time.NewTicker(10 * time.Second)
         defer ticker.Stop()
         for {
+                // Wait for the next scheduled tick, an explicit test-hook trigger,
+                // or a shutdown signal.  Both tick sources (ticker.C and maintainNow)
+                // fall through to the same maintain logic below; only done causes an
+                // early return.  Go select cases do not fall through, so the body
+                // must live outside the select statement.
                 select {
                 case <-h.done:
                         return
+                case <-h.maintainNow: // test hook: fire one tick immediately
                 case <-ticker.C:
-                        // Prune expired bans
-                        h.mgr.Prune()
+                }
 
-                        // Prune stale bad-block strike records so the map stays bounded
-                        // even when a distributed attacker registers many unique IPs.
-                        h.badBlockMu.Lock()
-                        now := time.Now()
-                        for ip, s := range h.badBlockCounts {
-                                if now.Sub(s.lastSeen) > badBlockStrikeTTL {
-                                        delete(h.badBlockCounts, ip)
-                                }
+                // Prune expired bans
+                h.mgr.Prune()
+
+                // Prune stale bad-block strike records so the map stays bounded
+                // even when a distributed attacker registers many unique IPs.
+                h.badBlockMu.Lock()
+                now := time.Now()
+                for ip, s := range h.badBlockCounts {
+                        if now.Sub(s.lastSeen) > badBlockStrikeTTL {
+                                delete(h.badBlockCounts, ip)
                         }
-                        h.badBlockMu.Unlock()
+                }
+                h.badBlockMu.Unlock()
 
-                        h.mu.RLock()
-                        count := len(h.peers)
-                        known := make([]string, len(h.peerList))
-                        copy(known, h.peerList)
-                        h.mu.RUnlock()
+                h.mu.RLock()
+                count := len(h.peers)
+                known := make([]string, len(h.peerList))
+                copy(known, h.peerList)
+                h.mu.RUnlock()
 
-                        if count < h.cfg.MinPeers {
-                                // Re-dial known peers discovered via peer exchange.
-                                for _, addr := range known {
-                                        h.mu.RLock()
-                                        _, connected := h.peers[addr]
-                                        h.mu.RUnlock()
-                                        if !connected {
-                                                go h.dialPeer(addr)
-                                        }
-                                }
-                                // Always retry configured bootnodes when isolated — these
-                                // are the only anchors when peerList is empty (e.g. fresh
-                                // start or after a network partition).
-                                for _, raw := range h.cfg.Bootnodes {
-                                        resolved, err := resolveBootnode(raw)
-                                        if err != nil {
-                                                continue
-                                        }
-                                        for _, addr := range resolved {
-                                                h.mu.RLock()
-                                                _, connected := h.peers[addr]
-                                                h.mu.RUnlock()
-                                                if !connected {
-                                                        go h.dialPeer(addr)
-                                                }
-                                        }
+                if count < h.cfg.MinPeers {
+                        // Re-dial known peers discovered via peer exchange.
+                        for _, addr := range known {
+                                h.mu.RLock()
+                                _, connected := h.peers[addr]
+                                h.mu.RUnlock()
+                                if !connected {
+                                        go h.dialPeer(addr)
                                 }
                         }
                 }
+
+                // Always retry configured bootnodes on every tick regardless
+                // of the current peer count.  Bootnodes are the only anchors
+                // when peerList is empty (fresh start or network partition),
+                // and — crucially — dialPeer skips the exponential back-off
+                // window for them so two validators that restart at the same
+                // time reconnect within seconds, not minutes.
+                //
+                // Re-resolve DNS outside h.mu (network I/O) then update under
+                // the write lock.  Each successful resolution calls
+                // applyBootnodeResolution which rebuilds bootnodeSet from
+                // bootnodeLastResolved, so a bootnode that moves to a new IP
+                // loses its old address's privileged status immediately.
+                // A DNS failure for a given bootnode leaves its last-known
+                // addresses intact (temporary outage retention).
+                type rawResult struct {
+                        raw      string
+                        resolved []string
+                }
+                var freshResults []rawResult
+                for _, raw := range h.cfg.Bootnodes {
+                        resolved, err := resolveBootnode(raw)
+                        if err != nil {
+                                continue // DNS failure: preserve last-known addrs
+                        }
+                        freshResults = append(freshResults, rawResult{raw, resolved})
+                }
+                // Collect the full set of bootnode addresses to dial (including
+                // retained last-known addrs for bootnodes whose DNS just failed).
+                var allBootnodeAddrs []string
+                h.mu.Lock()
+                for _, rr := range freshResults {
+                        h.applyBootnodeResolution(rr.raw, rr.resolved)
+                }
+                for _, addrs := range h.bootnodeLastResolved {
+                        allBootnodeAddrs = append(allBootnodeAddrs, addrs...)
+                }
+                h.mu.Unlock()
+                for _, addr := range allBootnodeAddrs {
+                        h.mu.RLock()
+                        _, connected := h.peers[addr]
+                        h.mu.RUnlock()
+                        if !connected {
+                                go h.dialPeer(addr)
+                        }
+                }
         }
+}
+
+// isBootnode reports whether addr is a resolved address of a configured
+// bootnode.  Callers must not hold h.mu.
+func (h *Host) isBootnode(addr string) bool {
+        h.mu.RLock()
+        _, ok := h.bootnodeSet[addr]
+        h.mu.RUnlock()
+        return ok
 }
 
 // DialPeer initiates an outbound connection to addr.  The dial happens in a
@@ -964,8 +1058,16 @@ func (h *Host) dialPeer(addr string) {
         if already || count >= h.cfg.MaxPeers {
                 return
         }
-        // Respect ban list and exponential back-off window.
-        if !h.mgr.CanDial(addr) {
+        // Configured bootnodes skip the exponential back-off window so a
+        // simultaneous restart of both validators does not leave the network
+        // isolated for up to 5 minutes.  The ban list still applies — a
+        // bootnode that is actively banned cannot be re-dialled.
+        if h.isBootnode(addr) {
+                if h.mgr.IsBanned(addr) {
+                        h.log.Debug("dialPeer: bootnode is banned", "addr", addr)
+                        return
+                }
+        } else if !h.mgr.CanDial(addr) {
                 h.log.Debug("dialPeer: addr is banned or in back-off window", "addr", addr)
                 return
         }
