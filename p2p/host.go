@@ -1442,7 +1442,13 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         // source port does not bypass the enforcement.
                         ourTip := h.handler.CurrentHeight()
                         peerIP := connIP(peer.addr)
-                        if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead {
+                        // When our tip is below BadBlockHeightLead we are syncing from
+                        // scratch: every legitimate block from a further-ahead peer
+                        // looks "far ahead", so skip the strike counter entirely until
+                        // we have enough chain history to distinguish wrong-fork spam
+                        // from normal catch-up traffic.  Task #1477.
+                        if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead &&
+                                ourTip >= h.cfg.BadBlockHeightLead {
                                 // Whitelisted peers are trusted validators; skip the
                                 // strike counter entirely so a temporarily-ahead validator
                                 // is never auto-banned for being on a longer fork.
