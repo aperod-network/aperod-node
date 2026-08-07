@@ -212,6 +212,48 @@ This looks like a fresh server — run <code>install-node.sh</code> instead of <
 fi
 
 # ---------------------------------------------------------------------------
+# Step 0c: Ensure timeout.conf drop-in exists with a safe TimeoutStopSec.
+#
+# The node's checkSystemdTimeout() guard checks the exact filename
+# /etc/systemd/system/aperod-node.service.d/timeout.conf.  If the file is
+# absent (e.g. pre-task-1426 install) the check falls through to the main
+# unit and may still pass — but having a dedicated drop-in makes the setting
+# explicit, auditable, and overridable without touching the main unit.
+#
+# We only write the file when it is missing.  If the operator has already
+# customised it (e.g. to a larger value) we leave it alone.
+# ---------------------------------------------------------------------------
+DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+TIMEOUT_CONF="${DROPIN_DIR}/timeout.conf"
+mkdir -p "${DROPIN_DIR}"
+
+if [[ ! -f "${TIMEOUT_CONF}" ]]; then
+  cat > "${TIMEOUT_CONF}" <<'TEOF'
+# Aperod node — shutdown timeout drop-in
+# ─────────────────────────────────────────────
+# Install path: /etc/systemd/system/aperod-node.service.d/timeout.conf
+#
+# TimeoutStopSec=900
+#   Give the SIGTERM shutdown handler up to 15 minutes to flush the UTXO
+#   snapshot to disk before systemd sends SIGKILL.  A shorter timeout
+#   truncates the snapshot and forces the next restart into the multi-hour
+#   800K-block scan — root cause of the August 2026 outage.
+#
+#   To change without reinstalling:
+#     nano /etc/systemd/system/aperod-node.service.d/timeout.conf
+#     systemctl daemon-reload
+
+[Service]
+TimeoutStopSec=900
+TEOF
+  echo "  [ok] timeout.conf drop-in created: ${TIMEOUT_CONF}"
+  systemctl daemon-reload
+  echo "  [patch] daemon-reload complete — new TimeoutStopSec takes effect after restart."
+else
+  echo "  [ok] ${TIMEOUT_CONF} already exists — not overwriting."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1: Pull latest source
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Pulling latest source as aperod..."
@@ -227,6 +269,12 @@ sudo -u aperod git -C "$APEROD_DIR" pull
 # same directory, then rename(2)) so the next scheduled backup always uses the
 # current code without ever exposing a partially written file.
 #
+# Security: this step runs as root (update-node.sh requires sudo) so it can
+# legitimately write to root-owned /usr/local/bin/.  The installed copy is
+# root-owned (mode 700, owner root) and is not writable by the aperod user,
+# preserving the privilege boundary between the unprivileged pull user and
+# the root-executed backup service.
+#
 # Logic lives in sync-backup-script.sh (same directory) so it can be sourced
 # and tested independently.  See that file for full documentation.
 # ---------------------------------------------------------------------------
@@ -234,6 +282,32 @@ sudo -u aperod git -C "$APEROD_DIR" pull
 source "${DEPLOY_DIR}/sync-backup-script.sh"
 echo "==> [1b] Syncing aperod_backup.sh..."
 _sync_backup_script
+
+# ---------------------------------------------------------------------------
+# Step 1c: Install/refresh the git post-merge hook.
+#
+# A bare `git pull` that bypasses update-node.sh runs as `aperod` and cannot
+# write to root-owned /usr/local/bin/.  The post-merge hook closes the
+# visibility gap: it detects a mismatch between the repo copy and the
+# installed copy and immediately alerts the operator on stderr (and via
+# Telegram when credentials are available), so they know to run
+# sudo update-node.sh to perform the privileged sync.
+#
+# We refresh the hook on every update-node.sh run so that changes to the
+# hook script itself are picked up automatically.
+#
+# If .git/hooks does not exist (tarball install) the step is a no-op.
+# ---------------------------------------------------------------------------
+echo "==> [1c] Installing/refreshing git post-merge hook..."
+HOOK_SRC="${DEPLOY_DIR}/post-merge"
+GIT_HOOKS_DIR="${APEROD_DIR}/.git/hooks"
+if [[ -d "${GIT_HOOKS_DIR}" && -f "${HOOK_SRC}" ]]; then
+  cp "${HOOK_SRC}" "${GIT_HOOKS_DIR}/post-merge"
+  chmod +x "${GIT_HOOKS_DIR}/post-merge"
+  echo "  [hook] post-merge hook installed: ${GIT_HOOKS_DIR}/post-merge"
+else
+  echo "  [hook] ${GIT_HOOKS_DIR} not found — skipping post-merge hook install (tarball install)."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Rebuild Go binary — if this fails, abort before touching the service.
