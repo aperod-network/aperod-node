@@ -54,6 +54,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/whitelist", s.localOnly(s.restNetworkWhitelist))
         s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.restNetworkWhitelistByEntry))
         s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
+        s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
@@ -537,7 +538,11 @@ type AddressUTXO struct {
         // AmountNapr is the decrypted output amount in nAPRO. Populated when a
         // view key is available (via view_key_hex query param or node.yaml view_key).
         // Null when no view key is configured.
-        AmountNapr      *uint64 `json:"amount_napr"`
+        AmountNapr *uint64 `json:"amount_napr"`
+        // IsCoinbase is true when this UTXO belongs to a per-block validator
+        // reward (coinbase) transaction.  Wallet history displays must filter
+        // these out so +0 APRO block-reward entries never pollute user history.
+        IsCoinbase bool `json:"is_coinbase"`
 }
 
 // restAddressUTXOs handles GET /api/v1/address/{addr}/utxos.
@@ -613,26 +618,32 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 var hsScalar *crypto.Scalar32
 
                 // Transparent match: OneTimePub == spendPub (direct payment / old-style).
+                // Not coinbase — direct spend-pub payments are normal transfers.
                 match := u.OneTimePub == spendPub
+                isCoinbase := false
 
                 // Mint match: OneTimePub == spendPub + height*G (coinbase reward outputs).
+                // These ARE coinbase — per-block validator block rewards use this key form.
                 if !match {
                         if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(u.BlockHeight)); hErr == nil {
                                 if mintPub, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
-                                        match = u.OneTimePub == mintPub
+                                        if u.OneTimePub == mintPub {
+                                                match = true
+                                                isCoinbase = true
+                                        }
                                 }
                         }
                 }
 
                 // Stealth match: ECDH scan using the view key.
                 // ScanForOutput returns the Hs scalar when the output belongs to us;
-                // nil when it doesn't.  This also covers any transparent output whose
-                // amount was encrypted with a real TxPubKey (non-zero).
+                // nil when it doesn't.  Stealth outputs are never coinbase.
                 if viewPriv != nil {
                         hs, _ := crypto.ScanForOutput(*viewPriv, spendPub, u.TxPubKey, u.OneTimePub)
                         if hs != nil {
                                 match = true
                                 hsScalar = hs
+                                // isCoinbase stays false — ECDH stealth transfers are not coinbase
                         }
                 }
 
@@ -659,6 +670,7 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                         EncAmountHex:    fmt.Sprintf("%x", u.EncAmount[:]),
                         BlockHeight:     u.BlockHeight,
                         AmountNapr:      amountNapr,
+                        IsCoinbase:      isCoinbase,
                 })
         }
 
@@ -831,13 +843,17 @@ func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr
 //   { "outputs": [...], "from_height": N, "next_height": M, "tip_height": T }
 
 type ScanOutput struct {
-        TxHash         string `json:"tx_hash"`
-        OutIdx         int    `json:"out_idx"`
-        BlockHeight    uint64 `json:"block_height"`
-        OneTimePubHex  string `json:"one_time_pub_hex"`
-        TxPubKeyHex    string `json:"tx_pub_key_hex"`
+        TxHash          string `json:"tx_hash"`
+        OutIdx          int    `json:"out_idx"`
+        BlockHeight     uint64 `json:"block_height"`
+        OneTimePubHex   string `json:"one_time_pub_hex"`
+        TxPubKeyHex     string `json:"tx_pub_key_hex"`
         AmountCommitHex string `json:"amount_commit_hex"`
-        EncAmountHex   string `json:"enc_amount_hex"`
+        EncAmountHex    string `json:"enc_amount_hex"`
+        // IsCoinbase is true when this output belongs to the first (coinbase)
+        // transaction in its block.  Wallet clients must filter these out so
+        // per-block validator rewards do not appear in user history.
+        IsCoinbase bool `json:"is_coinbase"`
 }
 
 func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
@@ -881,7 +897,11 @@ func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
                         nextHeight = h + 1
                         continue
                 }
-                for _, tx := range b.Txs {
+                for txIdx, tx := range b.Txs {
+                        // The first transaction in a block is the coinbase (block reward).
+                        // Wallet clients must filter these so per-block validator rewards
+                        // do not appear as +0 APRO entries in user history.
+                        isCoinbase := txIdx == 0 && tx.IsCoinbase()
                         hash := tx.Hash()
                         hashHex := fmt.Sprintf("%x", hash[:])
                         for j, out := range tx.Outputs {
@@ -896,6 +916,7 @@ func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
                                         TxPubKeyHex:     fmt.Sprintf("%x", out.TxPubKey[:]),
                                         AmountCommitHex: fmt.Sprintf("%x", out.AmountCommit[:]),
                                         EncAmountHex:    fmt.Sprintf("%x", out.EncAmount[:]),
+                                        IsCoinbase:      isCoinbase,
                                 })
                         }
                 }
@@ -1129,6 +1150,41 @@ func (s *Server) restNetworkWhitelistExemptions(w http.ResponseWriter, r *http.R
         events := s.whitelistExemptFn(since)
         if events == nil {
                 events = []WhitelistExemptionEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
+}
+
+// ─── GET /api/v1/network/ban-events ──────────────────────────────────────────
+//
+// Returns peer-ban events recorded by the P2P layer: each entry is a peer that
+// was banned for sending repeated out-of-range (wrong-fork) blocks.  Accepts an
+// optional `since` query parameter (Unix milliseconds) to fetch only events
+// recorded after that time.
+//
+// Response: { "events": [ { ip, peer_addr, peer_id, reason, violations, ban_duration_secs, at } ] }
+func (s *Server) restNetworkBanEvents(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.banEventFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+
+        var since time.Time
+        if raw := r.URL.Query().Get("since"); raw != "" {
+                ms, err := strconv.ParseInt(raw, 10, 64)
+                if err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "since must be a Unix-ms integer")
+                        return
+                }
+                since = time.UnixMilli(ms)
+        }
+
+        events := s.banEventFn(since)
+        if events == nil {
+                events = []BanEventEntry{}
         }
         writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
 }
