@@ -13,10 +13,14 @@ p2p:
   # peer_whitelist:
   #   - "1.2.3.4"          # single validator IP
   #   - "10.0.0.0/8"       # private network range
-  # Rogue-peer / wrong-fork ban knobs (all optional — defaults shown below).
-  # bad_block_height_lead: 1000   # how many blocks ahead of our tip triggers a strike
-  # bad_block_ban_threshold: 10   # strikes within the TTL window before the IP is banned
-  # bad_block_ban_duration: 24h   # how long the ban lasts
+  # Rogue-peer / wrong-fork ban knobs.
+  # bad_block_height_lead:  how many blocks ahead of our tip a peer's height must be
+  #                         before it counts as a wrong-fork strike.
+  # bad_block_ban_threshold: strikes within the TTL window before the IP is banned.
+  # bad_block_ban_duration:  how long the ban lasts.
+  bad_block_height_lead: 1000
+  bad_block_ban_threshold: 5
+  bad_block_ban_duration: 24h
 
 consensus:
   validator_key: "./data/testnet/validator.key"
