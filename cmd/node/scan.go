@@ -90,8 +90,8 @@ type startupScanParams struct {
 // The caller is responsible for loading the key-image index before calling
 // this function (when KiFromIndex is true).
 func runStartupScan(p startupScanParams) (startupScanResult, error) {
-	const syncProgressInterval = uint64(1000)  // report every 1 000 blocks
-	const gcInterval           = uint64(10000) // force GC every 10 000 blocks
+	const syncProgressInterval = uint64(1000)   // report every 1 000 blocks
+	const gcUTXOInterval       = uint64(50000)  // force GC every 50 000 UTXOs processed
 
 	// ── DB-index fast path ────────────────────────────────────────────────
 	// When UTXOFromIndex is true, both the active UTXO set and the spent
@@ -279,14 +279,12 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 
 	var txCount int64
 	blocksWithStake := 0
-	kiCount := 0 // only used when !KiFromIndex
+	kiCount    := 0     // only used when !KiFromIndex
+	utxoCount  := uint64(0) // cumulative output count; drives periodic GC
 
 	for h := scanFrom; h <= p.TipHeight; h++ {
 		if p.SetSyncProgress != nil && h%syncProgressInterval == 0 {
 			p.SetSyncProgress(h, p.TipHeight)
-		}
-		if h%gcInterval == 0 {
-			runtime.GC()
 		}
 
 		raw, fetchErr := p.DB.GetRawBlockByHeight(h)
@@ -335,6 +333,10 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 					BlockHeight:  b.Header.Height,
 				}
 				_ = p.DB.PutUTXO(txHash, uint32(i), su)
+				utxoCount++
+				if utxoCount%gcUTXOInterval == 0 {
+					runtime.GC()
+				}
 			}
 		}
 
@@ -412,6 +414,12 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
+	// Release UTXO-scan heap to the OS immediately so steady-state operation
+	// starts with the minimum possible RSS.  The periodic runtime.GC() calls
+	// during the loop already freed heap; FreeOSMemory() returns those pages
+	// so GOMEMLIMIT has full headroom before the consensus engine starts.
+	debug.FreeOSMemory()
+
 	if !p.KiFromIndex {
 		if err := p.DB.StoreTxTotal(txCount); err != nil {
 			p.Log.Warn("failed to persist tx total after block scan", "err", err)
@@ -421,6 +429,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			"key_images_marked", kiCount,
 			"blocks_scanned", p.TipHeight,
 			"total_txs_counted", txCount,
+			"utxos_processed", utxoCount,
 		)
 	}
 
