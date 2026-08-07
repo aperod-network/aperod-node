@@ -412,6 +412,137 @@ else
 fi
 
 # =============================================================================
+# Tests 11-13: update-node.sh upgrade-path for timeout.conf
+#
+# These tests extract the step 0c migration block from update-node.sh and
+# verify the three cases: absent, unsafe-existing, and safe-custom-existing.
+# =============================================================================
+
+UPDATE_SH="$SCRIPT_DIR/update-node.sh"
+if [[ ! -f "$UPDATE_SH" ]]; then
+  fail "update-node.sh not found at $UPDATE_SH — skipping upgrade-path tests"
+else
+
+# ---------------------------------------------------------------------------
+# run_update_timeout_block DROPIN_DIR
+#
+#   Extracts the step-0c migration block from update-node.sh and runs it
+#   against a controlled temp directory.  DROPIN_DIR and TIMEOUT_CONF are
+#   injected; systemctl is stubbed so daemon-reload does not require root.
+# ---------------------------------------------------------------------------
+run_update_timeout_block() {
+  local dropin_dir="$1"
+  local timeout_conf_path="$dropin_dir/timeout.conf"
+
+  local fake_sc_log="$TMPDIR_TEST/sc-update.log"
+  local fake_sc_dir
+  fake_sc_dir=$(make_fake_bin "systemctl" "$fake_sc_log")
+
+  # Extract the step 0c block from update-node.sh.
+  local block
+  block=$(awk '
+    /# Step 0c: Ensure timeout\.conf drop-in exists/{f=1}
+    f{print}
+    f && /^fi$/{f=0}
+  ' "$UPDATE_SH")
+
+  if [[ -z "$block" ]]; then
+    echo "[ERR] Could not extract step 0c block from $UPDATE_SH" >&2
+    return 1
+  fi
+
+  # The block reassigns DROPIN_DIR and TIMEOUT_CONF from SERVICE_NAME.
+  # Replace those two assignments with our temp-dir paths so the block
+  # writes to a location we can inspect without root.
+  block=$(echo "$block" | \
+    sed "s|DROPIN_DIR=.*|DROPIN_DIR=\"${dropin_dir}\"|" | \
+    sed "s|TIMEOUT_CONF=.*|TIMEOUT_CONF=\"${timeout_conf_path}\"|")
+
+  PATH="$fake_sc_dir:$PATH" \
+  bash -s <<RUNNER
+set -euo pipefail
+${block}
+RUNNER
+}
+
+# =============================================================================
+# Test 11: update-node.sh creates timeout.conf when absent
+# =============================================================================
+section "Test 11 (update-node.sh): creates timeout.conf when absent"
+
+T11_DIR=$(mktemp -d "$TMPDIR_TEST/t11-XXXXXXXX")
+T11_DROPIN="$T11_DIR/timeout.conf"
+# Do NOT pre-create the file.
+
+if run_update_timeout_block "$T11_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with absent timeout.conf"
+else
+  fail "step 0c exited non-zero with absent timeout.conf"
+fi
+
+if [[ -f "$T11_DROPIN" ]]; then
+  pass "timeout.conf was created: $T11_DROPIN"
+else
+  fail "timeout.conf was NOT created"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T11_DROPIN" 2>/dev/null; then
+  pass "TimeoutStopSec=900 written by step 0c (absent case)"
+else
+  fail "TimeoutStopSec=900 NOT found (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 12: update-node.sh upgrades unsafe existing timeout.conf (e.g. 300s)
+# =============================================================================
+section "Test 12 (update-node.sh): upgrades unsafe TimeoutStopSec=300 → 900"
+
+T12_DIR=$(mktemp -d "$TMPDIR_TEST/t12-XXXXXXXX")
+T12_DROPIN="$T12_DIR/timeout.conf"
+cat > "$T12_DROPIN" <<'PRE'
+[Service]
+TimeoutStopSec=300
+PRE
+
+if run_update_timeout_block "$T12_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with unsafe TimeoutStopSec=300"
+else
+  fail "step 0c exited non-zero with unsafe TimeoutStopSec=300"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T12_DROPIN" 2>/dev/null; then
+  pass "TimeoutStopSec upgraded from 300 → 900"
+else
+  fail "TimeoutStopSec was NOT upgraded (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 13: update-node.sh preserves safe custom TimeoutStopSec (e.g. 1200s)
+# =============================================================================
+section "Test 13 (update-node.sh): preserves safe custom TimeoutStopSec=1200"
+
+T13_DIR=$(mktemp -d "$TMPDIR_TEST/t13-XXXXXXXX")
+T13_DROPIN="$T13_DIR/timeout.conf"
+cat > "$T13_DROPIN" <<'PRE'
+[Service]
+TimeoutStopSec=1200
+PRE
+
+if run_update_timeout_block "$T13_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with safe TimeoutStopSec=1200"
+else
+  fail "step 0c exited non-zero with safe TimeoutStopSec=1200"
+fi
+
+if grep -q "^TimeoutStopSec=1200$" "$T13_DROPIN" 2>/dev/null; then
+  pass "TimeoutStopSec=1200 preserved (not overwritten)"
+else
+  fail "TimeoutStopSec=1200 was NOT preserved (content: $(cat "$T13_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+fi  # end: UPDATE_SH exists guard
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
