@@ -303,8 +303,14 @@ DROPIN_DIR="/etc/systemd/system/aperod-node.service.d"
 mkdir -p "${DROPIN_DIR}"
 
 cat > "${DROPIN_DIR}/timeout.conf" << 'DROPIN'
+# Aperod node — shutdown timeout drop-in
+# Install path: /etc/systemd/system/aperod-node.service.d/timeout.conf
+#
+# TimeoutStopSec=900 gives the UTXO snapshot up to 15 minutes to flush
+# before systemd sends SIGKILL.  The Aug 2026 outage was caused by a
+# 300 s value triggering SIGKILL mid-write on a 5.7 GB RAM node.
 [Service]
-TimeoutStopSec=300
+TimeoutStopSec=900
 DROPIN
 
 cat > "${DROPIN_DIR}/gomemlimit.conf" << DROPIN
@@ -313,7 +319,7 @@ Environment="GOMEMLIMIT=${GOMEMLIMIT_BYTES}"
 DROPIN
 
 systemctl daemon-reload
-ok "Drop-in конфиги применены (TimeoutStopSec=300, GOMEMLIMIT=${GOMEMLIMIT_BYTES})"
+ok "Drop-in конфиги применены (TimeoutStopSec=900, GOMEMLIMIT=${GOMEMLIMIT_BYTES})"
 echo
 
 # ── Закрываем туннель после загрузки (нода сама подключится по внешнему IP) ──
