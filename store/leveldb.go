@@ -614,6 +614,47 @@ func (d *DB) LoadTxIndex(minHeight uint64) (map[crypto.Hash32]TxIdxEntry, error)
         return result, nil
 }
 
+// CountMissingHeights returns the number of missing h/ height-index entries in
+// the range [1, tipHeight] by iterating the sorted height-prefix keys in one
+// pass.  It also returns the lowest missing height (firstMissing = 0 when
+// nothing is missing).  This is used by the --check-store bootstrap sanity
+// check to detect LevelDB gaps introduced by rsyncing a live database.
+func (d *DB) CountMissingHeights(tipHeight uint64) (missing uint64, firstMissing uint64, err error) {
+        if tipHeight == 0 {
+                return 0, 0, nil
+        }
+        startKey := heightKey(1)
+        endKey := heightKey(tipHeight + 1) // exclusive upper bound
+        iter := d.db.NewIterator(&util.Range{Start: startKey, Limit: endKey}, nil)
+        defer iter.Release()
+
+        expected := uint64(1)
+        for iter.Next() {
+                key := iter.Key()
+                if len(key) < len(prefixHeight)+8 {
+                        continue
+                }
+                h := binary.BigEndian.Uint64(key[len(prefixHeight):])
+                // Record each height in [expected, h-1] as missing.
+                for ; expected < h; expected++ {
+                        if missing == 0 {
+                                firstMissing = expected
+                        }
+                        missing++
+                }
+                expected = h + 1
+        }
+        // Trailing gap: heights in [expected, tipHeight] are absent.
+        for ; expected <= tipHeight; expected++ {
+                if missing == 0 {
+                        firstMissing = expected
+                }
+                missing++
+        }
+        err = iter.Error()
+        return
+}
+
 // ─── Key builders ─────────────────────────────────────────────────────────────
 
 func heightKey(h uint64) []byte {
