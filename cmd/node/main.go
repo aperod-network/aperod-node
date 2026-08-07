@@ -1099,6 +1099,24 @@ func run() error {
                 }
         }
 
+        // Mempool eviction: remove expired/old transactions every 5 minutes so
+        // low-fee transactions do not accumulate indefinitely in RAM.
+        go func() {
+                t := time.NewTicker(5 * time.Minute)
+                defer t.Stop()
+                for {
+                        select {
+                        case <-stop:
+                                return
+                        case <-t.C:
+                                n := mempool.Evict()
+                                if n > 0 {
+                                        log.Info("mempool: evicted expired transactions", "count", n)
+                                }
+                        }
+                }
+        }()
+
         if apiSrv != nil {
                 // Wire engine-dependent options now that the consensus engine exists.
                 apiSrv.SetRegistry(engine.Registry())
