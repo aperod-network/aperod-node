@@ -9,8 +9,8 @@ import (
 
 // MaxInMemoryBlocks is the sliding-window size of blocks kept in RAM.
 // Older blocks are evicted to keep memory usage bounded.
-// ~10 000 blocks at 3 s/block ≈ 8 hours of history in memory.
-const MaxInMemoryBlocks = 10_000
+// 1 000 blocks at 3 s/block ≈ 50 minutes of history — enough for reorgs.
+const MaxInMemoryBlocks = 1_000
 
 // TxLocation records where a transaction lives in the chain.
 type TxLocation struct {
