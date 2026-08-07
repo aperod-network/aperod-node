@@ -1026,6 +1026,10 @@ func run() error {
 
         // ── 9. Start subsystems ───────────────────────────────────────────────────
         stop := make(chan struct{})
+        // memPressureCh receives a signal when the memory watchdog detects that
+        // RSS is approaching GOMEMLIMIT; the signal loop treats this the same as
+        // SIGTERM so the snapshot can be saved while there is still headroom.
+        memPressureCh := make(chan struct{}, 1)
         // engineDone is closed when engine.Run returns so the shutdown path can
         // wait for the engine to fully stop before reading the DB tip and saving
         // the snapshot.  Without this wait the engine can produce a block AFTER
@@ -1049,6 +1053,51 @@ func run() error {
                         }
                 }
         }()
+
+        // Memory watchdog: monitor RSS every 20 s and trigger a proactive
+        // graceful restart when memory approaches GOMEMLIMIT.  A graceful
+        // restart saves the snapshot while there is still headroom; a
+        // SIGKILL (TimeoutStopSec expiry) does not — leading to a growing
+        // snapshot/gap cycle that makes each subsequent run shorter.
+        //
+        // Threshold: 65 % of GOMEMLIMIT.  At that point the UTXO set is
+        // small enough that TakeSnapshot() + gzip fits in the remaining 35 %
+        // (≈ 2.45 GB on a 7 GB limit) without triggering GC thrash.
+        {
+                limit := debug.SetMemoryLimit(-1) // -1 = query without changing
+                if limit > 0 {
+                        threshold := uint64(limit) * 65 / 100
+                        go func() {
+                                t := time.NewTicker(20 * time.Second)
+                                defer t.Stop()
+                                var fired bool
+                                for {
+                                        select {
+                                        case <-stop:
+                                                return
+                                        case <-t.C:
+                                                if fired {
+                                                        continue
+                                                }
+                                                rss := readRSSBytes()
+                                                if rss <= 0 || uint64(rss) < threshold {
+                                                        continue
+                                                }
+                                                log.Warn("memory watchdog: RSS approaching GOMEMLIMIT — initiating proactive graceful restart",
+                                                        "rss_bytes", rss,
+                                                        "threshold_bytes", threshold,
+                                                        "gomemlimit_bytes", limit,
+                                                )
+                                                fired = true
+                                                select {
+                                                case memPressureCh <- struct{}{}:
+                                                default:
+                                                }
+                                        }
+                                }
+                        }()
+                }
+        }
 
         if apiSrv != nil {
                 // Wire engine-dependent options now that the consensus engine exists.
@@ -1076,13 +1125,24 @@ func run() error {
         if cfg.P2P.ListenAddr != "" {
                 tcpAddr := parseP2PAddr(cfg.P2P.ListenAddr)
 
-                // Convert bootnode multiaddrs to plain TCP addrs.
+                // Validate and normalise bootnode addresses at startup.
+                // NormalizeBootnodeAddr checks syntax only (no DNS) — multiaddr
+                // literals (/ip4/, /ip6/) are converted to host:port; DNS names
+                // are kept as-is so the P2P host can re-resolve them periodically.
+                // A malformed entry (e.g. /ip6/badaddr with no /tcp/ component)
+                // logs a clear warning here rather than producing a confusing
+                // OS-level dial error deep inside the P2P layer.
                 bootnodes := make([]string, 0, len(cfg.P2P.Bootnodes))
                 for _, bn := range cfg.P2P.Bootnodes {
-                        parsed := parseP2PAddr(bn)
+                        normalized, err := p2p.NormalizeBootnodeAddr(bn)
+                        if err != nil {
+                                log.Warn("bootnode address is invalid and will be skipped — fix node.yaml to restore connectivity",
+                                        "bootnode", bn, "err", err)
+                                continue
+                        }
                         // Skip self-connections (same port as our listener).
-                        if parsed != tcpAddr {
-                                bootnodes = append(bootnodes, parsed)
+                        if normalized != tcpAddr {
+                                bootnodes = append(bootnodes, normalized)
                         }
                 }
 
@@ -1359,11 +1419,16 @@ func run() error {
         sig := make(chan os.Signal, 1)
         signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
         for {
-                s := <-sig
-                if s == syscall.SIGHUP {
-                        log.Info("SIGHUP received — reloading scan_checkpoint_interval from config", "config", cfgPath)
-                        reloadScanCheckpointInterval(cfgPath, cfg, log)
-                        continue
+                select {
+                case s := <-sig:
+                        if s == syscall.SIGHUP {
+                                log.Info("SIGHUP received — reloading scan_checkpoint_interval from config", "config", cfgPath)
+                                reloadScanCheckpointInterval(cfgPath, cfg, log)
+                                continue
+                        }
+                        log.Info("signal received — shutting down", "signal", s)
+                case <-memPressureCh:
+                        log.Warn("memory watchdog triggered — performing graceful restart to preserve snapshot")
                 }
                 break
         }
@@ -1537,6 +1602,26 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
         }
         log.Info("generated new validator key", "pub", lk.Public().ID(), "saved", keyPath)
         return lk, nil
+}
+
+// readRSSBytes returns the process Resident Set Size in bytes by reading
+// /proc/self/statm (Linux only).  The call does not stop the world, making it
+// safe to call from a background goroutine.  Returns 0 when the file is
+// unavailable (non-Linux environments, unit tests).
+func readRSSBytes() int64 {
+        data, err := os.ReadFile("/proc/self/statm")
+        if err != nil {
+                return 0
+        }
+        fields := strings.Fields(string(data))
+        if len(fields) < 2 {
+                return 0
+        }
+        pages, err := strconv.ParseInt(fields[1], 10, 64)
+        if err != nil {
+                return 0
+        }
+        return pages * 4096 // standard 4 KiB page size on Linux amd64/arm64
 }
 
 // parseGOMLEMLIMITBytes parses a GOMEMLIMIT string using exactly the grammar
