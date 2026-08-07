@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -844,6 +845,707 @@ func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
 		t.Errorf("PeerCount = %d after outbound dial; want ≥ 1 — whitelist incorrectly blocked outbound connection", h.PeerCount())
 	} else {
 		t.Logf("✓ outbound dial succeeded despite restrictive inbound whitelist (PeerCount=%d)", h.PeerCount())
+	}
+}
+
+// TestHost_PeerWhitelist_InvalidEntrySkipped verifies that a garbage entry in
+// PeerWhitelist is silently skipped (with a log warning) without crashing the
+// host and without discarding the surrounding valid entries.
+//
+// Three properties are asserted:
+//  1. NewHost + Start succeed with no error (no panic, no fatal).
+//  2. A connection from the valid bare IP (127.0.0.1, explicitly listed) completes
+//     the full P2P handshake and is registered as a peer — proving that entry was
+//     not thrown away together with the garbage one.
+//  3. The whitelist is still enforced (not silently reset to open): a second host
+//     whose list contains only a valid CIDR (that excludes 127.0.0.1) plus the
+//     same garbage entry rejects a connection from loopback — proving the CIDR
+//     entry was also kept despite the invalid neighbour.
+func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
+	// ── Part 1 & 2: valid IP entry survives the garbage entry ─────────────────
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "wl-invalid-host",
+		UserAgent:  "aperod/test",
+		PeerWhitelist: []string{
+			"127.0.0.1",   // valid bare IP  — must be kept
+			"10.0.0.0/8",  // valid CIDR     — must be kept
+			"not-an-ip",   // garbage        — must be skipped without crashing
+		},
+	}, &stubHandler{}, newTestLogger())
+
+	// Assertion 1: Start must not return an error (no panic, no fatal).
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v — host must start even when PeerWhitelist contains an invalid entry", err)
+	}
+	defer h.Stop()
+
+	addr := h.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr not exposed — skipping")
+	}
+
+	// Assertion 2: the valid IP entry is kept — a connection from 127.0.0.1
+	// must complete the full asymmetric P2P handshake and be registered as a peer.
+	// Keep the connection open until PeerCount is checked.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if wErr := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "wl-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); wErr != nil {
+		conn.Close()
+		t.Fatalf("write Ping: %v", wErr)
+	}
+	msgType, _, rErr := p2p.ReadMsg(conn)
+	if rErr != nil || msgType != p2p.MsgPong {
+		conn.Close()
+		t.Fatalf("expected MsgPong from host, got type=%v err=%v — valid IP entry may have been discarded alongside the invalid one", msgType, rErr)
+	}
+	conn.SetDeadline(time.Time{}) // clear deadline — hold connection open for assertion
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if h.PeerCount() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	count := h.PeerCount()
+	conn.Close()
+	if count < 1 {
+		t.Errorf("PeerCount = %d; want ≥ 1 — valid IP entry may have been discarded alongside the invalid one", count)
+	} else {
+		t.Logf("✓ whitelisted IP accepted and registered as peer (PeerCount=%d)", count)
+	}
+
+	// ── Part 3: valid CIDR entry also survives — whitelist is still enforced ──
+
+	// This host's whitelist contains a valid CIDR that does NOT cover 127.0.0.1,
+	// plus the same garbage entry.  A connection from loopback must be rejected,
+	// proving that (a) the CIDR entry was kept and (b) the garbage entry did not
+	// collapse the whitelist into open-network mode.
+	h2 := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "wl-reject-host",
+		UserAgent:  "aperod/test",
+		PeerWhitelist: []string{
+			"192.168.99.0/24", // valid CIDR — loopback NOT covered
+			"not-an-ip",       // garbage — must be skipped without crashing
+		},
+	}, &stubHandler{}, newTestLogger())
+	if err := h2.Start(); err != nil {
+		t.Fatalf("h2.Start: %v — host must start even with mixed valid/invalid whitelist", err)
+	}
+	defer h2.Stop()
+
+	addr2 := h2.ListenAddr()
+	if addr2 == "" {
+		t.Skip("h2 ListenAddr not exposed — skipping rejection check")
+	}
+
+	// Dial from 127.0.0.1 — must be rejected because the whitelist is active.
+	conn2, err := net.DialTimeout("tcp", addr2, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial h2: %v", err)
+	}
+	defer conn2.Close()
+
+	// Send a Ping so the host receives data and must actively reject, ruling
+	// out the case where silent connections are just ignored.
+	_ = p2p.WriteMsg(conn2, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "blocked-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	})
+
+	conn2.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1)
+	n, readErr := conn2.Read(buf)
+	if n > 0 {
+		t.Errorf("non-whitelisted connection was NOT rejected by h2: host sent %d byte(s) — whitelist may have been reset to open when invalid entry present", n)
+	} else if readErr == nil {
+		t.Error("non-whitelisted connection was NOT rejected by h2: Read returned nil (connection still open)")
+	} else {
+		var netErr net.Error
+		if errors.As(readErr, &netErr) && netErr.Timeout() {
+			t.Errorf("non-whitelisted connection timed out instead of being closed — whitelist enforcement broken when invalid entry present")
+		} else {
+			t.Logf("✓ non-whitelisted IP rejected despite invalid entry in whitelist (err: %v)", readErr)
+		}
+	}
+
+	if h2.PeerCount() != 0 {
+		t.Errorf("h2 PeerCount = %d; want 0 — non-whitelisted peer must not be registered", h2.PeerCount())
+	} else {
+		t.Log("✓ whitelist still active after invalid entry was skipped — no open-network regression")
+	}
+}
+
+// TestBootnode_SkipsBackoffWindow verifies that after 3 consecutive dial
+// failures back-off blocks a regular peer from being re-dialled while a
+// configured bootnode is still attempted on the very next call.
+//
+// Scenario:
+//   - Both the bootnode address and a random peer address receive 3 injected
+//     OnDialFail calls so PeerMgr.CanDial returns false for both.
+//   - DialPeer on the regular address must be silently blocked (no TCP connect).
+//   - DialPeer on the bootnode address must reach the listener (back-off skipped).
+func TestBootnode_SkipsBackoffWindow(t *testing.T) {
+	// ── Bootnode listener: accepts and immediately drops ──────────────────────
+	var bootnodeDials atomic.Int32
+	bootLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bootnode listen: %v", err)
+	}
+	defer bootLn.Close()
+	go func() {
+		for {
+			c, acceptErr := bootLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			bootnodeDials.Add(1)
+			c.Close()
+		}
+	}()
+	bootnodeAddr := bootLn.Addr().String()
+
+	// ── Regular peer listener ─────────────────────────────────────────────────
+	var regularDials atomic.Int32
+	regLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("regular listen: %v", err)
+	}
+	defer regLn.Close()
+	go func() {
+		for {
+			c, acceptErr := regLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			regularDials.Add(1)
+			c.Close()
+		}
+	}()
+	regularAddr := regLn.Addr().String()
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "bootnode-backoff-test",
+		UserAgent:  "aperod-test",
+		Bootnodes:  []string{bootnodeAddr},
+	}, &stubHandler{}, newTestLogger())
+
+	// Inject 3 consecutive failures for both addresses directly into PeerMgr
+	// so we don't have to wait for real TCP dials to fail.
+	for i := 0; i < 3; i++ {
+		p2p.HostRecordDialFail(host, bootnodeAddr)
+		p2p.HostRecordDialFail(host, regularAddr)
+	}
+
+	// PeerMgr.CanDial must now block both addresses (back-off window active).
+	if p2p.HostCanDial(host, regularAddr) {
+		t.Fatal("CanDial must be false for regular peer after 3 injected failures")
+	}
+	if p2p.HostCanDial(host, bootnodeAddr) {
+		t.Fatal("CanDial must be false for bootnode at the PeerMgr layer after 3 injected failures")
+	}
+
+	// Register the bootnode address in the host's internal set (normally done
+	// by Start when DNS is resolved; here we use the export helper that
+	// mirrors a successful maintainLoop resolution tick).
+	p2p.HostSetBootnodeResolved(host, bootnodeAddr, []string{bootnodeAddr})
+
+	// ── Regular peer: DialPeer must be silently blocked ───────────────────────
+	beforeReg := regularDials.Load()
+	host.DialPeer(regularAddr)
+	time.Sleep(200 * time.Millisecond)
+	if regularDials.Load() > beforeReg {
+		t.Error("regular peer was dialed despite back-off — back-off window must block non-bootnode peers")
+	}
+
+	// ── Bootnode: DialPeer must skip back-off and reach the listener ──────────
+	beforeBoot := bootnodeDials.Load()
+	host.DialPeer(bootnodeAddr)
+	time.Sleep(300 * time.Millisecond)
+	afterBoot := bootnodeDials.Load()
+	if afterBoot <= beforeBoot {
+		t.Errorf("bootnode dial count did not increase (before=%d after=%d): back-off must be skipped for configured bootnodes",
+			beforeBoot, afterBoot)
+	} else {
+		t.Logf("✓ bootnode re-dialed despite back-off (dial count %d→%d)", beforeBoot, afterBoot)
+	}
+}
+
+// TestBootnode_DNSRefresh_RemovesRetiredAddr verifies that when a bootnode's
+// DNS record changes (i.e. the bootnode moves to a new IP), the old address
+// is removed from the privileged set on the next resolution tick so it returns
+// to normal exponential back-off behaviour.
+//
+// Scenario:
+//  1. Bootnode "bn.example:30303" initially resolves to addrOld.
+//  2. addrOld accumulates 3 dial failures → PeerMgr back-off active.
+//  3. Back-off is skipped because addrOld is in bootnodeSet.
+//  4. DNS changes: "bn.example:30303" now resolves to addrNew only.
+//  5. After the tick, addrOld must no longer be in bootnodeSet.
+//  6. DialPeer(addrOld) must be blocked by back-off (not reach the listener).
+func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
+	// ── Two listeners: old and new bootnode addresses ─────────────────────────
+	var oldDials, newDials atomic.Int32
+
+	oldLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("old listen: %v", err)
+	}
+	defer oldLn.Close()
+	go func() {
+		for {
+			c, e := oldLn.Accept()
+			if e != nil {
+				return
+			}
+			oldDials.Add(1)
+			c.Close()
+		}
+	}()
+	addrOld := oldLn.Addr().String()
+
+	newLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("new listen: %v", err)
+	}
+	defer newLn.Close()
+	go func() {
+		for {
+			c, e := newLn.Accept()
+			if e != nil {
+				return
+			}
+			newDials.Add(1)
+			c.Close()
+		}
+	}()
+	addrNew := newLn.Addr().String()
+
+	const rawBootnode = "bn.example:30303" // symbolic key used in bootnodeLastResolved
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "dns-refresh-test",
+		UserAgent:  "aperod-test",
+		// cfg.Bootnodes deliberately empty: we drive resolution via the export
+		// helper to avoid real DNS lookups and maintainLoop timing in the test.
+	}, &stubHandler{}, newTestLogger())
+
+	// ── Step 1: initial resolution → addrOld is privileged ───────────────────
+	p2p.HostSetBootnodeResolved(host, rawBootnode, []string{addrOld})
+	if !p2p.HostIsBootnode(host, addrOld) {
+		t.Fatal("addrOld must be in bootnodeSet after initial resolution")
+	}
+
+	// ── Step 2: inject 3 failures → PeerMgr back-off active for addrOld ─────
+	for i := 0; i < 3; i++ {
+		p2p.HostRecordDialFail(host, addrOld)
+	}
+	if p2p.HostCanDial(host, addrOld) {
+		t.Fatal("CanDial must be false for addrOld after 3 injected failures")
+	}
+
+	// ── Step 3: despite back-off, DialPeer(addrOld) must still reach listener ─
+	before := oldDials.Load()
+	host.DialPeer(addrOld)
+	time.Sleep(250 * time.Millisecond)
+	if oldDials.Load() <= before {
+		t.Error("addrOld should be dialable (back-off skipped) while still in bootnodeSet")
+	}
+
+	// ── Step 4: DNS changes → bootnode now resolves to addrNew only ──────────
+	p2p.HostSetBootnodeResolved(host, rawBootnode, []string{addrNew})
+
+	// ── Step 5: addrOld must be gone from bootnodeSet; addrNew must be there ─
+	if p2p.HostIsBootnode(host, addrOld) {
+		t.Error("addrOld must NOT be in bootnodeSet after DNS moved to addrNew")
+	}
+	if !p2p.HostIsBootnode(host, addrNew) {
+		t.Error("addrNew must be in bootnodeSet after DNS resolution update")
+	}
+
+	// ── Step 6: DialPeer(addrOld) must now be blocked by its back-off ────────
+	before = oldDials.Load()
+	host.DialPeer(addrOld)
+	time.Sleep(250 * time.Millisecond)
+	if oldDials.Load() > before {
+		t.Errorf("addrOld was dialed after DNS moved away (before=%d after=%d): retired address must return to normal back-off", before, oldDials.Load())
+	} else {
+		t.Logf("✓ addrOld blocked by back-off after DNS refresh removed it from bootnodeSet")
+	}
+
+	// addrNew (the new bootnode) has no accumulated failures → DialPeer reaches it.
+	beforeNew := newDials.Load()
+	host.DialPeer(addrNew)
+	time.Sleep(250 * time.Millisecond)
+	if newDials.Load() <= beforeNew {
+		t.Errorf("addrNew should be reachable (no back-off, is bootnode) after DNS refresh")
+	} else {
+		t.Logf("✓ addrNew dialed successfully after DNS refresh (dial count %d→%d)", beforeNew, newDials.Load())
+	}
+}
+
+// ─── Whitelist sidecar tamper tests ──────────────────────────────────────────
+
+// TestHost_WhitelistSidecar_NullJSON verifies that a sidecar file containing
+// JSON null causes Start() to return a non-nil error (fail-closed).
+// json.Unmarshal decodes null into a nil slice; the node must abort rather than
+// silently treating null as an empty/open-network whitelist.
+func TestHost_WhitelistSidecar_NullJSON(t *testing.T) {
+	dir := t.TempDir()
+	sidecar := dir + "/whitelist.json"
+	if err := os.WriteFile(sidecar, []byte("null"), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		WhitelistFile: sidecar,
+		PeerWhitelist: []string{"1.2.3.4"},
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() returned nil; want non-nil error for JSON-null sidecar")
+	}
+	if !strings.Contains(err.Error(), "null") {
+		t.Errorf("error %q does not mention 'null'", err.Error())
+	}
+}
+
+// TestHost_WhitelistSidecar_InvalidIPEntry verifies that a sidecar file
+// containing a valid JSON array but with an unparseable IP/CIDR entry causes
+// Start() to return a non-nil error (fail-closed).
+// Unlike the cfg.PeerWhitelist path (which silently skips bad entries),
+// the sidecar path is fatal — an invalid entry could be a sign of tampering.
+func TestHost_WhitelistSidecar_InvalidIPEntry(t *testing.T) {
+	dir := t.TempDir()
+	sidecar := dir + "/whitelist.json"
+	// Valid JSON array but the entry "not-an-ip" is neither a bare IP nor CIDR.
+	if err := os.WriteFile(sidecar, []byte(`["1.2.3.4","not-an-ip"]`), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		WhitelistFile: sidecar,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() returned nil; want non-nil error for sidecar with invalid IP entry")
+	}
+	if !strings.Contains(err.Error(), "not-an-ip") {
+		t.Errorf("error %q does not mention the bad entry", err.Error())
+	}
+}
+
+// TestHost_WhitelistSidecar_UnreadablePermissions verifies that a sidecar file
+// that exists but cannot be read (permissions 0o000) causes Start() to return a
+// non-nil error (fail-closed).  The node must not start with an empty or default
+// whitelist when it cannot confirm the sidecar's contents.
+func TestHost_WhitelistSidecar_UnreadablePermissions(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root — permission checks do not apply")
+	}
+
+	dir := t.TempDir()
+	sidecar := dir + "/whitelist.json"
+	if err := os.WriteFile(sidecar, []byte(`["1.2.3.4"]`), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	// Remove all permissions so os.ReadFile returns an error.
+	if err := os.Chmod(sidecar, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(sidecar, 0o644) }) // restore so TempDir cleanup works
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		WhitelistFile: sidecar,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() returned nil; want non-nil error for unreadable sidecar")
+	}
+}
+
+// TestHost_AddToWhitelist_ConcurrentNeverDropsEntry is a concurrent stress test
+// that verifies two goroutines calling AddToWhitelist simultaneously always
+// produce a whitelist containing both entries.  Without wlMutate serialisation
+// both goroutines would snapshot the same (empty) list, append their own entry,
+// and the last writer would silently overwrite the first — a lost-update race.
+func TestHost_AddToWhitelist_ConcurrentNeverDropsEntry(t *testing.T) {
+	const entryA = "10.0.0.1"
+	const entryB = "10.0.0.2"
+	const iterations = 50 // run many times to surface any race
+
+	for iter := 0; iter < iterations; iter++ {
+		h := p2p.NewHost(p2p.Config{
+			MaxPeers:      10,
+			WhitelistFile: "-", // disable persistence so we test only the in-memory path
+		}, &stubHandler{}, newTestLogger())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := h.AddToWhitelist(entryA); err != nil {
+				t.Errorf("iter %d: AddToWhitelist(%q): %v", iter, entryA, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := h.AddToWhitelist(entryB); err != nil {
+				t.Errorf("iter %d: AddToWhitelist(%q): %v", iter, entryB, err)
+			}
+		}()
+		wg.Wait()
+
+		got := h.GetPeerWhitelist()
+		if len(got) != 2 {
+			t.Errorf("iter %d: whitelist has %d entries, want 2: %v", iter, len(got), got)
+			continue
+		}
+		hasA, hasB := false, false
+		for _, e := range got {
+			switch e {
+			case entryA:
+				hasA = true
+			case entryB:
+				hasB = true
+			}
+		}
+		if !hasA || !hasB {
+			t.Errorf("iter %d: whitelist missing an entry: %v", iter, got)
+		}
+	}
+}
+
+// TestHost_RemoveFromWhitelist_ConcurrentNeverDropsOtherRemoval verifies that
+// two goroutines calling RemoveFromWhitelist simultaneously each successfully
+// remove their own entry and neither call silently discards the other removal.
+// Without wlMutate serialisation both goroutines would snapshot the same 2-item
+// list, filter out their own entry, and the last writer would restore the entry
+// that the first writer removed — a lost-update race.
+func TestHost_RemoveFromWhitelist_ConcurrentNeverDropsOtherRemoval(t *testing.T) {
+	const entryA = "10.1.0.1"
+	const entryB = "10.1.0.2"
+	const iterations = 50
+
+	for iter := 0; iter < iterations; iter++ {
+		h := p2p.NewHost(p2p.Config{
+			MaxPeers:      10,
+			PeerWhitelist: []string{entryA, entryB},
+			WhitelistFile: "-",
+		}, &stubHandler{}, newTestLogger())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := h.RemoveFromWhitelist(entryA); err != nil {
+				t.Errorf("iter %d: RemoveFromWhitelist(%q): %v", iter, entryA, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := h.RemoveFromWhitelist(entryB); err != nil {
+				t.Errorf("iter %d: RemoveFromWhitelist(%q): %v", iter, entryB, err)
+			}
+		}()
+		wg.Wait()
+
+		got := h.GetPeerWhitelist()
+		if len(got) != 0 {
+			t.Errorf("iter %d: whitelist has %d entries after both removals, want 0: %v", iter, len(got), got)
+		}
+	}
+}
+
+// TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup is an integration test
+// that verifies maintainLoop re-dials BOTH configured bootnodes after a
+// transient network disconnection.
+//
+// Setup: bootnode A uses a plain IPv4 IP:port address; bootnode B uses the
+// /ip4/.../tcp/... multiaddr format (exercising resolveBootnode's parser) when
+// IPv6 is unavailable, or /ip6/::1/tcp/... when the host supports IPv6.
+//
+// Regression guarded: if the bootnode-retry loop in maintainLoop iterated only
+// a subset of bootnodeLastResolved (e.g. stopped after the first entry), the
+// node would silently end up with only one bootnode after a partition.
+func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
+	// ── Bootnode A: plain IPv4 IP:port ────────────────────────────────────────
+	lnA, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("lnA listen: %v", err)
+	}
+	defer lnA.Close()
+	addrA := lnA.Addr().String() // plain "127.0.0.1:PORT" — passed as-is to Bootnodes
+
+	// ── Bootnode B: prefer IPv6 multiaddr; fall back to IPv4 multiaddr ────────
+	// Using the multiaddr /ip4/.../tcp/... or /ip6/.../tcp/... form ensures the
+	// resolveBootnode round-trip (multiaddr → dialable IP:port) is exercised.
+	var lnB net.Listener
+	var addrBMultiaddr string
+
+	if ln6, err6 := net.Listen("tcp6", "[::1]:0"); err6 == nil {
+		lnB = ln6
+		h6, p6, _ := net.SplitHostPort(ln6.Addr().String())
+		addrBMultiaddr = fmt.Sprintf("/ip6/%s/tcp/%s", h6, p6)
+		t.Logf("bootnode B: IPv6 multiaddr %s", addrBMultiaddr)
+	} else {
+		// IPv6 not available — use a second IPv4 listener in multiaddr format.
+		ln4b, err4 := net.Listen("tcp4", "127.0.0.1:0")
+		if err4 != nil {
+			t.Fatalf("lnB listen: %v", err4)
+		}
+		lnB = ln4b
+		_, pB, _ := net.SplitHostPort(ln4b.Addr().String())
+		addrBMultiaddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%s", pB)
+		t.Logf("bootnode B: IPv4 multiaddr fallback %s", addrBMultiaddr)
+	}
+	defer lnB.Close()
+
+	var dialCountA, dialCountB atomic.Int32
+
+	// serverConns collects every server-side connection so we can close them
+	// all at once to simulate the network hiccup.
+	var connMu sync.Mutex
+	var serverConns []net.Conn
+
+	// startAcceptor runs a goroutine that accepts connections, completes the
+	// asymmetric P2P handshake (read Ping → write Pong), and holds the
+	// connection open until it is closed by the hiccup simulation or the test
+	// listener is closed.
+	startAcceptor := func(ln net.Listener, count *atomic.Int32) {
+		go func() {
+			for {
+				c, acceptErr := ln.Accept()
+				if acceptErr != nil {
+					return // listener closed — test is done
+				}
+				count.Add(1)
+				connMu.Lock()
+				serverConns = append(serverConns, c)
+				connMu.Unlock()
+				go func(c net.Conn) {
+					defer c.Close()
+					c.SetDeadline(time.Now().Add(2 * time.Second))
+					// Outbound dialer sends Ping first under the asymmetric handshake.
+					msgType, _, rdErr := p2p.ReadMsg(c)
+					if rdErr != nil || msgType != p2p.MsgPing {
+						return
+					}
+					if wrErr := p2p.WriteMsg(c, p2p.MsgPong, p2p.PingMsg{
+						NodeID: "bootnode", UserAgent: "test", Timestamp: time.Now().Unix(),
+					}); wrErr != nil {
+						return
+					}
+					c.SetDeadline(time.Time{}) // clear deadline — hold open
+					// io.Copy blocks until the connection is closed (hiccup sim or
+					// test teardown) and returns cleanly on EOF / net.Error.
+					io.Copy(io.Discard, c) //nolint:errcheck
+				}(c)
+			}
+		}()
+	}
+	startAcceptor(lnA, &dialCountA)
+	startAcceptor(lnB, &dialCountB)
+
+	// ── Host under test ────────────────────────────────────────────────────────
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		MinPeers:   2,
+		NodeID:     "maintain-test",
+		UserAgent:  "aperod-test",
+		// addrA is a plain IP:port; addrBMultiaddr is a /ip4/ or /ip6/ multiaddr.
+		// Both must survive the resolveBootnode round-trip inside maintainLoop.
+		Bootnodes: []string{addrA, addrBMultiaddr},
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	// ── Phase 1: wait for the initial dial to reach BOTH bootnodes ────────────
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dialCountA.Load() >= 1 && dialCountB.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dialCountA.Load() < 1 || dialCountB.Load() < 1 {
+		t.Fatalf("initial dial: want ≥1 dial to each bootnode; got A=%d B=%d",
+			dialCountA.Load(), dialCountB.Load())
+	}
+	t.Logf("initial dials ok: A=%d B=%d PeerCount=%d",
+		dialCountA.Load(), dialCountB.Load(), host.PeerCount())
+
+	// ── Phase 2: simulate network hiccup — close all server-side connections ──
+	connMu.Lock()
+	for _, c := range serverConns {
+		c.Close()
+	}
+	serverConns = serverConns[:0]
+	connMu.Unlock()
+
+	// Wait for the host to detect both peers dropped (PeerCount → 0).
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Logf("after hiccup: PeerCount=%d", host.PeerCount())
+
+	// ── Phase 3: fire one maintain tick; both bootnodes must be re-dialled ────
+	p2p.HostTriggerMaintain(host)
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dialCountA.Load() >= 2 && dialCountB.Load() >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Each bootnode must have been contacted at least twice (initial + reconnect).
+	if dialCountA.Load() < 2 {
+		t.Errorf("bootnode A (%s) not re-dialled after hiccup: total dials=%d, want ≥2",
+			addrA, dialCountA.Load())
+	}
+	if dialCountB.Load() < 2 {
+		t.Errorf("bootnode B (%s) not re-dialled after hiccup: total dials=%d, want ≥2",
+			addrBMultiaddr, dialCountB.Load())
+	}
+	if !t.Failed() {
+		t.Logf("✓ both bootnodes re-dialled after hiccup: A=%d B=%d",
+			dialCountA.Load(), dialCountB.Load())
 	}
 }
 
