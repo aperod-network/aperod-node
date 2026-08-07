@@ -258,17 +258,49 @@ if [[ ! -f "${TIMEOUT_CONF}" ]]; then
   echo "  [patch] daemon-reload complete — new TimeoutStopSec takes effect after restart."
 else
   # File exists — parse the current TimeoutStopSec and upgrade if unsafe.
-  # "infinity" is always safe; any numeric value below TIMEOUT_MIN_SEC is not.
-  _current=$(grep -E '^[[:space:]]*TimeoutStopSec=' "${TIMEOUT_CONF}" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+  #
+  # grep uses || true so a missing TimeoutStopSec line does not abort the
+  # script under set -euo pipefail (grep exits 1 when it matches nothing).
+  _current=$(grep -E '^[[:space:]]*TimeoutStopSec=' "${TIMEOUT_CONF}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]' || true)
   _need_upgrade=false
+
   if [[ -z "${_current}" ]]; then
-    # File exists but has no TimeoutStopSec — add one.
+    # File exists but has no TimeoutStopSec line — must add one.
     _need_upgrade=true
+
   elif [[ "${_current,,}" == "infinity" ]]; then
+    # infinity is always safe — never downgrade.
     _need_upgrade=false
+
   else
-    # Numeric: upgrade if below minimum threshold.
-    if [[ "${_current}" =~ ^[0-9]+$ ]] && (( _current < TIMEOUT_MIN_SEC )); then
+    # Normalise systemd duration syntax to seconds so suffixed values like
+    # "300s" or "5min" are compared correctly against TIMEOUT_MIN_SEC.
+    # Supported suffixes (case-insensitive, single unit only):
+    #   NNs | NNsec | NNsecs | NNsecond | NNseconds  → N seconds
+    #   NNm | NNmin | NNmins | NNminute | NNminutes   → N * 60
+    #   NNh | NNhr  | NNhrs  | NNhour   | NNhours     → N * 3600
+    # Bare integers are already in seconds.
+    # Any other format (compound "5min 30s", unrecognised suffix, etc.) is
+    # treated as unparseable and upgraded to the safe value — better safe
+    # than sorry when the UTXO snapshot could be multi-GB.
+    _secs=""
+    _lower="${_current,,}"
+
+    if [[ "${_lower}" =~ ^([0-9]+)(s|sec|secs|second|seconds)$ ]]; then
+      _secs="${BASH_REMATCH[1]}"
+    elif [[ "${_lower}" =~ ^([0-9]+)(m|min|mins|minute|minutes)$ ]]; then
+      _secs=$(( BASH_REMATCH[1] * 60 ))
+    elif [[ "${_lower}" =~ ^([0-9]+)(h|hr|hrs|hour|hours)$ ]]; then
+      _secs=$(( BASH_REMATCH[1] * 3600 ))
+    elif [[ "${_lower}" =~ ^[0-9]+$ ]]; then
+      _secs="${_current}"
+    fi
+    # _secs is empty → unrecognised format → upgrade.
+
+    if [[ -z "${_secs}" ]]; then
+      echo "  [patch] ${TIMEOUT_CONF}: TimeoutStopSec=${_current} is unrecognised/complex — upgrading to safe value."
+      _need_upgrade=true
+    elif (( _secs < TIMEOUT_MIN_SEC )); then
       _need_upgrade=true
     fi
   fi
@@ -279,7 +311,7 @@ else
     systemctl daemon-reload
     echo "  [patch] daemon-reload complete — TimeoutStopSec upgraded to ${TIMEOUT_MIN_SEC}."
   else
-    echo "  [ok] ${TIMEOUT_CONF}: TimeoutStopSec=${_current} is already safe (≥ ${TIMEOUT_MIN_SEC}s) — not overwriting."
+    echo "  [ok] ${TIMEOUT_CONF}: TimeoutStopSec=${_current} is safe (≥ ${TIMEOUT_MIN_SEC}s) — not overwriting."
   fi
 fi
 
