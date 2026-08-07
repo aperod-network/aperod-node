@@ -597,6 +597,86 @@ func TestTLS_HandshakeFlood(t *testing.T) {
 	}
 }
 
+// ─── T-12: Connection survives 12 s of idle silence (ReadTimeout regression) ──
+//
+// With the old ReadTimeout = 5 s a passive peer that had nothing to send would
+// be dropped after 5 s because ReadMsg would hit its deadline.  After raising
+// ReadTimeout to 30 s and moving the keepalive ticker to 10 s, a connection
+// that exchanges zero application messages must still be alive after 12 s.
+//
+// Two full TLS hosts are connected over real TCP (net.Pipe ignores deadlines).
+// Neither side sends any application data after the initial Aperod handshake.
+// The keepalive goroutine fires at ≈10 s, renewing the read deadline on both
+// sides.  At t = 12 s both hosts must still report PeerCount == 1.
+
+func TestTLS_ConnectionSurvivesIdleSilence(t *testing.T) {
+	cfgA, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-12: gen config A: %v", err)
+	}
+	cfgB, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-12: gen config B: %v", err)
+	}
+
+	hostA := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   5,
+		NodeID:     "silence-node-a",
+		UserAgent:  "aperod/test",
+		TLSConfig:  cfgA,
+	}, &stubHandler{}, newTestLogger())
+	if err := hostA.Start(); err != nil {
+		t.Fatalf("T-12: hostA.Start: %v", err)
+	}
+	t.Cleanup(hostA.Stop)
+
+	hostB := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   5,
+		NodeID:     "silence-node-b",
+		UserAgent:  "aperod/test",
+		TLSConfig:  cfgB,
+	}, &stubHandler{}, newTestLogger())
+	if err := hostB.Start(); err != nil {
+		t.Fatalf("T-12: hostB.Start: %v", err)
+	}
+	t.Cleanup(hostB.Stop)
+
+	// Connect B → A.  DialPeer is asynchronous; poll until both sides register
+	// the peer (or fail after 3 s).
+	hostB.DialPeer(hostA.ListenAddr())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if hostA.PeerCount() == 1 && hostB.PeerCount() == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if hostA.PeerCount() != 1 || hostB.PeerCount() != 1 {
+		t.Fatalf("T-12: connection not established after 3 s: hostA peers=%d hostB peers=%d",
+			hostA.PeerCount(), hostB.PeerCount())
+	}
+
+	// Sleep 12 s — no application data is sent by either side.
+	// With the old ReadTimeout = 5 s the connection would have been torn down
+	// around t = 5 s.  With ReadTimeout = 30 s and a 10 s keepalive ping both
+	// peers remain connected.
+	t.Log("T-12: sleeping 12 s to verify connection survives idle silence …")
+	time.Sleep(12 * time.Second)
+
+	if hostA.PeerCount() != 1 {
+		t.Errorf("T-12: hostA lost peer after 12 s of silence (peers=%d, want 1) — ReadTimeout too tight or keepalive broken", hostA.PeerCount())
+	}
+	if hostB.PeerCount() != 1 {
+		t.Errorf("T-12: hostB lost peer after 12 s of silence (peers=%d, want 1) — ReadTimeout too tight or keepalive broken", hostB.PeerCount())
+	}
+	t.Logf("T-12 ✓ both peers still connected after 12 s of idle silence: hostA=%d hostB=%d",
+		hostA.PeerCount(), hostB.PeerCount())
+}
+
 // ─── T-8: Forged-cert peer cannot inject a block ──────────────────────────────
 //
 // Security regression test: a peer that presents a self-signed certificate
@@ -698,5 +778,122 @@ func TestTLS_ForgedCert_CannotInjectBlock(t *testing.T) {
 		t.Errorf("T-8: OnBlock was called %d time(s) — forged-cert peer injected a block", len(handler.blocks))
 	} else {
 		t.Logf("T-8 ✓ forged-cert peer could not inject block: OnBlock=0 peers=%d", host.PeerCount())
+	}
+}
+
+// ─── T-13: Silent peer evicted after pong deadline ────────────────────────────
+//
+// Verifies that a peer which never replies to keepalive MsgPing messages is
+// evicted once 2× KeepaliveInterval elapses since the last MsgPong.  This
+// detects half-open TCP connections (e.g. after a peer crash) that would
+// otherwise hold a peer slot for up to ~2 h waiting for the OS TCP keepalive.
+//
+// Test sequence:
+//  1. Start a host with a short KeepaliveInterval (100 ms) so the deadline
+//     (200 ms) is reached quickly.
+//  2. Connect a raw plain-TCP client that completes only the initial Aperod
+//     handshake (sends MsgPing, receives MsgPong).
+//  3. The client drains all incoming messages (to avoid write-blocking the
+//     host) but never sends a MsgPong back.
+//  4. After ≈3 keepalive ticks (~300 ms) the host's pong-deadline check must
+//     close the connection.
+//  5. Assert PeerCount drops to 0 within 1 s.
+
+func TestKeepalive_SilentPeerEvicted(t *testing.T) {
+	const (
+		ka      = 100 * time.Millisecond // keepalive interval
+		timeout = 2 * time.Second        // test wall-clock budget
+	)
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          5,
+		NodeID:            "pong-deadline-host",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: ka,
+		// No TLSConfig — plain TCP for simplicity; TLS mutual-auth is tested
+		// separately in T-2/T-6/T-10.
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("T-13: host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	// Dial with a raw TCP connection (no TLS — host has no TLSConfig).
+	conn, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("T-13: dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Complete the Aperod handshake: dialer sends MsgPing, host replies MsgPong.
+	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "silent-peer", Height: 0, UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("T-13: write handshake ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(conn)
+	if err != nil {
+		t.Fatalf("T-13: read handshake pong: %v", err)
+	}
+	if msgType != p2p.MsgPong {
+		t.Fatalf("T-13: expected MsgPong from host, got %v", msgType)
+	}
+
+	// Handshake complete — host registers the peer.
+	time.Sleep(50 * time.Millisecond)
+	if host.PeerCount() != 1 {
+		t.Fatalf("T-13: peer not registered after handshake (count=%d, want 1)", host.PeerCount())
+	}
+
+	// Drain incoming MsgPing messages from the host's keepalive goroutine but
+	// never reply with MsgPong.  Run in a background goroutine; stop when the
+	// connection closes or the test ends.
+	conn.SetDeadline(time.Time{}) //nolint:errcheck
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			conn.SetReadDeadline(time.Now().Add(timeout)) //nolint:errcheck
+			typ, _, err := p2p.ReadMsg(conn)
+			if err != nil {
+				return // connection closed by host — expected
+			}
+			if typ != p2p.MsgPing {
+				// Unexpected message type; keep draining.
+				continue
+			}
+			// Intentionally do NOT send MsgPong — this is the whole point of
+			// the test.
+		}
+	}()
+
+	// Poll until PeerCount drops to 0 (host evicts the silent peer) or we time out.
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() == 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Wait for the drain goroutine to finish (it should have exited once the
+	// host closed the connection).
+	select {
+	case <-drainDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Log("T-13: drain goroutine did not finish — connection may still be open")
+	}
+
+	if host.PeerCount() != 0 {
+		t.Errorf("T-13: silent peer was NOT evicted after pong deadline "+
+			"(peer count=%d, want 0) — pong-deadline check not working",
+			host.PeerCount())
+	} else {
+		t.Logf("T-13 ✓ silent peer evicted after pong deadline: "+
+			"keepalive_interval=%s deadline=%s",
+			ka, 2*ka)
 	}
 }
