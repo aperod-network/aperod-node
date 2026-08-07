@@ -101,7 +101,87 @@ func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
         }
 }
 
+// runCheckStore implements the --check-store subcommand.
+//
+// Usage: aperod-node --check-store --data-dir=<path> [--max-missing=<n>]
+//
+// Opens the chain.db found inside <data-dir>, reads the stored tip height from
+// the metadata, then iterates the height index to count missing block entries.
+// Exits non-zero (and prints a human-readable error) when the count exceeds
+// max-missing (default: 5000 — identical to the scan.go runtime default so
+// the pre-flight check and the actual scan use the same threshold).
+//
+// This is intentionally config-free: operators call it right after an rsync
+// when no full node.yaml may yet be present on the relay.
+func runCheckStore() error {
+        dataDir := ""
+        maxMissing := uint64(5000) // mirrors the scan.go hardcoded default
+
+        args := os.Args[1:]
+        for i, arg := range args {
+                switch {
+                case strings.HasPrefix(arg, "--data-dir="):
+                        dataDir = strings.TrimPrefix(arg, "--data-dir=")
+                case arg == "--data-dir" && i+1 < len(args):
+                        dataDir = args[i+1]
+                case strings.HasPrefix(arg, "--max-missing="):
+                        if v, parseErr := strconv.ParseUint(strings.TrimPrefix(arg, "--max-missing="), 10, 64); parseErr == nil {
+                                maxMissing = v
+                        }
+                }
+        }
+
+        if dataDir == "" {
+                return fmt.Errorf("--check-store requires --data-dir=<path>")
+        }
+
+        dbPath := filepath.Join(dataDir, "chain.db")
+        db, err := store.Open(dbPath)
+        if err != nil {
+                return fmt.Errorf("check-store: open %s: %w", dbPath, err)
+        }
+        defer db.Close()
+
+        _, tipHeight, err := db.GetTip()
+        if err != nil {
+                return fmt.Errorf("check-store: read tip: %w", err)
+        }
+        if tipHeight == 0 {
+                fmt.Fprintf(os.Stdout, "check-store OK: empty store (tip_height=0)\n")
+                return nil
+        }
+
+        missing, firstMissing, err := db.CountMissingHeights(tipHeight)
+        if err != nil {
+                return fmt.Errorf("check-store: scan height index: %w", err)
+        }
+
+        if missing > maxMissing {
+                return fmt.Errorf(
+                        "check-store: %d missing blocks (first missing: %d, tip: %d) "+
+                                "exceeds threshold %d — "+
+                                "the rsync'd chain.db has gaps consistent with a live-LevelDB copy; "+
+                                "re-run bootstrap to obtain a consistent snapshot",
+                        missing, firstMissing, tipHeight, maxMissing,
+                )
+        }
+
+        fmt.Fprintf(os.Stdout,
+                "check-store OK: tip_height=%d missing=%d (threshold=%d)\n",
+                tipHeight, missing, maxMissing)
+        return nil
+}
+
 func run() error {
+        // ── 0. check-store subcommand ─────────────────────────────────────────────
+        // Processed before config loading so operators can verify a chain.db that
+        // was just rsync'd without needing a fully-configured node.yaml.
+        for _, arg := range os.Args[1:] {
+                if arg == "--check-store" {
+                        return runCheckStore()
+                }
+        }
+
         // ── 1. Load configuration ─────────────────────────────────────────────────
         cfgPath := "config/testnet.yaml"
         resetP2PIdentity := false
@@ -508,6 +588,8 @@ func run() error {
                         }
                         if apiSrv != nil {
                                 apiSrv.SetStoreMissingBlocks(int64(missingCount))
+                                apiSrv.SetStoreMissingFirstBlock(int64(firstMissing))
+                                apiSrv.SetStoreMissingLastBlock(int64(lastMissing))
                         }
                 }
 
@@ -1279,6 +1361,7 @@ func run() error {
                                 BadBlockBanDuration:  cfg.P2P.BadBlockBanDuration,
                                 BanFile:              banFilePath,
                                 WhitelistFile:        whitelistFilePath,
+                                KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
