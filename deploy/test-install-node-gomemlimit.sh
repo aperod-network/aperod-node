@@ -540,6 +540,103 @@ else
   fail "TimeoutStopSec=1200 was NOT preserved (content: $(cat "$T13_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
+# =============================================================================
+# Test 14: update-node.sh upgrades when timeout.conf has no TimeoutStopSec line
+# =============================================================================
+section "Test 14 (update-node.sh): upgrades when timeout.conf has no TimeoutStopSec directive"
+
+T14_DIR=$(mktemp -d "$TMPDIR_TEST/t14-XXXXXXXX")
+T14_DROPIN="$T14_DIR/timeout.conf"
+# Pre-create file without a TimeoutStopSec line
+cat > "$T14_DROPIN" <<'PRE'
+[Service]
+# placeholder — no TimeoutStopSec
+PRE
+
+if run_update_timeout_block "$T14_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 when timeout.conf has no TimeoutStopSec"
+else
+  fail "step 0c exited non-zero when timeout.conf has no TimeoutStopSec (grep -euo pipefail bug?)"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T14_DROPIN" 2>/dev/null; then
+  pass "TimeoutStopSec=900 added when directive was missing"
+else
+  fail "TimeoutStopSec=900 NOT added (content: $(cat "$T14_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 15: update-node.sh upgrades suffixed unsafe value "300s"
+# =============================================================================
+section "Test 15 (update-node.sh): upgrades suffixed unsafe TimeoutStopSec=300s"
+
+T15_DIR=$(mktemp -d "$TMPDIR_TEST/t15-XXXXXXXX")
+T15_DROPIN="$T15_DIR/timeout.conf"
+cat > "$T15_DROPIN" <<'PRE'
+[Service]
+TimeoutStopSec=300s
+PRE
+
+if run_update_timeout_block "$T15_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with TimeoutStopSec=300s"
+else
+  fail "step 0c exited non-zero with TimeoutStopSec=300s"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T15_DROPIN" 2>/dev/null; then
+  pass "300s upgraded to 900"
+else
+  fail "300s was NOT upgraded (content: $(cat "$T15_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 16: update-node.sh upgrades suffixed unsafe value "5min"
+# =============================================================================
+section "Test 16 (update-node.sh): upgrades suffixed unsafe TimeoutStopSec=5min (=300s)"
+
+T16_DIR=$(mktemp -d "$TMPDIR_TEST/t16-XXXXXXXX")
+T16_DROPIN="$T16_DIR/timeout.conf"
+cat > "$T16_DROPIN" <<'PRE'
+[Service]
+TimeoutStopSec=5min
+PRE
+
+if run_update_timeout_block "$T16_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with TimeoutStopSec=5min"
+else
+  fail "step 0c exited non-zero with TimeoutStopSec=5min"
+fi
+
+if grep -q "^TimeoutStopSec=900$" "$T16_DROPIN" 2>/dev/null; then
+  pass "5min (300 s) upgraded to 900"
+else
+  fail "5min was NOT upgraded (content: $(cat "$T16_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 17: update-node.sh preserves safe suffixed value "1800s"
+# =============================================================================
+section "Test 17 (update-node.sh): preserves safe suffixed TimeoutStopSec=1800s"
+
+T17_DIR=$(mktemp -d "$TMPDIR_TEST/t17-XXXXXXXX")
+T17_DROPIN="$T17_DIR/timeout.conf"
+cat > "$T17_DROPIN" <<'PRE'
+[Service]
+TimeoutStopSec=1800s
+PRE
+
+if run_update_timeout_block "$T17_DIR" >/dev/null 2>&1; then
+  pass "step 0c exited 0 with TimeoutStopSec=1800s"
+else
+  fail "step 0c exited non-zero with TimeoutStopSec=1800s"
+fi
+
+if grep -q "^TimeoutStopSec=1800s$" "$T17_DROPIN" 2>/dev/null; then
+  pass "1800s preserved (not overwritten)"
+else
+  fail "1800s was NOT preserved (content: $(cat "$T17_DROPIN" 2>/dev/null || echo '<missing>'))"
+fi
+
 fi  # end: UPDATE_SH exists guard
 
 # =============================================================================
