@@ -245,7 +245,7 @@ func DefaultConfig() *Config {
 			MinOutbound:          4,  // always keep 4 slots free for outbound dial-outs
 			MaxPendingHandshakes: 20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
 			BadBlockHeightLead:   1000,
-			BadBlockBanThreshold: 10,
+			BadBlockBanThreshold: 5,
 			BadBlockBanDuration:  24 * time.Hour,
 		},
 		Consensus: ConsensusConfig{
