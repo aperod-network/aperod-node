@@ -494,6 +494,25 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
+        // Disk fallback: the tx may be in an older block evicted from the
+        // in-memory sliding window.  Check the persisted tx-location index.
+        if diskTx, diskLoc, found, diskErr := s.getTransactionFromDisk(hash); diskErr == nil && found {
+                bHash := diskLoc.Block.Hash()
+                writeJSON(w, http.StatusOK, TxResponse{
+                        Hash:        hashStr,
+                        BlockHash:   fmt.Sprintf("%x", bHash[:]),
+                        BlockHeight: diskLoc.Block.Header.Height,
+                        TxIndex:     diskLoc.TxIndex,
+                        IsCoinbase:  diskLoc.TxIndex == 0 && diskTx.IsCoinbase(),
+                        Inputs:      len(diskTx.Inputs),
+                        Outputs:     len(diskTx.Outputs),
+                        Fee:         diskTx.Fee,
+                        Size:        diskTx.Size(),
+                        Version:     uint8(diskTx.Version),
+                })
+                return
+        }
+
         writeJSONError(w, http.StatusNotFound, "transaction not found")
 }
 
@@ -2246,7 +2265,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"syncing_height":       syncingHeight,
 		"tip_height":           tipHeight,
 		"utxo_rebuilding":      atomic.LoadInt32(&s.utxoRebuilding) == 1,
-		"store_missing_blocks": storeMissing,
+		"store_missing_blocks":      storeMissing,
+		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
+		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
 	}
 	// Use the live whitelist from the P2P layer when wired; fall back to the
 	// startup snapshot so /api/v1/status is never stale after live edits.
