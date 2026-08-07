@@ -11,6 +11,7 @@ package p2p_test
 import (
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -670,6 +671,228 @@ func TestBadBlockBan_NonWhitelistedStillBanned(t *testing.T) {
 		t.Errorf("ban entry for bare IP %q not found after threshold=3; all bans: %v", peerIP, bans)
 	}
 	t.Logf("non-whitelisted peer %s correctly banned after 3 out-of-range blocks", peerIP)
+}
+
+// ─── Test: whitelist loaded from sidecar survives a simulated node restart ────
+
+// TestBadBlockBan_WhitelistPersistsAcrossRestart is the regression test for the
+// scenario where the sidecar whitelist file is missing or empty after a restart,
+// causing a trusted validator to be incorrectly auto-banned.
+//
+// Sequence:
+//  1. Create Host1 with PeerWhitelist=["127.0.0.1"] + a WhitelistFile path.
+//     On Start() the sidecar is seeded from cfg.PeerWhitelist.
+//  2. Connect a peer and send out-of-range blocks → no ban (IP is whitelisted).
+//  3. Stop Host1.
+//  4. Create Host2 with an EMPTY cfg.PeerWhitelist but the SAME WhitelistFile.
+//     On Start() the sidecar is loaded as the authoritative whitelist.
+//  5. Connect a peer and send out-of-range blocks → still no ban.
+//
+// If loadWhitelistFromFile() is broken (e.g. sidecar ignored or file missing),
+// Host2 would start with an empty whitelist and ban the validator after
+// BadBlockBanThreshold strikes.
+func TestBadBlockBan_WhitelistPersistsAcrossRestart(t *testing.T) {
+	// Use a temp dir so the sidecar file is cleaned up automatically.
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	const threshold = 3
+
+	// ── Phase 1: first boot seeds the sidecar ────────────────────────────────
+
+	h1 := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-wl-restart-1",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+		// Whitelist the loopback so the test peer (127.0.0.1) is a trusted validator.
+		PeerWhitelist: []string{"127.0.0.1"},
+		// Persist the whitelist to disk so it survives the simulated restart.
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h1.Start(); err != nil {
+		t.Fatalf("h1.Start: %v", err)
+	}
+
+	conn1, peerIP := connectPeer(t, h1.ListenAddr())
+	defer conn1.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h1.PeerCount() == 1 }) {
+		t.Fatal("h1: peer did not register after handshake")
+	}
+
+	// Send threshold+5 out-of-range blocks; a non-whitelisted peer would be
+	// banned at exactly threshold.  The whitelisted 127.0.0.1 must not be banned.
+	for i := 0; i < threshold+5; i++ {
+		sendBlockAtHeight(t, conn1, 9999)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if bans := h1.ListBans(); len(bans) != 0 {
+		t.Fatalf("h1: whitelisted peer %s was banned after %d out-of-range blocks; expected no ban",
+			peerIP, threshold+5)
+	}
+	if h1.PeerCount() != 1 {
+		t.Errorf("h1: PeerCount = %d after out-of-range blocks from whitelisted peer, want 1",
+			h1.PeerCount())
+	}
+	t.Logf("h1: peer %s correctly not banned (whitelisted); sidecar written to %s", peerIP, wlFile)
+
+	h1.Stop()
+	conn1.Close()
+
+	// ── Phase 2: simulated restart — sidecar is the sole source of truth ─────
+
+	h2 := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-wl-restart-2",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+		// Deliberately omit PeerWhitelist — the sidecar is the authoritative source.
+		// If loadWhitelistFromFile() is broken, this becomes an empty whitelist and
+		// the test will detect the regression.
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h2.Start(); err != nil {
+		t.Fatalf("h2.Start (simulated restart): %v", err)
+	}
+	defer h2.Stop()
+
+	// Verify the whitelist was loaded from the sidecar (not from cfg.PeerWhitelist).
+	loaded := h2.GetPeerWhitelist()
+	found := false
+	for _, entry := range loaded {
+		if entry == "127.0.0.1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("h2: whitelist not loaded from sidecar %q; loaded entries: %v", wlFile, loaded)
+	}
+	t.Logf("h2: whitelist loaded from sidecar: %v", loaded)
+
+	conn2, peerIP2 := connectPeer(t, h2.ListenAddr())
+	defer conn2.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h2.PeerCount() == 1 }) {
+		t.Fatal("h2: peer did not register after handshake (post-restart)")
+	}
+
+	// Send the same number of out-of-range blocks as Phase 1.  If the whitelist
+	// was not restored from the sidecar, the peer would be banned at strike threshold.
+	for i := 0; i < threshold+5; i++ {
+		sendBlockAtHeight(t, conn2, 9999)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if bans := h2.ListBans(); len(bans) != 0 {
+		t.Errorf("h2 (post-restart): peer %s was banned — whitelist was NOT restored from sidecar %q; bans: %v",
+			peerIP2, wlFile, bans)
+	} else {
+		t.Logf("h2 (post-restart): peer %s correctly not banned — whitelist survived the restart", peerIP2)
+	}
+	if h2.PeerCount() != 1 {
+		t.Errorf("h2 (post-restart): PeerCount = %d, want 1", h2.PeerCount())
+	}
+}
+
+// ─── Tests: corrupt whitelist sidecar aborts Start() ─────────────────────────
+
+// TestWhitelistSidecar_CorruptAbortsStart verifies that loadWhitelistFromFile()
+// returns a fatal error for each class of corrupt sidecar, causing Start() to
+// abort rather than running fail-open (allowing all inbound peers in).
+func TestWhitelistSidecar_CorruptAbortsStart(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string // raw file content written to the sidecar
+	}{
+		{
+			name:    "json_null",
+			content: "null",
+		},
+		{
+			name:    "truncated_json",
+			content: `["1.2.3.4", "5.6.7`,
+		},
+		{
+			name:    "invalid_ip_entry",
+			content: `["1.2.3.4", "not-an-ip-or-cidr"]`,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			wlFile := dir + "/whitelist.json"
+
+			// Write the corrupt sidecar.
+			if err := os.WriteFile(wlFile, []byte(tc.content), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			h := p2p.NewHost(p2p.Config{
+				ListenAddr:    "127.0.0.1:0",
+				MaxPeers:      10,
+				NodeID:        "test-corrupt-wl-" + tc.name,
+				UserAgent:     "aperod/test",
+				WhitelistFile: wlFile,
+			}, &stubHandler{}, newTestLogger())
+
+			err := h.Start()
+			if err == nil {
+				h.Stop()
+				t.Fatalf("Start() returned nil for corrupt sidecar (%s); expected a non-nil error", tc.name)
+			}
+			t.Logf("Start() correctly returned error for %s: %v", tc.name, err)
+		})
+	}
+}
+
+// TestWhitelistSidecar_UnreadableAbortsStart verifies that Start() returns a
+// non-nil error when the sidecar file exists but cannot be read (mode 000).
+// This prevents the node from running as an open network when file permissions
+// prevent the whitelist from being loaded.
+func TestWhitelistSidecar_UnreadableAbortsStart(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root — chmod 000 does not restrict root; skipping unreadable-file test")
+	}
+
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// Write a valid sidecar, then make it unreadable.
+	if err := os.WriteFile(wlFile, []byte(`["1.2.3.4"]`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(wlFile, 0o000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(wlFile, 0o644) }) // restore so TempDir cleanup succeeds
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-unreadable-wl",
+		UserAgent:     "aperod/test",
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() returned nil for unreadable sidecar; expected a non-nil error")
+	}
+	t.Logf("Start() correctly returned error for unreadable sidecar: %v", err)
 }
 
 // Keep the import used via fmt.Sprintf in future tests.
