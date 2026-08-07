@@ -96,13 +96,30 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
 
                 tx, loc, ok := s.chain.GetTransaction(txHash)
                 if !ok {
-                        // Fallback: check mempool (tx submitted but not yet in a block)
+                        // Fallback 1: check mempool (tx submitted but not yet in a block)
                         mempoolTx, inMempool := s.mempool.Get(txHash)
-                        if !inMempool {
-                                return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart", u.TxHash[:min(16, len(u.TxHash))])
+                        if inMempool {
+                                tx = mempoolTx
+                                loc.Block = &core.Block{} // block not yet assigned; height 0
+                                ok = true
                         }
-                        tx = mempoolTx
-                        loc.Block = &core.Block{} // block not yet assigned; height 0
+                }
+                if !ok {
+                        // Fallback 2: LevelDB disk lookup for blocks evicted from the
+                        // in-memory sliding window (MaxInMemoryBlocks = 1000).
+                        // Admin-minted UTXOs in old blocks hit this path after a node
+                        // restart — the tx is on-chain but no longer in the in-memory map.
+                        diskTx, diskLoc, diskFound, diskErr := s.getTransactionFromDisk(txHash)
+                        if diskErr != nil {
+                                return nil, fmt.Errorf("disk fallback for tx %s: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], diskErr)
+                        }
+                        if diskFound {
+                                tx, loc, ok = diskTx, diskLoc, true
+                        }
+                }
+                if !ok {
+                        return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart", u.TxHash[:min(16, len(u.TxHash))])
                 }
                 if int(u.OutIdx) >= len(tx.Outputs) {
                         return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
