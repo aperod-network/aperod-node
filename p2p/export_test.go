@@ -45,3 +45,43 @@ func (h *Host) RecordBadBlockStrike(ip string) int {
 func HostCanDial(h *Host, addr string) bool {
 	return h.mgr.CanDial(addr)
 }
+
+// HostRecordDialFail directly records a dial failure in the host's PeerMgr,
+// advancing the back-off counter for addr.  Exported for tests that need to
+// inject back-off state without going through the network layer.
+func HostRecordDialFail(h *Host, addr string) {
+	h.mgr.OnDialFail(addr)
+}
+
+// HostSetBootnodeResolved records resolved as the current IP:port addresses
+// for the raw bootnode string raw, then rebuilds bootnodeSet.  An empty or
+// nil resolved slice removes raw's contribution so its addresses return to
+// normal back-off behaviour.  This mirrors what maintainLoop does on a
+// successful DNS resolution tick — use it in tests instead of calling Start().
+func HostSetBootnodeResolved(h *Host, raw string, resolved []string) {
+	h.mu.Lock()
+	if len(resolved) == 0 {
+		delete(h.bootnodeLastResolved, raw)
+		h.rebuildBootnodeSet()
+	} else {
+		h.applyBootnodeResolution(raw, resolved)
+	}
+	h.mu.Unlock()
+}
+
+// HostIsBootnode reports whether addr is currently in the host's privileged
+// bootnode set.  Exported for diagnostic assertions in tests.
+func HostIsBootnode(h *Host, addr string) bool {
+	return h.isBootnode(addr)
+}
+
+// HostTriggerMaintain fires one immediate maintainLoop tick without waiting
+// for the 10-second ticker.  Safe to call from any goroutine; non-blocking
+// (the channel is buffered with capacity 1, so a pending unfired tick is
+// never lost when the goroutine hasn't consumed the previous signal yet).
+func HostTriggerMaintain(h *Host) {
+	select {
+	case h.maintainNow <- struct{}{}:
+	default: // tick already pending — maintainLoop will pick it up
+	}
+}
