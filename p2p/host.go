@@ -78,6 +78,17 @@ type Config struct {
         // BadBlockBanDuration is how long the ban lasts after the threshold is
         // exceeded.  Default: 24h.
         BadBlockBanDuration time.Duration
+        // GetBlockStallTimeout is how long the relay waits for a MsgBlock
+        // response after sending MsgGetBlock before it considers the request
+        // stalled.  On stall detection the node logs a WARN and re-issues a
+        // MsgGetHeaders to restart the sync pipeline from the current tip.
+        // Default: 15s.  Lower values are useful in unit tests.
+        GetBlockStallTimeout time.Duration
+        // KeepaliveInterval is how often a MsgPing is sent to each connected
+        // peer so that the peer's ReadTimeout never fires due to silence from
+        // our side.  Must be in [1s, ReadTimeout/2] (i.e. [1s, 15s]).
+        // Default: 10s (applied in NewHost when zero).
+        KeepaliveInterval time.Duration
         // BanFile is the path to the JSON file used to persist active bans across
         // node restarts.  When empty, ban persistence is disabled.  Set to "-" to
         // explicitly disable persistence.  The file is written atomically (tmp +
@@ -127,6 +138,13 @@ type Handler interface {
         GetBlock(hash crypto.Hash32) *core.Block
 }
 
+// pendingBlockEntry records one outstanding MsgGetBlock request so the
+// stall-detection ticker can log actionable diagnostics if no MsgBlock arrives.
+type pendingBlockEntry struct {
+        sentAt      time.Time
+        headerHeight uint64 // block height from the header, for WARN log context
+}
+
 // Peer represents a connected remote node.
 type Peer struct {
         conn     net.Conn
@@ -135,6 +153,26 @@ type Peer struct {
         height   uint64
         mu       sync.Mutex
         outbound bool
+
+        // lastPongAt is the Unix nanosecond timestamp of the most recent MsgPong
+        // received from this peer.  Initialised to the connection start time so
+        // the first pong-deadline check does not fire before the peer has had a
+        // chance to reply.  Updated by dispatch on every MsgPong; read by the
+        // keepalive goroutine to detect peers that have stopped replying altogether.
+        // Uses atomic ops so dispatch and the keepalive goroutine coordinate without
+        // holding any other mutex.
+        lastPongAt atomic.Int64
+
+        // pendingBlocksMu guards pendingBlocks.  All access must hold this mutex.
+        pendingBlocksMu sync.Mutex
+        // pendingBlocks maps block hash → the time MsgGetBlock was sent for that
+        // hash and the block's height from the header.  Added in handleHeaders
+        // when MsgGetBlock is sent; removed when the corresponding MsgBlock
+        // arrives via dispatch.  The stall-detection ticker inspects this map to
+        // detect silently-dropped GetBlock responses and re-issue MsgGetHeaders.
+        // The map is owned exclusively by this Peer; it is cleaned up
+        // automatically when the Peer is dereferenced on disconnect.
+        pendingBlocks map[crypto.Hash32]pendingBlockEntry
 }
 
 // Send transmits a message to this peer.
@@ -277,6 +315,12 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         }
         if cfg.BadBlockBanDuration == 0 {
                 cfg.BadBlockBanDuration = 24 * time.Hour
+        }
+        if cfg.GetBlockStallTimeout == 0 {
+                cfg.GetBlockStallTimeout = 15 * time.Second
+        }
+        if cfg.KeepaliveInterval == 0 {
+                cfg.KeepaliveInterval = 10 * time.Second
         }
 
         // Parse PeerWhitelist entries once at construction time so acceptLoop
@@ -642,6 +686,25 @@ func (h *Host) saveWhitelistToFile(entries []string) error {
         }
         h.log.Debug("p2p: whitelist persisted", "entries", len(entries), "file", h.cfg.WhitelistFile)
         return nil
+}
+
+// DropPeer closes the active connection to addr without banning it.  The peer
+// may reconnect immediately; this is intended for tests that need to simulate
+// a transient network drop without permanently blacklisting the address.
+// Returns true when a connection was found and closed; false when addr is not
+// currently connected.
+func (h *Host) DropPeer(addr string) bool {
+	h.mu.Lock()
+	p, ok := h.peers[addr]
+	if ok {
+		p.conn.Close()
+		delete(h.peers, addr)
+	}
+	h.mu.Unlock()
+	if ok {
+		h.log.Info("p2p: peer connection dropped (test hook)", "addr", addr)
+	}
+	return ok
 }
 
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is
@@ -1223,7 +1286,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 }
         }
 
-        peer := &Peer{conn: conn, addr: addr, outbound: outbound}
+        peer := &Peer{
+                conn:          conn,
+                addr:          addr,
+                outbound:      outbound,
+                pendingBlocks: make(map[crypto.Hash32]pendingBlockEntry),
+        }
 
         // Handshake — asymmetric:
         //   Outbound (dialer)  : send Ping → receive Pong
@@ -1306,6 +1374,11 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // whether the session was healthy or should be counted as a failure.
         connectedAt = time.Now()
 
+        // Seed lastPongAt to the connection start time so the first keepalive
+        // pong-deadline check does not immediately evict a freshly connected peer
+        // that has not yet had a chance to reply to the first MsgPing.
+        peer.lastPongAt.Store(connectedAt.UnixNano())
+
         // Keepalive: send a Ping to the remote peer every 10 s so that the
         // peer's ReadTimeout (30 s) never fires due to silence from our side.
         // This is critical for relay/sync-only nodes that have no messages of
@@ -1315,13 +1388,31 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // conn.Close defer below).
         keepaliveDone := make(chan struct{})
         go func() {
-                ping := time.NewTicker(10 * time.Second)
-                sync := time.NewTicker(3 * time.Second)
+                ping  := time.NewTicker(h.cfg.KeepaliveInterval)
+                sync  := time.NewTicker(3 * time.Second)
+                stall := time.NewTicker(h.cfg.GetBlockStallTimeout)
                 defer ping.Stop()
                 defer sync.Stop()
+                defer stall.Stop()
                 for {
                         select {
                         case <-ping.C:
+                                // Pong-deadline check: if the peer has not replied to our
+                                // keepalive Pings for longer than 2× KeepaliveInterval, the
+                                // connection is considered dead (e.g. a half-open TCP session
+                                // after a peer crash).  Close the connection so the slot is
+                                // freed without waiting for the OS TCP keepalive (~2 h).
+                                pongDeadline := 2 * h.cfg.KeepaliveInterval
+                                lastPong := time.Unix(0, peer.lastPongAt.Load())
+                                if time.Since(lastPong) > pongDeadline {
+                                        h.log.Warn("keepalive: peer silent — no pong received within deadline, evicting",
+                                                "peer", peer.addr,
+                                                "deadline", pongDeadline,
+                                                "since_last_pong", time.Since(lastPong).Round(time.Millisecond),
+                                        )
+                                        conn.Close()
+                                        return
+                                }
                                 if err := peer.Send(MsgPing, PingMsg{
                                         NodeID:    h.cfg.NodeID,
                                         Height:    h.handler.CurrentHeight(),
@@ -1337,6 +1428,54 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                                 // large sync gaps.  This periodic check fills that gap: every
                                 // 3 s we ask for the next header batch until we catch up.
                                 if h.handler.CurrentHeight() < peer.height {
+                                        h.requestHeaders(peer)
+                                }
+                        case <-stall.C:
+                                // Stall detection: scan this peer's outstanding MsgGetBlock
+                                // requests.  Any entry older than GetBlockStallTimeout means
+                                // the peer did not serve the block (pruned, reorg, or race).
+                                // Log one WARN per stalled hash so operators see the exact
+                                // block hash and height, then re-issue MsgGetHeaders so the
+                                // sync pipeline restarts from the current tip rather than
+                                // hanging forever.
+                                //
+                                // Using a dedicated ticker (not the sync.C ticker) ensures
+                                // stall re-issues are driven solely by the stall timeout and
+                                // are independently observable in tests.
+                                now := time.Now()
+                                peer.pendingBlocksMu.Lock()
+                                type stalledEntry struct {
+                                        hash   crypto.Hash32
+                                        height uint64
+                                }
+                                var stalled []stalledEntry
+                                for hash, entry := range peer.pendingBlocks {
+                                        if now.Sub(entry.sentAt) > h.cfg.GetBlockStallTimeout {
+                                                // Skip if the block arrived from another peer in
+                                                // the meantime — no actual stall in that case.
+                                                if h.handler.GetBlock(hash) != nil {
+                                                        delete(peer.pendingBlocks, hash)
+                                                        continue
+                                                }
+                                                stalled = append(stalled, stalledEntry{
+                                                        hash:   hash,
+                                                        height: entry.headerHeight,
+                                                })
+                                                delete(peer.pendingBlocks, hash)
+                                        }
+                                }
+                                peer.pendingBlocksMu.Unlock()
+                                if len(stalled) > 0 {
+                                        for _, s := range stalled {
+                                                h.log.Warn("relay sync stall: peer did not serve block; re-issuing GetHeaders",
+                                                        "peer", peer.addr,
+                                                        "block_hash", fmt.Sprintf("%x", s.hash[:8]),
+                                                        "block_height", s.height,
+                                                        "stall_after", h.cfg.GetBlockStallTimeout,
+                                                        "our_height", h.handler.CurrentHeight(),
+                                                        "peer_height", peer.height,
+                                                )
+                                        }
                                         h.requestHeaders(peer)
                                 }
                         case <-keepaliveDone:
@@ -1392,12 +1531,16 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 })
 
         case MsgPong:
-                // Keepalive pong: update the peer's reported height and return.
+                // Keepalive pong: record receipt time for the pong-deadline check in
+                // the keepalive goroutine, update the peer's reported height, and return.
                 // No response needed.
                 var msg PingMsg // Pong reuses the same wire struct as Ping.
                 if err := unmarshal(data, &msg); err != nil {
                         return err
                 }
+                // Record the time of receipt so the keepalive goroutine can detect
+                // peers that have gone silent (half-open TCP connections after a crash).
+                peer.lastPongAt.Store(time.Now().UnixNano())
                 if msg.Height > 0 {
                         h.mu.Lock()
                         if p, ok := h.peers[peer.addr]; ok {
@@ -1537,8 +1680,16 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         h.badBlockMu.Unlock()
 
                 processBlock:
-                        // Gossip relay: forward to all other peers the first time we see this block.
+                        // Clear the pending-block entry for this peer so the
+                        // stall-detection ticker does not log a false warning for a
+                        // block that arrived normally.  Each Peer tracks only the
+                        // requests it sent, so deleting here is always safe.
                         blockHash := block.Hash()
+                        peer.pendingBlocksMu.Lock()
+                        delete(peer.pendingBlocks, blockHash)
+                        peer.pendingBlocksMu.Unlock()
+
+                        // Gossip relay: forward to all other peers the first time we see this block.
                         isNew := h.gossip.MarkAndCheck(blockHash)
                         h.handler.OnBlock(block)
                         // If this block extended our tip and we're still behind
@@ -1706,11 +1857,21 @@ func (h *Host) handleHeaders(peer *Peer, msg HeadersMsg) {
         if len(msg.Headers) == 0 {
                 return
         }
-        // Request each unknown block
+        // Request each unknown block and record it as pending so the per-peer
+        // stall-detection ticker can detect if MsgBlock never arrives.
+        now := time.Now()
         for _, sh := range msg.Headers {
                 hash := crypto.Hash32(sh.Hash)
                 if h.handler.GetBlock(hash) == nil {
                         peer.Send(MsgGetBlock, GetBlockMsg{Hash: hash})
+                        peer.pendingBlocksMu.Lock()
+                        if _, already := peer.pendingBlocks[hash]; !already {
+                                peer.pendingBlocks[hash] = pendingBlockEntry{
+                                        sentAt:      now,
+                                        headerHeight: sh.Height,
+                                }
+                        }
+                        peer.pendingBlocksMu.Unlock()
                 }
         }
 }
