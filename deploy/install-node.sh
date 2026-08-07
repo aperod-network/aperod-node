@@ -32,7 +32,7 @@ TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 TOTAL_RAM_BYTES=$(( TOTAL_RAM_KB * 1024 ))
 AUTO_GOMEMLIMIT=$(( TOTAL_RAM_BYTES * 3 / 4 ))
 MIN_GOMEMLIMIT=$(( 1536 * 1024 * 1024 ))   # 1.5 GiB floor
-MAX_GOMEMLIMIT=$(( 5905580032 ))            # 5500 MiB ceiling (prod-tested value)
+MAX_GOMEMLIMIT=$(( 6979321856 ))            # 6500 MiB ceiling — bumped Aug 2026 after UTXO set at 980k+ blocks hit 4.7 GB startup RSS; 5500 MiB caused GC thrash at 265% CPU
 if (( AUTO_GOMEMLIMIT < MIN_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MIN_GOMEMLIMIT}; fi
 if (( AUTO_GOMEMLIMIT > MAX_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MAX_GOMEMLIMIT}; fi
 GOMEMLIMIT_BYTES="${GOMEMLIMIT_BYTES:-${AUTO_GOMEMLIMIT}}"
@@ -371,7 +371,7 @@ EOF
 DROPIN_DIR="/etc/systemd/system/aperod-node.service.d"
 mkdir -p "${DROPIN_DIR}"
 cat > "${DROPIN_DIR}/gomemlimit.conf" <<EOF
-# Aperod node — memory limit and shutdown tuning
+# Aperod node — memory limit drop-in
 # ─────────────────────────────────────────────
 # Install path: /etc/systemd/system/aperod-node.service.d/gomemlimit.conf
 #
@@ -379,18 +379,41 @@ cat > "${DROPIN_DIR}/gomemlimit.conf" <<EOF
 #   Go soft memory limit.  Set to 75 % of host RAM at install time.
 #   To change: edit this file then run:
 #     systemctl daemon-reload && systemctl restart aperod-node
+
+[Service]
+Environment="GOMEMLIMIT=${GOMEMLIMIT_BYTES}"
+EOF
+ok "GOMEMLIMIT drop-in создан: ${DROPIN_DIR}/gomemlimit.conf (лимит: $(( GOMEMLIMIT_BYTES / 1024 / 1024 )) МиБ)"
+
+# ── 10c. TimeoutStopSec drop-in ───────────────────────────
+# Creates /etc/systemd/system/aperod-node.service.d/timeout.conf
+# (the exact filename that checkSystemdTimeout() checks inside the node).
+# A dedicated drop-in takes precedence over the main unit file and makes
+# the shutdown timeout visible and auditable without opening the full unit.
+#
+# 900 s = 15 minutes — enough for the UTXO snapshot to flush to disk
+# before systemd sends SIGKILL on a 5.7 GB RAM node.  A shorter value
+# (e.g. the 300 s default before August 2026) truncates the snapshot and
+# forces the next boot into the multi-hour 800 K-block rescan.
+cat > "${DROPIN_DIR}/timeout.conf" <<EOF
+# Aperod node — shutdown timeout drop-in
+# ─────────────────────────────────────────────
+# Install path: /etc/systemd/system/aperod-node.service.d/timeout.conf
 #
 # TimeoutStopSec=900
 #   Give the SIGTERM shutdown handler up to 15 minutes to flush the UTXO
 #   snapshot to disk before systemd sends SIGKILL.  A shorter timeout
 #   truncates the snapshot and forces the next restart into the multi-hour
 #   800K-block scan — root cause of the August 2026 outage.
+#
+#   To change without reinstalling:
+#     nano /etc/systemd/system/aperod-node.service.d/timeout.conf
+#     systemctl daemon-reload
 
 [Service]
-Environment="GOMEMLIMIT=${GOMEMLIMIT_BYTES}"
 TimeoutStopSec=900
 EOF
-ok "GOMEMLIMIT drop-in создан: ${DROPIN_DIR}/gomemlimit.conf (лимит: $(( GOMEMLIMIT_BYTES / 1024 / 1024 )) МиБ)"
+ok "Timeout drop-in создан: ${DROPIN_DIR}/timeout.conf (900 s)"
 
 systemctl daemon-reload
 systemctl enable aperod-node
