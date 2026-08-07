@@ -1585,13 +1585,21 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         // source port does not bypass the enforcement.
                         ourTip := h.handler.CurrentHeight()
                         peerIP := connIP(peer.addr)
-                        // When our tip is below BadBlockHeightLead we are syncing from
-                        // scratch: every legitimate block from a further-ahead peer
-                        // looks "far ahead", so skip the strike counter entirely until
-                        // we have enough chain history to distinguish wrong-fork spam
-                        // from normal catch-up traffic.  Task #1477.
+                        // A strike is only warranted when the received block is far
+                        // ahead of our tip AND the sending peer itself is NOT far ahead
+                        // of us.  A peer that is genuinely further along (peer.height >
+                        // ourTip+BadBlockHeightLead) is a node we are actively syncing
+                        // from; the blocks it sends at its own tip arrive via gossip
+                        // before our sync pipeline has applied the intermediate blocks.
+                        // Counting those as strikes would permanently ban the validator
+                        // we are catching up to — the exact bug that caused relay nodes
+                        // started from a snapshot to get banned during the catch-up gap.
+                        //
+                        // Rogue peers that fabricate future-height blocks announce a
+                        // peer.height that is at or below our tip (they pretend to be
+                        // at the same height), so the second condition catches them.
                         if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead &&
-                                ourTip >= h.cfg.BadBlockHeightLead {
+                                peer.height <= ourTip+h.cfg.BadBlockHeightLead {
                                 // Whitelisted peers are trusted validators; skip the
                                 // strike counter entirely so a temporarily-ahead validator
                                 // is never auto-banned for being on a longer fork.
