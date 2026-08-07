@@ -227,30 +227,60 @@ DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
 TIMEOUT_CONF="${DROPIN_DIR}/timeout.conf"
 mkdir -p "${DROPIN_DIR}"
 
-if [[ ! -f "${TIMEOUT_CONF}" ]]; then
-  cat > "${TIMEOUT_CONF}" <<'TEOF'
+# Safe threshold: any TimeoutStopSec below this value risks SIGKILL before
+# the UTXO snapshot finishes writing (Aug 2026 outage was caused by 300 s).
+TIMEOUT_MIN_SEC=900
+
+_write_timeout_conf() {
+  cat > "${TIMEOUT_CONF}" <<EOF
 # Aperod node — shutdown timeout drop-in
 # ─────────────────────────────────────────────
 # Install path: /etc/systemd/system/aperod-node.service.d/timeout.conf
 #
-# TimeoutStopSec=900
+# TimeoutStopSec=${TIMEOUT_MIN_SEC}
 #   Give the SIGTERM shutdown handler up to 15 minutes to flush the UTXO
 #   snapshot to disk before systemd sends SIGKILL.  A shorter timeout
 #   truncates the snapshot and forces the next restart into the multi-hour
 #   800K-block scan — root cause of the August 2026 outage.
 #
-#   To change without reinstalling:
-#     nano /etc/systemd/system/aperod-node.service.d/timeout.conf
-#     systemctl daemon-reload
+#   To raise this value: edit this file and run: systemctl daemon-reload
 
 [Service]
-TimeoutStopSec=900
-TEOF
-  echo "  [ok] timeout.conf drop-in created: ${TIMEOUT_CONF}"
+TimeoutStopSec=${TIMEOUT_MIN_SEC}
+EOF
+}
+
+if [[ ! -f "${TIMEOUT_CONF}" ]]; then
+  # File absent — create it with the safe value.
+  _write_timeout_conf
+  echo "  [ok] timeout.conf drop-in created: ${TIMEOUT_CONF} (TimeoutStopSec=${TIMEOUT_MIN_SEC})"
   systemctl daemon-reload
   echo "  [patch] daemon-reload complete — new TimeoutStopSec takes effect after restart."
 else
-  echo "  [ok] ${TIMEOUT_CONF} already exists — not overwriting."
+  # File exists — parse the current TimeoutStopSec and upgrade if unsafe.
+  # "infinity" is always safe; any numeric value below TIMEOUT_MIN_SEC is not.
+  _current=$(grep -E '^[[:space:]]*TimeoutStopSec=' "${TIMEOUT_CONF}" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+  _need_upgrade=false
+  if [[ -z "${_current}" ]]; then
+    # File exists but has no TimeoutStopSec — add one.
+    _need_upgrade=true
+  elif [[ "${_current,,}" == "infinity" ]]; then
+    _need_upgrade=false
+  else
+    # Numeric: upgrade if below minimum threshold.
+    if [[ "${_current}" =~ ^[0-9]+$ ]] && (( _current < TIMEOUT_MIN_SEC )); then
+      _need_upgrade=true
+    fi
+  fi
+
+  if [[ "${_need_upgrade}" == "true" ]]; then
+    echo "  [patch] ${TIMEOUT_CONF}: TimeoutStopSec=${_current:-<missing>} is below safe threshold (${TIMEOUT_MIN_SEC}s) — upgrading."
+    _write_timeout_conf
+    systemctl daemon-reload
+    echo "  [patch] daemon-reload complete — TimeoutStopSec upgraded to ${TIMEOUT_MIN_SEC}."
+  else
+    echo "  [ok] ${TIMEOUT_CONF}: TimeoutStopSec=${_current} is already safe (≥ ${TIMEOUT_MIN_SEC}s) — not overwriting."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
