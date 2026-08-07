@@ -1011,5 +1011,124 @@ func TestWhitelistInboundGate_AllowsAfterRestart(t *testing.T) {
 	t.Logf("h2 (post-restart): peer %s connected successfully — inbound-IP gate allowed whitelisted peer", peerIP)
 }
 
+// ─── Regression: full pipeline with asymmetric handshake ─────────────────────
+
+// TestRoguePeerBan_FullPipeline_AsymmetricHandshake is the dedicated regression
+// test for the auto-ban path after the asymmetric TLS handshake change landed.
+//
+// It exercises the complete pipeline in a single test:
+//
+//  1. Dialer sends Ping first; host replies with Pong (asymmetric handshake).
+//  2. Exactly BadBlockBanThreshold out-of-range blocks accumulate strikes.
+//  3. The peer is disconnected and its bare IP is banned on the threshold strike.
+//  4. A reconnect attempt from the same IP (new source port) is rejected by
+//     the host before the handshake completes.
+//
+// This test must stay passing whenever changes touch handleConn, the ban list,
+// or the Ping/Pong handshake protocol — it provides a single regression signal
+// for the entire handshake → dispatch → ban → reconnect-rejection chain.
+func TestRoguePeerBan_FullPipeline_AsymmetricHandshake(t *testing.T) {
+	const threshold = 10
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-full-pipeline",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+
+	// ── Step 1: complete the asymmetric Ping/Pong handshake ──────────────────
+	// connectPeer: dialer sends Ping → host replies Pong.
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after asymmetric handshake")
+	}
+	t.Logf("step 1 passed: peer %s registered after asymmetric Ping/Pong handshake", peerIP)
+
+	// ── Step 2: send threshold−1 bad blocks → must NOT trigger a ban ─────────
+	// ourTip = 0 (stubHandler); out-of-range threshold = 0 + 1000 = 1000.
+	for i := 0; i < threshold-1; i++ {
+		sendBlockAtHeight(t, conn, 5000)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if len(h.ListBans()) != 0 {
+		t.Errorf("step 2 failed: peer was banned after only %d out-of-range blocks (threshold=%d)",
+			threshold-1, threshold)
+	}
+	if h.PeerCount() != 1 {
+		t.Errorf("step 2 failed: PeerCount = %d after %d bad blocks, want 1", h.PeerCount(), threshold-1)
+	}
+	t.Logf("step 2 passed: %d bad blocks accumulated — no ban yet (threshold=%d)", threshold-1, threshold)
+
+	// ── Step 3: send the threshold-th bad block → ban + disconnect ───────────
+	sendBlockAtHeight(t, conn, 5000)
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("step 3 failed: peer was NOT disconnected after %d out-of-range blocks", threshold)
+	}
+
+	bans := h.ListBans()
+	if len(bans) == 0 {
+		t.Fatalf("step 3 failed: no ban entry found after %d out-of-range blocks", threshold)
+	}
+	found := false
+	for _, b := range bans {
+		if b.Addr == peerIP {
+			found = true
+			remaining := time.Until(b.ExpiresAt)
+			if remaining < 23*time.Hour {
+				t.Errorf("step 3 failed: ban duration too short: %v (want ≥ 23h)", remaining)
+			} else {
+				t.Logf("step 3 passed: bare IP %s banned; duration remaining=%v reason=%q",
+					b.Addr, remaining, b.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("step 3 failed: ban entry for bare IP %q not found; all bans: %v", peerIP, bans)
+	}
+
+	// ── Step 4: reconnect from the same bare IP must be rejected ─────────────
+	conn2, err := net.DialTimeout("tcp", hostAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("step 4 failed: host unreachable on reconnect: %v", err)
+	}
+	defer conn2.Close()
+
+	// Attempt the asymmetric handshake from the banned IP.
+	// The host must close the connection immediately on the ban check.
+	conn2.SetDeadline(time.Now().Add(time.Second))
+	_ = p2p.WriteMsg(conn2, p2p.MsgPing, p2p.PingMsg{
+		NodeID:    "rogue-reconnect",
+		Height:    0,
+		UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	})
+	_, _, readErr := p2p.ReadMsg(conn2)
+
+	if readErr == nil {
+		t.Errorf("step 4 failed: reconnect from banned IP %s was accepted (expected immediate close)", peerIP)
+	} else {
+		t.Logf("step 4 passed: reconnect from banned IP %s correctly rejected: %v", peerIP, readErr)
+	}
+
+	// PeerCount must still be 0.
+	time.Sleep(50 * time.Millisecond)
+	if h.PeerCount() != 0 {
+		t.Errorf("step 4 failed: PeerCount = %d after reconnect from banned IP, want 0", h.PeerCount())
+	}
+}
+
 // Keep the import used via fmt.Sprintf in future tests.
 var _ = fmt.Sprintf
