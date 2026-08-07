@@ -1114,7 +1114,7 @@ func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
 	log := newCaptureLogger(&logBuf)
 
 	snapLoaded := false
-	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	loaded, _, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
 	if loadErr == nil {
 		// Both files are corrupt — this branch must NOT be taken.
 		snapLoaded = true
@@ -1157,25 +1157,24 @@ func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
 	}
 }
 
-// ─── Test 10: missing primary with valid prev-backup → os.ErrNotExist ────────
+// ─── Test 10: missing primary with valid prev-backup → recovered via fallback ─
 
 // TestMissingPrimaryWithValidPrevReturnsNotExist confirms that when the primary
-// snapshot file has been deleted (os.ErrNotExist) but a valid same-height
-// prev-backup exists on disk, loadStartupSnapshotWithFallback returns
-// os.ErrNotExist rather than attempting recovery from the prev-backup.
+// snapshot file has been deleted but a valid same-height prev-backup with a
+// matching hash exists on disk, loadStartupSnapshotWithFallback recovers via
+// the prev-backup and returns success (nil error), rather than returning
+// os.ErrNotExist and forcing an unnecessary full block scan.
 //
-// This is intentional design: a missing primary means "no snapshot was written
-// for this tip", not "the snapshot is corrupt".  Treating absence as corruption
-// would hide the case where an operator accidentally deleted the snapshot — or
-// where the node simply never reached a checkpoint at this height — and would
-// silently load state from an older backup instead of triggering a clean scan.
+// This reflects intentional design: the prev-backup was written atomically
+// alongside the primary by saveStartupSnapshot, so it is equally trustworthy
+// when the hashes match.  Returning ErrNotExist in this case would silently
+// force a multi-hour rescan after any crash that left only the prev-backup.
 //
 // Assertions:
-//   - loadStartupSnapshotWithFallback returns a non-nil error.
-//   - The error satisfies os.IsNotExist (so the caller treats it as "no fast
-//     path available" and starts a full block scan).
-//   - snapLoaded stays false.
-//   - The "startup fast path complete" log line is NOT emitted.
+//   - loadStartupSnapshotWithFallback returns nil error (success).
+//   - The returned snapshot has the correct TipHeight and TipHashHex.
+//   - The "loaded v2 prev-backup snapshot (primary absent)" warning is logged.
+//   - snapLoaded becomes true so the caller uses the fast path.
 func TestMissingPrimaryWithValidPrevReturnsNotExist(t *testing.T) {
 	dir := t.TempDir()
 	_, blocks := buildChainInStore(t, dir, 3) // genesis + 3 blocks → height 0..3
@@ -1232,7 +1231,7 @@ func TestMissingPrimaryWithValidPrevReturnsNotExist(t *testing.T) {
 	log := newCaptureLogger(&logBuf)
 
 	snapLoaded := false
-	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	loaded, _, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
 	if loadErr == nil {
 		snapLoaded = true
 		log.Info("startup fast path complete — snapshot loaded",
@@ -1240,34 +1239,38 @@ func TestMissingPrimaryWithValidPrevReturnsNotExist(t *testing.T) {
 			"active_utxos", len(loaded.UTXOs.ActiveUTXOs),
 		)
 	} else if os.IsNotExist(loadErr) {
-		// Expected branch: caller treats missing primary as "no fast path".
-		// No log line here — mirrors the main.go behaviour for os.ErrNotExist.
-		_ = loadErr
+		_ = loadErr // caller treats missing primary as "no fast path"
 	} else {
 		log.Warn("snapshot load error, falling back to block scan", "err", loadErr)
 	}
 
 	// ── Assertions.
 
-	// The error must be non-nil and must satisfy os.IsNotExist so the caller
-	// correctly falls back to a full block scan without treating absence as
-	// corruption.
-	if loadErr == nil {
-		t.Error("loadStartupSnapshotWithFallback: expected non-nil error when primary is absent; got nil")
-	}
-	if loadErr != nil && !os.IsNotExist(loadErr) {
-		t.Errorf("loadStartupSnapshotWithFallback: expected os.ErrNotExist for missing primary; got: %v", loadErr)
+	// Recovery must succeed: the prev-backup has a matching hash and is valid.
+	if loadErr != nil {
+		t.Errorf("loadStartupSnapshotWithFallback: expected nil error (recovery via prev-backup); got %v\nlog:\n%s",
+			loadErr, logBuf.String())
 	}
 
-	// snapLoaded must remain false.
-	if snapLoaded {
-		t.Error("snapLoaded should be false when primary is absent (even though prev-backup is valid)")
+	// snapLoaded must be true: the fast path is available via the prev-backup.
+	if !snapLoaded {
+		t.Errorf("snapLoaded should be true when prev-backup with matching hash is available\nlog:\n%s", logBuf.String())
 	}
 
-	// The fast-path success message must NOT appear.
-	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
-		t.Error("fast-path success log must NOT appear when primary snapshot is missing")
-		t.Logf("captured log:\n%s", logBuf.String())
+	// The returned snapshot must have the correct tip height and hash.
+	if loaded == nil {
+		t.Fatal("loadStartupSnapshotWithFallback: returned nil snapshot with nil error")
+	}
+	if loaded.TipHeight != tipHeight {
+		t.Errorf("loaded.TipHeight = %d, want %d", loaded.TipHeight, tipHeight)
+	}
+	if loaded.TipHashHex != tipHashHex {
+		t.Errorf("loaded.TipHashHex = %s, want %s", loaded.TipHashHex, tipHashHex)
+	}
+
+	// The operator-visible warning must be emitted so they know the primary was absent.
+	if !logContainsMsg(&logBuf, "loaded v2 prev-backup snapshot (primary absent)") {
+		t.Errorf("expected \"loaded v2 prev-backup snapshot (primary absent)\" warning was not logged\nlog:\n%s", logBuf.String())
 	}
 }
 
@@ -1349,7 +1352,7 @@ func TestCorruptPrimaryFallsBackToPrev(t *testing.T) {
 	var logBuf bytes.Buffer
 	log := newCaptureLogger(&logBuf)
 
-	loaded, loadErr := loadStartupSnapshotWithFallback(dir, 3, hexH3, log)
+	loaded, _, loadErr := loadStartupSnapshotWithFallback(dir, 3, hexH3, log)
 	if loadErr != nil {
 		t.Fatalf("loadStartupSnapshotWithFallback: expected success via prev-backup, got: %v", loadErr)
 	}
@@ -1442,7 +1445,7 @@ func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
 	log := newCaptureLogger(&logBuf)
 
 	snapLoaded := false
-	loaded, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
+	loaded, _, loadErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, log)
 	if loadErr == nil {
 		snapLoaded = true
 		log.Info("startup fast path complete — snapshot loaded",
@@ -2043,7 +2046,7 @@ func TestShutdownSnapshotMatchesFinalDBTip(t *testing.T) {
 	var restartLog bytes.Buffer
 	log2 := newCaptureLogger(&restartLog)
 	snapLoaded := false
-	loaded2, loadErr2 := loadStartupSnapshotWithFallback(dir, dbTipHeight, dbTipHashHex, log2)
+	loaded2, _, loadErr2 := loadStartupSnapshotWithFallback(dir, dbTipHeight, dbTipHashHex, log2)
 	if loadErr2 == nil {
 		snapLoaded = true
 		log2.Info("startup fast path complete — snapshot loaded",
