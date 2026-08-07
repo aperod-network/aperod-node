@@ -1,22 +1,32 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  aperod-node-watchdog.sh — Restart aperod-node when its API stops responding
+#  aperod-node-watchdog.sh — Restart aperod-node when its API stops responding,
+#                            RSS exceeds the RAM threshold, or block production
+#                            stalls while the process is alive.
 #
-#  Invoked every 60 s by aperod-node-watchdog.timer.
+#  Invoked every 45–60 s by aperod-node-watchdog.timer.
 #  Sends GET /api/v1/status to 127.0.0.1:8545 with a 5 s timeout.
 #  If the response is not HTTP 200, triggers `systemctl restart aperod-node`.
 #
 #  Optional env vars (set in the .service unit's Environment= lines or in
 #  /etc/aperod/watchdog.env):
-#    NODE_API_URL   — base URL of the Go node API (default: http://127.0.0.1:8545)
-#    TIMEOUT_SECS   — curl timeout in seconds (default: 5)
+#    NODE_API_URL          — base URL of the Go node API (default: http://127.0.0.1:8545)
+#    TIMEOUT_SECS          — curl timeout in seconds (default: 5)
+#    RAM_THRESHOLD_MB      — restart when RSS exceeds this (default: 4800; 0=disable)
+#    STALL_CHECKS_MAX      — consecutive no-new-block checks before restart (default: 3; 0=disable)
+#    WATCHDOG_INTERVAL_SECS — probe interval, used only in Telegram messages (default: 60)
 #    SUPPORT_BOT_TOKEN      — Telegram bot token for alerts (optional)
 #    SUPPORT_ADMIN_CHAT_ID  — Telegram chat ID for alerts (optional)
+#    PEER_WAIT_MINS         — minutes with peer_count=0 before alerting (default: 10; 0=disable)
+#    MOCK_RSS_KB            — inject fake RSS for testing
+#    MOCK_HEIGHT            — inject fake block height for testing
+#    MOCK_PEER_COUNT        — inject fake peer count for testing
 # =============================================================================
 set -euo pipefail
 
 NODE_API_URL="${NODE_API_URL:-http://127.0.0.1:8545}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-5}"
+WATCHDOG_INTERVAL_SECS="${WATCHDOG_INTERVAL_SECS:-60}"
 STATUS_URL="${NODE_API_URL}/api/v1/status"
 
 # How long to wait between Telegram alerts for the same ongoing outage (default: 1 h).
@@ -91,14 +101,215 @@ append_restart_event() {
 write_timestamp "${LAST_CHECK_FILE}"
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health check (body captured for block-height parsing)
 # ---------------------------------------------------------------------------
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+_body_file=$(mktemp /tmp/aperod-wdog-XXXXXX)
+HTTP_CODE=$(curl -s -o "${_body_file}" -w "%{http_code}" \
   --max-time "${TIMEOUT_SECS}" \
   "${STATUS_URL}" 2>/dev/null || echo "000")
+RESPONSE_BODY=$(cat "${_body_file}" 2>/dev/null || echo "")
+rm -f "${_body_file}"
 
 if [[ "$HTTP_CODE" == "200" ]]; then
-  log "OK (HTTP ${HTTP_CODE})"
+  log "API OK (HTTP ${HTTP_CODE})"
+
+  # ── RAM guard — proactive restart before OOM/SIGKILL ─────────────────────
+  # Even when the API is healthy, RSS can grow unboundedly due to a memory
+  # leak in the block validator.  We restart proactively at RAM_THRESHOLD_MB
+  # (default: 4800 MB = 4.8 GB) so systemd never has to SIGKILL the process,
+  # which avoids LevelDB corruption from a mid-write forced kill.
+  #
+  # Set RAM_THRESHOLD_MB=0 to disable this check (archive nodes with large RAM).
+  # MOCK_RSS_KB may be set in tests to inject a fake RSS value.
+  RAM_THRESHOLD_MB="${RAM_THRESHOLD_MB:-4800}"
+  if [[ "${RAM_THRESHOLD_MB}" -gt 0 ]]; then
+    if [[ -n "${MOCK_RSS_KB:-}" ]]; then
+      RSS_KB="${MOCK_RSS_KB}"
+    else
+      RSS_KB=$(ps aux | grep '/usr/local/bin/aperod-node' | grep -v grep \
+               | awk '{print $6}' | head -1 2>/dev/null || true)
+    fi
+    RSS_KB="${RSS_KB:-0}"
+    THRESHOLD_KB=$(( RAM_THRESHOLD_MB * 1024 ))
+
+    if [[ "${RSS_KB}" -gt "${THRESHOLD_KB}" ]]; then
+      RSS_MB=$(( RSS_KB / 1024 ))
+      log "RAM threshold exceeded: ${RSS_MB} MB > ${RAM_THRESHOLD_MB} MB — restarting aperod-node"
+
+      # Respect cooldown for RAM alerts (separate from API-failure alerts)
+      LAST_RAM_ALERT_FILE="${STATE_DIR}/watchdog-last-ram-alert"
+      _now_r=$(date +%s)
+      _last_r=0
+      if [[ -f "${LAST_RAM_ALERT_FILE}" ]]; then
+        _last_r=$(cat "${LAST_RAM_ALERT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+      fi
+      if (( ( _now_r - _last_r ) >= ALERT_COOLDOWN_SECS )); then
+        send_telegram "🧠 <b>aperod-node RAM watchdog</b>
+Server: $(hostname)
+RSS: ${RSS_MB} MB ≥ threshold: ${RAM_THRESHOLD_MB} MB
+Action: <code>systemctl restart aperod-node</code>
+(proactive restart — API was still healthy)"
+        mkdir -p "${STATE_DIR}" 2>/dev/null || true
+        echo "${_now_r}" > "${LAST_RAM_ALERT_FILE}" || true
+      fi
+
+      systemctl restart aperod-node
+      write_timestamp "${LAST_RESTART_FILE}"
+      increment_restart_count
+      append_restart_event
+      log "aperod-node restarted due to RAM threshold"
+      exit 0
+    fi
+  fi
+
+  # ── Block-production stall check ───────────────────────────────────────────
+  # Detects a silent freeze: node process alive, API returns 200, but block
+  # height has not advanced for STALL_CHECKS_MAX consecutive probes.
+  # This catches the "255% CPU, blocks frozen, API healthy" failure mode that
+  # the RAM check and API check both miss.
+  #
+  # Set STALL_CHECKS_MAX=0 to disable.
+  # MOCK_HEIGHT may be set in tests to inject a fake height.
+  STALL_CHECKS_MAX="${STALL_CHECKS_MAX:-3}"
+  HEIGHT_FILE="${STATE_DIR}/watchdog-last-height"
+  STALL_COUNT_FILE="${STATE_DIR}/watchdog-stall-count"
+  LAST_STALL_ALERT_FILE="${STATE_DIR}/watchdog-last-stall-alert"
+
+  if [[ "${STALL_CHECKS_MAX}" -gt 0 ]]; then
+    if [[ -n "${MOCK_HEIGHT:-}" ]]; then
+      HEIGHT="${MOCK_HEIGHT}"
+      IS_SYNCING="false"
+    else
+      HEIGHT=$(echo "${RESPONSE_BODY}" | grep -o '"height":[0-9]*' \
+               | grep -o '[0-9]*$' | head -1 || true)
+      IS_SYNCING=$(echo "${RESPONSE_BODY}" | grep -o '"syncing":[a-z]*' \
+                   | grep -o '[a-z]*$' | head -1 || echo "false")
+    fi
+
+    if [[ -n "${HEIGHT:-}" && "${HEIGHT}" =~ ^[0-9]+$ && "${IS_SYNCING}" != "true" ]]; then
+      mkdir -p "${STATE_DIR}" 2>/dev/null || true
+      LAST_HEIGHT=0
+      if [[ -f "${HEIGHT_FILE}" ]]; then
+        LAST_HEIGHT=$(cat "${HEIGHT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+      fi
+
+      if [[ "${HEIGHT}" -gt "${LAST_HEIGHT}" ]]; then
+        # Height advancing — healthy, reset stall counter
+        echo "${HEIGHT}" > "${HEIGHT_FILE}" || true
+        echo "0" > "${STALL_COUNT_FILE}" || true
+
+      elif [[ "${HEIGHT}" -lt "${LAST_HEIGHT}" ]]; then
+        # Height regressed (post-restart snapshot) — accept and reset
+        echo "${HEIGHT}" > "${HEIGHT_FILE}" || true
+        echo "0" > "${STALL_COUNT_FILE}" || true
+        log "Block height regressed to ${HEIGHT} (post-restart snapshot load) — stall counter reset"
+
+      else
+        # Height unchanged — potential stall
+        STALL_COUNT=0
+        if [[ -f "${STALL_COUNT_FILE}" ]]; then
+          STALL_COUNT=$(cat "${STALL_COUNT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+        fi
+        STALL_COUNT=$(( STALL_COUNT + 1 ))
+        echo "${STALL_COUNT}" > "${STALL_COUNT_FILE}" || true
+        log "Block height stalled at ${HEIGHT} (stall check ${STALL_COUNT}/${STALL_CHECKS_MAX})"
+
+        if [[ "${STALL_COUNT}" -ge "${STALL_CHECKS_MAX}" ]]; then
+          _stall_secs=$(( STALL_COUNT * WATCHDOG_INTERVAL_SECS ))
+          log "Stall threshold reached (~${_stall_secs}s at height ${HEIGHT}) — restarting aperod-node"
+
+          _now_st=$(date +%s)
+          _last_st=0
+          if [[ -f "${LAST_STALL_ALERT_FILE}" ]]; then
+            _last_st=$(cat "${LAST_STALL_ALERT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+          fi
+          if (( ( _now_st - _last_st ) >= ALERT_COOLDOWN_SECS )); then
+            send_telegram "🧊 <b>aperod-node block stall watchdog</b>
+Server: $(hostname)
+Height frozen at: ${HEIGHT} for ~${_stall_secs}s (${STALL_COUNT} checks)
+Action: <code>systemctl restart aperod-node</code>
+(API was healthy — process frozen without producing blocks)"
+            echo "${_now_st}" > "${LAST_STALL_ALERT_FILE}" || true
+          fi
+
+          echo "0" > "${STALL_COUNT_FILE}" || true
+          systemctl restart aperod-node
+          write_timestamp "${LAST_RESTART_FILE}"
+          increment_restart_count
+          append_restart_event
+          log "aperod-node restarted due to block production stall at height ${HEIGHT}"
+          exit 0
+        fi
+      fi
+    fi
+  fi
+
+  # ── Peer-count zero alert ──────────────────────────────────────────────────
+  # Fires a Telegram alert when peer_count stays at 0 for longer than
+  # PEER_WAIT_MINS (default: 10 minutes).  Typical causes include a blocked
+  # port 30303, a wrong PRIMARY_IP in node.yaml, or a stale p2p_identity.key.
+  #
+  # Set PEER_WAIT_MINS=0 to disable.
+  # MOCK_PEER_COUNT may be set in tests to inject a fake value.
+  PEER_WAIT_MINS="${PEER_WAIT_MINS:-10}"
+  PEERS_ZERO_SINCE_FILE="${STATE_DIR}/watchdog-peers-zero-since"
+  LAST_PEER_ALERT_FILE="${STATE_DIR}/watchdog-last-peer-alert"
+
+  if [[ "${PEER_WAIT_MINS}" -gt 0 ]]; then
+    if [[ -n "${MOCK_PEER_COUNT:-}" ]]; then
+      PEER_COUNT="${MOCK_PEER_COUNT}"
+    else
+      PEER_COUNT=$(echo "${RESPONSE_BODY}" | grep -o '"peer_count":[0-9]*' \
+                   | grep -o '[0-9]*$' | head -1 || true)
+    fi
+    PEER_COUNT="${PEER_COUNT:-0}"
+
+    if [[ "${PEER_COUNT}" =~ ^[0-9]+$ && "${PEER_COUNT}" -gt 0 ]]; then
+      # Peers present — clear the zero-since marker
+      rm -f "${PEERS_ZERO_SINCE_FILE}" 2>/dev/null || true
+    else
+      # peer_count == 0
+      _now_p=$(date +%s)
+      mkdir -p "${STATE_DIR}" 2>/dev/null || true
+
+      if [[ ! -f "${PEERS_ZERO_SINCE_FILE}" ]]; then
+        echo "${_now_p}" > "${PEERS_ZERO_SINCE_FILE}" || true
+        log "peer_count=0 — started zero-peer timer"
+      else
+        _zero_since=$(cat "${PEERS_ZERO_SINCE_FILE}" 2>/dev/null | tr -dc '0-9' || echo "${_now_p}")
+        _zero_secs=$(( _now_p - _zero_since ))
+        _threshold_secs=$(( PEER_WAIT_MINS * 60 ))
+
+        log "peer_count=0 for ${_zero_secs}s (threshold: ${_threshold_secs}s)"
+
+        if (( _zero_secs >= _threshold_secs )); then
+          _last_pa=0
+          if [[ -f "${LAST_PEER_ALERT_FILE}" ]]; then
+            _last_pa=$(cat "${LAST_PEER_ALERT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+          fi
+          if (( ( _now_p - _last_pa ) >= ALERT_COOLDOWN_SECS )); then
+            _zero_mins=$(( _zero_secs / 60 ))
+            send_telegram "🔌 <b>aperod-node: no peers for ${_zero_mins} min</b>
+Server: $(hostname)
+peer_count has been <b>0</b> for <b>${_zero_mins} min</b>.
+
+Possible causes:
+• Port 30303/tcp blocked by firewall
+• Wrong bootnode address in <code>/etc/aperod/node.yaml</code>
+• Stale <code>p2p_identity.key</code> (delete and restart to regenerate)
+
+Check: <code>curl -s http://127.0.0.1:8545/api/v1/status | grep peer</code>"
+            echo "${_now_p}" > "${LAST_PEER_ALERT_FILE}" || true
+            log "Telegram peer-zero alert sent (${_zero_mins} min with 0 peers)"
+          else
+            log "Peer-zero alert suppressed (cooldown)"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  log "OK — API healthy, RAM within threshold, blocks advancing"
   exit 0
 fi
 
