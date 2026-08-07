@@ -605,9 +605,16 @@ func run() error {
                 // BEFORE the load so the directory contains only complete files.
                 cleanStaleSnapshotTmpFiles(cfg.DataDir, log)
                 snapLoaded := false
+                // rescueSnap is set when a snapshot is readable but the UTXO-count check
+                // fails.  It is consumed below (before the !snapLoaded block) to seed the
+                // in-memory UTXO + key-image state so the block scan covers only the few
+                // hundred blocks from rescueSnap.TipHeight+1 to tipHeight instead of
+                // scanning from block 1.
+                var rescueSnap *startupSnapshot
+                var rescueSnapHeight uint64
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
-                        if snap, snapIsRelaxed, serr := loadStartupSnapshotWithFallback(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
+                        if snap, snapIsRelaxed, serr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
                                 // ── UTXO count divergence check ──────────────────────────────────
                                 // See checkSnapshotUTXOCount in snapshot_utxo_check.go for the
                                 // full logic.  isRelaxed widens the tolerance to 100 % when the
@@ -643,26 +650,57 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
                                 }
-                        } else {
-                                // Emit a structured log entry that distinguishes "no snapshot"
-                                // (first run / new install) from "corrupt snapshot" (SIGKILL
-                                // victim or truncated write).  Operators can filter journalctl
-                                // output by startup_reason= to see why a long scan was triggered.
-                                logSnapshotStartupReason(serr, tipHeight, log)
+                                // Snapshot was readable but failed the UTXO-count divergence check.
+                                // Save a pointer so the rescue path below can seed key-images +
+                                // UTXOs and start the scan only from this height onwards.
+                                if !utxoCountOK && len(snap.UTXOs.KeyImages) > 0 {
+                                        rescueSnap = snap
+                                }
                         }
                 }
 
+                // ── Snapshot rescue path ──────────────────────────────────────────────
+                // When the tip-height snapshot failed the UTXO-count check but was
+                // otherwise readable, use it to seed the in-memory UTXO + key-image
+                // state.  The startup scan then covers only blocks from
+                // rescueSnap.TipHeight+1 to tipHeight — typically a few hundred blocks
+                // instead of scanning from block 1 (which can take hours on a 1M-block
+                // chain after an OOM-corrupted LevelDB key-image index).
+                if !snapLoaded && rescueSnap != nil {
+                        utxos.RestoreFromSnapshot(rescueSnap.UTXOs)
+                        registry.RestoreFromSnapshot(rescueSnap.Registry)
+                        registry.SetUTXOSet(utxos)
+                        if rescueSnap.TxTotal > 0 {
+                                initialTxTotal = rescueSnap.TxTotal
+                        }
+                        log.Warn("snapshot rescue: seeding UTXO + key-image state from snapshot "+
+                                "despite UTXO count divergence — scan covers remaining blocks only",
+                                "snapshot_height", rescueSnap.TipHeight,
+                                "key_images", len(rescueSnap.UTXOs.KeyImages),
+                                "active_utxos", len(rescueSnap.UTXOs.ActiveUTXOs),
+                        )
+                        rescueSnapHeight = rescueSnap.TipHeight
+                        rescueSnap = nil // allow GC
+                        runtime.GC()
+                        debug.FreeOSMemory()
+                }
+
                 if !snapLoaded {
+                // When a rescue snapshot was used, key-images up to rescueSnapHeight are
+                // already in memory.  Skip the LevelDB key-image index load; the startup
+                // scan will collect key-images only for blocks rescueSnapHeight+1..tipHeight.
+                kiCount := 0
+                kiFromIndex := rescueSnapHeight > 0
+                if !kiFromIndex {
                 // Try the fast path for spent key images first.
                 log.Info("loading spent key-image set from database index",
                         "tip_height", tipHeight)
-                kiCount := 0
                 kiIterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
                         utxos.MarkSpent(ki)
                         kiCount++
                         return nil
                 })
-                kiFromIndex := kiIterErr == nil && (kiCount > 0 || tipHeight == 0)
+                kiFromIndex = kiIterErr == nil && (kiCount > 0 || tipHeight == 0)
                 if kiFromIndex {
                         storedTotal, loadErr := db.LoadTxTotal()
                         if loadErr != nil {
@@ -683,6 +721,7 @@ func run() error {
                         }
                         kiCount = 0
                 }
+                } // end !kiFromIndex (ki index load block)
 
                 // ── DB-index fast path (UTXOFromIndex) ──────────────────────────
                 // When the key-image index, spent-UTXO index (su/), and stake-block
@@ -694,7 +733,10 @@ func run() error {
                         utxoFromIndex      bool
                         stakeBlockHeights  []uint64
                 )
-                if kiFromIndex && tipHeight > 0 {
+                // Skip the UTXOFromIndex fast path when the rescue snapshot already
+                // seeded the UTXO set: iterating db.IterActiveUTXOs would double-add
+                // entries on top of the snapshot UTXOs.
+                if kiFromIndex && tipHeight > 0 && rescueSnapHeight == 0 {
                         suSize, suErr := db.SpentUTXOIndexSize()
                         hasSb, sbErr := db.HasStakeBlockIndex()
                         if suErr == nil && sbErr == nil && suSize > 0 && hasSb {
@@ -763,6 +805,7 @@ func run() error {
                         CheckpointInterval:    cfg.Snapshot.ScanCheckpointInterval,
                         MaxMissingBlocks:      cfg.Snapshot.MaxMissingBlocks,
                         SetSyncProgress:       setSyncProgress,
+                        ResumeScanFrom:        rescueSnapHeight,
                 })
                 if scanErr != nil {
                         return scanErr
@@ -1538,6 +1581,22 @@ func saveShutdownSnapshot(
                 "tip_height", shutTipHeight,
                 "save_duration", snapSaveDur.String(),
         )
+
+        // Warn when the save duration is approaching the systemd stop timeout.
+        // If the ratio keeps creeping up (e.g. due to a CPU quota or a growing
+        // UTXO set), the next SIGKILL will arrive before the rename completes
+        // and the node will fall back to a multi-hour block scan on the next
+        // restart — with no advance notice.
+        //
+        //   > 50 % of TimeoutStopSec → Warn  (early notice; tune now)
+        //   > 80 % of TimeoutStopSec → Error (critical; increase immediately)
+        warnIfSnapshotSlowRelativeToTimeout(
+                snapSaveDur,
+                "/etc/systemd/system/aperod-node.service.d",
+                "/etc/systemd/system/aperod-node.service",
+                log,
+        )
+
         deleteOldSnapshots(dataDir, shutTipHeight)
         // Persist the active UTXO count keyed by tip hash so the
         // next restart's divergence check has an active-only reference
@@ -1757,6 +1816,167 @@ func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bo
         return nil
 }
 
+// parseSystemdDuration parses a systemd TimeoutStopSec value and returns the
+// equivalent number of seconds.  Accepted forms (matching systemd grammar):
+//
+//   - plain number: "900"          (bare seconds)
+//   - with suffix:  "900s", "15min", "1h", "1d", "1w"
+//   - "infinity"                   (mapped to 1e18 — effectively unlimited)
+//
+// The function handles the most common single-unit forms used in real drop-in
+// files.  Returns (seconds, true) on success; (0, false) on parse failure so
+// callers can silently skip unknown values without crashing.
+func parseSystemdDuration(val string) (float64, bool) {
+        val = strings.TrimSpace(val)
+        if strings.EqualFold(val, "infinity") {
+                return 1e18, true
+        }
+        // Plain bare seconds — the most common form: "900".
+        if secs, err := strconv.ParseFloat(val, 64); err == nil {
+                return secs, true
+        }
+        // Single-unit suffixes.  Listed longest-first so "min" and "ms" are
+        // matched before their prefix "m" / "s" could be.
+        type unit struct {
+                sfx string
+                mul float64
+        }
+        units := []unit{
+                {"month", 30 * 24 * 3600},
+                {"min", 60},
+                {"ms", 0.001},
+                {"us", 0.000001},
+                {"ns", 1e-9},
+                {"h", 3600},
+                {"d", 24 * 3600},
+                {"w", 7 * 24 * 3600},
+                {"s", 1},
+        }
+        for _, u := range units {
+                if strings.HasSuffix(val, u.sfx) {
+                        numStr := strings.TrimSpace(val[:len(val)-len(u.sfx)])
+                        if n, err := strconv.ParseFloat(numStr, 64); err == nil {
+                                return n * u.mul, true
+                        }
+                }
+        }
+        return 0, false
+}
+
+// readEffectiveTimeoutStopSec returns the effective TimeoutStopSec value (in
+// seconds) for the aperod-node service.  It scans every *.conf file in
+// dropinDir in lexicographic order (matching systemd drop-in precedence —
+// later files override earlier ones) and returns the LAST TimeoutStopSec
+// value found.  If none is found in the directory it falls back to
+// servicePath.
+//
+// Returns (seconds, true) when a value is found and parseable; (0, false)
+// when no TimeoutStopSec line is present anywhere or all files are absent.
+// Parse errors are silently ignored so callers do not need to handle an error
+// value — the worst case is that no threshold check runs.
+func readEffectiveTimeoutStopSec(dropinDir, servicePath string) (float64, bool) {
+        // scanFile reads all TimeoutStopSec= directives in path and returns the
+        // LAST parseable value found.  systemd unit files allow a directive to be
+        // reassigned multiple times; the final assignment takes effect.  Returning
+        // the first match is wrong when a drop-in overrides an earlier setting in
+        // the same file.  Whitespace around "=" is trimmed to match systemd's
+        // lenient unit-file parser.
+        scanFile := func(path string) (float64, bool) {
+                f, err := os.Open(path)
+                if err != nil {
+                        return 0, false
+                }
+                defer f.Close()
+                var last float64
+                found := false
+                sc := bufio.NewScanner(f)
+                for sc.Scan() {
+                        line := strings.TrimSpace(sc.Text())
+                        after, ok := strings.CutPrefix(line, "TimeoutStopSec")
+                        if !ok {
+                                continue
+                        }
+                        after = strings.TrimSpace(after)
+                        if !strings.HasPrefix(after, "=") {
+                                continue
+                        }
+                        val := strings.TrimSpace(after[1:])
+                        if secs, ok := parseSystemdDuration(val); ok {
+                                last = secs
+                                found = true
+                                // Do NOT return early — a later directive in the same file overrides.
+                        }
+                }
+                return last, found
+        }
+
+        // Scan all *.conf files in the drop-in directory in lex order;
+        // keep the LAST TimeoutStopSec seen (later drop-ins win in systemd).
+        if dropinDir != "" {
+                if entries, err := os.ReadDir(dropinDir); err == nil {
+                        var last float64
+                        found := false
+                        for _, e := range entries {
+                                if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+                                        continue
+                                }
+                                if secs, ok := scanFile(filepath.Join(dropinDir, e.Name())); ok {
+                                        last = secs
+                                        found = true
+                                }
+                        }
+                        if found {
+                                return last, true
+                        }
+                }
+        }
+
+        // Fall back to the main unit file.
+        if servicePath != "" {
+                return scanFile(servicePath)
+        }
+        return 0, false
+}
+
+// warnIfSnapshotSlowRelativeToTimeout emits a structured log entry when the
+// snapshot save duration represents a significant fraction of the effective
+// systemd TimeoutStopSec.  It is called immediately after every shutdown
+// snapshot save so operators receive advance notice before the ratio crosses
+// the dangerous threshold.
+//
+//   - dur > 80 % of TimeoutStopSec → log.Error  (critical; act now)
+//   - dur > 50 % of TimeoutStopSec → log.Warn   (early warning; plan ahead)
+//
+// dropinDir is the drop-in directory (e.g. /etc/systemd/system/aperod-node.service.d)
+// whose *.conf files are scanned in lex order.  servicePath is the main unit
+// file consulted when no drop-in value is found.  Both are injectable for
+// unit tests; on non-systemd hosts neither path exists and the function is a
+// no-op (readEffectiveTimeoutStopSec returns (0, false)).
+func warnIfSnapshotSlowRelativeToTimeout(dur time.Duration, dropinDir, servicePath string, log *slog.Logger) {
+        timeoutSec, found := readEffectiveTimeoutStopSec(dropinDir, servicePath)
+        if !found || timeoutSec <= 0 || timeoutSec >= 1e17 { // 1e17 = "infinity"
+                return
+        }
+        ratio := dur.Seconds() / timeoutSec
+        fix := fmt.Sprintf("increase TimeoutStopSec in a file under %s/ and run: systemctl daemon-reload", dropinDir)
+        switch {
+        case ratio > 0.80:
+                log.Error("snapshot save time is dangerously close to TimeoutStopSec — increase it immediately to avoid losing the snapshot on next shutdown",
+                        "save_duration", dur.String(),
+                        "timeout_stop_sec", timeoutSec,
+                        "ratio_pct", fmt.Sprintf("%.0f%%", ratio*100),
+                        "fix", fix,
+                )
+        case ratio > 0.50:
+                log.Warn("snapshot save time is approaching TimeoutStopSec — consider increasing it before it causes a missed snapshot",
+                        "save_duration", dur.String(),
+                        "timeout_stop_sec", timeoutSec,
+                        "ratio_pct", fmt.Sprintf("%.0f%%", ratio*100),
+                        "fix", fix,
+                )
+        }
+}
+
 // checkSystemdTimeout validates the effective TimeoutStopSec for the
 // aperod-node service and logs a warning when it is below the safe threshold.
 //
@@ -1782,42 +2002,17 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
         const minSec = 240
         const warnMsg = "systemd TimeoutStopSec is below safe threshold — snapshot may not save on restart"
 
-        // scanForTimeout reads a unit/drop-in file and returns (seconds, found, error).
-        // "infinity" maps to a very large number so the ≥ minSec check passes.
-        scanForTimeout := func(path string) (float64, bool, error) {
-                f, err := os.Open(path)
-                if err != nil {
-                        return 0, false, err
-                }
-                defer f.Close()
-                sc := bufio.NewScanner(f)
-                for sc.Scan() {
-                        line := strings.TrimSpace(sc.Text())
-                        after, ok := strings.CutPrefix(line, "TimeoutStopSec=")
-                        if !ok {
-                                continue
-                        }
-                        val := strings.TrimSpace(after)
-                        if strings.EqualFold(val, "infinity") {
-                                return 1e18, true, nil // effectively unlimited — safe
-                        }
-                        secs, parseErr := strconv.ParseFloat(val, 64)
-                        if parseErr != nil {
-                                return 0, true, fmt.Errorf("cannot parse TimeoutStopSec=%q in %s", val, path)
-                        }
-                        return secs, true, nil
-                }
-                return 0, false, nil // file exists but no TimeoutStopSec line
-        }
+        // Use the drop-in directory (derived from the canonical drop-in file path)
+        // so that ALL .conf files in the directory are checked, not just one.
+        // This matches real systemd semantics: every .conf file in the drop-in
+        // directory is applied in lex order; later files take precedence.
+        dropinDir := filepath.Dir(dropinPath)
 
-        // 1. Try the drop-in first.
-        if secs, found, err := scanForTimeout(dropinPath); err != nil && !os.IsNotExist(err) {
-                log.Warn("systemd TimeoutStopSec: could not read drop-in", "path", dropinPath, "err", err)
-                return
-        } else if found {
+        // 1. Try all drop-in .conf files first (directory scan, lex order).
+        if secs, found := readEffectiveTimeoutStopSec(dropinDir, ""); found {
                 if secs < minSec {
                         log.Warn(warnMsg,
-                                "source", dropinPath,
+                                "source", dropinDir,
                                 "current_sec", secs,
                                 "minimum_sec", minSec,
                                 "fix", fmt.Sprintf("set TimeoutStopSec=%d in %s and run: systemctl daemon-reload", minSec, dropinPath),
@@ -1827,10 +2022,7 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
         }
 
         // 2. Try the main unit file.
-        if secs, found, err := scanForTimeout(servicePath); err != nil && !os.IsNotExist(err) {
-                log.Warn("systemd TimeoutStopSec: could not read service file", "path", servicePath, "err", err)
-                return
-        } else if found {
+        if secs, found := readEffectiveTimeoutStopSec("", servicePath); found {
                 if secs < minSec {
                         log.Warn(warnMsg,
                                 "source", servicePath,
