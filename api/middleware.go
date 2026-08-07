@@ -180,6 +180,11 @@ var rateLimitExempt = map[string]bool{
 	// watchdog never triggers a spurious rate-limit 429, which would cause a
 	// false-positive node restart.
 	"/api/v1/status": true,
+	// Circuit-breaker health probe: the Node.js API server hits /health every
+	// 10 s to decide whether to open/close the circuit breaker.  A 429 here
+	// would be counted as a probe failure and keep the breaker open, blocking
+	// all wallet operations.
+	"/health": true,
 }
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
