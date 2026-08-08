@@ -140,17 +140,29 @@ cfg_path, new_addr, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(cfg_path) as f:
     cfg = yaml.safe_load(f) or {}
 
+# Migrate legacy root-level 'bootnodes' key produced by older install-node.sh.
+# The Go runtime only reads cfg.P2P.Bootnodes (yaml:"bootnodes" under p2p:);
+# a root-level key is silently ignored and the node stays isolated.  Move any
+# existing entries into p2p.bootnodes and remove the stale root-level key.
+legacy = cfg.pop("bootnodes", None)
+
 if "p2p" not in cfg or cfg["p2p"] is None:
     cfg["p2p"] = {}
 if "bootnodes" not in cfg["p2p"] or cfg["p2p"]["bootnodes"] is None:
     cfg["p2p"]["bootnodes"] = []
 
 existing = cfg["p2p"]["bootnodes"]
+
+# Preserve any valid entries from the migrated root-level key.
+if legacy:
+    for entry in (legacy if isinstance(legacy, list) else [legacy]):
+        if entry and entry not in existing:
+            existing.append(entry)
+
 if new_addr in existing:
     print(f"Already present: {new_addr}")
-    # Still write the unchanged config so the temp file is non-empty and
-    # the validate_yaml + cp cycle is a safe no-op rather than overwriting
-    # the original with an empty file.
+    # Still write the (possibly migrated) config so the temp file is non-empty
+    # and the validate_yaml + mv cycle is a safe no-op.
     with open(out_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
     sys.exit(0)
@@ -160,7 +172,10 @@ cfg["p2p"]["bootnodes"] = existing
 
 with open(out_path, "w") as f:
     yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-print(f"Added: {new_addr}")
+if legacy:
+    print(f"Migrated root-level bootnodes to p2p.bootnodes; added: {new_addr}")
+else:
+    print(f"Added: {new_addr}")
 EOF
 
   # Validate before replacing
@@ -251,6 +266,63 @@ EOF
   warn "Restart aperod-node to apply: systemctl restart aperod-node"
 }
 
+# ── set-snapshot-tolerance ───────────────────────────────────────────────────
+# Raises snapshot.utxo_count_tolerance_pct to the given value (never lowers it).
+# Used by join-network.sh --bootstrap-from so rsync-bootstrapped relay nodes
+# can load their snapshot even when the stored UTXO count drifts slightly from
+# the on-disk DB count.
+cmd_set_snapshot_tolerance() {
+  local min_pct="$1"
+  [[ -n "$min_pct" ]] || die "Usage: $0 set-snapshot-tolerance <pct>"
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+  ensure_pyyaml
+
+  local tmp cfg_dir lockfile
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
+  tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+
+  exec 9>"$lockfile"
+  flock -x 9
+
+  trap 'rm -f "${tmp:-}"' EXIT
+
+  python3 - "$CONFIG_FILE" "$min_pct" "$tmp" <<'EOF'
+import yaml, sys
+
+cfg_path, min_pct_s, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+min_pct = float(min_pct_s)
+
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+snap = cfg.setdefault("snapshot", {})
+current = snap.get("utxo_count_tolerance_pct", 0)
+if float(current) >= min_pct:
+    print(f"utxo_count_tolerance_pct already {current} (>= {min_pct_s}), kept")
+    sys.exit(0)
+
+snap["utxo_count_tolerance_pct"] = min_pct
+
+with open(out_path, "w") as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+print(f"Set utxo_count_tolerance_pct: {current} -> {min_pct}")
+EOF
+
+  if [[ $? -ne 0 ]]; then
+    rm -f "$tmp"; exit 0  # Python printed "already N, kept" and exited 0; or real error
+  fi
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; exit 0; }
+
+  validate_yaml "$tmp" || die "Validation failed — config not written."
+
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || true
+  backup_config
+  mv "$tmp" "$CONFIG_FILE"
+  ok "snapshot.utxo_count_tolerance_pct updated."
+  warn "Restart aperod-node to apply: systemctl restart aperod-node"
+}
+
 # ── restore-backup ────────────────────────────────────────────────────────────
 # Finds the newest timestamped backup beside CONFIG_FILE and mv's it back into
 # place atomically.  The superseded (current) config is kept as a backup itself
@@ -321,18 +393,20 @@ SUBCMD="${1:-help}"
 shift || true
 
 case "$SUBCMD" in
-  list-bootnodes)    cmd_list ;;
-  add-bootnode)      cmd_add "${1:-}" ;;
-  remove-bootnode)   cmd_remove "${1:-}" ;;
-  restore-backup)    cmd_restore_backup ;;
+  list-bootnodes)         cmd_list ;;
+  add-bootnode)           cmd_add "${1:-}" ;;
+  remove-bootnode)        cmd_remove "${1:-}" ;;
+  set-snapshot-tolerance) cmd_set_snapshot_tolerance "${1:-}" ;;
+  restore-backup)         cmd_restore_backup ;;
   help|--help|-h)
     echo "Usage: $0 <subcommand> [args]"
     echo ""
     echo "Subcommands:"
-    echo "  list-bootnodes            — List current bootnodes in node.yaml"
-    echo "  add-bootnode    <addr>    — Safely append a bootnode"
-    echo "  remove-bootnode <addr>    — Remove a bootnode by exact match"
-    echo "  restore-backup            — Roll back to the most-recent pre-write backup"
+    echo "  list-bootnodes                — List current bootnodes in node.yaml"
+    echo "  add-bootnode    <addr>        — Safely append a bootnode"
+    echo "  remove-bootnode <addr>        — Remove a bootnode by exact match"
+    echo "  set-snapshot-tolerance <pct> — Raise snapshot.utxo_count_tolerance_pct (never lowers)"
+    echo "  restore-backup                — Roll back to the most-recent pre-write backup"
     echo ""
     echo "Config file: ${CONFIG_FILE}"
     echo "Override:    APEROD_CONFIG=/path/to/node.yaml $0 ..."
