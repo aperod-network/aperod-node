@@ -178,6 +178,14 @@ type P2PConfig struct {
 	// Operators on high-latency links may lower this value; operators on fast
 	// LANs may raise it to reduce traffic.
 	KeepaliveInterval time.Duration `yaml:"keepalive_interval"`
+	// MaxBlockIngestPerSec caps the number of blocks per second that any single
+	// peer may deliver to this node.  When a syncing peer pushes blocks faster
+	// than this limit the dispatch goroutine sleeps just long enough to restore
+	// the token count, creating TCP-level backpressure without dropping blocks.
+	// Burst is fixed at the same value (one second worth of tokens).
+	// Default: 50.  Set to 0 to disable rate limiting (not recommended on
+	// resource-constrained nodes).
+	MaxBlockIngestPerSec int `yaml:"max_block_ingest_per_sec"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -254,6 +262,7 @@ func DefaultConfig() *Config {
 			BadBlockHeightLead:   1000,
 			BadBlockBanThreshold: 5,
 			BadBlockBanDuration:  24 * time.Hour,
+			MaxBlockIngestPerSec: 50, // cap sync-peer block delivery to prevent CPU spikes
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
@@ -370,6 +379,16 @@ func (c *Config) Validate() error {
 				)
 			}
 		}
+	}
+
+	// MaxBlockIngestPerSec: 0 = disabled (no throttle), positive = cap in
+	// blocks/sec, negative = configuration error.
+	if c.P2P.MaxBlockIngestPerSec < 0 {
+		return fmt.Errorf(
+			"p2p.max_block_ingest_per_sec (%d) must not be negative — "+
+				"use 0 to disable rate limiting or set a positive value (recommended: 50)",
+			c.P2P.MaxBlockIngestPerSec,
+		)
 	}
 
 	// Rogue-peer ban knob validation.  Zero means "use the built-in default"
