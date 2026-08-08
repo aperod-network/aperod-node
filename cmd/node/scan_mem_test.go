@@ -3,22 +3,20 @@ package main
 // Integration test: startup UTXO rebuild stays below a memory ceiling.
 //
 // Covers the requirement from task #1547:
-//   - runStartupScan() is run against a synthetic chain where each block
-//     carries multiple coinbase outputs so that the cumulative output counter
-//     crosses gcUTXOInterval (50 000) at least once, triggering the periodic
-//     runtime.GC() call inside the scan loop.
+//   - runStartupScan() is run against a synthetic chain of nScanBlocks blocks,
+//     each carrying outputsPerBlock coinbase outputs.  Total outputs cross
+//     gcUTXOInterval (50 000) at least once so the periodic GC logic fires.
 //   - A background goroutine samples runtime.MemStats.Sys at a fixed interval
 //     while the scan is in progress.
-//   - The SetSyncProgress callback takes an additional sample at every 1 000
-//     blocks so there is always at least one sample per progress tick.
+//   - The SetSyncProgress callback (fired every 1 000 blocks) takes an
+//     additional sample each time.  nScanBlocks > 1 000 guarantees at least
+//     one callback invocation, and the test asserts this explicitly.
 //   - After the scan the test asserts that the peak Sys value never exceeded
-//     scanMemCeilingMiB × 1 MiB, failing loudly with the peak value if so.
+//     scanMemCeilingMiB × 1 MiB.
 //
 // The ceiling (scanMemCeilingMiB) is set to 512 MiB, which is far below the
-// production 5 GB limit and still leaves plenty of room for in-process Go
-// runtime overhead on any reasonable CI host.  If that ceiling is ever
-// approached it means something in the scan loop is holding large allocations
-// across GC cycles and must be investigated.
+// production 5 GB limit.  If that ceiling is ever approached it means
+// something in the scan loop is holding large allocations across GC cycles.
 
 import (
 	"encoding/json"
@@ -47,14 +45,13 @@ const scanMemSampleInterval = 100 * time.Millisecond
 // TestStartupScanMemoryCeiling verifies that runStartupScan() keeps its peak
 // allocated Sys memory below scanMemCeilingMiB while rebuilding the UTXO set.
 //
-// Chain shape: nScanBlocks blocks, each with outputsPerBlock coinbase outputs.
-// Total outputs = nScanBlocks × outputsPerBlock, chosen to cross
-// gcUTXOInterval (50 000) at least once so the GC-per-N-outputs mechanism is
-// exercised.
+// Chain shape: nScanBlocks blocks (>1 000, so SetSyncProgress fires at least
+// once), each with outputsPerBlock coinbase outputs.  Total outputs exceed
+// gcUTXOInterval (50 000) so the GC-per-N-outputs mechanism is exercised.
 func TestStartupScanMemoryCeiling(t *testing.T) {
 	const (
-		nScanBlocks     = 200 // blocks written to the store
-		outputsPerBlock = 300 // outputs per block → 60 000 total (> gcUTXOInterval=50 000)
+		nScanBlocks     = 1100 // > 1 000 so syncProgressInterval callback fires ≥ once
+		outputsPerBlock = 55   // outputs per block → 60 500 total (> gcUTXOInterval=50 000)
 	)
 
 	dir := t.TempDir()
@@ -107,6 +104,11 @@ func TestStartupScanMemoryCeiling(t *testing.T) {
 		}
 	}()
 
+	// progressCallbacks counts how often SetSyncProgress was invoked.
+	// With nScanBlocks=1100 and the internal syncProgressInterval=1000,
+	// the callback must fire at least once.
+	var progressCallbacks atomic.Int64
+
 	// ── Run the production scan ───────────────────────────────────────────
 	var snapWg sync.WaitGroup
 	_, err := runStartupScan(startupScanParams{
@@ -121,8 +123,11 @@ func TestStartupScanMemoryCeiling(t *testing.T) {
 		Log:         discardLog(),
 		SnapshotWg:  &snapWg,
 		// SetSyncProgress is called every 1 000 blocks — use it as an
-		// additional deterministic memory sample point.
-		SetSyncProgress: func(_, _ uint64) { sampleMem() },
+		// additional deterministic memory sample point and count invocations.
+		SetSyncProgress: func(_, _ uint64) {
+			progressCallbacks.Add(1)
+			sampleMem()
+		},
 	})
 
 	// Stop the background monitor before asserting.
@@ -132,6 +137,19 @@ func TestStartupScanMemoryCeiling(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
+	}
+
+	// ── Assert SetSyncProgress was actually invoked ───────────────────────
+	gotCallbacks := progressCallbacks.Load()
+	if gotCallbacks == 0 {
+		t.Errorf(
+			"SetSyncProgress was never called during the scan (chain has %d blocks; "+
+				"the internal syncProgressInterval is 1 000 blocks — "+
+				"nScanBlocks must be > 1 000 for at least one invocation)",
+			nScanBlocks,
+		)
+	} else {
+		t.Logf("SetSyncProgress invoked %d time(s) during the scan", gotCallbacks)
 	}
 
 	// ── Assert memory ceiling ─────────────────────────────────────────────
@@ -187,8 +205,8 @@ func buildScanMemChain(
 	makeBlk := func(height uint64, prev crypto.Hash32) *core.Block {
 		outs := make([]core.Output, outputsPerBlock)
 		for i := range outs {
-			// Unique OneTimePub per output: encode (height, i) into the first
-			// 8 bytes so no two outputs share the same key.
+			// Unique OneTimePub per output: encode (height, outputIndex) into
+			// the first 8 bytes so no two outputs share the same key.
 			var otp crypto.Point32
 			otp[0] = byte(height)
 			otp[1] = byte(height >> 8)
@@ -196,7 +214,7 @@ func buildScanMemChain(
 			otp[3] = byte(height >> 24)
 			otp[4] = byte(i)
 			otp[5] = byte(i >> 8)
-			otp[6] = 0x01 // non-zero marker distinguishes from the zero value
+			otp[6] = 0x01 // non-zero marker distinguishes from zero value
 			outs[i] = core.Output{
 				OneTimePub: otp,
 				TxPubKey:   otp,
