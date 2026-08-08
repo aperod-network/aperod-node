@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -159,26 +160,36 @@ func (pm *PeerMgr) persistBans() {
 
 // LoadBansFromFile restores ban entries persisted by a previous run.
 // Entries that expired while the node was down are silently discarded.
-// A missing file is not an error (first boot).  A corrupt file is logged
-// and treated as empty — the node starts with a clean ban list rather than
-// refusing to start.
-func (pm *PeerMgr) LoadBansFromFile() {
+// A missing file is not an error (first boot) — nil is returned.
+//
+// A ban file that exists but cannot be read or decoded is a fatal error:
+// the caller (Start) must abort rather than continuing with an empty ban
+// list, which would allow previously-banned IPs to reconnect immediately
+// after a crash-corrupted write.  The operator must repair or remove the
+// file to restart the node.
+func (pm *PeerMgr) LoadBansFromFile() error {
 	if pm.banFile == "" || pm.banFile == "-" {
-		return
+		return nil
 	}
 	data, err := os.ReadFile(pm.banFile)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Default().Warn("p2p: ban persistence: read failed — starting with empty ban list",
-				"file", pm.banFile, "err", err)
+		if os.IsNotExist(err) {
+			return nil // first boot; no file yet
 		}
-		return
+		return fmt.Errorf("p2p: ban sidecar %q cannot be read: %w — "+
+			"repair or remove the file to restart the node", pm.banFile, err)
 	}
 	var entries []persistedBan
-	if err := json.Unmarshal(data, &entries); err != nil {
-		slog.Default().Warn("p2p: ban persistence: corrupt file — starting with empty ban list",
-			"file", pm.banFile, "err", err)
-		return
+	if jsonErr := json.Unmarshal(data, &entries); jsonErr != nil {
+		return fmt.Errorf("p2p: ban sidecar %q is corrupt (JSON parse error): %w — "+
+			"repair or remove the file to restart the node", pm.banFile, jsonErr)
+	}
+	// json.Unmarshal sets entries to nil for a JSON null value.
+	// A null sidecar is not a valid empty list: it indicates a truncated or
+	// tampered file.  Fail-closed so previously-banned IPs stay blocked.
+	if entries == nil {
+		return fmt.Errorf("p2p: ban sidecar %q contains JSON null (not a valid "+
+			"ban array) — repair or remove the file to restart the node", pm.banFile)
 	}
 	now := time.Now()
 	pm.mu.Lock()
@@ -188,6 +199,7 @@ func (pm *PeerMgr) LoadBansFromFile() {
 		}
 	}
 	pm.mu.Unlock()
+	return nil
 }
 
 // CanDial returns true when addr is not banned and its back-off window has
