@@ -174,6 +174,12 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                                                                         TxIndex: ti,
                                                                                 }
                                                                                 diskResolved = true
+                                                                                // Heal the stale byPubKey entry so VerifyTx
+                                                                                // C-0 check finds the correct AmountCommit.
+                                                                                s.utxos.PatchAmountCommit(
+                                                                                        out.OneTimePub,
+                                                                                        out.AmountCommit,
+                                                                                )
                                                                         }
                                                                         break
                                                                 }
