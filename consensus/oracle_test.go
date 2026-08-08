@@ -178,8 +178,9 @@ func TestOraclePrice_SurvivesRestart(t *testing.T) {
 	eng := newOracleEngine(t, []crypto.ValidatorPubKey{pub}, lk, chain, oracle.URL(), logger)
 
 	stop := make(chan struct{})
-	go eng.Run(stop)
-	defer close(stop)
+	done := make(chan struct{})
+	go func() { eng.Run(stop); close(done) }()
+	defer func() { close(stop); <-done }() // wait for engine goroutine to exit before key is Destroyed
 
 	produced := eng.ProducedCh()
 
