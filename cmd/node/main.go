@@ -536,6 +536,7 @@ func run() error {
                 apiSrv.SetAllowedOrigins(cfg.API.CORS)
                 apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
                 apiSrv.SetStore(db)
+                apiSrv.SetRSSStatsFn(readRSSBytes)
                 apiSrv.SetDataDir(cfg.DataDir)
                 apiSrv.SetPruningMode(cfg.Pruning.Mode)
                 apiSrv.SetKeepBlocks(cfg.Pruning.KeepBlocks)
