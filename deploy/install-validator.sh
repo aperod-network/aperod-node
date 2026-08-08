@@ -279,7 +279,7 @@ log_level: info
 p2p:
   listen_addr: /ip4/0.0.0.0/tcp/${P2P_PORT}
   bootnodes:
-    - /ip4/77.221.153.86/tcp/30303
+    - /ip4/<BOOTNODE_IP>/tcp/30303
   max_peers: 50
 
 consensus:
@@ -348,7 +348,9 @@ EOF
 
 chown -R "${APEROD_USER}:${APEROD_USER}" "${DATA_DIR}"
 
-systemctl daemon-reload
+# Write / verify memory-protection drop-ins (timeout.conf + gomemlimit.conf)
+# and call daemon-reload so the drop-ins are active before the service starts.
+bash "${INSTALL_DIR}/deploy/ensure-dropin.sh"
 systemctl enable aperod-node
 systemctl start  aperod-node
 ok "Сервис aperod-node запущен"
