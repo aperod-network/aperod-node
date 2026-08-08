@@ -10,6 +10,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -233,6 +234,161 @@ func TestReplayPostSnapshotGap_MissingBlock(t *testing.T) {
 
 	if complete {
 		t.Error("expected complete=false when block is missing from DB")
+	}
+}
+
+// ─── TestSnapshotGapFill_EndToEnd ────────────────────────────────────────────
+
+// TestSnapshotGapFill_EndToEnd is the end-to-end regression test for the
+// admin-mint UTXO loss bug (task #1564).
+//
+// Scenario simulated (unclean shutdown):
+//  1. Chain runs to height 1; a periodic snapshot is saved at height 1.
+//  2. An admin-mint transaction is written into block 2 (added to LevelDB).
+//  3. Node is SIGKILL'd — no SIGTERM snapshot at height 2 is written.
+//  4. Node restarts: tryLoadStartupSnapshot(tipHeight=2) fails because the
+//     only snapshot on disk is at height 1 (hash mismatch).
+//  5. findLatestSnapshot(dataDir, tipHeight=2) discovers the height-1 snapshot.
+//  6. replayPostSnapshotGap replays block 2 from raw LevelDB bytes.
+//  7. The admin-mint UTXO is now present in the in-memory UTXOSet so address
+//     scans and the circulating supply calculation are correct after restart.
+func TestSnapshotGapFill_EndToEnd(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	// ── Build block 1 ───────────────────────────────────────────────────────
+	// Block 1 contains a normal (non-mint) output; the snapshot is saved here.
+	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, priv, pub)
+	putRawBlk(t, db, genesis)
+
+	var normalPub crypto.Point32
+	normalPub[0] = 0x01
+	normalTx := core.Transaction{Outputs: []core.Output{{OneTimePub: normalPub}}}
+
+	blk1 := makeSignedBlk(t, 1, genesis.Hash(), priv, pub)
+	blk1.Txs = []core.Transaction{normalTx}
+	blk1.Header.MerkleRoot = core.MerkleRoot(blk1.Txs)
+	if err := blk1.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk1: %v", err)
+	}
+	putRawBlk(t, db, blk1)
+
+	// ── Save snapshot at height 1 ───────────────────────────────────────────
+	// Simulate the periodic checkpoint saved after block 1 is accepted.
+	// The UTXOSet at this point contains only the normalTx output.
+	utxosAtSnap := core.NewUTXOSet()
+	utxosAtSnap.Add(&core.UTXO{
+		TxHash:      normalTx.Hash(),
+		OutputIndex: 0,
+		OneTimePub:  normalPub,
+		BlockHeight: 1,
+	})
+	reg := core.NewValidatorRegistry()
+	reg.SetUTXOSet(utxosAtSnap)
+
+	blk1Hash := blk1.Hash()
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  1,
+		TipHashHex: fmt.Sprintf("%x", blk1Hash[:]),
+		UTXOs:      utxosAtSnap.TakeSnapshot(),
+		Registry:   reg.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// ── Add admin-mint block at height 2 (post-snapshot) ───────────────────
+	// A transparent admin-mint uses the bare spendPub as OneTimePub so the
+	// address scan can find it without a stealth derivation.
+	var mintPub crypto.Point32
+	mintPub[0] = 0xAD // "admin" sentinel byte
+
+	mintTx := core.Transaction{
+		Outputs: []core.Output{
+			{OneTimePub: mintPub},
+		},
+	}
+	mintTxHash := mintTx.Hash()
+
+	blk2 := makeSignedBlk(t, 2, blk1Hash, priv, pub)
+	blk2.Txs = []core.Transaction{mintTx}
+	blk2.Header.MerkleRoot = core.MerkleRoot(blk2.Txs)
+	if err := blk2.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk2: %v", err)
+	}
+	putRawBlk(t, db, blk2)
+
+	// ── Simulate restart ────────────────────────────────────────────────────
+	// The chain tip is now height 2.  tryLoadStartupSnapshot(2) would fail
+	// because the only snapshot on disk is at height 1 (different hash).
+	// The production code then calls findLatestSnapshot(dataDir, tipHeight=2)
+	// which discovers the height-1 snapshot, and then replayPostSnapshotGap
+	// replays block 2.
+	//
+	// We test that sub-path directly here.
+	utxosOnRestart := core.NewUTXOSet()
+
+	// findLatestSnapshot finds the highest snapshot below tipHeight=2.
+	// It must return the height-1 snapshot saved above.
+	gapSnap := findLatestSnapshot(dir, 2, silentLog())
+	if gapSnap == nil {
+		t.Fatal("findLatestSnapshot returned nil — height-1 snapshot not found")
+	}
+	if gapSnap.TipHeight != 1 {
+		t.Fatalf("findLatestSnapshot: expected TipHeight=1, got %d", gapSnap.TipHeight)
+	}
+
+	// Restore snapshot state.
+	utxosOnRestart.RestoreFromSnapshot(gapSnap.UTXOs)
+
+	// The normal output from block 1 is in the snapshot and must be visible.
+	if utxosOnRestart.Get(normalTx.Hash(), 0) == nil {
+		t.Error("normal UTXO from block 1 not restored from snapshot")
+	}
+	// The admin-mint from block 2 is NOT yet in the UTXOSet (it post-dates the snapshot).
+	if utxosOnRestart.Get(mintTxHash, 0) != nil {
+		t.Fatal("pre-condition: admin-mint UTXO should not be present before gap-fill")
+	}
+
+	// Gap-fill: replay block 2 from raw LevelDB bytes.
+	added, spent, complete := replayPostSnapshotGap(db, utxosOnRestart, 1, 2, silentLog())
+
+	if !complete {
+		t.Error("gap-fill: expected complete=true, got false")
+	}
+	if added != 1 {
+		t.Errorf("gap-fill: outputs added: want 1, got %d", added)
+	}
+	if spent != 0 {
+		t.Errorf("gap-fill: key images spent: want 0, got %d", spent)
+	}
+
+	// The admin-mint UTXO must now be in the UTXOSet.
+	u := utxosOnRestart.Get(mintTxHash, 0)
+	if u == nil {
+		t.Fatal("admin-mint UTXO not found after gap-fill — restart would show 0 in circulation")
+	}
+	if u.OneTimePub != mintPub {
+		t.Errorf("OneTimePub: want %x, got %x", mintPub, u.OneTimePub)
+	}
+	if u.BlockHeight != 2 {
+		t.Errorf("BlockHeight: want 2, got %d", u.BlockHeight)
+	}
+
+	// The normal UTXO from block 1 must still be present.
+	if utxosOnRestart.Get(normalTx.Hash(), 0) == nil {
+		t.Error("normal UTXO from block 1 disappeared after gap-fill")
 	}
 }
 
