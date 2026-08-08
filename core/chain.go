@@ -31,10 +31,6 @@ type Chain struct {
         maxInMemoryBlocks uint64 // sliding-window size; default MaxInMemoryBlocks
 }
 
-// NewChain creates an empty chain.  An optional maxInMemoryBlocks value may be
-// provided to override the default sliding-window size; 0 or omitted uses the
-// MaxInMemoryBlocks constant (1 000).  This allows node operators to tune the
-// in-memory block window via node.yaml without recompiling.
 // InMemoryBlockCount returns the number of blocks currently held in the
 // sliding in-memory window.  Used by /api/health to expose live memory stats
 // without requiring the caller to SSH into the node.
@@ -44,6 +40,10 @@ func (c *Chain) InMemoryBlockCount() int {
         return len(c.blocks)
 }
 
+// NewChain creates an empty chain.  An optional maxInMemoryBlocks value may be
+// provided to override the default sliding-window size; 0 or omitted uses the
+// MaxInMemoryBlocks constant (1 000).  This allows node operators to tune the
+// in-memory block window via node.yaml without recompiling.
 func NewChain(maxBlocks ...uint64) *Chain {
         max := uint64(MaxInMemoryBlocks)
         if len(maxBlocks) > 0 && maxBlocks[0] > 0 {
