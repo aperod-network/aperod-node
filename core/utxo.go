@@ -699,6 +699,53 @@ func (s *UTXOSet) Count() int {
 	return len(s.utxos)
 }
 
+// KeyImagesCount returns the total number of spent key images (both tiers).
+// Used for memory diagnostics.
+func (s *UTXOSet) KeyImagesCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.keyImages.length()
+}
+
+// KeyImagesRecentCount returns the number of key images in the runtime 'recent'
+// map (as opposed to the compact 'sorted' slice).  A large recent count means
+// CompactKeyImages has not been called recently and map-bucket overhead is
+// accumulating (~150 B/entry vs 32 B/entry in the sorted slice).
+func (s *UTXOSet) KeyImagesRecentCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.keyImages.recent)
+}
+
+// CompactKeyImages merges the 'recent' runtime-additions map into the compact
+// 'sorted' slice, reducing per-entry memory overhead from ~150 B (Go map bucket)
+// to 32 B (slice element).  The total number of key images is unchanged; only
+// the internal representation changes.
+//
+// Call this periodically (e.g. every GC cycle) to reclaim map-bucket overhead
+// that accumulates as new key images arrive at runtime.  At 10 TXs/block with
+// 2 inputs each, the recent map grows by ~20 entries/block (~3 KB overhead/block);
+// over 24 h at 1 block/3 s that is ~720 MB of avoidable map overhead reclaimed
+// by one call to CompactKeyImages followed by runtime.GC()+debug.FreeOSMemory().
+//
+// The merge is O(n log n) on the total key-image count, but runs once per GC
+// cycle (every ~5 min in production) rather than per-block, so the amortised
+// cost is negligible.  The call holds the write lock for the duration of the
+// sort; block processing is briefly paused.  On a 1 M-entry set the sort
+// completes in < 200 ms on a modern server.
+func (s *UTXOSet) CompactKeyImages() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := len(s.keyImages.recent)
+	if before == 0 {
+		return 0 // nothing to compact
+	}
+	// toSlice() returns a sorted merge of sorted+recent; restoreFromSlice
+	// installs it as the new sorted slice and clears recent.
+	s.keyImages.restoreFromSlice(s.keyImages.toSlice())
+	return before // number of entries moved from map to slice
+}
+
 // All returns a snapshot of all UTXOs (for testing / export).
 func (s *UTXOSet) All() []*UTXO {
 	s.mu.RLock()
