@@ -2451,31 +2451,32 @@ func replayPostSnapshotGap(
                         complete = false
                         break
                 }
+                // Apply the full UTXO state transition for this block — same
+                // semantics as the startup scan's ApplyBlock call.  This:
+                //   • inserts new outputs into the primary and byPubKey indexes
+                //   • removes real consumed UTXOs from the active/byPubKey indexes
+                //   • moves them into the spent-decoy pool
+                //   • invokes OnUTXOSpent for the persistent su/ index
+                //   • inserts canonical key images into the key-image set
+                //
+                // Using ApplyBlock (rather than manual MarkSpent+Add) is
+                // required so spent snapshot UTXOs are removed from the active
+                // index — otherwise they remain eligible as ring members and
+                // appear erroneously in address scans and the UTXO supply count.
+                if err := utxos.ApplyBlock(&blk); err != nil {
+                        log.Warn("snapshot gap-fill: ApplyBlock failed — halting replay",
+                                "height", h, "err", err)
+                        complete = false
+                        break
+                }
+                // Count for logging only.
                 for _, tx := range blk.Txs {
-                        txHash := tx.Hash()
-                        // Mark input key images spent so the double-spend guard
-                        // covers the gap window.
-                        for _, inp := range tx.Inputs {
-                                utxos.MarkSpent(inp.KeyImage)
-                                spent++
-                        }
-                        // Register new outputs so address scans include them.
-                        for i, out := range tx.Outputs {
-                                utxos.Add(&core.UTXO{
-                                        TxHash:       txHash,
-                                        OutputIndex:  uint32(i),
-                                        OneTimePub:   out.OneTimePub,
-                                        TxPubKey:     out.TxPubKey,
-                                        AmountCommit: out.AmountCommit,
-                                        EncAmount:    out.EncAmount,
-                                        BlockHeight:  blk.Header.Height,
-                                })
-                                added++
-                        }
+                        added += len(tx.Outputs)
+                        spent += len(tx.Inputs)
                 }
                 // Replay stake/delegation/withdrawal txs so validator registry
                 // state advances to chainTipHeight.  Matches the startup scan's
-                // call in runStartupScan.  A replay error means the gap block
+                // ReplayBlockStakeTxs call.  A replay error means the gap block
                 // cannot be trusted; halt and fall back to the full scan.
                 if replayErr := registry.ReplayBlockStakeTxs(blk.Txs, blk.Header.Height); replayErr != nil {
                         log.Warn("snapshot gap-fill: registry replay failed — halting",
