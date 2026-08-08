@@ -136,21 +136,40 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                 return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
                                         u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
                         }
-                        if su == nil {
+                        if su != nil {
+                                // Synthesise core.Output from the stored UTXO fields.
+                                // Only OneTimePub, TxPubKey, and AmountCommit are needed for
+                                // RingCT input construction; EncAmount is not used downstream.
+                                out = core.Output{
+                                        OneTimePub:   su.OneTimePub,
+                                        TxPubKey:     su.TxPubKey,
+                                        AmountCommit: su.AmountCommit,
+                                }
+                                loc = core.TxLocation{
+                                        Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
+                                        TxIndex: 0,
+                                }
+                        } else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
+                                // Fallback 4: in-memory UTXOSet catches the case where the
+                                // LevelDB u/ entry was lost after an OOM kill + repair but
+                                // the snapshot-restored in-memory set is intact. The in-memory
+                                // set is the canonical authority for ring-member AmountCommit
+                                // checks (C-0 uses byPubKey), so AmountCommit from here is
+                                // guaranteed to match the ring proof verification.
+                                s.log.Info("in-memory UTXO fallback: LevelDB u/ absent; resolving from snapshot UTXOSet",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                                out = core.Output{
+                                        OneTimePub:   memUTXO.OneTimePub,
+                                        TxPubKey:     memUTXO.TxPubKey,
+                                        AmountCommit: memUTXO.AmountCommit,
+                                }
+                                loc = core.TxLocation{
+                                        Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
+                                        TxIndex: 0,
+                                }
+                        } else {
                                 return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
                                         u.TxHash[:min(16, len(u.TxHash))])
-                        }
-                        // Synthesise core.Output from the stored UTXO fields.
-                        // Only OneTimePub, TxPubKey, and AmountCommit are needed for
-                        // RingCT input construction; EncAmount is not used downstream.
-                        out = core.Output{
-                                OneTimePub:   su.OneTimePub,
-                                TxPubKey:     su.TxPubKey,
-                                AmountCommit: su.AmountCommit,
-                        }
-                        loc = core.TxLocation{
-                                Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
-                                TxIndex: 0,
                         }
                 } else {
                         return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
