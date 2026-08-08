@@ -774,6 +774,55 @@ func run() error {
                                         // next automatic collection, doubling peak RSS on load.
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
+
+                                        // ── Post-snapshot UTXO gap-fill ──────────────────────────────
+                                        // The snapshot records the UTXO set at the time it was saved.
+                                        // Any UTXO created after the snapshot (e.g. a transparent
+                                        // admin-mint output) is in the LevelDB u/ namespace but absent
+                                        // from the snapshot, so it drops out of address scans until
+                                        // the next restart that catches a post-mint snapshot.
+                                        //
+                                        // Fix: iterate IterActiveUTXOs and call utxos.Add() for every
+                                        // entry not already in the snapshot.  utxos.Add() is an
+                                        // idempotent map write — re-adding snapshot UTXOs is safe.
+                                        //
+                                        // Guard: skip when the su/ spent-UTXO index is empty (first
+                                        // startup with no index yet).  IterActiveUTXOs relies on su/
+                                        // to filter out spent entries; without it we would add spent
+                                        // UTXOs back into the active set.
+                                        if gfSuSize, gfSuErr := db.SpentUTXOIndexSize(); gfSuErr != nil {
+                                                log.Warn("snapshot gap-fill: su/ index check failed (skipping)",
+                                                        "err", gfSuErr)
+                                        } else if gfSuSize == 0 && tipHeight > 0 {
+                                                log.Warn("snapshot gap-fill: su/ index empty on non-genesis " +
+                                                        "chain — UTXOs created after last snapshot may be " +
+                                                        "absent from address scans until next restart")
+                                        } else {
+                                                gfAdded := 0
+                                                gfErr := db.IterActiveUTXOs(func(su *store.StoredUTXO) error {
+                                                        if utxos.Get(su.TxHash, su.OutputIndex) == nil {
+                                                                utxos.Add(&core.UTXO{
+                                                                        TxHash:       su.TxHash,
+                                                                        OutputIndex:  su.OutputIndex,
+                                                                        OneTimePub:   su.OneTimePub,
+                                                                        TxPubKey:     su.TxPubKey,
+                                                                        AmountCommit: su.AmountCommit,
+                                                                        EncAmount:    su.EncAmount,
+                                                                        BlockHeight:  su.BlockHeight,
+                                                                })
+                                                                gfAdded++
+                                                        }
+                                                        return nil
+                                                })
+                                                if gfErr != nil {
+                                                        log.Warn("snapshot gap-fill: IterActiveUTXOs error (non-fatal)",
+                                                                "err", gfErr)
+                                                } else if gfAdded > 0 {
+                                                        log.Info("snapshot gap-fill: added post-snapshot UTXOs",
+                                                                "added", gfAdded,
+                                                                "total_active", utxos.Count())
+                                                }
+                                        }
                                 }
                                 // Snapshot was readable but failed the UTXO-count divergence check.
                                 // Save a pointer so the rescue path below can seed key-images +
