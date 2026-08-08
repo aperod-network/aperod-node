@@ -395,6 +395,26 @@ func run() error {
                 return fmt.Errorf("get tip: %w", err)
         }
 
+        // ── UTXO store rebuild (--repair-db only) ─────────────────────────────────
+        // After OOM kill + LevelDB RecoverFile, u/ (UTXO store) entries that were
+        // only in SST files at crash time may be absent even though their key-images
+        // are unspent.  Scan all blocks now and restore any missing u/ entries so
+        // validator-reward and admin-mint UTXOs remain spendable after repair.
+        // This must run before the height-index integrity check (which calls return nil
+        // for --repair-db) to ensure the rebuild completes even on the early-exit path.
+        if repairDB {
+                log.Info("--repair-db: scanning blocks to restore missing UTXO store entries",
+                        "tip_height", tipHeight)
+                restored, rebuildErr := rebuildMissingUTXOs(db, tipHeight, log)
+                if rebuildErr != nil {
+                        log.Warn("--repair-db: UTXO store rebuild completed with errors",
+                                "restored_entries", restored, "err", rebuildErr)
+                } else {
+                        log.Info("--repair-db: UTXO store rebuild complete",
+                                "restored_entries", restored)
+                }
+        }
+
         // Populated during the key-image rebuild scan below; stays 0 for genesis.
         var initialTxTotal int64
 
@@ -2185,6 +2205,70 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
                         ),
                 )
         }
+}
+
+// rebuildMissingUTXOs scans every stored block from height 0 to tipHeight and
+// re-populates u/ (UTXO store) entries that are absent but not marked spent in
+// the su/ index.  Called as part of --repair-db to fix validator-reward and
+// admin-mint UTXOs that survived the key-image index but whose u/ entries were
+// in SST files lost during an OOM-kill + LevelDB RecoverFile cycle.
+//
+// The rebuild is safe to run multiple times: it skips entries already present
+// in u/ and never overwrites them.  Already-spent outputs (su/ entry present)
+// are also skipped.  Missing blocks are silently skipped with a non-fatal error.
+func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logger) (int, error) {
+        rebuilt := 0
+        var firstErr error
+        for h := uint64(0); h <= tipHeight; h++ {
+                raw, err := blockStore.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        if err != nil && firstErr == nil {
+                                firstErr = fmt.Errorf("height %d: %w", h, err)
+                        }
+                        continue
+                }
+                var b core.Block
+                if err := json.Unmarshal(raw, &b); err != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("unmarshal height %d: %w", h, err)
+                        }
+                        continue
+                }
+                for _, tx := range b.Txs {
+                        txHash := tx.Hash()
+                        for outIdx, out := range tx.Outputs {
+                                if blockStore.IsUTXOSpent(txHash, uint32(outIdx)) {
+                                        continue // spent — su/ entry present, skip
+                                }
+                                existing, _ := blockStore.GetUTXO(txHash, uint32(outIdx))
+                                if existing != nil {
+                                        continue // already in store, skip
+                                }
+                                // u/ entry absent and not spent — restore it
+                                su := &store.StoredUTXO{
+                                        TxHash:       txHash,
+                                        OutputIndex:  uint32(outIdx),
+                                        OneTimePub:   out.OneTimePub,
+                                        TxPubKey:     out.TxPubKey,
+                                        AmountCommit: out.AmountCommit,
+                                        EncAmount:    out.EncAmount,
+                                        BlockHeight:  h,
+                                }
+                                if putErr := blockStore.PutUTXO(txHash, uint32(outIdx), su); putErr != nil {
+                                        if firstErr == nil {
+                                                firstErr = putErr
+                                        }
+                                        continue
+                                }
+                                rebuilt++
+                        }
+                }
+                if h%10_000 == 0 && h > 0 {
+                        log.Info("--repair-db: UTXO rebuild progress",
+                                "height", h, "tip", tipHeight, "restored", rebuilt)
+                }
+        }
+        return rebuilt, firstErr
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.
