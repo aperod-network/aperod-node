@@ -186,6 +186,13 @@ type P2PConfig struct {
 	// Default: 50.  Set to 0 to disable rate limiting (not recommended on
 	// resource-constrained nodes).
 	MaxBlockIngestPerSec int `yaml:"max_block_ingest_per_sec"`
+	// MaxStaleBootnodeAge is the maximum time a bootnode may go without a
+	// successful DNS resolution before a WARN is emitted on every discovery
+	// tick.  The warning includes the bootnode address and the exact age since
+	// last successful resolution so operators can identify and fix stale
+	// entries before the peer count silently drops to zero.
+	// Default: 24h.  Set to 0 to use the default.
+	MaxStaleBootnodeAge time.Duration `yaml:"max_stale_bootnode_age"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -262,7 +269,8 @@ func DefaultConfig() *Config {
 			BadBlockHeightLead:   1000,
 			BadBlockBanThreshold: 5,
 			BadBlockBanDuration:  24 * time.Hour,
-			MaxBlockIngestPerSec: 50, // cap sync-peer block delivery to prevent CPU spikes
+			MaxBlockIngestPerSec: 50,       // cap sync-peer block delivery to prevent CPU spikes
+			MaxStaleBootnodeAge:  24 * time.Hour, // warn when a bootnode DNS hasn't resolved for this long
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
@@ -328,6 +336,29 @@ func (c *Config) Warnings() []string {
 	var ws []string
 	if len(c.P2P.AllowedPeers) > 0 && len(c.P2P.Bootnodes) == 0 {
 		ws = append(ws, "allowed_peers is set but bootnodes is empty — node may be isolated (no peers to connect to)")
+	}
+	// Rogue-peer ban safety checks.  These are warnings (not hard failures) because
+	// operators may have deliberate reasons to raise the thresholds (e.g. a private
+	// test network with a single trusted peer that produces many chain-fork messages).
+	// However, values well above the safe defaults effectively disable the rogue-fork
+	// ban and leave the node unprotected against adversarial peers.
+	const safeBanThreshold = 50
+	const safeHeightLead = 10_000
+	if c.P2P.BadBlockBanThreshold > safeBanThreshold {
+		ws = append(ws, fmt.Sprintf(
+			"p2p.bad_block_ban_threshold is %d, which is above the recommended safe maximum of %d — "+
+				"a very large threshold effectively disables the rogue-fork ban and allows adversarial peers "+
+				"to send wrong-fork blocks indefinitely without being banned; recommended value: 5–10",
+			c.P2P.BadBlockBanThreshold, safeBanThreshold,
+		))
+	}
+	if c.P2P.BadBlockHeightLead > safeHeightLead {
+		ws = append(ws, fmt.Sprintf(
+			"p2p.bad_block_height_lead is %d, which is above the recommended safe maximum of %d — "+
+				"a very large height lead reduces sensitivity to rogue-fork spam and may allow adversarial "+
+				"peers to avoid ban detection for extended periods; recommended value: 500–2000",
+			c.P2P.BadBlockHeightLead, safeHeightLead,
+		))
 	}
 	return ws
 }
