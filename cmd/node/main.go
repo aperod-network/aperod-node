@@ -1259,22 +1259,44 @@ func run() error {
                         // tracks the real chain state (runs for local + peer blocks).
                         engine.DecrementPool(h)
 
-                        // Periodically force GC and return freed pages to the OS so that
-                        // RSS does not grow unboundedly between snapshot saves.  The Go
-                        // runtime only returns heap pages on GC; without an explicit call
-                        // during steady-state sync, RSS drifts upward until GOMEMLIMIT
-                        // causes GC thrash.  Running in a goroutine keeps the block
-                        // acceptance path non-blocking.
+                        // Periodically compact key images, force GC, and return freed
+                        // pages to the OS so RSS does not grow unboundedly between
+                        // snapshot saves.
                         //
-                        // 500 blocks ≈ 25 min at 1 block/3 s.  Previous value (5000)
-                        // fired every ~4.2 h, allowing 1–2 GB of RSS drift between
-                        // collections on a chain producing one block every 3 seconds.
-                        const gcEveryBlocks = uint64(500)
+                        // CompactKeyImages merges the runtime 'recent' map (≈150 B/entry
+                        // Go-map overhead) into the compact 'sorted' slice (32 B/entry).
+                        // On a chain with 10 TXs/block × 2 inputs the recent map grows
+                        // ~20 entries/block; without compaction that is ~118 B × 20 × 100
+                        // = 236 KB of avoidable overhead per GC cycle — which compounds
+                        // to ~1.7 GB/day on a busy chain.
+                        //
+                        // 100 blocks ≈ 5 min at 1 block/3 s.  The previous value (500)
+                        // fired every ~25 min, allowing up to 540 MB of RSS growth between
+                        // FreeOSMemory calls when live data was accumulating.  Lowering to
+                        // 100 caps the oscillation window to ~100 MB, keeping peak RSS
+                        // well below the watchdog threshold.
+                        const gcEveryBlocks = uint64(100)
                         if h > 0 && h%gcEveryBlocks == 0 {
-                                go func() {
+                                go func(height uint64) {
+                                        rssBefore := readRSSBytes()
+                                        recentMoved := utxos.CompactKeyImages()
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
-                                }()
+                                        rssAfter := readRSSBytes()
+                                        var ms runtime.MemStats
+                                        runtime.ReadMemStats(&ms)
+                                        log.Info("periodic GC complete",
+                                                "height", height,
+                                                "ki_recent_compacted", recentMoved,
+                                                "rss_before_mb", rssBefore>>20,
+                                                "rss_after_mb", rssAfter>>20,
+                                                "rss_freed_mb", (rssBefore-rssAfter)>>20,
+                                                "heap_alloc_mb", int64(ms.HeapAlloc)>>20,
+                                                "heap_sys_mb", int64(ms.HeapSys)>>20,
+                                                "heap_idle_mb", int64(ms.HeapIdle)>>20,
+                                                "num_gc", ms.NumGC,
+                                        )
+                                }(h)
                         }
 
                         // Persist spent key images and stake-block heights for every
@@ -1353,6 +1375,12 @@ func run() error {
                                 // point, so there is no remaining reference to snap's slices.
                                 snap.UTXOs = core.UTXOSnapshot{}
                                 snap.Registry = core.RegistrySnapshot{}
+                                // Compact key images after the snapshot: TakeSnapshot already
+                                // serialised them, so we can now merge the 'recent' map
+                                // (≈150 B/entry Go-map overhead) into the 'sorted' slice
+                                // (32 B/entry).  GC reclaims the old map buckets immediately
+                                // after this call.
+                                utxos.CompactKeyImages()
                                 runtime.GC()
                                 debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
                         }(periodicSnap, h, periodicActive)
@@ -1609,6 +1637,7 @@ func run() error {
                                 WhitelistFile:        whitelistFilePath,
                                 KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
                                 MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
+                                MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
