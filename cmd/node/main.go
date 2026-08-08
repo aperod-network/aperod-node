@@ -775,52 +775,74 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
-                                        // ── Post-snapshot UTXO gap-fill ──────────────────────────────
-                                        // The snapshot records the UTXO set at the time it was saved.
-                                        // Any UTXO created after the snapshot (e.g. a transparent
-                                        // admin-mint output) is in the LevelDB u/ namespace but absent
-                                        // from the snapshot, so it drops out of address scans until
-                                        // the next restart that catches a post-mint snapshot.
+                                        // ── Post-snapshot block-replay gap-fill ──────────────────────
+                                        // The snapshot captures the UTXO set at snap.TipHeight.  When
+                                        // the node was stopped without a clean SIGTERM (OOM-kill,
+                                        // SIGKILL) after blocks were accepted beyond that height, those
+                                        // post-snapshot blocks are in LevelDB but their UTXOs are
+                                        // absent from the snapshot.  Transparent admin-mint outputs are
+                                        // the most visible case: they disappear from address scans and
+                                        // the circulating supply shows 0.
                                         //
-                                        // Fix: iterate IterActiveUTXOs and call utxos.Add() for every
-                                        // entry not already in the snapshot.  utxos.Add() is an
-                                        // idempotent map write — re-adding snapshot UTXOs is safe.
+                                        // Fix: replay blocks snap.TipHeight+1 through tipHeight from
+                                        // the canonical block store.  For each block:
+                                        //   • add every tx output to the in-memory UTXO set
+                                        //   • mark every tx input's key image as spent
                                         //
-                                        // Guard: skip when the su/ spent-UTXO index is empty (first
-                                        // startup with no index yet).  IterActiveUTXOs relies on su/
-                                        // to filter out spent entries; without it we would add spent
-                                        // UTXOs back into the active set.
-                                        if gfSuSize, gfSuErr := db.SpentUTXOIndexSize(); gfSuErr != nil {
-                                                log.Warn("snapshot gap-fill: su/ index check failed (skipping)",
-                                                        "err", gfSuErr)
-                                        } else if gfSuSize == 0 && tipHeight > 0 {
-                                                log.Warn("snapshot gap-fill: su/ index empty on non-genesis " +
-                                                        "chain — UTXOs created after last snapshot may be " +
-                                                        "absent from address scans until next restart")
-                                        } else {
-                                                gfAdded := 0
-                                                gfErr := db.IterActiveUTXOs(func(su *store.StoredUTXO) error {
-                                                        if utxos.Get(su.TxHash, su.OutputIndex) == nil {
-                                                                utxos.Add(&core.UTXO{
-                                                                        TxHash:       su.TxHash,
-                                                                        OutputIndex:  su.OutputIndex,
-                                                                        OneTimePub:   su.OneTimePub,
-                                                                        TxPubKey:     su.TxPubKey,
-                                                                        AmountCommit: su.AmountCommit,
-                                                                        EncAmount:    su.EncAmount,
-                                                                        BlockHeight:  su.BlockHeight,
-                                                                })
-                                                                gfAdded++
+                                        // This approach is safe because it uses authoritative block
+                                        // data — no reliance on the su/ spent-UTXO index, which is a
+                                        // best-effort performance index that may be incomplete.  When
+                                        // snap.TipHeight == tipHeight (normal clean shutdown) the loop
+                                        // body never executes and overhead is a single integer compare.
+                                        if snap.TipHeight < tipHeight {
+                                                gfAdded, gfSpent, gfBlocks := 0, 0, uint64(0)
+                                                gfOK := true
+                                                for h := snap.TipHeight + 1; h <= tipHeight; h++ {
+                                                        blk, blkErr := db.GetBlockByHeight(h)
+                                                        if blkErr != nil || blk == nil {
+                                                                log.Warn("snapshot gap-fill: block not found "+
+                                                                        "(halting replay — remaining gap blocks "+
+                                                                        "will be absent from address scans)",
+                                                                        "height", h, "err", blkErr)
+                                                                gfOK = false
+                                                                break
                                                         }
-                                                        return nil
-                                                })
-                                                if gfErr != nil {
-                                                        log.Warn("snapshot gap-fill: IterActiveUTXOs error (non-fatal)",
-                                                                "err", gfErr)
-                                                } else if gfAdded > 0 {
-                                                        log.Info("snapshot gap-fill: added post-snapshot UTXOs",
-                                                                "added", gfAdded,
-                                                                "total_active", utxos.Count())
+                                                        for _, rawTx := range blk.TxData {
+                                                                var tx core.Transaction
+                                                                if err := json.Unmarshal(rawTx, &tx); err != nil {
+                                                                        continue
+                                                                }
+                                                                txHash := tx.Hash()
+                                                                // Mark spent key images so the double-spend
+                                                                // guard is accurate for the gap window.
+                                                                for _, inp := range tx.Inputs {
+                                                                        utxos.MarkSpent(inp.KeyImage)
+                                                                        gfSpent++
+                                                                }
+                                                                // Add new outputs created in this block.
+                                                                for i, out := range tx.Outputs {
+                                                                        utxos.Add(&core.UTXO{
+                                                                                TxHash:       txHash,
+                                                                                OutputIndex:  uint32(i),
+                                                                                OneTimePub:   out.OneTimePub,
+                                                                                TxPubKey:     out.TxPubKey,
+                                                                                AmountCommit: out.AmountCommit,
+                                                                                EncAmount:    out.EncAmount,
+                                                                                BlockHeight:  h,
+                                                                        })
+                                                                        gfAdded++
+                                                                }
+                                                        }
+                                                        gfBlocks++
+                                                }
+                                                if gfAdded > 0 || gfSpent > 0 || !gfOK {
+                                                        log.Info("snapshot gap-fill: replayed post-snapshot blocks",
+                                                                "snap_height",    snap.TipHeight,
+                                                                "tip_height",     tipHeight,
+                                                                "blocks_replayed", gfBlocks,
+                                                                "outputs_added",  gfAdded,
+                                                                "key_images_marked_spent", gfSpent,
+                                                                "complete",       gfOK)
                                                 }
                                         }
                                 }
