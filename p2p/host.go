@@ -847,7 +847,13 @@ func (h *Host) Start() error {
         // Restore persisted bans from disk before accepting any connections so
         // previously-banned peers are blocked immediately on restart — without
         // waiting for them to accumulate 10 strikes again.
-        h.mgr.LoadBansFromFile()
+        // A corrupt or unreadable ban file is a fatal error: continuing with an
+        // empty ban list would allow previously-banned IPs to reconnect without
+        // serving any additional strikes.  The operator must repair or remove
+        // the file to restart the node.
+        if err := h.mgr.LoadBansFromFile(); err != nil {
+                return err
+        }
 
         // Load the sidecar whitelist file (if configured).  loadWhitelistFromFile
         // returns a fatal error when the file exists but is unreadable or corrupt;
