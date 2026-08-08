@@ -6,9 +6,14 @@
 #
 # Tests included
 # ──────────────
-# TestAtomicBinarySwap  — verifies that running `make build-node` while a
+# TestAtomicBinarySwap   — verifies that running `make build-node` while a
 #   process backed by build/aperod-node is alive neither crashes the running
 #   process nor produces a corrupted binary (ELF magic check).
+#
+# TestNodeBinaryIsStatic — verifies that `make build-node` produces a fully
+#   static binary (no PT_INTERP ELF segment, ldd reports "not a dynamic
+#   executable") so it runs on Debian 11 / Ubuntu 20.04 (GLIBC 2.31) without
+#   "GLIBC_X.YY not found" errors.
 #
 # Exit codes
 # ──────────
@@ -56,10 +61,61 @@ run_test() {
     echo ""
 }
 
+# ── TestNodeBinaryIsStatic ────────────────────────────────────────────────────
+# Builds aperod-node via `make build-node` and verifies the resulting ELF has
+# no PT_INTERP segment (fully static) and that ldd reports "not a dynamic
+# executable".  Guards against regressions where CGO_ENABLED=0 is accidentally
+# removed from the Makefile, which would break Debian 11 / Ubuntu 20.04 nodes.
+run_test "TestNodeBinaryIsStatic" "TestNodeBinaryIsStatic"
+
 # ── TestAtomicBinarySwap ──────────────────────────────────────────────────────
 # Starts a stub process from build/aperod-node, runs make build-node
 # concurrently, and asserts the process survived and the new binary is valid ELF.
 run_test "TestAtomicBinarySwap" "TestAtomicBinarySwap"
+
+# ── update-api.sh backup-script sync (shell e2e) ──────────────────────────────
+# Verifies that the _sync_backup_script helper sourced by update-api.sh (Step 1b)
+# correctly replaces a stale installed copy and that sha256sum matches the repo
+# copy afterwards.  No Docker required — exercises the shell function directly.
+echo "--- UpdateApiBackupScriptSync"
+if bash "$SCRIPT_DIR/test-update-api-e2e.sh"; then
+    echo "PASS: UpdateApiBackupScriptSync"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: UpdateApiBackupScriptSync (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
+
+# ── join-network.sh identity isolation (shell e2e) ───────────────────────────
+# Verifies that join-network.sh never copies the source node's p2p_identity.key
+# to the target (rsync --exclude) and deletes any pre-existing key via SSH rm -f
+# so the target generates a fresh P2P fingerprint on first start.
+echo "--- JoinNetworkIdentityIsolation"
+if bash "$SCRIPT_DIR/test-join-network-identity.sh"; then
+    echo "PASS: JoinNetworkIdentityIsolation"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: JoinNetworkIdentityIsolation (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
+
+# ── verify-dropin.sh self-tests (shell e2e) ───────────────────────────────────
+# Mocks ssh via a PATH-prepended shim and exercises four failure modes:
+# missing GOMEMLIMIT, wrong GOMEMLIMIT, wrong TimeoutStopSec, missing drop-in.
+echo "--- VerifyDropinTests"
+if bash "$SCRIPT_DIR/test-verify-dropin.sh"; then
+    echo "PASS: VerifyDropinTests"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: VerifyDropinTests (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "=== Results: PASS=$PASS  FAIL=$FAIL ==="
