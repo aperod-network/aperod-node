@@ -15,6 +15,7 @@ import (
         "runtime"
         "runtime/debug"
         "strconv"
+        "sync/atomic"
         "strings"
         "syscall"
         "time"
@@ -1168,6 +1169,16 @@ func run() error {
         // By the time any block is produced, engine is fully initialised.
         var engine *consensus.Engine
 
+        // gcInFlight guards the periodic CompactKeyImages+GC+FreeOSMemory
+        // goroutine so at most one is active at any time.  Without this guard,
+        // rapid block acceptance (catch-up sync or multi-block bursts) can
+        // queue an unbounded backlog of goroutines that each serialise on the
+        // UTXOSet write lock, then each force a stop-the-world GC, worsening
+        // exactly the performance problem this maintenance is meant to solve.
+        // Both the periodic-GC path and the post-snapshot cleanup path use
+        // this same gate so they cannot overlap each other either.
+        var gcInFlight atomic.Bool
+
         // For the resume path, registry is already created and seeded inside the
         // startup scan above.  For genesis, it is nil here; NewEngine creates it.
 
@@ -1277,26 +1288,36 @@ func run() error {
                         // well below the watchdog threshold.
                         const gcEveryBlocks = uint64(100)
                         if h > 0 && h%gcEveryBlocks == 0 {
-                                go func(height uint64) {
-                                        rssBefore := readRSSBytes()
-                                        recentMoved := utxos.CompactKeyImages()
-                                        runtime.GC()
-                                        debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
-                                        rssAfter := readRSSBytes()
-                                        var ms runtime.MemStats
-                                        runtime.ReadMemStats(&ms)
-                                        log.Info("periodic GC complete",
-                                                "height", height,
-                                                "ki_recent_compacted", recentMoved,
-                                                "rss_before_mb", rssBefore>>20,
-                                                "rss_after_mb", rssAfter>>20,
-                                                "rss_freed_mb", (rssBefore-rssAfter)>>20,
-                                                "heap_alloc_mb", int64(ms.HeapAlloc)>>20,
-                                                "heap_sys_mb", int64(ms.HeapSys)>>20,
-                                                "heap_idle_mb", int64(ms.HeapIdle)>>20,
-                                                "num_gc", ms.NumGC,
-                                        )
-                                }(h)
+                                // Single-flight guard: skip if a prior GC goroutine is still
+                                // running.  Without this, rapid block acceptance during catch-up
+                                // sync queues an unbounded backlog of goroutines that all
+                                // serialise on the UTXOSet write lock, then each force a
+                                // stop-the-world GC — worsening the problem this task solves.
+                                if gcInFlight.CompareAndSwap(false, true) {
+                                        go func(height uint64) {
+                                                defer gcInFlight.Store(false)
+                                                rssBefore := readRSSBytes()
+                                                recentMoved := utxos.CompactKeyImages()
+                                                runtime.GC()
+                                                debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
+                                                rssAfter := readRSSBytes()
+                                                var ms runtime.MemStats
+                                                runtime.ReadMemStats(&ms)
+                                                log.Info("periodic GC complete",
+                                                        "height", height,
+                                                        "ki_recent_compacted", recentMoved,
+                                                        "rss_before_mb", rssBefore>>20,
+                                                        "rss_after_mb", rssAfter>>20,
+                                                        "rss_freed_mb", (rssBefore-rssAfter)>>20,
+                                                        "heap_alloc_mb", int64(ms.HeapAlloc)>>20,
+                                                        "heap_sys_mb", int64(ms.HeapSys)>>20,
+                                                        "heap_idle_mb", int64(ms.HeapIdle)>>20,
+                                                        "num_gc", ms.NumGC,
+                                                )
+                                        }(h)
+                                } else {
+                                        log.Debug("periodic GC skipped — previous cycle still in flight", "height", h)
+                                }
                         }
 
                         // Persist spent key images and stake-block heights for every
@@ -1380,9 +1401,17 @@ func run() error {
                                 // (≈150 B/entry Go-map overhead) into the 'sorted' slice
                                 // (32 B/entry).  GC reclaims the old map buckets immediately
                                 // after this call.
-                                utxos.CompactKeyImages()
-                                runtime.GC()
-                                debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
+                                // Use the same single-flight guard as the periodic GC path so
+                                // the two goroutines can never overlap and queue concurrent
+                                // stop-the-world GC events.
+                                if gcInFlight.CompareAndSwap(false, true) {
+                                        defer gcInFlight.Store(false)
+                                        utxos.CompactKeyImages()
+                                        runtime.GC()
+                                        debug.FreeOSMemory() // return freed pages to OS so GOMEMLIMIT has headroom
+                                } else {
+                                        log.Debug("post-snapshot GC skipped — periodic GC cycle still in flight", "height", height)
+                                }
                         }(periodicSnap, h, periodicActive)
                 },
         }, chain, mempool, log)
