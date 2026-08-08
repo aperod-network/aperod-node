@@ -701,11 +701,13 @@ func run() error {
                         return fmt.Errorf("apply genesis UTXOs on resume: %w", err)
                 }
 
-                // Load only the most recent maxInMemoryBlocks blocks.
-                // Older blocks are kept in SQLite; the in-memory window is bounded.
+                // Load only the most recent chainMaxBlocks blocks.
+                // Older blocks are kept on disk; the in-memory window is bounded.
                 // Uses loadRecentBlocksFromStore (resume.go) which continues past
                 // any missing heights rather than aborting early.
-                recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log)
+                recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log, chainMaxBlocks)
+                // startLoad is the first height in the loaded window.  It is used
+                // below to seed the tx-index fast path with the correct height range.
                 startLoad := uint64(1)
                 if tipHeight >= chainMaxBlocks {
                         startLoad = tipHeight - chainMaxBlocks + 1
@@ -720,7 +722,7 @@ func run() error {
                 // The count is also published on /api/v1/status so the admin panel
                 // can surface it without requiring log access.
                 {
-                        missingCount, firstMissing, lastMissing := countMissingBlocksInWindow(db, tipHeight)
+                        missingCount, firstMissing, lastMissing := countMissingBlocksInWindow(db, tipHeight, chainMaxBlocks)
                         if missingCount > 0 {
                                 log.Warn("store integrity warning",
                                         "missing_blocks", missingCount,
