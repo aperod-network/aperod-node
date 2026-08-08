@@ -20,6 +20,12 @@ import (
 // block height and tx position, then loads the block from LevelDB and
 // deserialises the transaction.
 //
+// IMPORTANT: blocks are stored via PutRawBlock as marshalled core.Block JSON,
+// NOT as StoredBlock JSON.  GetBlockByHeight returns a StoredBlock and always
+// yields nil TxData when given a core.Block payload.  We must use
+// GetRawBlockByHeight + json.Unmarshal into core.Block to recover the full
+// transaction list.
+//
 // Returns:
 //   - (tx, loc, true,  nil) on success
 //   - (zero, zero, false, nil) when the tx hash is not in the index
@@ -39,30 +45,34 @@ func (s *Server) getTransactionFromDisk(hash crypto.Hash32) (core.Transaction, c
 		return core.Transaction{}, core.TxLocation{}, false, nil
 	}
 
-	// 2. Load the stored block (contains TxData as []json.RawMessage).
-	sb, err := s.blockStore.GetBlockByHeight(entry.Height)
+	// 2. Load the raw block bytes (stored as marshalled core.Block JSON by
+	//    storeBlock/PutRawBlock — not as StoredBlock JSON).
+	raw, err := s.blockStore.GetRawBlockByHeight(entry.Height)
 	if err != nil {
 		return core.Transaction{}, core.TxLocation{}, false,
-			fmt.Errorf("disk load block at height %d: %w", entry.Height, err)
+			fmt.Errorf("disk load raw block at height %d: %w", entry.Height, err)
 	}
-	if sb == nil || entry.TxIdx >= len(sb.TxData) {
+	if raw == nil {
 		return core.Transaction{}, core.TxLocation{}, false, nil
 	}
 
-	// 3. Deserialise the raw JSON back into a core.Transaction.
-	var tx core.Transaction
-	if err := json.Unmarshal(sb.TxData[entry.TxIdx], &tx); err != nil {
+	// 3. Deserialise the block to access its transaction list.
+	var b core.Block
+	if err := json.Unmarshal(raw, &b); err != nil {
 		return core.Transaction{}, core.TxLocation{}, false,
-			fmt.Errorf("disk unmarshal tx (height=%d txIdx=%d): %w",
-				entry.Height, entry.TxIdx, err)
+			fmt.Errorf("disk unmarshal block at height %d: %w", entry.Height, err)
+	}
+	if entry.TxIdx >= len(b.Txs) {
+		return core.Transaction{}, core.TxLocation{}, false,
+			fmt.Errorf("disk tx index out of range: height=%d txIdx=%d txCount=%d",
+				entry.Height, entry.TxIdx, len(b.Txs))
 	}
 
 	// 4. Construct a synthetic TxLocation.  Only Header.Height is required by
-	//    the downstream mint-detection code (loc.Block.Header.Height); the full
-	//    block is not needed so we avoid loading it a second time.
+	//    the downstream mint-detection code (loc.Block.Header.Height).
 	loc := core.TxLocation{
 		Block:   &core.Block{Header: core.BlockHeader{Height: entry.Height}},
 		TxIndex: entry.TxIdx,
 	}
-	return tx, loc, true, nil
+	return b.Txs[entry.TxIdx], loc, true, nil
 }
