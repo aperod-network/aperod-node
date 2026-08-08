@@ -67,11 +67,14 @@ func anchorTipIfNeeded(chain tipAnchorable, db blockByHeightGetter, tipHeight ui
 // loadRecentBlocksFromStore (startLoad..tipHeight inclusive) and returns the
 // number of heights for which GetRawBlockByHeight returned nil or an error,
 // together with the first and last missing heights.  When no blocks are missing
-// all three return values are 0.  This is intentionally a separate function so
-// the existing loadRecentBlocksFromStore signature is unchanged and all its
-// tests continue to compile without modification.
-func countMissingBlocksInWindow(db blockByHeightGetter, tipHeight uint64) (missingCount, firstMissing, lastMissing uint64) {
-        maxLoad := uint64(core.MaxInMemoryBlocks)
+// all three return values are 0.
+//
+// maxBlocks controls the window size; pass 0 to use core.MaxInMemoryBlocks.
+func countMissingBlocksInWindow(db blockByHeightGetter, tipHeight uint64, maxBlocks uint64) (missingCount, firstMissing, lastMissing uint64) {
+        maxLoad := maxBlocks
+        if maxLoad == 0 {
+                maxLoad = uint64(core.MaxInMemoryBlocks)
+        }
         startLoad := uint64(1)
         if tipHeight >= maxLoad {
                 startLoad = tipHeight - maxLoad + 1
@@ -89,26 +92,32 @@ func countMissingBlocksInWindow(db blockByHeightGetter, tipHeight uint64) (missi
         return
 }
 
-func loadRecentBlocksFromStore(db blockByHeightGetter, tipHeight uint64, log *slog.Logger) []*core.Block {
-	maxLoad := uint64(core.MaxInMemoryBlocks)
-	startLoad := uint64(1)
-	if tipHeight >= maxLoad {
-		startLoad = tipHeight - maxLoad + 1
-	}
+// loadRecentBlocksFromStore reads at most maxBlocks blocks ending at tipHeight,
+// skipping (via continue) any heights that are absent or corrupt in the store.
+// Pass maxBlocks=0 to use core.MaxInMemoryBlocks (1 000).
+func loadRecentBlocksFromStore(db blockByHeightGetter, tipHeight uint64, log *slog.Logger, maxBlocks ...uint64) []*core.Block {
+        maxLoad := uint64(core.MaxInMemoryBlocks)
+        if len(maxBlocks) > 0 && maxBlocks[0] > 0 {
+                maxLoad = maxBlocks[0]
+        }
+        startLoad := uint64(1)
+        if tipHeight >= maxLoad {
+                startLoad = tipHeight - maxLoad + 1
+        }
 
-	recentBlocks := make([]*core.Block, 0, maxLoad)
-	for h := startLoad; h <= tipHeight; h++ {
-		raw, err := db.GetRawBlockByHeight(h)
-		if err != nil || raw == nil {
-			log.Warn("block missing in store during resume", "height", h)
-			continue // skip sparse gaps; don't abort the whole window
-		}
-		var b core.Block
-		if err := json.Unmarshal(raw, &b); err != nil {
-			log.Warn("block unmarshal failed", "height", h, "err", err)
-			continue
-		}
-		recentBlocks = append(recentBlocks, &b)
-	}
-	return recentBlocks
+        recentBlocks := make([]*core.Block, 0, maxLoad)
+        for h := startLoad; h <= tipHeight; h++ {
+                raw, err := db.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        log.Warn("block missing in store during resume", "height", h)
+                        continue // skip sparse gaps; don't abort the whole window
+                }
+                var b core.Block
+                if err := json.Unmarshal(raw, &b); err != nil {
+                        log.Warn("block unmarshal failed", "height", h, "err", err)
+                        continue
+                }
+                recentBlocks = append(recentBlocks, &b)
+        }
+        return recentBlocks
 }
