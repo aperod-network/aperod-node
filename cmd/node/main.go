@@ -101,6 +101,92 @@ func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
         }
 }
 
+// runCompactDB implements the --compact-db subcommand.
+//
+// Usage: aperod-node --compact-db --data-dir=<path>
+//
+// Opens chain.db, runs a full LevelDB compaction across the entire key range,
+// and exits.  Compaction reclaims physical disk space freed by Delete/prune
+// operations — it is the equivalent of VACUUM for LevelDB.  The node MUST be
+// stopped before running this command.
+//
+// The operation is safe to interrupt (LevelDB stays consistent) but may take
+// several minutes on large databases.  It prints before/after size estimates
+// to stdout so operators can see how much space was recovered.
+func runCompactDB() error {
+        dataDir := ""
+        args := os.Args[1:]
+        for i, arg := range args {
+                switch {
+                case strings.HasPrefix(arg, "--data-dir="):
+                        dataDir = strings.TrimPrefix(arg, "--data-dir=")
+                case arg == "--data-dir" && i+1 < len(args):
+                        dataDir = args[i+1]
+                }
+        }
+        if dataDir == "" {
+                return fmt.Errorf("--compact-db requires --data-dir=<path>")
+        }
+
+        dbPath := filepath.Join(dataDir, "chain.db")
+
+        // Measure disk use before compaction.
+        sizeBefore := dirSize(dbPath)
+
+        fmt.Fprintf(os.Stdout, "compact-db: opening %s (size before: %s)\n",
+                dbPath, formatBytes(sizeBefore))
+
+        db, err := store.Open(dbPath)
+        if err != nil {
+                return fmt.Errorf("compact-db: open %s: %w", dbPath, err)
+        }
+
+        fmt.Fprintf(os.Stdout, "compact-db: running full compaction (this may take several minutes)...\n")
+        if err := db.Compact(); err != nil {
+                db.Close()
+                return fmt.Errorf("compact-db: compaction failed: %w", err)
+        }
+        db.Close()
+
+        sizeAfter := dirSize(dbPath)
+        saved := sizeBefore - sizeAfter
+        fmt.Fprintf(os.Stdout,
+                "compact-db: done — size after: %s, saved: %s\n",
+                formatBytes(sizeAfter), formatBytes(saved))
+        return nil
+}
+
+// dirSize returns the total byte size of all files under path, ignoring errors.
+func dirSize(path string) int64 {
+        var total int64
+        entries, err := os.ReadDir(path)
+        if err != nil {
+                return 0
+        }
+        for _, e := range entries {
+                info, err := e.Info()
+                if err != nil {
+                        continue
+                }
+                total += info.Size()
+        }
+        return total
+}
+
+// formatBytes returns a human-readable size string (KB / MB / GB).
+func formatBytes(b int64) string {
+        switch {
+        case b >= 1<<30:
+                return fmt.Sprintf("%.2f GB", float64(b)/float64(1<<30))
+        case b >= 1<<20:
+                return fmt.Sprintf("%.2f MB", float64(b)/float64(1<<20))
+        case b >= 1<<10:
+                return fmt.Sprintf("%.2f KB", float64(b)/float64(1<<10))
+        default:
+                return fmt.Sprintf("%d B", b)
+        }
+}
+
 // runCheckStore implements the --check-store subcommand.
 //
 // Usage: aperod-node --check-store --data-dir=<path> [--max-missing=<n>]
@@ -177,8 +263,11 @@ func run() error {
         // Processed before config loading so operators can verify a chain.db that
         // was just rsync'd without needing a fully-configured node.yaml.
         for _, arg := range os.Args[1:] {
-                if arg == "--check-store" {
+                switch arg {
+                case "--check-store":
                         return runCheckStore()
+                case "--compact-db":
+                        return runCompactDB()
                 }
         }
 
