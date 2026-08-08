@@ -793,7 +793,7 @@ func run() error {
                                         // function is a no-op.
                                         if snap.TipHeight < tipHeight {
                                                 gfAdded, gfSpent, gfOK := replayPostSnapshotGap(
-                                                        db, utxos, snap.TipHeight, tipHeight, log)
+                                                        db, utxos, registry, snap.TipHeight, tipHeight, log)
                                                 if gfAdded > 0 || gfSpent > 0 || !gfOK {
                                                         log.Info("snapshot gap-fill: replayed post-snapshot blocks",
                                                                 "snap_height",             snap.TipHeight,
@@ -801,6 +801,13 @@ func run() error {
                                                                 "outputs_added",           gfAdded,
                                                                 "key_images_marked_spent", gfSpent,
                                                                 "complete",                gfOK)
+                                                }
+                                                if !gfOK {
+                                                        // Gap-fill incomplete — cannot trust UTXO/registry state.
+                                                        // Reset snapLoaded and hand the loaded snapshot to the
+                                                        // rescue path so the startup scan covers only the gap.
+                                                        snapLoaded = false
+                                                        rescueSnap = snap
                                                 }
                                         }
                                 }
@@ -857,7 +864,7 @@ func run() error {
                                         debug.FreeOSMemory()
 
                                         gfAdded, gfSpent, gfOK := replayPostSnapshotGap(
-                                                db, utxos, gapSnap.TipHeight, tipHeight, log)
+                                                db, utxos, registry, gapSnap.TipHeight, tipHeight, log)
 
                                         if gfOK {
                                                 log.Info("startup gap-fill complete — sub-tip snapshot + replay",
@@ -2405,23 +2412,26 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
 // spent or burned" from "originated in a now-pruned block".  The records are
 // intentionally never deleted (no DeleteUTXO call) so that spent and staked
 // outputs remain queryable after they leave the active set.
-// replayPostSnapshotGap adds UTXOs and marks key images spent for every block
-// in the half-open range (snapTipHeight, chainTipHeight].  It is called after a
-// snapshot restore when the node was stopped without a clean SIGTERM so that
-// post-snapshot blocks are present in LevelDB but absent from the in-memory
-// UTXO set.
+// replayPostSnapshotGap replays blocks in (snapTipHeight, chainTipHeight] from
+// raw LevelDB bytes (GetRawBlockByHeight → core.Block) and applies three
+// effects to the in-memory state, matching exactly what the startup scan does:
 //
-// The replay reads raw block bytes via GetRawBlockByHeight and unmarshals them
-// as core.Block — the same format written by storeBlock/PutRawBlock.  It does
-// NOT use the su/ spent-UTXO index, so the result is correct even when that
-// index is incomplete.
+//  1. Add every tx output to utxos (so address scans include post-snapshot mints)
+//  2. Mark every tx input's key image as spent (double-spend guard)
+//  3. Replay stake/delegation/withdrawal txs into registry
+//     (via ReplayBlockStakeTxs) so validator eligibility is correct
 //
-// Returns the number of outputs added, key images marked spent, and whether the
-// replay ran to completion (false when a block is missing from the DB).
-// Errors are logged and the function always returns without panicking.
+// All three must succeed for every block; if any block is missing, unreadable,
+// or causes a registry replay error the function halts and returns
+// complete=false.  The caller must fall back to the full startup scan (via
+// rescueSnap) rather than setting snapLoaded=true.
+//
+// When snapTipHeight == chainTipHeight (normal clean shutdown) the loop body
+// never executes and the function returns (0, 0, true) with no overhead.
 func replayPostSnapshotGap(
         db *store.DB,
         utxos *core.UTXOSet,
+        registry *core.ValidatorRegistry,
         snapTipHeight, chainTipHeight uint64,
         log *slog.Logger,
 ) (added, spent int, complete bool) {
@@ -2429,18 +2439,17 @@ func replayPostSnapshotGap(
         for h := snapTipHeight + 1; h <= chainTipHeight; h++ {
                 raw, err := db.GetRawBlockByHeight(h)
                 if err != nil || raw == nil {
-                        log.Warn("snapshot gap-fill: block not found "+
-                                "(halting replay — remaining gap blocks "+
-                                "will be absent from address scans)",
+                        log.Warn("snapshot gap-fill: block not found — halting replay",
                                 "height", h, "err", err)
                         complete = false
                         break
                 }
                 var blk core.Block
                 if err := json.Unmarshal(raw, &blk); err != nil {
-                        log.Warn("snapshot gap-fill: block unmarshal failed (skipping)",
+                        log.Warn("snapshot gap-fill: block unmarshal failed — halting replay",
                                 "height", h, "err", err)
-                        continue
+                        complete = false
+                        break
                 }
                 for _, tx := range blk.Txs {
                         txHash := tx.Hash()
@@ -2463,6 +2472,16 @@ func replayPostSnapshotGap(
                                 })
                                 added++
                         }
+                }
+                // Replay stake/delegation/withdrawal txs so validator registry
+                // state advances to chainTipHeight.  Matches the startup scan's
+                // call in runStartupScan.  A replay error means the gap block
+                // cannot be trusted; halt and fall back to the full scan.
+                if replayErr := registry.ReplayBlockStakeTxs(blk.Txs, blk.Header.Height); replayErr != nil {
+                        log.Warn("snapshot gap-fill: registry replay failed — halting",
+                                "height", h, "err", replayErr)
+                        complete = false
+                        break
                 }
         }
         return
