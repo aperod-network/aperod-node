@@ -7,9 +7,10 @@ import (
         "github.com/aperod/aperod/crypto"
 )
 
-// MaxInMemoryBlocks is the sliding-window size of blocks kept in RAM.
+// MaxInMemoryBlocks is the default sliding-window size of blocks kept in RAM.
 // Older blocks are evicted to keep memory usage bounded.
 // 1 000 blocks at 3 s/block ≈ 50 minutes of history — enough for reorgs.
+// Operators can override this via max_in_memory_blocks in node.yaml.
 const MaxInMemoryBlocks = 1_000
 
 // TxLocation records where a transaction lives in the chain.
@@ -21,20 +22,29 @@ type TxLocation struct {
 // Chain tracks the canonical chain state: the tip block and the full index of
 // known blocks. Reorganizations are handled via Reorg().
 type Chain struct {
-        mu       sync.RWMutex
-        blocks   map[crypto.Hash32]*Block     // recent blocks by hash
-        byHeight map[uint64]*Block            // canonical chain: height → block
-        txIndex  map[crypto.Hash32]TxLocation // tx hash → location
-        tip      *Block
-        genesis  *Block
+        mu                sync.RWMutex
+        blocks            map[crypto.Hash32]*Block     // recent blocks by hash
+        byHeight          map[uint64]*Block            // canonical chain: height → block
+        txIndex           map[crypto.Hash32]TxLocation // tx hash → location
+        tip               *Block
+        genesis           *Block
+        maxInMemoryBlocks uint64 // sliding-window size; default MaxInMemoryBlocks
 }
 
-// NewChain creates an empty chain.
-func NewChain() *Chain {
+// NewChain creates an empty chain.  An optional maxInMemoryBlocks value may be
+// provided to override the default sliding-window size; 0 or omitted uses the
+// MaxInMemoryBlocks constant (1 000).  This allows node operators to tune the
+// in-memory block window via node.yaml without recompiling.
+func NewChain(maxBlocks ...uint64) *Chain {
+        max := uint64(MaxInMemoryBlocks)
+        if len(maxBlocks) > 0 && maxBlocks[0] > 0 {
+                max = maxBlocks[0]
+        }
         return &Chain{
-                blocks:   make(map[crypto.Hash32]*Block),
-                byHeight: make(map[uint64]*Block),
-                txIndex:  make(map[crypto.Hash32]TxLocation),
+                blocks:            make(map[crypto.Hash32]*Block),
+                byHeight:          make(map[uint64]*Block),
+                txIndex:           make(map[crypto.Hash32]TxLocation),
+                maxInMemoryBlocks: max,
         }
 }
 
@@ -124,8 +134,8 @@ func (c *Chain) AddBlock(b *Block) error {
         c.indexTxs(b)
 
         // Evict the block that has fallen outside the sliding window.
-        if b.Header.Height >= MaxInMemoryBlocks {
-                evictH := b.Header.Height - MaxInMemoryBlocks
+        if b.Header.Height >= c.maxInMemoryBlocks {
+                evictH := b.Header.Height - c.maxInMemoryBlocks
                 if old, ok := c.byHeight[evictH]; ok {
                         delete(c.byHeight, evictH)
                         delete(c.blocks, old.Hash())
@@ -160,8 +170,8 @@ func (c *Chain) FastForward(blocks []*Block) {
                 c.indexTxs(b)
                 // Evict the block that has fallen outside the sliding window,
                 // mirroring AddBlock so memory stays bounded during bulk loads.
-                if b.Header.Height >= MaxInMemoryBlocks {
-                        evictH := b.Header.Height - MaxInMemoryBlocks
+                if b.Header.Height >= c.maxInMemoryBlocks {
+                        evictH := b.Header.Height - c.maxInMemoryBlocks
                         if old, ok := c.byHeight[evictH]; ok {
                                 delete(c.byHeight, evictH)
                                 delete(c.blocks, old.Hash())
@@ -200,8 +210,8 @@ func (c *Chain) FastForwardWithIndex(blocks []*Block, txEntries map[crypto.Hash3
                 c.blocks[h] = b
                 c.byHeight[b.Header.Height] = b
                 c.tip = b
-                if b.Header.Height >= MaxInMemoryBlocks {
-                        evictH := b.Header.Height - MaxInMemoryBlocks
+                if b.Header.Height >= c.maxInMemoryBlocks {
+                        evictH := b.Header.Height - c.maxInMemoryBlocks
                         if old, ok := c.byHeight[evictH]; ok {
                                 delete(c.byHeight, evictH)
                                 delete(c.blocks, old.Hash())
@@ -317,8 +327,8 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
                 c.blocks[h] = b
                 c.byHeight[b.Header.Height] = b
                 c.indexTxs(b)
-                if b.Header.Height >= MaxInMemoryBlocks {
-                        evictH := b.Header.Height - MaxInMemoryBlocks
+                if b.Header.Height >= c.maxInMemoryBlocks {
+                        evictH := b.Header.Height - c.maxInMemoryBlocks
                         if old, ok := c.byHeight[evictH]; ok {
                                 delete(c.byHeight, evictH)
                                 delete(c.blocks, old.Hash())
