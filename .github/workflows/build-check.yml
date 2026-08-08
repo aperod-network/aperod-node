@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: go build & vet
+    name: go build & vet & test
     runs-on: ubuntu-latest
 
     steps:
@@ -25,3 +25,6 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Test
+        run: go test -timeout 120s ./...
