@@ -100,6 +100,11 @@ type Config struct {
         // cfg.PeerWhitelist.  When empty, whitelist changes are lost on restart.
         // Set to "-" to explicitly disable persistence.
         WhitelistFile string
+        // MaxBlockIngestPerSec caps the number of blocks per second that any
+        // single peer may push to this node.  The dispatch goroutine sleeps as
+        // needed to honour the limit, creating TCP-level backpressure without
+        // dropping blocks.  Default: 50.  0 = disabled.
+        MaxBlockIngestPerSec int
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -145,6 +150,56 @@ type pendingBlockEntry struct {
         headerHeight uint64 // block height from the header, for WARN log context
 }
 
+// peerTokenBucket is a simple token-bucket rate limiter used to cap the
+// per-peer block ingest rate.  It is not safe for concurrent use; callers
+// must ensure only the dispatch goroutine calls Wait.
+type peerTokenBucket struct {
+        tokens   float64
+        lastTime time.Time
+        rate     float64 // tokens per second
+        burst    float64 // max tokens (= rate, i.e. one second of tokens)
+}
+
+// wait blocks (sleeps) until one token is available, then consumes it.
+// Returns 0 immediately when the rate is 0 or negative (limiter disabled).
+// The duration slept is the minimum needed to refill exactly one token,
+// creating backpressure without busy-waiting.
+//
+// Correctness invariant: after sleeping we advance lastTime past the sleep
+// duration so the sleep interval cannot be double-counted as freshly-accrued
+// tokens on the very next call.  Without this, each sleeping call would be
+// immediately followed by a free call (the sleep itself refills the token),
+// yielding pairs of blocks at twice the configured rate.
+func (b *peerTokenBucket) wait() time.Duration {
+        if b.rate <= 0 {
+                return 0
+        }
+        now := time.Now()
+        elapsed := now.Sub(b.lastTime).Seconds()
+        // Advance lastTime FIRST so a subsequent call that races
+        // in immediately after the sleep does not re-count elapsed.
+        b.lastTime = now
+        b.tokens += elapsed * b.rate
+        if b.tokens > b.burst {
+                b.tokens = b.burst
+        }
+        if b.tokens >= 1.0 {
+                b.tokens -= 1.0
+                return 0
+        }
+        // Insufficient tokens: compute how long until one token accrues.
+        need := 1.0 - b.tokens
+        waitDur := time.Duration(need / b.rate * float64(time.Second))
+        b.tokens = 0
+        time.Sleep(waitDur)
+        // Advance lastTime through the sleep so the sleep interval is not
+        // credited as freshly-accrued tokens on the next call.  Using Add
+        // rather than time.Now() keeps the accounting deterministic
+        // regardless of scheduler latency.
+        b.lastTime = b.lastTime.Add(waitDur)
+        return waitDur
+}
+
 // Peer represents a connected remote node.
 type Peer struct {
         conn     net.Conn
@@ -173,6 +228,10 @@ type Peer struct {
         // The map is owned exclusively by this Peer; it is cleaned up
         // automatically when the Peer is dereferenced on disconnect.
         pendingBlocks map[crypto.Hash32]pendingBlockEntry
+
+        // ingestBucket throttles block ingestion from this peer.  Owned
+        // exclusively by the dispatch goroutine; no mutex needed.
+        ingestBucket peerTokenBucket
 }
 
 // Send transmits a message to this peer.
@@ -208,6 +267,22 @@ type badBlockStrike struct {
 // whitelistExemptMaxEvents caps the in-memory ring buffer for whitelist
 // exemption events so memory cannot grow unboundedly on a busy node.
 const whitelistExemptMaxEvents = 100
+
+// banEventMaxEvents caps the in-memory ring buffer for peer-ban events.
+const banEventMaxEvents = 200
+
+// BanEvent records a single peer-ban event emitted when the wrong-fork
+// threshold is exceeded.  Stored in a ring buffer and exposed via
+// GetBanEvents so the API server can poll and send Telegram alerts.
+type BanEvent struct {
+        IP              string    `json:"ip"`
+        PeerAddr        string    `json:"peer_addr"`
+        PeerID          string    `json:"peer_id"`
+        Reason          string    `json:"reason"`
+        Violations      int       `json:"violations"`
+        BanDurationSecs int64     `json:"ban_duration_secs"`
+        At              time.Time `json:"at"`
+}
 
 // WhitelistExemptionEvent records a single "strike skipped due to whitelist"
 // event for the Admin Panel notification log.
@@ -282,6 +357,13 @@ type Host struct {
         // the Admin Panel notification log.  Capped at whitelistExemptMaxEvents.
         wlExemptEvents []WhitelistExemptionEvent
 
+        // banEventMu guards banEvents so the block-processing loop can append
+        // events concurrently with the API server reading them.
+        banEventMu sync.Mutex
+        // banEvents is a ring buffer of peer-ban events for the Admin Panel
+        // notification log.  Capped at banEventMaxEvents.
+        banEvents []BanEvent
+
         // bootnodeLastResolved maps each raw bootnode string (as it appears in
         // cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
         // Updated on every successful DNS resolution in Start() and maintainLoop.
@@ -322,6 +404,9 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.KeepaliveInterval == 0 {
                 cfg.KeepaliveInterval = 10 * time.Second
         }
+        // Note: MaxBlockIngestPerSec = 0 means "disabled" — no default is applied
+        // here so that unit tests that construct p2p.Config{} directly are not
+        // throttled.  Production nodes set the default via DefaultConfig() → 50.
 
         // Parse PeerWhitelist entries once at construction time so acceptLoop
         // can do cheap net.IPNet.Contains checks without re-parsing strings.
@@ -393,6 +478,21 @@ func (h *Host) SetBlockFetcher(
 ) {
         h.blockByHash = byHash
         h.blockByHeight = byHeight
+}
+
+// GetBanEvents returns all peer-ban events that occurred at or after since.
+// Thread-safe; safe to call concurrently with block processing.
+// Returns an empty (non-nil) slice when no events match.
+func (h *Host) GetBanEvents(since time.Time) []BanEvent {
+        h.banEventMu.Lock()
+        defer h.banEventMu.Unlock()
+        out := make([]BanEvent, 0)
+        for _, e := range h.banEvents {
+                if !e.At.Before(since) {
+                        out = append(out, e)
+                }
+        }
+        return out
 }
 
 // GetWhitelistExemptions returns all whitelist-exemption events that occurred at or
@@ -1286,11 +1386,18 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 }
         }
 
+        ingestRate := float64(h.cfg.MaxBlockIngestPerSec)
         peer := &Peer{
                 conn:          conn,
                 addr:          addr,
                 outbound:      outbound,
                 pendingBlocks: make(map[crypto.Hash32]pendingBlockEntry),
+                ingestBucket: peerTokenBucket{
+                        tokens:   ingestRate, // start full so first burst is free
+                        lastTime: time.Now(),
+                        rate:     ingestRate,
+                        burst:    ingestRate,
+                },
         }
 
         // Handshake — asymmetric:
@@ -1687,6 +1794,22 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                                         h.badBlockMu.Unlock()
                                         h.log.Info("peer IP banned for wrong-fork blocks",
                                                 "ip", peerIP, "addr", peer.addr, "duration", banDuration)
+                                        // Record the ban event so the API server can poll
+                                        // and send an admin Telegram notification.
+                                        h.banEventMu.Lock()
+                                        h.banEvents = append(h.banEvents, BanEvent{
+                                                IP:              peerIP,
+                                                PeerAddr:        peer.addr,
+                                                PeerID:          peer.id,
+                                                Reason:          "repeated out-of-range blocks (wrong fork)",
+                                                Violations:      count,
+                                                BanDurationSecs: int64(banDuration.Seconds()),
+                                                At:              time.Now(),
+                                        })
+                                        if len(h.banEvents) > banEventMaxEvents {
+                                                h.banEvents = h.banEvents[len(h.banEvents)-banEventMaxEvents:]
+                                        }
+                                        h.banEventMu.Unlock()
                                         return nil
                                 }
                                 return nil
@@ -1697,6 +1820,18 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         h.badBlockMu.Unlock()
 
                 processBlock:
+                        // Rate-limit block ingestion per peer.  The token bucket
+                        // sleeps the dispatch goroutine (which is the only reader
+                        // for this peer's conn) when tokens are exhausted, creating
+                        // TCP-level backpressure without dropping any blocks.
+                        if waited := peer.ingestBucket.wait(); waited > 0 {
+                                h.log.Warn("p2p: block ingest rate limit fired — applying backpressure",
+                                        "peer", peer.addr,
+                                        "waited_ms", waited.Milliseconds(),
+                                        "limit_per_sec", h.cfg.MaxBlockIngestPerSec,
+                                        "block_height", block.Header.Height)
+                        }
+
                         // Clear the pending-block entry for this peer so the
                         // stall-detection ticker does not log a false warning for a
                         // block that arrived normally.  Each Peer tracks only the
