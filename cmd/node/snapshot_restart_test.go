@@ -1083,13 +1083,13 @@ func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
 	primaryPath := snapshotPath(dir, tipHeight)
 	prevPath := snapshotPrevPath(primaryPath)
 
-	// Confirm both files were created before we corrupt them.
+	// Confirm the primary was created.
 	if _, err := os.Stat(primaryPath); os.IsNotExist(err) {
 		t.Fatalf("primary snapshot not created: %s", primaryPath)
 	}
-	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
-		t.Fatalf("same-height prev-backup not created: %s", prevPath)
-	}
+	// Write the prev-backup explicitly — the first save at a height does not
+	// auto-create a prev (task #1489: nothing to preserve on a fresh checkpoint).
+	writeGzipSnapFile(t, prevPath, snap)
 
 	// ── Corrupt the primary snapshot: truncate to half its size.
 	info, err := os.Stat(primaryPath)
@@ -1200,13 +1200,13 @@ func TestMissingPrimaryWithValidPrevReturnsNotExist(t *testing.T) {
 	primaryPath := snapshotPath(dir, tipHeight)
 	prevPath := snapshotPrevPath(primaryPath)
 
-	// Confirm both files exist before removing the primary.
+	// Confirm the primary was created.
 	if _, err := os.Stat(primaryPath); os.IsNotExist(err) {
 		t.Fatalf("primary snapshot not created: %s", primaryPath)
 	}
-	if _, err := os.Stat(prevPath); os.IsNotExist(err) {
-		t.Fatalf("same-height prev-backup not created: %s", prevPath)
-	}
+	// Write the prev-backup explicitly — the first save at a height does not
+	// auto-create a prev (task #1489: nothing to preserve on a fresh checkpoint).
+	writeGzipSnapFile(t, prevPath, snap)
 
 	// Confirm the prev-backup is valid (sanity-check for the test setup).
 	validPrev, prevErr := loadPrevBackupSnapshot(dir, tipHeight, tipHashHex)
@@ -1311,14 +1311,13 @@ func TestCorruptPrimaryFallsBackToPrev(t *testing.T) {
 	}
 
 	// ── Second save at height 3 — saveStartupSnapshot:
-	//    • promotes snapshot-v1-2.json → snapshot-v1-2-prev.json   (prior backup)
-	//    • writes snapshot-v1-3.json.tmp, copies it to snapshot-v1-3-prev.json
-	//    • renames tmp → snapshot-v1-3.json (primary)
+	//    • promotes snapshot-v2-2.json.gz → snapshot-v2-2-prev.json.gz (prior backup)
+	//    • writes snapshot-v2-3.json.gz (primary; no same-height prev on first save
+	//      at this height — task #1489 fix)
 	//
 	// After this call the directory contains:
-	//   snapshot-v1-2-prev.json  (prior height backup)
-	//   snapshot-v1-3-prev.json  (same-height backup — the recovery floor)
-	//   snapshot-v1-3.json       (current primary)
+	//   snapshot-v2-2-prev.json.gz  (prior height backup)
+	//   snapshot-v2-3.json.gz       (current primary)
 	snap3 := startupSnapshot{
 		Version:    snapVersion,
 		TipHeight:  3,
@@ -1331,12 +1330,12 @@ func TestCorruptPrimaryFallsBackToPrev(t *testing.T) {
 		t.Fatalf("second saveStartupSnapshot (h=3): %v", err)
 	}
 
-	// Confirm the same-height prev-backup exists.
+	// Write the same-height prev-backup explicitly — this simulates a second
+	// save at height 3 (e.g. a shutdown snapshot) or explicit prev creation.
+	// The first save at a height does not auto-create a prev (task #1489).
 	primaryPath := snapshotPath(dir, 3)
 	prevPath3 := snapshotPrevPath(primaryPath)
-	if _, err := os.Stat(prevPath3); os.IsNotExist(err) {
-		t.Fatalf("same-height prev backup %s was not created by saveStartupSnapshot", prevPath3)
-	}
+	writeGzipSnapFile(t, prevPath3, snap3)
 
 	// ── Corrupt the primary by truncating it to half its size (simulates a
 	// power-loss or process kill during a disk flush).
@@ -2014,7 +2013,7 @@ func TestShutdownSnapshotMatchesFinalDBTip(t *testing.T) {
 	//   3. db.GetTip()   → reads the final tip = 6
 	//   4. saveSnapshot  → snapshot written at height 6
 	var shutLog bytes.Buffer
-	performShutdown(stop, engineDone, db, utxos, registry, dir, newCaptureLogger(&shutLog))
+	performShutdown(stop, engineDone, db, utxos, registry, dir, newCaptureLogger(&shutLog), nil)
 
 	// ── Assert: snapshot height == final DB tip (6, not 5) ──────────────────
 	dbTipHash, dbTipHeight, dbErr := db.GetTip()
