@@ -1391,6 +1391,7 @@ func run() error {
                                 BanFile:              banFilePath,
                                 WhitelistFile:        whitelistFilePath,
                                 KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
+                                MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
