@@ -1108,11 +1108,17 @@ func run() error {
                                 if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
                                         log.Warn("failed to save periodic snapshot",
                                                 "height", height, "err", saveErr)
+                                        if apiSrv != nil {
+                                                apiSrv.SetSnapshotFailed(saveErr)
+                                        }
                                 } else {
                                         log.Info("periodic snapshot saved",
                                                 "height", height,
                                                 "save_duration", time.Since(periodicSaveStart).Round(time.Millisecond).String(),
                                         )
+                                        if apiSrv != nil {
+                                                apiSrv.SetSnapshotSaved(height)
+                                        }
                                         deleteOldSnapshots(cfg.DataDir, height)
                                         // Persist the active UTXO count keyed by tip hash so the
                                         // next restart's divergence check has an active-only
@@ -1471,6 +1477,23 @@ func run() error {
                                         }
                                         return out
                                 })
+                                // Wire peer-ban event log for admin Telegram notifications.
+                                apiSrv.SetBanEventFunc(func(since time.Time) []api.BanEventEntry {
+                                        evts := host.GetBanEvents(since)
+                                        out := make([]api.BanEventEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.BanEventEntry{
+                                                        IP:              e.IP,
+                                                        PeerAddr:        e.PeerAddr,
+                                                        PeerID:          e.PeerID,
+                                                        Reason:          e.Reason,
+                                                        Violations:      e.Violations,
+                                                        BanDurationSecs: e.BanDurationSecs,
+                                                        At:              e.At,
+                                                }
+                                        }
+                                        return out
+                                })
                                 // Seed the static /api/v1/status display from current live list.
                                 apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
@@ -1602,7 +1625,7 @@ func run() error {
 
         log.Info("shutting down...")
 
-        performShutdown(stop, engineDone, db, utxos, registry, cfg.DataDir, log)
+        performShutdown(stop, engineDone, db, utxos, registry, cfg.DataDir, log, apiSrv)
 
         // Persist pending mempool transactions so they survive the restart.
         if mpErr := mempool.Save(cfg.DataDir); mpErr != nil {
@@ -1641,6 +1664,7 @@ func performShutdown(
         registry *core.ValidatorRegistry,
         dataDir string,
         log *slog.Logger,
+        apiSrv *api.Server,
 ) {
         // Step 1 + 2: stop the engine and wait for full quiescence.
         // GetTip MUST NOT be called before this point.
@@ -1648,7 +1672,7 @@ func performShutdown(
         <-engineDone
 
         // Step 3 + 4: read the final tip and save the snapshot.
-        saveShutdownSnapshot(db, utxos, registry, dataDir, log)
+        saveShutdownSnapshot(db, utxos, registry, dataDir, log, apiSrv)
 }
 
 // saveShutdownSnapshot reads the current DB tip and writes a gzip-compressed
@@ -1660,6 +1684,7 @@ func saveShutdownSnapshot(
         registry *core.ValidatorRegistry,
         dataDir string,
         log *slog.Logger,
+        apiSrv *api.Server,
 ) {
         if registry == nil {
                 return
@@ -1680,7 +1705,13 @@ func saveShutdownSnapshot(
         snapSaveStart := time.Now()
         if saveErr := saveStartupSnapshot(dataDir, shutSnap); saveErr != nil {
                 log.Warn("shutdown: failed to save snapshot", "err", saveErr)
+                if apiSrv != nil {
+                        apiSrv.SetSnapshotFailed(saveErr)
+                }
                 return
+        }
+        if apiSrv != nil {
+                apiSrv.SetSnapshotSaved(shutTipHeight)
         }
         snapSaveDur := time.Since(snapSaveStart).Round(time.Millisecond)
         log.Info("shutdown: snapshot saved",
