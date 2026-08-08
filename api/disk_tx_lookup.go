@@ -68,10 +68,12 @@ func (s *Server) getTransactionFromDisk(hash crypto.Hash32) (core.Transaction, c
 				entry.Height, entry.TxIdx, len(b.Txs))
 	}
 
-	// 4. Construct a synthetic TxLocation.  Only Header.Height is required by
-	//    the downstream mint-detection code (loc.Block.Header.Height).
+	// 4. Construct TxLocation using the full deserialized block so that
+	//    loc.Block.Hash() returns the correct block hash in the REST response.
+	//    A synthetic block with only Header.Height set would produce the wrong
+	//    hash because Block.Hash() hashes the entire serialised block.
 	loc := core.TxLocation{
-		Block:   &core.Block{Header: core.BlockHeader{Height: entry.Height}},
+		Block:   &b,
 		TxIndex: entry.TxIdx,
 	}
 	return b.Txs[entry.TxIdx], loc, true, nil
