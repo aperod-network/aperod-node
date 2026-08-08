@@ -279,3 +279,100 @@ func TestCleanStaleTmpFilesPermissionError(t *testing.T) {
 		t.Errorf("unexpected stat error after failed removal: %v", err)
 	}
 }
+
+// TestCleanStaleTmpFilesNoTmpPresent verifies that CleanStaleTmpFiles is
+// completely silent when the data directory exists and contains mempool.json
+// but no .tmp file.  This is the common case after a clean shutdown: the node
+// wrote the snapshot atomically, renamed the .tmp to mempool.json, and exited
+// without leaving any orphan.  The function must not emit any log output and
+// must not touch mempool.json.
+func TestCleanStaleTmpFilesNoTmpPresent(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "mempool.json")
+	tmpPath := filepath.Join(dir, "mempool.json.tmp")
+
+	// Create mempool.json — simulates a clean prior shutdown.
+	if err := os.WriteFile(jsonPath, []byte(`{"saved_at":"2020-01-01T00:00:00Z","entries":[]}`), 0o600); err != nil {
+		t.Fatalf("write mempool.json: %v", err)
+	}
+
+	// Capture file content and metadata before the call so we can prove
+	// CleanStaleTmpFiles left mempool.json byte-for-byte identical.
+	contentBefore, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read mempool.json before CleanStaleTmpFiles: %v", err)
+	}
+	infoBefore, err := os.Stat(jsonPath)
+	if err != nil {
+		t.Fatalf("stat mempool.json before CleanStaleTmpFiles: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// Call CleanStaleTmpFiles directly — the function under test.
+	core.CleanStaleTmpFiles(dir, log)
+
+	// Log must be completely silent: no cleanup message, no warning.
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no log output when no .tmp is present, got:\n%s", logBuf.String())
+	}
+
+	// mempool.json must be untouched — same bytes, same size, same mode.
+	contentAfter, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Errorf("mempool.json unreadable after CleanStaleTmpFiles: %v", err)
+	} else if string(contentAfter) != string(contentBefore) {
+		t.Errorf("mempool.json content changed:\n  before: %q\n  after:  %q", contentBefore, contentAfter)
+	}
+	infoAfter, err := os.Stat(jsonPath)
+	if err != nil {
+		t.Errorf("stat mempool.json after CleanStaleTmpFiles: %v", err)
+	} else {
+		if infoAfter.Size() != infoBefore.Size() {
+			t.Errorf("mempool.json size changed: before=%d after=%d", infoBefore.Size(), infoAfter.Size())
+		}
+		if infoAfter.Mode() != infoBefore.Mode() {
+			t.Errorf("mempool.json mode changed: before=%v after=%v", infoBefore.Mode(), infoAfter.Mode())
+		}
+	}
+
+	// No .tmp should have been created.
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("unexpected .tmp file present after CleanStaleTmpFiles (err=%v)", err)
+	}
+}
+
+// TestCleanStaleTmpFilesMissingDataDir verifies that CleanStaleTmpFiles is a
+// safe no-op when the data directory itself does not exist.
+//
+// On first-ever startup (or a misconfigured path) os.Stat on the .tmp path
+// returns a *PathError.  The function must silently swallow that error — no
+// panic, no spurious warning log — so node startup continues normally.
+func TestCleanStaleTmpFilesMissingDataDir(t *testing.T) {
+	// Point to a directory that has never existed.
+	nonExistentDir := filepath.Join(t.TempDir(), "does-not-exist")
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// Must not panic.
+	core.CleanStaleTmpFiles(nonExistentDir, log)
+
+	// No cleanup message: there was nothing to clean up.
+	const unwantedCleanupMsg = "mempool: removed stale tmp file from previous crash"
+	if logContainsMsg(&logBuf, unwantedCleanupMsg) {
+		t.Errorf("spurious cleanup log emitted for missing data dir:\n%s", logBuf.String())
+	}
+
+	// No warning message: a missing directory is not an error worth logging.
+	const unwantedWarnMsg = "mempool: failed to remove stale tmp file (ignoring)"
+	if logContainsMsg(&logBuf, unwantedWarnMsg) {
+		t.Errorf("spurious warning log emitted for missing data dir:\n%s", logBuf.String())
+	}
+
+	// Log must be completely silent.
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no log output for missing data dir, got:\n%s", logBuf.String())
+	}
+}

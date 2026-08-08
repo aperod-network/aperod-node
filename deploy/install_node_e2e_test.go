@@ -9,6 +9,10 @@
 //  4. The systemd service file is present.
 //  5. The GOMEMLIMIT drop-in is present.
 //  6. The node config file is present.
+//  7. The `aperod` system user was created.
+//  8. /usr/local/bin/aperod_backup.sh exists after install.
+//  9. /usr/local/bin/aperod_backup.sh has permissions 700 (chmod 700).
+// 10. /usr/local/bin/aperod_backup.sh content matches deploy/aperod_backup.sh.
 //
 // The test delegates to test-install-node-e2e.sh, which builds a minimal
 // Ubuntu 22.04 Docker image pre-wired with stub commands (fake systemctl,

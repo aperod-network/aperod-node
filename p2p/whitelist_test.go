@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -445,6 +446,81 @@ func TestWhitelist_PersistFailureDoesNotModifyInMemory(t *testing.T) {
 	got2 := h.GetPeerWhitelist()
 	if len(got2) != 1 || got2[0] != "1.1.1.1" {
 		t.Fatalf("RemoveFromWhitelist persist failure: in-memory list modified unexpectedly: %v", got2)
+	}
+}
+
+// TestIpInWhitelist_CIDR verifies that ipInWhitelist accepts an IP that falls
+// inside a CIDR range and rejects one that falls outside it.
+func TestIpInWhitelist_CIDR(t *testing.T) {
+	_, net10, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	wlNets := []*net.IPNet{net10}
+
+	cases := []struct {
+		ip   string
+		want bool
+		desc string
+	}{
+		{"10.0.0.1", true, "first host in subnet"},
+		{"10.255.255.255", true, "last host in subnet"},
+		{"10.1.2.3", true, "arbitrary host inside 10.0.0.0/8"},
+		{"11.0.0.1", false, "just outside subnet"},
+		{"192.168.1.1", false, "entirely different range"},
+		{"0.0.0.0", false, "zero address outside 10/8"},
+	}
+
+	for _, tc := range cases {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", tc.ip)
+		}
+		got := ipInWhitelist(ip, wlNets, nil)
+		if got != tc.want {
+			t.Errorf("ipInWhitelist(%s, 10.0.0.0/8, nil) = %v, want %v (%s)",
+				tc.ip, got, tc.want, tc.desc)
+		}
+	}
+}
+
+// TestIpInWhitelist_MixedCIDRAndIP verifies that a whitelist combining a CIDR
+// range and individual IP entries correctly accepts IPs covered by either
+// entry and rejects IPs covered by neither.
+func TestIpInWhitelist_MixedCIDRAndIP(t *testing.T) {
+	_, net192, err := net.ParseCIDR("192.168.0.0/16")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	wlNets := []*net.IPNet{net192}
+	wlIPs := []net.IP{net.ParseIP("10.0.0.1")}
+
+	cases := []struct {
+		ip   string
+		want bool
+		desc string
+	}{
+		// Accepted via CIDR entry.
+		{"192.168.0.1", true, "first host in 192.168.0.0/16"},
+		{"192.168.5.10", true, "arbitrary host inside CIDR"},
+		{"192.168.255.254", true, "last host in CIDR"},
+		// Accepted via individual IP entry.
+		{"10.0.0.1", true, "exact individual IP match"},
+		// Rejected — covered by neither entry.
+		{"10.0.0.2", false, "adjacent to individual IP, not in CIDR"},
+		{"172.16.0.1", false, "unrelated address"},
+		{"193.168.0.1", false, "just outside CIDR"},
+	}
+
+	for _, tc := range cases {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", tc.ip)
+		}
+		got := ipInWhitelist(ip, wlNets, wlIPs)
+		if got != tc.want {
+			t.Errorf("ipInWhitelist(%s) = %v, want %v (%s)", tc.ip, got, tc.want, tc.desc)
+		}
 	}
 }
 

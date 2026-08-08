@@ -448,6 +448,75 @@ func TestMempoolConfirmedTxNotReplayedAfterRestart(t *testing.T) {
 	}
 }
 
+// ─── Test 6: CleanStaleTmpFiles removes old .tmp, leaves recent .tmp alone ───
+
+// TestCleanStaleTmpFilesOldFileDeleted verifies that CleanStaleTmpFiles removes
+// a truncated .tmp file whose mtime is more than 5 minutes in the past and that
+// a subsequent Load() finds an empty pool (not a JSON parse error).
+//
+// This is the regression guard for the OOM-kill scenario described in task
+// #1364: an interrupted atomic Save() leaves mempool.json.tmp on disk.  Without
+// cleanup the file accumulates; with cleanup the node boots cleanly.
+func TestCleanStaleTmpFilesOldFileDeleted(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "mempool.json.tmp")
+
+	// Write a truncated (non-JSON) .tmp to simulate an OOM-interrupted Save().
+	if err := os.WriteFile(tmpPath, []byte(`{"saved_at":"2026`), 0o600); err != nil {
+		t.Fatalf("WriteFile tmp: %v", err)
+	}
+
+	// Back-date mtime to 6 minutes ago (> staleTmpMaxAge of 5 min).
+	staleTime := time.Now().Add(-6 * time.Minute)
+	if err := os.Chtimes(tmpPath, staleTime, staleTime); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// CleanStaleTmpFiles must delete the stale .tmp.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	core.CleanStaleTmpFiles(dir, log)
+
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("stale .tmp still exists after CleanStaleTmpFiles; want deleted")
+	}
+
+	// Load must return 0 (no mempool.json present) without any parse error.
+	pool := core.NewMempool(mempoolTestConfig(), discardLogger())
+	n := pool.Load(dir, discardLogger())
+	if n != 0 {
+		t.Errorf("Load returned %d, want 0 (no mempool.json present)", n)
+	}
+	if pool.Count() != 0 {
+		t.Errorf("pool.Count() = %d after clean startup, want 0", pool.Count())
+	}
+
+	// The log should mention the removal.
+	if !strings.Contains(buf.String(), "stale tmp") && !strings.Contains(buf.String(), "removed stale") {
+		t.Logf("log output (informational): %s", buf.String())
+	}
+}
+
+// TestCleanStaleTmpFilesRecentFileKept verifies that CleanStaleTmpFiles does
+// NOT remove a .tmp file that is younger than staleTmpMaxAge (5 minutes).
+// A concurrent in-progress Save() must not be interrupted by startup cleanup.
+func TestCleanStaleTmpFilesRecentFileKept(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "mempool.json.tmp")
+
+	// Write a .tmp with a current mtime (well within the 5-minute window).
+	if err := os.WriteFile(tmpPath, []byte(`{"saved_at":"2026`), 0o600); err != nil {
+		t.Fatalf("WriteFile tmp: %v", err)
+	}
+
+	core.CleanStaleTmpFiles(dir, discardLogger())
+
+	// The recent .tmp must still be present.
+	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+		t.Errorf("recent .tmp was deleted by CleanStaleTmpFiles; want kept")
+	}
+}
+
 // ─── Test 4: SelectTxs orders restored txs by fee rate (descending) ──────────
 
 // TestMempoolPersistFeeRateOrderPreserved verifies that after a save/load cycle
@@ -566,7 +635,224 @@ func TestMempoolLoadCorruptFileReturnsZero(t *testing.T) {
 	}
 }
 
+// ─── Test 8: corrupt mempool.json is removed after failed Load ───────────────
+
+// TestMempoolLoadCorruptFileRemovedAfterFailedLoad verifies that Load() deletes
+// mempool.json when json.Unmarshal fails so the node does not re-emit the
+// corrupt-file warning on every subsequent restart.
+//
+// Covers the "Done looks like" requirements from task #1363:
+//   - Load() removes mempool.json when json.Unmarshal fails.
+//   - A second restart finds no file and starts with an empty pool.
+//   - The second restart does NOT re-emit the warning.
+func TestMempoolLoadCorruptFileRemovedAfterFailedLoad(t *testing.T) {
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"truncated_json", []byte(`{"saved_at":"2026`)},
+		{"garbage_bytes", []byte("NOT JSON AT ALL \x00\xff\xfe")},
+		{"empty_file", []byte("")},
+		{"wrong_schema", []byte(`[]`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "mempool.json")
+
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			// First restart: encounters the corrupt file.
+			pool1 := core.NewMempool(mempoolTestConfig(), discardLogger())
+			restored := pool1.Load(dir, discardLogger())
+			if restored != 0 {
+				t.Errorf("[%s] first Load() returned %d, want 0", tc.name, restored)
+			}
+
+			// The corrupt file must be gone now so it cannot block future restarts.
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("[%s] mempool.json still present after failed Load(); want removed", tc.name)
+			}
+
+			// Second restart: no file present → empty pool, no warning.
+			var warnBuf bytes.Buffer
+			warnLogger := slog.New(slog.NewTextHandler(&warnBuf, &slog.HandlerOptions{
+				Level: slog.LevelWarn,
+			}))
+			pool2 := core.NewMempool(mempoolTestConfig(), discardLogger())
+			restored2 := pool2.Load(dir, warnLogger)
+			if restored2 != 0 {
+				t.Errorf("[%s] second Load() returned %d, want 0", tc.name, restored2)
+			}
+			if pool2.Count() != 0 {
+				t.Errorf("[%s] pool2.Count() = %d after second restart, want 0", tc.name, pool2.Count())
+			}
+			// The second restart must not re-emit the "corrupt file" warning because
+			// the file is already gone.
+			if strings.Contains(warnBuf.String(), "unmarshal error") ||
+				strings.Contains(warnBuf.String(), "corrupt") {
+				t.Errorf("[%s] second Load() re-emitted corrupt-file warning; log: %q",
+					tc.name, warnBuf.String())
+			}
+		})
+	}
+}
+
+// ─── Test 9: Save() returns an error and leaves no .tmp on write failure ─────
+
+// TestMempoolSaveWriteFailureNoTmpLeftover simulates a disk-write failure by
+// pre-creating the temp file with mode 0o000 so that os.WriteFile fails when
+// it tries to open/truncate the existing file, and verifies that:
+//
+//  1. Save() returns a non-nil error — the failure is never silently ignored.
+//  2. No mempool.json.tmp leftover remains — Save() must remove the temp file
+//     even when os.WriteFile fails mid-creation (e.g. ENOSPC, EACCES).
+//
+// This is a deterministic fault: the .tmp file already exists (simulating a
+// partial write from a prior crash) and is locked to 0o000 so the write fails.
+// After Save() returns the error, the caller can verify that the .tmp has been
+// cleaned up — dir.Remove succeeds even on 0o000 files because removal
+// requires write permission on the *directory*, not on the file itself.
+//
+// The test is skipped when running as root because root can open 0o000 files
+// for writing, making the fault condition unreachable.
+func TestMempoolSaveWriteFailureNoTmpLeftover(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root: cannot deny write access to a 0o000 file; skipping")
+	}
+
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "mempool.json.tmp")
+	finalPath := filepath.Join(dir, "mempool.json")
+
+	// Pre-create the .tmp with no permissions — simulates a partial write left
+	// by a previous crash.  os.WriteFile will fail when it tries to open/truncate
+	// this file because O_WRONLY|O_TRUNC requires write permission on the file.
+	if err := os.WriteFile(tmpPath, []byte("partial"), 0o000); err != nil {
+		t.Fatalf("pre-create tmp: %v", err)
+	}
+	// Restore permissions after the test so t.TempDir() cleanup can remove it
+	// in case Save() failed to do so (prevents test resource leak).
+	t.Cleanup(func() { _ = os.Chmod(tmpPath, 0o600) })
+
+	pool := core.NewMempool(mempoolTestConfig(), discardLogger())
+	if err := pool.Add(makeTestTx(2000, 90)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Save() must return a non-nil error — write failure must never be silent.
+	err := pool.Save(dir)
+	if err == nil {
+		t.Fatal("Save() returned nil when os.WriteFile failed; want non-nil error")
+	}
+
+	// The .tmp file must be removed by Save() — no leftover after failure.
+	// (Removal requires only directory write permission, not file permission,
+	// so the cleanup _ = os.Remove(tmp) in Save() must succeed here.)
+	if _, statErr := os.Stat(tmpPath); !os.IsNotExist(statErr) {
+		t.Errorf("mempool.json.tmp left on disk after Save() write failure; want removed by Save()")
+	}
+
+	// The final file must also be absent — nothing committed to disk.
+	if _, statErr := os.Stat(finalPath); !os.IsNotExist(statErr) {
+		t.Errorf("mempool.json unexpectedly present after Save() write failure")
+	}
+}
+
 // ─── Test 7: corrupt mempool.json emits a Warn log so the operator is notified ─
+
+// ─── Test 10: static guard — CleanStaleTmpFiles precedes Load on every branch ─
+
+// TestCleanStaleTmpFilesCalledBeforeLoad is a static-analysis guard that reads
+// main.go and verifies two ordering invariants:
+//
+//  1. The FIRST call to cleanStaleSnapshotTmpFiles appears before the
+//     genesis/resume branch split (`if tipHash == (crypto.Hash32{})`).
+//     This guarantees both the genesis boot path and the resume boot path
+//     are covered by the cleanup — neither can be reached without it.
+//
+//  2. Every call to tryLoadStartupSnapshot is preceded (anywhere earlier in
+//     the file) by at least one cleanStaleSnapshotTmpFiles call.
+//     This prevents a .tmp left by a previous crash from being mistaken for a
+//     valid snapshot file.
+//
+// The test fails immediately if:
+//   - cleanStaleSnapshotTmpFiles is removed from main.go.
+//   - The first call is moved to after the genesis/resume branch split
+//     (leaving the genesis path unprotected).
+//   - tryLoadStartupSnapshot is added without a preceding cleanup call.
+//
+// Strategy: read the source file, collect 1-based line numbers for each
+// marker, then assert the ordering constraints.  No binary is compiled; the
+// check is deterministic and executes in microseconds.
+func TestCleanStaleTmpFilesCalledBeforeLoad(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("cannot read main.go: %v", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+
+	var cleanLines []int  // all cleanStaleSnapshotTmpFiles call sites
+	branchLine := -1      // genesis/resume branch split
+	var snapLoadLines []int // all tryLoadStartupSnapshot call sites
+
+	for i, raw := range lines {
+		lineNo := i + 1
+		trimmed := strings.TrimSpace(raw)
+		switch {
+		case strings.Contains(trimmed, "cleanStaleSnapshotTmpFiles("):
+			cleanLines = append(cleanLines, lineNo)
+		case strings.Contains(trimmed, "tipHash == (crypto.Hash32{})") && branchLine == -1:
+			branchLine = lineNo
+		case strings.Contains(trimmed, "tryLoadStartupSnapshot("):
+			snapLoadLines = append(snapLoadLines, lineNo)
+		}
+	}
+
+	// ── Invariant 0: the cleanup function must exist at least once ────────────
+	if len(cleanLines) == 0 {
+		t.Fatal("cleanStaleSnapshotTmpFiles not found in main.go — was the call removed?")
+	}
+
+	// ── Invariant 1: first cleanup precedes the genesis/resume branch split ───
+	// If this fails, the genesis startup path skips the .tmp cleanup entirely.
+	if branchLine == -1 {
+		t.Error("genesis/resume branch split (tipHash == crypto.Hash32{}) not found in main.go")
+	} else if cleanLines[0] >= branchLine {
+		t.Errorf(
+			"cleanStaleSnapshotTmpFiles first call (line %d) must appear BEFORE "+
+				"the genesis/resume branch split (line %d); "+
+				"genesis startup path would skip stale-tmp cleanup",
+			cleanLines[0], branchLine,
+		)
+	}
+
+	// ── Invariant 2: every tryLoadStartupSnapshot has a preceding cleanup ─────
+	// Checks that no new snapshot-load site was added without cleanup coverage.
+	if len(snapLoadLines) == 0 {
+		t.Error("tryLoadStartupSnapshot not found in main.go — was the snapshot load removed?")
+	}
+	for _, loadLine := range snapLoadLines {
+		hasPrior := false
+		for _, cleanLine := range cleanLines {
+			if cleanLine < loadLine {
+				hasPrior = true
+				break
+			}
+		}
+		if !hasPrior {
+			t.Errorf(
+				"tryLoadStartupSnapshot at line %d has no preceding cleanStaleSnapshotTmpFiles call; "+
+					"a stale .tmp could be mistaken for a valid snapshot",
+				loadLine,
+			)
+		}
+	}
+}
 
 // TestMempoolLoadCorruptFileLogsWarning verifies that Load() emits a slog Warn
 // message containing the text "unmarshal error" when mempool.json cannot be
@@ -598,8 +884,8 @@ func TestMempoolLoadCorruptFileLogsWarning(t *testing.T) {
 	}
 
 	logOutput := buf.String()
-	if !strings.Contains(logOutput, "unmarshal error") {
-		t.Errorf("expected warning log to contain \"unmarshal error\"; got: %q", logOutput)
+	if !strings.Contains(logOutput, "corrupt") {
+		t.Errorf("expected warning log to contain \"corrupt\"; got: %q", logOutput)
 	}
 	if !strings.Contains(logOutput, "WARN") {
 		t.Errorf("expected log level WARN in output; got: %q", logOutput)

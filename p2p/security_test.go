@@ -10,6 +10,7 @@ package p2p_test
 // 3.5.6 Peer count limit:     MaxPeers=1 causes the second connection to be dropped.
 
 import (
+        "crypto/tls"
         "encoding/json"
         "net"
         "testing"
@@ -523,4 +524,82 @@ func TestPeerWhitelist_NonMatchingIPRejected(t *testing.T) {
                 t.Logf("whitelist reject ✓ non-whitelisted IP rejected (readErr=%v, peers=%d)",
                         readErr, host.PeerCount())
         }
+}
+
+// ─── 3.5.8 Duplicate P2P identity (copied key) rejected ─────────────────────
+
+// TestDuplicateP2PIdentity_Rejected verifies that when a peer presents the
+// same TLS fingerprint as the host's own identity key — the "rsync copied
+// p2p_identity.key" scenario — the connection is closed immediately after the
+// TLS handshake and the peer is never registered in the peer table.
+//
+// Setup: one shared TLS identity (same cert/key) is used for both the host
+// and the dialing peer, simulating two nodes bootstrapped from the same data
+// directory.  The host's SelfFingerprint is set to the shared fingerprint so
+// the identity-conflict guard fires.
+func TestDuplicateP2PIdentity_Rejected(t *testing.T) {
+        // Generate a single TLS identity that will be shared by both "nodes".
+        sharedCfg, sharedFP, err := p2p.GenerateNodeTLSConfig()
+        if err != nil {
+                t.Fatalf("GenerateNodeTLSConfig: %v", err)
+        }
+
+        // Host: TLSConfig uses the shared identity; SelfFingerprint is set so
+        // the identity-conflict guard in handleConn can trigger.
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr:      "127.0.0.1:0",
+                MaxPeers:        5,
+                NodeID:          "host-node",
+                UserAgent:       "aperod/test",
+                TLSConfig:       sharedCfg,
+                SelfFingerprint: sharedFP,
+        }, &stubHandler{}, newTestLogger())
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        // Peer: dials using the SAME TLS config (identical cert → identical
+        // fingerprint), mimicking a second node that was cloned from the same
+        // data directory without regenerating its p2p_identity.key.
+        conn, err := tls.DialWithDialer(
+                &net.Dialer{Timeout: 2 * time.Second},
+                "tcp", host.ListenAddr(), sharedCfg,
+        )
+        if err != nil {
+                // Host closed the connection at the TLS layer — also acceptable.
+                t.Logf("3.5.8 ✓ duplicate-identity connection rejected at TLS level: %v", err)
+                if host.PeerCount() != 0 {
+                        t.Errorf("3.5.8: peer count = %d after rejected TLS dial, want 0", host.PeerCount())
+                }
+                return
+        }
+        defer conn.Close()
+
+        // TLS handshake completed.  The host's SelfFingerprint guard fires inside
+        // handleConn after Handshake(); the host must close the connection without
+        // ever sending a MsgPong back to the dialer.
+        conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+
+        // Attempt the Aperod application handshake — expect the host to close
+        // the conn before or immediately after it receives our Ping.
+        _ = p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+                NodeID: "clone-node", Height: 0, UserAgent: "aperod/test",
+                Timestamp: time.Now().Unix(),
+        })
+        _, _, readErr := p2p.ReadMsg(conn)
+
+        time.Sleep(100 * time.Millisecond)
+
+        // The connection must have been closed (readErr non-nil) AND the peer
+        // must not have been registered in the host's peer table.
+        if readErr == nil {
+                t.Error("3.5.8: host replied to a duplicate-identity peer — identity-conflict guard did not fire")
+        }
+        if host.PeerCount() != 0 {
+                t.Errorf("3.5.8: peer count = %d after identity-conflict rejection, want 0", host.PeerCount())
+        }
+
+        t.Logf("3.5.8 ✓ duplicate P2P identity rejected: readErr=%v peerCount=%d fp=%s…",
+                readErr, host.PeerCount(), sharedFP[:8])
 }

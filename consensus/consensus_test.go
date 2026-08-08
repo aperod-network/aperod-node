@@ -572,6 +572,60 @@ func TestHandleIncomingBlock_JustOverLimit(t *testing.T) {
 	}
 }
 
+// ─── Non-validator mode ───────────────────────────────────────────────────────
+
+// TestEngine_NonValidatorMode_NeverProducesBlock verifies that an engine
+// constructed with MyKey=nil (non-validator mode) never emits a block on
+// ProducedCh even when the round clock fires and the sole validator in the
+// set would be the scheduled proposer for that slot.
+//
+// This is the primary regression guard for the path at poa.go tick() line ~246:
+//
+//	if e.cfg.MyKey == nil || !proposer.Equals(e.cfg.MyKey.Public()) {
+//	    return nil // not our slot
+//	}
+//
+// A regression (e.g. inadvertently passing a non-nil key) would silently
+// re-enable block production and cause chain splits in production.
+func TestEngine_NonValidatorMode_NeverProducesBlock(t *testing.T) {
+	// Single-validator chain: at every round, proposerAt returns pub.
+	// The engine therefore "is" the scheduled proposer — but MyKey=nil
+	// means it must stay silent.
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := makeChainWithGenesis(t, priv, pub)
+
+	// Create engine in non-validator mode: validators list contains pub, but
+	// MyKey is nil so the engine must never produce a block.
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	eng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   []crypto.ValidatorPubKey{pub},
+		MyKey:        nil, // non-validator mode
+	}, chain, mp, newNopLogger())
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	// Wait long enough for several tick() invocations to fire.
+	select {
+	case block := <-eng.ProducedCh():
+		t.Errorf("non-validator engine produced block at height %d — MyKey=nil guard broken",
+			block.Header.Height)
+	case <-time.After(200 * time.Millisecond):
+		// Good: no block produced.
+	}
+
+	// Chain must remain at genesis height.
+	if h := chain.Height(); h != 0 {
+		t.Errorf("chain height = %d after non-validator run, want 0", h)
+	}
+}
+
 // TestEngine_SingleValidator_Finalizes verifies a 1-of-1 validator set auto-finalizes.
 func TestEngine_SingleValidator_Finalizes(t *testing.T) {
 	priv, pub, _ := crypto.GenerateValidatorKey()

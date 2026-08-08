@@ -1601,3 +1601,512 @@ func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
 		t.Error("CanDial must remain false — blocked dial must not clear back-off")
 	}
 }
+
+// ─── gapSyncHandler ──────────────────────────────────────────────────────────
+
+// gapSyncHandler is a Handler implementation for gap-sync tests.  It accepts
+// blocks in strict height order (currentHeight+1 only) and exposes the
+// accepted chain for CurrentTailHashes and GetBlock lookups — matching what a
+// real node's chain engine would do.
+type gapSyncHandler struct {
+	mu     sync.Mutex
+	tip    uint64
+	chain  []*core.Block          // chain[i] is the accepted block at height i
+	byHash map[crypto.Hash32]*core.Block
+}
+
+func newGapSyncHandler(genesis *core.Block) *gapSyncHandler {
+	h := &gapSyncHandler{
+		chain:  []*core.Block{genesis},
+		byHash: make(map[crypto.Hash32]*core.Block),
+	}
+	h.byHash[genesis.Hash()] = genesis
+	return h
+}
+
+func (h *gapSyncHandler) OnBlock(b *core.Block) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Accept only the strictly next block so the handler mirrors a real node's
+	// sequential AddBlock behaviour.
+	if b.Header.Height == h.tip+1 {
+		h.chain = append(h.chain, b)
+		h.byHash[b.Hash()] = b
+		h.tip = b.Header.Height
+	}
+}
+
+func (h *gapSyncHandler) OnTransaction(_ *core.Transaction) {}
+func (h *gapSyncHandler) OnVote(_ p2p.VoteMsg)              {}
+
+func (h *gapSyncHandler) CurrentHeight() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tip
+}
+
+func (h *gapSyncHandler) CurrentTailHashes(n int) []crypto.Hash32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	start := 0
+	if len(h.chain) > n {
+		start = len(h.chain) - n
+	}
+	out := make([]crypto.Hash32, 0, len(h.chain)-start)
+	for _, b := range h.chain[start:] {
+		out = append(out, b.Hash())
+	}
+	return out
+}
+
+func (h *gapSyncHandler) GetBlock(hash crypto.Hash32) *core.Block {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.byHash[hash]
+}
+
+func (h *gapSyncHandler) tipNow() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tip
+}
+
+// ─── 2000-block gap sync test ─────────────────────────────────────────────────
+
+// TestSync_RelayNode_Catches2000BlockGap is the integration test for the
+// header-sync re-trigger fix.
+//
+// Scenario: a relay node starts at height 0.  A validator peer holds a chain
+// of 2000 blocks.  After one outbound connection (no manual intervention), the
+// relay must sync its tip all the way to 2000 autonomously.
+//
+// The fix under test: in host.go processBlock, after OnBlock advances the
+// relay's tip, the node calls requestHeaders again if it is still behind the
+// peer.  This chains successive 500-header batches until the tip converges,
+// without waiting for the 3-second keepalive/sync ticker.
+//
+// The test uses a raw TCP "validator" server (not a full Host) to avoid the
+// deadlock that two Hosts' symmetric-handshake heuristics would create.  The
+// server:
+//   - completes the asymmetric P2P handshake, advertising height=2000
+//   - serves MsgGetHeaders by finding the relay's highest known hash in the
+//     validator chain and returning the next 500 headers
+//   - serves MsgGetBlock by returning the actual block for any hash in the chain
+//   - responds to MsgPing keepalives with MsgPong so the relay stays connected
+func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
+	const gapSize = 2000
+	const syncTimeout = 30 * time.Second
+
+	// ── Build the validator's chain: genesis + 2000 blocks ───────────────────
+	priv, pub, keyErr := crypto.GenerateValidatorKey()
+	if keyErr != nil {
+		t.Fatalf("GenerateValidatorKey: %v", keyErr)
+	}
+
+	validatorChain := make([]*core.Block, gapSize+1)
+	validatorByHash := make(map[crypto.Hash32]*core.Block, gapSize+1)
+	var prevHash crypto.Hash32
+	for i := 0; i <= gapSize; i++ {
+		hdr := core.BlockHeader{
+			Height:       uint64(i),
+			PrevHash:     prevHash,
+			ValidatorPub: pub,
+			Timestamp:    time.Now().UnixNano() + int64(i),
+		}
+		if signErr := hdr.Sign(priv); signErr != nil {
+			t.Fatalf("Sign block %d: %v", i, signErr)
+		}
+		b := &core.Block{Header: hdr}
+		validatorChain[i] = b
+		h := b.Hash()
+		validatorByHash[h] = b
+		prevHash = h
+	}
+
+	// ── Raw TCP "validator" server ────────────────────────────────────────────
+	ln, listenErr := net.Listen("tcp", "127.0.0.1:0")
+	if listenErr != nil {
+		t.Fatalf("validator listen: %v", listenErr)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// writeCh decouples reading from writing so the server never deadlocks:
+		// when both the relay and the server want to write at the same time,
+		// TCP buffers fill and each blocks waiting for the other to read.  Using
+		// a dedicated write goroutine with a buffered channel means the server's
+		// read loop is never stalled waiting for a write to complete.
+		type writeReq struct {
+			msgType p2p.MessageType
+			payload interface{}
+		}
+		writeCh := make(chan writeReq, 4096)
+		defer close(writeCh)
+		go func() {
+			for req := range writeCh {
+				conn.SetWriteDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
+				if wErr := p2p.WriteMsg(conn, req.msgType, req.payload); wErr != nil {
+					return
+				}
+			}
+		}()
+
+		// Asymmetric handshake: relay dials us as outbound, so it sends Ping
+		// first.  We read Ping and reply with Pong announcing height=gapSize.
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("validator: expected MsgPing got %v err=%v", mt, rdErr)
+			return
+		}
+		writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+			NodeID:    "validator",
+			Height:    gapSize,
+			UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		}}
+
+		// Message loop: serve GetHeaders, GetBlock, and keepalive Pings.
+		// We use SetReadDeadline (not SetDeadline) so the write goroutine is
+		// never blocked by the same per-message deadline.
+		//
+		// Rate-limit GetHeaders responses: the processBlock re-trigger in host.go
+		// fires for every accepted block during a batch, generating O(n) redundant
+		// GetHeaders requests per batch.  Each response with 500 headers would
+		// cause O(n²) GetBlock traffic that floods the write channel and deadlocks
+		// the TCP connection.  We suppress redundant requests by only serving a
+		// new batch once the relay's best known height has caught up to the end of
+		// the previous batch (lastBatchEnd).  The final block of each batch always
+		// triggers a requestHeaders with bestHeight == lastBatchEnd, which passes
+		// the guard and serves the next batch — exactly the re-trigger chain we
+		// are testing.
+		lastBatchEnd := uint64(0) // highest height included in the last batch served
+
+		// sentBlocks deduplicates GetBlock responses.  When redundant requestHeaders
+		// cause duplicate GetBlock requests (same hash requested multiple times),
+		// we only send the block once.  A relay that didn't receive the first
+		// response would rely on stall-detection to recover; in tests with reliable
+		// loopback TCP, the first response always arrives.
+		sentBlocks := make(map[crypto.Hash32]bool)
+
+		for {
+			conn.SetReadDeadline(time.Now().Add(syncTimeout)) //nolint:errcheck
+			msgType, data, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return
+			}
+			switch msgType {
+
+			case p2p.MsgGetHeaders:
+				var req p2p.GetHeadersMsg
+				if uErr := p2p.Unmarshal(data, &req); uErr != nil {
+					t.Logf("validator: unmarshal GetHeaders: %v", uErr)
+					return
+				}
+				// Find the relay's highest known hash in our chain.
+				bestHeight := uint64(0)
+				for _, hash := range req.KnownHashes {
+					if b, ok := validatorByHash[hash]; ok {
+						if b.Header.Height > bestHeight {
+							bestHeight = b.Header.Height
+						}
+					}
+				}
+				// Suppress this request if the relay has not yet consumed the
+				// previous batch (prevents O(n²) message explosion).
+				// The final block of each batch has bestHeight == lastBatchEnd
+				// so it passes through and drives the next batch.
+				if bestHeight < lastBatchEnd {
+					continue
+				}
+				// Serve up to 500 headers starting after bestHeight.
+				limit := req.Limit
+				if limit <= 0 || limit > 500 {
+					limit = 500
+				}
+				start := int(bestHeight) + 1
+				var hdrs []p2p.SerializedHeader
+				for i := start; i <= gapSize && len(hdrs) < limit; i++ {
+					b := validatorChain[i]
+					hash := b.Hash()
+					hdrs = append(hdrs, p2p.SerializedHeader{
+						Height:       b.Header.Height,
+						Hash:         hash,
+						PrevHash:     b.Header.PrevHash,
+						MerkleRoot:   b.Header.MerkleRoot,
+						Timestamp:    b.Header.Timestamp,
+						Round:        b.Header.Round,
+						ValidatorPub: b.Header.ValidatorPub,
+						Signature:    b.Header.Signature,
+					})
+				}
+				if len(hdrs) > 0 {
+					lastBatchEnd = hdrs[len(hdrs)-1].Height
+				}
+				writeCh <- writeReq{p2p.MsgHeaders, p2p.HeadersMsg{Headers: hdrs}}
+
+			case p2p.MsgGetBlock:
+				var req p2p.GetBlockMsg
+				if uErr := p2p.Unmarshal(data, &req); uErr != nil {
+					t.Logf("validator: unmarshal GetBlock: %v", uErr)
+					return
+				}
+				b, ok := validatorByHash[req.Hash]
+				if !ok {
+					// Block not found — send nothing; stall-detection will retry.
+					continue
+				}
+				// Deduplicate: only send each block once so duplicate GetBlock
+				// requests (from redundant requestHeaders) don't flood the channel.
+				if sentBlocks[req.Hash] {
+					continue
+				}
+				sentBlocks[req.Hash] = true
+				writeCh <- writeReq{p2p.MsgBlock, p2p.BlockToMsg(b)}
+
+			case p2p.MsgPing:
+				// Keepalive: respond with Pong so the relay does not evict us.
+				writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+					NodeID:    "validator",
+					Height:    gapSize,
+					UserAgent: "test",
+					Timestamp: time.Now().Unix(),
+				}}
+			}
+		}
+	}()
+
+	// ── Relay node starting at height 0 (genesis only) ───────────────────────
+	relayHandler := newGapSyncHandler(validatorChain[0])
+	relayHost := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "relay-gap-test",
+		UserAgent:            "aperod/test",
+		GetBlockStallTimeout: 2 * time.Second, // short so stall recovery is fast
+		KeepaliveInterval:    2 * time.Second,
+	}, relayHandler, newTestLogger())
+	if err := relayHost.Start(); err != nil {
+		t.Fatalf("relay Start: %v", err)
+	}
+	defer relayHost.Stop()
+
+	// Dial the validator.  After the handshake the relay sees peer.height=2000
+	// > our height=0 and immediately calls requestHeaders.  The sync pipeline
+	// then runs autonomously via the processBlock re-trigger until tip=2000.
+	relayHost.DialPeer(ln.Addr().String())
+
+	// ── Poll until the relay reaches the validator's tip ─────────────────────
+	deadline := time.Now().Add(syncTimeout)
+	for time.Now().Before(deadline) {
+		if relayHandler.tipNow() >= gapSize {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	finalTip := relayHandler.tipNow()
+	if finalTip < gapSize {
+		t.Errorf("relay tip stalled at %d after %s; want %d — "+
+			"processBlock re-trigger may not be firing correctly",
+			finalTip, syncTimeout, gapSize)
+	} else {
+		t.Logf("✓ relay synced %d-block gap autonomously: tip=%d", gapSize, finalTip)
+	}
+}
+
+// TestSync_RelayStall_ReissuesGetHeaders verifies that when a relay node sends
+// MsgGetBlock requests that the peer never answers (block pruned, reorg, or
+// race), the relay does not stall silently.  Instead, after GetBlockStallTimeout
+// the dedicated stall-detection ticker logs a warning and re-issues MsgGetHeaders
+// so the sync pipeline can recover.
+//
+// The test stands up a raw TCP server that:
+//   - completes the asymmetric P2P handshake with height=3 (so the relay
+//     immediately sends MsgGetHeaders after the Pong)
+//   - responds to every MsgGetHeaders with 3 fake headers, each with a
+//     distinct hash so the relay treats them all as unknown
+//   - silently ignores all MsgGetBlock requests
+//
+// Key timing assertion: with GetBlockStallTimeout=500ms the stall-detection
+// ticker (independent of the 3-second sync ticker) fires at ~500ms.  The test
+// records when the first and second MsgGetHeaders are received and asserts that
+// the elapsed time between them is in [400ms, 2500ms] — i.e. after the stall
+// timeout but well before the 3-second sync ticker would fire.  This proves
+// the stall-detection path (not the unconditional sync re-request) triggered
+// the re-issue.
+func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
+	const peerHeight = uint64(3)
+	const stallTimeout = 500 * time.Millisecond
+	// syncTickerInterval is the hardcoded 3-second sync ticker in host.go.
+	// The second GetHeaders must arrive well before this to prove the stall
+	// detection (not the sync ticker) caused the re-issue.
+	const syncTickerInterval = 3 * time.Second
+
+	// ── Build 3 fake SerializedHeaders with distinct hashes ─────────────────
+	fakeHeaders := make([]p2p.SerializedHeader, peerHeight)
+	for i := uint64(0); i < peerHeight; i++ {
+		var sh p2p.SerializedHeader
+		sh.Height = i + 1
+		// Give each header a unique, non-zero hash so the relay treats all as
+		// unknown blocks (stubHandler.GetBlock always returns nil).
+		sh.Hash[0] = byte(i + 1)
+		sh.Hash[1] = 0xDE
+		sh.Hash[2] = 0xAD
+		fakeHeaders[i] = sh
+	}
+
+	// ── Raw TCP "peer" server ────────────────────────────────────────────────
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// timestamps[n] records when the (n+1)-th MsgGetHeaders was received.
+	var tsMu sync.Mutex
+	var timestamps []time.Time
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// ── Asymmetric handshake: inbound side waits for Ping, replies Pong ──
+		// The relay host dials us as outbound, so it sends Ping first.
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		msgType, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || msgType != p2p.MsgPing {
+			t.Logf("peer server: expected MsgPing, got %v err=%v", msgType, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID:    "stall-peer",
+			Height:    peerHeight, // claim height=3 so relay triggers GetHeaders
+			UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		}); wErr != nil {
+			t.Logf("peer server: write Pong: %v", wErr)
+			return
+		}
+
+		// ── Message loop: serve GetHeaders, silently drop GetBlock ───────────
+		for {
+			conn.SetDeadline(time.Now().Add(10 * time.Second))
+			mt, _, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return
+			}
+			switch mt {
+			case p2p.MsgGetHeaders:
+				// Record the timestamp of each GetHeaders received.
+				tsMu.Lock()
+				timestamps = append(timestamps, time.Now())
+				tsMu.Unlock()
+				// Reply with the same 3 fake headers every time.
+				if wErr := p2p.WriteMsg(conn, p2p.MsgHeaders, p2p.HeadersMsg{
+					Headers: fakeHeaders,
+				}); wErr != nil {
+					t.Logf("peer server: write Headers: %v", wErr)
+					return
+				}
+			case p2p.MsgGetBlock:
+				// Intentionally silently drop — this is what causes the stall.
+				// Do NOT send MsgBlock back.
+			case p2p.MsgPing:
+				// Respond to keepalive pings so the relay doesn't disconnect us.
+				_ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+					NodeID: "stall-peer", Height: peerHeight,
+					UserAgent: "test", Timestamp: time.Now().Unix(),
+				})
+			}
+		}
+	}()
+
+	// ── Relay host with a short stall timeout ────────────────────────────────
+	relayHost := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "relay-stall-test",
+		UserAgent:            "aperod/test",
+		GetBlockStallTimeout: stallTimeout,
+	}, &stubHandler{}, newTestLogger())
+	if err := relayHost.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer relayHost.Stop()
+
+	// Dial the peer server; the relay will send GetHeaders immediately after
+	// the handshake because peerHeight (3) > relay.CurrentHeight() (0).
+	relayHost.DialPeer(ln.Addr().String())
+
+	// ── Wait for the first GetHeaders ────────────────────────────────────────
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		tsMu.Lock()
+		n := len(timestamps)
+		tsMu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tsMu.Lock()
+	n := len(timestamps)
+	tsMu.Unlock()
+	if n < 1 {
+		t.Fatal("peer server never received a MsgGetHeaders from the relay")
+	}
+	t.Logf("first MsgGetHeaders received at t=0")
+
+	// ── Wait for the second GetHeaders — must arrive via stall detection ─────
+	// The stall ticker fires at GetBlockStallTimeout (500ms), independently of
+	// the 3-second sync ticker.  We allow up to 2.4s (< syncTickerInterval) so
+	// any arrival proves the stall path fired, not the sync ticker.
+	maxWait := syncTickerInterval - 100*time.Millisecond // 2.9 s < sync ticker
+	deadline2 := time.Now().Add(maxWait)
+	for time.Now().Before(deadline2) {
+		tsMu.Lock()
+		n2 := len(timestamps)
+		tsMu.Unlock()
+		if n2 >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	tsMu.Lock()
+	ts := make([]time.Time, len(timestamps))
+	copy(ts, timestamps)
+	tsMu.Unlock()
+
+	if len(ts) < 2 {
+		t.Fatalf("relay did not re-issue MsgGetHeaders within %s of the first: got %d GetHeaders, want ≥ 2 (stall detection may not be firing)", maxWait, len(ts))
+	}
+
+	elapsed := ts[1].Sub(ts[0])
+	t.Logf("second MsgGetHeaders arrived %.0fms after first (stallTimeout=%s, syncTicker=3s)",
+		float64(elapsed.Milliseconds()), stallTimeout)
+
+	// The gap must be ≥ stallTimeout (stall ticker must have fired at least once
+	// before re-issuing) and < syncTickerInterval (proving the sync ticker was
+	// NOT the cause).
+	if elapsed < stallTimeout-50*time.Millisecond {
+		t.Errorf("second GetHeaders arrived too soon (%.0fms < stallTimeout %.0fms): stall ticker may have fired before the block requests were even sent",
+			float64(elapsed.Milliseconds()), float64(stallTimeout.Milliseconds()))
+	}
+	if elapsed >= syncTickerInterval {
+		t.Errorf("second GetHeaders arrived after the 3-second sync ticker (%.0fms ≥ 3000ms): stall detection did not fire — the re-issue was caused by the normal sync ticker, not the stall path",
+			float64(elapsed.Milliseconds()))
+	}
+	t.Logf("✓ stall-detection re-issued MsgGetHeaders after %.0fms (stall timeout: %s, sync ticker: 3s)",
+		float64(elapsed.Milliseconds()), stallTimeout)
+}

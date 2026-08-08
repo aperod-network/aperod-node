@@ -289,7 +289,8 @@ func TestSpentDecoyPool_RebuildAfterSnapshot(t *testing.T) {
 		KiFromIndex: false, // no pre-loaded key-image index; scan builds them incrementally
 		Log:         log,
 		SnapshotWg:  &wg,
-	})
+		CheckpointInterval: 50000,
+		})
 	wg.Wait() // ensure snapshot goroutine finishes before assertions
 
 	if err != nil {
@@ -438,7 +439,8 @@ func TestSpentDecoyPool_FullScanRebuildsDecoys(t *testing.T) {
 		KiFromIndex: false,
 		Log:         log,
 		SnapshotWg:  &wg,
-	})
+		CheckpointInterval: 50000,
+		})
 	wg.Wait()
 
 	if err != nil {

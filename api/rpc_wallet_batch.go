@@ -90,35 +90,58 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 			return nil, fmt.Errorf("utxo tx_hash %q: %w", u.TxHash, err)
 		}
 
-		tx, loc, ok := s.chain.GetTransaction(txHash)
-		if !ok {
+		tx, loc, txOk := s.chain.GetTransaction(txHash)
+		if !txOk {
 			mempoolTx, inMempool := s.mempool.Get(txHash)
 			if inMempool {
 				tx = mempoolTx
 				loc.Block = &core.Block{}
-				ok = true
+				txOk = true
 			}
 		}
-		if !ok {
-			// Disk fallback for blocks evicted from the in-memory window.
+		if !txOk {
+			// Fallback 2: tx-hash index disk lookup (newer blocks only).
 			diskTx, diskLoc, diskFound, diskErr := s.getTransactionFromDisk(txHash)
 			if diskErr != nil {
-				return nil, fmt.Errorf("disk fallback for tx %s: %w",
-					u.TxHash[:min(16, len(u.TxHash))], diskErr)
+				s.log.Warn("disk tx-index fallback error",
+					"tx", u.TxHash[:min(16, len(u.TxHash))], "err", diskErr)
 			}
 			if diskFound {
-				tx, loc, ok = diskTx, diskLoc, true
+				tx, loc, txOk = diskTx, diskLoc, true
 			}
 		}
-		if !ok {
+
+		var out core.Output
+		if txOk {
+			if int(u.OutIdx) >= len(tx.Outputs) {
+				return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
+					u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
+			}
+			out = tx.Outputs[u.OutIdx]
+		} else if s.blockStore != nil {
+			// Fallback 3: UTXO store — written for every output in every block.
+			su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
+			if suErr != nil {
+				return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
+					u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
+			}
+			if su == nil {
+				return nil, fmt.Errorf("tx %s not found on chain or mempool",
+					u.TxHash[:min(16, len(u.TxHash))])
+			}
+			out = core.Output{
+				OneTimePub:   su.OneTimePub,
+				TxPubKey:     su.TxPubKey,
+				AmountCommit: su.AmountCommit,
+			}
+			loc = core.TxLocation{
+				Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
+				TxIndex: 0,
+			}
+		} else {
 			return nil, fmt.Errorf("tx %s not found on chain or mempool",
 				u.TxHash[:min(16, len(u.TxHash))])
 		}
-		if int(u.OutIdx) >= len(tx.Outputs) {
-			return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
-				u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
-		}
-		out := tx.Outputs[u.OutIdx]
 
 		// Detect transparent mint output.
 		var zeroPub crypto.Point32
@@ -184,6 +207,15 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 						u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
 				}
 			}
+		}
+
+		// Pre-flight commitment check (mirrors rpc_wallet.go).
+		if preCommit, preErr := crypto.Commit(u.AmountNAPR, blind); preErr != nil {
+			return nil, fmt.Errorf("commit recompute for %s[%d]: %w",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, preErr)
+		} else if preCommit != out.AmountCommit {
+			return nil, fmt.Errorf("commitment mismatch for tx %s[%d]: stored blind/amount does not reproduce on-chain commitment — re-mint required",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
 		}
 
 		ownedUTXOs = append(ownedUTXOs, core.OwnedUTXO{

@@ -94,38 +94,68 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                         return nil, fmt.Errorf("utxo tx_hash %q: %w", u.TxHash, err)
                 }
 
-                tx, loc, ok := s.chain.GetTransaction(txHash)
-                if !ok {
+                tx, loc, txOk := s.chain.GetTransaction(txHash)
+                if !txOk {
                         // Fallback 1: check mempool (tx submitted but not yet in a block)
                         mempoolTx, inMempool := s.mempool.Get(txHash)
                         if inMempool {
                                 tx = mempoolTx
                                 loc.Block = &core.Block{} // block not yet assigned; height 0
-                                ok = true
+                                txOk = true
                         }
                 }
-                if !ok {
-                        // Fallback 2: LevelDB disk lookup for blocks evicted from the
-                        // in-memory sliding window (MaxInMemoryBlocks = 1000).
-                        // Admin-minted UTXOs in old blocks hit this path after a node
-                        // restart — the tx is on-chain but no longer in the in-memory map.
+                if !txOk {
+                        // Fallback 2: tx-hash index disk lookup (PutTxIdx entries).
+                        // Only covers blocks accepted after PutTxIdx was introduced —
+                        // older blocks fall through to Fallback 3 below.
                         diskTx, diskLoc, diskFound, diskErr := s.getTransactionFromDisk(txHash)
                         if diskErr != nil {
-                                return nil, fmt.Errorf("disk fallback for tx %s: %w",
-                                        u.TxHash[:min(16, len(u.TxHash))], diskErr)
+                                s.log.Warn("disk tx-index fallback error",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "err", diskErr)
                         }
                         if diskFound {
-                                tx, loc, ok = diskTx, diskLoc, true
+                                tx, loc, txOk = diskTx, diskLoc, true
                         }
                 }
-                if !ok {
-                        return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart", u.TxHash[:min(16, len(u.TxHash))])
+
+                // Resolve the output — either from the full tx or from the UTXO store.
+                var out core.Output
+                if txOk {
+                        if int(u.OutIdx) >= len(tx.Outputs) {
+                                return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
+                                        u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
+                        }
+                        out = tx.Outputs[u.OutIdx]
+                } else if s.blockStore != nil {
+                        // Fallback 3: UTXO store — written at block-acceptance time for
+                        // every output in every block since the node was first started.
+                        // This is the only reliable fallback for admin-minted UTXOs in
+                        // blocks predating PutTxIdx (the tx-hash index introduced later).
+                        su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
+                        if suErr != nil {
+                                return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
+                        }
+                        if su == nil {
+                                return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
+                                        u.TxHash[:min(16, len(u.TxHash))])
+                        }
+                        // Synthesise core.Output from the stored UTXO fields.
+                        // Only OneTimePub, TxPubKey, and AmountCommit are needed for
+                        // RingCT input construction; EncAmount is not used downstream.
+                        out = core.Output{
+                                OneTimePub:   su.OneTimePub,
+                                TxPubKey:     su.TxPubKey,
+                                AmountCommit: su.AmountCommit,
+                        }
+                        loc = core.TxLocation{
+                                Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
+                                TxIndex: 0,
+                        }
+                } else {
+                        return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
+                                u.TxHash[:min(16, len(u.TxHash))])
                 }
-                if int(u.OutIdx) >= len(tx.Outputs) {
-                        return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
-                                u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
-                }
-                out := tx.Outputs[u.OutIdx]
 
                 // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
                 // either the legacy literal spend_pub (all mints minted before the
@@ -228,6 +258,22 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                 }
                         }
                 }
+                // ── Pre-flight commitment check ───────────────────────────────────────
+                // Verify that (amount_napr, blind) reproduces the on-chain AmountCommit
+                // before passing the UTXO to TxBuilder.  If the stored blind_hex or
+                // amount_napr in the DB is wrong the ring builder will silently produce a
+                // bad ring and the validator rejects the tx with "no ring member found
+                // matching claimed commitment (C-0)".  Catching it here gives a clear
+                // error that the TypeScript layer can map to "re-mint required" or UTXO
+                // skip logic, rather than a cryptic ring-verification failure.
+                if preCommit, preErr := crypto.Commit(u.AmountNAPR, blind); preErr != nil {
+                        return nil, fmt.Errorf("commit recompute for %s[%d]: %w",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, preErr)
+                } else if preCommit != out.AmountCommit {
+                        return nil, fmt.Errorf("commitment mismatch for tx %s[%d]: stored blind/amount does not reproduce on-chain commitment — re-mint required",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+                }
+
                 // hsScalar is set above for stealth outputs (ECDH shared secret) and for
                 // mint outputs (the block height scalar); zero only for legacy/admin mints
                 // where mint_pub == spend_pub directly (height=0).
