@@ -316,6 +316,16 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                 }
                         }
                 }
+                // ── Heal stale byPubKey entry ─────────────────────────────────────────
+                // byPubKey is loaded from the snapshot at startup.  After an OOM kill
+                // the snapshot may hold a corrupt AmountCommit for this UTXO while the
+                // LevelDB u/ store or the raw block on disk has the correct value.
+                // We patch byPubKey here — after out.AmountCommit is resolved from the
+                // best available source (Fallback 1-4) — so that VerifyTx C-0 check
+                // sees the same AmountCommit that the transaction was built with.
+                // This is a no-op when byPubKey already holds the correct value.
+                s.utxos.PatchAmountCommit(out.OneTimePub, out.AmountCommit)
+
                 // ── Pre-flight commitment check ───────────────────────────────────────
                 // Verify that (amount_napr, blind) reproduces the on-chain AmountCommit
                 // before passing the UTXO to TxBuilder.  If the stored blind_hex or
