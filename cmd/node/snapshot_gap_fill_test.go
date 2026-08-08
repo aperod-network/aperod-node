@@ -237,6 +237,249 @@ func TestReplayPostSnapshotGap_MissingBlock(t *testing.T) {
 	}
 }
 
+// ─── TestReplayPostSnapshotGap_SnapshotUTXOSpentInGap ────────────────────────
+
+// TestReplayPostSnapshotGap_SnapshotUTXOSpentInGap is the regression test for
+// the UTXO-removal bug: if a UTXO present in the snapshot is spent by a block
+// in the gap window, the old manual-MarkSpent approach would leave the UTXO in
+// the active index; the correct ApplyBlock path removes it.
+//
+// Scenario:
+//  1. Snapshot saved at height 1 with a UTXO (oneTimePub=snapshotPub).
+//  2. Gap block at height 2 spends that UTXO (ring contains snapshotPub,
+//     AmountCommit matches the UTXO's zero commit).
+//  3. After gap-fill, the UTXO must be absent from the active index.
+func TestReplayPostSnapshotGap_SnapshotUTXOSpentInGap(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	// ── Block 1 with a snapshot UTXO ────────────────────────────────────────
+	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, priv, pub)
+	putRawBlk(t, db, genesis)
+
+	// The UTXO created at height 1 (in the snapshot) — AmountCommit is zero.
+	var snapshotPub crypto.Point32
+	snapshotPub[0] = 0xCC
+	mintTx := core.Transaction{Outputs: []core.Output{{OneTimePub: snapshotPub}}}
+	blk1 := makeSignedBlk(t, 1, genesis.Hash(), priv, pub)
+	blk1.Txs = []core.Transaction{mintTx}
+	blk1.Header.MerkleRoot = core.MerkleRoot(blk1.Txs)
+	if err := blk1.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk1: %v", err)
+	}
+	putRawBlk(t, db, blk1)
+
+	// Build snapshot at height 1 with the UTXO present in the active index.
+	utxosAtSnap := core.NewUTXOSet()
+	utxosAtSnap.Add(&core.UTXO{
+		TxHash:      mintTx.Hash(),
+		OutputIndex: 0,
+		OneTimePub:  snapshotPub,
+		BlockHeight: 1,
+		// AmountCommit is zero — matches inp.AmountCommit below.
+	})
+	reg := core.NewValidatorRegistry()
+	reg.SetUTXOSet(utxosAtSnap)
+	blk1Hash := blk1.Hash()
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  1,
+		TipHashHex: fmt.Sprintf("%x", blk1Hash[:]),
+		UTXOs:      utxosAtSnap.TakeSnapshot(),
+		Registry:   reg.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// ── Block 2: spends the snapshot UTXO ───────────────────────────────────
+	// Generate a valid key image (ComputeKeyImage requires a valid scalar+point).
+	kp, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	ki, err := crypto.ComputeKeyImage(kp.Spend.Private, kp.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage: %v", err)
+	}
+
+	spendTx := core.Transaction{
+		Inputs: []core.RingInput{{
+			KeyImage: ki,
+			// Ring contains only the real UTXO; AmountCommit is zero to match.
+			Ring: []crypto.Point32{snapshotPub},
+		}},
+	}
+	blk2 := makeSignedBlk(t, 2, blk1Hash, priv, pub)
+	blk2.Txs = []core.Transaction{spendTx}
+	blk2.Header.MerkleRoot = core.MerkleRoot(blk2.Txs)
+	if err := blk2.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk2: %v", err)
+	}
+	putRawBlk(t, db, blk2)
+
+	// ── Simulate restart: restore snapshot, run gap-fill ────────────────────
+	utxosOnRestart := core.NewUTXOSet()
+	gapSnap := findLatestSnapshot(dir, 2, silentLog())
+	if gapSnap == nil {
+		t.Fatal("findLatestSnapshot returned nil")
+	}
+	utxosOnRestart.RestoreFromSnapshot(gapSnap.UTXOs)
+
+	// Pre-condition: snapshot UTXO is present before gap-fill.
+	if utxosOnRestart.Get(mintTx.Hash(), 0) == nil {
+		t.Fatal("pre-condition: snapshot UTXO must be present before gap-fill")
+	}
+
+	regOnRestart := core.NewValidatorRegistry()
+	regOnRestart.SetUTXOSet(utxosOnRestart)
+
+	added, spent, complete := replayPostSnapshotGap(db, utxosOnRestart, regOnRestart, 1, 2, silentLog())
+
+	if !complete {
+		t.Errorf("gap-fill: expected complete=true, got false")
+	}
+	if spent != 1 {
+		t.Errorf("gap-fill: key images spent: want 1, got %d", spent)
+	}
+	if added != 0 {
+		t.Errorf("gap-fill: outputs added: want 0, got %d", added)
+	}
+
+	// The critical assertion: the snapshot UTXO must be REMOVED from the
+	// active index because it was spent in the gap block.
+	// Old code (manual MarkSpent+Add) would leave it as active — this test
+	// would fail against that implementation.
+	if utxosOnRestart.Get(mintTx.Hash(), 0) != nil {
+		t.Error("snapshot UTXO still in active index after gap spend — " +
+			"ApplyBlock semantics not applied (would appear in address scans and supply count)")
+	}
+	// Key image must be marked spent.
+	if !utxosOnRestart.IsSpent(ki) {
+		t.Error("key image not marked spent after gap-fill")
+	}
+}
+
+// ─── TestReplayPostSnapshotGap_FailureAtomicity ───────────────────────────────
+
+// TestReplayPostSnapshotGap_FailureAtomicity verifies that when the gap-fill
+// fails mid-way (registry error after ApplyBlock modifies UTXO state), the
+// caller can restore state from the original snapshot and recover cleanly.
+//
+// This exercises the rescue-seed path: rescueSnap = gapSnap → rescue path
+// calls utxos.RestoreFromSnapshot(gapSnap.UTXOs) → startup scan re-applies
+// the failed block from a clean state.
+func TestReplayPostSnapshotGap_FailureAtomicity(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, priv, pub)
+	putRawBlk(t, db, genesis)
+
+	// Snapshot at height 1 with a normal UTXO.
+	var normalPub crypto.Point32
+	normalPub[0] = 0xDD
+	normalTx := core.Transaction{Outputs: []core.Output{{OneTimePub: normalPub}}}
+	blk1 := makeSignedBlk(t, 1, genesis.Hash(), priv, pub)
+	blk1.Txs = []core.Transaction{normalTx}
+	blk1.Header.MerkleRoot = core.MerkleRoot(blk1.Txs)
+	if err := blk1.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk1: %v", err)
+	}
+	putRawBlk(t, db, blk1)
+
+	utxosAtSnap := core.NewUTXOSet()
+	utxosAtSnap.Add(&core.UTXO{
+		TxHash:      normalTx.Hash(),
+		OutputIndex: 0,
+		OneTimePub:  normalPub,
+		BlockHeight: 1,
+	})
+	reg := core.NewValidatorRegistry()
+	reg.SetUTXOSet(utxosAtSnap)
+	blk1Hash := blk1.Hash()
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  1,
+		TipHashHex: fmt.Sprintf("%x", blk1Hash[:]),
+		UTXOs:      utxosAtSnap.TakeSnapshot(),
+		Registry:   reg.TakeSnapshot(),
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// Gap block at height 2: valid mint output + bad stake tx.
+	// ApplyBlock will succeed (adds the output) but ReplayBlockStakeTxs will
+	// fail because the stake tx has wrong Extra length.
+	var mintPub2 crypto.Point32
+	mintPub2[0] = 0xEE
+	mintTx2 := core.Transaction{Outputs: []core.Output{{OneTimePub: mintPub2}}}
+	badStakeTx := core.Transaction{
+		Version: core.TxVersionStake,
+		Extra:   []byte("bad-extra-not-valid-length"),
+	}
+	blk2 := makeSignedBlk(t, 2, blk1Hash, priv, pub)
+	blk2.Txs = []core.Transaction{mintTx2, badStakeTx}
+	blk2.Header.MerkleRoot = core.MerkleRoot(blk2.Txs)
+	if err := blk2.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk2: %v", err)
+	}
+	putRawBlk(t, db, blk2)
+
+	// Simulate restart: restore snapshot, run gap-fill.
+	utxosOnRestart := core.NewUTXOSet()
+	gapSnap := findLatestSnapshot(dir, 2, silentLog())
+	if gapSnap == nil {
+		t.Fatal("findLatestSnapshot returned nil")
+	}
+	snapUTXOs := gapSnap.UTXOs // save original snapshot contents for later restore
+	utxosOnRestart.RestoreFromSnapshot(snapUTXOs)
+
+	regOnRestart := core.NewValidatorRegistry()
+	regOnRestart.SetUTXOSet(utxosOnRestart)
+	_, _, complete := replayPostSnapshotGap(db, utxosOnRestart, regOnRestart, 1, 2, silentLog())
+
+	// Gap-fill must fail because the stake tx is malformed.
+	if complete {
+		t.Error("expected complete=false when registry replay fails after ApplyBlock")
+	}
+
+	// Simulate rescue path: restore from the original snapshot.
+	// This is what the production code does: rescueSnap = gapSnap →
+	// utxos.RestoreFromSnapshot(rescueSnap.UTXOs).
+	utxosOnRestart.RestoreFromSnapshot(snapUTXOs)
+
+	// After restore, the original snapshot UTXO must be present.
+	if utxosOnRestart.Get(normalTx.Hash(), 0) == nil {
+		t.Error("snapshot UTXO not present after restore — rescue path cannot recover cleanly")
+	}
+	// The mint from block 2 (partially applied by ApplyBlock) must be GONE
+	// after restore — not a leftover from the failed gap-fill.
+	if utxosOnRestart.Get(mintTx2.Hash(), 0) != nil {
+		t.Error("partially applied UTXO from failed gap block still present after restore — " +
+			"rescue scan would see it as a duplicate")
+	}
+}
+
 // ─── TestReplayPostSnapshotGap_CorruptBlock ───────────────────────────────────
 
 // TestReplayPostSnapshotGap_CorruptBlock verifies that a block stored with
