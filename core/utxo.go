@@ -241,6 +241,23 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 	return s.byPubKey[pub]
 }
 
+// PatchAmountCommit corrects a stale AmountCommit for a UTXO identified by its
+// OneTimePub.  This is called by the API server Fallback-4 path when it
+// discovers that the snapshot-restored AmountCommit differs from the
+// authoritative value read from the raw block on disk (possible after an OOM
+// kill where the snapshot was saved with partially-written data).
+//
+// Updating byPubKey here ensures that the subsequent VerifyTx C-0 check finds
+// the correct AmountCommit and does not reject an otherwise-valid spend.
+// Both byPubKey and utxos store the same *UTXO pointer, so one write heals both.
+func (s *UTXOSet) PatchAmountCommit(oneTimePub crypto.Point32, correct crypto.Commitment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u := s.byPubKey[oneTimePub]; u != nil {
+		u.AmountCommit = correct
+	}
+}
+
 // Remove deletes a UTXO from the set (called when it is spent).
 func (s *UTXOSet) Remove(txHash crypto.Hash32, outIdx uint32) {
 	s.mu.Lock()
