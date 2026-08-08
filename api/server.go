@@ -128,6 +128,18 @@ type Server struct {
         storeMissingFirstBlock int64
         storeMissingLastBlock  int64
 
+        // snapshotMu guards the snapshot status fields below.
+        snapshotMu sync.Mutex
+        // lastSnapshotHeight is the block height of the most recently saved snapshot.
+        // Zero until the first successful save this session.
+        lastSnapshotHeight uint64
+        // lastSnapshotSavedAt is the wall-clock time when the last successful
+        // snapshot save completed.  IsZero() until first success.
+        lastSnapshotSavedAt time.Time
+        // lastSnapshotErrStr is the error from the most recent failed save attempt.
+        // Empty when the last attempt succeeded or no attempt has been made.
+        lastSnapshotErrStr string
+
         // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
         // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
         // for each admin-mint address; without caching each call does an O(n)
@@ -171,6 +183,29 @@ func (s *Server) SetReady() { atomic.StoreInt32(&s.syncing, 0) }
 // Call ~90 s after SetReady() to clear the utxo_rebuilding flag so wallets
 // resume showing live balance figures without the "rebuilding" banner.
 func (s *Server) SetUTXOReady() { atomic.StoreInt32(&s.utxoRebuilding, 0) }
+
+// SetSnapshotSaved records a successful snapshot save at the given chain height.
+// Called by the periodic-save goroutine and the shutdown handler in cmd/node/main.go.
+// Exposed via /api/v1/status so the API server's system monitor can track freshness.
+func (s *Server) SetSnapshotSaved(height uint64) {
+        s.snapshotMu.Lock()
+        s.lastSnapshotHeight = height
+        s.lastSnapshotSavedAt = time.Now()
+        s.lastSnapshotErrStr = ""
+        s.snapshotMu.Unlock()
+}
+
+// SetSnapshotFailed records a failed snapshot save attempt.
+// The error message is exposed via /api/v1/status so the API server's monitoring
+// loop can send a Telegram alert without polling the filesystem.
+func (s *Server) SetSnapshotFailed(err error) {
+        if err == nil {
+                return
+        }
+        s.snapshotMu.Lock()
+        s.lastSnapshotErrStr = err.Error()
+        s.snapshotMu.Unlock()
+}
 
 // SetSyncProgress records how far the startup block scan has progressed.
 // current is the height of the last block processed; tip is the chain tip height.
