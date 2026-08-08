@@ -105,6 +105,13 @@ type Config struct {
         // needed to honour the limit, creating TCP-level backpressure without
         // dropping blocks.  Default: 50.  0 = disabled.
         MaxBlockIngestPerSec int
+        // MaxStaleBootnodeAge is the maximum time a bootnode may go without a
+        // successful DNS resolution before a WARN is emitted on every
+        // discovery tick.  The warning includes the bootnode address and the
+        // age since last successful resolution so operators can identify and
+        // fix decommissioned hostnames before the peer count silently drops to
+        // zero.  Default: 24h (applied in NewHost when zero).
+        MaxStaleBootnodeAge time.Duration
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -373,6 +380,13 @@ type Host struct {
         // Protected by h.mu (write-lock for mutations, read-lock for lookups).
         bootnodeLastResolved map[string][]string
 
+        // bootnodeLastResolvedAt maps each raw bootnode string to the wall-clock
+        // time of its most recent successful DNS resolution.  Initialised to
+        // time.Now() when Start() is called so new nodes get a full grace period
+        // before any stale-bootnode WARN fires.  Updated by applyBootnodeResolution
+        // on every successful resolution.  Protected by h.mu.
+        bootnodeLastResolvedAt map[string]time.Time
+
         // bootnodeSet is the flat set of currently-privileged IP:port addresses,
         // rebuilt from bootnodeLastResolved on every write.  Used by dialPeer to
         // skip exponential back-off — only the ban list can block a bootnode.
@@ -404,6 +418,9 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.KeepaliveInterval == 0 {
                 cfg.KeepaliveInterval = 10 * time.Second
         }
+        if cfg.MaxStaleBootnodeAge == 0 {
+                cfg.MaxStaleBootnodeAge = 24 * time.Hour
+        }
         // Note: MaxBlockIngestPerSec = 0 means "disabled" — no default is applied
         // here so that unit tests that construct p2p.Config{} directly are not
         // throttled.  Production nodes set the default via DefaultConfig() → 50.
@@ -433,9 +450,10 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 badBlockCounts: make(map[string]badBlockStrike),
                 wlNets:         wlNets,
                 wlIPs:          wlIPs,
-                bootnodeLastResolved: make(map[string][]string),
-                bootnodeSet:          make(map[string]struct{}),
-                maintainNow:          make(chan struct{}, 1),
+                bootnodeLastResolved:   make(map[string][]string),
+                bootnodeLastResolvedAt: make(map[string]time.Time),
+                bootnodeSet:            make(map[string]struct{}),
+                maintainNow:            make(chan struct{}, 1),
         }
 }
 
@@ -453,9 +471,12 @@ func (h *Host) rebuildBootnodeSet() {
 
 // applyBootnodeResolution records the resolved addresses for a single raw
 // bootnode string and rebuilds bootnodeSet so retired addresses are removed
-// immediately.  Must be called with h.mu held (write lock).
+// immediately.  Also stamps bootnodeLastResolvedAt with the current time so
+// the stale-bootnode WARN in maintainLoop can calculate the age accurately.
+// Must be called with h.mu held (write lock).
 func (h *Host) applyBootnodeResolution(raw string, resolved []string) {
         h.bootnodeLastResolved[raw] = resolved
+        h.bootnodeLastResolvedAt[raw] = time.Now()
         h.rebuildBootnodeSet()
 }
 
@@ -856,6 +877,20 @@ func (h *Host) Start() error {
         go h.acceptLoop()
         go h.maintainLoop()
 
+        // Seed bootnodeLastResolvedAt to now so every configured bootnode
+        // starts with a full MaxStaleBootnodeAge grace period.  Without this
+        // seed, a bootnode whose first resolution attempt fails would have a
+        // zero timestamp and immediately trigger stale warnings on the first
+        // maintainLoop tick.
+        h.mu.Lock()
+        seedTime := time.Now()
+        for _, addr := range h.cfg.Bootnodes {
+                if _, exists := h.bootnodeLastResolvedAt[addr]; !exists {
+                        h.bootnodeLastResolvedAt[addr] = seedTime
+                }
+        }
+        h.mu.Unlock()
+
         // Dial bootnodes — resolve DNS hostnames before dialling so the
         // canonical peer key in h.peers is always an IP:port string.
         // applyBootnodeResolution records each successful resolution in
@@ -865,7 +900,7 @@ func (h *Host) Start() error {
                 go func(a string) {
                         resolved, err := resolveBootnode(a)
                         if err != nil {
-                                h.log.Warn("bootnode dns resolve failed", "addr", a, "err", err)
+                                h.log.Warn("bootnode dns resolve failed", "bootnode", a, "err", err)
                                 return
                         }
                         h.mu.Lock()
@@ -1168,13 +1203,20 @@ func (h *Host) maintainLoop() {
                 for _, raw := range h.cfg.Bootnodes {
                         resolved, err := resolveBootnode(raw)
                         if err != nil {
+                                h.log.Warn("bootnode dns resolve failed", "bootnode", raw, "err", err)
                                 continue // DNS failure: preserve last-known addrs
                         }
                         freshResults = append(freshResults, rawResult{raw, resolved})
                 }
                 // Collect the full set of bootnode addresses to dial (including
                 // retained last-known addrs for bootnodes whose DNS just failed).
+                // Also snapshot the last-resolved timestamps for stale-age checks.
                 var allBootnodeAddrs []string
+                type staleSample struct {
+                        raw     string
+                        lastAt  time.Time
+                }
+                var staleSamples []staleSample
                 h.mu.Lock()
                 for _, rr := range freshResults {
                         h.applyBootnodeResolution(rr.raw, rr.resolved)
@@ -1182,7 +1224,29 @@ func (h *Host) maintainLoop() {
                 for _, addrs := range h.bootnodeLastResolved {
                         allBootnodeAddrs = append(allBootnodeAddrs, addrs...)
                 }
+                for _, raw := range h.cfg.Bootnodes {
+                        if lastAt, ok := h.bootnodeLastResolvedAt[raw]; ok {
+                                staleSamples = append(staleSamples, staleSample{raw, lastAt})
+                        }
+                }
                 h.mu.Unlock()
+
+                // Warn when a bootnode has not resolved successfully for longer
+                // than MaxStaleBootnodeAge.  The warning fires on every discovery
+                // tick while the condition persists so operators see it clearly
+                // in logs without having to search for the original failure.
+                tickNow := time.Now()
+                for _, ss := range staleSamples {
+                        age := tickNow.Sub(ss.lastAt)
+                        if age > h.cfg.MaxStaleBootnodeAge {
+                                h.log.Warn("bootnode stale: DNS has not resolved successfully since last attempt",
+                                        "bootnode", ss.raw,
+                                        "age", age.Round(time.Second),
+                                        "max_stale_bootnode_age", h.cfg.MaxStaleBootnodeAge,
+                                )
+                        }
+                }
+
                 for _, addr := range allBootnodeAddrs {
                         h.mu.RLock()
                         _, connected := h.peers[addr]
