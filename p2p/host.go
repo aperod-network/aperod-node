@@ -397,6 +397,18 @@ type Host struct {
         // an immediate maintainLoop tick without waiting for the 10-second ticker.
         // nil in production (Start always initialises it).
         maintainNow chan struct{}
+
+        // listenFunc is the function used to open the TCP listener in Start().
+        // In production it is always net.Listen (set in NewHost).  Tests may
+        // replace it with a custom factory whose body runs at the real bind
+        // point — making it the only reliable way to assert the whitelist-before-
+        // listener ordering invariant: if net.Listen (or this field) is ever
+        // moved before loadWhitelistFromFile, the test factory executes before
+        // the whitelist is populated and the test fails immediately.
+        //
+        // Ordering invariant (must never regress):
+        //   loadWhitelistFromFile  ->  listenFunc / net.Listen  ->  tls.NewListener
+        listenFunc func(network, addr string) (net.Listener, error)
 }
 
 // NewHost creates a new p2p host.
@@ -450,6 +462,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 badBlockCounts: make(map[string]badBlockStrike),
                 wlNets:         wlNets,
                 wlIPs:          wlIPs,
+                listenFunc:     net.Listen,
                 bootnodeLastResolved:   make(map[string][]string),
                 bootnodeLastResolvedAt: make(map[string]time.Time),
                 bootnodeSet:            make(map[string]struct{}),
@@ -866,7 +879,12 @@ func (h *Host) Start() error {
                 h.log.Info("p2p: restored bans from file", "count", n, "file", h.cfg.BanFile)
         }
 
-        ln, err := net.Listen("tcp", h.cfg.ListenAddr)
+        // Ordering invariant: h.listenFunc (net.Listen in production) is called
+        // HERE — after loadWhitelistFromFile above.  Tests override listenFunc
+        // with a factory that captures GetPeerWhitelist() at bind time; if a
+        // future refactor moves this call above loadWhitelistFromFile, the test
+        // factory executes before the whitelist is populated and fails immediately.
+        ln, err := h.listenFunc("tcp", h.cfg.ListenAddr)
         if err != nil {
                 return fmt.Errorf("listen %s: %w", h.cfg.ListenAddr, err)
         }
