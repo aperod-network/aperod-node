@@ -2208,16 +2208,23 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
 }
 
 // rebuildMissingUTXOs scans every stored block from height 0 to tipHeight and
-// re-populates u/ (UTXO store) entries that are absent but not marked spent in
-// the su/ index.  Called as part of --repair-db to fix validator-reward and
-// admin-mint UTXOs that survived the key-image index but whose u/ entries were
-// in SST files lost during an OOM-kill + LevelDB RecoverFile cycle.
+// re-populates two LevelDB prefix families that are lost together during an
+// OOM-kill + RecoverFile cycle:
 //
-// The rebuild is safe to run multiple times: it skips entries already present
-// in u/ and never overwrites them.  Already-spent outputs (su/ entry present)
-// are also skipped.  Missing blocks are silently skipped with a non-fatal error.
+//   - u/  (UTXO store)    — needed by apr_walletSend to build ring inputs
+//   - t/  (tx-hash index) — needed by apr_walletSend to look up the full TX
+//
+// Both prefixes live in SST files and are lost simultaneously when the Go
+// runtime is OOM-killed mid-compaction.  Restoring only u/ leaves t/ broken,
+// so apr_walletSend still fails with "tx not found on chain or mempool" even
+// though the UTXO shows as active.
+//
+// The rebuild is safe to run multiple times: entries already present are
+// skipped; already-spent outputs (su/ entry present) skip the u/ restore.
+// Missing blocks are silently skipped with a non-fatal error.
 func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logger) (int, error) {
-        rebuilt := 0
+        rebuiltUTXO := 0
+        rebuiltTxIdx := 0
         var firstErr error
         for h := uint64(0); h <= tipHeight; h++ {
                 raw, err := blockStore.GetRawBlockByHeight(h)
@@ -2234,8 +2241,24 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
                         }
                         continue
                 }
-                for _, tx := range b.Txs {
+                for txPos, tx := range b.Txs {
                         txHash := tx.Hash()
+
+                        // ── t/ tx-hash index ──────────────────────────────────────────
+                        // apr_walletSend looks up the full TX by hash; if the t/ entry
+                        // is missing it returns "tx not found on chain or mempool" even
+                        // when the u/ UTXO entry is intact.
+                        if existing, _ := blockStore.LookupTxIdx(txHash); existing == nil {
+                                if putErr := blockStore.PutTxIdx(txHash, h, txPos); putErr != nil {
+                                        if firstErr == nil {
+                                                firstErr = putErr
+                                        }
+                                } else {
+                                        rebuiltTxIdx++
+                                }
+                        }
+
+                        // ── u/ UTXO store ─────────────────────────────────────────────
                         for outIdx, out := range tx.Outputs {
                                 if blockStore.IsUTXOSpent(txHash, uint32(outIdx)) {
                                         continue // spent — su/ entry present, skip
@@ -2244,7 +2267,6 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
                                 if existing != nil {
                                         continue // already in store, skip
                                 }
-                                // u/ entry absent and not spent — restore it
                                 su := &store.StoredUTXO{
                                         TxHash:       txHash,
                                         OutputIndex:  uint32(outIdx),
@@ -2260,15 +2282,20 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
                                         }
                                         continue
                                 }
-                                rebuilt++
+                                rebuiltUTXO++
                         }
                 }
                 if h%10_000 == 0 && h > 0 {
-                        log.Info("--repair-db: UTXO rebuild progress",
-                                "height", h, "tip", tipHeight, "restored", rebuilt)
+                        log.Info("repair: store rebuild progress",
+                                "height", h, "tip", tipHeight,
+                                "restored_utxo", rebuiltUTXO, "restored_txidx", rebuiltTxIdx)
                 }
         }
-        return rebuilt, firstErr
+        if rebuiltTxIdx > 0 || rebuiltUTXO > 0 {
+                log.Warn("repair: store gaps detected and repaired",
+                        "restored_utxo", rebuiltUTXO, "restored_txidx", rebuiltTxIdx)
+        }
+        return rebuiltUTXO + rebuiltTxIdx, firstErr
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.
