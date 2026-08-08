@@ -215,6 +215,14 @@ func (d *DB) MarkUTXOSpent(txHash crypto.Hash32, outIdx uint32) error {
         return d.put(spentUTXOKey(txHash, outIdx), []byte{0x01})
 }
 
+// IsUTXOSpent reports whether the given output has been marked as spent in the
+// su/ index.  Returns false on any lookup error (conservative — treats unknown
+// as unspent so callers can re-check with GetUTXO if needed).
+func (d *DB) IsUTXOSpent(txHash crypto.Hash32, outIdx uint32) bool {
+        data, err := d.get(spentUTXOKey(txHash, outIdx))
+        return err == nil && data != nil
+}
+
 // SpentUTXOIndexSize returns the number of entries in the su/ index.
 // Used at startup to detect whether the index has been populated by at least
 // one previous full-scan run.
