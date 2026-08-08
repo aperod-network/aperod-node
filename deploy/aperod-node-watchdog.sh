@@ -247,28 +247,52 @@ Action: <code>systemctl restart aperod-node</code>
   # ── Peer-count zero alert ──────────────────────────────────────────────────
   # Fires a Telegram alert when peer_count stays at 0 for longer than
   # PEER_WAIT_MINS (default: 10 minutes).  Typical causes include a blocked
-  # port 30303, a wrong PRIMARY_IP in node.yaml, or a stale p2p_identity.key.
+  # port 30303, a wrong bootnode address, or a stale p2p_identity.key.
   #
-  # Set PEER_WAIT_MINS=0 to disable.
-  # MOCK_PEER_COUNT may be set in tests to inject a fake value.
-  PEER_WAIT_MINS="${PEER_WAIT_MINS:-10}"
+  # peer_count is read from GET /api/v1/network/stats (not /api/v1/status).
+  # When the field is absent or non-numeric the stats probe is treated as
+  # "unknown" and the zero-since timer is RESET — only consecutive confirmed
+  # zero-peer observations may advance the timer toward an alert.
+  #
+  # Set PEER_WAIT_MINS=0 to disable.  Non-integer values fall back to 10.
+  # MOCK_PEER_COUNT may be set in tests to inject a fake value (bypasses curl).
+  _raw_peer_wait="${PEER_WAIT_MINS:-10}"
+  if [[ "${_raw_peer_wait}" =~ ^[0-9]+$ ]]; then
+    PEER_WAIT_MINS="${_raw_peer_wait}"
+  else
+    log "PEER_WAIT_MINS='${_raw_peer_wait}' is not a non-negative integer — using default 10"
+    PEER_WAIT_MINS=10
+  fi
   PEERS_ZERO_SINCE_FILE="${STATE_DIR}/watchdog-peers-zero-since"
   LAST_PEER_ALERT_FILE="${STATE_DIR}/watchdog-last-peer-alert"
+  STATS_URL="${NODE_API_URL}/api/v1/network/stats"
 
-  if [[ "${PEER_WAIT_MINS}" -gt 0 ]]; then
+  if [[ "${PEER_WAIT_MINS}" -eq 0 ]]; then
+    # Feature disabled — clear stale state so re-enabling never alerts based on
+    # a non-continuous/unobserved absence recorded before the disable.
+    rm -f "${PEERS_ZERO_SINCE_FILE}" "${LAST_PEER_ALERT_FILE}" 2>/dev/null || true
+  else
     if [[ -n "${MOCK_PEER_COUNT:-}" ]]; then
       PEER_COUNT="${MOCK_PEER_COUNT}"
     else
-      PEER_COUNT=$(echo "${RESPONSE_BODY}" | grep -o '"peer_count":[0-9]*' \
+      _stats_body=$(curl -s --max-time "${TIMEOUT_SECS}" "${STATS_URL}" 2>/dev/null || true)
+      PEER_COUNT=$(echo "${_stats_body}" | grep -o '"peer_count":[0-9]*' \
                    | grep -o '[0-9]*$' | head -1 || true)
     fi
-    PEER_COUNT="${PEER_COUNT:-0}"
 
-    if [[ "${PEER_COUNT}" =~ ^[0-9]+$ && "${PEER_COUNT}" -gt 0 ]]; then
-      # Peers present — clear the zero-since marker
+    # Only proceed when peer_count is an explicit non-empty integer.
+    # An absent or malformed field is treated as "unknown" — reset the zero-since
+    # timer so that only continuously confirmed zero-peer observations can alert.
+    if [[ ! "${PEER_COUNT:-}" =~ ^[0-9]+$ ]]; then
       rm -f "${PEERS_ZERO_SINCE_FILE}" 2>/dev/null || true
+      log "peer_count unavailable from ${STATS_URL} — zero-peer timer reset"
+    elif [[ "${PEER_COUNT}" -gt 0 ]]; then
+      # Peers present — clear both the zero-since marker and the per-outage alert
+      # cooldown so the next distinct outage always gets its own fresh alert.
+      rm -f "${PEERS_ZERO_SINCE_FILE}" "${LAST_PEER_ALERT_FILE}" 2>/dev/null || true
+      log "peer_count=${PEER_COUNT} — peer-zero timer and alert cooldown cleared"
     else
-      # peer_count == 0
+      # peer_count confirmed 0
       _now_p=$(date +%s)
       mkdir -p "${STATE_DIR}" 2>/dev/null || true
 
@@ -298,7 +322,7 @@ Possible causes:
 • Wrong bootnode address in <code>/etc/aperod/node.yaml</code>
 • Stale <code>p2p_identity.key</code> (delete and restart to regenerate)
 
-Check: <code>curl -s http://127.0.0.1:8545/api/v1/status | grep peer</code>"
+Check: <code>curl -s ${STATS_URL} | grep peer</code>"
             echo "${_now_p}" > "${LAST_PEER_ALERT_FILE}" || true
             log "Telegram peer-zero alert sent (${_zero_mins} min with 0 peers)"
           else
