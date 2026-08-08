@@ -108,6 +108,25 @@ type Config struct {
 	// Set to -1 to disable the GC entirely (not recommended in production).
 	// Set to 0 to use the Go runtime default (100).
 	GCPercent int `yaml:"gc_percent"`
+
+	// MaxInMemoryBlocks is the sliding-window size of blocks kept in RAM.
+	// Blocks older than (tip − MaxInMemoryBlocks) are evicted from the
+	// in-memory maps; they remain available on disk via the LevelDB store.
+	// 1 000 blocks at 3 s/block ≈ 50 minutes of reorg history.
+	//
+	// Operators with very low RAM can lower this value; operators that
+	// serve large GetBlock requests to many peers can raise it to reduce
+	// disk I/O at the cost of higher baseline RSS.
+	// Default: 1000.  Set to 0 to use the default.
+	MaxInMemoryBlocks uint64 `yaml:"max_in_memory_blocks"`
+
+	// MempoolEvictIntervalSec is the period between background mempool
+	// eviction runs.  Each run removes transactions whose TTL has expired
+	// (default TTL: 2 h) and enforces the MaxBytes RAM cap.  Lower values
+	// keep the mempool tighter at the cost of slightly more CPU; higher
+	// values let old transactions linger longer.
+	// Default: 300 (5 minutes).  Set to 0 to use the default.
+	MempoolEvictIntervalSec uint64 `yaml:"mempool_evict_interval_sec"`
 }
 
 // P2PConfig holds networking settings.
@@ -295,6 +314,8 @@ func DefaultConfig() *Config {
 			Enabled:    false,
 			ListenAddr: "127.0.0.1:8546",
 		},
+		MaxInMemoryBlocks:       1_000,
+		MempoolEvictIntervalSec: 300,
 	}
 }
 
