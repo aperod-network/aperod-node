@@ -8,6 +8,7 @@ import (
         "fmt"
         "log/slog"
         "net/http"
+        "runtime"
         "sync"
         "sync/atomic"
         "time"
@@ -154,6 +155,11 @@ type Server struct {
         // stakingPoolFn returns (remaining nAPRO, init nAPRO, reward mode string).
         // Wired from consensus.Engine after startup.  nil = not wired.
         stakingPoolFn func() (uint64, uint64, string)
+
+        // rssStatsFn returns the process Resident Set Size in bytes.
+        // Wired from cmd/node after startup via SetRSSStatsFn.
+        // Returns 0 when not wired (non-Linux environments, unit tests).
+        rssStatsFn func() int64
 }
 
 // NewServer creates a new API server.
@@ -255,6 +261,11 @@ func (s *Server) SetDataDir(dir string) { s.dataDir = dir }
 func (s *Server) SetStakingPoolFn(fn func() (uint64, uint64, string)) {
         s.stakingPoolFn = fn
 }
+
+// SetRSSStatsFn wires a function returning the process Resident Set Size in
+// bytes so /api/health can expose live memory stats without SSH access.
+// Optional — reports rss_bytes=0 when not wired (e.g. unit tests).
+func (s *Server) SetRSSStatsFn(f func() int64) { s.rssStatsFn = f }
 
 // SetPruningMode records the node's pruning mode ("archive" or "light") so
 // stake endpoints can detect when a missing UTXO may have been pruned rather
@@ -470,11 +481,26 @@ const (
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+        var ms runtime.MemStats
+        runtime.ReadMemStats(&ms)
+
+        rssBytes := int64(0)
+        if s.rssStatsFn != nil {
+                rssBytes = s.rssStatsFn()
+        }
+
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]interface{}{
                 "status": "ok",
                 "height": s.chain.Height(),
                 "time":   time.Now().UTC().Format(time.RFC3339),
+                "memory": map[string]interface{}{
+                        "rss_bytes":        rssBytes,
+                        "heap_alloc_bytes": ms.HeapAlloc,
+                        "in_memory_blocks": s.chain.InMemoryBlockCount(),
+                        "mempool_count":    s.mempool.Count(),
+                        "mempool_bytes":    s.mempool.TotalBytes(),
+                },
         })
 }
 
