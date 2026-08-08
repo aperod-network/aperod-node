@@ -65,6 +65,16 @@ func Recover(path string) (*DB, error) {
 // Close closes the database.
 func (d *DB) Close() error { return d.db.Close() }
 
+// Compact triggers a full LevelDB compaction across the entire key range.
+// This reclaims physical disk space that was logically freed by Delete calls
+// (e.g. after pruning removes old TxData entries).  The operation is
+// synchronous and may take several minutes on large databases; it is safe to
+// interrupt — LevelDB remains consistent.  Call only when the node is stopped
+// so LevelDB is not opened by two processes at the same time.
+func (d *DB) Compact() error {
+        return d.db.CompactRange(util.Range{})
+}
+
 // ─── Raw helpers ─────────────────────────────────────────────────────────────
 
 func (d *DB) put(key, val []byte) error {
