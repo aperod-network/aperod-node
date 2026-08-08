@@ -776,73 +776,31 @@ func run() error {
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
                                         // ── Post-snapshot block-replay gap-fill ──────────────────────
-                                        // The snapshot captures the UTXO set at snap.TipHeight.  When
-                                        // the node was stopped without a clean SIGTERM (OOM-kill,
-                                        // SIGKILL) after blocks were accepted beyond that height, those
-                                        // post-snapshot blocks are in LevelDB but their UTXOs are
-                                        // absent from the snapshot.  Transparent admin-mint outputs are
-                                        // the most visible case: they disappear from address scans and
-                                        // the circulating supply shows 0.
+                                        // The snapshot captures the UTXO set at snap.TipHeight.
+                                        // When the node was stopped without a clean SIGTERM (e.g.
+                                        // OOM-kill or SIGKILL) after blocks were accepted beyond
+                                        // that height, those post-snapshot blocks are in LevelDB
+                                        // but their UTXOs are absent from the snapshot.
+                                        // Transparent admin-mint outputs are the most visible case:
+                                        // they disappear from address scans and circulating supply
+                                        // shows 0 after restart.
                                         //
-                                        // Fix: replay blocks snap.TipHeight+1 through tipHeight from
-                                        // the canonical block store.  For each block:
-                                        //   • add every tx output to the in-memory UTXO set
-                                        //   • mark every tx input's key image as spent
-                                        //
-                                        // This approach is safe because it uses authoritative block
-                                        // data — no reliance on the su/ spent-UTXO index, which is a
-                                        // best-effort performance index that may be incomplete.  When
-                                        // snap.TipHeight == tipHeight (normal clean shutdown) the loop
-                                        // body never executes and overhead is a single integer compare.
+                                        // replayPostSnapshotGap replays each block from
+                                        // snap.TipHeight+1 through tipHeight using raw LevelDB
+                                        // block data (GetRawBlockByHeight → core.Block) — no
+                                        // reliance on the su/ spent-UTXO index.  When
+                                        // snap.TipHeight == tipHeight (normal clean shutdown) the
+                                        // function is a no-op.
                                         if snap.TipHeight < tipHeight {
-                                                gfAdded, gfSpent, gfBlocks := 0, 0, uint64(0)
-                                                gfOK := true
-                                                for h := snap.TipHeight + 1; h <= tipHeight; h++ {
-                                                        blk, blkErr := db.GetBlockByHeight(h)
-                                                        if blkErr != nil || blk == nil {
-                                                                log.Warn("snapshot gap-fill: block not found "+
-                                                                        "(halting replay — remaining gap blocks "+
-                                                                        "will be absent from address scans)",
-                                                                        "height", h, "err", blkErr)
-                                                                gfOK = false
-                                                                break
-                                                        }
-                                                        for _, rawTx := range blk.TxData {
-                                                                var tx core.Transaction
-                                                                if err := json.Unmarshal(rawTx, &tx); err != nil {
-                                                                        continue
-                                                                }
-                                                                txHash := tx.Hash()
-                                                                // Mark spent key images so the double-spend
-                                                                // guard is accurate for the gap window.
-                                                                for _, inp := range tx.Inputs {
-                                                                        utxos.MarkSpent(inp.KeyImage)
-                                                                        gfSpent++
-                                                                }
-                                                                // Add new outputs created in this block.
-                                                                for i, out := range tx.Outputs {
-                                                                        utxos.Add(&core.UTXO{
-                                                                                TxHash:       txHash,
-                                                                                OutputIndex:  uint32(i),
-                                                                                OneTimePub:   out.OneTimePub,
-                                                                                TxPubKey:     out.TxPubKey,
-                                                                                AmountCommit: out.AmountCommit,
-                                                                                EncAmount:    out.EncAmount,
-                                                                                BlockHeight:  h,
-                                                                        })
-                                                                        gfAdded++
-                                                                }
-                                                        }
-                                                        gfBlocks++
-                                                }
+                                                gfAdded, gfSpent, gfOK := replayPostSnapshotGap(
+                                                        db, utxos, snap.TipHeight, tipHeight, log)
                                                 if gfAdded > 0 || gfSpent > 0 || !gfOK {
                                                         log.Info("snapshot gap-fill: replayed post-snapshot blocks",
-                                                                "snap_height",    snap.TipHeight,
-                                                                "tip_height",     tipHeight,
-                                                                "blocks_replayed", gfBlocks,
-                                                                "outputs_added",  gfAdded,
+                                                                "snap_height",             snap.TipHeight,
+                                                                "tip_height",              tipHeight,
+                                                                "outputs_added",           gfAdded,
                                                                 "key_images_marked_spent", gfSpent,
-                                                                "complete",       gfOK)
+                                                                "complete",                gfOK)
                                                 }
                                         }
                                 }
@@ -2375,6 +2333,69 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
 // spent or burned" from "originated in a now-pruned block".  The records are
 // intentionally never deleted (no DeleteUTXO call) so that spent and staked
 // outputs remain queryable after they leave the active set.
+// replayPostSnapshotGap adds UTXOs and marks key images spent for every block
+// in the half-open range (snapTipHeight, chainTipHeight].  It is called after a
+// snapshot restore when the node was stopped without a clean SIGTERM so that
+// post-snapshot blocks are present in LevelDB but absent from the in-memory
+// UTXO set.
+//
+// The replay reads raw block bytes via GetRawBlockByHeight and unmarshals them
+// as core.Block — the same format written by storeBlock/PutRawBlock.  It does
+// NOT use the su/ spent-UTXO index, so the result is correct even when that
+// index is incomplete.
+//
+// Returns the number of outputs added, key images marked spent, and whether the
+// replay ran to completion (false when a block is missing from the DB).
+// Errors are logged and the function always returns without panicking.
+func replayPostSnapshotGap(
+        db *store.DB,
+        utxos *core.UTXOSet,
+        snapTipHeight, chainTipHeight uint64,
+        log *slog.Logger,
+) (added, spent int, complete bool) {
+        complete = true
+        for h := snapTipHeight + 1; h <= chainTipHeight; h++ {
+                raw, err := db.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        log.Warn("snapshot gap-fill: block not found "+
+                                "(halting replay — remaining gap blocks "+
+                                "will be absent from address scans)",
+                                "height", h, "err", err)
+                        complete = false
+                        break
+                }
+                var blk core.Block
+                if err := json.Unmarshal(raw, &blk); err != nil {
+                        log.Warn("snapshot gap-fill: block unmarshal failed (skipping)",
+                                "height", h, "err", err)
+                        continue
+                }
+                for _, tx := range blk.Txs {
+                        txHash := tx.Hash()
+                        // Mark input key images spent so the double-spend guard
+                        // covers the gap window.
+                        for _, inp := range tx.Inputs {
+                                utxos.MarkSpent(inp.KeyImage)
+                                spent++
+                        }
+                        // Register new outputs so address scans include them.
+                        for i, out := range tx.Outputs {
+                                utxos.Add(&core.UTXO{
+                                        TxHash:       txHash,
+                                        OutputIndex:  uint32(i),
+                                        OneTimePub:   out.OneTimePub,
+                                        TxPubKey:     out.TxPubKey,
+                                        AmountCommit: out.AmountCommit,
+                                        EncAmount:    out.EncAmount,
+                                        BlockHeight:  blk.Header.Height,
+                                })
+                                added++
+                        }
+                }
+        }
+        return
+}
+
 func storeBlock(db *store.DB, b *core.Block) error {
         data, err := json.Marshal(b)
         if err != nil {
