@@ -189,6 +189,128 @@ func TestUTXOSet_ApplyBlock_DoubleSpend(t *testing.T) {
         }
 }
 
+// ─── CompactKeyImages ─────────────────────────────────────────────────────────
+
+// TestCompactKeyImages_EmptyRecent_NoOp verifies that calling CompactKeyImages
+// on a set whose 'recent' map is already empty returns 0 and does not panic or
+// corrupt the existing 'sorted' slice.
+func TestCompactKeyImages_EmptyRecent_NoOp(t *testing.T) {
+        s := core.NewUTXOSet()
+        // Mark some key images spent — they go into 'recent'.
+        kp1, _ := crypto.GenerateWalletKeys()
+        ki1, _ := crypto.ComputeKeyImage(kp1.Spend.Private, kp1.Spend.Public)
+        s.MarkSpent(ki1)
+
+        // First compaction: merges ki1 from 'recent' into 'sorted'.
+        moved := s.CompactKeyImages()
+        if moved != 1 {
+                t.Fatalf("first compact: want 1 moved, got %d", moved)
+        }
+        if s.KeyImagesRecentCount() != 0 {
+                t.Fatalf("after first compact: want 0 in recent, got %d", s.KeyImagesRecentCount())
+        }
+
+        // Second compaction: recent is now empty → should be a no-op.
+        moved = s.CompactKeyImages()
+        if moved != 0 {
+                t.Fatalf("second compact (empty recent): want 0 moved, got %d", moved)
+        }
+        // The original key image must still be detectable as spent.
+        if !s.IsSpent(ki1) {
+                t.Fatal("key image no longer spent after no-op compaction")
+        }
+}
+
+// TestCompactKeyImages_PreservesMembership verifies that all key images marked
+// spent before compaction are still reported as spent afterwards, and that
+// key images never marked spent are still reported as unspent.
+func TestCompactKeyImages_PreservesMembership(t *testing.T) {
+        const n = 50
+        s := core.NewUTXOSet()
+
+        spent := make([]crypto.KeyImage, n)
+        for i := 0; i < n; i++ {
+                kp, _ := crypto.GenerateWalletKeys()
+                ki, _ := crypto.ComputeKeyImage(kp.Spend.Private, kp.Spend.Public)
+                spent[i] = ki
+                s.MarkSpent(ki)
+        }
+        if s.KeyImagesRecentCount() != n {
+                t.Fatalf("before compact: want %d in recent, got %d", n, s.KeyImagesRecentCount())
+        }
+        if s.KeyImagesCount() != n {
+                t.Fatalf("before compact: total count want %d, got %d", n, s.KeyImagesCount())
+        }
+
+        moved := s.CompactKeyImages()
+        if moved != n {
+                t.Fatalf("compact: want %d moved, got %d", n, moved)
+        }
+
+        // After compaction the 'recent' map must be empty.
+        if s.KeyImagesRecentCount() != 0 {
+                t.Fatalf("after compact: want 0 in recent, got %d", s.KeyImagesRecentCount())
+        }
+        // Total count must be unchanged.
+        if s.KeyImagesCount() != n {
+                t.Fatalf("after compact: total count want %d, got %d", n, s.KeyImagesCount())
+        }
+        // Every originally-spent key image must still be spent.
+        for i, ki := range spent {
+                if !s.IsSpent(ki) {
+                        t.Errorf("key image [%d] no longer spent after compaction", i)
+                }
+        }
+        // A fresh key image must not be reported as spent.
+        kpFresh, _ := crypto.GenerateWalletKeys()
+        kiFresh, _ := crypto.ComputeKeyImage(kpFresh.Spend.Private, kpFresh.Spend.Public)
+        if s.IsSpent(kiFresh) {
+                t.Fatal("fresh key image incorrectly reported as spent after compaction")
+        }
+}
+
+// TestCompactKeyImages_NewEntriesAfterCompact verifies that key images added
+// after a compaction are correctly placed in 'recent' and remain detectable.
+func TestCompactKeyImages_NewEntriesAfterCompact(t *testing.T) {
+        s := core.NewUTXOSet()
+
+        // Pre-compact batch.
+        kp1, _ := crypto.GenerateWalletKeys()
+        ki1, _ := crypto.ComputeKeyImage(kp1.Spend.Private, kp1.Spend.Public)
+        s.MarkSpent(ki1)
+        s.CompactKeyImages()
+
+        // Post-compact batch.
+        kp2, _ := crypto.GenerateWalletKeys()
+        ki2, _ := crypto.ComputeKeyImage(kp2.Spend.Private, kp2.Spend.Public)
+        s.MarkSpent(ki2)
+
+        if s.KeyImagesRecentCount() != 1 {
+                t.Fatalf("want 1 in recent after post-compact insert, got %d", s.KeyImagesRecentCount())
+        }
+        if s.KeyImagesCount() != 2 {
+                t.Fatalf("total count want 2, got %d", s.KeyImagesCount())
+        }
+        if !s.IsSpent(ki1) {
+                t.Fatal("pre-compact key image no longer spent")
+        }
+        if !s.IsSpent(ki2) {
+                t.Fatal("post-compact key image not detected as spent")
+        }
+
+        // Second compaction merges ki2 into sorted; ki1 already in sorted.
+        moved := s.CompactKeyImages()
+        if moved != 1 {
+                t.Fatalf("second compact: want 1 moved, got %d", moved)
+        }
+        if s.KeyImagesRecentCount() != 0 {
+                t.Fatalf("want 0 in recent after second compact, got %d", s.KeyImagesRecentCount())
+        }
+        if !s.IsSpent(ki1) || !s.IsSpent(ki2) {
+                t.Fatal("key image missing after second compaction")
+        }
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 func TestMempool_AddGet(t *testing.T) {
