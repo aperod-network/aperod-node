@@ -150,22 +150,55 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         TxIndex: 0,
                                 }
                         } else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
-                                // Fallback 4: in-memory UTXOSet catches the case where the
-                                // LevelDB u/ entry was lost after an OOM kill + repair but
-                                // the snapshot-restored in-memory set is intact. The in-memory
-                                // set is the canonical authority for ring-member AmountCommit
-                                // checks (C-0 uses byPubKey), so AmountCommit from here is
-                                // guaranteed to match the ring proof verification.
-                                s.log.Info("in-memory UTXO fallback: LevelDB u/ absent; resolving from snapshot UTXOSet",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                                out = core.Output{
-                                        OneTimePub:   memUTXO.OneTimePub,
-                                        TxPubKey:     memUTXO.TxPubKey,
-                                        AmountCommit: memUTXO.AmountCommit,
+                                // Fallback 4: in-memory UTXOSet told us the block height; now
+                                // read the block from disk to get the authoritative AmountCommit.
+                                // The snapshot AmountCommit may be stale/corrupt after an OOM
+                                // kill, but the raw block bytes on disk are the ground truth.
+                                // The t/ tx-hash index is also missing (same OOM), so we scan
+                                // the block's transactions directly.
+                                s.log.Info("in-memory UTXO fallback: LevelDB u/+t/ absent; reading block from disk",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
+                                        "height", memUTXO.BlockHeight)
+                                diskResolved := false
+                                if s.blockStore != nil {
+                                        raw, rawErr := s.blockStore.GetRawBlockByHeight(memUTXO.BlockHeight)
+                                        if rawErr == nil && raw != nil {
+                                                var blk core.Block
+                                                if jsonErr := json.Unmarshal(raw, &blk); jsonErr == nil {
+                                                        for ti, bTx := range blk.Txs {
+                                                                if bTx.Hash() == txHash {
+                                                                        if int(u.OutIdx) < len(bTx.Outputs) {
+                                                                                out = bTx.Outputs[u.OutIdx]
+                                                                                loc = core.TxLocation{
+                                                                                        Block:   &blk,
+                                                                                        TxIndex: ti,
+                                                                                }
+                                                                                diskResolved = true
+                                                                        }
+                                                                        break
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                        if rawErr != nil {
+                                                s.log.Warn("fallback4: block read error",
+                                                        "height", memUTXO.BlockHeight, "err", rawErr)
+                                        }
                                 }
-                                loc = core.TxLocation{
-                                        Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
-                                        TxIndex: 0,
+                                if !diskResolved {
+                                        // Block scan failed; use snapshot fields as last resort.
+                                        // AmountCommit may be stale but ring-verify will catch it.
+                                        s.log.Warn("fallback4: block scan failed; using snapshot AmountCommit",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                                        out = core.Output{
+                                                OneTimePub:   memUTXO.OneTimePub,
+                                                TxPubKey:     memUTXO.TxPubKey,
+                                                AmountCommit: memUTXO.AmountCommit,
+                                        }
+                                        loc = core.TxLocation{
+                                                Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
+                                                TxIndex: 0,
+                                        }
                                 }
                         } else {
                                 return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
