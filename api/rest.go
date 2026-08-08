@@ -2345,5 +2345,20 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 			resp["reward_mode"] = mode
 		}
 	}
+	// Snapshot status — lets the API server monitor snapshot freshness without
+	// hitting the filesystem.  last_snapshot_saved_at is a Unix timestamp (seconds);
+	// last_snapshot_error is non-empty only when the most recent save failed.
+	s.snapshotMu.Lock()
+	snapH   := s.lastSnapshotHeight
+	snapAt  := s.lastSnapshotSavedAt
+	snapErr := s.lastSnapshotErrStr
+	s.snapshotMu.Unlock()
+	resp["last_snapshot_height"] = snapH
+	if !snapAt.IsZero() {
+		resp["last_snapshot_saved_at"] = snapAt.Unix()
+	}
+	if snapErr != "" {
+		resp["last_snapshot_error"] = snapErr
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
