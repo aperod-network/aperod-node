@@ -110,7 +110,7 @@ func TestReplayPostSnapshotGap_OutputAdded(t *testing.T) {
 	}
 
 	// Gap-fill: replay blocks 1..1.
-	added, spent, complete := replayPostSnapshotGap(db, utxos, 0, 1, silentLog())
+	added, spent, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 1, silentLog())
 
 	if !complete {
 		t.Error("replayPostSnapshotGap: expected complete=true, got false")
@@ -174,7 +174,7 @@ func TestReplayPostSnapshotGap_KeyImageMarkedSpent(t *testing.T) {
 
 	utxos := core.NewUTXOSet()
 
-	added, spent, complete := replayPostSnapshotGap(db, utxos, 0, 1, silentLog())
+	added, spent, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 1, silentLog())
 
 	if !complete {
 		t.Error("expected complete=true")
@@ -206,7 +206,7 @@ func TestReplayPostSnapshotGap_NoOp(t *testing.T) {
 
 	utxos := core.NewUTXOSet()
 	// snapTipHeight == chainTipHeight → nothing to replay.
-	added, spent, complete := replayPostSnapshotGap(db, utxos, 5, 5, silentLog())
+	added, spent, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 5, 5, silentLog())
 
 	if !complete {
 		t.Error("expected complete=true for no-op case")
@@ -230,10 +230,92 @@ func TestReplayPostSnapshotGap_MissingBlock(t *testing.T) {
 
 	// Gap is heights 1..3 but LevelDB is empty — all blocks are missing.
 	utxos := core.NewUTXOSet()
-	_, _, complete := replayPostSnapshotGap(db, utxos, 0, 3, silentLog())
+	_, _, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 3, silentLog())
 
 	if complete {
 		t.Error("expected complete=false when block is missing from DB")
+	}
+}
+
+// ─── TestReplayPostSnapshotGap_CorruptBlock ───────────────────────────────────
+
+// TestReplayPostSnapshotGap_CorruptBlock verifies that a block stored with
+// corrupt JSON bytes in LevelDB halts the replay (complete=false) instead of
+// being silently skipped.  This exercises the "block unmarshal failed —
+// halting replay" path added to fix the fail-open skipping bug.
+func TestReplayPostSnapshotGap_CorruptBlock(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, priv, pub)
+	putRawBlk(t, db, genesis)
+
+	// Intentionally store invalid JSON at height 1 under a valid-looking hash.
+	var fakeHash crypto.Hash32
+	fakeHash[0] = 0xFF
+	corruptRaw := []byte(`{this is not valid json`)
+	if err := db.PutRawBlock(fakeHash, 1, corruptRaw); err != nil {
+		t.Fatalf("PutRawBlock corrupt: %v", err)
+	}
+
+	utxos := core.NewUTXOSet()
+	_, _, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 1, silentLog())
+
+	if complete {
+		t.Error("expected complete=false for corrupt block JSON, got true — would silently miss UTXOs")
+	}
+}
+
+// ─── TestReplayPostSnapshotGap_StakeInGap ─────────────────────────────────────
+
+// TestReplayPostSnapshotGap_StakeInGap verifies that when a stake transaction
+// is present in a gap block, a registry replay error causes complete=false so
+// the caller falls back to the startup scan rather than starting with a stale
+// validator registry.  It uses a deliberately malformed stake tx (TxVersionStake
+// but invalid Extra length) to trigger a registry error deterministically.
+func TestReplayPostSnapshotGap_StakeInGap(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, priv, pub)
+	putRawBlk(t, db, genesis)
+
+	// A stake tx with wrong Extra length — ReplayBlockStakeTxs returns an error
+	// for TxVersionStake with Extra != StakePayloadSize/StakePayloadSizeV2.
+	badStakeTx := core.Transaction{
+		Version: core.TxVersionStake,
+		Extra:   []byte("bad-extra-not-valid-length"),
+	}
+
+	blk1 := makeSignedBlk(t, 1, genesis.Hash(), priv, pub)
+	blk1.Txs = []core.Transaction{badStakeTx}
+	blk1.Header.MerkleRoot = core.MerkleRoot(blk1.Txs)
+	if err := blk1.Header.Sign(priv); err != nil {
+		t.Fatalf("re-sign blk1: %v", err)
+	}
+	putRawBlk(t, db, blk1)
+
+	utxos := core.NewUTXOSet()
+	_, _, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 1, silentLog())
+
+	if complete {
+		t.Error("expected complete=false when registry.ReplayBlockStakeTxs fails, got true")
 	}
 }
 
@@ -362,7 +444,7 @@ func TestSnapshotGapFill_EndToEnd(t *testing.T) {
 	}
 
 	// Gap-fill: replay block 2 from raw LevelDB bytes.
-	added, spent, complete := replayPostSnapshotGap(db, utxosOnRestart, 1, 2, silentLog())
+	added, spent, complete := replayPostSnapshotGap(db, utxosOnRestart, core.NewValidatorRegistry(), 1, 2, silentLog())
 
 	if !complete {
 		t.Error("gap-fill: expected complete=true, got false")
@@ -438,7 +520,7 @@ func TestReplayPostSnapshotGap_MultiBlock(t *testing.T) {
 
 	// Snapshot at height 0; gap covers blocks 1 and 2.
 	utxos := core.NewUTXOSet()
-	added, _, complete := replayPostSnapshotGap(db, utxos, 0, 2, silentLog())
+	added, _, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 2, silentLog())
 
 	if !complete {
 		t.Error("expected complete=true")
