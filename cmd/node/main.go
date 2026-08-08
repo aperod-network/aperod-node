@@ -1537,31 +1537,7 @@ func run() error {
                         go func() {
                                 t := time.NewTicker(20 * time.Second)
                                 defer t.Stop()
-                                var fired bool
-                                for {
-                                        select {
-                                        case <-stop:
-                                                return
-                                        case <-t.C:
-                                                if fired {
-                                                        continue
-                                                }
-                                                rss := readRSSBytes()
-                                                if rss <= 0 || uint64(rss) < threshold {
-                                                        continue
-                                                }
-                                                log.Warn("memory watchdog: RSS approaching GOMEMLIMIT — initiating proactive graceful restart",
-                                                        "rss_bytes", rss,
-                                                        "threshold_bytes", threshold,
-                                                        "gomemlimit_bytes", limit,
-                                                )
-                                                fired = true
-                                                select {
-                                                case memPressureCh <- struct{}{}:
-                                                default:
-                                                }
-                                        }
-                                }
+                                runMemoryWatchdogLoop(t.C, stop, threshold, limit, readRSSBytes, memPressureCh, log)
                         }()
                 }
         }
@@ -2131,6 +2107,59 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
         }
         log.Info("generated new validator key", "pub", lk.Public().ID(), "saved", keyPath)
         return lk, nil
+}
+
+// runMemoryWatchdogLoop is the body of the memory-watchdog goroutine.
+// It is extracted from the anonymous goroutine in run() so it can be
+// exercised in unit tests with an injectable ticker channel and RSS reader.
+//
+// Parameters:
+//
+//	ticks       — receives time.Time values at the poll interval (use t.C in
+//	              production; send manually in tests)
+//	stop        — closed when the node is shutting down
+//	threshold   — RSS bytes at which a proactive restart is triggered
+//	limit       — the GOMEMLIMIT value (logged only)
+//	readRSS     — returns current RSS in bytes; injectable for testing
+//	memPressureCh — receives a struct{}{} when threshold is exceeded
+//	log         — structured logger
+//
+// The function blocks until stop is closed.  It fires at most once (fired flag)
+// so a sustained high-RSS period does not send redundant signals.
+func runMemoryWatchdogLoop(
+        ticks <-chan time.Time,
+        stop <-chan struct{},
+        threshold uint64,
+        limit int64,
+        readRSS func() int64,
+        memPressureCh chan<- struct{},
+        log *slog.Logger,
+) {
+        var fired bool
+        for {
+                select {
+                case <-stop:
+                        return
+                case <-ticks:
+                        if fired {
+                                continue
+                        }
+                        rss := readRSS()
+                        if rss <= 0 || uint64(rss) < threshold {
+                                continue
+                        }
+                        log.Warn("memory watchdog: RSS approaching GOMEMLIMIT — initiating proactive graceful restart",
+                                "rss_bytes", rss,
+                                "threshold_bytes", threshold,
+                                "gomemlimit_bytes", limit,
+                        )
+                        fired = true
+                        select {
+                        case memPressureCh <- struct{}{}:
+                        default:
+                        }
+                }
+        }
 }
 
 // readRSSBytes returns the process Resident Set Size in bytes by reading
