@@ -813,6 +813,78 @@ func run() error {
                         }
                 }
 
+                // ── Sub-tip snapshot + block-replay gap-fill ──────────────────────────
+                // When tryLoadStartupSnapshot above found no snapshot at the exact chain
+                // tip (e.g. after an unclean shutdown where blocks were accepted after the
+                // last periodic snapshot was saved), find the highest valid snapshot below
+                // tipHeight and replay only the missing blocks.  This is the correct fix
+                // for the admin-mint UTXO loss bug: a transparent mint at height H is
+                // in LevelDB but absent from the snapshot at height H-1, so after a
+                // SIGKILL the UTXO disappears from address scans and circulating supply.
+                //
+                // If the gap-fill completes cleanly, snapLoaded is set true and the
+                // (expensive) full startup scan is skipped entirely.  If any block in the
+                // gap is missing or corrupt, the sub-tip snapshot is handed to rescueSnap
+                // so the startup scan covers only the remaining gap instead of the full
+                // chain — limiting the scan to a few blocks rather than millions.
+                if !snapLoaded {
+                        if gapSnap := findLatestSnapshot(cfg.DataDir, tipHeight, log); gapSnap != nil {
+                                log.Info("found sub-tip snapshot — attempting gap-fill",
+                                        "snap_height", gapSnap.TipHeight,
+                                        "tip_height",  tipHeight)
+
+                                // Validate UTXO count against the snapshot's own block hash
+                                // (the count was stored when the snapshot was saved, keyed by
+                                // the snapshot's tip hash, not the current chain tip hash).
+                                gapCountOK := checkSnapshotUTXOCount(
+                                        db,
+                                        len(gapSnap.UTXOs.ActiveUTXOs),
+                                        gapSnap.TipHashHex,
+                                        cfg.Snapshot.UTXOCountTolerancePct,
+                                        false, // not relaxed — we know the exact snapshot height
+                                        cfg.Consensus.NonValidator,
+                                        log,
+                                )
+
+                                if gapCountOK {
+                                        utxos.RestoreFromSnapshot(gapSnap.UTXOs)
+                                        registry.RestoreFromSnapshot(gapSnap.Registry)
+                                        registry.SetUTXOSet(utxos)
+                                        if gapSnap.TxTotal > 0 {
+                                                initialTxTotal = gapSnap.TxTotal
+                                        }
+                                        runtime.GC()
+                                        debug.FreeOSMemory()
+
+                                        gfAdded, gfSpent, gfOK := replayPostSnapshotGap(
+                                                db, utxos, gapSnap.TipHeight, tipHeight, log)
+
+                                        if gfOK {
+                                                log.Info("startup gap-fill complete — sub-tip snapshot + replay",
+                                                        "snap_height",             gapSnap.TipHeight,
+                                                        "tip_height",              tipHeight,
+                                                        "outputs_added",           gfAdded,
+                                                        "key_images_marked_spent", gfSpent)
+                                                snapLoaded = true
+                                        } else {
+                                                // Gap-fill incomplete — block missing or corrupt in range.
+                                                // Seed the startup scan from the sub-tip snapshot so it
+                                                // only covers the gap (gapSnap.TipHeight+1..tipHeight)
+                                                // rather than the full chain.
+                                                log.Warn("gap-fill incomplete — falling back to startup "+
+                                                        "scan seeded from sub-tip snapshot",
+                                                        "snap_height", gapSnap.TipHeight,
+                                                        "tip_height",  tipHeight)
+                                                rescueSnap = gapSnap
+                                        }
+                                } else if len(gapSnap.UTXOs.KeyImages) > 0 {
+                                        // UTXO count diverged but snapshot has key-image data.
+                                        // Use it as a rescue seed to shorten the scan.
+                                        rescueSnap = gapSnap
+                                }
+                        }
+                }
+
                 // ── Snapshot rescue path ──────────────────────────────────────────────
                 // When the tip-height snapshot failed the UTXO-count check but was
                 // otherwise readable, use it to seed the in-memory UTXO + key-image
