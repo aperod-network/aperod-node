@@ -395,23 +395,32 @@ func run() error {
                 return fmt.Errorf("get tip: %w", err)
         }
 
-        // ── UTXO store rebuild (--repair-db only) ─────────────────────────────────
-        // After OOM kill + LevelDB RecoverFile, u/ (UTXO store) entries that were
-        // only in SST files at crash time may be absent even though their key-images
-        // are unspent.  Scan all blocks now and restore any missing u/ entries so
-        // validator-reward and admin-mint UTXOs remain spendable after repair.
-        // This must run before the height-index integrity check (which calls return nil
-        // for --repair-db) to ensure the rebuild completes even on the early-exit path.
-        if repairDB {
-                log.Info("--repair-db: scanning blocks to restore missing UTXO store entries",
+        // ── UTXO store rebuild (every startup) ───────────────────────────────────
+        // After an OOM kill, LevelDB RecoverFile rebuilds the WAL but u/ (UTXO
+        // store) entries that lived only in SST files at crash time may be absent
+        // even though their key-images are still unspent.  Running the rebuild on
+        // every startup (not only --repair-db) makes the node self-healing: a
+        // systemd restart after an OOM kill automatically restores any missing
+        // entries before the engine starts, so no manual intervention is needed.
+        // The scan is fast (~4 s for 105 K blocks) and idempotent: entries already
+        // present are skipped, and already-spent outputs are skipped via su/.
+        if tipHeight > 0 {
+                prefix := "startup"
+                if repairDB {
+                        prefix = "--repair-db"
+                }
+                log.Info(prefix+": scanning blocks to restore missing UTXO store entries",
                         "tip_height", tipHeight)
                 restored, rebuildErr := rebuildMissingUTXOs(db, tipHeight, log)
                 if rebuildErr != nil {
-                        log.Warn("--repair-db: UTXO store rebuild completed with errors",
+                        log.Warn(prefix+": UTXO store rebuild completed with errors",
                                 "restored_entries", restored, "err", rebuildErr)
-                } else {
-                        log.Info("--repair-db: UTXO store rebuild complete",
+                } else if restored > 0 {
+                        log.Warn(prefix+": UTXO store gaps detected and repaired",
                                 "restored_entries", restored)
+                } else {
+                        log.Info(prefix+": UTXO store OK (no missing entries)",
+                                "tip_height", tipHeight)
                 }
         }
 
