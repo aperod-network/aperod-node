@@ -466,7 +466,13 @@ func run() error {
         }
 
         // ── 6. Initialize chain ───────────────────────────────────────────────────
-        chain := core.NewChain()
+        // Resolve the configured in-memory block window.  0 means "use default";
+        // pass the config value so the chain uses what node.yaml requests.
+        chainMaxBlocks := cfg.MaxInMemoryBlocks
+        if chainMaxBlocks == 0 {
+                chainMaxBlocks = core.MaxInMemoryBlocks
+        }
+        chain := core.NewChain(chainMaxBlocks)
         mempool := core.NewMempool(core.DefaultMempoolConfig(), log)
 
         // Create the UTXO set here (before chain loading) so the resume path
@@ -701,8 +707,8 @@ func run() error {
                 // any missing heights rather than aborting early.
                 recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log)
                 startLoad := uint64(1)
-                if tipHeight >= core.MaxInMemoryBlocks {
-                        startLoad = tipHeight - core.MaxInMemoryBlocks + 1
+                if tipHeight >= chainMaxBlocks {
+                        startLoad = tipHeight - chainMaxBlocks + 1
                 }
 
                 // ── Store integrity check (in-memory window) ──────────────────────
@@ -1542,10 +1548,15 @@ func run() error {
                 }
         }
 
-        // Mempool eviction: remove expired/old transactions every 5 minutes so
+        // Mempool eviction: remove expired/old transactions every
+        // MempoolEvictIntervalSec seconds (default 300 = 5 minutes) so
         // low-fee transactions do not accumulate indefinitely in RAM.
+        mempoolEvictInterval := time.Duration(cfg.MempoolEvictIntervalSec) * time.Second
+        if mempoolEvictInterval <= 0 {
+                mempoolEvictInterval = 5 * time.Minute
+        }
         go func() {
-                t := time.NewTicker(5 * time.Minute)
+                t := time.NewTicker(mempoolEvictInterval)
                 defer t.Stop()
                 for {
                         select {
