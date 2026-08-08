@@ -6,6 +6,7 @@
 
 RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&nbsp; 100 % fee burn &nbsp;·&nbsp; Permissionless PoA consensus
 
+[![Build Check](https://github.com/aperod-network/aperod-node/actions/workflows/build-check.yml/badge.svg)](https://github.com/aperod-network/aperod-node/actions/workflows/build-check.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
