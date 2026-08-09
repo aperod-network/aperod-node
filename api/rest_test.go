@@ -70,6 +70,18 @@ func restGet(t *testing.T, srv *api.Server, path string) (int, map[string]interf
         return rr.Code, resp
 }
 
+// restGetHeader sends a GET request with a single extra header.
+func restGetHeader(t *testing.T, srv *api.Server, path, header, value string) (int, map[string]interface{}) {
+        t.Helper()
+        req := httptest.NewRequest(http.MethodGet, path, nil)
+        req.Header.Set(header, value)
+        rr := httptest.NewRecorder()
+        srv.ServeHTTP(rr, req)
+        var resp map[string]interface{}
+        _ = json.NewDecoder(rr.Body).Decode(&resp)
+        return rr.Code, resp
+}
+
 // ─── /api/v1/blocks ───────────────────────────────────────────────────────────
 
 func TestREST_Blocks_WithGenesis(t *testing.T) {
@@ -762,9 +774,9 @@ func TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey(t *testing.T) {
 		t.Error("without view key: expected a non-empty note documenting the stealth limitation")
 	}
 
-	// ── With view key: stealth output must be present and amount decoded ─────
+	// ── With view key (X-View-Key header): stealth output must be present ────
 	viewKeyHex := hex.EncodeToString(wk.View.Private[:])
-	code2, resp2 := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos?view_key_hex="+viewKeyHex)
+	code2, resp2 := restGetHeader(t, srv, "/api/v1/address/"+string(addr)+"/utxos", "X-View-Key", viewKeyHex)
 	if code2 != http.StatusOK {
 		t.Fatalf("with view key: status = %d, want 200", code2)
 	}
