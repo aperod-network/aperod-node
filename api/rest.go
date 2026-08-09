@@ -570,14 +570,11 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 return
         }
 
-        // Resolve view key: X-View-Key header takes precedence over query param
-        // (which is deprecated — putting private scalars in URLs leaks them to
-        // access logs, browser history, and reverse-proxy request logs).
-        // Fall back to the node-level view key if neither is supplied.
+        // Resolve view key: X-View-Key header is the only accepted source.
+        // The view_key_hex query parameter was removed (F5 security fix) because
+        // query parameters are logged by reverse proxies, access logs, and browser
+        // history, leaking the private view scalar to anyone with log access.
         viewKeyHex := r.Header.Get("X-View-Key")
-        if viewKeyHex == "" {
-                viewKeyHex = r.URL.Query().Get("view_key_hex")
-        }
         if viewKeyHex == "" {
                 viewKeyHex = s.nodeViewKeyHex
         }
@@ -610,7 +607,18 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
                 // Silently ignore invalid hex — fall back to no-key behaviour.
         }
 
+        // F10 security fix: cap the number of UTXOs scanned to prevent a
+        // single request from saturating the node's CPU and memory.
+        // 200 000 UTXOs ≈ 200 MB; chains with more active UTXOs should use
+        // the paginated archive API instead of the live UTXO endpoint.
+        const maxUTXOScan = 200_000
         all := s.utxos.All()
+        scanLimited := len(all) > maxUTXOScan
+        if scanLimited {
+                all = all[:maxUTXOScan]
+                s.log.Warn("restAddressUTXOs: UTXO set exceeds scan cap; returning partial results",
+                        "cap", maxUTXOScan, "total", len(s.utxos.All()))
+        }
         results := make([]AddressUTXO, 0)
         seen := make(map[string]bool) // dedup by "txhash:outidx"
 
@@ -681,9 +689,10 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 
         // Store result in cache before writing response.
         respPayload := map[string]interface{}{
-                "address": addrStr,
-                "utxos":   results,
-                "note":    note,
+                "address":      addrStr,
+                "utxos":        results,
+                "note":         note,
+                "scan_limited": scanLimited, // true when UTXO set exceeds maxUTXOScan
         }
         if body, marshalErr := json.Marshal(respPayload); marshalErr == nil {
                 s.utxoAddrCache.Store(cacheKey, &utxoCacheEntry{
@@ -2060,11 +2069,18 @@ func (s *Server) restNetworkIdentity(w http.ResponseWriter, r *http.Request) {
 
 // restAdminMint creates a coinbase-style mint transaction and adds it to the mempool.
 // Called by the Node.js API server after it records the mint in PostgreSQL.
-// This endpoint is only reachable from localhost (127.0.0.1:8545 is not exposed
-// to the internet), so no additional auth is required.
+// Requires X-API-Key when an API key is configured; also restricted to localhost
+// by the localOnly() wrapper so it is never reachable from the open internet.
 func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost {
                 writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+                return
+        }
+        // Authentication: require X-API-Key when the node has one configured.
+        // Defense-in-depth on top of localOnly() — guards against SSRF and
+        // any future proxy configuration that widens the loopback restriction.
+        if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
+                writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
                 return
         }
 
