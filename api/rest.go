@@ -536,7 +536,7 @@ type AddressUTXO struct {
         EncAmountHex    string  `json:"enc_amount_hex"`
         BlockHeight     uint64  `json:"block_height"`
         // AmountNapr is the decrypted output amount in nAPRO. Populated when a
-        // view key is available (via view_key_hex query param or node.yaml view_key).
+        // view key is available (via X-View-Key header or node.yaml view_key).
         // Null when no view key is configured.
         AmountNapr *uint64 `json:"amount_napr"`
         // IsCoinbase is true when this UTXO belongs to a per-block validator
@@ -550,7 +550,7 @@ type AddressUTXO struct {
 // Without a view key: returns transparent / mint outputs (OneTimePub matches
 // spend pub directly) with amount_napr=null.
 //
-// With a view key (view_key_hex query param or view_key in node.yaml): also
+// With a view key (X-View-Key header or view_key in node.yaml): also
 // discovers stealth outputs via ECDH scan and sets amount_napr for them.
 //
 // Note on transparent/mint outputs: BuildMintTx leaves TxPubKey and EncAmount
@@ -826,14 +826,12 @@ func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr
                 writeJSONError(w, http.StatusBadRequest, "view_key_hex is required")
                 return
         }
-        // Inject view_key_hex into a cloned GET request so restAddressUTXOs can
-        // read it from the query string.  Cloning avoids mutating shared state
-        // (s.nodeViewKeyHex) which would be a race condition under concurrent calls.
-        q := r.URL.Query()
-        q.Set("view_key_hex", req.ViewKeyHex)
+        // Pass the view key via X-View-Key header (not query string — query params
+        // are logged by reverse proxies; F-046 security fix).  Clone the request
+        // to avoid mutating shared state under concurrent calls.
         r2 := r.Clone(r.Context())
         r2.Method = http.MethodGet
-        r2.URL.RawQuery = q.Encode()
+        r2.Header.Set("X-View-Key", req.ViewKeyHex)
         s.restAddressUTXOs(w, r2, addrStr)
 }
 
