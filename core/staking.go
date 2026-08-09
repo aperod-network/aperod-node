@@ -422,6 +422,18 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
 				burnTxHash[:8], burnOutIdx)
 		}
+		// F-008 security fix: transparent / mint outputs (TxPubKey == zero) use
+		// DeterministicMintBlind(spendPub, amount) as their blinding factor.
+		// Both inputs are public data — any observer can compute the blind and
+		// pass the Commit check below without owning the private key.
+		// Until StakePayloadV3 adds a full spend-key ownership proof, reject
+		// transparent mint outputs as stake deposits entirely.
+		var zeroPoint crypto.Point32
+		if burnUTXO.TxPubKey == zeroPoint {
+			return fmt.Errorf("registry: transparent/mint outputs (TxPubKey==zero) cannot be " +
+				"used as stake deposits — blinding factor is publicly derivable (F-008); " +
+				"use a stealth payment output for staking")
+		}
 		// Recompute Commit(amount, burnBlind) and require it to match the UTXO's
 		// on-chain AmountCommit.  If it doesn't, the depositor does not own the
 		// UTXO or has fabricated the amount (C-1 full check).
