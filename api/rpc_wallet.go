@@ -207,10 +207,18 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         }
                                 }
                         } else {
+                                // Both LevelDB u/ entry and in-memory UTXOSet have no record of
+                                // this tx.  This happens when the node was restarted after an OOM
+                                // kill and the UTXO store (u/ prefix) was not yet rebuilt.
+                                // Run `aperod-node --repair-db` to restore missing u/ entries.
+                                s.log.Warn("WALLET_SEND: tx not found in u/ store or in-memory UTXO set — run --repair-db",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
                                 return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
                                         u.TxHash[:min(16, len(u.TxHash))])
                         }
                 } else {
+                        s.log.Warn("WALLET_SEND: blockStore is nil — cannot look up tx",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
                         return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
                                 u.TxHash[:min(16, len(u.TxHash))])
                 }
