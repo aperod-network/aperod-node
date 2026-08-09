@@ -606,13 +606,17 @@ func TestC1_RejectFabricatedAmount(t *testing.T) {
 	burnTxHash := crypto.Hash32{0xAA}
 	const burnOutIdx uint32 = 0
 
+	// TxPubKey must be non-zero (stealth output) to pass the F-008 guard;
+	// the fabricated blind/amount pair then triggers the C-1 commit mismatch.
 	utxos := core.NewUTXOSet()
 	var onePub crypto.Point32
 	onePub[0] = 0x11
+	stealthTxPubAA := crypto.Point32{0x02}
 	utxos.Add(&core.UTXO{
 		TxHash:       burnTxHash,
 		OutputIndex:  burnOutIdx,
 		OneTimePub:   onePub,
+		TxPubKey:     stealthTxPubAA,
 		AmountCommit: realCommit,
 	})
 
@@ -667,13 +671,16 @@ func TestC1_AcceptValidV2Deposit(t *testing.T) {
 	burnTxHash := crypto.Hash32{0xBB}
 	const burnOutIdx uint32 = 0
 
+	// Non-zero TxPubKey marks this as a stealth output (F-008 guard).
 	utxos := core.NewUTXOSet()
 	var onePub crypto.Point32
 	onePub[0] = 0x22
+	stealthTxPubBB := crypto.Point32{0x02}
 	utxos.Add(&core.UTXO{
 		TxHash:       burnTxHash,
 		OutputIndex:  burnOutIdx,
 		OneTimePub:   onePub,
+		TxPubKey:     stealthTxPubBB,
 		AmountCommit: burnCommit,
 	})
 
@@ -727,13 +734,16 @@ func TestC1_RejectDoubleStake(t *testing.T) {
 	burnTxHash := crypto.Hash32{0xCC}
 	const burnOutIdx uint32 = 0
 
+	// Non-zero TxPubKey marks this as a stealth output (F-008 guard).
 	utxos := core.NewUTXOSet()
 	var onePub crypto.Point32
 	onePub[0] = 0x33
+	stealthTxPubCC := crypto.Point32{0x02}
 	utxos.Add(&core.UTXO{
 		TxHash:       burnTxHash,
 		OutputIndex:  burnOutIdx,
 		OneTimePub:   onePub,
+		TxPubKey:     stealthTxPubCC,
 		AmountCommit: burnCommit,
 	})
 
