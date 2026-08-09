@@ -42,10 +42,10 @@ func makeStealthUTXO(t *testing.T, utxos *core.UTXOSet, spendPub, viewPub crypto
 	return txHash, &so.HsScalar
 }
 
-// TestREST_AddressUTXOs_StealthDiscoveredByViewKeyParam verifies that a stealth
-// output sent to an address is discovered and its amount decoded when
-// view_key_hex is supplied as a query parameter.
-func TestREST_AddressUTXOs_StealthDiscoveredByViewKeyParam(t *testing.T) {
+// TestREST_AddressUTXOs_StealthDiscoveredByViewKeyHeader verifies that a stealth
+// output sent to an address is discovered and its amount decoded when the view
+// key is supplied via the X-View-Key request header (query param removed F-046).
+func TestREST_AddressUTXOs_StealthDiscoveredByViewKeyHeader(t *testing.T) {
 	srv, utxos := buildUTXOServer(t)
 
 	wk, err := crypto.GenerateWalletKeys()
@@ -58,7 +58,7 @@ func TestREST_AddressUTXOs_StealthDiscoveredByViewKeyParam(t *testing.T) {
 	txHash, _ := makeStealthUTXO(t, utxos, wk.Spend.Public, wk.View.Public, wantAmount, 0x01)
 
 	viewKeyHex := hex.EncodeToString(wk.View.Private[:])
-	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos?view_key_hex="+viewKeyHex)
+	code, resp := restGetHeader(t, srv, "/api/v1/address/"+string(addr)+"/utxos", "X-View-Key", viewKeyHex)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
@@ -178,9 +178,9 @@ func TestREST_AddressUTXOs_WrongViewKeyNoStealth(t *testing.T) {
 	addrB := crypto.EncodeAddress(crypto.MainnetByte, wkB.Spend.Public, wkB.View.Public)
 	makeStealthUTXO(t, utxos, wkA.Spend.Public, wkA.View.Public, 999_999, 0x04)
 
-	// Query with wallet B's view key against wallet B's address.
+	// Query with wallet B's view key against wallet B's address (via header).
 	viewKeyBHex := hex.EncodeToString(wkB.View.Private[:])
-	code, resp := restGet(t, srv, "/api/v1/address/"+string(addrB)+"/utxos?view_key_hex="+viewKeyBHex)
+	code, resp := restGetHeader(t, srv, "/api/v1/address/"+string(addrB)+"/utxos", "X-View-Key", viewKeyBHex)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
@@ -219,7 +219,7 @@ func TestREST_AddressUTXOs_MintAmountNullWithViewKey(t *testing.T) {
 	})
 
 	viewKeyHex := hex.EncodeToString(wk.View.Private[:])
-	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos?view_key_hex="+viewKeyHex)
+	code, resp := restGetHeader(t, srv, "/api/v1/address/"+string(addr)+"/utxos", "X-View-Key", viewKeyHex)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
