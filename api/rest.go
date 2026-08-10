@@ -2356,6 +2356,7 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"syncing_height":       syncingHeight,
 		"tip_height":           tipHeight,
 		"utxo_rebuilding":      atomic.LoadInt32(&s.utxoRebuilding) == 1,
+		"startup_rescue":       atomic.LoadInt32(&s.startupRescue) == 1,
 		"store_missing_blocks":      storeMissing,
 		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
