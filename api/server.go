@@ -140,6 +140,13 @@ type Server struct {
         // lastSnapshotErrStr is the error from the most recent failed save attempt.
         // Empty when the last attempt succeeded or no attempt has been made.
         lastSnapshotErrStr string
+        // lastSnapshotSaveDurMs is the wall-clock milliseconds taken by the most
+        // recent successful snapshot save.  Zero until the first timed save.
+        lastSnapshotSaveDurMs int64
+        // lastSnapshotTimeoutSec is the effective systemd TimeoutStopSec read at
+        // shutdown time.  Zero when systemd is not the supervisor or the value
+        // cannot be determined.
+        lastSnapshotTimeoutSec float64
 
         // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
         // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
@@ -198,6 +205,18 @@ func (s *Server) SetSnapshotSaved(height uint64) {
         s.lastSnapshotHeight = height
         s.lastSnapshotSavedAt = time.Now()
         s.lastSnapshotErrStr = ""
+        s.snapshotMu.Unlock()
+}
+
+// SetSnapshotTimings records the wall-clock duration of the last successful
+// snapshot save and the effective systemd TimeoutStopSec at that moment.
+// Both values are exposed via /api/v1/status so the Admin Panel can display
+// the timeout-ratio risk indicator without requiring log access.
+// timeoutSec == 0 means the value could not be determined (non-systemd host).
+func (s *Server) SetSnapshotTimings(dur time.Duration, timeoutSec float64) {
+        s.snapshotMu.Lock()
+        s.lastSnapshotSaveDurMs = dur.Milliseconds()
+        s.lastSnapshotTimeoutSec = timeoutSec
         s.snapshotMu.Unlock()
 }
 
