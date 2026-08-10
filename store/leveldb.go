@@ -509,6 +509,34 @@ func (d *DB) GetRawBlockByHeight(height uint64) ([]byte, error) {
         return d.GetRawBlock(hash)
 }
 
+// StoreSnapshotSaveDuration persists the wall-clock duration (in milliseconds)
+// of the most recent successful shutdown snapshot save.  The value survives a
+// process restart so checkStartupSnapshotTiming can warn on the next boot when
+// the observed save time already approaches the configured TimeoutStopSec —
+// before waiting for the next shutdown to discover the problem.
+func (d *DB) StoreSnapshotSaveDuration(ms int64) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(ms))
+	return d.PutMeta("last_snap_save_ms", buf)
+}
+
+// LoadSnapshotSaveDuration returns the persisted snapshot save duration in
+// milliseconds.  Returns (0, false, nil) when no value has been stored yet
+// (e.g. first boot or a pre-feature DB).
+func (d *DB) LoadSnapshotSaveDuration() (ms int64, found bool, err error) {
+	v, err := d.GetMeta("last_snap_save_ms")
+	if err != nil {
+		return 0, false, err
+	}
+	if v == nil {
+		return 0, false, nil
+	}
+	if len(v) != 8 {
+		return 0, false, fmt.Errorf("store: last_snap_save_ms metadata corrupted (%d bytes, want 8)", len(v))
+	}
+	return int64(binary.LittleEndian.Uint64(v)), true, nil
+}
+
 // ─── Iteration helpers ────────────────────────────────────────────────────────
 
 // StoreActiveUTXOCount persists the number of currently-active (unspent)
