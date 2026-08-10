@@ -1771,7 +1771,28 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 	outIdx := uint32(idx64)
 
 	utxo := s.utxos.Get(txHash, outIdx)
-	if utxo == nil {
+
+	// amountCommit and blockHeight are populated from whichever source has the UTXO.
+	var amountCommit crypto.Commitment
+	var blockHeight uint64
+	found := false
+
+	if utxo != nil {
+		amountCommit = utxo.AmountCommit
+		blockHeight = utxo.BlockHeight
+		found = true
+	} else if s.blockStore != nil {
+		// Fallback: check the persistent u/ LevelDB store.  This covers UTXOs from
+		// blocks that pre-date the current in-memory window (e.g. after a restart or
+		// when the UTXOSet was rebuilt from a snapshot that omitted old entries).
+		if su, suErr := s.blockStore.GetUTXO(txHash, outIdx); suErr == nil && su != nil {
+			amountCommit = su.AmountCommit
+			blockHeight = su.BlockHeight
+			found = true
+		}
+	}
+
+	if !found {
 		writeJSONError(w, http.StatusNotFound, s.utxoMissingReason(txHash, outIdx))
 		return
 	}
@@ -1779,17 +1800,17 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"tx_hash":           txHashHex,
 		"out_idx":           outIdx,
-		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
+		"amount_commit_hex": fmt.Sprintf("%x", amountCommit[:]),
 		"exists":            true,
-		"block_height":      utxo.BlockHeight,
+		"block_height":      blockHeight,
 	}
 	// Include block_timestamp when the source block is available.
 	// Try the in-memory sliding window first; fall back to blockStore for
 	// blocks older than the in-memory window (archive nodes and restarted nodes).
-	if blk := s.chain.GetByHeight(utxo.BlockHeight); blk != nil {
+	if blk := s.chain.GetByHeight(blockHeight); blk != nil {
 		resp["block_timestamp"] = time.Unix(0, blk.Header.Timestamp).UTC().Format(time.RFC3339)
 	} else if s.blockStore != nil {
-		heightStr := strconv.FormatUint(utxo.BlockHeight, 10)
+		heightStr := strconv.FormatUint(blockHeight, 10)
 		fullBlk, prunedBlk, _ := s.lookupBlockFromDisk(heightStr)
 		switch {
 		case fullBlk != nil:
@@ -1812,7 +1833,7 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		if tip := s.chain.Tip(); tip != nil {
 			tipHeight := tip.Header.Height
 			// pruneAt is the tip height at which this UTXO's block is pruned.
-			pruneAt := utxo.BlockHeight + s.keepBlocks
+			pruneAt := blockHeight + s.keepBlocks
 			if tipHeight >= pruneAt {
 				// At or past the prune boundary — report 0 so the CLI rejects.
 				resp["blocks_until_pruned"] = uint64(0)
