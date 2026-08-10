@@ -22,7 +22,7 @@ build-node:
 
 build-cli:
 	mkdir -p $(BUILD_DIR)
-	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI).new ./cmd/cli
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI).new ./cmd/cli
 	mv -f $(BUILD_DIR)/$(BINARY_CLI).new $(BUILD_DIR)/$(BINARY_CLI)
 
 build-explorer-indexer:
