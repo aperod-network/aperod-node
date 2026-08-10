@@ -1090,6 +1090,17 @@ func run() error {
                                 "active_utxos", len(rescueSnap.UTXOs.ActiveUTXOs),
                         )
                         rescueSnapHeight = rescueSnap.TipHeight
+                        // Structured alert log so operators / log aggregators can detect
+                        // the rescue path without parsing the free-text message above.
+                        log.Warn("startup: rescue path activated",
+                                "snapshot_height", rescueSnapHeight,
+                                "scan_from",       rescueSnapHeight+1,
+                        )
+                        // Expose the rescue flag on /api/v1/status for the lifetime of
+                        // this process so the API-server system monitor can alert once.
+                        if apiSrv != nil {
+                                apiSrv.SetStartupRescue()
+                        }
                         rescueSnap = nil // allow GC
                         runtime.GC()
                         debug.FreeOSMemory()
@@ -2030,6 +2041,30 @@ func saveShutdownSnapshot(
         log *slog.Logger,
         apiSrv *api.Server,
 ) {
+        const snapshotDropinDir  = "/etc/systemd/system/aperod-node.service.d"
+        const snapshotServicePath = "/etc/systemd/system/aperod-node.service"
+        saveShutdownSnapshotWithPaths(db, utxos, registry, dataDir, log, apiSrv,
+                snapshotDropinDir, snapshotServicePath, 0)
+}
+
+// saveShutdownSnapshotWithPaths is the real implementation of saveShutdownSnapshot.
+// dropinDir and servicePath are injectable so tests can supply synthetic systemd
+// config files without touching real /etc paths.
+//
+// saveDurOverride, when non-zero, is used as the snapshot save duration for the
+// ratio check instead of the real measured wall time.  Pass 0 in production; pass
+// a synthetic value in tests to exercise the ratio-warning path deterministically
+// without depending on wall-clock write speed.
+func saveShutdownSnapshotWithPaths(
+        db *store.DB,
+        utxos *core.UTXOSet,
+        registry *core.ValidatorRegistry,
+        dataDir string,
+        log *slog.Logger,
+        apiSrv *api.Server,
+        dropinDir, servicePath string,
+        saveDurOverride time.Duration,
+) {
         if registry == nil {
                 return
         }
@@ -2071,18 +2106,24 @@ func saveShutdownSnapshot(
         //
         //   > 50 % of TimeoutStopSec → Warn  (early notice; tune now)
         //   > 80 % of TimeoutStopSec → Error (critical; increase immediately)
-        const snapshotDropinDir  = "/etc/systemd/system/aperod-node.service.d"
-        const snapshotServicePath = "/etc/systemd/system/aperod-node.service"
+        //
+        // saveDurOverride, when non-zero, replaces the real measured duration for
+        // the ratio check so that tests can trigger the warning path deterministically
+        // without relying on wall-clock write speed.
+        warnDur := snapSaveDur
+        if saveDurOverride > 0 {
+                warnDur = saveDurOverride
+        }
         warnIfSnapshotSlowRelativeToTimeout(
-                snapSaveDur,
-                snapshotDropinDir,
-                snapshotServicePath,
+                warnDur,
+                dropinDir,
+                servicePath,
                 log,
         )
         // Expose timing via /api/v1/status so the Admin Panel can display the
         // timeout-ratio risk indicator without log access.
         if apiSrv != nil {
-                timeoutSec, _ := readEffectiveTimeoutStopSec(snapshotDropinDir, snapshotServicePath)
+                timeoutSec, _ := readEffectiveTimeoutStopSec(dropinDir, servicePath)
                 apiSrv.SetSnapshotTimings(snapSaveDur, timeoutSec)
         }
 
