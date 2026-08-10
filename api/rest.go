@@ -2384,9 +2384,11 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	// hitting the filesystem.  last_snapshot_saved_at is a Unix timestamp (seconds);
 	// last_snapshot_error is non-empty only when the most recent save failed.
 	s.snapshotMu.Lock()
-	snapH   := s.lastSnapshotHeight
-	snapAt  := s.lastSnapshotSavedAt
-	snapErr := s.lastSnapshotErrStr
+	snapH       := s.lastSnapshotHeight
+	snapAt      := s.lastSnapshotSavedAt
+	snapErr     := s.lastSnapshotErrStr
+	snapDurMs   := s.lastSnapshotSaveDurMs
+	snapTimeout := s.lastSnapshotTimeoutSec
 	s.snapshotMu.Unlock()
 	resp["last_snapshot_height"] = snapH
 	if !snapAt.IsZero() {
@@ -2394,6 +2396,17 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if snapErr != "" {
 		resp["last_snapshot_error"] = snapErr
+	}
+	// Expose snapshot timing so the Admin Panel can display the timeout-ratio
+	// risk indicator without requiring log access.
+	if snapDurMs > 0 {
+		resp["snapshot_save_duration_ms"] = snapDurMs
+		if snapTimeout > 0 {
+			ratio := float64(snapDurMs) / 1000.0 / snapTimeout * 100.0
+			// Round to one decimal place for readability.
+			resp["snapshot_timeout_sec"] = snapTimeout
+			resp["snapshot_ratio_pct"] = math.Round(ratio*10) / 10
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
