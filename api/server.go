@@ -110,6 +110,13 @@ type Server struct {
         // Default is 1 so every restart begins with the flag set.
         utxoRebuilding int32
 
+        // startupRescue is 1 for the lifetime of the process when the node used
+        // the rescue snapshot path at startup (UTXO-count mismatch in the primary
+        // snapshot, falling back to a tail scan from the rescue snapshot height).
+        // Never cleared — operators can query /api/v1/status at any time to check
+        // whether the current process recovered via the rescue path.
+        startupRescue int32
+
         // syncingHeight and tipHeight track startup block-scan progress so that
         // /api/v1/status can report how far along the replay is.
         // syncingHeight is the last block processed; tipHeight is the total to load.
@@ -196,6 +203,13 @@ func (s *Server) SetReady() { atomic.StoreInt32(&s.syncing, 0) }
 // Call ~90 s after SetReady() to clear the utxo_rebuilding flag so wallets
 // resume showing live balance figures without the "rebuilding" banner.
 func (s *Server) SetUTXOReady() { atomic.StoreInt32(&s.utxoRebuilding, 0) }
+
+// SetStartupRescue marks that this process started via the snapshot rescue path
+// (UTXO-count mismatch in the primary snapshot, tail scan from rescue height).
+// Call once when the rescue path is activated in cmd/node/main.go.
+// The flag is never cleared — it is visible on /api/v1/status for the lifetime
+// of the process so operators can confirm the recovery mode at any time.
+func (s *Server) SetStartupRescue() { atomic.StoreInt32(&s.startupRescue, 1) }
 
 // SetSnapshotSaved records a successful snapshot save at the given chain height.
 // Called by the periodic-save goroutine and the shutdown handler in cmd/node/main.go.
