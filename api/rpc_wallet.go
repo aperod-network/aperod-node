@@ -131,12 +131,20 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                         // every output in every block since the node was first started.
                         // This is the only reliable fallback for admin-minted UTXOs in
                         // blocks predating PutTxIdx (the tx-hash index introduced later).
+                        s.log.Info("WALLET_SEND_TRACE: trying blockStore.GetUTXO",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
                         su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
                         if suErr != nil {
+                                s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO error",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", suErr)
                                 return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
                                         u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
                         }
                         if su != nil {
+                                s.log.Info("WALLET_SEND_TRACE: blockStore.GetUTXO found UTXO",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
+                                        "height", su.BlockHeight,
+                                        "commit", fmt.Sprintf("%x", su.AmountCommit[:8]))
                                 // Synthesise core.Output from the stored UTXO fields.
                                 // Only OneTimePub, TxPubKey, and AmountCommit are needed for
                                 // RingCT input construction; EncAmount is not used downstream.
@@ -149,6 +157,12 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
                                         TxIndex: 0,
                                 }
+                        } else if func() bool {
+                                s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO returned nil",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                                return false
+                        }() {
+                                // unreachable — the closure always returns false
                         } else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
                                 // Fallback 4: in-memory UTXOSet told us the block height; now
                                 // read the block from disk to get the authoritative AmountCommit.
