@@ -2032,12 +2032,20 @@ func saveShutdownSnapshot(
         //
         //   > 50 % of TimeoutStopSec → Warn  (early notice; tune now)
         //   > 80 % of TimeoutStopSec → Error (critical; increase immediately)
+        const snapshotDropinDir  = "/etc/systemd/system/aperod-node.service.d"
+        const snapshotServicePath = "/etc/systemd/system/aperod-node.service"
         warnIfSnapshotSlowRelativeToTimeout(
                 snapSaveDur,
-                "/etc/systemd/system/aperod-node.service.d",
-                "/etc/systemd/system/aperod-node.service",
+                snapshotDropinDir,
+                snapshotServicePath,
                 log,
         )
+        // Expose timing via /api/v1/status so the Admin Panel can display the
+        // timeout-ratio risk indicator without log access.
+        if apiSrv != nil {
+                timeoutSec, _ := readEffectiveTimeoutStopSec(snapshotDropinDir, snapshotServicePath)
+                apiSrv.SetSnapshotTimings(snapSaveDur, timeoutSec)
+        }
 
         deleteOldSnapshots(dataDir, shutTipHeight)
         // Persist the active UTXO count keyed by tip hash so the
