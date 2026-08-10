@@ -97,6 +97,56 @@ func TestNodeBinaryIsStatic(t *testing.T) {
 	assertLddStatic(t, nodeBin)
 }
 
+// TestCliBinaryIsStatic builds aperod via `make build-cli` and then
+// asserts the resulting binary is fully statically linked (no PT_INTERP ELF
+// program header, no dynamic-linker dependency).
+func TestCliBinaryIsStatic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("ELF static-link check is Linux-specific; skipping on Windows")
+	}
+	if runtime.GOOS == "darwin" {
+		t.Skip("ELF static-link check does not apply to macOS Mach-O binaries; skipping")
+	}
+
+	// Locate make.
+	makeBin, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make not found in PATH; skipping TestCliBinaryIsStatic")
+	}
+
+	// The test lives in blockchain/deploy/; the Makefile is one level up.
+	deployDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("cannot determine deploy directory: %v", err)
+	}
+	blockchainDir := filepath.Dir(deployDir)
+	makefilePath := filepath.Join(blockchainDir, "Makefile")
+	if _, err := os.Stat(makefilePath); os.IsNotExist(err) {
+		t.Skipf("Makefile not found at %s; skipping TestCliBinaryIsStatic", makefilePath)
+	}
+
+	cliBin := filepath.Join(blockchainDir, "build", "aperod")
+
+	// ── Step 1: build aperod via the Makefile ────────────────────────────────
+	t.Log("running make build-cli …")
+	buildCmd := exec.Command(makeBin, "build-cli")
+	buildCmd.Dir = blockchainDir
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("make build-cli failed: %v\n%s", err, string(out))
+	}
+	t.Logf("make build-cli succeeded → %s", cliBin)
+
+	if _, err := os.Stat(cliBin); os.IsNotExist(err) {
+		t.Fatalf("build/aperod not found after make build-cli")
+	}
+
+	// ── Step 2: parse ELF program headers ────────────────────────────────────
+	assertNoInterp(t, cliBin)
+
+	// ── Step 3: confirm with ldd (best-effort) ────────────────────────────────
+	assertLddStatic(t, cliBin)
+}
+
 // assertNoInterp opens path as an ELF file and fails the test if any
 // PT_INTERP (dynamic-linker path) program header is found.
 func assertNoInterp(t *testing.T, path string) {
@@ -116,12 +166,12 @@ func assertNoInterp(t *testing.T, path string) {
 				// Trim the NUL terminator if present.
 				interp = []byte(strings.TrimRight(string(interp), "\x00"))
 			}
-			t.Errorf("aperod-node is NOT statically linked: PT_INTERP segment found\n"+
+			t.Errorf("%s is NOT statically linked: PT_INTERP segment found\n"+
 				"  interpreter : %s\n"+
 				"  This means the binary requires a dynamic linker and will fail\n"+
 				"  on Debian 11 / Ubuntu 20.04 with \"GLIBC_X.YY not found\".\n"+
-				"  Fix: ensure CGO_ENABLED=0 is set in the Makefile build-node target.",
-				string(interp))
+				"  Fix: ensure CGO_ENABLED=0 is set in the corresponding Makefile build target.",
+				path, string(interp))
 			return
 		}
 	}
