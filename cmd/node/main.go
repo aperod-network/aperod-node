@@ -6,6 +6,7 @@ import (
         "encoding/json"
         "fmt"
         "log/slog"
+        "math"
         "net/http"
         _ "net/http/pprof" // registers /debug/pprof/* handlers on http.DefaultServeMux
         "os"
@@ -553,6 +554,44 @@ func run() error {
                         }
                 }()
                 log.Info("API server started (syncing phase)", "addr", cfg.API.ListenAddr)
+        }
+
+        // ── Load persisted snapshot save duration ─────────────────────────────────
+        // StoreSnapshotSaveDuration is written at the end of every successful
+        // shutdown snapshot.  Loading it here lets us:
+        //   1. Pre-populate /api/v1/status (snapshot_save_duration_ms) from the
+        //      previous run so the Admin Panel shows a meaningful value immediately
+        //      after restart, before the next shutdown snapshot is taken.
+        //   2. Proactively warn when the observed duration already exceeds 50 % /
+        //      80 % of the current TimeoutStopSec — without waiting for the next
+        //      shutdown to discover the problem.
+        if savedSnapMs, found, loadErr := db.LoadSnapshotSaveDuration(); loadErr != nil {
+                log.Warn("startup: failed to load last_snap_save_ms from DB", "err", loadErr)
+        } else if found && savedSnapMs > 0 {
+                log.Info("startup: last snapshot save duration loaded from DB",
+                        "last_snap_save_ms", savedSnapMs,
+                )
+                // Feed the persisted timing into the API server so /api/v1/status
+                // returns a non-zero snapshot_save_duration_ms on the very first
+                // request after restart.
+                if apiSrv != nil {
+                        const dropinDir  = "/etc/systemd/system/aperod-node.service.d"
+                        const svcPath    = "/etc/systemd/system/aperod-node.service"
+                        timeoutSec, _ := readEffectiveTimeoutStopSec(dropinDir, svcPath)
+                        apiSrv.SetSnapshotTimings(
+                                time.Duration(savedSnapMs)*time.Millisecond,
+                                timeoutSec,
+                        )
+                }
+                // Proactive startup warning: if the observed save duration already
+                // exceeds a dangerous fraction of TimeoutStopSec, warn now — before
+                // the next shutdown — so operators can act while the node is running.
+                checkStartupSnapshotTiming(
+                        savedSnapMs,
+                        "/etc/systemd/system/aperod-node.service.d",
+                        "/etc/systemd/system/aperod-node.service",
+                        log,
+                )
         }
 
         if tipHash == (crypto.Hash32{}) {
@@ -2054,6 +2093,11 @@ func saveShutdownSnapshot(
         if metaErr := db.StoreActiveUTXOCount(shutSnap.TipHashHex, len(shutSnap.UTXOs.ActiveUTXOs)); metaErr != nil {
                 log.Warn("shutdown: failed to persist active_utxo_count metadata", "err", metaErr)
         }
+        // Persist the save duration so the next boot can compare it against the
+        // configured TimeoutStopSec before the next shutdown (proactive warning).
+        if durErr := db.StoreSnapshotSaveDuration(snapSaveDur.Milliseconds()); durErr != nil {
+                log.Warn("shutdown: failed to persist last_snap_save_ms metadata", "err", durErr)
+        }
 }
 
 // checkKeyFilePermissions returns an error if the key file has group- or
@@ -2476,6 +2520,47 @@ func warnIfSnapshotSlowRelativeToTimeout(dur time.Duration, dropinDir, servicePa
                         "timeout_stop_sec", timeoutSec,
                         "ratio_pct", fmt.Sprintf("%.0f%%", ratio*100),
                         "fix", fix,
+                )
+        }
+}
+
+// checkStartupSnapshotTiming compares the persisted last snapshot save duration
+// against the effective systemd TimeoutStopSec and emits a structured log
+// warning when the ratio is already concerning — on startup, before the next
+// shutdown.  This lets operators act proactively rather than discovering the
+// problem only when the next SIGKILL arrives mid-save.
+//
+// Thresholds:
+//
+//	> 80 % of TimeoutStopSec → Error (critical; increase immediately)
+//	> 50 % of TimeoutStopSec → Warn  (early notice; tune now)
+//
+// The function is a no-op when no TimeoutStopSec can be determined
+// (readEffectiveTimeoutStopSec returns (0, false)).
+func checkStartupSnapshotTiming(savedSnapMs int64, dropinDir, servicePath string, log *slog.Logger) {
+        timeoutSec, found := readEffectiveTimeoutStopSec(dropinDir, servicePath)
+        if !found || timeoutSec <= 0 {
+                return
+        }
+        ratio := float64(savedSnapMs) / 1000.0 / timeoutSec
+        const (
+                warnThreshold  = 0.50
+                errorThreshold = 0.80
+        )
+        switch {
+        case ratio > errorThreshold:
+                log.Error("startup: last snapshot save duration exceeds 80% of systemd stop timeout — SIGKILL risk on next shutdown",
+                        "last_snap_save_ms", savedSnapMs,
+                        "timeout_stop_sec", timeoutSec,
+                        "ratio_pct", math.Round(ratio*1000)/10,
+                        "fix", fmt.Sprintf("increase TimeoutStopSec in %s or reduce UTXO set size", dropinDir),
+                )
+        case ratio > warnThreshold:
+                log.Warn("startup: last snapshot save duration exceeds 50% of systemd stop timeout — consider increasing TimeoutStopSec",
+                        "last_snap_save_ms", savedSnapMs,
+                        "timeout_stop_sec", timeoutSec,
+                        "ratio_pct", math.Round(ratio*1000)/10,
+                        "fix", fmt.Sprintf("increase TimeoutStopSec in %s or reduce UTXO set size", dropinDir),
                 )
         }
 }
