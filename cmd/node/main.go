@@ -513,6 +513,22 @@ func run() error {
                         log.Info("--repair-db: UTXO store rebuild complete",
                                 "restored_entries", restored)
                 }
+
+                // Verify existing u/ entries against raw block data and overwrite
+                // any whose fields (AmountCommit, OneTimePub, TxPubKey, EncAmount)
+                // do not match the on-chain output.  Catches store corruption
+                // introduced by external writers or bad restore flows that
+                // rebuildMissingUTXOs cannot fix (it skips existing entries).
+                log.Info("--repair-db: verifying UTXO store entries against raw blocks",
+                        "tip_height", tipHeight)
+                fixed, verifyErr := verifyUTXOStoreEntries(db, tipHeight, log)
+                if verifyErr != nil {
+                        log.Warn("--repair-db: UTXO store verification completed with errors",
+                                "fixed_entries", fixed, "err", verifyErr)
+                } else {
+                        log.Info("--repair-db: UTXO store verification complete",
+                                "fixed_entries", fixed)
+                }
         }
 
         // Populated during the key-image rebuild scan below; stays 0 for genesis.
@@ -2814,6 +2830,83 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
                         "restored_utxo", rebuiltUTXO, "restored_txidx", rebuiltTxIdx)
         }
         return rebuiltUTXO + rebuiltTxIdx, firstErr
+}
+
+// verifyUTXOStoreEntries compares every existing (unspent) u/ store entry
+// against the authoritative output data in the raw block store and overwrites
+// entries whose fields diverge.  rebuildMissingUTXOs cannot catch this class
+// of corruption because it skips entries that already exist.
+//
+// Divergence has been observed in production: after an OOM crash + manual
+// restore, u/ entries carried AmountCommit values recomputed from incorrect
+// database amounts instead of the on-chain commitments, making the UTXOs
+// unspendable (ring construction used the wrong commitment).  Raw blocks are
+// the source of truth — consensus verified them at acceptance time.
+//
+// Every fix is logged with the tx hash and both commitments so operators can
+// audit exactly what was repaired.
+func verifyUTXOStoreEntries(blockStore *store.DB, tipHeight uint64, log *slog.Logger) (int, error) {
+        fixed := 0
+        var firstErr error
+        for h := uint64(0); h <= tipHeight; h++ {
+                raw, err := blockStore.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        if err != nil && firstErr == nil {
+                                firstErr = fmt.Errorf("height %d: %w", h, err)
+                        }
+                        continue
+                }
+                var b core.Block
+                if err := json.Unmarshal(raw, &b); err != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("unmarshal height %d: %w", h, err)
+                        }
+                        continue
+                }
+                for _, tx := range b.Txs {
+                        txHash := tx.Hash()
+                        for outIdx, out := range tx.Outputs {
+                                existing, _ := blockStore.GetUTXO(txHash, uint32(outIdx))
+                                if existing == nil {
+                                        continue // absent — rebuildMissingUTXOs handles these
+                                }
+                                if existing.AmountCommit == out.AmountCommit &&
+                                        existing.OneTimePub == out.OneTimePub &&
+                                        existing.TxPubKey == out.TxPubKey &&
+                                        existing.EncAmount == out.EncAmount &&
+                                        existing.BlockHeight == h {
+                                        continue // matches raw block — OK
+                                }
+                                log.Warn("repair: UTXO store entry diverges from raw block — overwriting",
+                                        "tx_hash", fmt.Sprintf("%x", txHash[:]),
+                                        "out_idx", outIdx,
+                                        "height", h,
+                                        "store_commit", fmt.Sprintf("%x", existing.AmountCommit[:]),
+                                        "block_commit", fmt.Sprintf("%x", out.AmountCommit[:]))
+                                su := &store.StoredUTXO{
+                                        TxHash:       txHash,
+                                        OutputIndex:  uint32(outIdx),
+                                        OneTimePub:   out.OneTimePub,
+                                        TxPubKey:     out.TxPubKey,
+                                        AmountCommit: out.AmountCommit,
+                                        EncAmount:    out.EncAmount,
+                                        BlockHeight:  h,
+                                }
+                                if putErr := blockStore.PutUTXO(txHash, uint32(outIdx), su); putErr != nil {
+                                        if firstErr == nil {
+                                                firstErr = putErr
+                                        }
+                                        continue
+                                }
+                                fixed++
+                        }
+                }
+                if h%100_000 == 0 && h > 0 {
+                        log.Info("repair: UTXO store verification progress",
+                                "height", h, "tip", tipHeight, "fixed", fixed)
+                }
+        }
+        return fixed, firstErr
 }
 
 // storeBlock serialises a block to JSON and writes it via PutRawBlock.

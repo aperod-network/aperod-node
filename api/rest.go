@@ -412,11 +412,12 @@ func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
 // to populate the address_txs table — it uniquely identifies the output recipient
 // without requiring a view-key scan.
 type BlockOutputItem struct {
-        TxHash        string `json:"tx_hash"`
-        TxIndex       int    `json:"tx_index"`
-        OutputIndex   int    `json:"output_index"`
-        OneTimePubHex string `json:"one_time_pub_hex"`
-        IsCoinbase    bool   `json:"is_coinbase"`
+        TxHash          string `json:"tx_hash"`
+        TxIndex         int    `json:"tx_index"`
+        OutputIndex     int    `json:"output_index"`
+        OneTimePubHex   string `json:"one_time_pub_hex"`
+        AmountCommitHex string `json:"amount_commit_hex"`
+        IsCoinbase      bool   `json:"is_coinbase"`
 }
 
 // writeBlockOutputs writes all outputs of a block as JSON for the explorer indexer.
@@ -431,11 +432,12 @@ func (s *Server) writeBlockOutputs(w http.ResponseWriter, b *core.Block) {
                 isCoinbase := i == 0 && tx.IsCoinbase()
                 for j, out := range tx.Outputs {
                         items = append(items, BlockOutputItem{
-                                TxHash:        txHashHex,
-                                TxIndex:       i,
-                                OutputIndex:   j,
-                                OneTimePubHex: fmt.Sprintf("%x", out.OneTimePub[:]),
-                                IsCoinbase:    isCoinbase,
+                                TxHash:          txHashHex,
+                                TxIndex:         i,
+                                OutputIndex:     j,
+                                OneTimePubHex:   fmt.Sprintf("%x", out.OneTimePub[:]),
+                                AmountCommitHex: fmt.Sprintf("%x", out.AmountCommit[:]),
+                                IsCoinbase:      isCoinbase,
                         })
                 }
         }
