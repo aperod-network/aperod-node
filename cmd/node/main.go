@@ -2873,9 +2873,15 @@ func verifyUTXOStoreEntries(blockStore *store.DB, tipHeight uint64, log *slog.Lo
                                 if existing.AmountCommit == out.AmountCommit &&
                                         existing.OneTimePub == out.OneTimePub &&
                                         existing.TxPubKey == out.TxPubKey &&
-                                        existing.EncAmount == out.EncAmount &&
-                                        existing.BlockHeight == h {
-                                        continue // matches raw block — OK
+                                        existing.EncAmount == out.EncAmount {
+                                        // Matches raw block — OK.  BlockHeight is
+                                        // deliberately NOT compared: identical
+                                        // deterministic mint txs (same address +
+                                        // amount + height param) share one tx hash
+                                        // and can be included at multiple chain
+                                        // heights, so a height-only mismatch is
+                                        // expected, not corruption.
+                                        continue
                                 }
                                 log.Warn("repair: UTXO store entry diverges from raw block — overwriting",
                                         "tx_hash", fmt.Sprintf("%x", txHash[:]),
