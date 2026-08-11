@@ -64,6 +64,10 @@ type Server struct {
         // Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
         whitelistExemptFn func(since time.Time) []WhitelistExemptionEntry
 
+        // stallEventFn returns block-fetch stall events since a given time.
+        // Wired to p2p.Host.GetStallEvents by cmd/node.
+        stallEventFn func(since time.Time) []StallEventEntry
+
         // peerWhitelist holds the parsed peer_whitelist entries from node.yaml.
         // Stored so /api/v1/status can report them to operators.
         peerWhitelist []string
@@ -334,6 +338,14 @@ func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
 // can report it (Task #504).
 func (s *Server) SetPendingHandshakeCounter(f func() int64) { s.pendingHandshakeCounter = f }
 
+// StallEventEntry is one block-fetch stall event returned by the REST API.
+// Mirrors p2p.StallEvent; defined here to avoid an import cycle.
+type StallEventEntry struct {
+        PeerAddr    string    `json:"peer_addr"`
+        StalledCount int      `json:"stalled_count"`
+        At          time.Time `json:"at"`
+}
+
 // BanEventEntry is one peer-ban event returned by the REST API.
 // Mirrors p2p.BanEvent; defined here to avoid an import cycle.
 type BanEventEntry struct {
@@ -402,6 +414,13 @@ func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = 
 // not found, or (false, err) when persistence fails.
 // Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
 func (s *Server) SetWhitelistRemoveFunc(f func(string) (bool, error)) { s.whitelistRemoveFn = f }
+
+// SetStallEventFunc wires a function that returns block-fetch stall events
+// recorded since a given time.  Wired to p2p.Host.GetStallEvents by cmd/node.
+// Optional — GET /api/v1/network/stall-events returns 503 when not wired.
+func (s *Server) SetStallEventFunc(f func(since time.Time) []StallEventEntry) {
+        s.stallEventFn = f
+}
 
 // SetBanEventFunc wires a function that returns peer-ban events recorded since a
 // given time.  Wired to p2p.Host.GetBanEvents by cmd/node.
