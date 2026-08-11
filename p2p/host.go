@@ -933,6 +933,13 @@ func (h *Host) Start() error {
                 h.listener = ln
         }
         h.log.Info("p2p listening", "addr", h.cfg.ListenAddr, "tls", h.cfg.TLSConfig != nil)
+        // Log the node's own fingerprint at INFO so operators can immediately
+        // verify identity consistency across nodes without grepping main.go logs.
+        // The fingerprint is set by main.go from LoadOrSaveP2PIdentity; it is
+        // empty when TLS is disabled (unit-test mode) — skip the log in that case.
+        if h.cfg.SelfFingerprint != "" {
+                h.log.Info("p2p node identity fingerprint", "fingerprint", h.cfg.SelfFingerprint)
+        }
 
         go h.acceptLoop()
         go h.maintainLoop()
@@ -1411,6 +1418,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // path — including early returns from a failed handshake.
         var connectedAt time.Time
 
+        // peer is declared early so that the panic-recovery defer (registered
+        // below, before handleConn creates the Peer object) can reference it.
+        // It is nil until the Peer is created after the TLS handshake succeeds.
+        // The identity-safe cleanup in both defers checks for nil before use.
+        var peer *Peer
+
         // Safety net: catch panics from malformed peer messages so a single
         // misbehaving peer cannot crash the node process.
         defer func() {
@@ -1421,7 +1434,16 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                                 "stack", string(debug.Stack()))
                         conn.Close()
                         h.mu.Lock()
-                        delete(h.peers, addr)
+                        // Identity-safe: do not evict a replacement peer registered
+                        // at the same address after a DropPeer / reconnect race.
+                        // peer is nil when the panic occurred before Peer creation
+                        // (e.g. during TLS handshake); in that case no entry was
+                        // ever registered so there is nothing to delete.
+                        if peer != nil {
+                                if current, ok := h.peers[addr]; ok && current == peer {
+                                        delete(h.peers, addr)
+                                }
+                        }
                         h.mu.Unlock()
                 }
         }()
@@ -1526,7 +1548,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         }
 
         ingestRate := float64(h.cfg.MaxBlockIngestPerSec)
-        peer := &Peer{
+        peer = &Peer{
                 conn:          conn,
                 addr:          addr,
                 outbound:      outbound,
@@ -1610,10 +1632,21 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 "direction", map[bool]string{true: "out", false: "in"}[outbound],
         )
 
-        // Initiate header sync if peer is ahead
-        if peerHeight > h.handler.CurrentHeight() {
-                h.requestHeaders(peer)
-        }
+        // Initiate header sync unconditionally now that the peer is registered.
+        //
+        // Why unconditional (not "if peerHeight > CurrentHeight()"): the height
+        // carried by the handshake Ping/Pong is captured when the remote's
+        // handleConn starts — the inbound side builds its Pong payload BEFORE
+        // it even reads our Ping.  A block produced during the handshake window
+        // is broadcast before this peer entry exists in the remote's peer table
+        // (silently missed) AND leaves peerHeight stale-equal to our local
+        // height, so a height-gap guard here would skip the request and the
+        // node would stay stalled until the keepalive Pong cycle or the
+        // GetBlock stall timer fires (10–15 s by default).  One unconditional
+        // GetHeaders round-trip closes that window: when we are already at the
+        // remote tip the response is an empty header list and handleHeaders
+        // no-ops, so the extra cost is a single small message per connection.
+        h.requestHeaders(peer)
 
         // Mark the connection as having reached the message loop.  The back-off
         // defer registered at the top of handleConn reads this value to decide
@@ -1750,7 +1783,16 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         defer func() {
                 conn.Close()
                 h.mu.Lock()
-                delete(h.peers, addr)
+                // Identity-safe cleanup: only remove the peer if it is still
+                // the same *Peer object registered at startup of this
+                // handleConn invocation.  DropPeer (and a racing reconnect)
+                // may have already removed this entry and replaced it with a
+                // fresh peer at the same address; a bare delete would evict
+                // the replacement, leaving the node with zero peers and no
+                // automatic recovery path.
+                if current, ok := h.peers[addr]; ok && current == peer {
+                        delete(h.peers, addr)
+                }
                 h.mu.Unlock()
                 h.log.Info("peer disconnected", "addr", addr)
         }()
