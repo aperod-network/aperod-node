@@ -212,6 +212,18 @@ type P2PConfig struct {
 	// entries before the peer count silently drops to zero.
 	// Default: 24h.  Set to 0 to use the default.
 	MaxStaleBootnodeAge time.Duration `yaml:"max_stale_bootnode_age"`
+	// GetBlockStallTimeout is how long the node waits for a MsgBlock reply
+	// after sending MsgGetBlock before the request is considered stalled.  On
+	// stall detection a WARN is logged and MsgGetHeaders is re-issued to
+	// restart the sync pipeline from the current tip.
+	//
+	// Tradeoff: lower values recover from a silently-dropped response faster
+	// but may produce false-stall warnings on high-latency or congested links.
+	// Higher values are safer on slow networks but delay recovery if a peer
+	// drops the response without disconnecting.
+	//
+	// Default: 15s.  Set to 0 to use the default.
+	GetBlockStallTimeout time.Duration `yaml:"get_block_stall_timeout"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -471,6 +483,18 @@ func (c *Config) Validate() error {
 			c.P2P.BadBlockHeightLead, maxSafeHeightLead,
 		)
 	}
+	// GetBlockStallTimeout: zero means "use the built-in default (15s)".
+	// Negative values would reach p2p.NewHost and cause time.NewTicker to panic
+	// on the first connection; reject them at config-load time instead.
+	if c.P2P.GetBlockStallTimeout < 0 {
+		return fmt.Errorf(
+			"p2p.get_block_stall_timeout (%v) must not be negative — "+
+				"negative durations panic when the stall-detection ticker is created; "+
+				"use 0 for the default (15s) or set a positive value (e.g. \"30s\")",
+			c.P2P.GetBlockStallTimeout,
+		)
+	}
+
 	// KeepaliveInterval validation.  Zero means "use the built-in default (10s)"
 	// so it is accepted without complaint.  Explicit values must be in [1s, 15s]:
 	//   • < 1s would flood slow peers with pings and may saturate a CPU core.

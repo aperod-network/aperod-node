@@ -7,6 +7,12 @@ p2p:
   bootnodes: []
   max_peers: 50
   min_peers: 4
+  # get_block_stall_timeout: "15s"  # How long to wait for a MsgBlock reply
+  #                                  # before re-issuing MsgGetHeaders.
+  #                                  # Lower values recover faster on reliable
+  #                                  # LANs; raise to "30s"–"60s" on high-
+  #                                  # latency or pruned-node setups to avoid
+  #                                  # spurious stall warnings.  Default: 15s.
 
 consensus:
   validator_key: ""          # path to ED25519 private key file (leave empty for non-validator)

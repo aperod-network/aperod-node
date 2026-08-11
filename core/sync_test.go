@@ -470,6 +470,152 @@ func TestSync_RelayNode_LiveBlocks(t *testing.T) {
 	t.Logf("✓ phase 2: relay received all live blocks: height=%d tip=%x", gotHeight, gotTip[:8])
 }
 
+// TestSync_KeepalivePong_UpdatesPeerHeight verifies that the relay's stored
+// peer height for the validator is updated by the keepalive Ping/Pong cycle:
+//
+//  1. Relay connects to the validator and performs initial sync (numInitial blocks).
+//  2. The relay's peer table entry for the validator already carries the initial
+//     height from the handshake Pong.
+//  3. The validator mines numExtra more blocks (its CurrentHeight() advances).
+//  4. The keepalive goroutine fires (short KeepaliveInterval) — relay sends a
+//     MsgPing; validator's dispatch responds with MsgPong carrying the new tip.
+//  5. The relay's dispatch updates peer.height from the Pong payload.
+//  6. The test asserts relay.PeerHeight(validatorAddr) == numInitial+numExtra.
+func TestSync_KeepalivePong_UpdatesPeerHeight(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	const numInitial = 4 // blocks pre-mined before relay connects
+	const numExtra = 3   // extra blocks mined after initial sync
+
+	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
+
+	// ── Build genesis + numInitial blocks on the validator chain ─────────────
+	genesis := buildBlock(t, nil, validatorPriv, validatorPub, 0)
+
+	validatorChain := core.NewChain()
+	if err := validatorChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("validator SetGenesis: %v", err)
+	}
+
+	prev := genesis
+	for i := 1; i <= numInitial; i++ {
+		b := buildBlock(t, prev, validatorPriv, validatorPub, uint64(i))
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock %d: %v", i, err)
+		}
+		prev = b
+	}
+
+	// ── Relay chain: starts with only genesis ─────────────────────────────────
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
+	}
+
+	// ── Validator p2p host ────────────────────────────────────────────────────
+	validatorHandler := &chainHandler{chain: validatorChain}
+	hostValidator := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "validator",
+		UserAgent:  "aperod/test",
+	}, validatorHandler, log)
+	hostValidator.SetHeaderProvider(validatorChain)
+	if err := hostValidator.Start(); err != nil {
+		t.Fatalf("hostValidator.Start: %v", err)
+	}
+	t.Cleanup(hostValidator.Stop)
+
+	validatorAddr := hostValidator.ListenAddr()
+	if validatorAddr == "" {
+		t.Skip("ListenAddr not available")
+	}
+
+	// ── Relay p2p host — short KeepaliveInterval so Ping/Pong fires quickly ──
+	// KeepaliveInterval=200ms means the first Ping to the validator fires within
+	// 200 ms after the initial sync completes, and the validator replies with a
+	// Pong carrying its updated height.
+	relayHandler := &chainHandler{chain: relayChain}
+	hostRelay := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          10,
+		NodeID:            "relay",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: 200 * time.Millisecond,
+	}, relayHandler, log)
+	hostRelay.SetHeaderProvider(relayChain)
+	if err := hostRelay.Start(); err != nil {
+		t.Fatalf("hostRelay.Start: %v", err)
+	}
+	t.Cleanup(hostRelay.Stop)
+
+	// ── Phase 1: relay connects and performs initial catch-up sync ────────────
+	hostRelay.DialPeer(validatorAddr)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= uint64(numInitial) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if relayChain.Height() != uint64(numInitial) {
+		t.Fatalf("phase 1: relay height = %d, want %d — initial sync timed out",
+			relayChain.Height(), numInitial)
+	}
+	t.Logf("✓ phase 1: relay synced to height=%d", numInitial)
+
+	// Confirm the relay already recorded the validator's height from the
+	// handshake Pong (this is the baseline before the extra blocks are mined).
+	h0, ok := hostRelay.PeerHeight(validatorAddr)
+	if !ok {
+		t.Fatalf("phase 1: validator peer not found in relay peer table after sync")
+	}
+	if h0 < uint64(numInitial) {
+		t.Errorf("phase 1: relay stored peer height = %d, want >= %d", h0, numInitial)
+	}
+	t.Logf("✓ phase 1: relay stored peer height = %d", h0)
+
+	// ── Phase 2: validator mines extra blocks ─────────────────────────────────
+	// The relay is NOT explicitly told about these blocks; it can only learn the
+	// new height via the keepalive Pong that the validator sends in reply to the
+	// relay's next periodic MsgPing.
+	for i := 1; i <= numExtra; i++ {
+		height := uint64(numInitial + i)
+		b := buildBlock(t, prev, validatorPriv, validatorPub, height)
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock height=%d: %v", height, err)
+		}
+		prev = b
+	}
+	wantHeight := uint64(numInitial + numExtra)
+	t.Logf("✓ phase 2: validator tip now at height=%d", wantHeight)
+
+	// ── Phase 3: wait for keepalive Pong to propagate the new height ──────────
+	// The relay's keepalive goroutine sends a MsgPing every KeepaliveInterval
+	// (200 ms).  The validator's dispatch replies with a MsgPong that carries
+	// validatorChain.Height() == wantHeight.  The relay's dispatch updates
+	// peer.height from the Pong payload.  We allow up to 3 s (15 × 200 ms).
+	deadline = time.Now().Add(3 * time.Second)
+	var gotPeerHeight uint64
+	for time.Now().Before(deadline) {
+		h, connected := hostRelay.PeerHeight(validatorAddr)
+		if connected && h >= wantHeight {
+			gotPeerHeight = h
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if gotPeerHeight < wantHeight {
+		h, _ := hostRelay.PeerHeight(validatorAddr)
+		t.Errorf("phase 3: relay stored peer height = %d, want >= %d — keepalive Pong did not update peer height",
+			h, wantHeight)
+		return
+	}
+	t.Logf("✓ phase 3: relay stored peer height updated to %d via keepalive Pong", gotPeerHeight)
+}
+
 // TestSync_RelayNode_ReconnectAfterDrop verifies that a relay node which loses
 // its connection to the validator automatically reconnects and re-syncs to the
 // latest chain tip — with no manual intervention.

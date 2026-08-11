@@ -219,6 +219,76 @@ func TestHost_Handshake_InboundWithMessages(t *testing.T) {
 	<-done
 }
 
+// TestHost_WhitelistSidecar_EmptyRetainsCfgEntries verifies that when the
+// whitelist sidecar file is valid JSON but contains an empty array ([]), and
+// cfg.PeerWhitelist is non-empty, Start() retains the cfg entries rather than
+// silently opening the network.
+//
+// Without this retention behaviour, an admin "clear-all" operation in the
+// Admin Panel would write an empty sidecar and, on the next restart, the node
+// would accept connections from every IP — even ones that should still be
+// blocked via peer_whitelist in node.yaml.
+func TestHost_WhitelistSidecar_EmptyRetainsCfgEntries(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// Write an empty-array sidecar — the file is valid JSON but has no entries.
+	if err := os.WriteFile(wlFile, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-wl-retain",
+		UserAgent:     "aperod/test",
+		WhitelistFile: wlFile,
+		PeerWhitelist: []string{"1.2.3.4"},
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	got := h.GetPeerWhitelist()
+	if len(got) != 1 || got[0] != "1.2.3.4" {
+		t.Errorf("GetPeerWhitelist = %v, want [1.2.3.4] — empty sidecar must not clear node.yaml entries", got)
+	}
+}
+
+// TestHost_WhitelistSidecar_EmptyNoCfg_OpenNetwork verifies that when the
+// whitelist sidecar file is a valid empty array ([]) AND cfg.PeerWhitelist is
+// also empty, the node starts in open-network mode (no IP restriction).
+func TestHost_WhitelistSidecar_EmptyNoCfg_OpenNetwork(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// Write an empty-array sidecar.
+	if err := os.WriteFile(wlFile, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-wl-open",
+		UserAgent:     "aperod/test",
+		WhitelistFile: wlFile,
+		// PeerWhitelist intentionally empty — open network desired.
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	got := h.GetPeerWhitelist()
+	if len(got) != 0 {
+		t.Errorf("GetPeerWhitelist = %v, want [] — empty sidecar + no cfg entries should be open network", got)
+	}
+}
+
 // TestHost_MaliciousPacket_NodeSurvives proves that the defer recover() added to
 // handleConn keeps the node process alive when a peer sends garbage bytes that
 // would otherwise trigger a panic in the message parser.
@@ -1291,6 +1361,72 @@ func TestHost_WhitelistSidecar_UnreadablePermissions(t *testing.T) {
 	}
 }
 
+// TestHost_AddToWhitelist_UnwritableDir_RollsBack verifies the write-first
+// design of applyWhitelistLocked: when the sidecar directory loses write
+// permission after the node starts, AddToWhitelist must
+//   (a) return a non-nil error, and
+//   (b) leave the in-memory whitelist unchanged — no silent partial update.
+//
+// Without the persist-before-swap ordering, the caller would receive an error
+// but the in-memory list would already contain the new entry; on the next
+// restart the sidecar (which was never updated) would be loaded as authoritative,
+// silently dropping the entry that the admin thought was persisted.
+func TestHost_AddToWhitelist_UnwritableDir_RollsBack(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root — directory permission checks do not apply")
+	}
+
+	dir := t.TempDir()
+	sidecar := dir + "/whitelist.json"
+
+	// Start with a single entry in the sidecar so the node has a known baseline.
+	if err := os.WriteFile(sidecar, []byte(`["1.2.3.4"]`), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-wl-unwritable",
+		UserAgent:     "aperod/test",
+		WhitelistFile: sidecar,
+		// No PeerWhitelist in cfg — sidecar is already present and authoritative.
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	// Confirm baseline: the sidecar was loaded correctly.
+	before := h.GetPeerWhitelist()
+	if len(before) != 1 || before[0] != "1.2.3.4" {
+		t.Fatalf("unexpected baseline whitelist: %v", before)
+	}
+
+	// Make the sidecar directory unwritable so os.CreateTemp fails.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	// Always restore so t.TempDir cleanup can remove it.
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	// (a) AddToWhitelist must return a non-nil error.
+	addErr := h.AddToWhitelist("5.6.7.8")
+	if addErr == nil {
+		t.Fatal("AddToWhitelist returned nil; want non-nil error for unwritable sidecar directory")
+	}
+	t.Logf("AddToWhitelist error (expected): %v", addErr)
+
+	// (b) In-memory whitelist must be unchanged — no silent partial update.
+	after := h.GetPeerWhitelist()
+	if len(after) != 1 || after[0] != "1.2.3.4" {
+		t.Errorf("GetPeerWhitelist = %v; want [1.2.3.4] — in-memory list must not be modified when persist fails", after)
+	} else {
+		t.Logf("✓ in-memory whitelist unchanged after persist failure: %v", after)
+	}
+}
+
 // TestHost_AddToWhitelist_ConcurrentNeverDropsEntry is a concurrent stress test
 // that verifies two goroutines calling AddToWhitelist simultaneously always
 // produce a whitelist containing both entries.  Without wlMutate serialisation
@@ -2109,4 +2245,206 @@ func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
 	}
 	t.Logf("✓ stall-detection re-issued MsgGetHeaders after %.0fms (stall timeout: %s, sync ticker: 3s)",
 		float64(elapsed.Milliseconds()), stallTimeout)
+}
+
+// TestSync_RelayStall_Recovers verifies that after a stall cycle (peer never
+// answers MsgGetBlock), once the peer resumes serving blocks the relay
+// successfully advances its chain tip to the expected height and hash.
+//
+// Scenario:
+//   - A raw TCP peer builds a 3-block chain and advertises height=3.
+//   - On the first MsgGetHeaders it replies with the real headers but silently
+//     drops all MsgGetBlock requests → relay stalls.
+//   - The stall-detection ticker fires and the relay re-issues MsgGetHeaders.
+//   - On the second (and subsequent) GetHeaders the peer serves both headers
+//     AND the requested blocks.
+//   - The relay must eventually reach height=3 with the correct tip hash.
+func TestSync_RelayStall_Recovers(t *testing.T) {
+	const numBlocks = 3
+	const stallTimeout = 400 * time.Millisecond
+	const testTimeout = 10 * time.Second
+
+	// ── Build a small real chain ─────────────────────────────────────────────
+	priv, pub, keyErr := crypto.GenerateValidatorKey()
+	if keyErr != nil {
+		t.Fatalf("GenerateValidatorKey: %v", keyErr)
+	}
+
+	peerChain := make([]*core.Block, numBlocks+1)
+	peerByHash := make(map[crypto.Hash32]*core.Block, numBlocks+1)
+	var prevHash crypto.Hash32
+	for i := 0; i <= numBlocks; i++ {
+		hdr := core.BlockHeader{
+			Height:       uint64(i),
+			PrevHash:     prevHash,
+			ValidatorPub: pub,
+			Timestamp:    time.Now().UnixNano() + int64(i),
+		}
+		if signErr := hdr.Sign(priv); signErr != nil {
+			t.Fatalf("Sign block %d: %v", i, signErr)
+		}
+		b := &core.Block{Header: hdr}
+		peerChain[i] = b
+		h := b.Hash()
+		peerByHash[h] = b
+		prevHash = h
+	}
+	wantTip := peerChain[numBlocks].Hash()
+
+	// ── Raw TCP peer server ──────────────────────────────────────────────────
+	ln, listenErr := net.Listen("tcp", "127.0.0.1:0")
+	if listenErr != nil {
+		t.Fatalf("listen: %v", listenErr)
+	}
+	defer ln.Close()
+
+	// getHeadersCount counts how many MsgGetHeaders the peer has received.
+	// Once it reaches 2 (meaning the stall ticker fired and re-issued), the
+	// peer starts serving MsgGetBlock responses.
+	var getHeadersCount atomic.Int32
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Dedicated write goroutine to avoid read/write deadlocks on loopback.
+		type writeReq struct {
+			msgType p2p.MessageType
+			payload interface{}
+		}
+		writeCh := make(chan writeReq, 512)
+		defer close(writeCh)
+		go func() {
+			for req := range writeCh {
+				conn.SetWriteDeadline(time.Now().Add(testTimeout)) //nolint:errcheck
+				if wErr := p2p.WriteMsg(conn, req.msgType, req.payload); wErr != nil {
+					return
+				}
+			}
+		}()
+
+		// Asymmetric handshake: relay dials us outbound → it sends Ping first.
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("peer: expected MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+		writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+			NodeID:    "recover-peer",
+			Height:    uint64(numBlocks),
+			UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		}}
+
+		// Build the SerializedHeader list once.
+		headers := make([]p2p.SerializedHeader, numBlocks)
+		for i := 1; i <= numBlocks; i++ {
+			b := peerChain[i]
+			headers[i-1] = p2p.SerializedHeader{
+				Height:       b.Header.Height,
+				Hash:         b.Hash(),
+				PrevHash:     b.Header.PrevHash,
+				MerkleRoot:   b.Header.MerkleRoot,
+				Timestamp:    b.Header.Timestamp,
+				Round:        b.Header.Round,
+				ValidatorPub: b.Header.ValidatorPub,
+				Signature:    b.Header.Signature,
+			}
+		}
+
+		// Message loop.
+		for {
+			conn.SetReadDeadline(time.Now().Add(testTimeout)) //nolint:errcheck
+			msgType, data, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return
+			}
+			switch msgType {
+
+			case p2p.MsgGetHeaders:
+				n := getHeadersCount.Add(1)
+				// Always serve the full header list so the relay knows what to
+				// fetch.  The first time we still drop GetBlock, causing a stall.
+				writeCh <- writeReq{p2p.MsgHeaders, p2p.HeadersMsg{Headers: headers}}
+				_ = n // suppress unused-variable warning
+
+			case p2p.MsgGetBlock:
+				// Phase 1: drop the request if the stall ticker has not yet
+				// fired (getHeadersCount < 2).  Phase 2: serve the block.
+				if getHeadersCount.Load() < 2 {
+					// Intentionally silent — causes the stall.
+					continue
+				}
+				var req p2p.GetBlockMsg
+				if uErr := p2p.Unmarshal(data, &req); uErr != nil {
+					t.Logf("peer: unmarshal GetBlock: %v", uErr)
+					return
+				}
+				b, ok := peerByHash[req.Hash]
+				if !ok {
+					continue
+				}
+				writeCh <- writeReq{p2p.MsgBlock, p2p.BlockToMsg(b)}
+
+			case p2p.MsgPing:
+				writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+					NodeID:    "recover-peer",
+					Height:    uint64(numBlocks),
+					UserAgent: "test",
+					Timestamp: time.Now().Unix(),
+				}}
+			}
+		}
+	}()
+
+	// ── Relay node starting at genesis ───────────────────────────────────────
+	relayHandler := newGapSyncHandler(peerChain[0])
+	relayHost := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "relay-recover-test",
+		UserAgent:            "aperod/test",
+		GetBlockStallTimeout: stallTimeout,
+		KeepaliveInterval:    2 * time.Second,
+	}, relayHandler, newTestLogger())
+	if err := relayHost.Start(); err != nil {
+		t.Fatalf("relay Start: %v", err)
+	}
+	defer relayHost.Stop()
+
+	// Connect relay → peer.  After the handshake the relay sees peerHeight=3
+	// and immediately issues MsgGetHeaders.  Blocks are initially dropped,
+	// triggering the stall ticker.  After the stall ticker re-issues
+	// MsgGetHeaders (getHeadersCount reaches 2), the peer serves real blocks.
+	relayHost.DialPeer(ln.Addr().String())
+
+	// ── Poll until the relay reaches the expected tip ────────────────────────
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if relayHandler.tipNow() >= uint64(numBlocks) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	gotHeight := relayHandler.tipNow()
+	if gotHeight != uint64(numBlocks) {
+		t.Errorf("relay height = %d, want %d — did not recover after stall (getHeadersCount=%d)",
+			gotHeight, numBlocks, getHeadersCount.Load())
+		return
+	}
+
+	// Verify the tip hash matches the peer's canonical chain.
+	gotTip := relayHandler.chain[numBlocks].Hash()
+	if gotTip != wantTip {
+		t.Errorf("relay tip hash mismatch:\n  got  %x\n  want %x", gotTip[:8], wantTip[:8])
+		return
+	}
+
+	t.Logf("✓ relay recovered after stall: height=%d tip=%x (stall re-issue count=%d)",
+		gotHeight, gotTip[:8], getHeadersCount.Load())
 }
