@@ -1746,6 +1746,7 @@ func run() error {
                                 KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
                                 MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
                                 MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
+                                GetBlockStallTimeout: cfg.P2P.GetBlockStallTimeout,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
@@ -1845,6 +1846,19 @@ func run() error {
                                                         Violations:      e.Violations,
                                                         BanDurationSecs: e.BanDurationSecs,
                                                         At:              e.At,
+                                                }
+                                        }
+                                        return out
+                                })
+                                // Wire block-fetch stall event log for the Admin Panel notification log.
+                                apiSrv.SetStallEventFunc(func(since time.Time) []api.StallEventEntry {
+                                        evts := host.GetStallEvents(since)
+                                        out := make([]api.StallEventEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.StallEventEntry{
+                                                        PeerAddr:    e.PeerAddr,
+                                                        StalledCount: e.StalledCount,
+                                                        At:          e.At,
                                                 }
                                         }
                                         return out
