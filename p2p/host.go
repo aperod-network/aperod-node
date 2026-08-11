@@ -278,6 +278,20 @@ const whitelistExemptMaxEvents = 100
 // banEventMaxEvents caps the in-memory ring buffer for peer-ban events.
 const banEventMaxEvents = 200
 
+// stallEventMaxEvents caps the in-memory ring buffer for block-fetch stall
+// events so memory cannot grow unboundedly during prolonged sync storms.
+const stallEventMaxEvents = 200
+
+// StallEvent records a single block-fetch stall event emitted when the
+// GetBlockStallTimeout fires without a MsgBlock response from a peer.
+// Stored in a ring buffer and exposed via GetStallEvents so the API server
+// can poll and surface them in the Admin Panel notification log.
+type StallEvent struct {
+        PeerAddr    string    `json:"peer_addr"`
+        StalledCount int      `json:"stalled_count"` // number of blocks that stalled in one tick
+        At          time.Time `json:"at"`
+}
+
 // BanEvent records a single peer-ban event emitted when the wrong-fork
 // threshold is exceeded.  Stored in a ring buffer and exposed via
 // GetBanEvents so the API server can poll and send Telegram alerts.
@@ -370,6 +384,13 @@ type Host struct {
         // banEvents is a ring buffer of peer-ban events for the Admin Panel
         // notification log.  Capped at banEventMaxEvents.
         banEvents []BanEvent
+
+        // stallEventMu guards stallEvents so the keepalive goroutine can append
+        // events concurrently with the API server reading them.
+        stallEventMu sync.Mutex
+        // stallEvents is a ring buffer of block-fetch stall events for the Admin
+        // Panel notification log.  Capped at stallEventMaxEvents.
+        stallEvents []StallEvent
 
         // bootnodeLastResolved maps each raw bootnode string (as it appears in
         // cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
@@ -522,6 +543,21 @@ func (h *Host) GetBanEvents(since time.Time) []BanEvent {
         defer h.banEventMu.Unlock()
         out := make([]BanEvent, 0)
         for _, e := range h.banEvents {
+                if !e.At.Before(since) {
+                        out = append(out, e)
+                }
+        }
+        return out
+}
+
+// GetStallEvents returns all block-fetch stall events that occurred at or after
+// since.  Thread-safe; safe to call concurrently with the keepalive goroutine.
+// Returns an empty (non-nil) slice when no events match.
+func (h *Host) GetStallEvents(since time.Time) []StallEvent {
+        h.stallEventMu.Lock()
+        defer h.stallEventMu.Unlock()
+        out := make([]StallEvent, 0)
+        for _, e := range h.stallEvents {
                 if !e.At.Before(since) {
                         out = append(out, e)
                 }
@@ -1023,6 +1059,21 @@ func (h *Host) ListBans() []BanInfo {
 // LiftBan removes the P2P ban for addr. Returns true if the ban existed.
 func (h *Host) LiftBan(addr string) bool {
         return h.mgr.LiftBan(addr)
+}
+
+// PeerHeight returns the last-reported chain height for the peer at addr and
+// whether the peer is currently connected.  The height is updated by the
+// MsgPong dispatch handler on every keepalive reply, so callers can use this
+// to verify that the keepalive Ping/Pong cycle propagates validator tip
+// advances to the relay's peer table.
+func (h *Host) PeerHeight(addr string) (uint64, bool) {
+        h.mu.RLock()
+        defer h.mu.RUnlock()
+        p, ok := h.peers[addr]
+        if !ok {
+                return 0, false
+        }
+        return p.height, true
 }
 
 // ListenAddr returns the actual bound address (useful when ListenAddr was ":0").
@@ -1671,6 +1722,19 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                                                         "peer_height", peer.height,
                                                 )
                                         }
+                                        // Record a single stall event for the entire tick so the
+                                        // Admin Panel notification log shows stalled peer + count.
+                                        ev := StallEvent{
+                                                PeerAddr:    peer.addr,
+                                                StalledCount: len(stalled),
+                                                At:          time.Now(),
+                                        }
+                                        h.stallEventMu.Lock()
+                                        h.stallEvents = append(h.stallEvents, ev)
+                                        if len(h.stallEvents) > stallEventMaxEvents {
+                                                h.stallEvents = h.stallEvents[len(h.stallEvents)-stallEventMaxEvents:]
+                                        }
+                                        h.stallEventMu.Unlock()
                                         h.requestHeaders(peer)
                                 }
                         case <-keepaliveDone:
