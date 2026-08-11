@@ -151,6 +151,20 @@ if echo \"\${CMD}\" | grep -q 'enable --now aperod-node'; then
   exit 0
 fi
 
+# verify-dropin.sh: 'systemctl show aperod-node' — return fake output with
+# the expected GOMEMLIMIT and TimeoutStopUSec values so the verify step passes.
+if echo \"\${CMD}\" | grep -q 'systemctl show aperod-node'; then
+  printf 'Environment=GOMEMLIMIT=5368709120\nTimeoutStopUSec=15min\n'
+  exit 0
+fi
+
+# verify-dropin.sh: 'test -f /etc/systemd/.../gomemlimit.conf && echo yes || echo no'
+# and same for timeout.conf — return 'yes' so the drop-in presence check passes.
+if echo \"\${CMD}\" | grep -q 'gomemlimit\.conf\|timeout\.conf'; then
+  echo 'yes'
+  exit 0
+fi
+
 # All other SSH commands (disable, chown, ensure-dropin, etc.) — succeed silently
 cat >/dev/null 2>&1 || true
 printf 'stopped\nremoved\nstarted\n'
@@ -379,6 +393,16 @@ fi
 
 if echo \"\${CMD}\" | grep -q 'network/stats'; then
   echo '{\"height\":55000,\"peer_count\":1,\"syncing\":false}'
+  exit 0
+fi
+
+# verify-dropin.sh: systemctl show + drop-in file checks
+if echo \"\${CMD}\" | grep -q 'systemctl show aperod-node'; then
+  printf 'Environment=GOMEMLIMIT=5368709120\nTimeoutStopUSec=15min\n'
+  exit 0
+fi
+if echo \"\${CMD}\" | grep -q 'gomemlimit\.conf\|timeout\.conf'; then
+  echo 'yes'
   exit 0
 fi
 
