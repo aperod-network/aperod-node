@@ -55,6 +55,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.restNetworkWhitelistByEntry))
         s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
         s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
+        s.mux.HandleFunc("/api/v1/network/stall-events", s.localOnly(s.restNetworkStallEvents))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
@@ -1192,6 +1193,41 @@ func (s *Server) restNetworkBanEvents(w http.ResponseWriter, r *http.Request) {
         events := s.banEventFn(since)
         if events == nil {
                 events = []BanEventEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
+}
+
+// ─── GET /api/v1/network/stall-events ────────────────────────────────────────
+//
+// Returns block-fetch stall events recorded by the P2P layer: each entry is a
+// peer that failed to serve a requested block within GetBlockStallTimeout.
+// Accepts an optional `since` query parameter (Unix milliseconds) to fetch
+// only events recorded after that time.
+//
+// Response: { "events": [ { peer_addr, stalled_count, at } ] }
+func (s *Server) restNetworkStallEvents(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.stallEventFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+
+        var since time.Time
+        if raw := r.URL.Query().Get("since"); raw != "" {
+                ms, err := strconv.ParseInt(raw, 10, 64)
+                if err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "since must be a Unix-ms integer")
+                        return
+                }
+                since = time.UnixMilli(ms)
+        }
+
+        events := s.stallEventFn(since)
+        if events == nil {
+                events = []StallEventEntry{}
         }
         writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
 }
