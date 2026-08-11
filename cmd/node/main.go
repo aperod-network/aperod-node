@@ -932,6 +932,63 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
+                                        // ── Snapshot ↔ disk-store reconciliation ─────────────────────
+                                        // A snapshot can carry corrupted UTXO fields indefinitely: a bad
+                                        // write into the in-memory set is persisted at the next snapshot
+                                        // save and reloaded on every restart, while the u/ disk store
+                                        // (written from consensus-verified raw block data) stays correct.
+                                        // Cross-check every active/staked UTXO against the disk store and
+                                        // patch divergent fields, then persist the corrected snapshot so
+                                        // the next restart starts clean.  Observed in production: an
+                                        // admin restore flow inserted commitments recomputed from wrong
+                                        // amounts, making the UTXOs unspendable until reconciled.
+                                        recChecked, recFixed, recPubMism := utxos.ReconcileWithStore(
+                                                func(txHash crypto.Hash32, outIdx uint32) (*core.UTXO, bool) {
+                                                        su, gerr := db.GetUTXO(txHash, outIdx)
+                                                        if gerr != nil || su == nil {
+                                                                return nil, false
+                                                        }
+                                                        return &core.UTXO{
+                                                                TxHash:       su.TxHash,
+                                                                OutputIndex:  su.OutputIndex,
+                                                                OneTimePub:   su.OneTimePub,
+                                                                TxPubKey:     su.TxPubKey,
+                                                                AmountCommit: su.AmountCommit,
+                                                                EncAmount:    su.EncAmount,
+                                                                BlockHeight:  su.BlockHeight,
+                                                        }, true
+                                                },
+                                                func(u *core.UTXO, disk *core.UTXO) {
+                                                        log.Warn("snapshot reconcile: in-memory UTXO diverges from disk store — patching",
+                                                                "tx_hash", fmt.Sprintf("%x", u.TxHash[:]),
+                                                                "out_idx", u.OutputIndex,
+                                                                "mem_commit", fmt.Sprintf("%x", u.AmountCommit[:]),
+                                                                "disk_commit", fmt.Sprintf("%x", disk.AmountCommit[:]))
+                                                })
+                                        if recFixed > 0 || recPubMism > 0 {
+                                                log.Warn("snapshot reconcile: divergent entries patched from disk store",
+                                                        "checked", recChecked, "fixed", recFixed,
+                                                        "one_time_pub_mismatches", recPubMism)
+                                                txTotRec, _ := db.LoadTxTotal()
+                                                recSnap := startupSnapshot{
+                                                        Version:    snapVersion,
+                                                        TipHeight:  snap.TipHeight,
+                                                        TipHashHex: snap.TipHashHex,
+                                                        TxTotal:    txTotRec,
+                                                        UTXOs:      utxos.TakeSnapshot(),
+                                                        Registry:   registry.TakeSnapshot(),
+                                                }
+                                                if saveErr := saveStartupSnapshot(cfg.DataDir, recSnap); saveErr != nil {
+                                                        log.Warn("snapshot reconcile: failed to save corrected snapshot",
+                                                                "err", saveErr)
+                                                } else {
+                                                        log.Info("snapshot reconcile: corrected snapshot saved")
+                                                }
+                                        } else {
+                                                log.Info("snapshot reconcile: in-memory UTXO set matches disk store",
+                                                        "checked", recChecked)
+                                        }
+
                                         // ── --rebuild-key-images: fix stale snapshot key-image set ──
                                         // When a transaction is lost mid-flight (OOM kill after the
                                         // ring inputs were hashed but before the block was confirmed),

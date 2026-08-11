@@ -77,6 +77,62 @@ func (s *UTXOSet) TakeSnapshot() UTXOSnapshot {
 	}
 }
 
+// ReconcileWithStore cross-checks every active and staked UTXO against the
+// authoritative persistent store (the u/ LevelDB index, written from raw
+// block data at acceptance time) and overwrites in-memory fields that
+// diverge.  Snapshots can carry corrupted values indefinitely: a bad write
+// into the in-memory set (e.g. a manual restore flow that recomputed
+// commitments from incorrect database amounts) is persisted by the next
+// snapshot save and reloaded on every subsequent restart.  The disk store is
+// the source of truth — consensus verified those outputs when their blocks
+// were accepted.
+//
+// lookup returns the on-disk UTXO for (txHash, outIdx) or ok=false when the
+// store has no entry (absent entries are skipped, never treated as
+// divergence).  OneTimePub is deliberately not patched: it is the byPubKey
+// map key, and a divergence there indicates deeper corruption that must not
+// be silently re-keyed; it is only counted and reported.
+//
+// Returns (checked, fixed, pubKeyMismatches).
+func (s *UTXOSet) ReconcileWithStore(
+	lookup func(txHash crypto.Hash32, outIdx uint32) (*UTXO, bool),
+	onFix func(u *UTXO, disk *UTXO),
+) (checked, fixed, pubKeyMismatches int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	reconcile := func(m map[UTXOKey]*UTXO) {
+		for k, u := range m {
+			disk, ok := lookup(k.TxHash, k.OutputIndex)
+			if !ok || disk == nil {
+				continue
+			}
+			checked++
+			if u.OneTimePub != disk.OneTimePub {
+				pubKeyMismatches++
+				continue
+			}
+			if u.AmountCommit == disk.AmountCommit &&
+				u.TxPubKey == disk.TxPubKey &&
+				u.EncAmount == disk.EncAmount &&
+				u.BlockHeight == disk.BlockHeight {
+				continue
+			}
+			if onFix != nil {
+				onFix(u, disk)
+			}
+			u.AmountCommit = disk.AmountCommit
+			u.TxPubKey = disk.TxPubKey
+			u.EncAmount = disk.EncAmount
+			u.BlockHeight = disk.BlockHeight
+			fixed++
+		}
+	}
+	reconcile(s.utxos)
+	reconcile(s.stakedUTXOs)
+	return checked, fixed, pubKeyMismatches
+}
+
 // RestoreFromSnapshot replaces the UTXOSet content with the provided snapshot.
 // It rebuilds both primary (utxos) and secondary (byPubKey, spentPubKeys,
 // stakedUTXOs, keyImages, rollbackJournal) indexes from the snapshot data.
