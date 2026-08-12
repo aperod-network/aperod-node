@@ -168,26 +168,42 @@ func copySnapshotChecksum(src, dst string) {
 		_ = os.Remove(dstChk)
 		return
 	}
-	_ = copyFile(srcChk, dstChk) // best-effort: a missing sidecar only skips verification
+	if err := copyFile(srcChk, dstChk); err != nil {
+		// A failed copy must not leave a STALE destination sidecar behind:
+		// the just-promoted prev snapshot would fail verification against
+		// the old digest and an otherwise valid backup would be rejected.
+		// Removing the sidecar downgrades the prev to "no sidecar" (loads
+		// with verification skipped) — strictly better than a false reject.
+		_ = os.Remove(dstChk)
+	}
 }
 
 // verifySnapshotChecksum compares the SHA-256 of the snapshot file at path
-// against its sidecar.  Returns nil when the sidecar is absent or malformed
-// (snapshots written by pre-checksum binaries must keep loading — the schema
-// version / height / hash checks still apply), and a descriptive error when
-// the sidecar holds a valid digest that does not match the file content —
-// the signature of a truncated or partially-written snapshot.  Task #964.
+// against its sidecar.  Only an ABSENT sidecar (os.IsNotExist) skips
+// verification — that is the backward-compatible path for snapshots written
+// by pre-checksum binaries; the schema version / height / hash checks still
+// apply.  A sidecar that exists but is unreadable or malformed is reported
+// as corruption: silently skipping verification in those cases would let a
+// structurally valid but altered snapshot be deserialised, which is exactly
+// what this check exists to prevent.  Task #964.
 func verifySnapshotChecksum(path string) error {
 	raw, err := os.ReadFile(snapshotChecksumPath(path))
 	if err != nil {
-		return nil // no sidecar — backward compatible, verification skipped
+		if os.IsNotExist(err) {
+			return nil // no sidecar — backward compatible, verification skipped
+		}
+		return fmt.Errorf("snapshot checksum sidecar unreadable (path=%s): %w — "+
+			"treating snapshot as corrupt and falling back", path, err)
 	}
 	want := strings.TrimSpace(string(raw))
 	if len(want) != sha256.Size*2 {
-		return nil // malformed sidecar — treat as absent rather than blocking startup
+		return fmt.Errorf("snapshot checksum sidecar malformed (path=%s, len=%d, want %d hex chars): "+
+			"treating snapshot as corrupt and falling back",
+			path, len(want), sha256.Size*2)
 	}
 	if _, err := hex.DecodeString(want); err != nil {
-		return nil
+		return fmt.Errorf("snapshot checksum sidecar is not valid hex (path=%s): %w — "+
+			"treating snapshot as corrupt and falling back", path, err)
 	}
 
 	f, err := os.Open(path)
