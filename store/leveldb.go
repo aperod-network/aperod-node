@@ -728,63 +728,80 @@ func (d *DB) LookupTxIdx(txHash crypto.Hash32) (*TxIdxEntry, error) {
         }, nil
 }
 
-// RepairAllHeightIndex scans every block stored in the b/ namespace, builds a
-// height→hash map from the actual block data, then sweeps h/<height> for every
-// height in [0..tipHeight] and rewrites any entry that is absent or points at
-// the wrong hash.
+// RepairAllHeightIndex scans the b/ block namespace, then sweeps h/<height>
+// for every height in [0..tipHeight] and fills in any entry that is absent or
+// zeroed.  It deliberately does NOT overwrite an existing non-zero h/ entry:
+// b/ can contain multiple bodies that encode the same height (e.g. orphaned
+// fork blocks), and without a full canonical-chain traversal we cannot safely
+// select among them.  Only absent/zeroed h/ slots — where filling in any
+// unambiguous body is strictly better than leaving the slot empty — are repaired.
 //
 // The b/ key suffix is always the 32-byte block hash; the JSON body contains
-// the height (either as a top-level "height" field for StoredBlock or nested
-// under "Header"."Height" for a serialised core.Block).  Both shapes are probed
-// so the function works regardless of which write path populated the store.
+// the height (top-level "height" for StoredBlock, or nested "Header"."Height"
+// for a serialised core.Block).  If two parseable bodies exist for the same
+// height, the slot is treated as ambiguous and skipped even if h/ is absent.
 //
-// progress is called with (scanned, tipHeight) after every 10 000 heights so
-// operators can see that the sweep is making progress; pass nil to skip.
+// For non-zero h/ entries the function verifies that the body (a) exists and
+// (b) encodes the same height as the h/ key.  An entry that fails either check
+// is counted as skipped (dangling or mis-height) — it cannot be safely repaired
+// from b/ alone.
+//
+// progress is called with (scanned, tipHeight) every 10 000 heights; pass nil
+// to skip.
 //
 // Returns:
-//   - repaired: number of h/ entries successfully rewritten.
-//   - skipped:  number of heights whose h/ was absent/mismatched but whose
-//               block body was also absent from b/ — these could NOT be
-//               repaired.  A non-zero skipped count means the sweep is
-//               incomplete; callers must NOT treat the sweep as fully
-//               successful and must not write the height-index sentinel.
-//   - err:      first I/O error encountered (sweep continues past errors).
+//   - repaired: absent/zeroed h/ entries successfully filled in.
+//   - skipped:  heights whose h/ is broken and could not be safely repaired
+//               (missing body, ambiguous body, or mis-height body).  A non-zero
+//               skipped count means the sweep is incomplete; callers MUST NOT
+//               write the height-index sentinel.
+//   - err:      first I/O error encountered; the sweep continues past errors.
 func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total uint64)) (repaired uint64, skipped uint64, err error) {
-        // heightProbe covers both storage shapes:
-        //   StoredBlock  — top-level "height" field
-        //   core.Block   — "Header"."Height" nested field (capital letters, no JSON tags)
+        // heightProbe covers both storage shapes.
         type heightProbe struct {
                 Height uint64 `json:"height"`
                 Header struct {
                         Height uint64 `json:"Height"`
                 } `json:"Header"`
         }
+        parseBodyHeight := func(data []byte) (uint64, bool) {
+                var probe heightProbe
+                if jsonErr := json.Unmarshal(data, &probe); jsonErr != nil {
+                        return 0, false
+                }
+                h := probe.Height
+                if h == 0 {
+                        h = probe.Header.Height
+                }
+                return h, true
+        }
 
-        // Phase 1: build height→hash from b/ block data.
-        // The last 32 bytes of each b/ key are the canonical block hash; the
-        // JSON body supplies the height so we never rely on the h/ index we are
-        // about to repair.
-        byHeight := make(map[uint64]crypto.Hash32, int(tipHeight)+1)
+        // Phase 1: scan b/ and build a height → (hash, ambiguous) map.
+        // "ambiguous" is set when two or more parseable bodies both claim the
+        // same height — in that case we cannot safely pick one for repair.
+        type bEntry struct {
+                hash      crypto.Hash32
+                ambiguous bool
+        }
+        byHeight := make(map[uint64]bEntry, int(tipHeight)+1)
         iter := d.db.NewIterator(util.BytesPrefix(prefixBlock), nil)
         for iter.Next() {
                 key := iter.Key()
                 if len(key) < len(prefixBlock)+32 {
                         continue
                 }
-                var probe heightProbe
-                if jsonErr := json.Unmarshal(iter.Value(), &probe); jsonErr != nil {
-                        continue // corrupt or incompatible entry; skip
-                }
-                h := probe.Height
-                if h == 0 {
-                        h = probe.Header.Height
-                }
-                if h > tipHeight {
-                        continue // beyond tip — ignore
+                bh, ok := parseBodyHeight(iter.Value())
+                if !ok || bh > tipHeight {
+                        continue
                 }
                 var hash crypto.Hash32
                 copy(hash[:], key[len(prefixBlock):])
-                byHeight[h] = hash
+                if prev, exists := byHeight[bh]; exists {
+                        // A second body claims this height — mark ambiguous.
+                        byHeight[bh] = bEntry{hash: prev.hash, ambiguous: true}
+                } else {
+                        byHeight[bh] = bEntry{hash: hash, ambiguous: false}
+                }
         }
         iter.Release()
         if iterErr := iter.Error(); iterErr != nil {
@@ -797,7 +814,6 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
                 if progress != nil && h%10000 == 0 {
                         progress(h, tipHeight)
                 }
-                want, known := byHeight[h]
 
                 existing, getErr := d.get(heightKey(h))
                 if getErr != nil {
@@ -811,54 +827,55 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
                         copy(existingHash[:], existing)
                 }
 
-                if known {
-                        if existingHash == want {
-                                continue // h/ is already correct
-                        }
-                        // h/ is absent/zero or points to a different hash.
-                        // Repair with the canonical hash sourced from b/.
-                        if repErr := d.putSync(heightKey(h), want[:]); repErr != nil {
+                if existingHash != (crypto.Hash32{}) {
+                        // h/ has a non-zero entry.  Verify that the referenced body
+                        // (a) exists and (b) encodes the correct height.  We do NOT
+                        // replace a non-zero h/ entry: b/ may contain multiple bodies
+                        // at this height and we cannot determine which is canonical
+                        // without a full chain traversal.
+                        bodyKey := append(append([]byte{}, prefixBlock...), existingHash[:]...)
+                        body, lookErr := d.get(bodyKey)
+                        if lookErr != nil {
                                 if firstErr == nil {
-                                        firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
+                                        firstErr = fmt.Errorf("verify block body at height %d: %w", h, lookErr)
                                 }
                                 continue
                         }
-                        repaired++
+                        if body == nil {
+                                // Dangling: h/ points to a missing block body.
+                                skipped++
+                                continue
+                        }
+                        bodyHeight, ok := parseBodyHeight(body)
+                        if !ok || bodyHeight != h {
+                                // Body exists but encodes the wrong height — broken.
+                                skipped++
+                                continue
+                        }
+                        // Non-zero h/ entry with a valid, height-matching body — OK.
                         continue
                 }
 
-                // !known: no parseable block body was found for height h during the
-                // b/ scan.  Check the existing h/ entry to determine if it is a
-                // dangling pointer (non-zero hash pointing at a missing body) or
-                // simply absent/zeroed.
-                if existingHash == (crypto.Hash32{}) {
-                        // h/ is absent or zeroed, and no block body — cannot repair.
+                // h/ is absent or zeroed.  Attempt to fill it in from b/.
+                entry, known := byHeight[h]
+                if !known {
+                        // No body in b/ for this height at all — cannot repair.
                         skipped++
                         continue
                 }
-                // h/ has a non-zero hash that was not in byHeight.  This means either
-                // the block body is missing from b/ (dangling pointer) or it could not
-                // be parsed during the b/ scan (corrupt JSON).  In either case we
-                // cannot verify or repair the entry — count it as an incomplete/skipped
-                // height so the caller does not treat the sweep as fully successful.
-                bodyKey := append(append([]byte{}, prefixBlock...), existingHash[:]...)
-                body, lookErr := d.get(bodyKey)
-                if lookErr != nil {
+                if entry.ambiguous {
+                        // Two or more bodies claim this height; cannot safely pick one.
+                        skipped++
+                        continue
+                }
+                // Exactly one unambiguous body exists at this height — fill in h/.
+                if repErr := d.putSync(heightKey(h), entry.hash[:]); repErr != nil {
                         if firstErr == nil {
-                                firstErr = fmt.Errorf("verify block body at height %d: %w", h, lookErr)
+                                firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
                         }
                         continue
                 }
-                if body == nil {
-                        // Dangling: h/ points to a block hash that has no body in b/.
-                        // Cannot repair (no alternative canonical hash).
-                        skipped++
-                } else {
-                        // Block body exists but was not parseable during Phase 1 (corrupt
-                        // JSON or unknown schema).  We cannot verify the height claim so
-                        // we treat this as an unresolvable entry.
-                        skipped++
-                }
+                repaired++
         }
         if progress != nil {
                 progress(tipHeight, tipHeight)
@@ -919,7 +936,10 @@ func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken u
                         broken++
                         continue
                 }
-                // Non-zero h/ entry: verify the block body is present.
+                // Non-zero h/ entry: verify the block body (a) exists and
+                // (b) encodes the same height as the h/ key.  A body that
+                // resolves to a different height (swapped index entries, rsync
+                // scramble) passes the existence check but is still broken.
                 bodyKey := append(append([]byte{}, prefixBlock...), e.hash[:]...)
                 body, getErr := d.get(bodyKey)
                 if getErr != nil {
@@ -927,8 +947,33 @@ func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken u
                                 "check-height-index: lookup block body at height %d (hash %x): %w",
                                 h, e.hash[:4], getErr)
                 }
+                isBroken := false
                 if body == nil {
                         // Dangling pointer: h/ points to a missing b/ body.
+                        isBroken = true
+                } else {
+                        // Body exists — verify height claim.
+                        var probe struct {
+                                Height uint64 `json:"height"`
+                                Header struct {
+                                        Height uint64 `json:"Height"`
+                                } `json:"Header"`
+                        }
+                        if jsonErr := json.Unmarshal(body, &probe); jsonErr != nil {
+                                // Unparseable body — treat as broken.
+                                isBroken = true
+                        } else {
+                                bodyHeight := probe.Height
+                                if bodyHeight == 0 {
+                                        bodyHeight = probe.Header.Height
+                                }
+                                if bodyHeight != h {
+                                        // Body encodes a different height than h/ claims.
+                                        isBroken = true
+                                }
+                        }
+                }
+                if isBroken {
                         if broken == 0 {
                                 firstBroken = h
                         }
