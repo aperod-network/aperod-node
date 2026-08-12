@@ -10,16 +10,42 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aperod/aperod/p2p"
 )
 
+// syncBuf is a bytes.Buffer protected by a mutex so that concurrent logger
+// goroutines (Write) and test goroutines (Reset, String) do not race.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // captureWarnLogger returns an slog.Logger that writes JSON records at Warn
 // level and above to buf.  JSON output makes it straightforward to assert on
 // specific structured fields without fragile string matching.
-func captureWarnLogger(buf *bytes.Buffer) *slog.Logger {
+func captureWarnLogger(buf *syncBuf) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
 	}))
@@ -28,7 +54,7 @@ func captureWarnLogger(buf *bytes.Buffer) *slog.Logger {
 // logContainsBootnodeWarn scans the newline-delimited JSON log lines in buf
 // and returns true when at least one line is a WARN record that contains both
 // a non-empty "bootnode" key and a non-empty "err" key.
-func logContainsBootnodeWarn(buf *bytes.Buffer) bool {
+func logContainsBootnodeWarn(buf *syncBuf) bool {
 	for _, line := range strings.Split(buf.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -58,7 +84,7 @@ func logContainsBootnodeWarn(buf *bytes.Buffer) bool {
 // A valid but unreachable address (127.0.0.1:19998) is included to confirm
 // the node continues past the bad entry and still tries valid bootnodes.
 func TestBootnodeWarn_StartupLog(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuf
 	log := captureWarnLogger(&buf)
 
 	h := p2p.NewHost(p2p.Config{
@@ -99,7 +125,7 @@ func TestBootnodeWarn_StartupLog(t *testing.T) {
 // This exercises the path in host.go that runs after the node has already
 // started, ensuring operators are warned continuously — not just at startup.
 func TestBootnodeWarn_MaintainLoopLog(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuf
 	log := captureWarnLogger(&buf)
 
 	h := p2p.NewHost(p2p.Config{
@@ -147,7 +173,7 @@ func TestBootnodeWarn_MaintainLoopLog(t *testing.T) {
 //
 // This is the "node continues to start" assertion from the acceptance criteria.
 func TestBootnodeWarn_NodeContinuesAfterBadBootnode(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuf
 	log := captureWarnLogger(&buf)
 
 	h := p2p.NewHost(p2p.Config{
