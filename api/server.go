@@ -636,6 +636,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
         fmt.Fprintf(w, "# TYPE aperod_mempool_size gauge\n")
         fmt.Fprintf(w, "aperod_mempool_size %d\n", s.mempool.Count())
 
+        fmt.Fprintf(w, "# HELP aperod_mempool_bytes Total byte size of all transactions currently in the mempool.\n")
+        fmt.Fprintf(w, "# TYPE aperod_mempool_bytes gauge\n")
+        fmt.Fprintf(w, "aperod_mempool_bytes %d\n", s.mempool.TotalBytes())
+
+        fmt.Fprintf(w, "# HELP aperod_mempool_evictions_total Transactions evicted from the mempool since process start (TTL + capacity pressure).\n")
+        fmt.Fprintf(w, "# TYPE aperod_mempool_evictions_total counter\n")
+        fmt.Fprintf(w, "aperod_mempool_evictions_total %d\n", s.mempool.EvictionsTotal())
+
         fmt.Fprintf(w, "# HELP aperod_utxo_count Number of unspent outputs tracked in memory.\n")
         fmt.Fprintf(w, "# TYPE aperod_utxo_count gauge\n")
         fmt.Fprintf(w, "aperod_utxo_count %d\n", s.utxos.Count())
