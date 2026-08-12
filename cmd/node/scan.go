@@ -362,9 +362,18 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				"height", h, "err", applyErr)
 		}
 
-		// UTXO index backfill.
-		for _, tx := range b.Txs {
+		// UTXO index backfill + tx-hash index backfill.
+		// PutTxIdx is written alongside PutUTXO so that after any startup
+		// scan — full or partial-checkpoint resume — every block from
+		// scanFrom through TipHeight has a t/ entry in LevelDB.  This
+		// guarantees that getTransactionFromDisk (LookupTxIdx →
+		// GetRawBlockByHeight) can resolve any UTXO in those blocks
+		// without falling through to the slower u/ and in-memory fallbacks.
+		for txPos, tx := range b.Txs {
 			txHash := tx.Hash()
+			// Persist tx location so GetTransaction disk fallback works
+			// for all blocks covered by this scan.
+			_ = p.DB.PutTxIdx(txHash, h, txPos)
 			for i, out := range tx.Outputs {
 				su := &store.StoredUTXO{
 					TxHash:       txHash,
@@ -461,6 +470,15 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
+	// Record that t/ entries have been written through TipHeight so the
+	// background backfill goroutine (snapshot fast path, see main.go) can
+	// resume from this point on the next restart instead of re-scanning
+	// the entire history.
+	if markErr := p.DB.StoreTxIdxCompleteHeight(p.TipHeight); markErr != nil {
+		p.Log.Warn("failed to persist txidx_complete_height after scan",
+			"err", markErr)
+	}
+
 	// Release UTXO-scan heap to the OS immediately so steady-state operation
 	// starts with the minimum possible RSS.  The periodic runtime.GC() calls
 	// during the loop already freed heap; FreeOSMemory() returns those pages
@@ -520,15 +538,17 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			for _, pub := range observedProducers {
 				seedPubs = append(seedPubs, pub)
 			}
-			seedStake := core.MinStakeNAPR * 10
-			p.Registry.InitFromGenesis(seedPubs, seedStake)
+			// SeedFromObservedProducers tags entries as Seeded=true and uses
+			// exactly MinStakeNAPR (not ×10) so epoch-churn ordering is not
+			// skewed.  The first real stake deposit will demote these sentinels.
+			p.Registry.SeedFromObservedProducers(seedPubs)
 			seedActive, _ := p.Registry.Count()
-			p.Log.Warn("startup scan: registry was empty after scan — seeded observed block producers as active validators",
+			p.Log.Warn("startup scan: registry was empty after scan — seeded observed block producers as active validators (sentinel)",
 				"seeded_count", len(seedPubs),
-				"seed_stake_napro", seedStake,
+				"seed_stake_napro", core.MinStakeNAPR,
 				"active_after_seed", seedActive,
 				"tip_height", p.TipHeight,
-				"note", "these entries will be replaced once a real stake transaction is replayed",
+				"note", "seeded entries are tagged Seeded=true and will be demoted when real stake data arrives",
 			)
 		}
 	}
