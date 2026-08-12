@@ -458,6 +458,23 @@ type Host struct {
         dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
         dialFnMu        sync.RWMutex
 
+        // pendingConns maps the canonical bare IP of a just-connected peer to
+        // the live TCP/TLS conn that has not yet been handed to handleConn.
+        // BanPeer closes every conn in pendingConns[ip] so that a connection
+        // that completed dialContextFunc after BanPeer's cancel is still
+        // prevented from reaching the peer message loop.
+        //
+        // The field is accessed only while dialGateMu is held.
+        pendingConns map[string]map[uint64]net.Conn
+
+        // postConnectHook, when non-nil, is called by dialPeer between the
+        // post-dial ban check (which registers the conn in pendingConns) and
+        // the launch of handleConn.  This gives tests a deterministic window
+        // to call BanPeer while the conn is registered as pending, in order to
+        // verify that BanPeer closes it before handleConn can start.
+        // Always nil in production.
+        postConnectHook func()
+
         // listenFunc is the function used to open the TCP listener in Start().
         // In production it is always net.Listen (set in NewHost).  Tests may
         // replace it with a custom factory whose body runs at the real bind
@@ -530,6 +547,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 listenFunc:     net.Listen,
                 dialContextFunc: defaultDialer.DialContext,
                 dialingIPs:     make(map[string]map[uint64]context.CancelFunc),
+                pendingConns:   make(map[string]map[uint64]net.Conn),
                 bootnodeLastResolved:   make(map[string][]string),
                 bootnodeLastResolvedAt: make(map[string]time.Time),
                 bootnodeSet:            make(map[string]struct{}),
@@ -943,13 +961,25 @@ func (h *Host) DropPeer(addr string) bool {
 }
 
 // cancelInFlightDials cancels every outbound dial currently in progress to ip
-// (canonical bare IP) by invoking and removing the registered CancelFuncs.
-// Must be called while dialGateMu is held.
+// (canonical bare IP) and closes every connection that completed dialContextFunc
+// but has not yet been handed to handleConn.  Must be called while dialGateMu
+// is held.
+//
+// Closing dialingIPs cancels the context so dialContextFunc returns immediately
+// (preventing new TCP connections for in-flight dials).  Closing pendingConns
+// covers the narrower window where dialContextFunc has already returned a live
+// conn but the conn has not yet been passed to handleConn: closing it here
+// ensures handleConn is never called for a banned peer even if the TCP
+// handshake completed before the ban was committed.
 func (h *Host) cancelInFlightDials(ip string) {
         for _, cancel := range h.dialingIPs[ip] {
                 cancel()
         }
         delete(h.dialingIPs, ip)
+        for _, conn := range h.pendingConns[ip] {
+                conn.Close()
+        }
+        delete(h.pendingConns, ip)
 }
 
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is
@@ -1577,7 +1607,56 @@ func (h *Host) dialPeer(addr string) {
         } else {
                 conn = tcpConn
         }
+
+        // ── Post-connect gate: prevent handoff to handleConn if banned ────────
+        //
+        // dialContextFunc may return a live conn even when the context was
+        // cancelled (e.g. if the TCP connect completed in the same scheduler
+        // tick as BanPeer's cancel).  Register the conn as pending under
+        // dialGateMu: this is atomic with BanPeer's ban-write, so exactly one
+        // of the following is guaranteed:
+        //
+        //   A) IsBanned is true inside our gate ⟹ we close conn here.
+        //   B) BanPeer runs after we register ⟹ it closes conn via pendingConns.
+        //   C) BanPeer has already run and returned ⟹ IsBanned is true (case A).
+        //
+        // In all cases handleConn is either called with an already-closed conn
+        // (case B, fails at first read/write and is rejected by its own IsBanned
+        // guard) or is never called at all (cases A and C).
+        pendingID := h.nextDialID.Add(1)
+        h.dialGateMu.Lock()
+        if h.mgr.IsBanned(addr) {
+                h.dialGateMu.Unlock()
+                conn.Close()
+                h.log.Debug("dropping connection to just-banned peer", "addr", addr)
+                return
+        }
+        if h.pendingConns[canonIP] == nil {
+                h.pendingConns[canonIP] = make(map[uint64]net.Conn)
+        }
+        h.pendingConns[canonIP][pendingID] = conn
+        h.dialGateMu.Unlock()
+
+        // postConnectHook, when non-nil (tests only), fires here so the test
+        // can call BanPeer while conn is registered as pending and verify it
+        // is closed by cancelInFlightDials rather than reaching handleConn.
+        if h.postConnectHook != nil {
+                h.postConnectHook()
+        }
+
         go h.handleConn(conn, true)
+
+        // Deregister the pending conn — handleConn is now the owner.
+        // If BanPeer already ran and closed the conn, the entry was already
+        // removed from pendingConns by cancelInFlightDials; the delete is a no-op.
+        h.dialGateMu.Lock()
+        if m := h.pendingConns[canonIP]; m != nil {
+                delete(m, pendingID)
+                if len(m) == 0 {
+                        delete(h.pendingConns, canonIP)
+                }
+        }
+        h.dialGateMu.Unlock()
 }
 
 func (h *Host) handleConn(conn net.Conn, outbound bool) {
