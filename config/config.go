@@ -205,6 +205,25 @@ type P2PConfig struct {
 	// Default: 50.  Set to 0 to disable rate limiting (not recommended on
 	// resource-constrained nodes).
 	MaxBlockIngestPerSec int `yaml:"max_block_ingest_per_sec"`
+	// TxRateBurst is the per-source-IP token-bucket capacity for incoming P2P
+	// transactions: up to this many transactions may arrive back-to-back from
+	// one IP before throttling kicks in.  Protects block-production latency
+	// from slow mempool floods that force constant eviction churn.
+	// Default: 50.  Set to 0 to disable tx rate limiting.
+	TxRateBurst int `yaml:"tx_rate_burst"`
+	// TxRateSustained is the sustained transaction rate (tx/sec) each source
+	// IP may maintain once its burst allowance is used up.
+	// Only effective when tx_rate_burst > 0.  Default: 10.
+	TxRateSustained int `yaml:"tx_rate_sustained"`
+	// TxRateBanThreshold is the number of throttled (dropped) transactions
+	// after which the flooding IP is temporarily banned.  The counter resets
+	// as soon as the peer drops back below the rate limit, so only sustained
+	// flooding accumulates toward a ban.  Whitelisted IPs are throttled but
+	// never banned.  Default: 100.  Set to 0 to throttle without banning.
+	TxRateBanThreshold int `yaml:"tx_rate_ban_threshold"`
+	// TxRateBanDuration is how long a tx-flooding IP stays banned after
+	// exceeding tx_rate_ban_threshold.  Default: 1h.
+	TxRateBanDuration time.Duration `yaml:"tx_rate_ban_duration"`
 	// MaxStaleBootnodeAge is the maximum time a bootnode may go without a
 	// successful DNS resolution before a WARN is emitted on every discovery
 	// tick.  The warning includes the bootnode address and the exact age since
@@ -301,6 +320,10 @@ func DefaultConfig() *Config {
 			BadBlockBanThreshold: 5,
 			BadBlockBanDuration:  24 * time.Hour,
 			MaxBlockIngestPerSec: 50,       // cap sync-peer block delivery to prevent CPU spikes
+TxRateBurst:          50,       // per-IP tx burst allowance (mempool-flood guard)
+TxRateSustained:      10,       // per-IP sustained tx/sec after burst is spent
+TxRateBanThreshold:   100,      // sustained violations before a temporary ban
+TxRateBanDuration:    time.Hour,
 			MaxStaleBootnodeAge:  24 * time.Hour, // warn when a bootnode DNS hasn't resolved for this long
 		},
 		Consensus: ConsensusConfig{
