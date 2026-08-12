@@ -363,7 +363,10 @@ func TestHost_GossipRelay_DuplicateBlock_NotRelayedTwice(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 
 	// Handler called at least once, no panic
-	if len(handler.blocks) < 1 {
+	handler.mu.Lock()
+	blockCount := len(handler.blocks)
+	handler.mu.Unlock()
+	if blockCount < 1 {
 		t.Error("OnBlock must have been called at least once")
 	}
 }
