@@ -449,10 +449,14 @@ type Host struct {
         nextDialID atomic.Uint64
 
         // dialContextFunc is the function used for outbound TCP dials.
-        // In production it is (&net.Dialer{Timeout: DialTimeout}).DialContext.
+        // In production it is (&net.Dialer{}).DialContext (the DialTimeout
+        // deadline is set by the context created in dialPeer).
         // Tests may replace it with a function that blocks on a channel to
         // exercise the race between an in-progress dial and a concurrent ban.
+        // All accesses must be guarded by dialFnMu to prevent data races when
+        // tests replace the function while a startup dial goroutine is active.
         dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+        dialFnMu        sync.RWMutex
 
         // listenFunc is the function used to open the TCP listener in Start().
         // In production it is always net.Listen (set in NewHost).  Tests may
@@ -507,7 +511,11 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 }
         }
 
-        defaultDialer := &net.Dialer{Timeout: DialTimeout}
+        // The TCP dialer carries no Timeout; the deadline is embedded in the
+        // context created by dialPeer via context.WithTimeout(…, DialTimeout).
+        // This keeps the total TCP+TLS deadline uniform and allows BanPeer to
+        // cancel in-flight dials via a single cancel func.
+        defaultDialer := &net.Dialer{}
         h := &Host{
                 cfg:            cfg,
                 handler:        handler,
@@ -1482,7 +1490,12 @@ func (h *Host) dialPeer(addr string) {
         //
         // The mutex is released BEFORE net.DialContext so it is never held
         // across network I/O.
-        ctx, cancel := context.WithCancel(context.Background())
+        // The context carries the total dial+handshake deadline (DialTimeout)
+        // so that both the TCP connect and the TLS handshake are bounded even
+        // when the remote peer accepts TCP but stalls the TLS negotiation.
+        // BanPeer cancels the same context (via the cancel func registered in
+        // dialingIPs) so in-flight dials abort immediately when the peer is banned.
+        ctx, cancel := context.WithTimeout(context.Background(), DialTimeout)
         dialID := h.nextDialID.Add(1)
         canonIP := connIP(addr)
 
@@ -1523,11 +1536,17 @@ func (h *Host) dialPeer(addr string) {
         }()
 
         h.log.Debug("dialing peer", "addr", addr)
-        // Establish the TCP connection using the injectable dialContextFunc.
-        // If BanPeer is called while DialContext is in progress, it invokes the
-        // registered cancel func, causing DialContext to return immediately with
-        // context.Canceled — so no TCP socket reaches the remote listener.
-        tcpConn, err := h.dialContextFunc(ctx, "tcp", addr)
+        // Load the dial function under the read lock so that a concurrent
+        // SetDialFunc (used by tests) cannot race with this read.
+        h.dialFnMu.RLock()
+        dialFn := h.dialContextFunc
+        h.dialFnMu.RUnlock()
+
+        // Establish the TCP connection.  If BanPeer is called while DialContext
+        // is in progress, it invokes the registered cancel func, causing
+        // DialContext to return immediately with context.Canceled — so no TCP
+        // socket reaches the remote listener.
+        tcpConn, err := dialFn(ctx, "tcp", addr)
         if err != nil {
                 if ctx.Err() != nil {
                         h.log.Debug("dial aborted (peer banned during dial)", "addr", addr)
