@@ -106,6 +106,26 @@ type Config struct {
         // needed to honour the limit, creating TCP-level backpressure without
         // dropping blocks.  Default: 50.  0 = disabled.
         MaxBlockIngestPerSec int
+        // TxRateBurst is the token-bucket capacity for incoming P2P
+        // transactions from one source IP: up to this many transactions may
+        // arrive back-to-back before throttling kicks in.
+        // 0 = tx rate limiting disabled (unit-test friendly); production
+        // nodes get the default (50) via config.DefaultConfig().
+        TxRateBurst int
+        // TxRateSustained is the sustained refill rate in transactions per
+        // second per source IP once the burst allowance is used up.
+        // Only effective when TxRateBurst > 0.  Recommended: 10.
+        TxRateSustained int
+        // TxRateBanThreshold is the number of throttled (dropped)
+        // transactions after which the source IP is temporarily banned.
+        // The counter resets as soon as the peer drops back below the rate
+        // limit, so only sustained flooding accumulates toward a ban.
+        // 0 = throttle only, never ban.  Recommended: 100.
+        TxRateBanThreshold int
+        // TxRateBanDuration is how long the ban lasts after
+        // TxRateBanThreshold is exceeded.  Default: 1h (applied in NewHost
+        // when zero and TxRateBurst > 0).
+        TxRateBanDuration time.Duration
         // MaxStaleBootnodeAge is the maximum time a bootnode may go without a
         // successful DNS resolution before a WARN is emitted on every
         // discovery tick.  The warning includes the bootnode address and the
@@ -379,6 +399,11 @@ type Host struct {
         // the Admin Panel notification log.  Capped at whitelistExemptMaxEvents.
         wlExemptEvents []WhitelistExemptionEvent
 
+        // txRate throttles incoming P2P transactions per source IP so a
+        // slow mempool flood cannot force constant eviction churn during
+        // SelectTxs.  nil when Config.TxRateBurst <= 0 (disabled).
+        txRate *txRateLimiter
+
         // banEventMu guards banEvents so the block-processing loop can append
         // events concurrently with the API server reading them.
         banEventMu sync.Mutex
@@ -510,6 +535,13 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.MaxStaleBootnodeAge == 0 {
                 cfg.MaxStaleBootnodeAge = 24 * time.Hour
         }
+        if cfg.TxRateBurst > 0 && cfg.TxRateBanDuration == 0 {
+                cfg.TxRateBanDuration = time.Hour
+        }
+        // Note: TxRateBurst = 0 means "tx rate limiting disabled" — no default
+        // is applied here so that unit tests constructing p2p.Config{} directly
+        // are not throttled.  Production nodes get the defaults via
+        // config.DefaultConfig() → burst 50, sustained 10, ban threshold 100.
         // Note: MaxBlockIngestPerSec = 0 means "disabled" — no default is applied
         // here so that unit tests that construct p2p.Config{} directly are not
         // throttled.  Production nodes set the default via DefaultConfig() → 50.
@@ -553,6 +585,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 bootnodeSet:            make(map[string]struct{}),
                 maintainNow:            make(chan struct{}, 1),
         }
+        h.txRate = newTxRateLimiter(cfg.TxRateBurst, cfg.TxRateSustained, cfg.TxRateBanThreshold)
         h.keepaliveIntervalNs.Store(int64(cfg.KeepaliveInterval))
         return h
 }
@@ -1012,6 +1045,65 @@ func (h *Host) BanPeer(addr, reason string, d time.Duration) {
         }
         h.mu.Unlock()
         h.log.Info("peer banned", "addr", addr, "ip", bannedIP, "reason", reason, "duration", d)
+}
+
+// banTxFlooder temporarily bans an IP that kept flooding transactions past
+// TxRateBanThreshold.  Mirrors the wrong-fork ban path: the ban is keyed by
+// bare IP (reconnects on a new source port stay blocked), all established
+// connections from the IP are closed, and a BanEvent is recorded for the
+// Admin Panel notification log.  Whitelisted IPs (trusted validators/relays)
+// are never banned — their excess transactions are still dropped by the
+// throttle, but a legitimate relay bursting during sync must not lose
+// connectivity.
+func (h *Host) banTxFlooder(peerIP string, peer *Peer, violations int) {
+        h.wlMu.RLock()
+        wlNets := h.wlNets
+        wlIPs := h.wlIPs
+        h.wlMu.RUnlock()
+        if len(wlNets) > 0 || len(wlIPs) > 0 {
+                if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
+                        h.log.Warn("tx flood from whitelisted peer — throttled but not banned",
+                                "peer", peer.addr, "ip", peerIP, "violations", violations)
+                        return
+                }
+        }
+
+        const reason = "sustained transaction flood (tx rate limit)"
+        banDuration := h.cfg.TxRateBanDuration
+        // Commit the ban and cancel any in-flight dials to this IP under
+        // dialGateMu so no new TCP connection can start after the ban is written.
+        h.dialGateMu.Lock()
+        h.mgr.Ban(peerIP, reason, banDuration)
+        h.cancelInFlightDials(peerIP)
+        h.dialGateMu.Unlock()
+        // Close ALL currently established connections from the same IP.
+        h.mu.Lock()
+        for addr, p := range h.peers {
+                if connIP(addr) == peerIP {
+                        p.conn.Close()
+                        delete(h.peers, addr)
+                }
+        }
+        h.mu.Unlock()
+        // Forget the rate-limit state so a post-ban reconnect starts fresh.
+        h.txRate.forget(peerIP)
+        h.log.Info("peer IP banned for transaction flood",
+                "ip", peerIP, "addr", peer.addr, "violations", violations, "duration", banDuration)
+        // Record the ban event so the API server can poll and notify admins.
+        h.banEventMu.Lock()
+        h.banEvents = append(h.banEvents, BanEvent{
+                IP:              peerIP,
+                PeerAddr:        peer.addr,
+                PeerID:          peer.id,
+                Reason:          reason,
+                Violations:      violations,
+                BanDurationSecs: int64(banDuration.Seconds()),
+                At:              time.Now(),
+        })
+        if len(h.banEvents) > banEventMaxEvents {
+                h.banEvents = h.banEvents[len(h.banEvents)-banEventMaxEvents:]
+        }
+        h.banEventMu.Unlock()
 }
 
 // Start binds the listener and begins accepting connections.
@@ -2340,6 +2432,28 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 return nil
 
         case MsgTx:
+                // Per-source-IP tx rate limit: a peer flooding transactions
+                // just below the mempool eviction rate can force constant
+                // eviction churn and degrade SelectTxs / block-production
+                // latency.  Check BEFORE unmarshal so throttled floods do not
+                // even pay the deserialization cost.  Keyed by bare IP so a
+                // reconnect on a new source port does not reset the budget.
+                if h.txRate != nil {
+                        txPeerIP := connIP(peer.addr)
+                        allowed, banNow, violations := h.txRate.allow(txPeerIP)
+                        if !allowed {
+                                h.log.Warn("tx rate limit exceeded — dropping transaction",
+                                        "peer", peer.addr,
+                                        "ip", txPeerIP,
+                                        "violations", violations,
+                                        "burst", h.cfg.TxRateBurst,
+                                        "sustained_per_sec", h.cfg.TxRateSustained)
+                                if banNow {
+                                        h.banTxFlooder(txPeerIP, peer, violations)
+                                }
+                                return nil
+                        }
+                }
                 var tx core.Transaction
                 if err := unmarshal(data, &tx); err != nil {
                         return err
