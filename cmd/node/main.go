@@ -1852,6 +1852,10 @@ func run() error {
                                 WhitelistFile:        whitelistFilePath,
                                 KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
                                 MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
+                                TxRateBurst:          cfg.P2P.TxRateBurst,
+                                TxRateSustained:      cfg.P2P.TxRateSustained,
+                                TxRateBanThreshold:   cfg.P2P.TxRateBanThreshold,
+                                TxRateBanDuration:    cfg.P2P.TxRateBanDuration,
                                 MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
                                 GetBlockStallTimeout: cfg.P2P.GetBlockStallTimeout,
                         }, handler, log)
