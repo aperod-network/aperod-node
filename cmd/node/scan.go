@@ -292,6 +292,15 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
+	// ── txidx_complete_height continuity check ────────────────────────────
+	// Read the existing marker before the scan begins so we can decide
+	// after the scan whether the combined coverage (previousScan + thisScan)
+	// is contiguous from block 1.  If it is not (e.g. this is a suffix-only
+	// checkpoint-resume run and the pre-checkpoint prefix was not previously
+	// indexed), we must NOT advance the marker to TipHeight — doing so would
+	// make the background backfill goroutine skip the unindexed prefix.
+	existingTxIdxComplete, _, _ := p.DB.LoadTxIdxCompleteHeight()
+
 	// ── Main scan loop ─────────────────────────────────────────────────────
 	var msScanStart runtime.MemStats
 	runtime.ReadMemStats(&msScanStart)
@@ -470,13 +479,30 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
-	// Record that t/ entries have been written through TipHeight so the
-	// background backfill goroutine (snapshot fast path, see main.go) can
-	// resume from this point on the next restart instead of re-scanning
-	// the entire history.
-	if markErr := p.DB.StoreTxIdxCompleteHeight(p.TipHeight); markErr != nil {
-		p.Log.Warn("failed to persist txidx_complete_height after scan",
-			"err", markErr)
+	// Advance txidx_complete_height only when this scan establishes or
+	// extends a contiguous prefix from block 1.
+	//
+	// Two cases where it is safe to set the marker to TipHeight:
+	//   • scanFrom == 1: we scanned from genesis, so every block 1..TipHeight
+	//     has a t/ entry.
+	//   • scanFrom > 1 && existingTxIdxComplete+1 >= scanFrom: a previous run
+	//     had already indexed blocks 1..existingTxIdxComplete; this run
+	//     extended coverage from scanFrom onward with no gap in between.
+	//
+	// If neither holds (e.g. suffix-only checkpoint-resume with no prior
+	// marker), blocks 1..scanFrom-1 are still unindexed.  Do NOT advance the
+	// marker — the background backfill goroutine must cover that prefix.
+	if scanFrom <= 1 || existingTxIdxComplete+1 >= scanFrom {
+		if markErr := p.DB.StoreTxIdxCompleteHeight(p.TipHeight); markErr != nil {
+			p.Log.Warn("failed to persist txidx_complete_height after scan",
+				"err", markErr)
+		}
+	} else {
+		p.Log.Info("txidx_complete_height not advanced: suffix-only scan with incomplete prefix",
+			"scan_from", scanFrom,
+			"existing_complete", existingTxIdxComplete,
+			"tip_height", p.TipHeight,
+		)
 	}
 
 	// Release UTXO-scan heap to the OS immediately so steady-state operation
