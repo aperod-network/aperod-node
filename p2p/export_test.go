@@ -131,6 +131,17 @@ func SetListenFunc(h *Host, fn func(network, addr string) (net.Listener, error))
 	}
 }
 
+// SetPostConnectHook sets a callback that dialPeer invokes after successfully
+// dialling and registering the connection in pendingConns, but before calling
+// go handleConn.  The hook gives a deterministic test window to call BanPeer
+// while the conn is pending: BanPeer will close it via cancelInFlightDials so
+// handleConn never receives a live connection to a banned peer.
+//
+// Pass nil to clear the hook (no-op in production; the field is always nil).
+func SetPostConnectHook(h *Host, fn func()) {
+	h.postConnectHook = fn
+}
+
 // SetDialFunc replaces the outbound TCP dial function used by dialPeer.
 // The replacement receives a context that BanPeer may cancel while the dial is
 // in progress; the function must honour context cancellation and return
