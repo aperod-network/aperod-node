@@ -354,6 +354,33 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	}
 
 	// Pass 2: apply state changes — cannot fail after pass 1 succeeded.
+	s.applyTxsLocked(block)
+	return nil
+}
+
+// ReplayBlockKnownSpends applies a canonical block during the startup replay
+// scan when the spent key-image set was pre-loaded from the persistent index
+// (KiFromIndex=true in scan.go).  In that situation ApplyBlock's pass-1
+// double-spend check fires for every spending block — the key image is already
+// marked spent — so the whole block would be rejected: its outputs never enter
+// the active set, the spent ring member stays wrongly active in byPubKey, and
+// the spentPubKeys pool (Phase 2 ring decoys) is never rebuilt, silently
+// degrading ring privacy to Phase 1 after every fast-path restart.
+//
+// This method runs ApplyBlock's pass-2 state transition only.  Skipping pass 1
+// is safe here because the replayed blocks come from the local canonical chain
+// and were fully validated (including double-spend checks) when first accepted.
+// keyImages.insert is idempotent, so re-inserting pre-loaded images is a no-op.
+func (s *UTXOSet) ReplayBlockKnownSpends(block *Block) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyTxsLocked(block)
+}
+
+// applyTxsLocked is ApplyBlock's pass 2: marks inputs spent, moves the real
+// spent UTXO from byPubKey to spentPubKeys, records the rollback journal, and
+// adds outputs.  Caller must hold s.mu.
+func (s *UTXOSet) applyTxsLocked(block *Block) {
 	for _, tx := range block.Txs {
 		txHash := tx.Hash()
 		// Mark inputs spent and move the real spent UTXO from byPubKey to
@@ -436,7 +463,6 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 			s.byPubKey[out.OneTimePub] = u
 		}
 	}
-	return nil
 }
 
 // RollbackBlock reverses ApplyBlock for chain reorganization or failed block
