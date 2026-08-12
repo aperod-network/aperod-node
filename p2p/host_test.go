@@ -2755,3 +2755,190 @@ func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
 		t.Errorf("PeerCount = %d after reconnect from banned IP, want 0", h.PeerCount())
 	}
 }
+
+// ─── Relay self-heal test ─────────────────────────────────────────────────────
+
+// TestHost_RelayNode_SelfHeals_AfterMissedSyncWindow verifies the MsgPong
+// self-heal path: when the initial requestHeaders fires during the UTXO-rebuild
+// window and blocks cannot be applied yet, a subsequent keepalive MsgPong from
+// the ahead peer re-triggers requestHeaders so the relay catches up without a
+// manual restart.
+//
+// Scenario:
+//  1. catchingHost (our node, height 0) dials aheadServer (height 5).
+//  2. aheadServer completes the handshake with MsgPong(height=0) so the Pong
+//     handler does not immediately trigger a second requestHeaders — only the
+//     unconditional post-handshake requestHeaders fires.
+//  3. aheadServer receives the initial MsgGetHeaders and silently drops it
+//     (simulates the UTXO-rebuild window where AddBlock rejects all blocks).
+//  4. aheadServer sends MsgPong(height=5), simulating a live keepalive reply
+//     from the ahead peer.
+//  5. catchingHost's MsgPong dispatch sees height 5 > CurrentHeight() 0 and
+//     calls requestHeaders again.
+//  6. This time aheadServer serves the request: MsgHeaders → MsgGetBlock →
+//     MsgBlock, which catchingHost delivers to its handler.
+//  7. The test asserts CurrentHeight() > 0 without any manual restart.
+func TestHost_RelayNode_SelfHeals_AfterMissedSyncWindow(t *testing.T) {
+	// ── 1. Build a one-block chain for the ahead server to serve. ───────────
+	priv, pub, keyErr := crypto.GenerateValidatorKey()
+	if keyErr != nil {
+		t.Fatalf("GenerateValidatorKey: %v", keyErr)
+	}
+	hdr := core.BlockHeader{
+		Height:       1,
+		ValidatorPub: pub,
+		Timestamp:    time.Now().UnixNano(),
+	}
+	if signErr := hdr.Sign(priv); signErr != nil {
+		t.Fatalf("Sign: %v", signErr)
+	}
+	block := &core.Block{Header: hdr}
+	blockMsg := p2p.BlockToMsg(block)
+
+	headersMsg := p2p.HeadersMsg{
+		Headers: []p2p.SerializedHeader{blockMsg.Header},
+	}
+
+	// ── 2. Ahead server: accept one connection and drive the protocol. ───────
+	ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+	if lnErr != nil {
+		t.Fatalf("listen: %v", lnErr)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+
+		// Inbound side: wait for MsgPing from catchingHost (outbound sends first).
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("server: expected MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+
+		// Reply with MsgPong(height=0) so the catching host's MsgPong dispatch
+		// does NOT immediately fire requestHeaders again (0 is not > CurrentHeight()=0).
+		// Only the unconditional post-handshake requestHeaders fires.
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "ahead-server", Height: 0, UserAgent: "test",
+			Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			t.Logf("server: write initial Pong: %v", wErr)
+			return
+		}
+
+		// Phase 1: read the unconditional post-handshake MsgGetHeaders and drop
+		// it silently — simulates the UTXO-rebuild window where AddBlock rejects
+		// all incoming blocks, so the tip cannot advance on this cycle.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr = p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgGetHeaders {
+			t.Logf("server: expected initial MsgGetHeaders, got %v err=%v", mt, rdErr)
+			return
+		}
+		// Intentionally do NOT respond — simulates the blocked-startup window.
+
+		// Phase 2: send a keepalive MsgPong with Height=5 (ahead of the catching
+		// node's tip=0).  This should trigger requestHeaders in the dispatch loop.
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "ahead-server", Height: 5, UserAgent: "test",
+			Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			t.Logf("server: write keepalive Pong(5): %v", wErr)
+			return
+		}
+
+		// Phase 3: serve the Pong-triggered MsgGetHeaders.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr = p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgGetHeaders {
+			t.Logf("server: expected second MsgGetHeaders, got %v err=%v", mt, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgHeaders, headersMsg); wErr != nil {
+			t.Logf("server: write MsgHeaders: %v", wErr)
+			return
+		}
+
+		// Serve MsgGetBlock → MsgBlock.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr = p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgGetBlock {
+			t.Logf("server: expected MsgGetBlock, got %v err=%v", mt, rdErr)
+			return
+		}
+		_ = p2p.WriteMsg(conn, p2p.MsgBlock, blockMsg) //nolint:errcheck
+
+		// Hold the connection open until the test finishes so the catching host
+		// does not see an EOF before OnBlock is called.
+		time.Sleep(3 * time.Second)
+	}()
+
+	// ── 3. Catching host: start at height 0. ─────────────────────────────────
+	catchHandler := &heightTrackingHandler{}
+	catchingHost := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   5,
+		NodeID:     "catching-node",
+		UserAgent:  "aperod/test",
+		// High threshold so block height 1 (above tip 0) never earns a
+		// rogue-fork strike while our tip is still at 0.
+		BadBlockHeightLead:   1_000,
+		BadBlockBanThreshold: 10_000,
+	}, catchHandler, newTestLogger())
+	if err := catchingHost.Start(); err != nil {
+		t.Fatalf("catchingHost.Start: %v", err)
+	}
+	defer catchingHost.Stop()
+
+	// ── 4. Dial the ahead server. ────────────────────────────────────────────
+	catchingHost.DialPeer(ln.Addr().String())
+
+	// ── 5. Assert self-heal: CurrentHeight() must advance above 0. ───────────
+	// Budget: 4 s.  All steps are local in-process so this is very generous:
+	//   dial+handshake (~10 ms) → initial GetHeaders dropped → Pong(5) triggers
+	//   second GetHeaders → Headers → GetBlock → Block → OnBlock → height=1.
+	var gotHeight uint64
+	if !waitFor(4*time.Second, func() bool {
+		gotHeight = catchHandler.CurrentHeight()
+		return gotHeight > 0
+	}) {
+		t.Fatalf("relay node did not self-heal after missed sync window: CurrentHeight()=%d, want >0", gotHeight)
+	}
+	t.Logf("✓ relay self-healed: CurrentHeight()=%d (tip advanced without manual restart)", gotHeight)
+
+	<-serverDone
+}
+
+// heightTrackingHandler is a Handler stub that advances its reported height
+// whenever OnBlock is called with a higher block, mimicking a real chain
+// handler that accepts incoming blocks and updates its tip.
+type heightTrackingHandler struct {
+	mu     sync.Mutex
+	height uint64
+}
+
+func (h *heightTrackingHandler) OnBlock(b *core.Block) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if b.Header.Height > h.height {
+		h.height = b.Header.Height
+	}
+}
+func (h *heightTrackingHandler) OnTransaction(_ *core.Transaction)    {}
+func (h *heightTrackingHandler) OnVote(_ p2p.VoteMsg)                 {}
+func (h *heightTrackingHandler) CurrentHeight() uint64                 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.height
+}
+func (h *heightTrackingHandler) CurrentTailHashes(_ int) []crypto.Hash32 { return nil }
+func (h *heightTrackingHandler) GetBlock(_ crypto.Hash32) *core.Block    { return nil }
