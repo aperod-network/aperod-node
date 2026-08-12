@@ -2790,6 +2790,12 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         // in both raw and canonical form, so the LevelDB k/ index purge below
         // recognises entries written via either MarkKeyImageSpent path.
         valid := make(map[crypto.KeyImage]bool)
+        // scanComplete guards the purge below: deleting index entries based on an
+        // INCOMPLETE block scan could remove a genuinely confirmed key image and
+        // re-open a spent output.  Any unreadable or undecodable block therefore
+        // disables the purge (fail closed); re-persisting confirmed key images is
+        // additive and stays safe either way.
+        scanComplete := true
         for h := uint64(1); h <= tipHeight; h++ {
                 if h%100000 == 0 {
                         log.Info("--rebuild-key-images: scanning blocks",
@@ -2797,10 +2803,16 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                 }
                 raw, err := blockStore.GetRawBlockByHeight(h)
                 if err != nil || raw == nil {
+                        log.Warn("--rebuild-key-images: block unreadable — phantom purge disabled (fail closed)",
+                                "height", h, "err", err)
+                        scanComplete = false
                         continue
                 }
                 var blk core.Block
                 if jsonErr := json.Unmarshal(raw, &blk); jsonErr != nil {
+                        log.Warn("--rebuild-key-images: block undecodable — phantom purge disabled (fail closed)",
+                                "height", h, "err", jsonErr)
+                        scanComplete = false
                         continue
                 }
                 for _, tx := range blk.Txs {
@@ -2821,6 +2833,19 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         // entries stay there, the same UTXOs become unspendable again after the
         // next snapshot loss (exactly the OOM-kill scenario this flag repairs).
         removed := 0
+        if !scanComplete {
+                log.Error("--rebuild-key-images: block scan incomplete — skipping phantom purge; " +
+                        "repair the block store (--repair-db) and re-run to purge phantom entries")
+                // Still re-persist the confirmed key images we did observe (additive,
+                // safe) so the index is at least as complete as before.
+                for ki := range valid {
+                        if kiErr := blockStore.MarkKeyImageSpent(ki); kiErr != nil {
+                                log.Warn("--rebuild-key-images: failed to persist key image",
+                                        "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
+                        }
+                }
+                return count, nil
+        }
         purgeErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
                 if valid[ki] {
                         return nil

@@ -4,6 +4,7 @@ import (
         "encoding/hex"
         "encoding/json"
         "fmt"
+        "strings"
 
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
@@ -426,16 +427,20 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         // Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
         verifier := core.NewTxVerifier(s.utxos)
         if err := verifier.VerifyTx(&result.Tx); err != nil {
-                if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
-                        return nil, fmt.Errorf("verify: %w", dsErr)
+                if isKeyImageConflictErr(err) {
+                        if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
+                                return nil, fmt.Errorf("verify: %w", dsErr)
+                        }
                 }
                 return nil, fmt.Errorf("verify: %w", err)
         }
 
         // ── 7. Submit to mempool ──────────────────────────────────────────────────
         if err := s.mempool.Add(result.Tx); err != nil {
-                if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
-                        return nil, fmt.Errorf("mempool: %w", dsErr)
+                if isKeyImageConflictErr(err) {
+                        if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
+                                return nil, fmt.Errorf("mempool: %w", dsErr)
+                        }
                 }
                 return nil, fmt.Errorf("mempool: %w", err)
         }
@@ -471,7 +476,22 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
 // key images that never appeared in any confirmed transaction (Task #1929);
 // operators repair that with `aperod-node --rebuild-key-images`.
 //
+// isKeyImageConflictErr reports whether an error from VerifyTx or Mempool.Add
+// is a key-image double-spend conflict (verifier: "already spent";
+// mempool: "double-spend attempt, key image conflicts with tx …").
+func isKeyImageConflictErr(err error) bool {
+        if err == nil {
+                return false
+        }
+        msg := err.Error()
+        return strings.Contains(msg, "already spent") || strings.Contains(msg, "double-spend")
+}
+
 // Returns nil when no input is flagged (the original error was unrelated).
+//
+// Callers must gate on isKeyImageConflictErr first: attributing an unrelated
+// verification error to a "spent" UTXO (e.g. after a block landed between
+// VerifyTx and the re-check) would make wallets skip a healthy candidate.
 func describeSpentInput(utxos *core.UTXOSet, result *core.BuildResult) error {
         if utxos == nil || result == nil {
                 return nil

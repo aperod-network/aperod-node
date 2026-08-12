@@ -94,3 +94,50 @@ func TestRebuildKeyImagesPurgesPhantomIndexEntries(t *testing.T) {
 		t.Errorf("missing confirmed key image must be re-persisted (spent=%v err=%v)", spent, err)
 	}
 }
+
+// TestRebuildKeyImagesFailClosedOnIncompleteScan verifies that the phantom
+// purge is skipped when any block in [1, tip] cannot be read: deleting index
+// entries based on an incomplete scan could remove a genuinely confirmed key
+// image and re-open a spent output.
+func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var confirmedKI, unknownKI crypto.KeyImage
+	confirmedKI[0] = 0xC1
+	unknownKI[0] = 0xF1
+
+	// Block at height 2 only — height 1 is missing, so the scan is incomplete.
+	blk := &core.Block{}
+	blk.Header.Height = 2
+	blk.Txs = []core.Transaction{{Inputs: []core.RingInput{{KeyImage: confirmedKI}}}}
+	raw, err := json.Marshal(blk)
+	if err != nil {
+		t.Fatalf("marshal block: %v", err)
+	}
+	if err := db.PutRawBlock(blk.Hash(), 2, raw); err != nil {
+		t.Fatalf("PutRawBlock: %v", err)
+	}
+
+	// unknownKI is not in block 2 — but it MIGHT be in the unreadable block 1,
+	// so the purge must not touch it.
+	if err := db.MarkKeyImageSpent(unknownKI); err != nil {
+		t.Fatalf("MarkKeyImageSpent: %v", err)
+	}
+
+	utxos := core.NewUTXOSet()
+	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, slog.Default()); err != nil {
+		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
+	}
+
+	if spent, err := db.IsKeyImageSpent(unknownKI); err != nil || !spent {
+		t.Errorf("incomplete scan must NOT purge index entries (spent=%v err=%v)", spent, err)
+	}
+	if spent, err := db.IsKeyImageSpent(confirmedKI); err != nil || !spent {
+		t.Errorf("observed confirmed key image must still be re-persisted (spent=%v err=%v)", spent, err)
+	}
+}
