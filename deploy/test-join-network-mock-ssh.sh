@@ -257,6 +257,9 @@ elif echo \"\${CMD}\" | grep -q 'systemctl show'; then
   # verify-dropin.sh checks these two settings over ssh
   echo 'Environment=GOMEMLIMIT=5368709120'
   echo 'TimeoutStopUSec=15min'
+elif echo \"\${CMD}\" | grep -q 'test -f'; then
+  # verify-dropin.sh checks that drop-in files exist on the target
+  echo 'yes'
 elif echo \"\${CMD}\" | grep -q 'curl'; then
   echo '{\"ok\":true}'
 else
