@@ -944,22 +944,22 @@ func saveSnapAtHeight(t *testing.T, dir string, height uint64, hashHex string) {
 	}
 }
 
-// assertCorruptSnapshotReason runs err through logSnapshotStartupReason and
-// asserts the emitted startup_reason equals want ("corrupt_snapshot" or
-// "no_snapshot") — the exact wiring run() uses when snapLoaded=false.
-func assertCorruptSnapshotReason(t *testing.T, err error, height uint64, want string) {
+// assertStartupReasonInBuf asserts that the captured logger buffer — filled by
+// tryLoadStartupSnapshot itself, the exact helper run() calls — contains the
+// structured startup_reason entry with the wanted value ("corrupt_snapshot" or
+// "no_snapshot").  Because the assertion reads the SAME buffer the production
+// helper wrote to, these tests fail if tryLoadStartupSnapshot ever stops
+// calling logSnapshotStartupReason on a load failure.
+func assertStartupReasonInBuf(t *testing.T, buf *bytes.Buffer, want string) {
 	t.Helper()
-	var buf bytes.Buffer
-	logSnapshotStartupReason(err, height, newCaptureLogger(&buf))
-
 	wantMsg := "snapshot corrupt or unreadable — falling back to full block scan"
 	if want == "no_snapshot" {
 		wantMsg = "no snapshot found — full block scan required"
 	}
-	if !logContainsMsg(&buf, wantMsg) {
-		t.Fatalf("expected log %q, got:\n%s", wantMsg, buf.String())
+	if !logContainsMsg(buf, wantMsg) {
+		t.Fatalf("expected log %q emitted by tryLoadStartupSnapshot, got:\n%s", wantMsg, buf.String())
 	}
-	reason, ok := logFieldValue(&buf, wantMsg, "startup_reason")
+	reason, ok := logFieldValue(buf, wantMsg, "startup_reason")
 	if !ok || reason != want {
 		t.Errorf("startup_reason = %q (ok=%v), want %q", reason, ok, want)
 	}
@@ -973,7 +973,8 @@ func assertCorruptSnapshotReason(t *testing.T, err error, height uint64, want st
 // startup_reason=corrupt_snapshot, not a silent wrong-state fast path.
 func TestSilentReplacement_WrongHeightContentAtTipPath(t *testing.T) {
 	dir := t.TempDir()
-	log := newCaptureLogger(&bytes.Buffer{})
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
 
 	const oldHeight, newHeight = uint64(5), uint64(6)
 	const newHash = "beefbeef"
@@ -993,7 +994,9 @@ func TestSilentReplacement_WrongHeightContentAtTipPath(t *testing.T) {
 		t.Fatalf("copy checksum sidecar: %v", err)
 	}
 
-	_, _, err := loadStartupSnapshotWithFallback(dir, newHeight, newHash, log)
+	// Production step: run() calls tryLoadStartupSnapshot, which both loads
+	// (with fallbacks) AND emits the startup_reason entry on failure.
+	_, _, err := tryLoadStartupSnapshot(dir, newHeight, newHash, log)
 	if err == nil {
 		t.Fatal("stale snapshot content at the current tip path was ACCEPTED — height check bypassed")
 	}
@@ -1004,7 +1007,7 @@ func TestSilentReplacement_WrongHeightContentAtTipPath(t *testing.T) {
 		t.Errorf("expected a height-mismatch rejection, got: %v", err)
 	}
 
-	assertCorruptSnapshotReason(t, err, newHeight, "corrupt_snapshot")
+	assertStartupReasonInBuf(t, &buf, "corrupt_snapshot")
 }
 
 // TestSilentReplacement_WrongHashSameHeight covers mode B: the primary at the
@@ -1013,14 +1016,15 @@ func TestSilentReplacement_WrongHeightContentAtTipPath(t *testing.T) {
 // must classify as corrupt_snapshot.
 func TestSilentReplacement_WrongHashSameHeight(t *testing.T) {
 	dir := t.TempDir()
-	log := newCaptureLogger(&bytes.Buffer{})
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
 
 	const height = uint64(9)
 
 	// The file on disk claims hash "aaaa1111", but the DB tip hash is different.
 	saveSnapAtHeight(t, dir, height, "aaaa1111")
 
-	_, _, err := loadStartupSnapshotWithFallback(dir, height, "bbbb2222", log)
+	_, _, err := tryLoadStartupSnapshot(dir, height, "bbbb2222", log)
 	if err == nil {
 		t.Fatal("snapshot with mismatched tip hash was ACCEPTED — hash check bypassed")
 	}
@@ -1031,7 +1035,7 @@ func TestSilentReplacement_WrongHashSameHeight(t *testing.T) {
 		t.Errorf("expected a hash-mismatch rejection, got: %v", err)
 	}
 
-	assertCorruptSnapshotReason(t, err, height, "corrupt_snapshot")
+	assertStartupReasonInBuf(t, &buf, "corrupt_snapshot")
 }
 
 // TestSilentReplacement_StaleSnapshotAtOldHeightIgnored covers mode C: a valid
@@ -1042,13 +1046,14 @@ func TestSilentReplacement_WrongHashSameHeight(t *testing.T) {
 // sees startup_reason=no_snapshot (clean full-scan, not corruption).
 func TestSilentReplacement_StaleSnapshotAtOldHeightIgnored(t *testing.T) {
 	dir := t.TempDir()
-	log := newCaptureLogger(&bytes.Buffer{})
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
 
 	const oldHeight, newHeight = uint64(41), uint64(42)
 
 	saveSnapAtHeight(t, dir, oldHeight, "0ddba11c")
 
-	snap, _, err := loadStartupSnapshotWithFallback(dir, newHeight, "5eaf00d5", log)
+	snap, _, err := tryLoadStartupSnapshot(dir, newHeight, "5eaf00d5", log)
 	if err == nil {
 		t.Fatalf("expected error, got snapshot at height %d (stale file loaded as current state!)", snap.TipHeight)
 	}
@@ -1056,5 +1061,5 @@ func TestSilentReplacement_StaleSnapshotAtOldHeightIgnored(t *testing.T) {
 		t.Fatalf("expected os.ErrNotExist (stale file ignored), got: %v", err)
 	}
 
-	assertCorruptSnapshotReason(t, err, newHeight, "no_snapshot")
+	assertStartupReasonInBuf(t, &buf, "no_snapshot")
 }
