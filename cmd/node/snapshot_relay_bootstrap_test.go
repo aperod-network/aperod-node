@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -205,52 +206,107 @@ func TestRelayBootstrap_RestorePopulatesRegistryAndUTXOs(t *testing.T) {
 	}
 }
 
-// ─── Test 3: block signed by snapshotted validator is accepted by Chain ────────
+// ─── Test 3: relay consensus engine accepts block after rsync snapshot restore ──
 
-// TestRelayBootstrap_IncomingBlockAccepted is the end-to-end guard: after the
-// snapshot is restored, a block signed by the snapshotted validator can be
-// added to a Chain seeded from the same genesis.  This mirrors what happens on
-// a relay node after bootstrap: it restores the snapshot, builds its Chain from
-// the genesis block, then accepts the first incoming block from a peer.
+// TestRelayBootstrap_IncomingBlockAccepted is the full end-to-end guard for the
+// silent-rejection bug (task #1659).
+//
+// Scenario — mirrors production bootstrap via rsync:
+//  1. A real validator engine produces block 1.
+//  2. An operator rsyncs chain.db + snapshot from the running peer.
+//     The rsync'd DB metadata shows 5% fewer active UTXOs than the snapshot
+//     (the donor node's last saved count predates some transactions).
+//  3. The relay node starts with non_validator=true and configured tolerance 1%.
+//     checkSnapshotUTXOCount applies the 10% floor and accepts the snapshot.
+//  4. RestoreFromSnapshot populates the relay's UTXOSet and ValidatorRegistry.
+//  5. A relay consensus.Engine is built with Config.Validators seeded from the
+//     restored registry — exactly as main.go does in the NonValidator=true path.
+//  6. Block 1 arrives from the real validator via NewBlockCh().
+//  7. The relay engine's handleIncomingBlock() runs isKnownValidator() and
+//     proposerAt() against the restored registry — both must pass.
+//  8. The relay chain advances to height 1, proving the block was accepted.
+//
+// Before the fix: step 3 rejected the snapshot → registry stayed zeroed →
+// isKnownValidator() returned false for every incoming block → silent rejection.
 func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 	dir := t.TempDir()
 
-	// Generate the validator that will produce and sign the incoming block.
+	// ── Step 1: validator engine produces block 1 ─────────────────────────────
 	valPriv, valPub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatalf("GenerateValidatorKey: %v", err)
 	}
-
-	// Build genesis block (height 0) signed by the validator.
 	genesis := makeSignedBlk(t, 0, crypto.Hash32{}, valPriv, valPub)
 
-	// Create the chain from genesis.
-	chain := core.NewChain()
-	if err := chain.SetGenesis(genesis); err != nil {
-		t.Fatalf("SetGenesis: %v", err)
+	validatorChain := core.NewChain()
+	if err := validatorChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("validator SetGenesis: %v", err)
+	}
+	lk, err := crypto.NewLockedValidatorKey(valPriv.Bytes(), nil)
+	if err != nil {
+		t.Fatalf("NewLockedValidatorKey: %v", err)
+	}
+	defer lk.Destroy()
+
+	validatorUTXOs := core.NewUTXOSet()
+	validatorReg := core.NewValidatorRegistry()
+	validatorMp := core.NewMempool(core.DefaultMempoolConfig())
+	validatorEng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   []crypto.ValidatorPubKey{valPub},
+		Registry:     validatorReg,
+		MyKey:        lk,
+	}, validatorChain, validatorMp, silentLog())
+	validatorEng.SetTxVerifier(core.NewTxVerifier(validatorUTXOs), validatorUTXOs)
+
+	validatorStop := make(chan struct{})
+	go validatorEng.Run(validatorStop)
+	defer close(validatorStop)
+
+	var block1 *core.Block
+	select {
+	case block1 = <-validatorEng.ProducedCh():
+		// got the produced block
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timeout: validator engine did not produce block 1 within 500 ms")
+	}
+	if block1.Header.Height != 1 {
+		t.Fatalf("expected block at height 1, got %d", block1.Header.Height)
 	}
 
-	// Build the snapshot at height 0 (as rsync'd from the running peer).
+	// ── Step 2: build and save a snapshot (as rsync'd from the running peer) ──
+	// The snapshot is taken at genesis (height 0) and carries the validator's
+	// registry entry — exactly what the relay node receives after rsync.
 	tipHashArr := genesis.Hash()
 	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
-	valPubHex := fmt.Sprintf("%x", valPub[:])
+	valPubHex := valPub.Hex()
+
+	// 100 UTXOs with distinct TxHash values (prevents UTXOKey collisions).
+	activeUTXOs := make([]*core.UTXO, 100)
+	for i := range activeUTXOs {
+		var txHash crypto.Hash32
+		txHash[0] = byte(i)
+		txHash[1] = byte(i >> 8)
+		activeUTXOs[i] = &core.UTXO{TxHash: txHash, BlockHeight: uint64(i + 1)}
+	}
 
 	snap := startupSnapshot{
 		Version:    snapVersion,
 		TipHeight:  0,
 		TipHashHex: tipHashHex,
 		TxTotal:    0,
-		UTXOs:      core.UTXOSnapshot{},
+		UTXOs:      core.UTXOSnapshot{ActiveUTXOs: activeUTXOs},
 		Registry: core.RegistrySnapshot{
 			Validators: map[string]*core.ValidatorEntry{
 				valPubHex: {
 					PubKey:    valPub,
-					StakeNAPR: 1_000_000_000,
+					StakeNAPR: core.MinStakeNAPR * 10,
+					Status:    core.ValidatorActive,
 				},
 			},
 		},
 	}
-
 	if err := saveStartupSnapshot(dir, snap); err != nil {
 		t.Fatalf("saveStartupSnapshot: %v", err)
 	}
@@ -259,8 +315,7 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 		t.Fatalf("loadStartupSnapshot: %v", serr)
 	}
 
-	// Open a DB that mimics an rsync'd chain.db — no active-UTXO metadata entry
-	// (rsync copies the chain blocks but not the snapshot metadata).
+	// ── Step 3: rsync scenario — DB metadata shows 5% fewer UTXOs than snapshot
 	dbPath := filepath.Join(dir, "chain.db")
 	db, derr := store.Open(dbPath)
 	if derr != nil {
@@ -268,51 +323,78 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Donor's DB metadata recorded 95 active UTXOs; snapshot has 100 — 5% divergence.
+	// Configured tolerance is 1%; nonValidator floor of 10% must apply.
+	const donorCount = 95
+	if err := db.StoreActiveUTXOCount(tipHashHex, donorCount); err != nil {
+		t.Fatalf("StoreActiveUTXOCount: %v", err)
+	}
+
 	var logBuf bytes.Buffer
 	log := newCaptureLogger(&logBuf)
 
-	// With no DB metadata entry, the check is skipped and the snapshot is
-	// accepted (identical to the "first snapshot" path on the relay node).
 	ok := checkSnapshotUTXOCount(db, len(loaded.UTXOs.ActiveUTXOs), tipHashHex,
 		1.0 /* configuredPct */, false /* isRelaxed */, true /* nonValidator */, log)
 	if !ok {
-		t.Fatalf("checkSnapshotUTXOCount returned false; log:\n%s", logBuf.String())
-	}
-	if !logContainsMsg(&logBuf, "snapshot UTXO count check skipped — no prior active count in db (first snapshot)") {
-		t.Errorf("expected 'check skipped' log when DB has no metadata; log:\n%s", logBuf.String())
+		t.Fatalf("checkSnapshotUTXOCount rejected snapshot (5%% divergence should pass "+
+			"with nonValidator floor 10%%); log:\n%s", logBuf.String())
 	}
 
-	// Restore snapshot into fresh in-memory structures (mirrors main.go).
-	utxos := core.NewUTXOSet()
-	registry := core.NewValidatorRegistry()
-	utxos.RestoreFromSnapshot(loaded.UTXOs)
-	registry.RestoreFromSnapshot(loaded.Registry)
-	registry.SetUTXOSet(utxos)
+	// ── Step 4: restore snapshot into fresh in-memory structures ─────────────
+	relayUTXOs := core.NewUTXOSet()
+	relayReg := core.NewValidatorRegistry()
+	relayUTXOs.RestoreFromSnapshot(loaded.UTXOs)
+	relayReg.RestoreFromSnapshot(loaded.Registry)
+	relayReg.SetUTXOSet(relayUTXOs)
 
-	// Registry must be populated so the relay can validate incoming blocks.
-	snap2 := registry.TakeSnapshot()
-	if _, found := snap2.Validators[valPubHex]; !found {
-		t.Fatalf("validator missing from restored registry; relay will reject all incoming blocks "+
-			"with 'producer X is not the scheduled proposer 00000000'")
+	// Guard: registry must be non-empty before building the engine.
+	restoredVals := relayReg.GetActiveValidators()
+	if len(restoredVals) == 0 {
+		t.Fatalf("restored registry has no active validators; relay engine will reject " +
+			"all incoming blocks with 'producer X is not the scheduled proposer 00000000'")
 	}
 
-	// Build and sign a block at height 1 — the first "incoming" peer block.
-	incomingBlock := &core.Block{
-		Header: core.BlockHeader{
-			Height:       1,
-			PrevHash:     tipHashArr,
-			Timestamp:    time.Now().UnixNano(),
-			ValidatorPub: valPub,
-			MerkleRoot:   core.MerkleRoot(nil),
-		},
+	// ── Step 5: build relay consensus engine from restored registry ───────────
+	// main.go NonValidator=true branch: Config.Validators = genesis validator pub keys,
+	// Registry = restored registry.  InitFromGenesis skips keys already present.
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
 	}
-	if err := incomingBlock.Header.Sign(valPriv); err != nil {
-		t.Fatalf("Sign block h=1: %v", err)
-	}
+	relayMp := core.NewMempool(core.DefaultMempoolConfig())
+	relayEng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   restoredVals, // seeded from restored snapshot registry
+		Registry:     relayReg,
+		MyKey:        nil, // non-validator: never produces blocks
+	}, relayChain, relayMp, silentLog())
+	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
 
-	// Chain.AddBlock must succeed — this is the "incoming valid block is accepted" criterion.
-	if err := chain.AddBlock(incomingBlock); err != nil {
-		t.Errorf("chain.AddBlock(h=1) failed: %v; "+
-			"relay node rejected an incoming block from the snapshotted validator", err)
+	relayStop := make(chan struct{})
+	go relayEng.Run(relayStop)
+	defer close(relayStop)
+
+	// ── Steps 6–8: submit block 1 and assert relay chain advances ─────────────
+	// handleIncomingBlock exercises isKnownValidator() and proposerAt() against
+	// the relay's restored registry.  Both must pass for the chain to advance.
+	relayEng.NewBlockCh() <- block1
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case <-deadline:
+			t.Errorf("relay chain height = %d after 300 ms, want 1; "+
+				"isKnownValidator() or proposerAt() rejected the block despite "+
+				"registry being restored from snapshot (rsync bootstrap regression)",
+				relayChain.Height())
+			return
+		default:
+			if relayChain.Height() == 1 {
+				t.Log("OK: relay engine accepted block 1 after rsync-bootstrap snapshot restore")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 }
