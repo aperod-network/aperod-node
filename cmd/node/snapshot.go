@@ -284,14 +284,19 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	// every first-time checkpoint because no prior backup source existed,
 	// forcing a full rescan after any crash mid genesis scan.
 	if _, statErr := os.Stat(path); statErr == nil {
-		if err := copyFile(path, snapshotPrevPath(path)); err != nil {
-			return fmt.Errorf("write same-height prev backup: %w", err)
-		}
-		// Sidecar promotion is fail-closed: aborting the save here leaves the
-		// original primary (and its sidecar) fully intact on disk, so the node
-		// can still recover from it on the next start.
+		// Staged publication (fail-closed): promote the SIDECAR first, then
+		// the snapshot file.  If the sidecar copy fails, nothing has been
+		// touched — the old prev backup (and its sidecar) remain intact and
+		// the save aborts with the original primary still on disk.  If the
+		// file copy then fails, the prev sidecar already holds the NEW digest
+		// while the prev file is still the OLD content — verification fails
+		// and loaders fall back, rather than accepting a prev backup whose
+		// integrity can no longer be proven.
 		if err := copySnapshotChecksum(path, snapshotPrevPath(path)); err != nil {
 			return fmt.Errorf("promote checksum sidecar for same-height prev backup: %w", err)
+		}
+		if err := copyFile(path, snapshotPrevPath(path)); err != nil {
+			return fmt.Errorf("write same-height prev backup: %w", err)
 		}
 	}
 
@@ -316,12 +321,14 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 			if full == path {
 				continue // same height already handled by the guard above
 			}
-			if copyErr := copyFile(full, snapshotPrevPath(full)); copyErr == nil {
-				// Best-effort loop: a sidecar promotion failure is ignored here
-				// (no logger in scope), but copySnapshotChecksum leaves any
-				// stale destination sidecar in place on failure, so a suspect
-				// prev backup fails verification and falls back — fail-closed.
-				_ = copySnapshotChecksum(full, snapshotPrevPath(full))
+			// Staged publication, same order as the same-height guard: sidecar
+			// first, then the file.  A sidecar failure skips the file copy
+			// entirely (old prev state intact); a file-copy failure after the
+			// sidecar leaves a digest that does not match the old prev content,
+			// forcing verification failure and fallback — never an unverified
+			// prev backup from a checksum-protected source.
+			if chkErr := copySnapshotChecksum(full, snapshotPrevPath(full)); chkErr == nil {
+				_ = copyFile(full, snapshotPrevPath(full))
 			}
 			break // only one other primary should exist at a time
 		}
@@ -352,18 +359,22 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 		return fmt.Errorf("close snapshot tmp: %w", fCloseErr)
 	}
 
+	// Staged publication (fail-closed): write the SHA-256 sidecar BEFORE
+	// renaming the snapshot into place.  A sidecar write failure aborts the
+	// save while the previous primary (and its matching sidecar, when the
+	// heights differ) is still on disk — a current-binary snapshot is never
+	// published without its checksum, so it can never be mistaken for an
+	// unchecked legacy file on restart.  If the rename below then fails, the
+	// sidecar already holds the NEW digest while path still has the OLD
+	// content — verification fails and loaders fall back to the prev backup
+	// promoted above, rather than serving a file of unproven integrity.
+	if chkErr := writeSnapshotChecksum(path, hasher.Sum(nil)); chkErr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write snapshot checksum sidecar: %w", chkErr)
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("rename snapshot: %w", err)
-	}
-
-	// Write the SHA-256 sidecar AFTER the primary is in place.  A sidecar
-	// write failure must not fail the save (a missing sidecar only skips
-	// verification), but any STALE sidecar from a previous save at this
-	// height must be removed — otherwise the fresh snapshot would fail
-	// verification against the old digest on the next startup.
-	if chkErr := writeSnapshotChecksum(path, hasher.Sum(nil)); chkErr != nil {
-		_ = os.Remove(snapshotChecksumPath(path))
 	}
 	return nil
 }
