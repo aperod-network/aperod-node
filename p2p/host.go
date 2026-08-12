@@ -905,15 +905,25 @@ func (h *Host) DropPeer(addr string) bool {
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is
 // closed immediately and future dial/accept attempts from that address are
 // rejected.
+//
+// mgr.Ban now also stores a bare-IP entry when addr is "IP:port", so a
+// reconnect on a different source port (e.g. the peer's listen port vs the
+// ephemeral connection port recorded here) is blocked without any extra work.
+// We close ALL active connections whose source IP matches addr's IP — not just
+// the one exact-addr match — to mirror the rogue-fork ban path and ensure no
+// sibling connection from the same host slips through.
 func (h *Host) BanPeer(addr, reason string, d time.Duration) {
         h.mgr.Ban(addr, reason, d)
+        bannedIP := connIP(addr)
         h.mu.Lock()
-        if p, ok := h.peers[addr]; ok {
-                p.conn.Close()
-                delete(h.peers, addr)
+        for a, p := range h.peers {
+                if connIP(a) == bannedIP {
+                        p.conn.Close()
+                        delete(h.peers, a)
+                }
         }
         h.mu.Unlock()
-        h.log.Info("peer banned", "addr", addr, "reason", reason, "duration", d)
+        h.log.Info("peer banned", "addr", addr, "ip", bannedIP, "reason", reason, "duration", d)
 }
 
 // Start binds the listener and begins accepting connections.
@@ -1278,7 +1288,18 @@ func (h *Host) maintainLoop() {
 
                 if count < h.cfg.MinPeers {
                         // Re-dial known peers discovered via peer exchange.
+                        // Check IsBanned here — before launching the goroutine —
+                        // to close the brief window where a peer was banned by the
+                        // rogue-fork path (or BanPeer) and the ban write raced with
+                        // this loop's snapshot of h.peers.  dialPeer has its own
+                        // IsBanned guard as a second layer, but skipping the goroutine
+                        // entirely avoids unnecessary TCP dial attempts and the small
+                        // scheduler-induced window where the goroutine may run before
+                        // a concurrent ban write completes.
                         for _, addr := range known {
+                                if h.mgr.IsBanned(addr) {
+                                        continue
+                                }
                                 h.mu.RLock()
                                 _, connected := h.peers[addr]
                                 h.mu.RUnlock()
@@ -1355,6 +1376,14 @@ func (h *Host) maintainLoop() {
                 }
 
                 for _, addr := range allBootnodeAddrs {
+                        // Mirror the IsBanned guard applied to the MinPeers path
+                        // above: skip banned bootnodes before touching h.mu so the
+                        // ban check and the connection-table check are both done
+                        // outside the lock, minimising lock contention and closing
+                        // the goroutine-scheduling window described in task #1650.
+                        if h.mgr.IsBanned(addr) {
+                                continue
+                        }
                         h.mu.RLock()
                         _, connected := h.peers[addr]
                         h.mu.RUnlock()
