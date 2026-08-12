@@ -55,6 +55,20 @@ func (s *stubHandler) blockCount() int {
 	return len(s.blocks)
 }
 
+// txCount returns the number of transactions received so far, safe for concurrent use.
+func (s *stubHandler) txCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.txs)
+}
+
+// voteCount returns the number of votes received so far, safe for concurrent use.
+func (s *stubHandler) voteCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.votes)
+}
+
 func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
