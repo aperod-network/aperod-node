@@ -260,6 +260,102 @@ func runCheckStore() error {
         return nil
 }
 
+// runRepairHeightIndex implements the --repair-height-index subcommand.
+//
+// Usage: aperod-node --repair-height-index --data-dir=<path>
+//
+// Scans every block in chain.db (b/ namespace), builds a height→hash map from
+// the actual block data, then rewrites any h/<height> entry that is absent or
+// mismatched.  This fixes the class of corruption that the tip-only startup
+// integrity check cannot address: zeroed or missing index entries at heights
+// below the tip — the typical symptom of a live-LevelDB rsync.
+//
+// The node MUST be stopped before running this command.  Unlike --check-store
+// (which counts gaps) this command actually repairs them.
+//
+// On success it writes a sentinel so the auto-repair path inside run() knows
+// the index has been verified and will not re-scan from scratch on every
+// subsequent restart.
+func runRepairHeightIndex() error {
+        dataDir := ""
+        args := os.Args[1:]
+        for i, arg := range args {
+                switch {
+                case strings.HasPrefix(arg, "--data-dir="):
+                        dataDir = strings.TrimPrefix(arg, "--data-dir=")
+                case arg == "--data-dir" && i+1 < len(args):
+                        dataDir = args[i+1]
+                }
+        }
+        if dataDir == "" {
+                return fmt.Errorf("--repair-height-index requires --data-dir=<path>")
+        }
+
+        dbPath := filepath.Join(dataDir, "chain.db")
+        db, err := store.Open(dbPath)
+        if err != nil {
+                return fmt.Errorf("repair-height-index: open %s: %w", dbPath, err)
+        }
+        defer db.Close()
+
+        _, tipHeight, err := db.GetTip()
+        if err != nil {
+                return fmt.Errorf("repair-height-index: read tip: %w", err)
+        }
+        if tipHeight == 0 {
+                fmt.Fprintf(os.Stdout, "repair-height-index: empty store (tip_height=0) — nothing to repair\n")
+                return nil
+        }
+
+        fmt.Fprintf(os.Stdout,
+                "repair-height-index: scanning %d stored blocks (tip_height=%d)...\n",
+                tipHeight+1, tipHeight)
+
+        lastPct := uint64(101) // sentinel so first progress call always prints
+        progress := func(scanned, total uint64) {
+                if total == 0 {
+                        return
+                }
+                pct := scanned * 100 / total
+                if pct != lastPct {
+                        fmt.Fprintf(os.Stdout,
+                                "repair-height-index: %d / %d (%d%%)\r",
+                                scanned, total, pct)
+                        lastPct = pct
+                }
+        }
+
+        repaired, repErr := db.RepairAllHeightIndex(tipHeight, progress)
+        fmt.Fprintf(os.Stdout, "\n") // newline after \r progress line
+
+        if repaired > 0 {
+                // Write sentinel so normal startup skips the auto-repair sweep.
+                if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
+                        fmt.Fprintf(os.Stderr,
+                                "repair-height-index: warning: failed to write sentinel: %v\n", sentErr)
+                }
+                fmt.Fprintf(os.Stdout,
+                        "repair-height-index: repaired %d height-index entries "+
+                                "(tip_height=%d) — start normally\n",
+                        repaired, tipHeight)
+        } else {
+                // Index was already consistent; still write the sentinel so
+                // subsequent starts also skip the (now unnecessary) sweep.
+                if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
+                        fmt.Fprintf(os.Stderr,
+                                "repair-height-index: warning: failed to write sentinel: %v\n", sentErr)
+                }
+                fmt.Fprintf(os.Stdout,
+                        "repair-height-index: height index already consistent "+
+                                "(tip_height=%d, 0 entries repaired) — start normally\n",
+                        tipHeight)
+        }
+        if repErr != nil {
+                return fmt.Errorf("repair-height-index: %w", repErr)
+        }
+        return nil
+}
+
 // checkStartupIntegrity cross-verifies the tip pointer against the canonical
 // height index at startup and self-heals a missing/zeroed or mismatched
 // h/<tipHeight> entry from the authoritative tip pointer.
@@ -376,6 +472,8 @@ func run() error {
                         return runCheckStore()
                 case "--compact-db":
                         return runCompactDB()
+                case "--repair-height-index":
+                        return runRepairHeightIndex()
                 }
         }
 
@@ -817,6 +915,54 @@ func run() error {
                 }
                 if done {
                         return nil
+                }
+
+                // ── Startup height-index auto-repair (non-validator nodes) ────────────
+                // On the first start after an rsync bootstrap the
+                // height_index_sentinel metadata key is absent.  Run a full sweep of
+                // the b/ namespace and repair any h/ entry that is missing or zeroed
+                // at heights below the tip — gaps that the tip-only integrity check
+                // above cannot fix.  After a successful sweep the sentinel is written
+                // so subsequent restarts skip this (potentially slow) scan.
+                //
+                // Validators do NOT run this path: they must be bootstrapped from a
+                // clean snapshot and any gap below the tip is a hard-fail requiring
+                // operator intervention.  The sentinel also has no meaning for
+                // --repair-db runs (which already do a full UTXO rebuild and exit
+                // early via the done==true branch above).
+                if cfg.Consensus.NonValidator && !repairDB {
+                        sentinelHeight, sentinelFound, sentErr := db.LoadHeightIndexSentinel()
+                        if sentErr != nil {
+                                log.Warn("startup: failed to read height-index sentinel",
+                                        "err", sentErr)
+                        }
+                        // Run repair when sentinel is absent or was written at a lower
+                        // height than the current tip (the chain has grown since the last
+                        // sweep and may have gained new corrupt entries via incremental rsync).
+                        if !sentinelFound || sentinelHeight < tipHeight {
+                                log.Info("startup: running height-index repair sweep (sentinel absent or stale)",
+                                        "tip_height", tipHeight,
+                                        "sentinel_height", sentinelHeight,
+                                        "sentinel_found", sentinelFound,
+                                )
+                                repaired, sweepErr := db.RepairAllHeightIndex(tipHeight, nil)
+                                if sweepErr != nil {
+                                        log.Warn("startup: height-index sweep completed with errors",
+                                                "repaired", repaired, "err", sweepErr)
+                                } else if repaired > 0 {
+                                        log.Info("startup: height-index sweep repaired missing entries",
+                                                "repaired", repaired, "tip_height", tipHeight)
+                                } else {
+                                        log.Info("startup: height-index sweep complete — index consistent",
+                                                "tip_height", tipHeight)
+                                }
+                                // Write sentinel regardless of errors so we do not repeat
+                                // the full sweep on every restart when the store is healthy.
+                                if sentErr2 := db.StoreHeightIndexSentinel(tipHeight); sentErr2 != nil {
+                                        log.Warn("startup: failed to write height-index sentinel",
+                                                "err", sentErr2)
+                                }
+                        }
                 }
 
                 // Always load genesis (height 0).
