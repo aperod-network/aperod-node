@@ -6,12 +6,15 @@
 // the resulting file with config.Load — verifying that cfg.P2P.Bootnodes
 // actually contains the expected entry, not just that the YAML shape is
 // correct.
+// TestJoinNetworkBootnodeNonDefaultPort covers the --p2p-port flag path: when
+// an operator supplies a non-standard P2P port the written bootnode multiaddr
+// must embed that port, not the default 30303.
 //
 // Run from the blockchain root:
 //
 //	go test ./deploy/...
 //
-// Both tests are skipped automatically when bash or python3 is not available.
+// All tests are skipped automatically when bash or python3 is not available.
 package deploy_test
 
 import (
@@ -255,4 +258,183 @@ genesis:
 			}
 		})
 	}
+}
+
+// TestJoinNetworkBootnodeNonDefaultPort runs aperod-join.sh itself with
+// --p2p-port 30304 so the argument-parsing block and BOOTNODE_ADDR
+// construction in the script are exercised end-to-end.  External commands are
+// replaced by lightweight stubs (id, systemctl, curl) placed at the front of
+// PATH; APEROD_NODE_YAML and APEROD_DROPIN_DIR redirect the two writable
+// system paths so no root access is required.  After the script exits the test
+// loads the resulting file with config.Load and asserts cfg.P2P.Bootnodes
+// contains /ip4/89.169.53.128/tcp/30304 (not /tcp/30303).
+func TestJoinNetworkBootnodeNonDefaultPort(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires bash + python3; skipping on Windows")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not found in PATH; skipping TestJoinNetworkBootnodeNonDefaultPort")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not found in PATH; skipping TestJoinNetworkBootnodeNonDefaultPort")
+	}
+	checkYaml := exec.Command("python3", "-c", "import yaml")
+	if err := checkYaml.Run(); err != nil {
+		t.Skip("python3 pyyaml not available; skipping TestJoinNetworkBootnodeNonDefaultPort")
+	}
+
+	const (
+		primaryIP      = "89.169.53.128"
+		nonDefaultPort = "30304"
+		defaultPort    = "30303"
+		wantBootnode   = "/ip4/" + primaryIP + "/tcp/" + nonDefaultPort
+	)
+
+	// Locate aperod-join.sh relative to this test file (blockchain/deploy/).
+	scriptDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("cannot determine script directory: %v", err)
+	}
+	joinSh := filepath.Join(scriptDir, "aperod-join.sh")
+	if _, err := os.Stat(joinSh); os.IsNotExist(err) {
+		t.Fatalf("aperod-join.sh not found at %s", joinSh)
+	}
+	nodeConfigSh := filepath.Join(scriptDir, "node-config.sh")
+
+	// ── Stub binaries ────────────────────────────────────────────────────────
+	// Create a temporary directory with lightweight stubs that satisfy the
+	// checks aperod-join.sh performs before reaching step 7/8 (bootnode write).
+	stubDir := t.TempDir()
+
+	stubs := map[string]string{
+		// id: "-u" → 0 (root); anything else → exit 1 (user not found → chown skipped)
+		"id": `#!/usr/bin/env bash
+for arg; do [[ "$arg" == "-u" ]] && echo 0 && exit 0; done
+exit 1`,
+		// systemctl: is-active → exit 1 (not running, script continues with warn)
+		//            everything else (disable, daemon-reload) → exit 0
+		"systemctl": `#!/usr/bin/env bash
+[[ "${1:-}" == "is-active" ]] && exit 1
+exit 0`,
+		// curl: /api/v1/snapshot → exit 1 (non-fatal warn path)
+		//       /api/v1/status   → exit 0 (primary reachable)
+		//       everything else  → exit 0
+		"curl": `#!/usr/bin/env bash
+for arg; do
+  [[ "$arg" == *"/api/v1/snapshot"* ]] && exit 1
+done
+exit 0`,
+		// pip3: delegate to "python3 -m pip" so node-config.sh can install pyyaml
+		// when the real pip3 binary is absent from PATH.
+		"pip3": `#!/usr/bin/env bash
+python3 -m pip "$@"`,
+	}
+
+	for name, body := range stubs {
+		p := filepath.Join(stubDir, name)
+		if err := os.WriteFile(p, []byte(body+"\n"), 0o755); err != nil {
+			t.Fatalf("write stub %s: %v", name, err)
+		}
+	}
+
+	// ── Temp directories for overridable paths ───────────────────────────────
+	cfgFile, err := os.CreateTemp("", "node-*.yaml")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	cfgPath := cfgFile.Name()
+	t.Cleanup(func() { os.Remove(cfgPath) })
+
+	// nestedYAML matches the config produced by install-validator.sh.
+	nestedYAML := strings.TrimSpace(`
+network: testnet
+data_dir: /tmp/aperod-test
+log_level: info
+p2p:
+  listen_addr: /ip4/0.0.0.0/tcp/30303
+  bootnodes: []
+  max_peers: 50
+consensus:
+  validator_key: /etc/aperod/validator.key
+  reward_address: aproecTest
+api:
+  enabled: true
+  listen_addr: 127.0.0.1:8545
+genesis:
+  file: /etc/aperod/genesis-testnet.yaml
+`) + "\n"
+	if _, err := cfgFile.WriteString(nestedYAML); err != nil {
+		t.Fatalf("write config yaml: %v", err)
+	}
+	cfgFile.Close()
+
+	dataDir := t.TempDir()
+	dropinDir := t.TempDir()
+
+	// ── Build the command environment ────────────────────────────────────────
+	// Inherit the full process environment so Python site-packages (pyyaml),
+	// locale, and other implicit dependencies remain available, then override
+	// only the vars that redirect system paths to our temp directories.
+	overrides := map[string]string{
+		"PATH":                  fmt.Sprintf("%s:%s", stubDir, os.Getenv("PATH")),
+		"APEROD_NODE_YAML":      cfgPath,
+		"APEROD_DROPIN_DIR":     dropinDir,
+		"APEROD_NODE_CONFIG_SH": nodeConfigSh,
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		key := kv[:strings.IndexByte(kv, '=')]
+		if val, ok := overrides[key]; ok {
+			env = append(env, key+"="+val)
+			delete(overrides, key)
+		} else {
+			env = append(env, kv)
+		}
+	}
+	// Append any overrides that were not already present in the environment.
+	for k, v := range overrides {
+		env = append(env, k+"="+v)
+	}
+
+	// ── Run aperod-join.sh with --p2p-port 30304 ────────────────────────────
+	cmd := exec.Command("bash", joinSh,
+		fmt.Sprintf("%s:8545", primaryIP),
+		"--p2p-port", nonDefaultPort,
+		"--data-dir", dataDir,
+		"--user", "nonexistentuser_gotest",
+		"--skip-start",
+		"--no-chaindb",
+	)
+	cmd.Env = env
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("aperod-join.sh --p2p-port %s failed (exit %v):\n%s",
+			nonDefaultPort, runErr, out)
+	}
+	t.Logf("aperod-join.sh output:\n%s", out)
+
+	// ── Load the written config and assert the bootnode port ─────────────────
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load failed after aperod-join.sh run: %v", err)
+	}
+
+	if len(cfg.P2P.Bootnodes) != 1 {
+		t.Fatalf("cfg.P2P.Bootnodes length = %d, want 1; got: %v",
+			len(cfg.P2P.Bootnodes), cfg.P2P.Bootnodes)
+	}
+	got := cfg.P2P.Bootnodes[0]
+
+	if got != wantBootnode {
+		t.Errorf("cfg.P2P.Bootnodes[0] = %q, want %q", got, wantBootnode)
+	}
+	if !strings.Contains(got, "/tcp/"+nonDefaultPort) {
+		t.Errorf("bootnode %q does not contain expected port /tcp/%s", got, nonDefaultPort)
+	}
+	if strings.Contains(got, "/tcp/"+defaultPort) {
+		t.Errorf("bootnode %q contains hardcoded default port /tcp/%s — --p2p-port flag appears broken in aperod-join.sh",
+			got, defaultPort)
+	}
+
+	t.Logf("cfg.P2P.Bootnodes[0] = %q  ✓ (port %s preserved end-to-end)", got, nonDefaultPort)
 }

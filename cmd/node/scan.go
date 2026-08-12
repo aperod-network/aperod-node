@@ -83,6 +83,14 @@ type startupScanParams struct {
 	// and call Wait() before asserting on log output or temp-dir contents;
 	// production callers leave it nil.
 	SnapshotWg *sync.WaitGroup
+
+	// GCHook, when non-nil, is called in place of runtime.GC() each time the
+	// cumulative UTXO output counter crosses a gcUTXOInterval boundary during
+	// the main scan loop.  The argument is the current value of utxoCount at
+	// the moment the boundary is crossed (always a multiple of gcUTXOInterval).
+	// Tests inject a recording function here to assert on the exact boundary
+	// sequence without running a real GC cycle.  Production callers leave it nil.
+	GCHook func(utxoCount uint64)
 }
 
 // runStartupScan performs the unified startup block scan:
@@ -370,7 +378,11 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				_ = p.DB.PutUTXO(txHash, uint32(i), su)
 				utxoCount++
 				if utxoCount%gcUTXOInterval == 0 {
-					runtime.GC()
+					if p.GCHook != nil {
+						p.GCHook(utxoCount)
+					} else {
+						runtime.GC()
+					}
 				}
 			}
 		}

@@ -230,6 +230,85 @@ func TestSaveShutdownSnapshot_LogsTipHeight(t *testing.T) {
 	}
 }
 
+// TestSaveShutdownSnapshot_RatioPctFiresAfterRealWrite is an end-to-end test that
+// exercises the full path from saveShutdownSnapshotWithPaths → real snapshot
+// serialisation → warnIfSnapshotSlowRelativeToTimeout → ratio_pct log field.
+//
+// It uses a synthetic drop-in with a short TimeoutStopSec (100 ms) together with
+// a saveDurOverride (500 ms) so that the ratio is deterministically 500 %, well
+// above the 80 % Error threshold.  The test also populates a configurable number
+// of UTXOs (utxoCount) to exercise realistic snapshot serialisation — a future
+// format change that inflates the snapshot schema will still exercise the real
+// write path even though the ratio check uses the override.
+func TestSaveShutdownSnapshot_RatioPctFiresAfterRealWrite(t *testing.T) {
+	const utxoCount = 200 // realistic but fast; increase if format grows significantly
+
+	dir := t.TempDir()
+	db, utxos, registry := buildMinimalChainForShutdown(t, dir)
+
+	// Populate synthetic UTXOs so the snapshot serialisation covers a
+	// realistic payload.  The fields are zero-valued except for BlockHeight and
+	// OutputIndex to keep each UTXO key unique.
+	for i := 0; i < utxoCount; i++ {
+		var txHash crypto.Hash32
+		txHash[0] = byte(i)
+		txHash[1] = byte(i >> 8)
+		utxos.Add(&core.UTXO{
+			TxHash:      txHash,
+			OutputIndex: uint32(i),
+			BlockHeight: 1,
+		})
+	}
+
+	// Write a synthetic drop-in with a very short TimeoutStopSec so the ratio
+	// check is triggered without depending on wall-clock write speed.
+	dropinDir := t.TempDir()
+	const timeoutConf = "[Service]\nTimeoutStopSec=100ms\n"
+	if err := os.WriteFile(filepath.Join(dropinDir, "timeout.conf"), []byte(timeoutConf), 0o644); err != nil {
+		t.Fatalf("write synthetic timeout.conf: %v", err)
+	}
+	servicePath := filepath.Join(t.TempDir(), "aperod-node.service") // intentionally absent
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+
+	// saveDurOverride = 500 ms → ratio = 500 ms / 100 ms = 5.0 → 500 % > 80 %.
+	// The Error-level message must be emitted with a ratio_pct field.
+	const syntheticDur = 500 * time.Millisecond
+	saveShutdownSnapshotWithPaths(db, utxos, registry, dir, log, nil, dropinDir, servicePath, syntheticDur)
+
+	// The snapshot itself must have been written successfully.
+	const wantSavedMsg = "shutdown: snapshot saved"
+	if !logContainsMsg(&buf, wantSavedMsg) {
+		t.Fatalf("expected log %q not found; full output:\n%s", wantSavedMsg, buf.String())
+	}
+
+	// The ratio_pct field must appear on the Error-level warning message.
+	// 500 ms / 100 ms = 5.0 → ratio_pct must be exactly "500%".
+	const wantWarnMsg = "snapshot save time is dangerously close to TimeoutStopSec — increase it immediately to avoid losing the snapshot on next shutdown"
+	if !logContainsMsg(&buf, wantWarnMsg) {
+		t.Fatalf("expected Error-level ratio warning %q not found; full output:\n%s", wantWarnMsg, buf.String())
+	}
+
+	// Verify the record is logged at ERROR level (not Warn or Info).
+	level, hasLevel := logFieldValue(&buf, wantWarnMsg, "level")
+	if !hasLevel {
+		t.Fatalf("level field missing from ratio warning record; full output:\n%s", buf.String())
+	}
+	if level != "ERROR" {
+		t.Errorf("expected log level ERROR for ratio warning, got %q", level)
+	}
+
+	// Verify ratio_pct is exactly "500%" — deterministic given 500 ms / 100 ms = 5.0×.
+	pct, ok := logFieldValue(&buf, wantWarnMsg, "ratio_pct")
+	if !ok || pct == "" {
+		t.Fatalf("ratio_pct field missing from ratio warning; full output:\n%s", buf.String())
+	}
+	if pct != "500%" {
+		t.Errorf("ratio_pct = %q, want \"500%%\" (500 ms / 100 ms = 5.0×)", pct)
+	}
+}
+
 func TestSaveShutdownSnapshot_NilRegistryNoOp(t *testing.T) {
 	dir := t.TempDir()
 	db, utxos, _ := buildMinimalChainForShutdown(t, dir)

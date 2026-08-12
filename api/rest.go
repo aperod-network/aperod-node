@@ -56,6 +56,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
         s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
         s.mux.HandleFunc("/api/v1/network/stall-events", s.localOnly(s.restNetworkStallEvents))
+        s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.restNetworkP2PConfig))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
@@ -2448,4 +2449,58 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ─── GET /api/v1/network/p2p-config ──────────────────────────────────────────
+//
+// Returns current live P2P tuning parameters (keepalive_interval_secs).
+//
+// POST /api/v1/network/p2p-config
+//
+// Accepts { keepalive_interval_secs: <int> } and updates the live interval
+// without restarting the node.  Valid range: [1, 15] seconds.
+
+// p2pConfigRequest is the JSON body for POST /api/v1/network/p2p-config.
+type p2pConfigRequest struct {
+	KeepaliveIntervalSecs int `json:"keepalive_interval_secs"`
+}
+
+func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if s.p2pKeepaliveGetFn == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+			return
+		}
+		d := s.p2pKeepaliveGetFn()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"keepalive_interval_secs":     int(d.Seconds()),
+			"bad_block_ban_threshold":     s.p2pBadBlockBanThreshold,
+			"bad_block_ban_duration_secs": s.p2pBadBlockBanDurationSecs,
+			"bad_block_height_lead":       s.p2pBadBlockHeightLead,
+		})
+
+	case http.MethodPost:
+		if s.p2pKeepaliveSetFn == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+			return
+		}
+		var req p2pConfigRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		d := time.Duration(req.KeepaliveIntervalSecs) * time.Second
+		if err := s.p2pKeepaliveSetFn(d); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"message":                 "keepalive_interval updated",
+			"keepalive_interval_secs": req.KeepaliveIntervalSecs,
+		})
+
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }

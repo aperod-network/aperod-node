@@ -179,6 +179,111 @@ func assertNoInterp(t *testing.T, path string) {
 	t.Log("ELF PT_INTERP segment absent — binary is fully static ✓")
 }
 
+// TestUpdateNodeStaticGuard verifies that the ldd-based guard added to
+// update-node.sh (Step 2b) correctly distinguishes dynamic binaries from
+// static ones.
+//
+// The test exercises two cases:
+//
+//  1. A known dynamically-linked system binary (e.g. /bin/ls) triggers the
+//     guard — ldd output does NOT contain "not a dynamic executable", so the
+//     guard would abort the upgrade.
+//
+//  2. The freshly built aperod-node binary passes the guard — ldd reports
+//     "not a dynamic executable", so the upgrade proceeds normally.
+//
+// This gives confidence that, if CGO_ENABLED=0 were accidentally dropped from
+// the Makefile, update-node.sh would catch the regression before ever stopping
+// the running service.
+//
+// Skip conditions: non-Linux OS, ldd absent, Makefile absent (case 2 only).
+func TestUpdateNodeStaticGuard(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		t.Skip("ldd guard is Linux-specific; skipping on non-Linux")
+	}
+
+	lddBin, err := exec.LookPath("ldd")
+	if err != nil {
+		t.Skip("ldd not found in PATH; skipping TestUpdateNodeStaticGuard")
+	}
+
+	// ── Case 1: a known dynamic binary must NOT say "not a dynamic executable" ──
+	//
+	// update-node.sh fires (aborts) when ldd does NOT output that string.
+	// We verify the guard logic is directionally correct: a real dynamic binary
+	// produces output that would trigger the abort.
+	dynamicBin := "/bin/ls"
+	if _, statErr := os.Stat(dynamicBin); os.IsNotExist(statErr) {
+		// Some distros (NixOS, Alpine) place ls elsewhere.
+		for _, alt := range []string{"/usr/bin/ls", "/bin/cat", "/usr/bin/cat"} {
+			if _, altErr := os.Stat(alt); altErr == nil {
+				dynamicBin = alt
+				break
+			}
+		}
+		if _, statErr2 := os.Stat(dynamicBin); os.IsNotExist(statErr2) {
+			t.Skip("could not find a known dynamically-linked system binary; skipping Case 1")
+		}
+	}
+
+	dynOut, _ := exec.Command(lddBin, dynamicBin).CombinedOutput()
+	dynStr := strings.TrimSpace(string(dynOut))
+	t.Logf("ldd %s → %s", dynamicBin, dynStr)
+
+	if strings.Contains(dynStr, "not a dynamic executable") {
+		// If /bin/ls is somehow static (unusual musl build), skip rather than fail.
+		t.Skipf("%s appears to be statically linked on this host — cannot exercise dynamic guard; skipping", dynamicBin)
+	}
+	t.Logf("Case 1 ✓: dynamic binary %s correctly triggers the guard (ldd did not say \"not a dynamic executable\")", dynamicBin)
+
+	// ── Case 2: the freshly built aperod-node must pass the guard ────────────
+	//
+	// Build aperod-node via the Makefile (same as update-node.sh does) and
+	// confirm ldd says "not a dynamic executable".  Skip gracefully when the
+	// Makefile or make binary is unavailable (e.g. restricted CI).
+	deployDir, absErr := filepath.Abs(".")
+	if absErr != nil {
+		t.Fatalf("cannot determine deploy directory: %v", absErr)
+	}
+	blockchainDir := filepath.Dir(deployDir)
+	makefilePath := filepath.Join(blockchainDir, "Makefile")
+	if _, statErr := os.Stat(makefilePath); os.IsNotExist(statErr) {
+		t.Logf("Makefile not found at %s — skipping Case 2 (aperod-node guard check)", makefilePath)
+		return
+	}
+
+	makeBin, makeErr := exec.LookPath("make")
+	if makeErr != nil {
+		t.Log("make not found in PATH — skipping Case 2 (aperod-node guard check)")
+		return
+	}
+
+	t.Log("running make build-node for guard check…")
+	buildCmd := exec.Command(makeBin, "build-node")
+	buildCmd.Dir = blockchainDir
+	if out, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
+		t.Fatalf("make build-node failed: %v\n%s", buildErr, string(out))
+	}
+
+	nodeBin := filepath.Join(blockchainDir, "build", "aperod-node")
+	if _, statErr := os.Stat(nodeBin); os.IsNotExist(statErr) {
+		t.Fatalf("build/aperod-node not found after make build-node")
+	}
+
+	staticOut, _ := exec.Command(lddBin, nodeBin).CombinedOutput()
+	staticStr := strings.TrimSpace(string(staticOut))
+	t.Logf("ldd aperod-node → %s", staticStr)
+
+	if !strings.Contains(staticStr, "not a dynamic executable") {
+		t.Errorf("update-node.sh guard would fire on the freshly built aperod-node:\n"+
+			"  ldd output : %s\n"+
+			"  Ensure CGO_ENABLED=0 is set in the Makefile build-node target.",
+			staticStr)
+		return
+	}
+	t.Log("Case 2 ✓: aperod-node passes the static-link guard — update-node.sh would not abort ✓")
+}
+
 // assertLddStatic runs ldd on path and checks that the output contains
 // "not a dynamic executable".  When ldd is not found the check is skipped
 // with a log message (ldd absence is not a test failure).

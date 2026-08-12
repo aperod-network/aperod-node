@@ -343,6 +343,86 @@ func TestCleanStaleTmpFilesNoTmpPresent(t *testing.T) {
 	}
 }
 
+// TestCleanStaleTmpFilesOnlyUnrelatedFiles verifies that CleanStaleTmpFiles is
+// completely silent and does not touch any files when the data directory exists
+// and contains only unrelated files (e.g. chain.db, snapshot files) — no
+// mempool.json and no .tmp file at all.
+//
+// This guards against a future refactor that accidentally glob-matches or
+// removes non-mempool files: if CleanStaleTmpFiles ever touches chain.db or
+// snapshots the test will catch it immediately.
+func TestCleanStaleTmpFilesOnlyUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plant unrelated files that must not be touched.
+	unrelated := []string{"chain.db", "snapshot-000100.bin", "node.yaml"}
+	for _, name := range unrelated {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("data-"+name), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// Capture content+mtime for each file so we can prove they are untouched.
+	type snapshot struct {
+		content []byte
+		modTime time.Time
+	}
+	before := make(map[string]snapshot, len(unrelated))
+	for _, name := range unrelated {
+		p := filepath.Join(dir, name)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s before: %v", name, err)
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s before: %v", name, err)
+		}
+		before[name] = snapshot{content: data, modTime: fi.ModTime()}
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// Call CleanStaleTmpFiles — the function under test.
+	core.CleanStaleTmpFiles(dir, log)
+
+	// Log must be completely silent: no cleanup message, no warning.
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no log output when only unrelated files are present, got:\n%s", logBuf.String())
+	}
+
+	// Every unrelated file must be byte-for-byte identical and have the same mtime.
+	for _, name := range unrelated {
+		p := filepath.Join(dir, name)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("%s: unreadable after CleanStaleTmpFiles: %v", name, err)
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("%s: stat failed after CleanStaleTmpFiles: %v", name, err)
+			continue
+		}
+		snap := before[name]
+		if string(data) != string(snap.content) {
+			t.Errorf("%s: content changed — CleanStaleTmpFiles touched an unrelated file", name)
+		}
+		if !fi.ModTime().Equal(snap.modTime) {
+			t.Errorf("%s: mtime changed from %v to %v — CleanStaleTmpFiles touched an unrelated file",
+				name, snap.modTime, fi.ModTime())
+		}
+	}
+
+	// No .tmp file should have been created as a side-effect.
+	tmpPath := filepath.Join(dir, "mempool.json.tmp")
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("unexpected .tmp file present after CleanStaleTmpFiles (err=%v)", err)
+	}
+}
+
 // TestCleanStaleTmpFilesMissingDataDir verifies that CleanStaleTmpFiles is a
 // safe no-op when the data directory itself does not exist.
 //

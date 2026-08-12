@@ -1,7 +1,7 @@
 // Package deploy_test — CI guard for the rsync-safety guard in join-network.sh.
 //
 // TestJoinNetworkRsyncGuard shells out to test-join-network-rsync-guard.sh
-// which exercises two scenarios without requiring live infrastructure:
+// which exercises three scenarios without requiring live infrastructure:
 //
 //  1. Negative path: a stubbed systemctl returns non-zero for
 //     "stop aperod-node".  The script must abort before running rsync and
@@ -11,6 +11,10 @@
 //     replaced with stubs that simulate a clean run.  The stub ssh returns
 //     valid JSON for the network/stats poll so the script detects height > 0
 //     and peer_count > 0 and exits 0.
+//
+//  3. Health-wait timeout: the stub ssh always returns an empty string for
+//     the network/stats poll (API never comes up).  The script must exhaust
+//     all HEALTH_MAX_ATTEMPTS, exit 1, and print the "Таймаут" warning.
 //
 // Run from the blockchain root:
 //

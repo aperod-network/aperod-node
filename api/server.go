@@ -80,6 +80,28 @@ type Server struct {
         whitelistAddFn    func(string) error
         whitelistRemoveFn func(string) (bool, error)
 
+        // p2pKeepaliveGetFn returns the current live keepalive Ping interval.
+        // Wired to p2p.Host.GetKeepaliveInterval by cmd/node.
+        // Optional — GET /api/v1/network/p2p-config returns 503 when not wired.
+        p2pKeepaliveGetFn func() time.Duration
+        // p2pKeepaliveSetFn updates the live keepalive Ping interval.
+        // Returns an error when the value is outside the allowed [1s, 15s] range.
+        // Wired to p2p.Host.SetKeepaliveInterval by cmd/node.
+        // Optional — POST /api/v1/network/p2p-config returns 503 when not wired.
+        p2pKeepaliveSetFn func(time.Duration) error
+
+        // p2pBadBlockBanThreshold is the configured rogue-fork ban threshold
+        // (number of out-of-range blocks before a peer is banned).
+        // Set via SetP2PBanConfig after the P2P host is started.
+        p2pBadBlockBanThreshold int
+        // p2pBadBlockBanDurationSecs is BadBlockBanDuration in whole seconds.
+        // Set via SetP2PBanConfig after the P2P host is started.
+        p2pBadBlockBanDurationSecs int64
+        // p2pBadBlockHeightLead is how many blocks ahead of our tip a peer's
+        // block height must be before it counts as an out-of-range strike.
+        // Set via SetP2PBanConfig after the P2P host is started.
+        p2pBadBlockHeightLead uint64
+
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
         p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
@@ -414,6 +436,26 @@ func (s *Server) SetWhitelistAddFunc(f func(string) error) { s.whitelistAddFn = 
 // not found, or (false, err) when persistence fails.
 // Optional — DELETE /api/v1/network/whitelist/:entry returns 503 when not wired.
 func (s *Server) SetWhitelistRemoveFunc(f func(string) (bool, error)) { s.whitelistRemoveFn = f }
+
+// SetP2PKeepaliveGetFunc wires a function returning the current live keepalive
+// Ping interval.  Wired to p2p.Host.GetKeepaliveInterval by cmd/node.
+// Optional — GET /api/v1/network/p2p-config returns 503 when not wired.
+func (s *Server) SetP2PKeepaliveGetFunc(f func() time.Duration) { s.p2pKeepaliveGetFn = f }
+
+// SetP2PKeepaliveSetFunc wires a function that updates the live keepalive
+// Ping interval.  Wired to p2p.Host.SetKeepaliveInterval by cmd/node.
+// Optional — POST /api/v1/network/p2p-config returns 503 when not wired.
+func (s *Server) SetP2PKeepaliveSetFunc(f func(time.Duration) error) { s.p2pKeepaliveSetFn = f }
+
+// SetP2PBanConfig stores the static rogue-fork ban parameters read from
+// node.yaml so that GET /api/v1/network/p2p-config can include them in its
+// response.  Call this once after the P2P host is started and the config has
+// been validated.
+func (s *Server) SetP2PBanConfig(threshold int, durationSecs int64, heightLead uint64) {
+        s.p2pBadBlockBanThreshold = threshold
+        s.p2pBadBlockBanDurationSecs = durationSecs
+        s.p2pBadBlockHeightLead = heightLead
+}
 
 // SetStallEventFunc wires a function that returns block-fetch stall events
 // recorded since a given time.  Wired to p2p.Host.GetStallEvents by cmd/node.

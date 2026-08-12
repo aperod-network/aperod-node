@@ -9,7 +9,9 @@ package core_test
 // Verification: all three chains end at the same height and tip hash.
 
 import (
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -767,4 +769,185 @@ func TestSync_RelayNode_ReconnectAfterDrop(t *testing.T) {
 		return
 	}
 	t.Logf("✓ phase 4: relay reconnected and resynced: height=%d tip=%x", gotHeight, gotTip[:8])
+}
+
+// TestSync_RelayNode_BlockMinedDuringReconnectHandshake reproduces the
+// handshake-window race deterministically and verifies the relay converges
+// WITHOUT waiting for the keepalive-Pong cycle or the GetBlock stall timer:
+//
+//  1. Relay syncs to numInitial blocks, then the connection is dropped.
+//  2. The relay re-dials the validator through a gated TCP proxy that holds
+//     the relay→validator direction (the handshake Ping) closed.
+//  3. While the Ping is held, the validator's handleConn has already built
+//     its Pong payload carrying height=numInitial (the payload is constructed
+//     when the connection is accepted — before the Ping is read).  The
+//     validator now mines one more block and broadcasts it; the relay is not
+//     yet registered in the validator's peer table, so the block is silently
+//     missed.
+//  4. The gate opens: the Ping flows, the validator replies with the STALE
+//     Pong (height=numInitial == relay's local height), and both sides
+//     register the peer.  A "peerHeight > localHeight" guard would therefore
+//     skip the post-handshake GetHeaders and the relay would stay stalled
+//     until the keepalive Pong (10 s) or stall timer (15 s) fired.
+//  5. The unconditional post-registration requestHeaders closes the window:
+//     the relay must reach numInitial+1 well before either timer (≤ 5 s).
+func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	const numInitial = 4 // blocks synced before the drop
+
+	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
+
+	// ── Build genesis + numInitial blocks on the validator chain ─────────────
+	genesis := buildBlock(t, nil, validatorPriv, validatorPub, 0)
+
+	validatorChain := core.NewChain()
+	if err := validatorChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("validator SetGenesis: %v", err)
+	}
+	prev := genesis
+	for i := 1; i <= numInitial; i++ {
+		b := buildBlock(t, prev, validatorPriv, validatorPub, uint64(i))
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock %d: %v", i, err)
+		}
+		prev = b
+	}
+
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
+	}
+
+	// ── Validator p2p host ───────────────────────────────────────────────────
+	validatorHandler := &chainHandler{chain: validatorChain}
+	hostValidator := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "validator",
+		UserAgent:  "aperod/test",
+	}, validatorHandler, log)
+	hostValidator.SetHeaderProvider(validatorChain)
+	if err := hostValidator.Start(); err != nil {
+		t.Fatalf("hostValidator.Start: %v", err)
+	}
+	t.Cleanup(hostValidator.Stop)
+
+	validatorAddr := hostValidator.ListenAddr()
+	if validatorAddr == "" {
+		t.Skip("ListenAddr not available")
+	}
+
+	// ── Relay p2p host ───────────────────────────────────────────────────────
+	// Default KeepaliveInterval (10 s) and GetBlockStallTimeout (15 s) are kept
+	// intentionally: the test's 5-second convergence deadline proves recovery
+	// came from the post-handshake GetHeaders, not from either fallback timer.
+	relayHandler := &chainHandler{chain: relayChain}
+	hostRelay := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "relay",
+		UserAgent:  "aperod/test",
+	}, relayHandler, log)
+	hostRelay.SetHeaderProvider(relayChain)
+	if err := hostRelay.Start(); err != nil {
+		t.Fatalf("hostRelay.Start: %v", err)
+	}
+	t.Cleanup(hostRelay.Stop)
+
+	// ── Phase 1: initial sync over a direct connection ────────────────────────
+	hostRelay.DialPeer(validatorAddr)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= uint64(numInitial) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if relayChain.Height() != uint64(numInitial) {
+		t.Fatalf("phase 1: relay height = %d, want %d — initial sync timed out",
+			relayChain.Height(), numInitial)
+	}
+	t.Logf("✓ phase 1: relay synced to height=%d", numInitial)
+
+	// ── Phase 2: drop the connection ──────────────────────────────────────────
+	if !hostRelay.DropPeer(validatorAddr) {
+		t.Fatal("phase 2: DropPeer returned false — connection was not found")
+	}
+
+	// ── Phase 3: gated proxy — hold the relay's handshake Ping ────────────────
+	// The proxy forwards validator→relay bytes freely but blocks the
+	// relay→validator direction until gate is closed, pinning the validator's
+	// handleConn between "Pong payload built (height=numInitial)" and "Ping
+	// received" for as long as the test needs.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("phase 3: proxy listen: %v", err)
+	}
+	t.Cleanup(func() { proxyLn.Close() })
+
+	gate := make(chan struct{})
+	go func() {
+		client, err := proxyLn.Accept()
+		if err != nil {
+			return
+		}
+		server, err := net.Dial("tcp", validatorAddr)
+		if err != nil {
+			client.Close()
+			return
+		}
+		t.Cleanup(func() { client.Close(); server.Close() })
+		go io.Copy(client, server) //nolint:errcheck // validator→relay flows freely
+		go func() {
+			<-gate // hold relay→validator until the block below is mined
+			io.Copy(server, client) //nolint:errcheck
+		}()
+	}()
+
+	proxyAddr := proxyLn.Addr().String()
+	hostRelay.DialPeer(proxyAddr)
+
+	// Give the dial time to reach the validator so its handleConn snapshots
+	// height=numInitial into the pending Pong payload.
+	time.Sleep(300 * time.Millisecond)
+
+	// ── Phase 4: mine + broadcast exactly inside the handshake window ─────────
+	extra := buildBlock(t, prev, validatorPriv, validatorPub, uint64(numInitial+1))
+	if err := validatorChain.AddBlock(extra); err != nil {
+		t.Fatalf("phase 4: validator AddBlock: %v", err)
+	}
+	hostValidator.BroadcastBlock(extra) // relay not registered yet → silently missed
+	wantHeight := uint64(numInitial + 1)
+	wantTip := validatorChain.Tip().Hash()
+	t.Logf("✓ phase 4: block %d mined and broadcast during handshake window", wantHeight)
+
+	// ── Phase 5: open the gate — handshake completes with a STALE Pong ────────
+	close(gate)
+
+	// The relay must converge via the unconditional post-registration
+	// GetHeaders — well before the 10 s keepalive Pong or 15 s stall timer.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= wantHeight {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	gotHeight := relayChain.Height()
+	if gotHeight != wantHeight {
+		t.Errorf("phase 5: relay height = %d, want %d — block mined during the reconnect "+
+			"handshake was not recovered by the post-registration GetHeaders (stall-timer "+
+			"fallback would take 10–15 s)", gotHeight, wantHeight)
+		return
+	}
+	gotTip := relayChain.Tip().Hash()
+	if gotTip != wantTip {
+		t.Errorf("phase 5: relay tip hash mismatch:\n  got  %x\n  want %x", gotTip[:8], wantTip[:8])
+		return
+	}
+	t.Logf("✓ phase 5: relay converged without waiting for the stall timer: height=%d tip=%x",
+		gotHeight, gotTip[:8])
 }

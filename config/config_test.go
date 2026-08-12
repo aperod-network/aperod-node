@@ -150,6 +150,83 @@ func TestValidate_PeerWhitelist(t *testing.T) {
 	}
 }
 
+func TestValidate_KeepaliveInterval(t *testing.T) {
+	tests := []struct {
+		name      string
+		interval  time.Duration
+		wantError bool
+	}{
+		// Zero means "use the built-in default (10 s)" — must be accepted.
+		{
+			name:      "zero means use default and is accepted",
+			interval:  0,
+			wantError: false,
+		},
+		// Values below the 1 s floor would flood slow peers with pings.
+		{
+			name:      "negative value is rejected",
+			interval:  -time.Second,
+			wantError: true,
+		},
+		{
+			name:      "500ms is below 1s floor and is rejected",
+			interval:  500 * time.Millisecond,
+			wantError: true,
+		},
+		{
+			name:      "999ms is just below 1s floor and is rejected",
+			interval:  999 * time.Millisecond,
+			wantError: true,
+		},
+		// Values above the 15 s ceiling risk the peer's 30 s ReadTimeout firing.
+		{
+			name:      "16s exceeds 15s ceiling and is rejected",
+			interval:  16 * time.Second,
+			wantError: true,
+		},
+		{
+			name:      "1h is far above ceiling and is rejected",
+			interval:  time.Hour,
+			wantError: true,
+		},
+		// Values inside [1s, 15s] must be accepted.
+		{
+			name:      "1s (floor) is accepted",
+			interval:  time.Second,
+			wantError: false,
+		},
+		{
+			name:      "5s is accepted",
+			interval:  5 * time.Second,
+			wantError: false,
+		},
+		{
+			name:      "10s (production default) is accepted",
+			interval:  10 * time.Second,
+			wantError: false,
+		},
+		{
+			name:      "15s (ceiling) is accepted",
+			interval:  15 * time.Second,
+			wantError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.P2P.KeepaliveInterval = tc.interval
+			err := cfg.Validate()
+			if tc.wantError && err == nil {
+				t.Errorf("Validate() returned nil, want error for keepalive_interval=%v", tc.interval)
+			}
+			if !tc.wantError && err != nil {
+				t.Errorf("Validate() returned unexpected error for keepalive_interval=%v: %v", tc.interval, err)
+			}
+		})
+	}
+}
+
 func TestValidate_MemoryLimitBytes(t *testing.T) {
 	const mib512 = 512 * 1024 * 1024 // 536870912
 

@@ -1261,79 +1261,183 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 // This is the signature of a wrong-fork attacker: it pretends to be at the
 // same network height as us but floods us with fake future blocks.
 // The fix must leave this detection path intact.
+//
+// Subtests cover the range of announced heights that do NOT qualify for the
+// sync exemption (peer.height ≤ ourTip + BadBlockHeightLead):
+//
+//   - peer_height_equals_our_tip   : rogue announces same height as us
+//   - peer_height_zero             : rogue announces height 0 (no effort to lie)
+//   - peer_height_inside_lead_window: rogue announces ourTip+500 (within the lead)
+//   - fresh_node_our_tip_zero      : our node just started (tip=0); ban still fires
 func TestBadBlockBan_RoguePeerStillBanned(t *testing.T) {
-	// Our node is deep in the chain (e.g. a live validator).
-	const ourHeight = 1_000_000
-	// Rogue peer lies and announces it is at the same height.
-	const roguePeerHeight = 1_000_000
+	const (
+		threshold  = 5
+		lead       = 1000
+		banDur     = 24 * time.Hour
+	)
 
-	h := p2p.NewHost(p2p.Config{
-		ListenAddr:           "127.0.0.1:0",
-		MaxPeers:             10,
-		NodeID:               "test-rogue-deep-chain",
-		UserAgent:            "aperod/test",
-		BadBlockBanThreshold: 5,
-		BadBlockHeightLead:   1000,
-		BadBlockBanDuration:  24 * time.Hour,
-	}, &fixedHeightHandler{height: ourHeight}, newTestLogger())
-	if err := h.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer h.Stop()
+	// connectAndSendBadBlocks dials host, announces peerHeight in the Ping,
+	// then sends threshold bad blocks at rogueBlockHeight.  It returns once the
+	// host has banned the peer (PeerCount drops to 0) or the sub-test fails.
+	connectAndSendBadBlocks := func(
+		t *testing.T,
+		h *p2p.Host,
+		peerHeight uint64,
+		rogueBlockHeight uint64,
+	) {
+		t.Helper()
+		hostAddr := h.ListenAddr()
 
-	hostAddr := h.ListenAddr()
-
-	conn, err := net.DialTimeout("tcp", hostAddr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	// Rogue peer announces its height as equal to ours (or even 0) — NOT far ahead.
-	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
-		NodeID:    "rogue-peer",
-		Height:    roguePeerHeight,
-		UserAgent: "test",
-		Timestamp: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("write ping: %v", err)
-	}
-	msgType, _, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPong {
-		t.Fatalf("expected MsgPong, got type=%v err=%v", msgType, err)
-	}
-	conn.SetDeadline(time.Time{})
-
-	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
-		t.Fatal("peer did not register after handshake")
-	}
-
-	// Rogue peer sends blocks far ahead of both the announced height and our tip.
-	// These should score strikes because peer.height is NOT > ourTip+BadBlockHeightLead.
-	const rogueBlockHeight = ourHeight + 500_000
-	for i := 0; i < 5; i++ {
-		sb := p2p.SerializedBlock{
-			Header: p2p.SerializedHeader{Height: rogueBlockHeight},
+		conn, err := net.DialTimeout("tcp", hostAddr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
 		}
-		conn.SetWriteDeadline(time.Now().Add(time.Second))
-		if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
-			// Connection may have been closed by the ban — stop sending.
-			break
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
+			NodeID:    "rogue-peer",
+			Height:    peerHeight,
+			UserAgent: "test",
+			Timestamp: time.Now().UnixNano(),
+		}); err != nil {
+			t.Fatalf("write ping: %v", err)
 		}
-		conn.SetWriteDeadline(time.Time{})
+		msgType, _, err := p2p.ReadMsg(conn)
+		if err != nil || msgType != p2p.MsgPong {
+			t.Fatalf("expected MsgPong, got type=%v err=%v", msgType, err)
+		}
+		conn.SetDeadline(time.Time{})
+
+		if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+			t.Fatal("peer did not register after handshake")
+		}
+
+		for i := 0; i < threshold; i++ {
+			sb := p2p.SerializedBlock{
+				Header: p2p.SerializedHeader{Height: rogueBlockHeight},
+			}
+			conn.SetWriteDeadline(time.Now().Add(time.Second))
+			if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
+				// Connection may have been closed by the ban — stop sending.
+				break
+			}
+			conn.SetWriteDeadline(time.Time{})
+		}
+
+		if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+			t.Errorf("rogue peer was NOT banned after %d wrong-fork blocks (threshold=%d, peer_height=%d, rogue_block=%d)",
+				threshold, threshold, peerHeight, rogueBlockHeight)
+		}
+		if bans := h.ListBans(); len(bans) == 0 {
+			t.Errorf("rogue peer was not banned; expected a ban entry (peer_height=%d, rogue_block=%d)",
+				peerHeight, rogueBlockHeight)
+		} else {
+			t.Logf("rogue peer correctly banned: peer_height=%d rogue_block=%d bans=%d",
+				peerHeight, rogueBlockHeight, len(bans))
+		}
 	}
 
-	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
-		t.Errorf("rogue peer was NOT banned after %d wrong-fork blocks (threshold=5)", 5)
-	}
+	// ── Subtest 1: rogue announces height equal to our tip ───────────────────
+	//
+	// Classic wrong-fork attacker: claims to be at the same height as us, then
+	// sends blocks 500 000 heights in the future.
+	// Exemption check: peer.height (1 000 000) ≤ ourTip (1 000 000) + lead (1 000)
+	// → NOT exempt → strikes accumulate → ban fires.
+	t.Run("peer_height_equals_our_tip", func(t *testing.T) {
+		const ourHeight = 1_000_000
+		h := p2p.NewHost(p2p.Config{
+			ListenAddr:           "127.0.0.1:0",
+			MaxPeers:             10,
+			NodeID:               "test-rogue-same-height",
+			UserAgent:            "aperod/test",
+			BadBlockBanThreshold: threshold,
+			BadBlockHeightLead:   lead,
+			BadBlockBanDuration:  banDur,
+		}, &fixedHeightHandler{height: ourHeight}, newTestLogger())
+		if err := h.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer h.Stop()
+		connectAndSendBadBlocks(t, h, ourHeight, ourHeight+500_000)
+	})
 
-	bans := h.ListBans()
-	if len(bans) == 0 {
-		t.Fatalf("rogue peer was not banned; expected a ban entry")
-	}
-	t.Logf("rogue peer correctly banned after sending fake blocks at height %d (our_tip=%d, peer_height=%d)",
-		rogueBlockHeight, ourHeight, roguePeerHeight)
+	// ── Subtest 2: rogue announces height 0 (didn't bother lying) ────────────
+	//
+	// The attacker doesn't even pretend to be synced — it just sends far-future
+	// blocks.  peer.height (0) is well below ourTip + lead, so the exemption
+	// does not apply and the ban must still fire.
+	t.Run("peer_height_zero", func(t *testing.T) {
+		const ourHeight = 1_000_000
+		h := p2p.NewHost(p2p.Config{
+			ListenAddr:           "127.0.0.1:0",
+			MaxPeers:             10,
+			NodeID:               "test-rogue-height-zero",
+			UserAgent:            "aperod/test",
+			BadBlockBanThreshold: threshold,
+			BadBlockHeightLead:   lead,
+			BadBlockBanDuration:  banDur,
+		}, &fixedHeightHandler{height: ourHeight}, newTestLogger())
+		if err := h.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer h.Stop()
+		// peerHeight=0, rogueBlock far above ourTip+lead.
+		connectAndSendBadBlocks(t, h, 0, ourHeight+500_000)
+	})
+
+	// ── Subtest 3: rogue announces ourTip+500 (inside the lead window) ────────
+	//
+	// The attacker claims to be 500 blocks ahead of us — plausible for a fast
+	// validator, but still within the lead window (lead=1000).
+	// peer.height (1 000 500) ≤ ourTip (1 000 000) + lead (1 000) = 1 001 000
+	// → NOT exempt → strikes accumulate → ban fires.
+	t.Run("peer_height_inside_lead_window", func(t *testing.T) {
+		const ourHeight = 1_000_000
+		const peerHeight = ourHeight + 500 // inside the lead window
+		h := p2p.NewHost(p2p.Config{
+			ListenAddr:           "127.0.0.1:0",
+			MaxPeers:             10,
+			NodeID:               "test-rogue-inside-lead",
+			UserAgent:            "aperod/test",
+			BadBlockBanThreshold: threshold,
+			BadBlockHeightLead:   lead,
+			BadBlockBanDuration:  banDur,
+		}, &fixedHeightHandler{height: ourHeight}, newTestLogger())
+		if err := h.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer h.Stop()
+		// rogueBlock far above ourTip+lead to ensure it scores strikes.
+		connectAndSendBadBlocks(t, h, peerHeight, ourHeight+500_000)
+	})
+
+	// ── Subtest 4: fresh node (ourTip=0) still bans a rogue peer ─────────────
+	//
+	// The node just started from genesis or a fresh snapshot with tip=0.
+	// The attacker announces height=500 (inside the lead window of 0+1000=1000)
+	// and sends blocks at height 5000 (above the lead threshold).
+	// peer.height (500) ≤ ourTip (0) + lead (1000) = 1000
+	// → NOT exempt → strikes accumulate → ban fires.
+	t.Run("fresh_node_our_tip_zero", func(t *testing.T) {
+		const ourHeight = 0
+		const peerHeight = 500 // inside lead window (0+1000)
+		h := p2p.NewHost(p2p.Config{
+			ListenAddr:           "127.0.0.1:0",
+			MaxPeers:             10,
+			NodeID:               "test-rogue-fresh-node",
+			UserAgent:            "aperod/test",
+			BadBlockBanThreshold: threshold,
+			BadBlockHeightLead:   lead,
+			BadBlockBanDuration:  banDur,
+		}, &fixedHeightHandler{height: ourHeight}, newTestLogger())
+		if err := h.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		defer h.Stop()
+		// rogueBlock above ourTip+lead (0+1000=1000).
+		connectAndSendBadBlocks(t, h, peerHeight, 5000)
+	})
 }
 
 // Keep the import used via fmt.Sprintf in future tests.

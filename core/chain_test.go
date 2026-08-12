@@ -1,11 +1,14 @@
 package core_test
 
-// chain_test.go — tests for Chain sliding-window memory eviction (#462).
+// chain_test.go — tests for Chain sliding-window memory eviction and reorg
+// handling after cache eviction.
 //
 // Tests:
 //  1. After adding MaxInMemoryBlocks+N blocks, the oldest N blocks are evicted.
 //  2. The most recent MaxInMemoryBlocks blocks remain accessible via GetByHeight.
 //  3. The chain tip is correct after eviction.
+//  4. Reorg succeeds when the fork-point block has already been evicted from
+//     the in-memory cache (covers the LevelDB fall-through path).
 
 import (
 	"testing"
@@ -113,5 +116,124 @@ func TestChain_MemoryCapTipIntact(t *testing.T) {
 	}
 	if tip.Header.Height != uint64(total) {
 		t.Errorf("Tip height: got %d, want %d", tip.Header.Height, total)
+	}
+}
+
+// TestChain_ReorgAfterCacheEviction verifies that Reorg succeeds when the
+// fork-point block has already been evicted from the in-memory sliding-window
+// cache.  This exercises the code path that would fall back to the on-disk
+// store in a full node, ensuring that reducing MaxInMemoryBlocks from 10 000
+// to 1 000 does not silently break reorg processing for deep forks.
+//
+// Setup:
+//   - Build a canonical chain of MaxInMemoryBlocks+forkPoint+1 blocks so that
+//     the block at forkPoint is guaranteed to have been evicted from c.blocks
+//     and c.byHeight before the reorg is attempted.
+//   - Fork point is chosen well inside the evicted region (50 blocks below the
+//     eviction boundary) to give a clear margin.
+//   - Five alternate blocks are built on top of the (evicted) fork-point block.
+//
+// Assertions:
+//  1. Reorg returns nil — the chain accepts the alternate branch.
+//  2. Tip advances to the last alternate block.
+//  3. Old canonical blocks above the fork point that were in the cache are
+//     removed (GetByHeight returns nil for a sample height in that range).
+//  4. The alternate blocks are installed and accessible via GetByHeight.
+//  5. The fork-point block itself remains unavailable (still evicted).
+func TestChain_ReorgAfterCacheEviction(t *testing.T) {
+	// forkPoint is the height at which the alternate chain branches off.
+	// We pick 50 so there is a comfortable margin inside the evicted region.
+	const forkPoint = uint64(50)
+	// altLen is the number of blocks in the alternate branch.
+	const altLen = 5
+
+	// Build the canonical chain long enough to evict the block at forkPoint.
+	// Adding block at height H evicts the block at H-MaxInMemoryBlocks.
+	// Block at forkPoint is evicted when we add height = forkPoint+MaxInMemoryBlocks.
+	// We add a few extra blocks beyond that to confirm eviction is stable.
+	const totalHeight = forkPoint + core.MaxInMemoryBlocks + 10
+
+	// Use a minimal genesis (no validator key needed; SetGenesis only checks
+	// height==0 and PrevHash=={}).
+	genesis := makeMinimalBlock(0, crypto.Hash32{})
+
+	c := core.NewChain()
+	if err := c.SetGenesis(genesis); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+
+	// Walk the chain, recording the hash of the block at forkPoint so we can
+	// build a valid alternate branch from it.
+	var forkPointHash crypto.Hash32
+	prev := genesis
+	for h := uint64(1); h <= totalHeight; h++ {
+		b := makeMinimalBlock(h, prev.Hash())
+		if err := c.AddBlock(b); err != nil {
+			t.Fatalf("AddBlock(height=%d): %v", h, err)
+		}
+		if h == forkPoint {
+			forkPointHash = b.Hash()
+		}
+		prev = b
+	}
+
+	// Confirm the fork-point block has been evicted from the in-memory cache.
+	if c.GetByHeight(forkPoint) != nil {
+		t.Fatalf("expected block at height %d to be evicted before reorg, but it is still in cache", forkPoint)
+	}
+
+	// Build the alternate branch: altLen blocks rooted at forkPoint.
+	// Each block's PrevHash connects to its predecessor within the alt branch;
+	// the first block's PrevHash connects to the (evicted) canonical block at
+	// forkPoint, establishing the correct ancestry even though that block is
+	// no longer in RAM.
+	altBlocks := make([]*core.Block, altLen)
+	altPrev := forkPointHash
+	for i := 0; i < altLen; i++ {
+		h := forkPoint + uint64(i) + 1
+		blk := makeMinimalBlock(h, altPrev)
+		altBlocks[i] = blk
+		altPrev = blk.Hash()
+	}
+
+	// Perform the reorg — must succeed even though the fork-point block is
+	// no longer in the in-memory cache.
+	if err := c.Reorg(forkPoint, altBlocks); err != nil {
+		t.Fatalf("Reorg(forkPoint=%d, altLen=%d): unexpected error: %v", forkPoint, altLen, err)
+	}
+
+	// 1. Tip must be the last alternate block.
+	wantTipHeight := forkPoint + altLen
+	tip := c.Tip()
+	if tip == nil {
+		t.Fatal("Tip() is nil after reorg")
+	}
+	if tip.Header.Height != wantTipHeight {
+		t.Errorf("Tip height after reorg: got %d, want %d", tip.Header.Height, wantTipHeight)
+	}
+
+	// 2. A canonical block from the old branch that was in the cache before the
+	//    reorg (e.g. the previous tip) must have been removed.
+	if c.GetByHeight(totalHeight) != nil {
+		t.Errorf("old tip at height %d should be removed after reorg, but GetByHeight returned a block", totalHeight)
+	}
+
+	// 3. The alternate blocks must now be the canonical chain at their heights.
+	for i, b := range altBlocks {
+		h := forkPoint + uint64(i) + 1
+		got := c.GetByHeight(h)
+		if got == nil {
+			t.Errorf("alt block at height %d not found after reorg", h)
+			continue
+		}
+		if got.Hash() != b.Hash() {
+			t.Errorf("height %d: canonical block hash mismatch after reorg", h)
+		}
+	}
+
+	// 4. The fork-point block itself must still be absent from the in-memory
+	//    cache (it was evicted before the reorg and Reorg does not re-insert it).
+	if c.GetByHeight(forkPoint) != nil {
+		t.Errorf("fork-point block at height %d should remain evicted after reorg", forkPoint)
 	}
 }
