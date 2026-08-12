@@ -260,6 +260,39 @@ func runCheckStore() error {
         return nil
 }
 
+// ─── Height-index sentinel (file-based) ──────────────────────────────────────
+//
+// The sentinel is stored as a plain file at <dataDir>/height_index_verified,
+// deliberately OUTSIDE the chain.db/ LevelDB directory.  Operators who
+// bootstrap a relay node typically rsync only chain.db/:
+//
+//   rsync -a validator:/opt/aperod/data/testnet/chain.db/ relay:/opt/aperod/data/testnet/chain.db/
+//
+// Because the sentinel lives next to chain.db/ (not inside it) it is NOT
+// copied by that rsync command.  The relay therefore starts without a sentinel
+// on every fresh bootstrap, unconditionally triggering the repair sweep before
+// any blocks are processed.
+//
+// A sentinel inside chain.db would be copied by the rsync and could cause the
+// relay to skip the sweep even when the rsync introduced index corruption.
+
+// heightIndexSentinelPath returns the path of the sentinel marker file.
+func heightIndexSentinelPath(dataDir string) string {
+        return filepath.Join(dataDir, "height_index_verified")
+}
+
+// loadHeightIndexSentinel returns true when the sentinel file exists.
+func loadHeightIndexSentinel(dataDir string) bool {
+        _, err := os.Stat(heightIndexSentinelPath(dataDir))
+        return err == nil
+}
+
+// storeHeightIndexSentinel creates (or overwrites) the sentinel marker file.
+// Non-fatal on error: the sentinel is absent and the next restart retries.
+func storeHeightIndexSentinel(dataDir string) error {
+        return os.WriteFile(heightIndexSentinelPath(dataDir), []byte("1\n"), 0644)
+}
+
 // runRepairHeightIndex implements the --repair-height-index subcommand.
 //
 // Usage: aperod-node --repair-height-index --data-dir=<path>
@@ -273,9 +306,9 @@ func runCheckStore() error {
 // The node MUST be stopped before running this command.  Unlike --check-store
 // (which counts gaps) this command actually repairs them.
 //
-// On success it writes a sentinel so the auto-repair path inside run() knows
-// the index has been verified and will not re-scan from scratch on every
-// subsequent restart.
+// On success it writes a sentinel FILE at <data-dir>/height_index_verified so
+// the auto-repair path inside run() knows the index has been verified.  The
+// file lives outside chain.db/ so it is NOT copied by a chain.db-only rsync.
 func runRepairHeightIndex() error {
         dataDir := ""
         args := os.Args[1:]
@@ -335,9 +368,9 @@ func runRepairHeightIndex() error {
         // residual corruption.
         sweepOK := repErr == nil && skipped == 0
         if sweepOK {
-                if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
+                if sentErr := storeHeightIndexSentinel(dataDir); sentErr != nil {
                         fmt.Fprintf(os.Stderr,
-                                "repair-height-index: warning: failed to write sentinel: %v\n", sentErr)
+                                "repair-height-index: warning: failed to write sentinel file: %v\n", sentErr)
                 }
         }
 
@@ -988,18 +1021,19 @@ func run() error {
                 // A partial sweep leaves the sentinel absent so the next restart
                 // retries rather than skipping on corrupted data.
                 if cfg.Consensus.NonValidator && !repairDB {
-                        _, sentinelFound, sentErr := db.LoadHeightIndexSentinel()
-                        if sentErr != nil {
-                                log.Warn("startup: failed to read height-index sentinel",
-                                        "err", sentErr)
-                        }
-                        // Only sweep when the sentinel is absent (first start after rsync).
-                        // If the sentinel was written at any prior height it means the
-                        // initial rsync data was already verified; new blocks since then
-                        // are atomically written and need no sweep.
+                        // Only sweep when the sentinel FILE is absent.  The sentinel is
+                        // stored at <dataDir>/height_index_verified — OUTSIDE chain.db/ —
+                        // so it is never copied by a chain.db-only rsync bootstrap.  A
+                        // relay that just received a fresh chain.db copy will therefore
+                        // always find the sentinel absent and always run the sweep, even
+                        // if the source node had previously written the sentinel in its
+                        // own data directory.
+                        sentinelFound := loadHeightIndexSentinel(cfg.DataDir)
                         if !sentinelFound {
                                 log.Info("startup: height-index sentinel absent — running repair sweep",
-                                        "tip_height", tipHeight)
+                                        "tip_height", tipHeight,
+                                        "sentinel_path", heightIndexSentinelPath(cfg.DataDir),
+                                )
                                 repaired, skipped, sweepErr := db.RepairAllHeightIndex(tipHeight, nil)
                                 sweepComplete := sweepErr == nil && skipped == 0
                                 if sweepErr != nil {
@@ -1016,10 +1050,10 @@ func run() error {
                                         log.Info("startup: height-index sweep complete — index consistent",
                                                 "tip_height", tipHeight)
                                 }
-                                // Write sentinel only after a fully successful sweep so that
-                                // a partial repair is retried on the next restart.
+                                // Write sentinel file only after a fully successful sweep so
+                                // that a partial repair is retried on the next restart.
                                 if sweepComplete {
-                                        if sentErr2 := db.StoreHeightIndexSentinel(tipHeight); sentErr2 != nil {
+                                        if sentErr2 := storeHeightIndexSentinel(cfg.DataDir); sentErr2 != nil {
                                                 log.Warn("startup: failed to write height-index sentinel",
                                                         "err", sentErr2)
                                         }
