@@ -140,7 +140,7 @@ The snapshot already exists (`startupSnapshot` in `main.go`, `loadStartupSnapsho
 
 1. **Always save a snapshot after the full block scan** — already done (lines 512–532 of `main.go`).
 2. **Always save a snapshot on SIGTERM** — already done (lines 850–866 of `main.go`).
-3. **Verify snapshot integrity on load** — add a checksum (SHA-256 of the serialised content) stored alongside the file; reject and fall back on mismatch rather than silently serving corrupted state.
+3. **Verify snapshot integrity on load** — ✅ done (2026-08-12): a SHA-256 checksum of the compressed snapshot bytes is written to a `.sha256` sidecar on every save; `openGzipSnapshotReader` verifies it before deserialising and returns a descriptive corrupt error on mismatch, so all loaders (primary, prev-backup, checkpoints) fall back instead of silently serving corrupted state. Snapshots without a sidecar (older binaries) still load.
 4. **Cap snapshot file size** — at large chain heights the JSON snapshot may itself exceed RAM. Consider a binary/msgpack encoding that is 3–5× smaller than JSON.
 
 ### Secondary fix: Key-image-only binary dump (for the fallback path)
