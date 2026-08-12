@@ -2796,6 +2796,11 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         // disables the purge (fail closed); re-persisting confirmed key images is
         // additive and stays safe either way.
         scanComplete := true
+        // On pruned nodes millions of historical blocks are missing by design;
+        // log only the first few occurrences plus a final summary instead of one
+        // WARN line per block.
+        const maxUnreadableLogs = 5
+        unreadable := 0
         for h := uint64(1); h <= tipHeight; h++ {
                 if h%100000 == 0 {
                         log.Info("--rebuild-key-images: scanning blocks",
@@ -2803,15 +2808,21 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                 }
                 raw, err := blockStore.GetRawBlockByHeight(h)
                 if err != nil || raw == nil {
-                        log.Warn("--rebuild-key-images: block unreadable — phantom purge disabled (fail closed)",
-                                "height", h, "err", err)
+                        if unreadable < maxUnreadableLogs {
+                                log.Warn("--rebuild-key-images: block unreadable — phantom purge disabled (fail closed)",
+                                        "height", h, "err", err)
+                        }
+                        unreadable++
                         scanComplete = false
                         continue
                 }
                 var blk core.Block
                 if jsonErr := json.Unmarshal(raw, &blk); jsonErr != nil {
-                        log.Warn("--rebuild-key-images: block undecodable — phantom purge disabled (fail closed)",
-                                "height", h, "err", jsonErr)
+                        if unreadable < maxUnreadableLogs {
+                                log.Warn("--rebuild-key-images: block undecodable — phantom purge disabled (fail closed)",
+                                        "height", h, "err", jsonErr)
+                        }
+                        unreadable++
                         scanComplete = false
                         continue
                 }
@@ -2834,8 +2845,9 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         // next snapshot loss (exactly the OOM-kill scenario this flag repairs).
         removed := 0
         if !scanComplete {
-                log.Error("--rebuild-key-images: block scan incomplete — skipping phantom purge; " +
-                        "repair the block store (--repair-db) and re-run to purge phantom entries")
+                log.Error("--rebuild-key-images: block scan incomplete — skipping phantom purge",
+                        "unreadable_blocks", unreadable,
+                        "hint", "expected on pruned nodes; on archive nodes run --repair-db and re-run")
                 // Still re-persist the confirmed key images we did observe (additive,
                 // safe) so the index is at least as complete as before.
                 for ki := range valid {
@@ -2844,6 +2856,21 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                                         "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
                         }
                 }
+                // CRITICAL: the block scan could not observe key images spent inside
+                // pruned/unreadable blocks, but ClearKeyImages() above already wiped
+                // them from the in-memory set.  Restore every entry from the
+                // persistent k/ index into memory so the rebuilt snapshot does not
+                // lose confirmed spends (which would re-open double-spend windows).
+                restoredFromIndex := 0
+                if iterErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
+                        utxos.MarkSpent(ki)
+                        restoredFromIndex++
+                        return nil
+                }); iterErr != nil {
+                        return count, fmt.Errorf("restore key images from index after incomplete scan: %w", iterErr)
+                }
+                log.Info("--rebuild-key-images: in-memory set restored from persistent index (scan incomplete)",
+                        "restored_from_index", restoredFromIndex, "from_block_scan", count)
                 return count, nil
         }
         purgeErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {

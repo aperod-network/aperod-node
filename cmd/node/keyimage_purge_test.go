@@ -140,4 +140,15 @@ func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
 	if spent, err := db.IsKeyImageSpent(confirmedKI); err != nil || !spent {
 		t.Errorf("observed confirmed key image must still be re-persisted (spent=%v err=%v)", spent, err)
 	}
+
+	// The in-memory set must be restored from the persistent index: unknownKI
+	// could have been spent inside the unreadable block, so dropping it from
+	// memory (and thus from the rebuilt snapshot) would re-open a double-spend
+	// window on pruned nodes.
+	if !utxos.IsSpent(unknownKI) {
+		t.Errorf("incomplete scan must restore index-known key images into the in-memory set")
+	}
+	if !utxos.IsSpent(confirmedKI) {
+		t.Errorf("scanned key image must be in the in-memory set")
+	}
 }
