@@ -191,14 +191,36 @@ func (pm *PeerMgr) LoadBansFromFile() error {
 		return fmt.Errorf("p2p: ban sidecar %q contains JSON null (not a valid "+
 			"ban array) — repair or remove the file to restart the node", pm.banFile)
 	}
+	// Migrate and load: apply banKey() to every entry so that pre-existing
+	// "IP:port" records written by older node versions are normalised to
+	// bare-IP keys on load.  When two entries collapse to the same canonical
+	// key (e.g. "1.2.3.4:9000" and "1.2.3.4" both map to "1.2.3.4"), the
+	// entry with the furthest expiry is kept to preserve the strongest ban.
+	// Expired entries are silently discarded before normalisation.
 	now := time.Now()
+	migrated := false
 	pm.mu.Lock()
 	for _, e := range entries {
-		if now.Before(e.Until) {
-			pm.banned[e.Addr] = banEntry{reason: e.Reason, until: e.Until}
+		if !now.Before(e.Until) {
+			continue // expired while node was down — discard
 		}
+		key := banKey(e.Addr)
+		if key != e.Addr {
+			migrated = true // canonical key differs → legacy file entry
+		}
+		entry := banEntry{reason: e.Reason, until: e.Until}
+		if existing, ok := pm.banned[key]; ok && existing.until.After(e.Until) {
+			continue // keep the longer-lived existing entry on collision
+		}
+		pm.banned[key] = entry
 	}
 	pm.mu.Unlock()
+	// Re-persist the normalised form so that the on-disk file is canonical
+	// after the first restart, and LiftBan calls on subsequent restarts hit
+	// the correct key without needing another migration pass.
+	if migrated {
+		pm.persistBans()
+	}
 	return nil
 }
 
