@@ -239,6 +239,84 @@ run_join() {
 }
 
 # =============================================================================
+# ── TEST I0: Timeout path — is-active never returns 1 → abort before rsync
+# =============================================================================
+# systemctl stop exits 0 (pretends to work) but is-active also always exits 0
+# (service never actually stops).  The 15-second wait loop exhausts and the
+# script must abort with a non-zero exit, leaving rsync uncalled and the source
+# p2p_identity.key completely untouched.
+section "I0: 15-s timeout — source refuses to stop → abort before rsync; source key intact"
+
+I0_SRC="${TMPDIR_TEST}/i0-src"
+I0_TGT="${TMPDIR_TEST}/i0-tgt"
+mkdir -p "${I0_SRC}" "${I0_TGT}"
+
+# Seed a known fingerprint in the source — must survive untouched.
+echo "source-fingerprint-i0-deadbeef4242" > "${I0_SRC}/p2p_identity.key"
+# Add a chain.db so the data-dir check in join-network.sh passes.
+mkdir -p "${I0_SRC}/chain.db" && touch "${I0_SRC}/chain.db/CURRENT"
+
+I0_YAML="${TMPDIR_TEST}/i0-node.yaml"
+write_node_yaml "${I0_YAML}"
+
+# systemctl stub: stop exits 0 (command accepted) but is-active ALWAYS exits 0
+# (service is still running) → the wait loop never exits early → timeout fires.
+I0_BIN="${TMPDIR_TEST}/i0-bin"
+make_stub "${I0_BIN}" "systemctl" '
+case "$*" in
+  *"stop aperod-node"*)          exit 0 ;;   # pretend stop command succeeded …
+  *"is-active"*)                 exit 0 ;;   # … but service is STILL active
+  *) exit 0 ;;
+esac
+'
+
+# sleep stub: no-op so the 15-iteration wait loop finishes instantly.
+make_stub "${I0_BIN}" "sleep" 'exit 0'
+
+# rsync stub: writes a sentinel file so we can detect whether it was called.
+I0_RSYNC_SENTINEL="${TMPDIR_TEST}/i0-rsync-called"
+make_stub "${I0_BIN}" "rsync" "
+touch '${I0_RSYNC_SENTINEL}'
+exit 0
+"
+
+# ssh stub: SSH is only used after the stop/wait phase, but we provide a
+# minimal stub in case any early step reaches it (it should not).
+make_stub "${I0_BIN}" "ssh" '
+shift
+echo "stopped"
+exit 0
+'
+
+run_join "${TARGET_IP}" "${I0_BIN}" "${I0_SRC}" "${I0_TGT}" "${I0_YAML}"
+
+# I0a: script must exit non-zero (abort due to timeout)
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "I0a: join-network.sh exited non-zero (${LAST_EXIT}) after 15-s timeout"
+else
+  fail "I0a: expected non-zero exit after timeout but got 0. Output:\n${LAST_OUTPUT}"
+fi
+
+# I0b: rsync must NOT have been called (LevelDB integrity preserved)
+if [[ ! -f "${I0_RSYNC_SENTINEL}" ]]; then
+  pass "I0b: rsync was not called — LevelDB not touched after timeout abort"
+else
+  fail "I0b: rsync was called despite source node never stopping — LevelDB would be corrupted"
+fi
+
+# I0c: source p2p_identity.key must be intact and unchanged
+if [[ -f "${I0_SRC}/p2p_identity.key" ]]; then
+  I0_ACTUAL=$(cat "${I0_SRC}/p2p_identity.key")
+  if [[ "${I0_ACTUAL}" == "source-fingerprint-i0-deadbeef4242" ]]; then
+    pass "I0c: source p2p_identity.key unchanged after abort"
+  else
+    fail "I0c: source p2p_identity.key content changed unexpectedly: ${I0_ACTUAL}"
+  fi
+else
+  fail "I0c: source p2p_identity.key is missing after abort — script damaged the source"
+fi
+
+# =============================================================================
 # ── TEST I1: Normal path — rsync excludes key AND rm -f deletes old target key
 # =============================================================================
 section "I1: Normal path — --exclude keeps source key local; SSH rm -f wipes target key"

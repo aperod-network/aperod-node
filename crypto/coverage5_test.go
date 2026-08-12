@@ -97,9 +97,15 @@ func TestDecodeAddress_WrongLength(t *testing.T) {
 func TestDecodeAddress_BadChecksum(t *testing.T) {
         wk, _ := crypto.GenerateWalletKeys()
         addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
-        // Flip last character to corrupt checksum
+        // Flip last character to corrupt checksum. Pick a replacement that
+        // differs from the current last character — otherwise (~1/58 runs)
+        // the address is unchanged and decoding succeeds.
         s := string(addr)
-        corrupted := crypto.Address(s[:len(s)-1] + "X")
+        repl := "X"
+        if s[len(s)-1] == 'X' {
+                repl = "Y"
+        }
+        corrupted := crypto.Address(s[:len(s)-1] + repl)
         _, _, _, err := crypto.DecodeAddress(corrupted)
         if err == nil {
                 t.Fatal("expected checksum error, got nil")

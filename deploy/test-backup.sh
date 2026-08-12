@@ -1886,6 +1886,136 @@ else
 fi
 
 # =============================================================================
+# Test 21: update-validator.sh — sources sync-backup-script.sh and calls
+#          _sync_backup_script so aperod_backup.sh stays in sync on the main
+#          server and on each validator that has backup configured.
+# =============================================================================
+section "Test 21: update-validator.sh sources sync-backup-script.sh and calls _sync_backup_script"
+
+UPDATE_VALIDATOR_SH="$SCRIPT_DIR/update-validator.sh"
+
+if [[ ! -f "$UPDATE_VALIDATOR_SH" ]]; then
+  fail "update-validator.sh not found at: $UPDATE_VALIDATOR_SH"
+else
+
+  # Static check 21a: sources sync-backup-script.sh
+  if grep -qE 'source\s.*sync-backup-script\.sh' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh sources sync-backup-script.sh"
+  else
+    fail "update-validator.sh does NOT source sync-backup-script.sh"
+  fi
+
+  # Static check 21b: calls _sync_backup_script
+  if grep -q '_sync_backup_script' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh calls _sync_backup_script"
+  else
+    fail "update-validator.sh does NOT call _sync_backup_script"
+  fi
+
+  # Static check 21c: passes the repo aperod_backup.sh path explicitly
+  # (so the function does not rely on ambient BLOCKCHAIN_DIR / APEROD_DIR)
+  if grep -q 'aperod_backup.sh' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh references aperod_backup.sh (passes path to _sync_backup_script)"
+  else
+    fail "update-validator.sh does NOT reference aperod_backup.sh"
+  fi
+
+  # Static check 21d: remote validators also receive the backup script.
+  # The SCP call uses BACKUP_SH_SRC (set to "${DEPLOY_DIR}/aperod_backup.sh"),
+  # so match either the literal path or the variable name in an scp call.
+  if grep -qE 'scp.*BACKUP_SH_SRC|BACKUP_SH_SRC=.*aperod_backup' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh SCPs aperod_backup.sh to each validator (via BACKUP_SH_SRC)"
+  else
+    fail "update-validator.sh does NOT SCP aperod_backup.sh to validators"
+  fi
+
+  # Static check 21e: remote install is conditional on backup being configured
+  # (BACKUP_SH_SENT guard so validators without setup-backup.sh are skipped)
+  if grep -q 'BACKUP_SH_SENT' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh uses BACKUP_SH_SENT guard (remote install is conditional)"
+  else
+    fail "update-validator.sh does NOT have BACKUP_SH_SENT guard"
+  fi
+
+  # Behavioral check 21f: remote backup install uses atomic stage-then-rename.
+  # Extract the remote heredoc and verify it never directly `cp` onto the live
+  # installed path, instead staging into the same directory and using `mv -f`.
+  # This prevents a concurrent cron/systemd backup job from reading a half-written
+  # file (the same guarantee _sync_backup_script provides on the main server).
+  REMOTE_HEREDOC=$(sed -n '/REMOTE_EOF/,/^REMOTE_EOF$/p' "$UPDATE_VALIDATOR_SH" || true)
+
+  # Must use mv -f for the final install of the backup script.
+  if echo "$REMOTE_HEREDOC" | grep -q 'mv -f.*BACKUP'; then
+    pass "remote backup install uses mv -f (atomic rename, not direct cp to live path)"
+  else
+    fail "remote backup install does NOT use mv -f — direct cp onto live path is not atomic"
+  fi
+
+  # Must stage into the install directory (same filesystem) via mktemp.
+  if echo "$REMOTE_HEREDOC" | grep -qE 'mktemp.*INSTALL_DIR|mktemp.*usr.local.bin'; then
+    pass "remote backup install stages into the install directory (same filesystem mktemp)"
+  else
+    fail "remote backup install does NOT stage into the install directory — mv may cross filesystems"
+  fi
+
+  # Must NOT have a bare 'sudo cp ... BACKUP_INSTALLED' without a subsequent mv -f
+  # (i.e. the cp must target the staging temp file, not the live installed path).
+  DIRECT_CP=$(echo "$REMOTE_HEREDOC" | grep -E 'sudo cp.*BACKUP_INSTALLED' || true)
+  if [[ -z "$DIRECT_CP" ]]; then
+    pass "remote script does not directly cp onto the live BACKUP_INSTALLED path"
+  else
+    fail "remote script has a bare 'sudo cp ... BACKUP_INSTALLED' — live path is overwritten non-atomically: $DIRECT_CP"
+  fi
+
+fi
+
+# =============================================================================
+# Test 22: install-node.sh — copies aperod_backup.sh to /usr/local/bin/ as
+#          part of first-time setup so the correct version is present from day 1.
+# =============================================================================
+section "Test 22: install-node.sh copies aperod_backup.sh to /usr/local/bin/ on first-time install"
+
+INSTALL_NODE_SH="$SCRIPT_DIR/install-node.sh"
+
+if [[ ! -f "$INSTALL_NODE_SH" ]]; then
+  fail "install-node.sh not found at: $INSTALL_NODE_SH"
+else
+
+  # Static check 22a: copies aperod_backup.sh
+  if grep -qE 'cp.*aperod_backup\.sh' "$INSTALL_NODE_SH"; then
+    pass "install-node.sh copies aperod_backup.sh"
+  else
+    fail "install-node.sh does NOT copy aperod_backup.sh"
+  fi
+
+  # Static check 22b: installs to /usr/local/bin/
+  if grep -qE 'aperod_backup\.sh.*(/usr/local/bin/|/usr/local/bin/aperod_backup)' "$INSTALL_NODE_SH" \
+     || grep -qE '/usr/local/bin/aperod_backup\.sh' "$INSTALL_NODE_SH"; then
+    pass "install-node.sh installs aperod_backup.sh to /usr/local/bin/"
+  else
+    fail "install-node.sh does NOT install aperod_backup.sh to /usr/local/bin/"
+  fi
+
+  # Static check 22c: sets executable permission (chmod 700 or chmod +x)
+  if grep -qE 'chmod.*(700|[+]x).*aperod_backup' "$INSTALL_NODE_SH" \
+     || grep -A3 'cp.*aperod_backup' "$INSTALL_NODE_SH" | grep -q 'chmod'; then
+    pass "install-node.sh sets executable permission on aperod_backup.sh"
+  else
+    fail "install-node.sh does NOT set executable permission on aperod_backup.sh"
+  fi
+
+  # Static check 22d: installation is guarded by a file-existence check
+  # (e.g. [[ -f "${SCRIPT_DIR}/aperod_backup.sh" ]]) so a missing repo
+  # copy does not abort the install.
+  if grep -qE '\[\[.*-f.*aperod_backup' "$INSTALL_NODE_SH"; then
+    pass "install-node.sh guards aperod_backup.sh copy with a -f existence check"
+  else
+    fail "install-node.sh does NOT guard aperod_backup.sh copy with a -f check"
+  fi
+
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

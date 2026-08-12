@@ -41,7 +41,7 @@ fi
 TMPDIR_TEST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
-PRIMARY_IP="10.0.0.1"
+PRIMARY_IP="89.169.53.128"
 BOOTNODE="/ip4/${PRIMARY_IP}/tcp/30303"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -693,6 +693,110 @@ else
     pass "node-config.sh path: p2p.bootnodes[0] == ${BOOTNODE}"
   else
     fail "node-config.sh path: p2p.bootnodes[0] mismatch: expected '${BOOTNODE}', got '${FIRST14}'"
+  fi
+fi
+
+# ── Test 15: aperod-join.sh end-to-end with --p2p-port 30304 ──────────────────
+# Runs aperod-join.sh itself (not just the injection helper) with --p2p-port 30304
+# so the argument-parsing block and BOOTNODE_ADDR construction are exercised.
+# External commands are replaced by lightweight stubs so the test needs no root,
+# no real network, and no systemd.  Uses the existing APEROD_NODE_YAML and
+# APEROD_DROPIN_DIR env-var overrides to redirect filesystem writes.
+section "Test 15: aperod-join.sh end-to-end — --p2p-port 30304 written as bootnode port"
+if [[ ! -f "${APEROD_JOIN_SH}" ]]; then
+  echo -e "${YELLOW}  SKIP${NC}  aperod-join.sh not found at ${APEROD_JOIN_SH}"
+else
+  STUB15="${TMPDIR_TEST}/stubs-t15"
+  mkdir -p "${STUB15}"
+
+  # id stub:
+  #   id -u          → 0 (root check passes)
+  #   id <username>  → exit 1 (user doesn't exist → chown block skipped with warn)
+  cat > "${STUB15}/id" << 'STUB'
+#!/usr/bin/env bash
+for arg; do [[ "$arg" == "-u" ]] && echo 0 && exit 0; done
+exit 1
+STUB
+
+  # systemctl stub:
+  #   is-active → exit 1 (not running → script continues without stopping)
+  #   everything else (disable, daemon-reload) → exit 0
+  cat > "${STUB15}/systemctl" << 'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == "is-active" ]] && exit 1
+exit 0
+STUB
+
+  # curl stub:
+  #   /api/v1/status        → exit 0 (primary reachable)
+  #   /api/v1/snapshot/*    → exit 1 (snapshot unavailable — non-fatal warn path)
+  #   anything else         → exit 0
+  cat > "${STUB15}/curl" << 'STUB'
+#!/usr/bin/env bash
+for arg; do
+  [[ "$arg" == *"/api/v1/snapshot"* ]] && exit 1
+done
+exit 0
+STUB
+
+  chmod +x "${STUB15}/id" "${STUB15}/systemctl" "${STUB15}/curl"
+
+  # Temp dirs that replace the real system paths via env-var overrides.
+  CFG15="${TMPDIR_TEST}/node-t15.yaml"
+  DATA15="${TMPDIR_TEST}/data-t15"
+  DROPIN15="${TMPDIR_TEST}/dropin-t15"
+  make_nested_config "${CFG15}"
+  mkdir -p "${DATA15}" "${DROPIN15}"
+
+  # Run aperod-join.sh with --p2p-port 30304.
+  # --skip-start avoids systemctl enable/start; --no-chaindb avoids chain.db download.
+  # APEROD_NODE_YAML and APEROD_DROPIN_DIR redirect the two writable system paths.
+  PATH="${STUB15}:${PATH}" \
+    APEROD_NODE_YAML="${CFG15}" \
+    APEROD_NODE_CONFIG_SH="${NODE_CONFIG_SH}" \
+    APEROD_DROPIN_DIR="${DROPIN15}" \
+    bash "${APEROD_JOIN_SH}" \
+      "${PRIMARY_IP}:8545" \
+      --p2p-port 30304 \
+      --data-dir "${DATA15}" \
+      --user nonexistentuser_test15 \
+      --skip-start \
+      --no-chaindb \
+    >/dev/null 2>&1
+  EXIT15=$?
+
+  if [[ ${EXIT15} -eq 0 ]]; then
+    pass "aperod-join.sh exited 0 with --p2p-port 30304"
+  else
+    fail "aperod-join.sh exited ${EXIT15} with --p2p-port 30304 (expected 0)"
+  fi
+
+  if is_valid_yaml "${CFG15}"; then
+    pass "node.yaml is valid YAML after aperod-join.sh run"
+  else
+    fail "node.yaml is invalid YAML after aperod-join.sh run"
+  fi
+
+  COUNT15=$(get_nested_bootnodes "${CFG15}" | count_lines)
+  if [[ "${COUNT15}" -eq 1 ]]; then
+    pass "p2p.bootnodes contains exactly 1 entry"
+  else
+    fail "expected 1 p2p.bootnode, got '${COUNT15}'"
+  fi
+
+  FIRST15=$(get_nested_bootnodes "${CFG15}" | head -1)
+  WANT15="/ip4/${PRIMARY_IP}/tcp/30304"
+  if [[ "${FIRST15}" == "${WANT15}" ]]; then
+    pass "p2p.bootnodes[0] == ${WANT15} (port 30304 preserved end-to-end)"
+  else
+    fail "p2p.bootnodes[0] mismatch: expected '${WANT15}', got '${FIRST15}'"
+  fi
+
+  # Critical: default port 30303 must NOT appear when 30304 was requested.
+  if echo "${FIRST15}" | grep -qF "/tcp/30303"; then
+    fail "bootnode contains default port 30303 — --p2p-port flag appears broken in aperod-join.sh"
+  else
+    pass "bootnode does not contain the hardcoded default port 30303 (correct)"
   fi
 fi
 

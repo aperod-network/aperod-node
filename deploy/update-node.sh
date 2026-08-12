@@ -440,6 +440,67 @@ if [[ ! -f "${BINARY_SRC}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 2b: Guard — abort if the fresh binary is dynamically linked.
+#
+# If CGO_ENABLED=0 is accidentally removed from the Makefile, the compiled
+# binary links against the build host's GLIBC.  Older production hosts
+# (Debian 11, Ubuntu 20.04) ship GLIBC 2.31 and refuse to start a binary
+# that requires GLIBC_2.32+, causing an immediate crash-loop on every
+# upgraded machine after the service restarts.
+#
+# This check runs BEFORE the service is stopped — if the binary is dynamic,
+# the old version keeps running untouched and the operator gets a clear error
+# message instead of a silent regression that only surfaces after restart.
+#
+# Primary check: ldd (present on all glibc-based Linux distros).
+#   Static binary  → "not a dynamic executable"
+#   Dynamic binary → lists shared-library dependencies (guard fires)
+#
+# Fallback check (when ldd is absent, e.g. musl-based Alpine): readelf -l
+# looks for a PT_INTERP program header directly in the ELF.
+# ---------------------------------------------------------------------------
+echo "==> [2b] Verifying binary is statically linked..."
+
+_binary_is_dynamic=false
+
+if command -v ldd > /dev/null 2>&1; then
+  _ldd_out=$(ldd "${BINARY_SRC}" 2>&1 || true)
+  if echo "${_ldd_out}" | grep -q "not a dynamic executable"; then
+    echo "  ldd: binary is statically linked ✓"
+  else
+    _binary_is_dynamic=true
+    echo "  ldd output:" >&2
+    echo "${_ldd_out}" | sed 's/^/    /' >&2
+  fi
+elif command -v readelf > /dev/null 2>&1; then
+  if readelf -l "${BINARY_SRC}" 2>/dev/null | grep -q 'INTERP'; then
+    _binary_is_dynamic=true
+    echo "  readelf: PT_INTERP segment found — binary has a dynamic linker path" >&2
+  else
+    echo "  readelf: no PT_INTERP segment — binary is statically linked ✓"
+  fi
+else
+  echo "  [warn] Neither ldd nor readelf found — skipping static-link check."
+  echo "         Ensure CGO_ENABLED=0 is set in the Makefile build-node target."
+fi
+
+if [[ "${_binary_is_dynamic}" == "true" ]]; then
+  echo ""
+  echo "✗ Static-link check FAILED — ${BINARY_SRC} is dynamically linked." >&2
+  echo "  The service was NOT stopped. The old binary is still running." >&2
+  echo "  Fix: ensure CGO_ENABLED=0 is set in the Makefile build-node target," >&2
+  echo "  then re-run update-node.sh." >&2
+
+  send_telegram_alert "⚠️ <b>aperod-node static-link check FAILED</b>
+Server: $(hostname)
+The freshly built binary at <code>${BINARY_SRC}</code> is dynamically linked.
+The service was <b>NOT stopped</b> — the old binary is still running.
+Fix: ensure <code>CGO_ENABLED=0</code> in the Makefile <code>build-node</code> target, then re-run <code>update-node.sh</code>."
+
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Step 3: Stop the service BEFORE copying.
 #
 # Copying over a running Go binary fails with "Text file busy" (ETXTBSY).

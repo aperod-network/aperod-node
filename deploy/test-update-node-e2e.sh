@@ -42,6 +42,10 @@
 #    U3.  curl http://127.0.0.1:8545/api/v1/status returns HTTP 200.
 #    U4.  /usr/local/bin/aperod-node               is executable.
 #    U5.  /etc/systemd/system/aperod-node.service  still exists.
+#    U6.  /usr/local/bin/aperod_backup.sh           exists after upgrade.
+#    U7.  /usr/local/bin/aperod_backup.sh           has permissions 700.
+#    U8.  /usr/local/bin/aperod_backup.sh           content matches the repo copy
+#         (i.e. the stale pre-seeded version was replaced by _sync_backup_script).
 #
 #  Skip condition:
 #    Docker is not found in PATH → test prints SKIP and exits 0.
@@ -347,6 +351,26 @@ rpc:
   listen_addr: "0.0.0.0:8545"
 YAML
 
+# 8b. Install a deliberately stale version of aperod_backup.sh so that
+#     _sync_backup_script (Step 1b of update-node.sh) has a real content
+#     mismatch to fix.  We prepend a comment that differs from the repo
+#     copy; the rest of the file is identical so the script remains valid.
+#     Permissions are 700 (root-owned) mirroring what setup-backup.sh
+#     would have written during the original install.
+BACKUP_DEST="/usr/local/bin/aperod_backup.sh"
+BACKUP_SRC="/deploy/aperod_backup.sh"
+if [[ -f "$BACKUP_SRC" ]]; then
+  {
+    echo "# PRESEED-OLD — intentionally stale version for update test"
+    cat "$BACKUP_SRC"
+  } > "$BACKUP_DEST"
+  chmod 700 "$BACKUP_DEST"
+  chown root:root "$BACKUP_DEST" 2>/dev/null || true
+  echo "[preseed] Installed stale aperod_backup.sh at $BACKUP_DEST (mode 700, differs from repo)."
+else
+  echo "[preseed] WARN: $BACKUP_SRC not found — backup-script sync assertions will be skipped."
+fi
+
 # 9. Start the "old" service so there is a running PID to stop
 UNIT_FILE="/etc/systemd/system/aperod-node.service"
 STATE_DIR="/run/fake-systemd"
@@ -441,6 +465,56 @@ if [[ -f /etc/systemd/system/aperod-node.service ]]; then
   pass_assert "U5: /etc/systemd/system/aperod-node.service still exists"
 else
   fail_assert "U5: /etc/systemd/system/aperod-node.service was removed"
+fi
+
+# U6/U7/U8: backup-script sync assertions.
+#
+# The preseed installed a stale aperod_backup.sh (extra comment line
+# prepended so content differs from the repo copy).  update-node.sh
+# Step 1b calls _sync_backup_script, which must detect the mismatch
+# and atomically replace the installed copy with the repo version.
+#
+# U6: file must still be present after the upgrade.
+# U7: permissions must be 700 (chmod applied by _sync_backup_script).
+# U8: content must match the repo copy (stale version was replaced).
+
+BACKUP_DEST="/usr/local/bin/aperod_backup.sh"
+BACKUP_SRC="/deploy/aperod_backup.sh"
+
+if [[ -f "$BACKUP_SRC" ]]; then
+  if [[ -f "$BACKUP_DEST" ]]; then
+    pass_assert "U6: $BACKUP_DEST exists after upgrade"
+  else
+    fail_assert "U6: $BACKUP_DEST NOT found — _sync_backup_script step may not have run"
+  fi
+
+  if [[ -f "$BACKUP_DEST" ]]; then
+    BACKUP_PERM=$(stat -c '%a' "$BACKUP_DEST" 2>/dev/null || echo "000")
+    if [[ "$BACKUP_PERM" == "700" ]]; then
+      pass_assert "U7: $BACKUP_DEST has permissions 700"
+    else
+      fail_assert "U7: $BACKUP_DEST has permissions $BACKUP_PERM (expected 700)"
+    fi
+  else
+    fail_assert "U7: $BACKUP_DEST not present — cannot check permissions"
+  fi
+
+  if [[ -f "$BACKUP_DEST" ]]; then
+    if cmp -s "$BACKUP_SRC" "$BACKUP_DEST"; then
+      pass_assert "U8: $BACKUP_DEST content matches repo copy (stale version was replaced)"
+    else
+      fail_assert "U8: $BACKUP_DEST content differs from repo copy — stale version was NOT replaced"
+      echo "     diff (repo vs installed, first 20 lines):" >&2
+      diff "$BACKUP_SRC" "$BACKUP_DEST" | head -20 >&2 || true
+    fi
+  else
+    fail_assert "U8: $BACKUP_DEST not present — cannot compare content"
+  fi
+else
+  # Source absent from the image build context — skip gracefully.
+  pass_assert "U6: $BACKUP_SRC absent from image — backup sync assertions skipped"
+  pass_assert "U7: (skipped — source absent)"
+  pass_assert "U8: (skipped — source absent)"
 fi
 
 echo ""

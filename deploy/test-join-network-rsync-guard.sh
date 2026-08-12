@@ -243,7 +243,10 @@ esac
 
 # ssh stub: handles every remote call.
 #   • "curl.*network/stats" → valid JSON with height=54321, peer_count=2
-#   • anything else         → print "stopped" / "removed" / "started" and exit 0
+#   • "systemctl show aperod-node" → valid GOMEMLIMIT + TimeoutStopUSec output
+#                                     (satisfies verify-dropin.sh)
+#   • "test -f" drop-in file checks  → "yes"
+#   • anything else                  → print "stopped" / "removed" / "started"
 # The heredoc for step 5/7 (bootnode injection) arrives via stdin when the
 # remote command is just "bash"; the stub reads and discards stdin then exits 0.
 make_stub "${POS_BIN}" "ssh" '
@@ -253,6 +256,11 @@ if echo "$CMD" | grep -q "network/stats"; then
   echo '\''{"height":54321,"peer_count":2,"syncing":false}'\''
 elif echo "$CMD" | grep -q "curl"; then
   echo '\''{"ok":true}'\''
+elif echo "$CMD" | grep -q "systemctl show aperod-node"; then
+  echo "Environment=GOMEMLIMIT=5368709120"
+  echo "TimeoutStopUSec=15min"
+elif echo "$CMD" | grep -q "test -f"; then
+  echo "yes"
 else
   # Heredoc or other remote commands: drain stdin, print neutral success.
   cat >/dev/null
@@ -340,6 +348,8 @@ esac
 
 # ssh stub: first 2 network/stats calls return height=0 (API not ready yet);
 # 3rd call onwards returns height=77, peer_count=1.
+# Also satisfies verify-dropin.sh: systemctl show → GOMEMLIMIT+TimeoutStopUSec,
+# drop-in test -f checks → "yes".
 DELAYED_STATS_CALL="${TMPDIR_TEST}/delayed-stats-calls"
 make_stub "${DELAYED_BIN}" "ssh" "
 shift
@@ -354,6 +364,11 @@ if echo \"\$CMD\" | grep -q 'network/stats'; then
   else
     echo '{\"height\":77,\"peer_count\":1,\"syncing\":false}'
   fi
+elif echo \"\$CMD\" | grep -q 'systemctl show aperod-node'; then
+  echo 'Environment=GOMEMLIMIT=5368709120'
+  echo 'TimeoutStopUSec=15min'
+elif echo \"\$CMD\" | grep -q 'test -f'; then
+  echo 'yes'
 elif echo \"\$CMD\" | grep -q 'curl'; then
   echo '{\"ok\":true}'
 else
@@ -393,6 +408,275 @@ if echo "${LAST_OUTPUT}" | grep -q "peers=1"; then
   pass "D4: output reports peers=1 after API becomes ready"
 else
   fail "D4: expected 'peers=1' in output. Got:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
+# ── HEALTH-WAIT TIMEOUT — API never comes up ──────────────────────────────────
+# =============================================================================
+section "Health-wait timeout — API never responds → exit 1 + Таймаут warning"
+# This exercises the step-7 health-wait loop in push-mode join-network.sh when
+# the target API never becomes ready.  Every ssh call that would fetch
+# network/stats returns an empty string so the loop exhausts all
+# HEALTH_MAX_ATTEMPTS and exits 1 with the "Таймаут" warning.
+
+HT_DATA="${TMPDIR_TEST}/ht-data"
+mkdir -p "${HT_DATA}/chain.db"
+touch "${HT_DATA}/chain.db/CURRENT"
+
+HT_BIN="${TMPDIR_TEST}/ht-bin"
+
+# systemctl: source stop succeeds, is-active returns 1 (not running), start/enable OK.
+make_stub "${HT_BIN}" "systemctl" '
+case "$*" in
+  *"stop aperod-node"*)   exit 0 ;;
+  *"is-active"*)          exit 1 ;;
+  *"start aperod-node"*)  exit 0 ;;
+  *"enable"*)             exit 0 ;;
+  *"disable"*)            exit 0 ;;
+  *)                      exit 0 ;;
+esac
+'
+
+# ssh stub:
+#   • network/stats polls → empty string (API never ready)
+#   • systemctl show aperod-node → valid output satisfying verify-dropin.sh
+#   • drop-in file existence checks → "yes"
+#   • all other remote commands → neutral success
+make_stub "${HT_BIN}" "ssh" '
+shift   # drop "root@IP"
+CMD="$*"
+if echo "$CMD" | grep -q "network/stats"; then
+  # Return empty string — simulates API never coming up.
+  echo ""
+elif echo "$CMD" | grep -q "systemctl show aperod-node"; then
+  # Satisfy verify-dropin.sh GOMEMLIMIT and TimeoutStopUSec checks.
+  echo "Environment=GOMEMLIMIT=5368709120"
+  echo "TimeoutStopUSec=15min"
+elif echo "$CMD" | grep -q "test -f"; then
+  # Satisfy verify-dropin.sh drop-in file existence checks.
+  echo "yes"
+else
+  # Heredoc and other remote commands: drain stdin, return success strings.
+  cat >/dev/null
+  printf "stopped\nremoved\nstarted\n"
+fi
+exit 0
+'
+
+# rsync: succeed silently.
+make_stub "${HT_BIN}" "rsync" 'exit 0'
+
+# sleep: no-op so 30 loop iterations complete instantly.
+make_stub "${HT_BIN}" "sleep" 'exit 0'
+
+run_join "${TARGET_IP}" "${HT_BIN}" "${HT_DATA}"
+
+# ── Assertion HT1: script exits non-zero (health-wait timeout) ───────────────
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "HT1: script exited non-zero (${LAST_EXIT}) after health-wait timeout"
+else
+  fail "HT1: script should exit non-zero after health-wait timeout but exited 0"
+fi
+
+# ── Assertion HT2: output contains the Russian "Таймаут" warning ──────────────
+if echo "${LAST_OUTPUT}" | grep -q "Таймаут"; then
+  pass "HT2: output contains 'Таймаут' warning"
+else
+  fail "HT2: expected 'Таймаут' in output. Got:\n${LAST_OUTPUT}"
+fi
+
+# ── Assertion HT3: all HEALTH_MAX_ATTEMPTS were exhausted ────────────────────
+# The loop prints "API ещё не готов" on every failed poll (when STATS is empty).
+HT_POLL_COUNT=$(echo "${LAST_OUTPUT}" | grep -c "ещё не готов" || true)
+if [[ "${HT_POLL_COUNT}" -ge 30 ]]; then
+  pass "HT3: health-wait loop ran ${HT_POLL_COUNT} iterations (all attempts exhausted)"
+else
+  fail "HT3: expected ≥30 'ещё не готов' lines but counted ${HT_POLL_COUNT}"
+fi
+
+# =============================================================================
+# ── RSYNC INTERRUPTED MID-COPY → EXIT trap must restart source node ───────────
+# =============================================================================
+section "Rsync interrupted mid-copy — EXIT trap restarts source node unconditionally"
+# If the script is killed or rsync exits non-zero (e.g. SSH disconnect, Ctrl-C,
+# partial LevelDB copy), the EXIT trap installed after step 2 must fire and
+# print the source-restart attempt regardless.  The source node must NOT be left
+# stopped silently.
+
+RI_DATA="${TMPDIR_TEST}/ri-data"
+mkdir -p "${RI_DATA}/chain.db"
+touch "${RI_DATA}/chain.db/CURRENT"
+
+RI_BIN="${TMPDIR_TEST}/ri-bin"
+
+# systemctl: stop succeeds, is-active returns 1 (stopped immediately),
+# start returns 0 so the trap can restart the source.
+make_stub "${RI_BIN}" "systemctl" '
+case "$*" in
+  *"stop aperod-node"*)   exit 0 ;;
+  *"is-active"*)          exit 1 ;;
+  *"start aperod-node"*)  exit 0 ;;
+  *"enable"*)             exit 0 ;;
+  *"disable"*)            exit 0 ;;
+  *)                      exit 0 ;;
+esac
+'
+
+# ssh: target disable/stop returns success so step 1 passes; anything else
+# drains stdin and returns neutral success strings.
+make_stub "${RI_BIN}" "ssh" '
+shift   # drop "root@IP"
+cat >/dev/null
+printf "stopped\nremoved\nstarted\n"
+exit 0
+'
+
+# rsync: exits 1 to simulate an interrupted / partial mid-copy transfer.
+RI_RSYNC_CALLED="${TMPDIR_TEST}/ri-rsync-called"
+make_stub "${RI_BIN}" "rsync" "
+touch '${RI_RSYNC_CALLED}'
+exit 1
+"
+
+# sleep: no-op so any retry loops finish instantly.
+make_stub "${RI_BIN}" "sleep" 'exit 0'
+
+run_join "${TARGET_IP}" "${RI_BIN}" "${RI_DATA}"
+
+# ── Assertion RI1: script exits non-zero after rsync failure ──────────────────
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "RI1: script exited non-zero (${LAST_EXIT}) when rsync failed mid-copy"
+else
+  fail "RI1: script should exit non-zero after rsync failure but exited 0"
+fi
+
+# ── Assertion RI2: rsync stub was actually invoked ───────────────────────────
+if [[ -f "${RI_RSYNC_CALLED}" ]]; then
+  pass "RI2: rsync was called (confirming the failure path was exercised)"
+else
+  fail "RI2: rsync stub was never called — test did not reach the rsync step"
+fi
+
+# ── Assertion RI3: EXIT trap printed the [TRAP] banner ───────────────────────
+if echo "${LAST_OUTPUT}" | grep -q "\[TRAP\]"; then
+  pass "RI3: EXIT trap printed [TRAP] source-restart banner after rsync failure"
+else
+  fail "RI3: expected [TRAP] message in output after rsync failure. Got:\n${LAST_OUTPUT}"
+fi
+
+# ── Assertion RI4: trap confirmed source-node restart attempt ─────────────────
+# The trap message contains "источнике" (Russian for "on the source").
+if echo "${LAST_OUTPUT}" | grep -q "источнике"; then
+  pass "RI4: trap confirmed source-node restart attempt ('источнике' present)"
+else
+  fail "RI4: expected 'источнике' in trap output. Got:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
+# ── TARGET NODE NOT INSTALLED — node.yaml absent on target ───────────────────
+# =============================================================================
+section "Target node not installed — step-5 heredoc guard detects absent node.yaml → abort + install instruction"
+# Step 5 of join-network.sh sends a heredoc to `ssh root@TARGET bash`.
+# The heredoc contains a [[ ! -f "${NODE_YAML}" ]] guard that prints an error
+# and exits 1 when the file is absent.
+#
+# This test lets the guard execute FOR REAL by:
+#   1. Pointing SECONDARY_NODE_YAML at a temp path that is never created.
+#   2. Making the ssh stub run its stdin (the heredoc payload) via `exec bash`
+#      instead of emitting canned output — so the actual guard code runs.
+#
+# If the guard is removed or the error message changes, NI2/NI3 will fail.
+
+NI_DATA="${TMPDIR_TEST}/ni-data"
+mkdir -p "${NI_DATA}/chain.db"
+touch "${NI_DATA}/chain.db/CURRENT"
+
+# Deliberately absent: do NOT create this file.
+NI_NODE_YAML="${TMPDIR_TEST}/ni-node.yaml"
+
+NI_BIN="${TMPDIR_TEST}/ni-bin"
+
+# systemctl: source stop/is-active/start behave correctly so steps 2+trap work.
+make_stub "${NI_BIN}" "systemctl" '
+case "$*" in
+  *"stop aperod-node"*)   exit 0 ;;
+  *"is-active"*)          exit 1 ;;
+  *"start aperod-node"*)  exit 0 ;;
+  *"enable"*)             exit 0 ;;
+  *"disable"*)            exit 0 ;;
+  *)                      exit 0 ;;
+esac
+'
+
+# ssh stub:
+#   • systemctl disable/stop on target (step 1) → "stopped", exit 0
+#   • rm -f identity key (step 4)               → "removed", exit 0
+#   • bare "bash" (step-5 heredoc)              → execute the stdin payload
+#                                                  via `exec bash` so the real
+#                                                  [[ ! -f ]] guard runs
+#   • anything else                             → neutral success
+make_stub "${NI_BIN}" "ssh" '
+shift   # drop "root@IP"
+CMD="$*"
+if echo "$CMD" | grep -qE "systemctl (disable|stop)"; then
+  cat >/dev/null
+  echo "stopped"
+  exit 0
+elif echo "$CMD" | grep -q "rm -f"; then
+  echo "removed"
+  exit 0
+elif [[ "$CMD" == "bash" ]]; then
+  # Run the heredoc payload as a real bash script.
+  # join-network.sh expands ${SECONDARY_NODE_YAML} into the heredoc before
+  # piping it here, so NODE_YAML will contain the temp path that does not
+  # exist — the [[ ! -f "${NODE_YAML}" ]] guard will fire for real.
+  exec bash
+else
+  cat >/dev/null
+  printf "stopped\nremoved\nstarted\n"
+  exit 0
+fi
+'
+
+# rsync: succeed silently (it runs before step 5).
+make_stub "${NI_BIN}" "rsync" 'exit 0'
+
+# sleep: no-op.
+make_stub "${NI_BIN}" "sleep" 'exit 0'
+
+# Run join-network.sh with SECONDARY_NODE_YAML pointing to the absent file.
+NI_EXIT=0
+NI_OUTPUT=$(
+  PATH="${NI_BIN}:${PATH}" \
+  PRIMARY_IP="${PRIMARY_IP}" \
+  PRIMARY_DATA_DIR="${NI_DATA}" \
+  SECONDARY_NODE_YAML="${NI_NODE_YAML}" \
+  bash "${JOIN_SH}" "${TARGET_IP}" 2>&1
+) || NI_EXIT=$?
+
+# ── Assertion NI1: script exits non-zero ──────────────────────────────────────
+if [[ ${NI_EXIT} -ne 0 ]]; then
+  pass "NI1: script exited non-zero (${NI_EXIT}) when node.yaml is absent on target"
+else
+  fail "NI1: script should exit non-zero but exited 0. Output:\n${NI_OUTPUT}"
+fi
+
+# ── Assertion NI2: real guard message 'не найден' appears in output ───────────
+# This text is printed by the [[ ! -f "${NODE_YAML}" ]] block inside the
+# heredoc in join-network.sh step 5.  If that block is removed, this fails.
+if echo "${NI_OUTPUT}" | grep -q "не найден"; then
+  pass "NI2: output contains 'не найден' (real step-5 guard message)"
+else
+  fail "NI2: expected 'не найден' in output. Got:\n${NI_OUTPUT}"
+fi
+
+# ── Assertion NI3: output contains the install instruction ───────────────────
+# The guard also prints the install instruction (install-validator.sh /
+# install-node.sh).  If that line is removed from the heredoc, this fails.
+if echo "${NI_OUTPUT}" | grep -q "install"; then
+  pass "NI3: output contains install instruction (install-validator.sh or install-node.sh)"
+else
+  fail "NI3: expected install instruction in output. Got:\n${NI_OUTPUT}"
 fi
 
 # =============================================================================

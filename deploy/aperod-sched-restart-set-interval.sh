@@ -97,9 +97,16 @@ OnBootSec=${INTERVAL}
 OnUnitActiveSec=${INTERVAL}
 DROPIN
 
-# ── Reload systemd and restart the timer ──────────────────────────────────────
+# ── Reload systemd (and optionally restart the timer) ────────────────────────
+# APEROD_DROPIN_ONLY=1: write the drop-in and daemon-reload only.
+# Used by install-node.sh on the no-primary-ip path so that a pre-existing
+# enabled timer is not activated before aperod-join.sh has run.
 systemctl daemon-reload
-systemctl restart aperod-node-sched-restart.timer
-
-echo "[OK]  Sched-restart timer restarted — interval is now ${INTERVAL} s (${INTERVAL_H} h)."
-echo "      Verify: systemctl list-timers aperod-node-sched-restart.timer"
+if [[ "${APEROD_DROPIN_ONLY:-0}" == "1" ]]; then
+  echo "[OK]  Drop-in written and daemon reloaded (write-only mode; timer not restarted)."
+  echo "      Interval will take effect when the timer is started by aperod-join.sh."
+else
+  systemctl restart aperod-node-sched-restart.timer
+  echo "[OK]  Sched-restart timer restarted — interval is now ${INTERVAL} s (${INTERVAL_H} h)."
+  echo "      Verify: systemctl list-timers aperod-node-sched-restart.timer"
+fi

@@ -400,7 +400,87 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
-hdr "12. Сводка и следующие шаги"
+hdr "12. Соответствие установленного скрипта бэкапа репозиторию"
+
+INSTALLED_BACKUP="/usr/local/bin/aperod_backup.sh"
+REPO_BACKUP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aperod_backup.sh"
+
+if [ ! -f "$INSTALLED_BACKUP" ]; then
+  err "Установленный скрипт не найден: ${INSTALLED_BACKUP}"
+  echo "     → Запустите: sudo bash blockchain/deploy/setup-backup.sh"
+elif [ ! -f "$REPO_BACKUP" ]; then
+  warn "Скрипт репозитория не найден: ${REPO_BACKUP}"
+  echo "     → Убедитесь, что вы запускаете check-system.sh из клона репозитория."
+else
+  INSTALLED_SUM=$(sha256sum "$INSTALLED_BACKUP" | awk '{print $1}')
+  REPO_SUM=$(sha256sum "$REPO_BACKUP" | awk '{print $1}')
+
+  if [ "$INSTALLED_SUM" = "$REPO_SUM" ]; then
+    ok "Установленный скрипт совпадает с репозиторием (sha256: ${INSTALLED_SUM:0:16}…)"
+  else
+    echo ""
+    echo -e "  ${RED}✗${NC} ${BLD}РАСХОЖДЕНИЕ: установленный скрипт отличается от репозитория!${NC}"
+    echo ""
+    echo "     Установленный : ${INSTALLED_BACKUP}"
+    echo "       sha256      : ${INSTALLED_SUM}"
+    echo "     Репозиторий   : ${REPO_BACKUP}"
+    echo "       sha256      : ${REPO_SUM}"
+    echo ""
+    echo "     Это может произойти если был выполнен git pull без запуска"
+    echo "     update-node.sh или update-api.sh."
+    echo ""
+    echo "     ── Как исправить ────────────────────────────────────────────"
+    echo "     sudo bash blockchain/deploy/update-node.sh"
+    echo "     (выполняет привилегированную атомарную замену как root)"
+    echo "     ──────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── Telegram alert if TELEGRAM_BOT_TOKEN is set ──────────────────────────
+    # Try to read the token from several places check-system.sh can reach
+    _TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+    if [ -z "$_TG_TOKEN" ]; then
+      _TG_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=)\S+' /etc/environment 2>/dev/null | head -1 || true)
+    fi
+    if [ -z "$_TG_TOKEN" ]; then
+      _TG_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=)\S+' /etc/aperod/api.env 2>/dev/null | head -1 || true)
+    fi
+
+    _TG_CHAT="${ADMIN_TELEGRAM_CHAT_ID:-}"
+    if [ -z "$_TG_CHAT" ]; then
+      _TG_CHAT=$(grep -oP '(?<=^ADMIN_TELEGRAM_CHAT_ID=)\S+' /etc/environment 2>/dev/null | head -1 || true)
+    fi
+    if [ -z "$_TG_CHAT" ]; then
+      _TG_CHAT=$(grep -oP '(?<=^ADMIN_TELEGRAM_CHAT_ID=)\S+' /etc/aperod/api.env 2>/dev/null | head -1 || true)
+    fi
+
+    if [ -n "$_TG_TOKEN" ] && [ -n "$_TG_CHAT" ]; then
+      _ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      _tg_text="⚠️ <b>Aperod: скрипт бэкапа расходится с репозиторием</b>%0A%0A"
+      _tg_text+="<b>Установленный:</b> <code>${INSTALLED_BACKUP}</code>%0A"
+      _tg_text+="<code>${INSTALLED_SUM}</code>%0A%0A"
+      _tg_text+="<b>Репозиторий:</b> <code>${REPO_BACKUP}</code>%0A"
+      _tg_text+="<code>${REPO_SUM}</code>%0A%0A"
+      _tg_text+="[!] Скорее всего, был выполнен <code>git pull</code> без запуска update-node.sh или update-api.sh.%0A%0A"
+      _tg_text+="<b>Исправление:</b>%0A"
+      _tg_text+="<code>sudo bash blockchain/deploy/update-node.sh</code>%0A%0A"
+      _tg_text+="<b>Время проверки:</b> ${_ts_iso}"
+      curl -s --max-time 15 -X POST \
+        "https://api.telegram.org/bot${_TG_TOKEN}/sendMessage" \
+        -d "chat_id=${_TG_CHAT}" \
+        -d "text=${_tg_text}" \
+        -d "parse_mode=HTML" \
+        -d "disable_web_page_preview=true" \
+        >/dev/null 2>&1 && echo "  Telegram-уведомление о расхождении отправлено администратору." || true
+    else
+      warn "TELEGRAM_BOT_TOKEN не найден — Telegram-уведомление пропущено."
+      echo "     Задайте TELEGRAM_BOT_TOKEN и ADMIN_TELEGRAM_CHAT_ID в /etc/environment"
+      echo "     или /etc/aperod/api.env чтобы получать оповещения автоматически."
+    fi
+  fi
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+hdr "13. Сводка и следующие шаги"
 
 echo ""
 echo "  Команды для быстрого теста бэкапа (после настройки APEROD_BACKUP_PASSWORD):"

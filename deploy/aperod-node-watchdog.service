@@ -41,6 +41,17 @@ Environment=TIMEOUT_SECS=5
 # Changing WATCHDOG_INTERVAL_SECS in watchdog.env takes effect after
 # running `sudo aperod-watchdog-set-interval`.
 Environment=WATCHDOG_INTERVAL_SECS=60
+# RAM threshold in MB above which the node is proactively restarted even
+# when the API is healthy.  Prevents OOM-induced SIGKILL and LevelDB
+# corruption.  Set to 0 to disable RAM-based restarts.
+# Override in /etc/aperod/watchdog.env: RAM_THRESHOLD_MB=<value>
+Environment=RAM_THRESHOLD_MB=4800
+# Number of consecutive no-new-block probes before the node is restarted.
+# Catches silent freezes where the process is alive and API responds but block
+# production has stalled (e.g. CPU-saturated GC loop).  At a 45 s interval,
+# 3 checks = ~135 s of frozen height before restart.  Set to 0 to disable.
+Environment=STALL_CHECKS_MAX=3
+Environment=WATCHDOG_INTERVAL_SECS=45
 
 ExecStart=/usr/local/bin/aperod-node-watchdog.sh
 

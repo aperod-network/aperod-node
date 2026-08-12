@@ -100,6 +100,13 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---------------------------------------------------------------------------
+# Keep /usr/local/bin/aperod_backup.sh in sync with the repo on this server.
+# Logic is identical to the step in update-node.sh — see sync-backup-script.sh.
+# ---------------------------------------------------------------------------
+# shellcheck source=sync-backup-script.sh
+source "${DEPLOY_DIR}/sync-backup-script.sh"
+
 VALIDATORS_CONF="${VALIDATORS_CONF:-${DEPLOY_DIR}/validators.conf}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519}"
 KNOWN_HOSTS_FILE="${KNOWN_HOSTS_FILE:-/etc/aperod/validator_known_hosts}"
@@ -222,6 +229,19 @@ echo "    $(ls -lh "${BINARY_SRC}" | awk '{print $5, $9}')"
 echo ""
 
 # ---------------------------------------------------------------------------
+# Sync aperod_backup.sh on this (main) server.
+#
+# setup-backup.sh installs /usr/local/bin/aperod_backup.sh once and never
+# updates it again.  When git pull brings in changes to the backup script the
+# running installed copy would silently stay stale.  This step atomically
+# replaces it (stage + rename(2)) so the next scheduled backup always runs
+# the current code.  Non-fatal: skipped when backup is not configured.
+# ---------------------------------------------------------------------------
+echo "==> Syncing aperod_backup.sh on this server..."
+_sync_backup_script /usr/local/bin/aperod_backup.sh "${DEPLOY_DIR}/aperod_backup.sh"
+echo ""
+
+# ---------------------------------------------------------------------------
 # Process each validator.
 # ---------------------------------------------------------------------------
 FAILED=()
@@ -244,7 +264,7 @@ for TARGET in "${VALIDATORS[@]}"; do
   # the remote install step (Step 3) does the atomic swap.
   REMOTE_TMP="/tmp/aperod-node-new"
 
-  echo "  [1/4] Copying binary to ${TARGET}:${REMOTE_TMP}..."
+  echo "  [1/5] Copying binary to ${TARGET}:${REMOTE_TMP}..."
   if ! scp "${SSH_OPTS[@]}" "${BINARY_SRC}" "${TARGET}:${REMOTE_TMP}"; then
     echo "  ✗ SCP failed for ${TARGET}" >&2
     send_telegram_alert "❌ <b>update-validator failed — SCP error</b>
@@ -254,7 +274,23 @@ Could not copy binary. Check SSH key and network connectivity."
     continue
   fi
 
-  # ── Steps 2–4: Remote: stop → install → start → health check ────────────
+  # ── Step 1b: Push aperod_backup.sh to the validator (non-fatal) ──────────
+  # Only copies if the file already exists on the remote (i.e. setup-backup.sh
+  # was previously run on that validator).  A missing installed copy or a
+  # missing repo file is silently skipped so this step never aborts the update.
+  BACKUP_SH_SRC="${DEPLOY_DIR}/aperod_backup.sh"
+  REMOTE_BACKUP_TMP="/tmp/aperod_backup_new.sh"
+  BACKUP_SH_SENT=0
+  if [[ -f "${BACKUP_SH_SRC}" ]]; then
+    if scp "${SSH_OPTS[@]}" "${BACKUP_SH_SRC}" "${TARGET}:${REMOTE_BACKUP_TMP}" 2>/dev/null; then
+      BACKUP_SH_SENT=1
+      echo "  [1b] aperod_backup.sh staged on ${TARGET}."
+    else
+      echo "  [warn] aperod_backup.sh SCP failed for ${TARGET} — skipping backup sync." >&2
+    fi
+  fi
+
+  # ── Steps 2–5: Remote: stop → install → start → health check ────────────
   REMOTE_SCRIPT=$(cat <<'REMOTE_EOF'
 set -euo pipefail
 
@@ -264,22 +300,55 @@ SERVICE_NAME="__SERVICE_NAME__"
 HEALTH_MAX_ATTEMPTS="__HEALTH_MAX_ATTEMPTS__"
 HEALTH_WAIT_SECS="__HEALTH_WAIT_SECS__"
 SKIP_HEALTH_CHECK="__SKIP_HEALTH_CHECK__"
+BACKUP_SH_SENT="__BACKUP_SH_SENT__"
 HEALTH_URL="http://127.0.0.1:8545/api/v1/status"
+BACKUP_INSTALLED="/usr/local/bin/aperod_backup.sh"
+BACKUP_TMP="/tmp/aperod_backup_new.sh"
 
-echo "  [2/4] Stopping ${SERVICE_NAME}..."
+echo "  [2/5] Stopping ${SERVICE_NAME}..."
 sudo systemctl stop "${SERVICE_NAME}" || true
 sleep 1
 
-echo "  [3/4] Installing binary to ${BINARY_DST}..."
+echo "  [3/5] Installing binary to ${BINARY_DST}..."
 sudo cp "${BINARY_SRC}" "${BINARY_DST}"
 sudo chmod +x "${BINARY_DST}"
 echo "    Installed: $(${BINARY_DST} --version 2>/dev/null || ls -lh "${BINARY_DST}" | awk '{print $5, $9}')"
 rm -f "${BINARY_SRC}"
 
-echo "  Starting ${SERVICE_NAME}..."
+# ── Step 3b: Install aperod_backup.sh if backup is configured ────────────
+# Only replaces the installed copy when the script was sent (BACKUP_SH_SENT=1)
+# AND backup is already configured on this validator (/usr/local/bin/aperod_backup.sh
+# exists).  This mirrors the _sync_backup_script non-fatal contract.
+#
+# Atomicity: stage into the same directory as the installed copy (/usr/local/bin),
+# set permissions, then rename(2) via mv -f.  A cron/systemd backup job that starts
+# concurrently will see either the complete old copy or the complete new copy, never
+# a partially written file — exactly the same guarantee as _sync_backup_script on
+# the main server.
+if [[ "${BACKUP_SH_SENT}" == "1" ]] && [[ -f "${BACKUP_INSTALLED}" ]]; then
+  if [[ -f "${BACKUP_TMP}" ]]; then
+    INSTALL_DIR="$(dirname "${BACKUP_INSTALLED}")"
+    BACKUP_STAGE="$(sudo mktemp "${INSTALL_DIR}/.aperod_backup_sync.XXXXXXXX" 2>/dev/null)" || BACKUP_STAGE=""
+    if [[ -n "${BACKUP_STAGE}" ]]; then
+      sudo cp "${BACKUP_TMP}" "${BACKUP_STAGE}" \
+        && sudo chmod 700 "${BACKUP_STAGE}" \
+        && sudo mv -f "${BACKUP_STAGE}" "${BACKUP_INSTALLED}" \
+        && echo "  [3b] aperod_backup.sh updated on this validator (atomic rename)." \
+        || { sudo rm -f "${BACKUP_STAGE}" 2>/dev/null || true
+             echo "  [warn] aperod_backup.sh atomic rename failed — keeping old copy." >&2; }
+    else
+      echo "  [warn] aperod_backup.sh sync skipped — cannot create staging file in ${INSTALL_DIR}" >&2
+    fi
+    rm -f "${BACKUP_TMP}"
+  fi
+elif [[ -f "${BACKUP_TMP}" ]]; then
+  rm -f "${BACKUP_TMP}"   # clean up temp file when backup is not configured
+fi
+
+echo "  [4/5] Starting ${SERVICE_NAME}..."
 sudo systemctl start "${SERVICE_NAME}"
 
-echo "  [4/4] Health check (polling ${HEALTH_URL})..."
+echo "  [5/5] Health check (polling ${HEALTH_URL})..."
 if [[ "${SKIP_HEALTH_CHECK}" == "1" ]]; then
   echo "    SKIP_HEALTH_CHECK=1 — skipping."
   exit 0
@@ -313,6 +382,7 @@ REMOTE_EOF
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__HEALTH_MAX_ATTEMPTS__/${HEALTH_MAX_ATTEMPTS}}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__HEALTH_WAIT_SECS__/${HEALTH_WAIT_SECS}}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__SKIP_HEALTH_CHECK__/${SKIP_HEALTH_CHECK}}"
+  REMOTE_SCRIPT="${REMOTE_SCRIPT//__BACKUP_SH_SENT__/${BACKUP_SH_SENT}}"
 
   if ! ssh "${SSH_OPTS[@]}" "${TARGET}" "bash -s" <<< "${REMOTE_SCRIPT}"; then
     echo "  ✗ Remote update failed on ${TARGET}" >&2

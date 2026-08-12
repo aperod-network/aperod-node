@@ -279,7 +279,7 @@ log_level: info
 p2p:
   listen_addr: /ip4/0.0.0.0/tcp/${P2P_PORT}
   bootnodes:
-    - /ip4/<BOOTNODE_IP>/tcp/30303
+    - /ip4/77.221.153.86/tcp/30303
   max_peers: 50
 
 consensus:

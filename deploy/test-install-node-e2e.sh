@@ -259,7 +259,7 @@ mkdir -p "$STATE_DIR"
 echo "[fake-systemctl] $*" >> "$LOG_FILE"
 
 case "$*" in
-  "start aperod-node")
+  "start aperod-node"|"enable --now aperod-node")
     UNIT_FILE="/etc/systemd/system/aperod-node.service"
     if [[ ! -f "$UNIT_FILE" ]]; then
       echo "[fake-systemctl] ERROR: unit file not found: $UNIT_FILE" >> "$LOG_FILE"
@@ -392,10 +392,17 @@ echo "════════════════════════�
 echo "  Running install-node.sh (non-interactive)"
 echo "══════════════════════════════════════════════════"
 
+# Determine test mode from env var INSTALL_PRIMARY_IP (set by outer runner)
+PRIMARY_IP="${INSTALL_PRIMARY_IP:-}"
+
 # Pipe "1\n" for the wallet-choice prompt (choice 1 = create new wallet).
 # The curl stub returns a valid IP for external lookups so the external-IP
 # read() prompt is never reached.
-printf '1\n' | bash /deploy/install-node.sh
+if [[ -n "$PRIMARY_IP" ]]; then
+  printf '1\n' | bash /deploy/install-node.sh --primary-ip "$PRIMARY_IP"
+else
+  printf '1\n' | bash /deploy/install-node.sh
+fi
 INSTALL_EXIT=$?
 
 echo ""
@@ -410,26 +417,50 @@ else
   fail_assert "A1: install-node.sh exited $INSTALL_EXIT (expected 0)"
 fi
 
-# A2: service must be active (fake systemctl checks PID liveness)
-if systemctl is-active --quiet aperod-node; then
-  pass_assert "A2: systemctl is-active aperod-node returned 0"
+# A2: active-state assertion depends on --primary-ip
+#   With --primary-ip:    node must be active (service was started)
+#   Without --primary-ip: node must NOT be active (safety hold until aperod-join.sh)
+if [[ -n "$PRIMARY_IP" ]]; then
+  if systemctl is-active --quiet aperod-node; then
+    pass_assert "A2: aperod-node is active after --primary-ip install (expected)"
+  else
+    fail_assert "A2: aperod-node NOT active after --primary-ip install (expected active)"
+    echo "     fake-systemctl log:" >&2
+    cat /tmp/fake-systemctl.log >&2 || true
+    echo "     aperod-node stub log:" >&2
+    cat /tmp/aperod-node-stub.log >&2 || true
+  fi
 else
-  fail_assert "A2: systemctl is-active aperod-node returned non-zero"
-  echo "     fake-systemctl log:" >&2
-  cat /tmp/fake-systemctl.log >&2 || true
-  echo "     aperod-node stub log:" >&2
-  cat /tmp/aperod-node-stub.log >&2 || true
+  if ! systemctl is-active --quiet aperod-node 2>/dev/null; then
+    pass_assert "A2: aperod-node correctly NOT active on no-primary-ip install (safety hold)"
+  else
+    fail_assert "A2: aperod-node is active on no-primary-ip install — this allows isolated-chain creation"
+    echo "     fake-systemctl log:" >&2
+    cat /tmp/fake-systemctl.log >&2 || true
+  fi
 fi
 
-# A3: health endpoint must respond HTTP 200
-HTTP_CODE=$(/usr/bin/curl -s -o /dev/null -w "%{http_code}" \
-  --max-time 5 http://127.0.0.1:8545/health 2>/dev/null || echo "000")
-if [[ "$HTTP_CODE" == "200" ]]; then
-  pass_assert "A3: GET /health returned HTTP $HTTP_CODE"
+# A3: health endpoint assertion mirrors A2
+#   With --primary-ip:    must return 200
+#   Without --primary-ip: must NOT return 200 (node not running)
+if [[ -n "$PRIMARY_IP" ]]; then
+  HTTP_CODE=$(/usr/bin/curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 5 http://127.0.0.1:8545/health 2>/dev/null || echo "000")
+  if [[ "$HTTP_CODE" == "200" ]]; then
+    pass_assert "A3: GET /health returned HTTP 200 after --primary-ip install"
+  else
+    fail_assert "A3: GET /health returned HTTP $HTTP_CODE (expected 200 after --primary-ip install)"
+    echo "     aperod-node stub log:" >&2
+    cat /tmp/aperod-node-stub.log >&2 || true
+  fi
 else
-  fail_assert "A3: GET /health returned HTTP $HTTP_CODE (expected 200)"
-  echo "     aperod-node stub log:" >&2
-  cat /tmp/aperod-node-stub.log >&2 || true
+  HTTP_CODE=$(/usr/bin/curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 2 http://127.0.0.1:8545/health 2>/dev/null || echo "000")
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    pass_assert "A3: GET /health returned HTTP $HTTP_CODE (node correctly not running on no-primary-ip install)"
+  else
+    fail_assert "A3: GET /health returned HTTP 200 on no-primary-ip install — node must not be running"
+  fi
 fi
 
 # A4: systemd service file must be present
@@ -460,6 +491,91 @@ if id aperod &>/dev/null; then
   pass_assert "A7: system user 'aperod' was created by the installer"
 else
   fail_assert "A7: system user 'aperod' NOT created — real systemd would reject the service start"
+fi
+
+# A8: backup script must be installed at the expected location
+BACKUP_DEST="/usr/local/bin/aperod_backup.sh"
+if [[ -f "$BACKUP_DEST" ]]; then
+  pass_assert "A8: $BACKUP_DEST exists"
+else
+  fail_assert "A8: $BACKUP_DEST NOT found — install-node.sh backup-script step failed"
+fi
+
+# A9: backup script must be executable (chmod 700 = rwx------)
+# stat -c %a prints the octal permission bits
+if [[ -f "$BACKUP_DEST" ]]; then
+  PERM=$(stat -c '%a' "$BACKUP_DEST" 2>/dev/null || echo "000")
+  if [[ "$PERM" == "700" ]]; then
+    pass_assert "A9: $BACKUP_DEST has permissions 700"
+  else
+    fail_assert "A9: $BACKUP_DEST has permissions $PERM (expected 700)"
+  fi
+else
+  fail_assert "A9: $BACKUP_DEST not present — cannot check permissions"
+fi
+
+# A10: installed backup script content must match the source in the deploy dir
+BACKUP_SRC="/deploy/aperod_backup.sh"
+if [[ -f "$BACKUP_DEST" && -f "$BACKUP_SRC" ]]; then
+  if cmp -s "$BACKUP_SRC" "$BACKUP_DEST"; then
+    pass_assert "A10: $BACKUP_DEST content matches source $BACKUP_SRC"
+  else
+    fail_assert "A10: $BACKUP_DEST content differs from source $BACKUP_SRC — stale version installed"
+    echo "     diff (source vs installed):" >&2
+    diff "$BACKUP_SRC" "$BACKUP_DEST" >&2 || true
+  fi
+elif [[ ! -f "$BACKUP_SRC" ]]; then
+  fail_assert "A10: source $BACKUP_SRC not found in image — cannot compare content"
+else
+  fail_assert "A10: $BACKUP_DEST not present — cannot compare content"
+fi
+
+# A11: installed backup script must pass bash syntax check (bash -n)
+# This catches truncated writes (e.g. disk-full during install) that would
+# cause a silent failure at backup time.
+BACKUP_DEST="/usr/local/bin/aperod_backup.sh"
+if [[ -f "$BACKUP_DEST" ]]; then
+  if bash -n "$BACKUP_DEST" 2>/dev/null; then
+    pass_assert "A11: bash -n $BACKUP_DEST passed (script is syntactically valid)"
+  else
+    fail_assert "A11: bash -n $BACKUP_DEST FAILED — installed script has syntax errors or is truncated"
+    bash -n "$BACKUP_DEST" >&2 || true
+  fi
+else
+  fail_assert "A11: $BACKUP_DEST not present — cannot run syntax check"
+fi
+
+# A12: bootnode entry must be present in node.yaml on --primary-ip path,
+#      and must be absent (no custom primary entry) on the no-primary path.
+if [[ -n "$PRIMARY_IP" ]]; then
+  if grep -q "/ip4/${PRIMARY_IP}/tcp/" /etc/aperod/node.yaml 2>/dev/null; then
+    pass_assert "A12: node.yaml contains bootnode entry for ${PRIMARY_IP}"
+  else
+    fail_assert "A12: node.yaml missing bootnode /ip4/${PRIMARY_IP}/tcp/ (--primary-ip was provided)"
+    echo "     node.yaml p2p section:" >&2
+    grep -A10 "^p2p:" /etc/aperod/node.yaml >&2 || cat /etc/aperod/node.yaml >&2
+  fi
+else
+  # On no-primary path the template emits `p2p.bootnodes: []` — check that
+  # node-config.sh was NOT called and the list is genuinely empty.
+  # Accept both `bootnodes: []` (inline) and `bootnodes:` followed by no entries.
+  YAML_BOOTNODES_ENTRIES=$(python3 -c "
+import sys, yaml
+with open('/etc/aperod/node.yaml') as f:
+    cfg = yaml.safe_load(f)
+p2p = cfg.get('p2p', {}) or {}
+entries = p2p.get('bootnodes', []) or []
+print(len(entries))
+" 2>/dev/null || echo "error")
+  if [[ "$YAML_BOOTNODES_ENTRIES" == "0" ]]; then
+    pass_assert "A12: p2p.bootnodes is empty on no-primary-ip install (correct)"
+  elif [[ "$YAML_BOOTNODES_ENTRIES" == "error" ]]; then
+    fail_assert "A12: could not parse node.yaml to check p2p.bootnodes"
+    cat /etc/aperod/node.yaml >&2 || true
+  else
+    fail_assert "A12: p2p.bootnodes has $YAML_BOOTNODES_ENTRIES entries on no-primary-ip install (expected 0)"
+    grep -A10 "bootnodes" /etc/aperod/node.yaml >&2 || true
+  fi
 fi
 
 echo ""
@@ -493,7 +609,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # so no network I/O happens during the installer run.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
-      jq python3 curl make bash ca-certificates passwd util-linux \
+      jq python3 python3-yaml curl make bash ca-certificates passwd util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 # Stub commands — prepended to PATH in the test harness
@@ -530,12 +646,36 @@ echo -e "${GREEN}[OK]${NC}   Image built: $IMAGE_TAG"
 echo -e "\n${BOLD}Running install-node.sh e2e test inside container…${NC}"
 echo "────────────────────────────────────────────────────"
 
+FAILURES=0
+
+# ── Run 1: no --primary-ip (safety-hold path) ─────────────────────────────────
+# Do NOT pass INSTALL_PRIMARY_IP at all — leaving it unset in the container
+# ensures the harness takes the no-primary branch without risk of empty-string
+# misinterpretation across Docker/shell versions.
+echo -e "\n${BOLD}[Run 1/2] No --primary-ip: node must NOT be started or enabled${NC}"
+echo "────────────────────────────────────────────────────"
 if docker run --rm "$IMAGE_TAG" bash /test-harness.sh; then
-  echo "────────────────────────────────────────────────────"
-  echo -e "${GREEN}${BOLD}install-node.sh e2e smoke test PASSED.${NC}"
+  echo -e "${GREEN}  PASS${NC}  Run 1 (no --primary-ip) passed"
+else
+  echo -e "${RED}  FAIL${NC}  Run 1 (no --primary-ip) failed"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# ── Run 2: with --primary-ip (bootnode + active-service path) ─────────────────
+echo -e "\n${BOLD}[Run 2/2] --primary-ip 10.0.0.2: node must be started and bootnode written${NC}"
+echo "────────────────────────────────────────────────────"
+if docker run --rm -e INSTALL_PRIMARY_IP=10.0.0.2 "$IMAGE_TAG" bash /test-harness.sh; then
+  echo -e "${GREEN}  PASS${NC}  Run 2 (--primary-ip 10.0.0.2) passed"
+else
+  echo -e "${RED}  FAIL${NC}  Run 2 (--primary-ip 10.0.0.2) failed"
+  FAILURES=$((FAILURES + 1))
+fi
+
+echo "────────────────────────────────────────────────────"
+if [[ $FAILURES -eq 0 ]]; then
+  echo -e "${GREEN}${BOLD}install-node.sh e2e smoke test PASSED (both paths).${NC}"
   exit 0
 else
-  echo "────────────────────────────────────────────────────"
-  echo -e "${RED}${BOLD}install-node.sh e2e smoke test FAILED.${NC}"
+  echo -e "${RED}${BOLD}install-node.sh e2e smoke test FAILED ($FAILURES of 2 run(s) failed).${NC}"
   exit 1
 fi

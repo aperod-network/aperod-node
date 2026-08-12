@@ -49,6 +49,17 @@ step "1. Установка скрипта бэкапа"
 install -o root -g root -m 700 "${SCRIPT_DIR}/aperod_backup.sh" /usr/local/bin/aperod_backup.sh
 ok "aperod_backup.sh → /usr/local/bin/aperod_backup.sh (mode 700)"
 
+# Verify the installed file is non-empty, executable, and syntactically valid.
+# A truncated write (e.g. disk-full during install) or wrong permissions would
+# cause a silent failure at backup time — catch it now instead.
+[[ -s /usr/local/bin/aperod_backup.sh ]] \
+  || die "aperod_backup.sh установлен, но файл пустой — возможна неполная запись"
+[[ -x /usr/local/bin/aperod_backup.sh ]] \
+  || die "aperod_backup.sh не исполняемый после install — проверьте файловую систему"
+bash -n /usr/local/bin/aperod_backup.sh \
+  || die "aperod_backup.sh не прошёл синтаксическую проверку (bash -n) — файл мог быть усечён при записи"
+ok "aperod_backup.sh прошёл синтаксическую проверку (bash -n)"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 step "2. Установка systemd unit-файлов"
 

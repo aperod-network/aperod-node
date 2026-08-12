@@ -269,6 +269,57 @@ else
 fi
 
 # =============================================================================
+# Test 10: second run does not change file mtime (write_if_changed is truly
+#          a no-op when content is already correct)
+# =============================================================================
+section "Test 10: second run does not change file mtime (no spurious rewrite)"
+
+T10_DIR=$(mktemp -d "$TMPDIR_TEST/t10-XXXXXXXX")
+T10_SC_LOG="$TMPDIR_TEST/t10-sc.log"
+
+# First run — create the files
+run_ensure_dropin "$T10_DIR" "$T10_SC_LOG" >/dev/null 2>&1
+
+# Sleep >1 s so any rewrite on the second run would produce a visibly different
+# mtime (filesystem timestamps have 1-second resolution on most kernels).
+sleep 1.1
+
+# Capture mtime before second run
+if stat --version >/dev/null 2>&1; then
+  # GNU stat (Linux)
+  TIMEOUT_MTIME_BEFORE=$(stat -c '%Y' "$T10_DIR/timeout.conf")
+  GOMEMLIMIT_MTIME_BEFORE=$(stat -c '%Y' "$T10_DIR/gomemlimit.conf")
+else
+  # BSD stat (macOS)
+  TIMEOUT_MTIME_BEFORE=$(stat -f '%m' "$T10_DIR/timeout.conf")
+  GOMEMLIMIT_MTIME_BEFORE=$(stat -f '%m' "$T10_DIR/gomemlimit.conf")
+fi
+
+# Second run — should be a complete no-op for file writes
+run_ensure_dropin "$T10_DIR" "$T10_SC_LOG" >/dev/null 2>&1
+
+# Capture mtime after second run
+if stat --version >/dev/null 2>&1; then
+  TIMEOUT_MTIME_AFTER=$(stat -c '%Y' "$T10_DIR/timeout.conf")
+  GOMEMLIMIT_MTIME_AFTER=$(stat -c '%Y' "$T10_DIR/gomemlimit.conf")
+else
+  TIMEOUT_MTIME_AFTER=$(stat -f '%m' "$T10_DIR/timeout.conf")
+  GOMEMLIMIT_MTIME_AFTER=$(stat -f '%m' "$T10_DIR/gomemlimit.conf")
+fi
+
+if [[ "$TIMEOUT_MTIME_BEFORE" == "$TIMEOUT_MTIME_AFTER" ]]; then
+  pass "timeout.conf mtime unchanged after second run (mtime: $TIMEOUT_MTIME_BEFORE)"
+else
+  fail "timeout.conf was rewritten on second run (mtime: $TIMEOUT_MTIME_BEFORE → $TIMEOUT_MTIME_AFTER)"
+fi
+
+if [[ "$GOMEMLIMIT_MTIME_BEFORE" == "$GOMEMLIMIT_MTIME_AFTER" ]]; then
+  pass "gomemlimit.conf mtime unchanged after second run (mtime: $GOMEMLIMIT_MTIME_BEFORE)"
+else
+  fail "gomemlimit.conf was rewritten on second run (mtime: $GOMEMLIMIT_MTIME_BEFORE → $GOMEMLIMIT_MTIME_AFTER)"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

@@ -36,3 +36,49 @@ api:
 
 genesis:
   file: "config/genesis-testnet.yaml"
+
+# Snapshot integrity-check settings.
+# utxo_count_tolerance_pct: maximum allowed percentage difference between the
+# UTXO count recorded in the snapshot and the count in the on-disk DB before
+# the snapshot is considered invalid and a full block scan is triggered.
+# Default: 1 (1%).
+#
+# IMPORTANT for relay nodes bootstrapped via rsync:
+#   The rsync'd snapshot was written against the validator's DB state.  After
+#   rsync the local DB may differ slightly, causing the node to reject the
+#   snapshot and fall back to an all-zeros validator registry → every incoming
+#   block is rejected with "producer X is not the scheduled proposer 00000000".
+#   Set this to 10 or higher when bootstrapping from rsync.  The join-network.sh
+#   --bootstrap-from mode sets this automatically.
+#
+# snapshot:
+#   utxo_count_tolerance_pct: 10   # relay/rsync bootstrap — raise from default 1
+
+# Pruning controls how much historical transaction data is kept on disk.
+# mode: "archive" keeps every byte forever (default — use for validator nodes
+#        that need to serve full historical data).
+# mode: "light"   strips RingCT/Bulletproof TxData from blocks older than
+#        keep_blocks, retaining only block headers and the height index.
+#        Fires automatically in the background every ~100 blocks.
+#        Safe for relay/observer nodes and reduces disk use by ~70 % over time.
+#
+# keep_blocks: 200000 ≈ 6.5 days at 3 s/block.  Adjust to taste.
+#
+pruning:
+  mode: light
+  keep_blocks: 200000
+
+# Memory tuning (optional — sensible defaults apply when omitted).
+#
+# max_in_memory_blocks: sliding-window of blocks kept in RAM for fast access
+#   (reorgs, header-sync, API requests).  Older blocks are evicted but remain
+#   on disk.  Default: 1000 (≈ 50 minutes at 3 s/block).  Lower this on nodes
+#   with very limited RAM; raise it on relay nodes that serve many GetBlock
+#   requests to reduce disk I/O.
+# max_in_memory_blocks: 1000
+#
+# mempool_evict_interval_sec: how often (in seconds) the background eviction
+#   pass removes expired transactions from the mempool.  Default: 300 (5 min).
+#   Lower this to keep a tighter mempool; raise it to reduce GC pressure on
+#   nodes with a small mempool load.
+# mempool_evict_interval_sec: 300

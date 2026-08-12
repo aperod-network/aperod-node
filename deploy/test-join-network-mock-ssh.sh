@@ -398,6 +398,39 @@ else
   else
     fail "M2e: expected 'peers=3' in output. Got:\n${LAST_OUTPUT}"
   fi
+
+  # ── M2 idempotency: second run must not add a duplicate entry ──────────────
+  # join-network.sh step 5/7 calls node-config.sh add-bootnode again with the
+  # same multiaddr.  node-config.sh must detect the entry is already present
+  # and leave p2p.bootnodes with exactly 1 entry.
+  M2_SECOND_EXIT=0
+  M2_SECOND_OUTPUT=$(
+    PATH="${M2_BIN}:${PATH}" \
+    PRIMARY_IP="${PRIMARY_IP}" \
+    PRIMARY_DATA_DIR="${M2_DATA}" \
+    SECONDARY_NODE_YAML="${M2_YAML}" \
+    SECONDARY_NODE_CONFIG_SH="${NODE_CONFIG_SH}" \
+    bash "${JOIN_SH}" "${TARGET_IP}" 2>&1
+  ) || M2_SECOND_EXIT=$?
+
+  if [[ ${M2_SECOND_EXIT} -eq 0 ]]; then
+    pass "M2f: second run exited 0 (node-config.sh idempotency)"
+  else
+    fail "M2f: second run expected exit 0, got ${M2_SECOND_EXIT}. Output:\n${M2_SECOND_OUTPUT}"
+  fi
+
+  M2_COUNT2=$(get_p2p_bootnodes "${M2_YAML}" | count_lines)
+  if [[ "${M2_COUNT2}" -eq 1 ]]; then
+    pass "M2g: p2p.bootnodes has exactly 1 entry after second run (no duplicate via node-config.sh)"
+  else
+    fail "M2g: expected exactly 1 bootnode after second run, got ${M2_COUNT2} — node-config.sh added a duplicate"
+  fi
+
+  if is_valid_yaml "${M2_YAML}"; then
+    pass "M2h: node.yaml is valid YAML after second node-config.sh run"
+  else
+    fail "M2h: node.yaml is invalid YAML after second node-config.sh run"
+  fi
 fi
 
 # =============================================================================
@@ -531,6 +564,56 @@ if [[ "${M5_COUNT}" -eq 1 ]]; then
   pass "M5b: p2p.bootnodes has exactly 1 entry after two runs (idempotent)"
 else
   fail "M5b: expected 1 bootnode after two runs, got ${M5_COUNT} — duplicate was added"
+fi
+
+# =============================================================================
+# ── TEST M6: Missing node.yaml — exits non-zero with "не найден" message ──────
+# =============================================================================
+section "M6: Missing node.yaml on secondary — script exits non-zero with install guidance"
+#
+# When SECONDARY_NODE_YAML points at a non-existent path the guard inside the
+# step-5/7 heredoc must reject the run immediately (exit 1), propagating a
+# non-zero exit code from join-network.sh.  The output must contain:
+#   • "не найден" — the Russian-language error phrase
+#   • "install-validator.sh" or "install-node.sh" — the install guidance
+# And the absent file must NOT be created (no silent config synthesis).
+
+M6_DATA="${TMPDIR_TEST}/m6-data"
+mkdir -p "${M6_DATA}/chain.db" && touch "${M6_DATA}/chain.db/CURRENT"
+
+# Deliberately do NOT create this file — it is the absent node.yaml.
+M6_YAML="${TMPDIR_TEST}/m6-node.yaml"
+
+M6_BIN="${TMPDIR_TEST}/m6-bin"
+build_systemctl_stub "${M6_BIN}"
+build_ssh_stub "${M6_BIN}" 99999 0
+make_stub "${M6_BIN}" "rsync" 'exit 0'
+make_stub "${M6_BIN}" "sleep"  'exit 0'
+
+run_join "${TARGET_IP}" "${M6_BIN}" "${M6_DATA}" "${M6_YAML}" "/nonexistent/node-config.sh"
+
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "M6a: join-network.sh exited non-zero (${LAST_EXIT}) when node.yaml is absent"
+else
+  fail "M6a: expected non-zero exit when node.yaml absent, got 0. Output:\n${LAST_OUTPUT}"
+fi
+
+if echo "${LAST_OUTPUT}" | grep -q "не найден"; then
+  pass "M6b: output contains 'не найден' error message"
+else
+  fail "M6b: 'не найден' not found in output. Got:\n${LAST_OUTPUT}"
+fi
+
+if echo "${LAST_OUTPUT}" | grep -qE "install-validator\.sh|install-node\.sh"; then
+  pass "M6c: output contains install guidance (install-validator.sh / install-node.sh)"
+else
+  fail "M6c: install guidance missing from output. Got:\n${LAST_OUTPUT}"
+fi
+
+if [[ ! -f "${M6_YAML}" ]]; then
+  pass "M6d: no node.yaml was synthesised at the absent path"
+else
+  fail "M6d: a node.yaml was wrongly created at ${M6_YAML} — silent config synthesis detected"
 fi
 
 # =============================================================================

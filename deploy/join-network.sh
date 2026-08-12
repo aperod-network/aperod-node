@@ -7,7 +7,7 @@
 #
 #    sudo bash join-network.sh <IP_НОВОГО_СЕРВЕРА>
 #
-#    Пример: sudo bash join-network.sh <PRIMARY_IP>
+#    Пример: sudo bash join-network.sh 77.221.153.86
 #
 #  РЕЖИМ 2 (bootstrap): Запуск на НОВОМ реле.
 #  Копирует chain.db и актуальный снимок с валидатора, чтобы
@@ -15,7 +15,7 @@
 #
 #    sudo bash join-network.sh --bootstrap-from=<IP_ВАЛИДАТОРА>
 #
-#    Пример: sudo bash join-network.sh --bootstrap-from=<PRIMARY_IP>
+#    Пример: sudo bash join-network.sh --bootstrap-from=89.169.53.128
 #
 #  Что делает скрипт (push-режим):
 #    1. Останавливает и отключает aperod-node на новом сервере
@@ -170,6 +170,25 @@ ${BOLD}╔═══════════════════════�
       "import sys,json; d=json.load(sys.stdin); print(d.get('tip_height', d.get('height', 'unknown')))" 2>/dev/null || echo "unknown")
   fi
   info "  Validator tip_height = ${VALIDATOR_TIP}"
+
+  # ── Шаг 1b: Проверяем наличие данных валидатора ─────────
+  # MUST run BEFORE stopping any service: if the validator uses a non-standard
+  # data dir the rsync would silently copy nothing, and the relay would ban the
+  # validator on first connect.  Catching the mismatch here — while both nodes
+  # are still running — lets the operator fix VALIDATOR_DATA_DIR without
+  # triggering the cleanup trap.
+  info "Шаг 1b/9: Проверяем наличие ${VALIDATOR_DATA_DIR} на валидаторе (${VALIDATOR_IP})…"
+  if ! ssh "root@${VALIDATOR_IP}" "[ -d '${VALIDATOR_DATA_DIR}' ]" 2>/dev/null; then
+    die "Директория данных валидатора не найдена: ${VALIDATOR_DATA_DIR}
+  Если валидатор установлен по нестандартному пути, переопределите переменную:
+    VALIDATOR_DATA_DIR=/путь/к/данным bash join-network.sh --bootstrap-from=${VALIDATOR_IP}"
+  fi
+  if ! ssh "root@${VALIDATOR_IP}" "[ -d '${VALIDATOR_DATA_DIR}/chain.db' ]" 2>/dev/null; then
+    die "Поддиректория chain.db не найдена внутри ${VALIDATOR_DATA_DIR} на валидаторе.
+  Убедитесь что aperod-node на валидаторе был запущен хотя бы раз, или переопределите путь:
+    VALIDATOR_DATA_DIR=/путь/к/данным bash join-network.sh --bootstrap-from=${VALIDATOR_IP}"
+  fi
+  ok "VALIDATOR_DATA_DIR и chain.db подтверждены на валидаторе"
 
   # ── Шаг 2: Останавливаем local aperod-node ────────────────
   info "Шаг 2/9: Останавливаем local aperod-node…"
@@ -503,8 +522,49 @@ info "Назначение:       ${TARGET_IP}:${SECONDARY_DATA_DIR}"
 info "Bootnode:         ${PRIMARY_BOOTNODE}"
 echo
 
+# ── State tracking: which services were stopped by this script ─────────────
+# Flags are set immediately after each stop command so that the EXIT/ERR trap
+# can restart whichever services are down, regardless of which step failed.
+# Cleared to 0 after each confirmed restart so the trap is idempotent.
+_TARGET_STOPPED=0
+_SOURCE_STOPPED=0
+
+# ── Защитный trap: гарантирует запуск ОБОИХ узлов при любом сбое ──────────
+# Installed BEFORE Step 1 so it fires even if the script is interrupted
+# immediately after the target node is stopped.
+# Снимается после успешного явного systemctl start ниже (trap - EXIT ERR).
+_push_cleanup() {
+  local _exit=$?
+  if [[ ${_exit} -ne 0 ]]; then
+    warn "[TRAP] Скрипт завершился с кодом ${_exit} — восстанавливаем ноды…"
+    if [[ ${_TARGET_STOPPED} -eq 1 ]]; then
+      warn "[TRAP] Перезапускаем aperod-node на ЦЕЛЕВОМ сервере (${TARGET_IP})…"
+      if ssh "root@${TARGET_IP}" "systemctl start aperod-node 2>/dev/null && echo started" 2>/dev/null; then
+        ok "[TRAP] aperod-node на целевом сервере (${TARGET_IP}) запущен."
+      else
+        warn "[TRAP] Не удалось запустить aperod-node на целевом сервере — запустите вручную:"
+        warn "       ssh root@${TARGET_IP} systemctl start aperod-node"
+      fi
+    fi
+    if [[ ${_SOURCE_STOPPED} -eq 1 ]]; then
+      warn "[TRAP] Перезапускаем aperod-node на ИСТОЧНИКЕ (этот сервер)…"
+      if systemctl start aperod-node 2>/dev/null; then
+        ok "[TRAP] aperod-node на источнике запущен. Проверьте состояние сети вручную."
+      else
+        warn "[TRAP] Не удалось запустить aperod-node через trap — запустите вручную:"
+        warn "       systemctl start aperod-node"
+      fi
+    fi
+  fi
+}
+trap '_push_cleanup' EXIT ERR
+
 # ── Шаг 1: Останавливаем ноду на целевом сервере ──────────
 info "Шаг 1/7: Останавливаем и отключаем aperod-node на ${TARGET_IP}…"
+# Set the flag BEFORE sending the SSH command so that an SSH disconnect
+# after the remote stop fires (but before the command returns) still causes
+# the trap to attempt a restart, not silently leave the target node down.
+_TARGET_STOPPED=1
 ssh "root@${TARGET_IP}" "systemctl disable --now aperod-node 2>/dev/null; echo 'stopped'" || \
   ssh "root@${TARGET_IP}" "systemctl stop aperod-node 2>/dev/null || true; echo 'stopped'"
 ok "Нода остановлена (systemd auto-restart отключён)"
@@ -529,26 +589,8 @@ if systemctl is-active --quiet aperod-node; then
   systemctl start aperod-node 2>/dev/null || true
   die "aperod-node на источнике не остановился за 15 с. Прерываем."
 fi
+_SOURCE_STOPPED=1
 ok "aperod-node на источнике остановлен"
-
-# ── Защитный trap: гарантирует запуск источника при любом сбое ──
-# Срабатывает при выходе по ошибке (set -e / ERR) или по сигналу,
-# пока нода на источнике остановлена. Снимается после успешного
-# явного systemctl start ниже (trap - EXIT ERR).
-_source_node_trap() {
-  local _exit=$?
-  if [[ ${_exit} -ne 0 ]]; then
-    warn "[TRAP] rsync или последующий шаг завершился с кодом ${_exit}."
-    warn "[TRAP] Автоматически запускаем aperod-node на ИСТОЧНИКЕ…"
-    if systemctl start aperod-node 2>/dev/null; then
-      ok "[TRAP] aperod-node на источнике запущен. Проверьте состояние сети вручную."
-    else
-      warn "[TRAP] Не удалось запустить aperod-node через trap — запустите вручную:"
-      warn "       systemctl start aperod-node"
-    fi
-  fi
-}
-trap '_source_node_trap' EXIT ERR
 
 # ── Шаг 3: Rsync данных с --delete ────────────────────────
 info "Шаг 3/7: Синхронизируем цепь (rsync --delete)…"
@@ -563,12 +605,13 @@ ok "Rsync завершён"
 info "Перезапускаем aperod-node на источнике…"
 if systemctl start aperod-node 2>/dev/null; then
   ok "aperod-node на источнике запущен"
-  # Снимаем trap: источник запущен, дальнейшие ошибки его не касаются
-  trap - EXIT ERR
 else
   warn "Не удалось запустить aperod-node на источнике — проверьте вручную"
-  trap - EXIT ERR
 fi
+# Mark source as back up so the trap won't try to restart it again.
+# We intentionally keep the trap active: the target node is still stopped
+# and must be restarted by the trap if any subsequent step fails.
+_SOURCE_STOPPED=0
 
 # ── Шаг 4: Удаляем скопированный p2p identity ─────────────
 info "Шаг 4/7: Удаляем скопированный p2p_identity.key…"
@@ -649,7 +692,21 @@ ssh "root@${TARGET_IP}" "
   systemctl enable --now aperod-node
   echo 'started'
 "
+# Target is confirmed up — clear the flag and remove the trap so that
+# subsequent failures (health-wait, verify-dropin) do not trigger a
+# spurious restart of a node that is already running.
+_TARGET_STOPPED=0
+trap - EXIT ERR
 ok "Нода запущена"
+
+# ── Verify drop-in settings on the new node ───────────────
+info "Верифицируем drop-in настройки на ${TARGET_IP}…"
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! bash "${_SCRIPT_DIR}/verify-dropin.sh" "${TARGET_IP}"; then
+  warn "Drop-in проверка не прошла на ${TARGET_IP}."
+  warn "Убедитесь что ensure-dropin.sh выполнился корректно и повторите join-network.sh."
+  exit 1
+fi
 
 # ── Шаг 7: Ожидаем готовности API ─────────────────────────
 info "Шаг 7/7: Ожидаем готовности API (key-image rebuild, ~5 мин)…"

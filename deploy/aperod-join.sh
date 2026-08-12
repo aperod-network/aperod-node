@@ -24,6 +24,7 @@
 #    --tunnel     <user@host> Поднять SSH-туннель (рекомендуется при --api-key)
 #    --data-dir   <path>     Директория данных (по умолчанию /var/lib/aperod)
 #    --user       <name>     Пользователь-владелец данных (по умолчанию aperod)
+#    --p2p-port   <port>     P2P-порт основного узла (по умолчанию 30303)
 #    --skip-start            Не запускать aperod-node после загрузки
 #    --no-chaindb            Пропустить загрузку chain.db (только snapshot)
 #
@@ -44,8 +45,9 @@
 #    4. Скачивает snapshot (UTXO-состояние) через HTTP с основного узла
 #    5. Распаковывает файлы в data_dir с проверкой имён файлов
 #    6. Удаляет p2p_identity.key (нода генерирует новый при старте)
-#    7. Применяет drop-in конфиги systemd (timeout, GOMEMLIMIT)
-#    8. Запускает aperod-node и ждёт готовности API
+#    7. Прописывает PRIMARY_IP как bootnode в /etc/aperod/node.yaml
+#    8. Применяет drop-in конфиги systemd (timeout, GOMEMLIMIT)
+#    9. Запускает aperod-node и ждёт готовности API
 # ============================================================
 set -euo pipefail
 
@@ -64,10 +66,15 @@ TUNNEL_HOST=""
 SKIP_START=false
 NO_CHAINDB=false
 PRIMARY=""
+PRIMARY_P2P_PORT=30303           # P2P port of the primary node (--p2p-port)
 TUNNEL_LOCAL_PORT=19545          # ephemeral local port for SSH tunnel
 HEALTH_MAX_ATTEMPTS=60           # 5 мин при 5-секундном интервале
 HEALTH_WAIT_SECS=5
 TUNNEL_PID=""
+# NODE_YAML / NODE_CONFIG_SH: overridable via env vars so that tests can
+# redirect paths to temp files without root access or a real install.
+NODE_YAML="${APEROD_NODE_YAML:-/etc/aperod/node.yaml}"
+NODE_CONFIG_SH="${APEROD_NODE_CONFIG_SH:-/opt/aperod/blockchain/deploy/node-config.sh}"
 
 # ── Парсинг аргументов ────────────────────────────────────
 if [[ $# -eq 0 ]]; then
@@ -79,12 +86,13 @@ shift
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --api-key)    API_KEY="${2:-}";     shift 2 ;;
-    --tunnel)     TUNNEL_HOST="${2:-}"; shift 2 ;;
-    --data-dir)   DATA_DIR="${2:-}";    shift 2 ;;
-    --user)       DATA_USER="${2:-}";   shift 2 ;;
-    --skip-start) SKIP_START=true;      shift   ;;
-    --no-chaindb) NO_CHAINDB=true;      shift   ;;
+    --api-key)    API_KEY="${2:-}";           shift 2 ;;
+    --tunnel)     TUNNEL_HOST="${2:-}";       shift 2 ;;
+    --data-dir)   DATA_DIR="${2:-}";          shift 2 ;;
+    --user)       DATA_USER="${2:-}";         shift 2 ;;
+    --p2p-port)   PRIMARY_P2P_PORT="${2:-}";  shift 2 ;;
+    --skip-start) SKIP_START=true;            shift   ;;
+    --no-chaindb) NO_CHAINDB=true;            shift   ;;
     *) die "Неизвестный аргумент: $1" ;;
   esac
 done
@@ -281,7 +289,7 @@ fi
 echo
 
 # ── Шаг 6: Права и p2p identity ──────────────────────────
-info "Шаг 6/7: Устанавливаем права и очищаем p2p identity…"
+info "Шаг 6/8: Устанавливаем права и очищаем p2p identity…"
 
 # Удаляем p2p_identity.key — нода сгенерирует новый уникальный ключ при старте.
 # Если скопировать ключ с основного узла, оба сервера видят друг друга как
@@ -297,9 +305,65 @@ else
 fi
 echo
 
-# ── Шаг 7: systemd drop-in конфиги ───────────────────────
-info "Шаг 7/7: Применяем systemd drop-in конфиги…"
-DROPIN_DIR="/etc/systemd/system/aperod-node.service.d"
+# ── Шаг 7: Прописываем bootnode в node.yaml ──────────────
+# Без этого шага у нового узла нет записей в p2p.bootnodes.
+# Оба узла (основной и новый) ждут входящего подключения и
+# никогда не устанавливают соединение — peer_count=0 навсегда.
+BOOTNODE_ADDR="/ip4/${PRIMARY_HOST}/tcp/${PRIMARY_P2P_PORT}"
+info "Шаг 7/8: Прописываем bootnode ${BOOTNODE_ADDR} в ${NODE_YAML}…"
+
+if [[ ! -f "${NODE_YAML}" ]]; then
+  warn "${NODE_YAML} не найден — пропускаем настройку bootnode"
+  warn "Прописать вручную после установки:"
+  warn "  bash /opt/aperod/blockchain/deploy/node-config.sh add-bootnode ${BOOTNODE_ADDR}"
+else
+  # Preferred path: node-config.sh (YAML-safe, idempotent, handles legacy migration).
+  if [[ -x "${NODE_CONFIG_SH}" ]]; then
+    APEROD_CONFIG="${NODE_YAML}" bash "${NODE_CONFIG_SH}" add-bootnode "${BOOTNODE_ADDR}"
+  else
+    # Fallback: inline Python — same logic as node-config.sh and join-network.sh.
+    python3 - "${NODE_YAML}" "${BOOTNODE_ADDR}" <<'PY'
+import sys, yaml, os
+
+cfg_path = sys.argv[1]
+bootnode  = sys.argv[2]
+
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Migrate legacy root-level 'bootnodes' into p2p.bootnodes.
+# The Go runtime only reads cfg.P2P.Bootnodes (yaml:"bootnodes" under p2p:);
+# a root-level key is silently ignored and the node stays isolated.
+legacy = cfg.pop("bootnodes", None)
+
+p2p = cfg.setdefault("p2p", {})
+nodes = list(p2p.get("bootnodes") or [])
+
+if legacy:
+    for entry in (legacy if isinstance(legacy, list) else [legacy]):
+        if entry and entry not in nodes:
+            nodes.append(entry)
+
+if bootnode not in nodes:
+    nodes.append(bootnode)
+p2p["bootnodes"] = nodes
+
+tmp = cfg_path + ".tmp"
+with open(tmp, "w") as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+os.replace(tmp, cfg_path)
+print(f"[OK]   p2p.bootnodes updated: {nodes}")
+PY
+  fi
+  ok "Bootnode ${BOOTNODE_ADDR} прописан в ${NODE_YAML}"
+fi
+echo
+
+# ── Шаг 8: systemd drop-in конфиги ───────────────────────
+info "Шаг 8/8: Применяем systemd drop-in конфиги…"
+# APEROD_DROPIN_DIR lets tests redirect to a writable temp directory so the
+# full script can run end-to-end without root or a real systemd installation.
+DROPIN_DIR="${APEROD_DROPIN_DIR:-/etc/systemd/system/aperod-node.service.d}"
 mkdir -p "${DROPIN_DIR}"
 
 cat > "${DROPIN_DIR}/timeout.conf" << 'DROPIN'
@@ -369,6 +433,27 @@ else
     warn "Проверьте логи: journalctl -u aperod-node -n 50 --no-pager"
     exit 1
   fi
+fi
+
+# ── Активируем watchdog и таймер перезапуска ─────────────────────────────────
+# install-node.sh копирует файлы таймеров, но не запускает их когда --primary-ip
+# не был передан — чтобы не допустить запуска ноды до получения корректного
+# chain.db.  После успешного join нода работает в сети, поэтому безопасно
+# выполнить enable + start.  Для нод, установленных с --primary-ip, таймеры уже
+# активны — enable --now идемпотентен и просто убедится в этом.
+#
+# Когда вызван --skip-start (нода не запускалась), таймеры тоже НЕ активируем:
+# watchdog сразу сделает `systemctl restart aperod-node` после первого
+# неудачного health-probe, что означает запуск ноды вопреки --skip-start.
+if [[ "${SKIP_START}" == "false" ]]; then
+  for _timer in aperod-node-watchdog.timer aperod-node-sched-restart.timer; do
+    if systemctl list-unit-files --quiet "${_timer}" &>/dev/null; then
+      systemctl enable --now "${_timer}" && ok "${_timer} включён и запущен"
+    fi
+  done
+  unset _timer
+else
+  info "Таймеры watchdog/sched-restart не активированы (--skip-start; запустите вручную после старта ноды)"
 fi
 
 # ── Итог ──────────────────────────────────────────────────

@@ -24,6 +24,45 @@ REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
 
+# Resolve script directory early — referenced in step 8b (bootnode) and later
+# steps (watchdog, backup, etc.).  Must be set before any ${SCRIPT_DIR} use.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Аргументы командной строки ────────────────────────────
+# --primary-ip <IP>   Публичный IP основного (primary) узла.
+#                     Если указан, сразу прописывается как bootnode в node.yaml.
+#                     Если не указан — нода стартует без bootnode; запустите
+#                     aperod-join.sh отдельно до первого старта ноды.
+PRIMARY_NODE_IP=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --primary-ip)
+      PRIMARY_NODE_IP="${2:-}"
+      [[ -n "${PRIMARY_NODE_IP}" ]] || die "--primary-ip требует значение (IP-адрес)"
+      # Validate: must be a bare IPv4 address (4 octets, each 0-255, no leading zeros)
+      if ! [[ "${PRIMARY_NODE_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        die "--primary-ip '${PRIMARY_NODE_IP}' не является корректным IPv4-адресом (ожидается формат A.B.C.D)"
+      fi
+      IFS='.' read -r _o1 _o2 _o3 _o4 <<< "${PRIMARY_NODE_IP}"
+      for _oct in "${_o1}" "${_o2}" "${_o3}" "${_o4}"; do
+        # Reject leading zeros (e.g. "08") — they are ambiguous and not standard
+        if [[ "${_oct}" =~ ^0[0-9] ]]; then
+          die "--primary-ip '${PRIMARY_NODE_IP}': октет '${_oct}' содержит ведущий ноль (используйте ${_oct#0} вместо ${_oct})"
+        fi
+        # Force base-10 to avoid octal interpretation in arithmetic context
+        if (( 10#${_oct} > 255 )); then
+          die "--primary-ip '${PRIMARY_NODE_IP}': октет ${_oct} вне диапазона 0-255"
+        fi
+      done
+      unset _o1 _o2 _o3 _o4 _oct
+      shift 2
+      ;;
+    *)
+      die "Неизвестный аргумент: $1. Использование: sudo bash install-node.sh [--primary-ip <IP>]"
+      ;;
+  esac
+done
+
 # ── Лимит памяти Go-рантайма (GOMEMLIMIT) ─────────────────
 # По умолчанию — 75 % от общей RAM хоста, но не меньше 1.5 ГБ и не больше
 # 5.5 ГБ (значение, проверенное на продакшн-ноде с 7.8 ГБ RAM).
@@ -272,6 +311,9 @@ p2p:
   listen: /ip4/0.0.0.0/tcp/${P2P_PORT}
   external: /ip4/${MY_IP}/tcp/${P2P_PORT}
   max_peers: 30
+  # bootnodes: populated by aperod-join.sh or --primary-ip flag.
+  # Do NOT start the node until aperod-join.sh has been run.
+  bootnodes: []
 
 rpc:
   # ВАЖНО: только localhost! Никогда не меняйте на 0.0.0.0
@@ -280,11 +322,6 @@ rpc:
 
 wallet:
   key_file: ${WALLET_FILE}
-
-bootnodes:
-  - /ip4/172.28.0.11/tcp/30303
-  - /ip4/172.28.0.12/tcp/30303
-  - /ip4/172.28.0.13/tcp/30303
 
 # ── Обрезка старых блоков (pruning) ──────────────────────
 # Хранить только последние N блоков, старые удалять автоматически.
@@ -304,6 +341,36 @@ metrics:
 EOF
 
 ok "Конфигурация сохранена: ${CONFIG_DIR}/node.yaml"
+
+# ── 8b. Bootnode из --primary-ip ──────────────────────────
+# Если оператор передал --primary-ip, немедленно прописываем основной узел
+# как bootnode через node-config.sh, чтобы нода не стартовала без пиров.
+# Если --primary-ip не передан — выводим заметное предупреждение.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  BOOTNODE_ADDR="/ip4/${PRIMARY_NODE_IP}/tcp/${P2P_PORT}"
+  info "Прописываем bootnode из --primary-ip: ${BOOTNODE_ADDR}"
+  bash "${SCRIPT_DIR}/node-config.sh" add-bootnode "${BOOTNODE_ADDR}" \
+    || die "Не удалось добавить bootnode ${BOOTNODE_ADDR} — проверьте ${CONFIG_DIR}/node.yaml"
+  ok "Bootnode добавлен: ${BOOTNODE_ADDR}"
+else
+  echo
+  echo -e "${YELLOW}${BOLD}╔══════════════════════════════════════════════════════════╗"
+  echo -e "║  ⚠  ВНИМАНИЕ: bootnode не настроен                        ║"
+  echo -e "╠══════════════════════════════════════════════════════════╣"
+  echo -e "║  Нода стартует без пиров и может сформировать отдельную  ║"
+  echo -e "║  цепь с несовместимым genesis-блоком.                    ║"
+  echo -e "║                                                          ║"
+  echo -e "║  Запустите ноду ТОЛЬКО ПОСЛЕ выполнения aperod-join.sh:  ║"
+  echo -e "║                                                          ║"
+  echo -e "║    sudo bash /opt/aperod/deploy/aperod-join.sh \\         ║"
+  echo -e "║      <PRIMARY_IP>:8545                                   ║"
+  echo -e "║                                                          ║"
+  echo -e "║  Или переустановите с флагом --primary-ip:               ║"
+  echo -e "║                                                          ║"
+  echo -e "║    sudo bash install-node.sh --primary-ip <PRIMARY_IP>   ║"
+  echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
+  echo
+fi
 
 # ── 9. Firewall ────────────────────────────────────────────
 info "Настраиваем ufw…"
@@ -416,13 +483,21 @@ EOF
 ok "Timeout drop-in создан: ${DROPIN_DIR}/timeout.conf (900 s)"
 
 systemctl daemon-reload
-systemctl enable aperod-node
-systemctl start  aperod-node
+# Only enable (and start) aperod-node when a bootnode has been configured.
+# Without a bootnode the node could mine a block with an incompatible genesis key;
+# the operator must run aperod-join.sh first.  aperod-join.sh runs
+# `systemctl enable --now aperod-node` after populating chain data and bootnode.
+# Do NOT run `systemctl enable` here on the no-primary path: even without a
+# `systemctl start`, an enabled unit would auto-start on the next reboot.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  systemctl enable --now aperod-node
+else
+  info "Сервис aperod-node НЕ включён в автозапуск и НЕ запущен."
+  info "aperod-join.sh выполнит enable+start после загрузки корректного chain.db."
+fi
 
 # ── 11. Watchdog — автоматический перезапуск при зависании API ────────────────
 info "Устанавливаем watchdog для aperod-node…"
-# Resolve the script directory so we can reference sibling deploy files
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "${SCRIPT_DIR}/aperod-node-watchdog.sh" /usr/local/bin/aperod-node-watchdog.sh
 chmod +x /usr/local/bin/aperod-node-watchdog.sh
 cp "${SCRIPT_DIR}/aperod-node-watchdog.service" /etc/systemd/system/
@@ -451,11 +526,26 @@ fi
 cp "${SCRIPT_DIR}/aperod-watchdog-set-interval.sh" /usr/local/bin/aperod-watchdog-set-interval
 chmod +x /usr/local/bin/aperod-watchdog-set-interval
 
-# Apply WATCHDOG_INTERVAL_SECS from watchdog.env to the timer drop-in
-/usr/local/bin/aperod-watchdog-set-interval
+# Apply WATCHDOG_INTERVAL_SECS from watchdog.env to the timer drop-in.
+# On the no-primary path use APEROD_DROPIN_ONLY=1: write the drop-in file and
+# run daemon-reload but skip `systemctl restart`, so a pre-existing enabled
+# timer is not accidentally activated before aperod-join.sh runs.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  /usr/local/bin/aperod-watchdog-set-interval
+else
+  APEROD_DROPIN_ONLY=1 /usr/local/bin/aperod-watchdog-set-interval
+fi
 
-systemctl enable --now aperod-node-watchdog.timer
-ok "Watchdog установлен (aperod-node-watchdog.timer запущен)"
+# Only enable/start the watchdog when the node itself is enabled (--primary-ip path).
+# On the no-primary path `aperod-node` is not enabled either; enabling the watchdog
+# would allow it to start the node indirectly (`systemctl restart aperod-node`).
+# aperod-join.sh enables and starts this timer after a successful chain sync.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  systemctl enable --now aperod-node-watchdog.timer
+  ok "Watchdog установлен и запущен (aperod-node-watchdog.timer)"
+else
+  ok "Watchdog установлен (файлы скопированы; enable+start выполнит aperod-join.sh)"
+fi
 
 # ── 11b. Scheduled RAM-prevention restart timer ───────────────────────────────
 # The Go node leaks ~1.3 GB/h.  A restart every 3 h keeps RAM well below the
@@ -494,11 +584,31 @@ cp "${SCRIPT_DIR}/aperod-sched-restart-set-interval.sh" \
    /usr/local/bin/aperod-sched-restart-set-interval
 chmod +x /usr/local/bin/aperod-sched-restart-set-interval
 
-# Apply the interval from sched-restart.env to the timer drop-in
-/usr/local/bin/aperod-sched-restart-set-interval
+# Apply the interval from sched-restart.env to the timer drop-in.
+# Same APEROD_DROPIN_ONLY guard as the watchdog helper above.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  /usr/local/bin/aperod-sched-restart-set-interval
+else
+  APEROD_DROPIN_ONLY=1 /usr/local/bin/aperod-sched-restart-set-interval
+fi
 
-systemctl enable --now aperod-node-sched-restart.timer
-ok "Таймер планового перезапуска установлен (aperod-node-sched-restart.timer, каждые 3 ч)"
+# Same guard as the watchdog: do not enable the restart timer until the node
+# is safely connected to the network.  An enabled timer would fire after its
+# interval and run `systemctl restart aperod-node`, starting an isolated node.
+# aperod-join.sh enables and starts this timer after a successful chain sync.
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  systemctl enable --now aperod-node-sched-restart.timer
+  ok "Таймер планового перезапуска установлен и запущен (aperod-node-sched-restart.timer, каждые 3 ч)"
+else
+  ok "Таймер планового перезапуска установлен (файлы скопированы; enable+start выполнит aperod-join.sh)"
+fi
+
+# Install sudoers rule so the Admin Panel (aperod-api) can change the interval
+# via PATCH /api/admin/system/sched-restart-interval without SSH access.
+# Mirrors the watchdog-interval sudoers setup done earlier in this script.
+info "Устанавливаем sudoers-правило для Admin Panel (sched-restart-interval)…"
+bash "${SCRIPT_DIR}/setup-sched-restart-interval.sh"
+ok "Sudoers-правило для sched-restart-interval установлено"
 
 # ── 12. aperod_backup.sh ──────────────────────────────────────────────────
 # Install the backup script from the repo so the correct version is present
@@ -509,7 +619,16 @@ info "Устанавливаем aperod_backup.sh…"
 if [[ -f "${SCRIPT_DIR}/aperod_backup.sh" ]]; then
   cp "${SCRIPT_DIR}/aperod_backup.sh" /usr/local/bin/aperod_backup.sh
   chmod 700 /usr/local/bin/aperod_backup.sh
-  ok "aperod_backup.sh установлен: /usr/local/bin/aperod_backup.sh"
+  # Verify the installed file is non-empty, executable, and syntactically valid.
+  # A truncated write (e.g. disk-full during install) or wrong permissions would
+  # cause a silent failure at backup time — catch it now instead.
+  [[ -s /usr/local/bin/aperod_backup.sh ]] \
+    || die "aperod_backup.sh установлен, но файл пустой — возможна неполная запись"
+  [[ -x /usr/local/bin/aperod_backup.sh ]] \
+    || die "aperod_backup.sh не исполняемый после chmod 700 — проверьте файловую систему"
+  bash -n /usr/local/bin/aperod_backup.sh \
+    || die "aperod_backup.sh не прошёл синтаксическую проверку (bash -n) — файл мог быть усечён при записи"
+  ok "aperod_backup.sh установлен и прошёл синтаксическую проверку: /usr/local/bin/aperod_backup.sh"
   info "  Для настройки резервного копирования запустите: sudo bash ${SCRIPT_DIR}/setup-backup.sh"
 else
   warn "aperod_backup.sh не найден в ${SCRIPT_DIR} — пропускаем установку скрипта резервного копирования"
@@ -537,19 +656,29 @@ else
   info "  .git/hooks не найден — пропускаем (установка через тарбол, без git)."
 fi
 
-# Проверяем что стартовал
-sleep 3
-if systemctl is-active --quiet aperod-node; then
-  ok "Сервис aperod-node запущен и добавлен в автозапуск"
+# Проверяем что стартовал (только если --primary-ip был передан)
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
+  sleep 3
+  if systemctl is-active --quiet aperod-node; then
+    ok "Сервис aperod-node запущен и добавлен в автозапуск"
+  else
+    warn "Сервис запущен, но, возможно, есть ошибки. Проверьте: journalctl -u aperod-node -n 30"
+  fi
 else
-  warn "Сервис запущен, но, возможно, есть ошибки. Проверьте: journalctl -u aperod-node -n 30"
+  ok "Сервис aperod-node НЕ включён в автозапуск — выполните aperod-join.sh для первого запуска"
 fi
 
 # ── Итоговый вывод ────────────────────────────────────────
 echo
+if [[ -n "${PRIMARY_NODE_IP}" ]]; then
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}${BOLD}  ✓  Aperod APR нода установлена и запущена!${NC}"
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+else
+echo -e "${YELLOW}${BOLD}══════════════════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}${BOLD}  ✓  Aperod APR нода установлена (сервис не запущен)${NC}"
+echo -e "${YELLOW}${BOLD}══════════════════════════════════════════════════════════${NC}"
+fi
 echo
 echo -e "  ${BOLD}Ваш APR-адрес:${NC}"
 echo -e "  ${WALLET_ADDR:-[адрес в файле ${WALLET_FILE}]}"
@@ -566,3 +695,17 @@ echo -e "${YELLOW}${BOLD}  ⚠  Не забудьте сделать резер�
 echo -e "  gpg --symmetric --cipher-algo AES256 ${WALLET_FILE}"
 echo -e "  Сохраните .gpg файл на USB или в менеджере паролей."
 echo
+if [[ -z "${PRIMARY_NODE_IP}" ]]; then
+  echo -e "${YELLOW}${BOLD}  ⚠  ВАЖНО: нода НЕ запущена и НЕ добавлена в автозапуск.${NC}"
+  echo -e "  Сервис aperod-node будет запущен автоматически после aperod-join.sh."
+  echo -e "  До этого нода не будет стартовать — ни вручную, ни при перезагрузке."
+  echo -e ""
+  echo -e "  Для подключения к сети выполните одно из следующих действий:"
+  echo -e ""
+  echo -e "  Вариант 1 — рекомендуется (синхронизирует chain.db и запускает ноду):"
+  echo -e "    sudo bash /opt/aperod/deploy/aperod-join.sh <PRIMARY_IP>:8545"
+  echo -e ""
+  echo -e "  Вариант 2 — переустановка с флагом (если chain.db ещё не получен):"
+  echo -e "    sudo bash install-node.sh --primary-ip <PRIMARY_IP>"
+  echo
+fi
