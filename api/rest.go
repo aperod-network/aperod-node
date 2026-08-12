@@ -899,6 +899,7 @@ func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
                         limit = n
                 }
         }
+        skipCoinbase := q.Get("skip_coinbase") == "true"
 
         outputs := make([]ScanOutput, 0, limit)
         nextHeight := fromHeight
@@ -913,6 +914,9 @@ func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
                         // Wallet clients must filter these so per-block validator rewards
                         // do not appear as +0 APRO entries in user history.
                         isCoinbase := txIdx == 0 && tx.IsCoinbase()
+                        if skipCoinbase && isCoinbase {
+                                continue
+                        }
                         hash := tx.Hash()
                         hashHex := fmt.Sprintf("%x", hash[:])
                         for j, out := range tx.Outputs {
