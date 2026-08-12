@@ -213,8 +213,11 @@ func TestRepairAllHeightIndex_AbsentEntry(t *testing.T) {
 }
 
 // TestRepairAllHeightIndex_SentinelGating confirms the caller contract: when
-// RepairAllHeightIndex returns skipped>0, the sentinel must NOT be written.
-// This test simulates the gate logic from runRepairHeightIndex.
+// RepairAllHeightIndex returns skipped>0, the sweep is incomplete and callers
+// must not treat it as fully verified.  This test validates the sweepOK gate
+// condition (repErr==nil && skipped==0) that the caller uses to decide whether
+// to write the sentinel; it does NOT call StoreHeightIndexSentinel (which is a
+// file-system operation owned by main.go, not the store package).
 func TestRepairAllHeightIndex_SentinelGating(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir)
@@ -231,29 +234,20 @@ func TestRepairAllHeightIndex_SentinelGating(t *testing.T) {
 	}
 
 	_, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
+	db.Close()
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", repErr)
 	}
 
 	// Sentinel MUST NOT be written when skipped > 0.
+	// The gate in main.go is: sweepOK := repErr == nil && skipped == 0
 	sweepOK := repErr == nil && skipped == 0
 	if sweepOK {
-		// Write the sentinel (this branch would be taken by the caller).
-		if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
-			t.Fatalf("StoreHeightIndexSentinel: %v", sentErr)
-		}
 		t.Error("sweepOK was true despite skipped>0 — sentinel would be written incorrectly")
-	} else {
-		// Confirm the sentinel is absent.
-		_, found, loadErr := db.LoadHeightIndexSentinel()
-		if loadErr != nil {
-			t.Fatalf("LoadHeightIndexSentinel: %v", loadErr)
-		}
-		if found {
-			t.Error("sentinel was found even though sweep was incomplete (skipped>0)")
-		}
 	}
-	db.Close()
+	if skipped == 0 {
+		t.Error("skipped = 0 for a dangling entry — RepairAllHeightIndex did not count it as unrepairable")
+	}
 }
 
 // ─── CheckAllHeightIndex tests ────────────────────────────────────────────────
