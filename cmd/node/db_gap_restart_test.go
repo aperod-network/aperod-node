@@ -23,9 +23,13 @@ package main
 //     still loads the blocks that follow it.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -433,4 +437,360 @@ func TestDBGapAtStartOfWindow(t *testing.T) {
 	if tip := chain.Tip(); tip.Header.Height != tipHeight {
 		t.Errorf("chain tip = %d, want %d", tip.Header.Height, tipHeight)
 	}
+}
+
+// TestHeadersFromWithEntireWindowGap is the regression guard for the scenario
+// where every block in the loadRecentBlocksFromStore window (startLoad..tipHeight)
+// is absent from the store — i.e. the entire in-memory window is a gap.
+//
+// With the old `break` behaviour this returned 0 blocks and left chain.Height()
+// at genesis, causing the consensus engine to produce a duplicate block at
+// height 1 and silently fork away from the canonical chain.  Even with the
+// `continue` fix, if every height in the window is missing the returned slice
+// is still empty and FastForward is a no-op.  anchorTipIfNeeded must then fetch
+// the tip block directly so that HeadersFrom can serve at least that one header
+// to a syncing peer.
+//
+// Setup:
+//   - Build a chain of N blocks (heights 0–N); only genesis (0) and tip (N) are
+//     persisted to the store — heights 1..N-1 are all absent.
+//   - A filteredGetter hides height N from the window scan, making the returned
+//     slice empty (entire window is a gap).
+//   - anchorTipIfNeeded is given the unfiltered store (block N present) and must
+//     advance chain.Height() from 0 to N.
+//   - HeadersFrom with a peer that only knows genesis must return ≥ 1 header
+//     (at minimum the tip block's header at height N).
+func TestHeadersFromWithEntireWindowGap(t *testing.T) {
+	const (
+		nBlocks   = 9
+		tipHeight = uint64(nBlocks)
+	)
+
+	dir := t.TempDir()
+
+	// Build a chain where only genesis (0) and tip (9) are stored in the DB.
+	// Heights 1..8 are all absent — the entire window is a gap.
+	// buildEntireWindowGapChain persists only genesis + tip; all intermediate
+	// heights are omitted, simulating a heavy prune or partial rsync.
+	db, blocks := buildEntireWindowGapChain(t, dir, nBlocks)
+
+	// ── Step A: window scan with tip block hidden (filteredGetter) ─────────
+	// Heights 1..8 are not in the store; height 9 is hidden → slice is empty.
+	var scanLog bytes.Buffer
+	filtered := &filteredGetter{inner: db, hideHeight: tipHeight}
+	recentBlocks := loadRecentBlocksFromStore(filtered, tipHeight, newCaptureLogger(&scanLog))
+
+	if len(recentBlocks) != 0 {
+		t.Fatalf("pre-condition: expected 0 blocks from entire-window gap, got %d", len(recentBlocks))
+	}
+
+	// ── Step B: FastForward with empty slice — chain stays at genesis ──────
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	chain.FastForward(recentBlocks) // no-op
+
+	if chain.Height() != 0 {
+		t.Fatalf("pre-condition: chain.Height() = %d after empty FastForward, want 0", chain.Height())
+	}
+
+	// ── Step C: anchorTipIfNeeded with full store must advance to tipHeight ─
+	var anchorLog bytes.Buffer
+	if err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&anchorLog)); err != nil {
+		t.Fatalf("anchorTipIfNeeded: %v", err)
+	}
+	if chain.Height() != tipHeight {
+		t.Errorf("chain.Height() = %d after anchorTipIfNeeded, want %d", chain.Height(), tipHeight)
+	}
+	if !logContainsMsg(&anchorLog, "tip block loaded as in-memory anchor") {
+		t.Errorf("expected 'tip block loaded as in-memory anchor' log not found\nlog:\n%s", anchorLog.String())
+	}
+	t.Logf("chain anchored to height %d after entire-window gap", chain.Height())
+
+	// ── Step D: HeadersFrom must serve at least the tip block ─────────────
+	// A syncing peer that only knows genesis sends genesis hash as its known tip.
+	// HeadersFrom must return ≥ 1 header (the tip block at height N).
+	genesisHash := blocks[0].Hash()
+	headers := chain.HeadersFrom([]crypto.Hash32{genesisHash}, 500)
+
+	if len(headers) == 0 {
+		t.Fatal("HeadersFrom returned 0 headers: node cannot serve any blocks after entire-window gap + anchor")
+	}
+
+	maxServed := uint64(0)
+	for _, hdr := range headers {
+		if hdr.Height > maxServed {
+			maxServed = hdr.Height
+		}
+	}
+	if maxServed < tipHeight {
+		t.Errorf("HeadersFrom served max height %d, want >= %d (tip must be reachable)", maxServed, tipHeight)
+	}
+	t.Logf("HeadersFrom served %d header(s), max height = %d (entire-window gap covered)", len(headers), maxServed)
+}
+
+// buildEntireWindowGapChain creates a chain of nBlocks blocks where only
+// genesis (height 0) and the tip (height nBlocks) are persisted to the store.
+// All intermediate heights 1..nBlocks-1 are deliberately absent, simulating
+// the "entire in-memory window is a gap" scenario (e.g. after a heavy prune or
+// a partial rsync that copied only the tip block alongside genesis).
+//
+// The DB tip is set to the last block.  Returns the open store and a slice of
+// all created blocks (index i == height i).
+func buildEntireWindowGapChain(t *testing.T, dir string, nBlocks int) (*store.DB, []*core.Block) {
+	t.Helper()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	makeBlock := func(height uint64, prevHash crypto.Hash32) *core.Block {
+		hdr := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prevHash,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(nil),
+		}
+		if signErr := hdr.Sign(priv); signErr != nil {
+			t.Fatalf("block Sign height=%d: %v", height, signErr)
+		}
+		return &core.Block{Header: hdr}
+	}
+
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	storeBlk := func(b *core.Block) {
+		raw, merr := json.Marshal(b)
+		if merr != nil {
+			t.Fatalf("marshal block h=%d: %v", b.Header.Height, merr)
+		}
+		if perr := db.PutRawBlock(b.Hash(), b.Header.Height, raw); perr != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, perr)
+		}
+	}
+
+	blocks := make([]*core.Block, nBlocks+1)
+	genesis := makeBlock(0, crypto.Hash32{})
+	blocks[0] = genesis
+	storeBlk(genesis) // genesis always stored
+
+	prevBlock := genesis
+	for i := 1; i <= nBlocks; i++ {
+		blk := makeBlock(uint64(i), prevBlock.Hash())
+		blocks[i] = blk
+		// Store only the tip block; all intermediate blocks are absent.
+		if i == nBlocks {
+			storeBlk(blk)
+		}
+		prevBlock = blk
+	}
+
+	tip := blocks[nBlocks]
+	if err := db.PutTip(tip.Hash(), uint64(nBlocks)); err != nil {
+		t.Fatalf("PutTip: %v", err)
+	}
+
+	return db, blocks
+}
+
+// logContainsFieldValue scans JSON log lines in buf for an entry that has the
+// named structured field set to wantValue (string comparison).  Used to assert
+// key=value log fields (e.g. startup_reason=corrupt_snapshot) independently of
+// the human-readable msg text.
+func logContainsFieldValue(buf *bytes.Buffer, fieldName, wantValue string) bool {
+	sc := bufio.NewScanner(bytes.NewReader(buf.Bytes()))
+	for sc.Scan() {
+		var rec map[string]interface{}
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			continue
+		}
+		if fv, ok := rec[fieldName].(string); ok && fv == wantValue {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCorruptSnapshotFallsBackToGapResumeScan is the regression guard for the
+// interaction between a corrupt/truncated startup snapshot and a gap in the
+// LevelDB block window.
+//
+// The test exercises the complete production startup sequence from main.go in
+// the exact order production uses:
+//
+//	loadRecentBlocksFromStore  (main.go line 764) — in-memory block window
+//	FastForward                (main.go line 816) — chain populated
+//	anchorTipIfNeeded          (main.go line 846) — chain tip anchored
+//	tryLoadStartupSnapshot     (main.go line 899) — snapshot fast-path attempt
+//	runStartupScan             (main.go, !snapLoaded branch) — UTXO fallback scan
+//
+// Three failure modes are combined so that reverting any single fix breaks the
+// test:
+//
+//  1. LevelDB gap: block 4 is absent from the store.  Both loadRecentBlocksFromStore
+//     (continue-on-gap) and runStartupScan (MaxMissingBlocks tolerance) must
+//     survive it.  The old break regression in loadRecentBlocksFromStore would
+//     return 0 blocks.
+//
+//  2. Tip block hidden during the window scan via filteredGetter: FastForward
+//     ends at height 8, so anchorTipIfNeeded must fetch block 9 from the real
+//     DB and advance the chain — making that assertion non-trivial.
+//
+//  3. Corrupt snapshot (truncated non-gzip bytes at snapshotPath(dir, 9)):
+//     tryLoadStartupSnapshot rejects it and emits startup_reason=corrupt_snapshot.
+//     This gates the full UTXO scan (runStartupScan) — the "gap-resume scan" that
+//     must run after the corrupt snapshot is rejected.
+//
+// Verified outcomes (mirrors the "Done looks like" criteria):
+//   - blocks_loaded_in_memory > 0 (gap skipped via continue, not abort).
+//   - chain.Height() == tipHeight after anchorTipIfNeeded (non-trivial anchor).
+//   - tryLoadStartupSnapshot returns an error before runStartupScan is invoked.
+//   - Structured log field startup_reason == "corrupt_snapshot" is present.
+//   - runStartupScan returns ScanFrom == 1 (full scan — no partial checkpoint).
+func TestCorruptSnapshotFallsBackToGapResumeScan(t *testing.T) {
+	const (
+		nBlocks     = 9        // heights 0 – 9
+		gapInWindow = uint64(4) // block 4 absent from the LevelDB store
+	)
+	tipHeight := uint64(nBlocks)
+
+	dir := t.TempDir()
+	// buildChainWithGap stores all blocks except gapInWindow.
+	// The tip block (height 9) IS stored in the real DB so anchorTipIfNeeded
+	// and runStartupScan can access it; it is only hidden during the window
+	// scan via filteredGetter.
+	db, blocks := buildChainWithGap(t, dir, nBlocks, gapInWindow)
+
+	// Write a truncated (corrupt) snapshot at tipHeight.
+	// The v2 format is gzip-compressed JSON; writing raw non-gzip bytes makes
+	// openGzipSnapshotReader fail — identical to a SIGKILL mid-write leaving a
+	// partially-written gzip on disk.
+	tipHashHex := fmt.Sprintf("%x", blocks[nBlocks].Hash())
+	truncated := []byte(`{"v":2,"tip_height":9,"tip_hash":"` + tipHashHex[:8]) // no gzip wrapper
+	if err := os.WriteFile(snapshotPath(dir, tipHeight), truncated, 0644); err != nil {
+		t.Fatalf("write corrupt snapshot: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// ── Production step A: loadRecentBlocksFromStore (main.go line 764). ──────
+	// filteredTip hides height 9 during the window scan while leaving it in the
+	// real db for anchorTipIfNeeded.
+	filteredTip := &filteredGetter{inner: db, hideHeight: tipHeight}
+	recentBlocks := loadRecentBlocksFromStore(filteredTip, tipHeight, log)
+
+	// blocks_loaded_in_memory must be > 0: gap at gapInWindow is skipped via
+	// continue, not abort.  The old break regression returns 0 here.
+	if len(recentBlocks) == 0 {
+		t.Fatalf("blocks_loaded_in_memory == 0 (break regression or entire window absent)\nlog:\n%s",
+			logBuf.String())
+	}
+	// Heights loaded: 1,2,3,[4 gap],5,6,7,8 — tip 9 also hidden → 7 blocks.
+	wantLoaded := nBlocks - 2 // gap at gapInWindow + tip hidden = 2 absent
+	if len(recentBlocks) != wantLoaded {
+		t.Errorf("blocks_loaded_in_memory = %d, want %d (gap at %d + tip hidden)",
+			len(recentBlocks), wantLoaded, gapInWindow)
+	}
+	t.Logf("blocks_loaded_in_memory = %d (gap at %d, tip %d hidden)",
+		len(recentBlocks), gapInWindow, tipHeight)
+
+	// ── Production step B: FastForward (main.go line 816). ────────────────────
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	chain.FastForward(recentBlocks)
+
+	// Pre-condition: chain must be below tipHeight so anchorTipIfNeeded has real
+	// work to do (tip was hidden from the window scan).
+	if chain.Height() >= tipHeight {
+		t.Fatalf("pre-condition failed: chain.Height() = %d, want < %d before anchor",
+			chain.Height(), tipHeight)
+	}
+	t.Logf("chain.Height() after FastForward = %d (tip hidden; anchor needed)", chain.Height())
+
+	// ── Production step C: anchorTipIfNeeded (main.go line 846). ─────────────
+	// Real DB exposes block 9 — anchor fetches and fast-forwards it.
+	if err := anchorTipIfNeeded(chain, db, tipHeight, log); err != nil {
+		t.Fatalf("anchorTipIfNeeded: %v", err)
+	}
+	if chain.Height() != tipHeight {
+		t.Errorf("chain.Height() = %d after anchorTipIfNeeded, want %d", chain.Height(), tipHeight)
+	}
+	if !logContainsMsg(&logBuf, "tip block loaded as in-memory anchor") {
+		t.Errorf("anchorTipIfNeeded log message not found\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Production step D: tryLoadStartupSnapshot (main.go line 899). ────────
+	// Corrupt snapshot must be rejected; this gates the UTXO scan (step E).
+	snap, _, serr := tryLoadStartupSnapshot(dir, tipHeight, tipHashHex, log)
+	if serr == nil || snap != nil {
+		t.Fatalf("tryLoadStartupSnapshot: expected error for corrupt snapshot, got snap=%v err=%v",
+			snap, serr)
+	}
+	t.Logf("tryLoadStartupSnapshot correctly rejected corrupt snapshot: %v", serr)
+
+	// Structured field startup_reason=corrupt_snapshot distinguishes truncation
+	// (SIGKILL mid-write) from a first run (no_snapshot).
+	if !logContainsFieldValue(&logBuf, "startup_reason", "corrupt_snapshot") {
+		t.Errorf("structured log field startup_reason=corrupt_snapshot not found\nlog:\n%s",
+			logBuf.String())
+	}
+	const corruptMsg = "snapshot corrupt or unreadable — falling back to full block scan"
+	if !logContainsMsg(&logBuf, corruptMsg) {
+		t.Errorf("log msg %q not found\nlog:\n%s", corruptMsg, logBuf.String())
+	}
+
+	// ── Production step E: runStartupScan (main.go !snapLoaded branch). ───────
+	// Because tryLoadStartupSnapshot returned an error, snapLoaded is false and
+	// production calls runStartupScan — the "gap-resume scan" this task covers.
+	// With MaxMissingBlocks=10 the scan must survive the gap at height 4 and
+	// complete successfully, returning ScanFrom=1 (no partial checkpoint exists).
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+
+	var wg sync.WaitGroup
+	result, scanErr := runStartupScan(startupScanParams{
+		DataDir:          dir,
+		TipHeight:        tipHeight,
+		TipHashHex:       tipHashHex,
+		DB:               db,
+		UTXOs:            utxos,
+		Registry:         registry,
+		KiFromIndex:      false, // fresh start — no index pre-loaded
+		InitTxTotal:      0,
+		Log:              log,
+		SnapshotWg:       &wg,
+		MaxMissingBlocks: 10, // tolerate the gap at height 4
+	})
+	// Wait for any async snapshot goroutines before asserting on log output.
+	wg.Wait()
+
+	if scanErr != nil {
+		t.Fatalf("runStartupScan: %v (gap at height %d with MaxMissingBlocks=10 should be tolerated)",
+			scanErr, gapInWindow)
+	}
+	// ScanFrom must be 1: the corrupt tip snapshot is not a valid partial
+	// checkpoint (findLatestSnapshot inside runStartupScan rejects it), so the
+	// scan starts from the beginning of the chain.
+	if result.ScanFrom != 1 {
+		t.Errorf("runStartupScan ScanFrom = %d, want 1 (full scan after corrupt snapshot rejection)",
+			result.ScanFrom)
+	}
+	t.Logf("runStartupScan completed: ScanFrom=%d (gap at height %d tolerated)",
+		result.ScanFrom, gapInWindow)
+
+	t.Logf("full startup sequence verified: %d blocks_loaded_in_memory, "+
+		"chain anchored to height %d, corrupt snapshot rejected "+
+		"(startup_reason=corrupt_snapshot), gap-resume scan ran from block 1",
+		len(recentBlocks), tipHeight)
 }
