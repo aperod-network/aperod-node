@@ -436,6 +436,213 @@ func TestRepairAllHeightIndex_PersistenceAfterRepair(t *testing.T) {
 	}
 }
 
+// ─── Regression tests: multi-body and swapped-index scenarios ─────────────────
+
+// TestRepairAllHeightIndex_TwoBodiesAtOneHeight verifies that RepairAllHeightIndex
+// does NOT overwrite a canonical h/<height> entry when two parseable block bodies
+// both claim the same height.  Without a canonical-chain traversal we cannot
+// select between them; the correct behaviour is to leave the existing non-zero
+// h/ entry intact and count the height as OK if it resolves to a valid body.
+func TestRepairAllHeightIndex_TwoBodiesAtOneHeight(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Write blocks at heights 0 and 1.
+	hashes := putChainBlocks(t, db, 2)
+
+	// Write a second block body that also claims height 1 — simulating a fork
+	// block stored alongside the canonical one.
+	var forkHash crypto.Hash32
+	forkHash[0] = 0xAA
+	forkHash[1] = 0xBB
+	forkSB := &store.StoredBlock{Height: 1, Hash: forkHash}
+	if err := db.PutBlock(forkHash, forkSB); err != nil {
+		t.Fatalf("PutBlock(fork): %v", err)
+	}
+	// PutBlock overwrites h/<1> to forkHash.  Restore it to the canonical
+	// hash (hashes[1]) to simulate the scenario where h/<1> is canonical but
+	// b/ has an extra fork body at the same height.
+	db = writeHeightKey(t, dir, db, 1, hashes[1])
+
+	_, tipHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
+	db.Close()
+
+	if repErr != nil {
+		t.Fatalf("RepairAllHeightIndex: %v", repErr)
+	}
+	if repaired != 0 {
+		t.Errorf("repaired = %d, want 0 — must not touch an existing non-zero h/ entry", repaired)
+	}
+	// skipped should be 0: h/<1> already points at a valid body with the
+	// correct height — both bodies are known but the existing h/ is OK.
+	if skipped != 0 {
+		t.Errorf("skipped = %d, want 0 — canonical h/<1> is valid; no repair needed", skipped)
+	}
+
+	// Verify h/<1> still resolves correctly (canonical block is intact).
+	db2, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	got, err := db2.GetBlockByHeight(1)
+	if err != nil {
+		t.Fatalf("GetBlockByHeight(1): %v", err)
+	}
+	if got == nil {
+		t.Fatal("height 1 lost after repair — canonical entry destroyed")
+	}
+	if got.Hash != hashes[1] {
+		t.Errorf("GetBlockByHeight(1) = %x, want canonical %x — wrong body selected", got.Hash[:4], hashes[1][:4])
+	}
+}
+
+// TestRepairAllHeightIndex_TwoBodiesAbsentEntry verifies that when two parseable
+// bodies both claim the same height AND h/<height> is absent/zeroed, the height
+// is counted as skipped (ambiguous — cannot safely pick one for repair).
+func TestRepairAllHeightIndex_TwoBodiesAbsentEntry(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	hashes := putChainBlocks(t, db, 2)
+
+	// Write a fork block at height 1 — PutBlock overwrites h/<1> to forkHash.
+	var forkHash crypto.Hash32
+	forkHash[0] = 0xCC
+	if err := db.PutBlock(forkHash, &store.StoredBlock{Height: 1, Hash: forkHash}); err != nil {
+		t.Fatalf("PutBlock(fork): %v", err)
+	}
+	// Now b/ has two bodies at height 1 (hashes[1] and forkHash).  Also make
+	// sure the first body's b/ entry remains present (PutBlock for fork doesn't
+	// delete the original body, only updates h/).
+	_ = hashes
+
+	// Delete h/<1> so the entry is absent — both bodies exist but no index.
+	db = deleteRawKeys(t, dir, db, heightKeyRaw(1))
+
+	_, tipHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
+	db.Close()
+
+	if repErr != nil {
+		t.Fatalf("RepairAllHeightIndex: %v", repErr)
+	}
+	if repaired != 0 {
+		t.Errorf("repaired = %d, want 0 — ambiguous height must not be repaired", repaired)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1 — ambiguous absent entry must be counted as skipped", skipped)
+	}
+}
+
+// TestCheckAllHeightIndex_SwappedValidHashes verifies that CheckAllHeightIndex
+// detects the case where two h/ entries point at valid block bodies but the
+// bodies encode swapped heights (h/<0> → body claiming height 1, and vice versa).
+// A body-existence-only check would miss this; the body-height validation added
+// to CheckAllHeightIndex catches it.
+func TestCheckAllHeightIndex_SwappedValidHashes(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	hashes := putChainBlocks(t, db, 2) // heights 0 and 1
+
+	// Swap h/<0> and h/<1>: each now points at the other height's body.
+	db = deleteRawKeys(t, dir, db, heightKeyRaw(0), heightKeyRaw(1))
+	db = writeHeightKey(t, dir, db, 0, hashes[1]) // h/<0> → block at height 1
+	db = writeHeightKey(t, dir, db, 1, hashes[0]) // h/<1> → block at height 0
+
+	_, tipHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight)
+	db.Close()
+
+	if chkErr != nil {
+		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
+	}
+	if broken != 2 {
+		t.Errorf("broken = %d, want 2 — both swapped entries must be detected as broken", broken)
+	}
+}
+
+// TestCheckAllHeightIndex_WrongHeightBody verifies that a single h/<height>
+// entry pointing at a block body that encodes a DIFFERENT height is detected
+// as broken by CheckAllHeightIndex.
+func TestCheckAllHeightIndex_WrongHeightBody(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	hashes := putChainBlocks(t, db, 2)
+
+	// Rewrite h/<1> to point at block 0's body (which encodes height 0).
+	db = deleteRawKeys(t, dir, db, heightKeyRaw(1))
+	db = writeHeightKey(t, dir, db, 1, hashes[0]) // h/<1> → body at height 0
+
+	_, tipHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+	db.Close()
+
+	if chkErr != nil {
+		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
+	}
+	if broken != 1 {
+		t.Errorf("broken = %d, want 1", broken)
+	}
+	if firstBroken != 1 {
+		t.Errorf("firstBroken = %d, want 1", firstBroken)
+	}
+}
+
+// writeHeightKey directly sets h/<height> to the given hash, bypassing the
+// normal PutBlock path.  Used by tests to inject broken index states.
+func writeHeightKey(t *testing.T, dir string, db *store.DB, height uint64, hash crypto.Hash32) *store.DB {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close for writeHeightKey: %v", err)
+	}
+	raw, err := leveldb.OpenFile(dir, nil)
+	if err != nil {
+		t.Fatalf("open raw leveldb: %v", err)
+	}
+	if err := raw.Put(heightKeyRaw(height), hash[:], &opt.WriteOptions{Sync: true}); err != nil {
+		raw.Close()
+		t.Fatalf("raw put h/%d: %v", height, err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw leveldb: %v", err)
+	}
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after writeHeightKey: %v", err)
+	}
+	return reopened
+}
+
 // ─── Raw helper for writing a deliberately dangling h/ entry ──────────────────
 
 // writeDanglingHeightEntry directly writes an h/<height> key that points to a
