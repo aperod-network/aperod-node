@@ -15,6 +15,139 @@ package p2p_test
 // Without the dial-gate mechanism, step 3 would be replaced by a successful
 // TCP connect to the target listener, and dialCount would reach 1.
 //
+// TestBanDial_PostConnect_BanDropsConnection exercises the narrow window where
+// dialContextFunc has already returned a live TCP connection (the remote
+// listener received the SYN/ACK) but the connection has not yet been passed
+// to handleConn.
+//
+// Flow:
+//  1. An injected dialContextFunc dials immediately and returns the live conn.
+//  2. postConnectHook fires (under the gate: IsBanned=false, conn registered in
+//     pendingConns) and blocks, holding the test at that exact window.
+//  3. Test calls BanPeer — it acquires dialGateMu, writes the ban, and closes
+//     the pending conn via cancelInFlightDials.
+//  4. Hook unblocks → go handleConn is called with an already-closed conn →
+//     the peer never joins the peer table.
+//
+// Without the pendingConns mechanism, step 3 would not close the conn and
+// handleConn would run with a live connection to a banned peer.
+
+import (
+	"context"
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aperod/aperod/p2p"
+)
+
+func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Track how many connections the listener received and whether each
+	// was immediately closed by the other side (no data, immediate EOF).
+	type connResult struct {
+		conn net.Conn
+		err  error
+	}
+	connCh := make(chan connResult, 4)
+	go func() {
+		for {
+			c, aErr := ln.Accept()
+			connCh <- connResult{c, aErr}
+			if aErr != nil {
+				return
+			}
+		}
+	}()
+
+	targetAddr := ln.Addr().String()
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		MinPeers:   1,
+		NodeID:     "test-post-connect-ban",
+		UserAgent:  "aperod/test",
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	// Replace the dial function with one that returns a live conn immediately
+	// (no context-cancellation check on return) so the raw TCP connection
+	// always reaches dialPeer regardless of whether BanPeer cancels the context.
+	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Dial without honouring ctx so that the conn is returned even if
+		// BanPeer has already cancelled the dial context.
+		return net.Dial(network, addr)
+	})
+
+	// postConnectHook fires after the post-dial gate check registers the conn
+	// in pendingConns but before go handleConn.  Block here so BanPeer can
+	// run with the conn in pendingConns.
+	hookReady := make(chan struct{})
+	hookRelease := make(chan struct{})
+	p2p.SetPostConnectHook(h, func() {
+		close(hookReady) // signal: conn is pending, BanPeer window is open
+		<-hookRelease    // block until test has called BanPeer
+	})
+
+	// Seed the target and trigger a maintainLoop tick to launch the dial.
+	p2p.HostAddKnownPeer(h, targetAddr)
+	p2p.HostTriggerMaintain(h)
+
+	// Wait for the dial goroutine to reach the post-connect hook (conn
+	// established, registered in pendingConns).
+	select {
+	case <-hookReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial goroutine did not reach postConnectHook within 2 s")
+	}
+
+	// Confirm listener received the TCP connection.
+	var listenerConn net.Conn
+	select {
+	case res := <-connCh:
+		if res.err != nil {
+			t.Fatalf("listener accept: %v", res.err)
+		}
+		listenerConn = res.conn
+		defer listenerConn.Close()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("listener did not receive connection within 500 ms")
+	}
+
+	// Call BanPeer — it must close the pending conn via cancelInFlightDials.
+	h.BanPeer(targetAddr, "post-connect ban", 24*time.Hour)
+
+	// Release the hook — go handleConn is called with an already-closed conn.
+	close(hookRelease)
+
+	// Allow time for the goroutine to exit.
+	time.Sleep(100 * time.Millisecond)
+
+	// The connection must NOT have been admitted to the peer loop.
+	if pc := h.PeerCount(); pc != 0 {
+		t.Errorf("PeerCount = %d — post-connect banned conn was admitted to peer loop", pc)
+	}
+
+	// The listener side of the connection must be closed (no data, EOF).
+	listenerConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, readErr := listenerConn.Read(buf)
+	if readErr == nil {
+		t.Error("listener conn read succeeded — connection was not closed after BanPeer")
+	}
+	t.Logf("✓ post-connect ban closed pending conn before handleConn could admit it (PeerCount=%d)", h.PeerCount())
+}
+
 // TestBanReconnect_MaintainLoopSkipsBannedPeer verifies that maintainLoop does
 // not attempt to re-dial a peer that was just banned — even when the banned
 // address is present in peerList and the peer count is below MinPeers.
@@ -40,16 +173,6 @@ package p2p_test
 // listen address ("IP:port") and maintainLoop re-dials that same address, so
 // IsBanned must match via the bare-IP entry that Ban() now writes in addition
 // to the full "IP:port" key.
-
-import (
-	"context"
-	"net"
-	"sync/atomic"
-	"testing"
-	"time"
-
-	"github.com/aperod/aperod/p2p"
-)
 
 // TestBanDial_ConcurrentBan_KnownPeer exercises the dial-gate race for the
 // known-peer (MinPeers/peerList) path:
