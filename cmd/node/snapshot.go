@@ -157,36 +157,49 @@ func writeSnapshotChecksum(path string, digest []byte) error {
 // copySnapshotChecksum keeps a snapshot's checksum sidecar in sync when the
 // snapshot file itself is copied (primary → prev-backup promotion).
 //
-// When the source has no sidecar (snapshot written by a pre-checksum binary),
-// any stale sidecar at the destination is REMOVED — otherwise a leftover
-// sidecar from an older promotion would make the fresh copy fail verification
-// even though it is perfectly valid.
-func copySnapshotChecksum(src, dst string) {
+// Fail-closed contract (task #964 review):
+//   - Source sidecar ABSENT (os.IsNotExist only): the source snapshot was
+//     written by a pre-checksum binary.  Any stale sidecar at the destination
+//     is removed — a leftover digest from an older promotion would make the
+//     fresh, valid copy fail verification.
+//   - Source sidecar stat fails for any OTHER reason (permissions, I/O): the
+//     error is returned.  Treating it as "absent" would silently convert a
+//     checksum-protected snapshot into an unchecksummed backup.
+//   - Copy fails: the error is returned and any existing destination sidecar
+//     is LEFT IN PLACE.  A stale digest forces a verification failure and a
+//     fallback — fail-closed — whereas removing it would skip verification
+//     entirely on a backup whose integrity is now unknown.
+func copySnapshotChecksum(src, dst string) error {
 	srcChk := snapshotChecksumPath(src)
 	dstChk := snapshotChecksumPath(dst)
 	if _, err := os.Stat(srcChk); err != nil {
-		_ = os.Remove(dstChk)
-		return
+		if os.IsNotExist(err) {
+			_ = os.Remove(dstChk)
+			return nil
+		}
+		return fmt.Errorf("stat source checksum sidecar %s: %w", srcChk, err)
 	}
 	if err := copyFile(srcChk, dstChk); err != nil {
-		// A failed copy must not leave a STALE destination sidecar behind:
-		// the just-promoted prev snapshot would fail verification against
-		// the old digest and an otherwise valid backup would be rejected.
-		// Removing the sidecar downgrades the prev to "no sidecar" (loads
-		// with verification skipped) — strictly better than a false reject.
-		_ = os.Remove(dstChk)
+		return fmt.Errorf("copy checksum sidecar %s -> %s: %w", srcChk, dstChk, err)
 	}
+	return nil
 }
 
-// verifySnapshotChecksum compares the SHA-256 of the snapshot file at path
-// against its sidecar.  Only an ABSENT sidecar (os.IsNotExist) skips
-// verification — that is the backward-compatible path for snapshots written
-// by pre-checksum binaries; the schema version / height / hash checks still
-// apply.  A sidecar that exists but is unreadable or malformed is reported
-// as corruption: silently skipping verification in those cases would let a
-// structurally valid but altered snapshot be deserialised, which is exactly
-// what this check exists to prevent.  Task #964.
-func verifySnapshotChecksum(path string) error {
+// verifySnapshotChecksum compares the SHA-256 of the ALREADY-OPEN snapshot
+// file f against the sidecar at snapshotChecksumPath(path), then seeks f back
+// to offset 0 so the caller can deserialise it.  Hashing the same descriptor
+// that will be deserialised (rather than re-opening the pathname) closes the
+// verify/deserialise race: a file replaced on disk between the two operations
+// cannot pass verification as one file and load as another.
+//
+// Only an ABSENT sidecar (os.IsNotExist) skips verification — that is the
+// backward-compatible path for snapshots written by pre-checksum binaries;
+// the schema version / height / hash checks still apply.  A sidecar that
+// exists but is unreadable or malformed is reported as corruption: silently
+// skipping verification in those cases would let a structurally valid but
+// altered snapshot be deserialised, which is exactly what this check exists
+// to prevent.  Task #964.
+func verifySnapshotChecksum(f *os.File, path string) error {
 	raw, err := os.ReadFile(snapshotChecksumPath(path))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -206,11 +219,6 @@ func verifySnapshotChecksum(path string) error {
 			"treating snapshot as corrupt and falling back", path, err)
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return fmt.Errorf("hash snapshot for checksum verification: %w", err)
@@ -222,6 +230,9 @@ func verifySnapshotChecksum(path string) error {
 				"file is corrupt, truncated mid-write, or was replaced on disk — "+
 				"falling back instead of serving wrong chain state",
 			path, want, got)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind snapshot after checksum verification: %w", err)
 	}
 	return nil
 }
@@ -276,7 +287,12 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 		if err := copyFile(path, snapshotPrevPath(path)); err != nil {
 			return fmt.Errorf("write same-height prev backup: %w", err)
 		}
-		copySnapshotChecksum(path, snapshotPrevPath(path))
+		// Sidecar promotion is fail-closed: aborting the save here leaves the
+		// original primary (and its sidecar) fully intact on disk, so the node
+		// can still recover from it on the next start.
+		if err := copySnapshotChecksum(path, snapshotPrevPath(path)); err != nil {
+			return fmt.Errorf("promote checksum sidecar for same-height prev backup: %w", err)
+		}
 	}
 
 	// Best-effort: copy any existing primary at a DIFFERENT height to its own
@@ -301,7 +317,11 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 				continue // same height already handled by the guard above
 			}
 			if copyErr := copyFile(full, snapshotPrevPath(full)); copyErr == nil {
-				copySnapshotChecksum(full, snapshotPrevPath(full))
+				// Best-effort loop: a sidecar promotion failure is ignored here
+				// (no logger in scope), but copySnapshotChecksum leaves any
+				// stale destination sidecar in place on failure, so a suspect
+				// prev backup fails verification and falls back — fail-closed.
+				_ = copySnapshotChecksum(full, snapshotPrevPath(full))
 			}
 			break // only one other primary should exist at a time
 		}
@@ -369,12 +389,14 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 				"likely interrupted mid-write — node will fall back to scan or prev backup",
 			info.Size(), path)
 	}
-	// Verify the SHA-256 sidecar BEFORE deserialising (task #964).  A mismatch
-	// is returned as a descriptive (non-NotExist) error so every caller —
-	// primary, prev-backup, and checkpoint loaders — treats the file as
-	// corrupt and falls back rather than silently serving wrong chain state.
-	// Snapshots without a sidecar (pre-checksum binaries) skip verification.
-	if chkErr := verifySnapshotChecksum(path); chkErr != nil {
+	// Verify the SHA-256 sidecar BEFORE deserialising (task #964).  The check
+	// hashes THIS descriptor and rewinds it, so the verified bytes are the
+	// exact bytes handed to the gzip reader below.  A mismatch is returned as
+	// a descriptive (non-NotExist) error so every caller — primary,
+	// prev-backup, and checkpoint loaders — treats the file as corrupt and
+	// falls back rather than silently serving wrong chain state.  Snapshots
+	// without a sidecar (pre-checksum binaries) skip verification.
+	if chkErr := verifySnapshotChecksum(f, path); chkErr != nil {
 		f.Close()
 		return nil, nil, chkErr
 	}
