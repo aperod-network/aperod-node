@@ -253,6 +253,10 @@ if [[ \"\${CMD}\" == \"bash\" ]]; then
   bash   # execute the heredoc from stdin locally
 elif echo \"\${CMD}\" | grep -q 'network/stats'; then
   echo '{\"height\":${height},\"peer_count\":${peer_count},\"syncing\":false}'
+elif echo \"\${CMD}\" | grep -q 'systemctl show'; then
+  # verify-dropin.sh checks these two settings over ssh
+  echo 'Environment=GOMEMLIMIT=5368709120'
+  echo 'TimeoutStopUSec=15min'
 elif echo \"\${CMD}\" | grep -q 'curl'; then
   echo '{\"ok\":true}'
 else
