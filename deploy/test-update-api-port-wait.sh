@@ -121,6 +121,17 @@ SCENARIO
     fi
 }
 
+# ── P6: pm2 stop precedes the port wait (else pm2 resurrects the killed child) ─
+{
+    stop_line="$(grep -n '^pm2 stop "\$PM2_APP"' "$UPDATE_API" | head -1 | cut -d: -f1 || true)"
+    wait_line="$(grep -n 'wait_port_free "\$API_PORT"' "$UPDATE_API" | grep -v '^[0-9]*:[[:space:]]*#' | head -1 | cut -d: -f1 || true)"
+    if [[ -n "$stop_line" && -n "$wait_line" && "$stop_line" -lt "$wait_line" ]]; then
+        pass_test "P6: pm2 stop (line $stop_line) precedes wait_port_free (line $wait_line) — no kill of a live pm2 child"
+    else
+        fail_test "P6: pm2 stop must run BEFORE wait_port_free (stop=$stop_line, wait=$wait_line); killing a pm2-managed child triggers auto-respawn churn"
+    fi
+}
+
 echo ""
 TOTAL=$((PASS + FAIL))
 echo -e "Results: ${GREEN}${PASS}/${TOTAL} passed${NC}"

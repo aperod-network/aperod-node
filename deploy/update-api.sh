@@ -164,11 +164,15 @@ fi
 #         any crash-loop that starts immediately after this deploy.
 # ---------------------------------------------------------------------------
 echo "==> [3/4] Restarting PM2 process '$PM2_APP'..."
-# Kill any orphaned Node.js process still holding port 3001 (can happen when a
-# previous PM2 daemon was killed but its child process survived) and wait until
-# the port is genuinely free. Without this, the new process crashes immediately
-# with EADDRINUSE and PM2 enters a crash loop.
+# Stop the pm2-managed process FIRST, then wait for the port to be free.
+#
+# Order matters: if we kill whatever holds port 3001 while pm2 still manages
+# it, pm2 sees the child die and auto-respawns it, racing our own restart —
+# observed in production as 5 restarts in 10 s (exactly the health-check
+# threshold). After `pm2 stop` the process is released gracefully and anything
+# still holding the port afterwards is a genuine orphan that is safe to kill.
 API_PORT="${API_PORT:-3001}"
+pm2 stop "$PM2_APP" 2>/dev/null || true
 wait_port_free "$API_PORT" "${PORT_FREE_TIMEOUT:-10}" || {
   send_telegram_alert "⚠️ <b>aperod-api deploy</b>: port ${API_PORT} could not be freed on $(hostname); pm2 NOT restarted."
   echo "✗ Aborting before pm2 restart — old process still holds port ${API_PORT}." >&2
