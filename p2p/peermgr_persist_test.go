@@ -37,6 +37,74 @@ func TestPeerMgr_PersistAndRestore(t *testing.T) {
 	}
 }
 
+// TestPeerMgr_LiftBan_PersistAndReload is the persistence-reload regression
+// test for the canonical bare-IP storage fix.  It exercises the full cycle:
+//
+//  1. Ban via "IP:port" (ephemeral connection address).
+//  2. Confirm all ports on that IP are blocked.
+//  3. Call LiftBan once — using the same "IP:port" form to verify canonical
+//     normalisation in LiftBan, or the bare IP to mirror Admin Panel usage.
+//  4. Verify all ports are immediately unblocked in memory.
+//  5. Reload the ban file into a fresh PeerMgr and confirm no residual ban.
+//
+// Without the canonical-storage fix, Ban("IP:port") and LiftBan("IP:port")
+// used different keys (full address vs bare IP), leaving a ghost entry after
+// a lift that reappeared on the next node restart.
+func TestPeerMgr_LiftBan_PersistAndReload(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		banAddr  string
+		liftAddr string
+	}{
+		{"ban_port_lift_port", "1.2.3.4:56789", "1.2.3.4:56789"},
+		{"ban_port_lift_bare", "1.2.3.4:56789", "1.2.3.4"},
+		{"ban_bare_lift_bare", "1.2.3.4", "1.2.3.4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "bans.json")
+			pm := newPeerMgrWithFile(f)
+
+			pm.Ban(tc.banAddr, "rogue peer", time.Hour)
+
+			// Pre-condition: multiple ports and bare IP are blocked.
+			for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+				if !pm.IsBanned(check) {
+					t.Fatalf("pre-condition failed: %s must be banned before lift", check)
+				}
+			}
+
+			// Single LiftBan must remove the entire ban.
+			if removed := pm.LiftBan(tc.liftAddr); !removed {
+				t.Fatalf("LiftBan(%q) returned false — ban entry not found under canonical key", tc.liftAddr)
+			}
+
+			// In-memory: all ports unblocked immediately.
+			for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+				if pm.IsBanned(check) {
+					t.Errorf("after LiftBan: %s is still banned in memory — partial-lift regression", check)
+				}
+			}
+			if n := pm.BannedCount(); n != 0 {
+				t.Errorf("BannedCount = %d after LiftBan, want 0", n)
+			}
+
+			// Reload from persisted file: no ghost entries must survive.
+			pm2 := newPeerMgrWithFile(f)
+			if err := pm2.LoadBansFromFile(); err != nil {
+				t.Fatalf("LoadBansFromFile after lift: %v", err)
+			}
+			for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+				if pm2.IsBanned(check) {
+					t.Errorf("after reload: %s is still banned — ghost entry in ban file after LiftBan", check)
+				}
+			}
+			if n := pm2.BannedCount(); n != 0 {
+				t.Errorf("BannedCount after reload = %d, want 0", n)
+			}
+		})
+	}
+}
+
 // TestPeerMgr_ExpiredBansFilteredOnLoad verifies that bans that expired while
 // the node was down are silently discarded and do not block legitimate peers.
 func TestPeerMgr_ExpiredBansFilteredOnLoad(t *testing.T) {
