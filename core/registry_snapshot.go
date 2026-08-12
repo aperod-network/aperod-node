@@ -21,9 +21,17 @@ func (r *ValidatorRegistry) TakeSnapshot() RegistrySnapshot {
 
 // RestoreFromSnapshot replaces the registry content with the provided snapshot.
 // Call SetUTXOSet separately after this to re-wire the UTXOSet pointer.
+//
+// A nil Validators map (e.g. a snapshot written before registry snapshotting
+// was added) is treated as an empty registry rather than a nil map, preventing
+// a panic in any subsequent InitFromGenesis or ProcessStakeTx call.
 func (r *ValidatorRegistry) RestoreFromSnapshot(snap RegistrySnapshot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.validators = snap.Validators
+	if snap.Validators != nil {
+		r.validators = snap.Validators
+	} else {
+		r.validators = make(map[string]*ValidatorEntry)
+	}
 	r.dynamicMinNAPR = snap.DynamicMinNAPR
 }
