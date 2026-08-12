@@ -383,7 +383,17 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 
 		// Goal 2: rebuild the active UTXO set.
-		if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
+		//
+		// When the key-image index pre-loaded every spent key image
+		// (KiFromIndex=true), ApplyBlock's pass-1 double-spend check would
+		// reject every spending block: outputs would be lost, spent ring
+		// members would stay wrongly active, and the spentPubKeys ring-decoy
+		// pool (Phase 2 privacy) would never be rebuilt.  Replay the block
+		// via the pass-2-only path instead — the blocks are canonical and
+		// were fully validated when first accepted.
+		if p.KiFromIndex {
+			p.UTXOs.ReplayBlockKnownSpends(&b)
+		} else if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
 			p.Log.Warn("startup scan: ApplyBlock failed (continuing)",
 				"height", h, "err", applyErr)
 		}
