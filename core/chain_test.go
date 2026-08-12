@@ -85,6 +85,85 @@ func TestChain_MemoryCapEviction(t *testing.T) {
 			t.Errorf("height %d should be in the sliding window, but GetByHeight returned nil", h)
 		}
 	}
+
+	// Verify: the in-memory block count equals EXACTLY the window size — the
+	// cap holds, with no hidden accumulation in the blocks map.
+	if got := c.InMemoryBlockCount(); got != core.MaxInMemoryBlocks {
+		t.Errorf("InMemoryBlockCount = %d, want exactly %d after eviction", got, core.MaxInMemoryBlocks)
+	}
+}
+
+// TestChain_MemoryCapConfigurableWindow (#462) — a custom (smaller) window
+// passed to NewChain is enforced exactly, proving the cap logic follows the
+// configured value rather than the compile-time constant.
+func TestChain_MemoryCapConfigurableWindow(t *testing.T) {
+	const window = 25
+	const extra = 7
+	const total = window + extra
+
+	c := core.NewChain(window)
+	genesis := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(genesis); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+
+	hashes := make([]crypto.Hash32, total+1)
+	hashes[0] = genesis.Hash()
+	prev := genesis
+	for h := uint64(1); h <= uint64(total); h++ {
+		b := makeMinimalBlock(h, prev.Hash())
+		if err := c.AddBlock(b); err != nil {
+			t.Fatalf("AddBlock(height=%d): %v", h, err)
+		}
+		hashes[h] = b.Hash()
+		prev = b
+	}
+
+	if got := c.InMemoryBlockCount(); got != window {
+		t.Errorf("InMemoryBlockCount = %d, want exactly %d (configured window)", got, window)
+	}
+	// Oldest surviving height is total-window+1; everything below is evicted.
+	for h := uint64(0); h <= uint64(total-window); h++ {
+		if c.GetByHash(hashes[h]) != nil {
+			t.Errorf("evicted block at height %d still reachable by hash", h)
+		}
+	}
+}
+
+// TestChain_FastForwardMemoryCap (#462) — bulk-loading more blocks than the
+// window via FastForward (the startup / P2P catch-up path) must apply the
+// same eviction so memory stays bounded.
+func TestChain_FastForwardMemoryCap(t *testing.T) {
+	const window = 30
+	const total = window + 12
+
+	c := core.NewChain(window)
+	genesis := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(genesis); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+
+	blocks := make([]*core.Block, 0, total)
+	prev := genesis
+	for h := uint64(1); h <= uint64(total); h++ {
+		b := makeMinimalBlock(h, prev.Hash())
+		blocks = append(blocks, b)
+		prev = b
+	}
+	c.FastForward(blocks)
+
+	if c.Height() != uint64(total) {
+		t.Errorf("Height after FastForward = %d, want %d", c.Height(), total)
+	}
+	if got := c.InMemoryBlockCount(); got != window {
+		t.Errorf("InMemoryBlockCount after FastForward = %d, want exactly %d", got, window)
+	}
+	if c.GetByHeight(0) != nil {
+		t.Error("genesis should have been evicted by the FastForward sliding window")
+	}
+	if c.GetByHeight(uint64(total)) == nil {
+		t.Error("tip block missing after FastForward")
+	}
 }
 
 // TestChain_MemoryCapTipIntact (#462) — the chain tip remains correct and
