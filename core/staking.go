@@ -246,9 +246,15 @@ type ValidatorEntry struct {
 	PubKey          crypto.ValidatorPubKey
 	StakeNAPR       uint64
 	Status          ValidatorStatus
-	ActivationEpoch uint64         // epoch when the validator first becomes eligible
-	UnbondEndBlock  uint64         // block height after which stake is released (full Unbonding only)
+	ActivationEpoch uint64           // epoch when the validator first becomes eligible
+	UnbondEndBlock  uint64           // block height after which stake is released (full Unbonding only)
 	UnbondingQueue  []UnbondingEntry // partial withdrawal queue; released in UpdateEpoch
+	// Seeded marks entries that were synthetically inserted by SeedFromObservedProducers
+	// during startup when the registry was empty.  Such entries carry exactly
+	// MinStakeNAPR so that epoch-churn ordering is not skewed.  The first real
+	// stake deposit for ANY pubkey demotes all remaining seeded entries to
+	// ValidatorExited; a deposit for the same pubkey replaces the sentinel entirely.
+	Seeded bool `json:"seeded,omitempty"`
 }
 
 // APRStake returns the stake in whole APRO (for display).
@@ -351,6 +357,35 @@ func (r *ValidatorRegistry) InitFromGenesis(pubs []crypto.ValidatorPubKey, genes
 				StakeNAPR:       genesisStake,
 				Status:          ValidatorActive,
 				ActivationEpoch: 0,
+			}
+		}
+	}
+}
+
+// SeedFromObservedProducers inserts sentinel Active entries for block producers
+// observed during a startup scan when the registry was otherwise empty.
+//
+// Each entry is tagged with Seeded=true and carries exactly MinStakeNAPR (not
+// a multiple) so that epoch-churn ordering is not artificially skewed if real
+// validators join later.  The sentinel entries are cleaned up automatically the
+// first time applyDeposit processes any real stake deposit:
+//   - A deposit for the same pubkey replaces the sentinel with real stake data.
+//   - A deposit for any pubkey demotes all remaining seeded entries to
+//     ValidatorExited so they no longer influence consensus selection.
+//
+// Idempotent: existing entries (seeded or real) are never overwritten.
+func (r *ValidatorRegistry) SeedFromObservedProducers(pubs []crypto.ValidatorPubKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, pub := range pubs {
+		key := pub.Hex()
+		if _, exists := r.validators[key]; !exists {
+			r.validators[key] = &ValidatorEntry{
+				PubKey:          pub,
+				StakeNAPR:       MinStakeNAPR,
+				Status:          ValidatorActive,
+				ActivationEpoch: 0,
+				Seeded:          true,
 			}
 		}
 	}
@@ -968,6 +1003,19 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 	}
 }
 
+// demoteSeededLocked sets all seeded sentinel entries to ValidatorExited and
+// clears their Seeded flag.  Called from applyDeposit after any real stake
+// deposit is applied so that synthetic entries do not persist once real stake
+// data exists.  Caller must hold r.mu (Write lock).
+func (r *ValidatorRegistry) demoteSeededLocked() {
+	for _, e := range r.validators {
+		if e.Seeded {
+			e.Status = ValidatorExited
+			e.Seeded = false
+		}
+	}
+}
+
 func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey, amount, height uint64) error {
 	// Use dynamic minimum stake (DST) if oracle price has been set, otherwise
 	// fall back to the static MinStakeNAPR constant.
@@ -994,13 +1042,27 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 			return fmt.Errorf("validator is unbonding/exited; wait %d blocks before re-staking",
 				UnbondingBlocks)
 		default:
-			// Top-up: increase stake — checked addition prevents uint64 overflow.
-			if existing.StakeNAPR > math.MaxUint64-amount {
-				return fmt.Errorf("stake top-up overflow: current %.4f + deposit %.4f would exceed uint64",
-					float64(existing.StakeNAPR)/float64(BaseUnitsPerAPR),
-					float64(amount)/float64(BaseUnitsPerAPR))
+			if existing.Seeded {
+				// Replace sentinel with real stake data instead of topping up
+				// the artificial seed amount.  Re-enters the activation queue
+				// like any other new deposit.
+				existing.StakeNAPR = amount
+				existing.Status = ValidatorPending
+				existing.ActivationEpoch = height/EpochLength + 1
+				existing.Seeded = false
+				existing.UnbondEndBlock = 0
+				existing.UnbondingQueue = nil
+			} else {
+				// Top-up: increase stake — checked addition prevents uint64 overflow.
+				if existing.StakeNAPR > math.MaxUint64-amount {
+					return fmt.Errorf("stake top-up overflow: current %.4f + deposit %.4f would exceed uint64",
+						float64(existing.StakeNAPR)/float64(BaseUnitsPerAPR),
+						float64(amount)/float64(BaseUnitsPerAPR))
+				}
+				existing.StakeNAPR += amount
 			}
-			existing.StakeNAPR += amount
+			// Any real deposit (same pubkey) also clears remaining seeded sentinels.
+			r.demoteSeededLocked()
 			return nil
 		}
 	}
@@ -1012,6 +1074,8 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 		Status:          ValidatorPending,
 		ActivationEpoch: epoch + 1, // earliest: next epoch
 	}
+	// Any real deposit (new pubkey) clears all remaining seeded sentinels.
+	r.demoteSeededLocked()
 	return nil
 }
 
