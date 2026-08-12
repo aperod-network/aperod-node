@@ -157,8 +157,14 @@ func TestAddress_EncodeDecodeRoundtrip(t *testing.T) {
 func TestAddress_InvalidChecksum(t *testing.T) {
 	kp, _ := crypto.GenerateWalletKeys()
 	addr := string(crypto.EncodeAddress(crypto.TestnetByte, kp.Spend.Public, kp.View.Public))
-	// Corrupt the last character
-	corrupted := addr[:len(addr)-1] + "X"
+	// Corrupt the last character with a value guaranteed to differ from the
+	// original (a bare "X" was a no-op ~1/58 runs when the address already
+	// ended in 'X', making the test pass vacuously).
+	replacement := "X"
+	if addr[len(addr)-1] == 'X' {
+		replacement = "Y"
+	}
+	corrupted := addr[:len(addr)-1] + replacement
 	if err := crypto.Validate(crypto.Address(corrupted)); err == nil {
 		t.Fatal("corrupted address should fail validation")
 	}
