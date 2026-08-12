@@ -2112,3 +2112,168 @@ func TestMemoryLimitBytes_Zero_EmitsGOMLEMLIMITWarning(t *testing.T) {
 		t.Errorf("expected GOMEMLIMIT warning was not logged when memory_limit_bytes=0 and GOMEMLIMIT is absent\nlog:\n%s", logBuf.String())
 	}
 }
+
+// ─── Task #1019: bit-flipped snapshot → rejected, falls back to block scan ────
+
+// TestBitFlippedSnapshotFallsBackToBlockScan verifies the full done-when of
+// task #1019: a snapshot whose on-disk bytes were corrupted after a valid save
+// (bit flip — the disk-full / crash-mid-write signature) is REJECTED by the
+// checksum verification with a distinct non-NotExist error, and the startup
+// decision falls back to the block scan instead of fast-path-loading a
+// structurally-valid-but-wrong state (e.g. an empty UTXO set that would allow
+// double-spends).
+func TestBitFlippedSnapshotFallsBackToBlockScan(t *testing.T) {
+	dir := t.TempDir()
+
+	tipHeight := uint64(42)
+	tipHashHex := strings.Repeat("ab", 32)
+
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		TxTotal:    7,
+		UTXOs: core.UTXOSnapshot{
+			ActiveUTXOs: []*core.UTXO{{BlockHeight: 7}},
+		},
+		Registry: core.RegistrySnapshot{
+			Validators: map[string]*core.ValidatorEntry{},
+		},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+
+	// Corrupt the snapshot in place: flip one bit in the middle of the file.
+	// This models silent corruption AFTER a successful atomic write (bad
+	// sector, torn write surfacing later) — the file still exists, has a
+	// plausible size, and may even decompress, but its bytes are wrong.
+	path := snapshotPath(dir, tipHeight)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot for corruption: %v", err)
+	}
+	if len(raw) < 120 {
+		t.Fatalf("snapshot unexpectedly small (%d bytes)", len(raw))
+	}
+	raw[len(raw)/2] ^= 0x01
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatalf("write corrupted snapshot: %v", err)
+	}
+
+	// ── 1. Direct load: distinct checksum error, NOT os.ErrNotExist. ────────
+	_, loadErr := loadStartupSnapshot(dir, tipHeight, tipHashHex)
+	if loadErr == nil {
+		t.Fatal("loadStartupSnapshot accepted a bit-flipped snapshot — corrupt fast-path state would be served")
+	}
+	if os.IsNotExist(loadErr) {
+		t.Fatalf("bit-flipped snapshot reported as missing (os.ErrNotExist) instead of corrupt: %v", loadErr)
+	}
+	if !strings.Contains(loadErr.Error(), "checksum mismatch") {
+		t.Errorf("expected a distinct checksum-mismatch error, got: %v", loadErr)
+	}
+
+	// ── 2. Fallback loader: no prev backup exists (first save at this height),
+	// so recovery must FAIL with a corrupt-primary error — never a silent
+	// fast path and never a clean "no snapshot" signal. ─────────────────────
+	var fbBuf bytes.Buffer
+	_, _, fbErr := loadStartupSnapshotWithFallback(dir, tipHeight, tipHashHex, newCaptureLogger(&fbBuf))
+	if fbErr == nil {
+		t.Fatal("loadStartupSnapshotWithFallback accepted a bit-flipped snapshot with no valid backup")
+	}
+	if os.IsNotExist(fbErr) {
+		t.Fatalf("fallback loader reported corrupt snapshot as missing: %v", fbErr)
+	}
+	if !strings.Contains(fbErr.Error(), "no prev-backup available") {
+		t.Errorf("expected 'primary corrupt … no prev-backup available' error, got: %v", fbErr)
+	}
+
+	// ── 3. Startup decision (mirrors main.go's snapshot fast path): the load
+	// error must route to the block scan, with the fast-path log absent. ────
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snapLoaded := false
+	if loaded, serr := loadStartupSnapshot(dir, tipHeight, tipHashHex); serr == nil {
+		_ = loaded
+		log.Info("startup fast path complete — snapshot loaded", "tip_height", tipHeight)
+		snapLoaded = true
+	} else if !os.IsNotExist(serr) {
+		log.Warn("snapshot load error, falling back to block scan", "err", serr)
+	}
+	if !snapLoaded {
+		log.Info("running startup block scan",
+			"tip_height", tipHeight,
+			"ki_from_index", false,
+			"heap_sys_mib_before", uint64(0),
+		)
+	}
+
+	if logContainsMsg(&logBuf, "startup fast path complete — snapshot loaded") {
+		t.Error("fast-path log must NOT appear for a bit-flipped snapshot")
+	}
+	if !logContainsMsg(&logBuf, "snapshot load error, falling back to block scan") {
+		t.Errorf("expected corrupt-snapshot warning before block scan\nlog:\n%s", logBuf.String())
+	}
+	if !logContainsMsg(&logBuf, "running startup block scan") {
+		t.Errorf("block scan must run when the snapshot is corrupt\nlog:\n%s", logBuf.String())
+	}
+}
+
+// TestTruncatedSnapshotFallsBackToBlockScan covers the truncation half of task
+// #1019: a snapshot cut off mid-write (crash / disk-full between write and
+// flush) must be rejected — via the minimum-size guard for tiny remnants and
+// via the checksum for larger partial files — and never fast-path loaded.
+func TestTruncatedSnapshotFallsBackToBlockScan(t *testing.T) {
+	dir := t.TempDir()
+
+	tipHeight := uint64(9)
+	tipHashHex := strings.Repeat("cd", 32)
+
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		UTXOs: core.UTXOSnapshot{
+			ActiveUTXOs: []*core.UTXO{{BlockHeight: 3}, {BlockHeight: 4}},
+		},
+		Registry: core.RegistrySnapshot{
+			Validators: map[string]*core.ValidatorEntry{},
+		},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+	path := snapshotPath(dir, tipHeight)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		keep    int // bytes to keep from the front
+		wantSub string
+	}{
+		{"tiny remnant under size guard", 50, "truncated or empty"},
+		{"half file fails checksum", len(raw) / 2, "checksum mismatch"},
+		{"all but last byte fails checksum", len(raw) - 1, "checksum mismatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, raw[:tc.keep], 0644); err != nil {
+				t.Fatalf("truncate snapshot: %v", err)
+			}
+			_, loadErr := loadStartupSnapshot(dir, tipHeight, tipHashHex)
+			if loadErr == nil {
+				t.Fatal("truncated snapshot was accepted — incomplete state would be fast-path loaded")
+			}
+			if os.IsNotExist(loadErr) {
+				t.Fatalf("truncated snapshot reported as missing: %v", loadErr)
+			}
+			if !strings.Contains(loadErr.Error(), tc.wantSub) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantSub, loadErr)
+			}
+		})
+	}
+}
