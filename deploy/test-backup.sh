@@ -2016,6 +2016,136 @@ else
 fi
 
 # =============================================================================
+# Test 23: backup_dir_unavailable → exit 0 (skipped), status/reason set,
+#          Telegram alert fires when tokens are present.
+#
+#   Regression guard: when BACKUP_DIR cannot be created the script must record
+#   _BACKUP_FINAL_STATUS=skipped / _BACKUP_SKIP_REASON=backup_dir_unavailable in
+#   the history log AND fire the Telegram alert (not a noisy failure metric).
+#   mkdir failure is simulated by pointing BACKUP_DIR under a regular file, so
+#   `mkdir -p` cannot create the directory (a file is not a directory).
+# =============================================================================
+section "Test 23: backup_dir_unavailable → skipped + reason set + Telegram alert"
+
+T23_DIR=$(mktemp -d "$TMPDIR_TEST/run-t23-XXXXXXXX")
+make_settings_json "$T23_DIR/data"
+mkdir -p "$T23_DIR/metrics"
+
+# Create a regular file, then aim BACKUP_DIR at a subpath *under* that file.
+# `mkdir -p` fails because a component of the path is not a directory — this
+# reproduces a non-writable / unavailable backup location without needing root.
+T23_BLOCKER_FILE="$T23_DIR/not-a-dir"
+: > "$T23_BLOCKER_FILE"
+T23_BACKUP_DIR="$T23_BLOCKER_FILE/aperod_backups"
+
+T23_CURL_LOG="$T23_DIR/curl.log"
+T23_FAKE_CURL=$(make_fake_curl "$T23_CURL_LOG")
+
+# sudo stub — pg_dump path must never be reached after the guard bails.
+T23_FAKE_SUDO=$(make_fake_bin "sudo" "$T23_DIR/sudo.log" 0)
+T23_FAKE_RCLONE=$(make_fake_bin "rclone" "$T23_DIR/rclone.log" 0)
+T23_FAKE_GPG=$(make_fake_bin "gpg" "$T23_DIR/gpg.log" 0)
+
+T23_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t23" \
+  DATA_DIR="$T23_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T23_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T23_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T23_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="tok-t23" \
+  ADMIN_TELEGRAM_CHAT_ID="23000023" \
+  PATH="$T23_FAKE_CURL:$T23_FAKE_SUDO:$T23_FAKE_RCLONE:$T23_FAKE_GPG:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T23_EXIT=$?
+[[ "$T23_EXIT" -eq 99 ]] && T23_EXIT=0  # script returned 0
+
+if [[ "$T23_EXIT" -eq 0 ]]; then
+  pass "backup_dir_unavailable exits 0 (skipped, not failed)"
+else
+  fail "backup_dir_unavailable exited $T23_EXIT — expected 0"
+fi
+
+# The history-log JSON line encodes _BACKUP_FINAL_STATUS and _BACKUP_SKIP_REASON.
+T23_LOG="$T23_DIR/backup.log"
+if [[ -f "$T23_LOG" ]] && grep -q '"status":"skipped"' "$T23_LOG"; then
+  pass "history log records _BACKUP_FINAL_STATUS=skipped"
+else
+  fail "history log missing status=skipped (log: $(cat "$T23_LOG" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ -f "$T23_LOG" ]] && grep -q '"skipReason":"backup_dir_unavailable"' "$T23_LOG"; then
+  pass "history log records _BACKUP_SKIP_REASON=backup_dir_unavailable"
+else
+  fail "history log missing skipReason=backup_dir_unavailable (log: $(cat "$T23_LOG" 2>/dev/null || echo '<missing>'))"
+fi
+
+# Prometheus: skipped, not a failure.
+T23_PROM="$T23_DIR/metrics/aperod_backup.prom"
+if [[ -f "$T23_PROM" ]] && grep -q "^aperod_backup_last_success 0" "$T23_PROM"; then
+  pass "Prometheus: aperod_backup_last_success=0 on backup_dir_unavailable"
+else
+  fail "Prometheus: aperod_backup_last_success=0 NOT found (file: $(cat "$T23_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+
+# Telegram POST must fire with tokens present, targeting the Telegram API.
+if [[ -f "$T23_CURL_LOG" ]] && grep -q "api.telegram.org" "$T23_CURL_LOG"; then
+  pass "Telegram backup_dir_unavailable alert curl POST fired when tokens are set"
+else
+  fail "Telegram backup_dir_unavailable alert was NOT sent (log: $(cat "$T23_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# The alert must carry the configured chat id (correct routing).
+if [[ -f "$T23_CURL_LOG" ]] && grep -q "23000023" "$T23_CURL_LOG"; then
+  pass "Telegram backup_dir_unavailable alert routed to the configured chat id"
+else
+  fail "Telegram backup_dir_unavailable alert missing chat id (log: $(cat "$T23_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# The alert must be an HTTP POST (curl -X POST), matching the script's call.
+if [[ -f "$T23_CURL_LOG" ]] && grep -q -- "-X POST" "$T23_CURL_LOG"; then
+  pass "Telegram backup_dir_unavailable alert uses an HTTP POST"
+else
+  fail "Telegram backup_dir_unavailable alert is not a POST (log: $(cat "$T23_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 24: backup_dir_unavailable + tokens unset → NO Telegram curl POST
+#
+#   The alert block is guarded by TELEGRAM_BOT_TOKEN + ADMIN_TELEGRAM_CHAT_ID;
+#   with both empty no curl call to the Telegram API must be attempted.
+# =============================================================================
+section "Test 24: backup_dir_unavailable + tokens unset → no Telegram curl POST"
+
+T24_DIR=$(mktemp -d "$TMPDIR_TEST/run-t24-XXXXXXXX")
+make_settings_json "$T24_DIR/data"
+mkdir -p "$T24_DIR/metrics"
+
+T24_BLOCKER_FILE="$T24_DIR/not-a-dir"
+: > "$T24_BLOCKER_FILE"
+T24_BACKUP_DIR="$T24_BLOCKER_FILE/aperod_backups"
+
+T24_CURL_LOG="$T24_DIR/curl.log"
+T24_FAKE_CURL=$(make_fake_curl "$T24_CURL_LOG")
+T24_FAKE_SUDO=$(make_fake_bin "sudo" "$T24_DIR/sudo.log" 0)
+
+T24_EXIT=99
+APEROD_BACKUP_PASSWORD="test-pass-t24" \
+  DATA_DIR="$T24_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T24_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T24_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T24_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="" \
+  ADMIN_TELEGRAM_CHAT_ID="" \
+  PATH="$T24_FAKE_CURL:$T24_FAKE_SUDO:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T24_EXIT=$?
+[[ "$T24_EXIT" -eq 99 ]] && T24_EXIT=0
+
+if [[ ! -f "$T24_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T24_CURL_LOG"; then
+  pass "no Telegram curl POST when tokens are unset (alert correctly suppressed)"
+else
+  fail "Telegram alert fired despite unset tokens (log: $(cat "$T24_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

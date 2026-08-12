@@ -260,6 +260,112 @@ func runCheckStore() error {
         return nil
 }
 
+// checkStartupIntegrity cross-verifies the tip pointer against the canonical
+// height index at startup and self-heals a missing/zeroed or mismatched
+// h/<tipHeight> entry from the authoritative tip pointer.
+//
+// It returns (done, err):
+//   - done==true  means the caller should return err immediately (used for the
+//     --reset-tip / --repair-db CLI early-exit paths, where err is nil).
+//   - done==false means the caller should continue normal startup; err may still
+//     be non-nil for a fatal validator-side failure.
+//
+// This is the REAL production code path invoked from run(); it is factored out
+// as a standalone helper so it can be unit-tested with a slog capture handler
+// (verifying, for example, that a successful self-heal is logged at INFO — not
+// WARN — so operators filtering alerts by log level are not spuriously paged).
+func checkStartupIntegrity(
+        db *store.DB,
+        tipHeight uint64,
+        tipHash crypto.Hash32,
+        nonValidator bool,
+        resetTip bool,
+        repairDB bool,
+        log *slog.Logger,
+) (done bool, err error) {
+        indexedBlock, idxErr := db.GetBlockByHeight(tipHeight)
+        if idxErr != nil {
+                return false, fmt.Errorf("startup integrity check: read height index at %d: %w", tipHeight, idxErr)
+        }
+        integrityOK := true
+        if indexedBlock == nil {
+                // Missing or zeroed height-index entry at the tip height.
+                // Common after rsync bootstrap or an OOM-kill that corrupted
+                // the LevelDB SST.  Attempt a one-time self-repair from the
+                // tip pointer (the authoritative source of truth) before
+                // deciding how to proceed.
+                repErr := db.RepairHeightIndex(tipHeight, tipHash)
+                if repErr == nil {
+                        // Repair succeeded.  Log INFO so operators can see
+                        // the self-heal in the startup log; subsequent restarts
+                        // will find a valid entry and skip this branch entirely.
+                        log.Info("startup integrity: height index was missing/zeroed — repaired from tip pointer",
+                                "tip_height", tipHeight, "tip_hash", fmt.Sprintf("%x", tipHash[:8]))
+                } else {
+                        // Repair failed.  Validators must not continue: a broken
+                        // height index on a proposer risks block production on a
+                        // corrupt state.  Non-validators log a WARN and continue
+                        // so the relay node can still serve headers.
+                        if !nonValidator {
+                                return false, fmt.Errorf(
+                                        "startup integrity (validator): height index missing for tip height %d "+
+                                                "and repair failed: %w; run --repair-db or restore from a clean snapshot",
+                                        tipHeight, repErr)
+                        }
+                        log.Warn("startup integrity: height index missing and repair failed — continuing",
+                                "tip_height", tipHeight, "tip_hash", fmt.Sprintf("%x", tipHash[:8]), "err", repErr)
+                        integrityOK = false
+                }
+                if resetTip || repairDB {
+                        if repErr == nil {
+                                fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip / --repair-db)\n", tipHeight)
+                        } else {
+                                fmt.Printf("aperod-node: height index repair FAILED at height %d: %v\n", tipHeight, repErr)
+                        }
+                        return true, nil
+                }
+        } else if indexedBlock.Hash != tipHash {
+                // Hash mismatch: the height-index entry is stale or corrupt
+                // while the tip pointer is authoritative.  Attempt repair.
+                repErr := db.RepairHeightIndex(tipHeight, tipHash)
+                if repErr == nil {
+                        log.Info("startup integrity: height index hash mismatch — repaired from tip pointer",
+                                "tip_height", tipHeight,
+                                "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
+                                "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]))
+                } else {
+                        if !nonValidator {
+                                return false, fmt.Errorf(
+                                        "startup integrity (validator): height index hash mismatch at tip height %d "+
+                                                "and repair failed: %w; run --repair-db or restore from a clean snapshot",
+                                        tipHeight, repErr)
+                        }
+                        log.Warn("startup integrity: height index hash mismatch and repair failed — continuing",
+                                "tip_height", tipHeight,
+                                "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
+                                "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]),
+                                "err", repErr)
+                        integrityOK = false
+                }
+                if resetTip || repairDB {
+                        if repErr == nil {
+                                fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip / --repair-db)\n", tipHeight)
+                        } else {
+                                fmt.Printf("aperod-node: height index repair FAILED at height %d: %v\n", tipHeight, repErr)
+                        }
+                        return true, nil
+                }
+        } else if resetTip || repairDB {
+                // Height index is already correct; nothing to repair.
+                fmt.Printf("aperod-node: height index already consistent at height %d — start normally\n", tipHeight)
+                return true, nil
+        }
+        if integrityOK {
+                log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
+        }
+        return false, nil
+}
+
 func run() error {
         // ── 0. check-store subcommand ─────────────────────────────────────────────
         // Processed before config loading so operators can verify a chain.db that
@@ -316,6 +422,19 @@ func run() error {
         // the node.  Prints the config path and network name so the caller can
         // confirm which file was checked.
         if validateOnly {
+                // Enforce the same fatal validator-key permission check the node
+                // applies at startup (mode & 0o077 must be 0).  Running it as part of
+                // this dry-run — BEFORE any live service is stopped — lets deploy
+                // tooling detect an unsafe-permission key and fix it without ever
+                // taking the node offline.  Otherwise the old binary keeps running
+                // while the freshly deployed one would refuse to boot.
+                keyPath := cfg.Consensus.ValidatorKey
+                if keyPath == "" {
+                        keyPath = filepath.Join(cfg.DataDir, "validator.key")
+                }
+                if err := checkKeyFilePermissions(keyPath); err != nil {
+                        return err
+                }
                 fmt.Fprintf(os.Stdout, "config OK: %s (network=%s)\n", cfgPath, cfg.Network)
                 return nil
         }
@@ -684,85 +803,20 @@ func run() error {
                 // left at genesis while the DB tip had advanced to 973102, causing
                 // blocks to be silently overwritten). Hard-fail here so the operator
                 // can intervene before any block production begins.
-                indexedBlock, idxErr := db.GetBlockByHeight(tipHeight)
-                if idxErr != nil {
-                        return fmt.Errorf("startup integrity check: read height index at %d: %w", tipHeight, idxErr)
+                //
+                // The logic lives in checkStartupIntegrity so it can be unit-tested
+                // in isolation (see cmd/node/startup_integrity_test.go); done==true
+                // means one of the --reset-tip / --repair-db CLI paths has finished
+                // and run() should return immediately.
+                done, err := checkStartupIntegrity(
+                        db, tipHeight, tipHash,
+                        cfg.Consensus.NonValidator, resetTip, repairDB, log,
+                )
+                if err != nil {
+                        return err
                 }
-                integrityOK := true
-                if indexedBlock == nil {
-                        // Missing or zeroed height-index entry at the tip height.
-                        // Common after rsync bootstrap or an OOM-kill that corrupted
-                        // the LevelDB SST.  Attempt a one-time self-repair from the
-                        // tip pointer (the authoritative source of truth) before
-                        // deciding how to proceed.
-                        repErr := db.RepairHeightIndex(tipHeight, tipHash)
-                        if repErr == nil {
-                                // Repair succeeded.  Log INFO so operators can see
-                                // the self-heal in the startup log; subsequent restarts
-                                // will find a valid entry and skip this branch entirely.
-                                log.Info("startup integrity: height index was missing/zeroed — repaired from tip pointer",
-                                        "tip_height", tipHeight, "tip_hash", fmt.Sprintf("%x", tipHash[:8]))
-                        } else {
-                                // Repair failed.  Validators must not continue: a broken
-                                // height index on a proposer risks block production on a
-                                // corrupt state.  Non-validators log a WARN and continue
-                                // so the relay node can still serve headers.
-                                if !cfg.Consensus.NonValidator {
-                                        return fmt.Errorf(
-                                                "startup integrity (validator): height index missing for tip height %d "+
-                                                        "and repair failed: %w; run --repair-db or restore from a clean snapshot",
-                                                tipHeight, repErr)
-                                }
-                                log.Warn("startup integrity: height index missing and repair failed — continuing",
-                                        "tip_height", tipHeight, "tip_hash", fmt.Sprintf("%x", tipHash[:8]), "err", repErr)
-                                integrityOK = false
-                        }
-                        if resetTip || repairDB {
-                                if repErr == nil {
-                                        fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip / --repair-db)\n", tipHeight)
-                                } else {
-                                        fmt.Printf("aperod-node: height index repair FAILED at height %d: %v\n", tipHeight, repErr)
-                                }
-                                return nil
-                        }
-                } else if indexedBlock.Hash != tipHash {
-                        // Hash mismatch: the height-index entry is stale or corrupt
-                        // while the tip pointer is authoritative.  Attempt repair.
-                        repErr := db.RepairHeightIndex(tipHeight, tipHash)
-                        if repErr == nil {
-                                log.Info("startup integrity: height index hash mismatch — repaired from tip pointer",
-                                        "tip_height", tipHeight,
-                                        "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
-                                        "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]))
-                        } else {
-                                if !cfg.Consensus.NonValidator {
-                                        return fmt.Errorf(
-                                                "startup integrity (validator): height index hash mismatch at tip height %d "+
-                                                        "and repair failed: %w; run --repair-db or restore from a clean snapshot",
-                                                tipHeight, repErr)
-                                }
-                                log.Warn("startup integrity: height index hash mismatch and repair failed — continuing",
-                                        "tip_height", tipHeight,
-                                        "tip_pointer_hash", fmt.Sprintf("%x", tipHash[:8]),
-                                        "height_index_hash", fmt.Sprintf("%x", indexedBlock.Hash[:8]),
-                                        "err", repErr)
-                                integrityOK = false
-                        }
-                        if resetTip || repairDB {
-                                if repErr == nil {
-                                        fmt.Printf("aperod-node: height index repaired at height %d — start normally (without --reset-tip / --repair-db)\n", tipHeight)
-                                } else {
-                                        fmt.Printf("aperod-node: height index repair FAILED at height %d: %v\n", tipHeight, repErr)
-                                }
-                                return nil
-                        }
-                } else if resetTip || repairDB {
-                        // Height index is already correct; nothing to repair.
-                        fmt.Printf("aperod-node: height index already consistent at height %d — start normally\n", tipHeight)
+                if done {
                         return nil
-                }
-                if integrityOK {
-                        log.Info("startup integrity check passed", "height", tipHeight, "hash", fmt.Sprintf("%x", tipHash[:8]))
                 }
 
                 // Always load genesis (height 0).

@@ -149,11 +149,11 @@ if [[ -f "${VALIDATOR_KEY}" ]]; then
   key_mode=$(stat -c '%a'  "${VALIDATOR_KEY}" 2>/dev/null || true)
   needs_fix=false
   [[ "${key_owner}" != "aperod" ]] && needs_fix=true
-  [[ "${key_mode}"  != "600"    ]] && needs_fix=true
+  [[ "${key_mode: -2}" != "00"  ]] && needs_fix=true
   if [[ "${needs_fix}" == "true" ]]; then
-    echo "  [fix] ${VALIDATOR_KEY}: owner=${key_owner} mode=${key_mode} → fixing to aperod:aperod 600"
+    echo "  [fix] ${VALIDATOR_KEY}: owner=${key_owner} mode=${key_mode} → chown aperod:aperod + strip group/other bits"
     chown aperod:aperod "${VALIDATOR_KEY}"
-    chmod 600           "${VALIDATOR_KEY}"
+    chmod g-rwx,o-rwx   "${VALIDATOR_KEY}"
     echo "  [fix] validator.key ownership corrected (one-time fix for pre-July-2026 installs)."
   else
     echo "  [ok] ${VALIDATOR_KEY}: ownership and permissions are correct (aperod:aperod 600)."
@@ -391,6 +391,12 @@ source "${DEPLOY_DIR}/sync-backup-script.sh"
 echo "==> [1b] Syncing aperod_backup.sh..."
 _sync_backup_script
 
+# Also keep /usr/local/bin/aperod-deploy (copy of deploy/aperod-api-deploy.sh
+# at the monorepo root) fresh — it was previously installed once and never
+# updated by git pull.  Non-fatal if either side is absent on this host.
+echo "==> [1b] Syncing aperod-deploy..."
+_sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-api-deploy.sh"
+
 # ---------------------------------------------------------------------------
 # Step 1c: Install/refresh the git post-merge hook.
 #
@@ -498,6 +504,190 @@ The service was <b>NOT stopped</b> — the old binary is still running.
 Fix: ensure <code>CGO_ENABLED=0</code> in the Makefile <code>build-node</code> target, then re-run <code>update-node.sh</code>."
 
   exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2c: Validator-key permission preflight — runs BEFORE the service stop.
+#
+# The freshly deployed binary refuses to boot when the validator key file has
+# any group/other permission bit set (mode & 0o077 != 0).  A production node
+# whose key still carries historical 644 permissions would therefore be
+# stopped, have the new binary installed, and only THEN fail the startup check —
+# leaving the service in a crash-restart loop until an operator runs chmod by
+# hand.  That is exactly the ~20-minute outage this preflight prevents.
+#
+# Strategy:
+#   1. Resolve the key path from node.yaml (data_dir + consensus.validator_key);
+#      fall back to the standard on-disk layout, then to a glob.
+#   2. If the file is group/other-accessible OR not owned by aperod, AUTO-FIX it
+#      with `chmod g-rwx,o-rwx` + `chown aperod:aperod`.  Stripping group/other is the safest
+#      possible mode — this NEVER loosens permissions, only tightens them.
+#   3. As a belt-and-braces check, run the new binary's `--validate-config`
+#      dry-run (which enforces the same key-permission rule plus config parsing)
+#      BEFORE stopping the node.  If it still reports a fatal problem, abort now
+#      with a clear message while the old binary keeps serving.
+#
+# All of this happens while the OLD (working) node is still running, so a
+# failure here costs zero downtime.
+# ---------------------------------------------------------------------------
+
+# _resolve_validator_key_path — print the validator key path the node will use.
+# Reads data_dir and consensus.validator_key from node.yaml when present; falls
+# back to the standard testnet data layout and finally a glob.  Prints nothing
+# if no candidate file exists.
+_resolve_validator_key_path() {
+  local node_yaml="$1"
+  local candidate=""
+
+  if [[ -f "${node_yaml}" ]]; then
+    # An explicit consensus.validator_key wins if it is set to a non-empty path.
+    local explicit_key
+    explicit_key=$(grep -E '^[[:space:]]*validator_key:' "${node_yaml}" 2>/dev/null \
+      | head -1 | sed -E 's/^[[:space:]]*validator_key:[[:space:]]*//' \
+      | sed -E 's/[[:space:]]*(#.*)?$//' | tr -d '"'"'"'' || true)
+    if [[ -n "${explicit_key}" ]]; then
+      candidate="${explicit_key}"
+    else
+      # Otherwise the node derives <data_dir>/validator.key.
+      local data_dir
+      data_dir=$(grep -E '^[[:space:]]*data_dir:' "${node_yaml}" 2>/dev/null \
+        | head -1 | sed -E 's/^[[:space:]]*data_dir:[[:space:]]*//' \
+        | sed -E 's/[[:space:]]*(#.*)?$//' | tr -d '"'"'"'' || true)
+      if [[ -n "${data_dir}" ]]; then
+        # Resolve a relative data_dir against the node.yaml directory.
+        if [[ "${data_dir}" != /* ]]; then
+          data_dir="${data_dir#./}"   # drop a leading ./ so the path stays clean
+          data_dir="$(cd "$(dirname "${node_yaml}")" && pwd)/${data_dir}"
+        fi
+        candidate="${data_dir%/}/validator.key"
+      fi
+    fi
+  fi
+
+  if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  # Fallback 1: the standard production on-disk layout.
+  local prod_key="${BLOCKCHAIN_DIR}/data/testnet/validator.key"
+  if [[ -f "${prod_key}" ]]; then
+    printf '%s\n' "${prod_key}"
+    return 0
+  fi
+
+  # Fallback 2: glob under the blockchain data tree (first match wins).
+  local globbed
+  globbed=$(find "${BLOCKCHAIN_DIR}" -maxdepth 4 -name validator.key -type f 2>/dev/null | head -1 || true)
+  if [[ -n "${globbed}" ]]; then
+    printf '%s\n' "${globbed}"
+    return 0
+  fi
+
+  return 0   # no key file found — nothing to preflight (non-validator node)
+}
+
+# preflight_validator_key — tighten permissions/ownership on the validator key
+# so the new binary's startup check cannot fail.  chmod g-rwx,o-rwx (owner bits
+# preserved, e.g. 0400 stays 0400) + chown aperod:aperod only ever tightens access.  Returns 0 on success (fixed or already safe),
+# 1 only if the file exists but could not be made safe (caller must abort).
+preflight_validator_key() {
+  local key_path="$1"
+
+  if [[ -z "${key_path}" || ! -f "${key_path}" ]]; then
+    echo "  [ok] No validator key file found — permission preflight skipped (non-validator node)."
+    return 0
+  fi
+
+  local mode owner
+  mode=$(stat -c '%a' "${key_path}" 2>/dev/null || echo "")
+  owner=$(stat -c '%U' "${key_path}" 2>/dev/null || echo "")
+
+  # mode & 0o077 != 0  ⇒  some group/other bit is set (what the binary rejects).
+  local needs_chmod=false
+  if [[ -n "${mode}" ]]; then
+    # Right-pad short modes (e.g. "60" is not expected, but be defensive).
+    local go_bits="${mode: -2}"          # last two octal digits (group+other)
+    [[ "${go_bits}" != "00" ]] && needs_chmod=true
+  else
+    needs_chmod=true                     # stat failed — force a tighten
+  fi
+
+  local needs_chown=false
+  [[ "${owner}" != "aperod" ]] && needs_chown=true
+
+  if [[ "${needs_chmod}" == "true" ]]; then
+    echo "  [fix] ${key_path}: mode ${mode:-?} is group/other-accessible → chmod g-rwx,o-rwx (tighten only, owner bits preserved)"
+    if ! chmod g-rwx,o-rwx "${key_path}"; then
+      echo "✗ Could not chmod g-rwx,o-rwx ${key_path}" >&2
+      return 1
+    fi
+  fi
+
+  if [[ "${needs_chown}" == "true" ]]; then
+    echo "  [fix] ${key_path}: owner ${owner:-?} → aperod:aperod"
+    if ! chown aperod:aperod "${key_path}"; then
+      echo "✗ Could not chown aperod:aperod ${key_path}" >&2
+      return 1
+    fi
+  fi
+
+  # Re-verify the mode is now safe (defensive; should always pass after chmod).
+  local final_mode
+  final_mode=$(stat -c '%a' "${key_path}" 2>/dev/null || echo "")
+  if [[ -n "${final_mode}" && "${final_mode: -2}" != "00" ]]; then
+    echo "✗ ${key_path} still has unsafe permissions (${final_mode}) after fix" >&2
+    return 1
+  fi
+
+  if [[ "${needs_chmod}" == "false" && "${needs_chown}" == "false" ]]; then
+    echo "  [ok] ${key_path}: permissions and ownership already safe (no group/other bits, aperod-owned)."
+  else
+    echo "  [ok] ${key_path}: validator key permissions/ownership corrected before stopping the node."
+  fi
+  return 0
+}
+
+echo "==> [2c] Validator-key permission preflight (before stopping the node)..."
+_vkey_path="$(_resolve_validator_key_path "${NODE_YAML}")"
+if ! preflight_validator_key "${_vkey_path}"; then
+  echo "" >&2
+  echo "✗ Validator-key preflight FAILED — the service was NOT stopped." >&2
+  echo "  The old binary is still running. Fix the key file, then re-run update-node.sh." >&2
+  echo "  Manual recovery: chmod go-rwx ${_vkey_path:-<validator.key>} && chown aperod:aperod ${_vkey_path:-<validator.key>}" >&2
+  send_telegram_alert "⚠️ <b>aperod-node validator-key preflight FAILED</b>
+Server: $(hostname)
+The validator key at <code>${_vkey_path:-&lt;unknown&gt;}</code> could not be made safe (chmod go-rwx / chown aperod:aperod).
+The service was <b>NOT stopped</b> — the old binary is still running.
+Fix the key file permissions and re-run <code>update-node.sh</code>."
+  exit 1
+fi
+
+# Belt-and-braces: run the new binary's dry-run validation (config parse + the
+# same fatal validator-key permission check) BEFORE stopping the live node.
+# --validate-config exits 0 on success; any non-zero means the new binary would
+# refuse to boot, so we abort now while the old binary is still serving.
+# Skippable via SKIP_CONFIG_DRYRUN=1 for environments where the RPC config is
+# not present on the deploy host.
+SKIP_CONFIG_DRYRUN="${SKIP_CONFIG_DRYRUN:-0}"
+if [[ "${SKIP_CONFIG_DRYRUN}" != "1" && -f "${NODE_YAML}" ]]; then
+  if "${BINARY_SRC}" --validate-config --config "${NODE_YAML}" >/tmp/aperod-validate.$$  2>&1; then
+    echo "  [ok] New binary dry-run passed ($(head -1 /tmp/aperod-validate.$$ 2>/dev/null))."
+    rm -f /tmp/aperod-validate.$$ 2>/dev/null || true
+  else
+    _dryrun_out="$(cat /tmp/aperod-validate.$$ 2>/dev/null || true)"
+    rm -f /tmp/aperod-validate.$$ 2>/dev/null || true
+    echo "" >&2
+    echo "✗ New binary dry-run FAILED — the service was NOT stopped." >&2
+    echo "  The old binary is still running. Fix the reported issue and re-run update-node.sh." >&2
+    echo "  Details: ${_dryrun_out}" >&2
+    send_telegram_alert "⚠️ <b>aperod-node config dry-run FAILED</b>
+Server: $(hostname)
+The freshly built binary rejected the live config during <code>--validate-config</code>:
+<code>${_dryrun_out}</code>
+The service was <b>NOT stopped</b> — the old binary is still running."
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
