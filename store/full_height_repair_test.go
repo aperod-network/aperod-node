@@ -268,7 +268,7 @@ func TestCheckAllHeightIndex_Consistent(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
-	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
 	}
@@ -294,7 +294,7 @@ func TestCheckAllHeightIndex_AbsentEntry(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
-	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	db.Close()
 
 	if chkErr != nil {
@@ -327,7 +327,7 @@ func TestCheckAllHeightIndex_DanglingEntry(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
-	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	db.Close()
 
 	if chkErr != nil {
@@ -369,7 +369,7 @@ func TestCheckAllHeightIndex_CountMissingHeightsMissesIt(t *testing.T) {
 	}
 
 	// CheckAllHeightIndex catches the dangling entry.
-	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	db.Close()
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
@@ -427,7 +427,7 @@ func TestRepairAllHeightIndex_PersistenceAfterRepair(t *testing.T) {
 	}
 
 	// CheckAllHeightIndex must now pass.
-	broken, _, chkErr := db2.CheckAllHeightIndex(tipHeight)
+	broken, _, chkErr := db2.CheckAllHeightIndex(tipHeight, 0)
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex after repair: %v", chkErr)
 	}
@@ -573,7 +573,7 @@ func TestCheckAllHeightIndex_SwappedValidHashes(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
-	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	db.Close()
 
 	if chkErr != nil {
@@ -604,7 +604,7 @@ func TestCheckAllHeightIndex_WrongHeightBody(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
-	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
 	db.Close()
 
 	if chkErr != nil {

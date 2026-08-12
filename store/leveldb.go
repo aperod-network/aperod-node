@@ -883,27 +883,34 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
         return repaired, skipped, firstErr
 }
 
-// CheckAllHeightIndex verifies the height index for every height in [0..tipHeight].
-// It scans the h/ range and, for each non-zero hash found there, verifies that the
-// corresponding block body exists in the b/ namespace.  Both absent/zeroed h/ entries
-// and dangling entries (non-zero h/ pointing at a missing b/ body) are counted as broken.
+// CheckAllHeightIndex verifies the height index for every height in
+// [fromHeight..tipHeight].  Pass fromHeight=0 to check the full chain.  For
+// pruned nodes (pruning.mode=light), pass fromHeight = tipHeight-keepBlocks so
+// intentionally-deleted block bodies below the pruning boundary are not
+// incorrectly counted as corruption.
 //
-// This is used by validator startup to hard-fail on any corrupt lower-height entry,
-// since CountMissingHeights only detects absent keys and cannot catch dangling pointers.
+// It scans the h/ range and, for each non-zero hash found there, verifies that
+// the corresponding block body exists in the b/ namespace.  Both absent/zeroed
+// h/ entries and dangling entries (non-zero h/ pointing at a missing b/ body)
+// are counted as broken.
 //
-// Returns (broken, firstBroken, err); broken==0 means the index is fully consistent.
+// Returns (broken, firstBroken, err); broken==0 means the index is fully
+// consistent within [fromHeight..tipHeight].
 // firstBroken is the lowest broken height (0 when nothing is broken).
-func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken uint64, err error) {
+func (d *DB) CheckAllHeightIndex(tipHeight, fromHeight uint64) (broken uint64, firstBroken uint64, err error) {
         if tipHeight == 0 {
                 return 0, 0, nil
+        }
+        if fromHeight > tipHeight {
+                fromHeight = tipHeight
         }
         // Phase 1: collect all h/<height> entries in the range and their hashes.
         type heightEntry struct {
                 hash  crypto.Hash32
                 found bool // false = absent / zeroed
         }
-        entries := make(map[uint64]heightEntry, int(tipHeight)+1)
-        startKey := heightKey(0)
+        entries := make(map[uint64]heightEntry, int(tipHeight-fromHeight)+1)
+        startKey := heightKey(fromHeight)
         endKey := heightKey(tipHeight + 1) // exclusive upper bound
         iter := d.db.NewIterator(&util.Range{Start: startKey, Limit: endKey}, nil)
         for iter.Next() {
@@ -924,9 +931,9 @@ func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken u
                 return 0, 0, fmt.Errorf("check-height-index: scan h/ range: %w", iterErr)
         }
 
-        // Phase 2: for every height in [0..tipHeight] check that h/ exists, is
-        // non-zero, and that the hash resolves to a real b/ body.
-        for h := uint64(0); h <= tipHeight; h++ {
+        // Phase 2: for every height in [fromHeight..tipHeight] check that h/ exists,
+        // is non-zero, and that the hash resolves to a real b/ body.
+        for h := fromHeight; h <= tipHeight; h++ {
                 e, found := entries[h]
                 if !found || e.hash == (crypto.Hash32{}) {
                         // Absent or zeroed h/ entry.

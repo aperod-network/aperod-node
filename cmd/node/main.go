@@ -980,10 +980,19 @@ func run() error {
                 //   • absent/zeroed h/ keys (missed by CountMissingHeights-only checks)
                 //   • dangling h/ entries whose b/<hash> block body is missing
                 //
+                // For pruned nodes (pruning.mode=light) blocks older than
+                // tipHeight-keepBlocks have been intentionally deleted from b/; their
+                // absent h/ entries are not corruption.  Start the check from the
+                // pruning boundary so the validator guard only fires on the kept range.
+                //
                 // This check runs AFTER checkStartupIntegrity (which already verified
-                // the tip entry) and covers [0..tipHeight] inclusive.
+                // the tip entry) and covers [checkFrom..tipHeight] inclusive.
                 if !cfg.Consensus.NonValidator && !repairDB && tipHeight > 0 {
-                        broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+                        checkFrom := uint64(0)
+                        if cfg.Pruning.Mode == "light" && cfg.Pruning.KeepBlocks > 0 && tipHeight > cfg.Pruning.KeepBlocks {
+                                checkFrom = tipHeight - cfg.Pruning.KeepBlocks
+                        }
+                        broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, checkFrom)
                         if chkErr != nil {
                                 return fmt.Errorf(
                                         "startup integrity (validator): height-index check failed: %w; "+
