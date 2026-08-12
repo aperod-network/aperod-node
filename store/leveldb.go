@@ -810,32 +810,132 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
                 if len(existing) == 32 {
                         copy(existingHash[:], existing)
                 }
-                if known && existingHash == want {
-                        continue // already correct
-                }
-                if existingHash != (crypto.Hash32{}) && !known {
-                        // h/ has a non-zero entry but b/ has no data — the h/ entry
-                        // could be valid (we just didn't find the block); leave it alone.
+
+                if known {
+                        if existingHash == want {
+                                continue // h/ is already correct
+                        }
+                        // h/ is absent/zero or points to a different hash.
+                        // Repair with the canonical hash sourced from b/.
+                        if repErr := d.putSync(heightKey(h), want[:]); repErr != nil {
+                                if firstErr == nil {
+                                        firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
+                                }
+                                continue
+                        }
+                        repaired++
                         continue
                 }
-                if !known {
-                        // h/ is absent/zero AND b/ has no data — cannot repair.
+
+                // !known: no parseable block body was found for height h during the
+                // b/ scan.  Check the existing h/ entry to determine if it is a
+                // dangling pointer (non-zero hash pointing at a missing body) or
+                // simply absent/zeroed.
+                if existingHash == (crypto.Hash32{}) {
+                        // h/ is absent or zeroed, and no block body — cannot repair.
                         skipped++
                         continue
                 }
-                // h/ is absent/zero or mismatched, and b/ has the block — rewrite.
-                if repErr := d.putSync(heightKey(h), want[:]); repErr != nil {
+                // h/ has a non-zero hash that was not in byHeight.  This means either
+                // the block body is missing from b/ (dangling pointer) or it could not
+                // be parsed during the b/ scan (corrupt JSON).  In either case we
+                // cannot verify or repair the entry — count it as an incomplete/skipped
+                // height so the caller does not treat the sweep as fully successful.
+                bodyKey := append(append([]byte{}, prefixBlock...), existingHash[:]...)
+                body, lookErr := d.get(bodyKey)
+                if lookErr != nil {
                         if firstErr == nil {
-                                firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
+                                firstErr = fmt.Errorf("verify block body at height %d: %w", h, lookErr)
                         }
                         continue
                 }
-                repaired++
+                if body == nil {
+                        // Dangling: h/ points to a block hash that has no body in b/.
+                        // Cannot repair (no alternative canonical hash).
+                        skipped++
+                } else {
+                        // Block body exists but was not parseable during Phase 1 (corrupt
+                        // JSON or unknown schema).  We cannot verify the height claim so
+                        // we treat this as an unresolvable entry.
+                        skipped++
+                }
         }
         if progress != nil {
                 progress(tipHeight, tipHeight)
         }
         return repaired, skipped, firstErr
+}
+
+// CheckAllHeightIndex verifies the height index for every height in [0..tipHeight].
+// It scans the h/ range and, for each non-zero hash found there, verifies that the
+// corresponding block body exists in the b/ namespace.  Both absent/zeroed h/ entries
+// and dangling entries (non-zero h/ pointing at a missing b/ body) are counted as broken.
+//
+// This is used by validator startup to hard-fail on any corrupt lower-height entry,
+// since CountMissingHeights only detects absent keys and cannot catch dangling pointers.
+//
+// Returns (broken, firstBroken, err); broken==0 means the index is fully consistent.
+// firstBroken is the lowest broken height (0 when nothing is broken).
+func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken uint64, err error) {
+        if tipHeight == 0 {
+                return 0, 0, nil
+        }
+        // Phase 1: collect all h/<height> entries in the range and their hashes.
+        type heightEntry struct {
+                hash  crypto.Hash32
+                found bool // false = absent / zeroed
+        }
+        entries := make(map[uint64]heightEntry, int(tipHeight)+1)
+        startKey := heightKey(0)
+        endKey := heightKey(tipHeight + 1) // exclusive upper bound
+        iter := d.db.NewIterator(&util.Range{Start: startKey, Limit: endKey}, nil)
+        for iter.Next() {
+                key := iter.Key()
+                if len(key) < len(prefixHeight)+8 {
+                        continue
+                }
+                h := binary.BigEndian.Uint64(key[len(prefixHeight):])
+                val := iter.Value()
+                var hash crypto.Hash32
+                if len(val) == 32 {
+                        copy(hash[:], val)
+                }
+                entries[h] = heightEntry{hash: hash, found: true}
+        }
+        iter.Release()
+        if iterErr := iter.Error(); iterErr != nil {
+                return 0, 0, fmt.Errorf("check-height-index: scan h/ range: %w", iterErr)
+        }
+
+        // Phase 2: for every height in [0..tipHeight] check that h/ exists, is
+        // non-zero, and that the hash resolves to a real b/ body.
+        for h := uint64(0); h <= tipHeight; h++ {
+                e, found := entries[h]
+                if !found || e.hash == (crypto.Hash32{}) {
+                        // Absent or zeroed h/ entry.
+                        if broken == 0 {
+                                firstBroken = h
+                        }
+                        broken++
+                        continue
+                }
+                // Non-zero h/ entry: verify the block body is present.
+                bodyKey := append(append([]byte{}, prefixBlock...), e.hash[:]...)
+                body, getErr := d.get(bodyKey)
+                if getErr != nil {
+                        return broken, firstBroken, fmt.Errorf(
+                                "check-height-index: lookup block body at height %d (hash %x): %w",
+                                h, e.hash[:4], getErr)
+                }
+                if body == nil {
+                        // Dangling pointer: h/ points to a missing b/ body.
+                        if broken == 0 {
+                                firstBroken = h
+                        }
+                        broken++
+                }
+        }
+        return broken, firstBroken, nil
 }
 
 // StoreHeightIndexSentinel records the tip height at which the full
