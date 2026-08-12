@@ -72,6 +72,23 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	copy(available, b.ownedUTXOs)
 	sort.Slice(available, func(i, j int) bool { return available[i].Amount > available[j].Amount })
 
+	// Deduplicate by OneTimePub: outputs sharing a one-time public key share
+	// the same key image (height-0 admin mints to one address); spending two
+	// of them in one tx produces duplicate key images and is rejected by
+	// consensus.  Keep the largest (first occurrence, list is largest-first).
+	{
+		seen := make(map[crypto.Point32]struct{}, len(available))
+		uniq := available[:0]
+		for _, u := range available {
+			if _, dup := seen[u.OneTimePub]; dup {
+				continue
+			}
+			seen[u.OneTimePub] = struct{}{}
+			uniq = append(uniq, u)
+		}
+		available = uniq
+	}
+
 	// Fee estimation: nOut = N recipients + 1 change slot.
 	const maxInputs = 8
 	nOut := len(recipients) + 1

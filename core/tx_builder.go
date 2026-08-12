@@ -107,6 +107,25 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 return available[i].Amount > available[j].Amount
         })
 
+        // Deduplicate by OneTimePub: outputs that share a one-time public key
+        // share the same key image (e.g. height-0 admin mints to one address —
+        // OneTimePub = spendPub + 0*G for all of them).  A transaction spending
+        // two such outputs would carry duplicate key images and be rejected by
+        // consensus, so only one of them can ever be spent.  Keep the largest
+        // (list is sorted largest-first, so the first occurrence wins).
+        {
+                seen := make(map[crypto.Point32]struct{}, len(available))
+                uniq := available[:0]
+                for _, u := range available {
+                        if _, dup := seen[u.OneTimePub]; dup {
+                                continue
+                        }
+                        seen[u.OneTimePub] = struct{}{}
+                        uniq = append(uniq, u)
+                }
+                available = uniq
+        }
+
         // ── UTXO selection: iterate until fee estimate stabilises ────────────────
         // Fee = estimated_tx_size_bytes × feePerByte.
         // We iterate: pick UTXOs → estimate size → recalculate fee → check again.
