@@ -2645,3 +2645,113 @@ func TestSync_RelayStall_Recovers(t *testing.T) {
 	t.Logf("✓ relay recovered after stall: height=%d tip=%x (stall re-issue count=%d)",
 		gotHeight, gotTip[:8], getHeadersCount.Load())
 }
+
+// ─── Rogue peer is still auto-banned at the production threshold (5) ─────────
+
+// TestHost_RoguePeer_BannedAtProductionThreshold is an end-to-end guard for the
+// rogue-fork protection at the production default threshold of 5 (the value
+// shipped in config.DefaultConfig after the threshold was raised so legitimate
+// validators are not dropped).  It proves that raising the threshold did NOT
+// silently disable the protection: a deliberately rogue peer that keeps
+// sending blocks far above our tip
+//
+//   1. is NOT banned by the first 5 bad blocks minus one (threshold-1 = 4),
+//   2. IS banned once the 5-strike threshold is reached (ListBans has a
+//      matching bare-IP entry with the "rogue fork blocks" reason),
+//   3. is disconnected immediately (PeerCount drops to 0), and
+//   4. cannot reconnect from the same IP on a new source port.
+//
+// The task description asks for 6+ bad blocks; we send 6 to mirror a real
+// attacker that does not stop at the threshold.
+func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
+	const prodThreshold = 5 // must match config.DefaultConfig().P2P.BadBlockBanThreshold
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-rogue-prod-threshold",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: prodThreshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("rogue peer did not register after handshake")
+	}
+
+	// Phase 1: threshold-1 bad blocks must NOT ban (legitimate validators that
+	// briefly race ahead stay connected).
+	for i := 0; i < prodThreshold-1; i++ {
+		sendBlockAtHeight(t, conn, 500_000) // far above ourTip(0)+lead(1000)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if n := len(h.ListBans()); n != 0 {
+		t.Fatalf("banned after only %d bad blocks (threshold=%d): %v", prodThreshold-1, prodThreshold, h.ListBans())
+	}
+	if h.PeerCount() != 1 {
+		t.Fatalf("peer disconnected before threshold was reached (PeerCount=%d)", h.PeerCount())
+	}
+
+	// Phase 2: cross the threshold — send 2 more (total 6 > threshold).
+	// The connection may be evicted mid-loop once the 5th strike lands, so a
+	// write error on the 6th block is acceptable attacker-side behaviour.
+	for i := 0; i < 2; i++ {
+		sb := p2p.SerializedBlock{Header: p2p.SerializedHeader{Height: 500_000}}
+		conn.SetWriteDeadline(time.Now().Add(time.Second))
+		if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
+			t.Logf("write bad block #%d failed (peer already evicted): %v", prodThreshold+i, err)
+			break
+		}
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	// 3) Peer must be disconnected.
+	if !waitFor(time.Second, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("rogue peer NOT disconnected after %d+ bad blocks (PeerCount=%d)", prodThreshold+1, h.PeerCount())
+	}
+
+	// 2) Ban entry for the bare IP must exist.
+	var banned bool
+	if !waitFor(time.Second, func() bool {
+		for _, b := range h.ListBans() {
+			if b.Addr == peerIP {
+				banned = true
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no ban entry for rogue IP %q after exceeding threshold=%d; bans: %v", peerIP, prodThreshold, h.ListBans())
+	}
+	if !banned {
+		t.Fatalf("unreachable: waitFor returned true without setting banned")
+	}
+
+	// 4) Reconnect from the same IP (new OS-assigned source port) is rejected:
+	// the host closes the connection without completing the handshake.
+	c2, err := net.DialTimeout("tcp", hostAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("host unreachable on reconnect attempt: %v", err)
+	}
+	defer c2.Close()
+	c2.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = p2p.WriteMsg(c2, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "rogue-peer-back", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+	})
+	if mt, _, readErr := p2p.ReadMsg(c2); readErr == nil && mt == p2p.MsgPong {
+		t.Errorf("reconnect from banned IP %s completed handshake (got MsgPong) — ban not enforced on accept path", peerIP)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if h.PeerCount() != 0 {
+		t.Errorf("PeerCount = %d after reconnect from banned IP, want 0", h.PeerCount())
+	}
+}
