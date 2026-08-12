@@ -246,6 +246,17 @@ type Peer struct {
         // holding any other mutex.
         lastPongAt atomic.Int64
 
+        // lastHeadersRequestedAt is the Unix nanosecond timestamp of the most
+        // recent requestHeaders call that was triggered from a MsgPong handler.
+        // Used to enforce a per-peer cooldown (≥ KeepaliveInterval) so that a
+        // peer reporting a height just 1 block ahead of ours — a normal
+        // propagation-delay situation — does not cause a requestHeaders storm on
+        // every keepalive Pong.  Zero means no Pong-triggered request has been
+        // sent yet, which lets the very first Pong with a height gap fire
+        // immediately (preserving the self-heal behaviour).
+        // Updated atomically by the dispatch goroutine; no mutex needed.
+        lastHeadersRequestedAt atomic.Int64
+
         // pendingBlocksMu guards pendingBlocks.  All access must hold this mutex.
         pendingBlocksMu sync.Mutex
         // pendingBlocks maps block hash → the time MsgGetBlock was sent for that
@@ -2213,8 +2224,21 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 // queries are not yet enabled).  On the next keepalive Pong the node
                 // detects the height gap and restarts the sync pipeline automatically,
                 // without requiring a manual restart.
+                //
+                // Cooldown: when the gap is exactly 1 block the peer likely just
+                // produced a new block whose MsgBlock is still in flight.  Firing
+                // requestHeaders on every subsequent Pong until that block arrives
+                // creates noisy chatter under a fast keepalive interval.  We
+                // suppress repeated Pong-triggered calls within one KeepaliveInterval
+                // so the self-heal benefit is preserved (fires once per interval)
+                // while back-to-back redundant requests are eliminated.
                 if msg.Height > h.handler.CurrentHeight() {
-                        h.requestHeaders(peer)
+                        nowNs := time.Now().UnixNano()
+                        cooldownNs := int64(h.GetKeepaliveInterval())
+                        if nowNs-peer.lastHeadersRequestedAt.Load() >= cooldownNs {
+                                peer.lastHeadersRequestedAt.Store(nowNs)
+                                h.requestHeaders(peer)
+                        }
                 }
                 return nil
 
