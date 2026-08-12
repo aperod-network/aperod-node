@@ -908,3 +908,153 @@ func TestFallbackClassification_PrimaryAbsentCorruptLegacy(t *testing.T) {
 		t.Errorf("startup_reason = %q, want corrupt_snapshot", reason)
 	}
 }
+
+// ─── Silent on-disk snapshot replacement (task: stale/foreign snapshot) ───────
+//
+// A snapshot file can be silently replaced on disk by an older backup or a
+// partial rsync.  Two distinct modes must both be rejected and classified via
+// logSnapshotStartupReason using the same wiring as the corrupt-primary tests:
+//
+//   A. The file at the CURRENT tip's path contains a structurally valid
+//      gzip+JSON snapshot from a DIFFERENT tip height (file + checksum sidecar
+//      copied together, so the checksum passes) → TipHeight validation fails
+//      → non-NotExist error → startup_reason=corrupt_snapshot.
+//
+//   B. The file at the current tip's path has the right height but a WRONG
+//      TipHashHex (snapshot from a different chain / pre-reorg backup)
+//      → hash validation fails → startup_reason=corrupt_snapshot.
+//
+//   C. A valid snapshot exists only at the OLD height path after the DB tip
+//      advanced → nothing found at the new height → os.ErrNotExist →
+//      startup_reason=no_snapshot (the stale file is ignored, never loaded).
+
+// saveSnapAtHeight saves a minimal but valid v2 snapshot (with checksum
+// sidecar) at the given height/hash via the production save path.
+func saveSnapAtHeight(t *testing.T, dir string, height uint64, hashHex string) {
+	t.Helper()
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  height,
+		TipHashHex: hashHex,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot(h=%d): %v", height, err)
+	}
+}
+
+// assertCorruptSnapshotReason runs err through logSnapshotStartupReason and
+// asserts the emitted startup_reason equals want ("corrupt_snapshot" or
+// "no_snapshot") — the exact wiring run() uses when snapLoaded=false.
+func assertCorruptSnapshotReason(t *testing.T, err error, height uint64, want string) {
+	t.Helper()
+	var buf bytes.Buffer
+	logSnapshotStartupReason(err, height, newCaptureLogger(&buf))
+
+	wantMsg := "snapshot corrupt or unreadable — falling back to full block scan"
+	if want == "no_snapshot" {
+		wantMsg = "no snapshot found — full block scan required"
+	}
+	if !logContainsMsg(&buf, wantMsg) {
+		t.Fatalf("expected log %q, got:\n%s", wantMsg, buf.String())
+	}
+	reason, ok := logFieldValue(&buf, wantMsg, "startup_reason")
+	if !ok || reason != want {
+		t.Errorf("startup_reason = %q (ok=%v), want %q", reason, ok, want)
+	}
+}
+
+// TestSilentReplacement_WrongHeightContentAtTipPath covers mode A: the primary
+// at the current tip's path is a fully valid gzip+JSON snapshot — checksum
+// sidecar and all — but its content is from an older tip height (e.g. an old
+// backup rsync'd over the current file, sidecar included).  The height check
+// must reject it with a non-NotExist error so the operator sees
+// startup_reason=corrupt_snapshot, not a silent wrong-state fast path.
+func TestSilentReplacement_WrongHeightContentAtTipPath(t *testing.T) {
+	dir := t.TempDir()
+	log := newCaptureLogger(&bytes.Buffer{})
+
+	const oldHeight, newHeight = uint64(5), uint64(6)
+	const newHash = "beefbeef"
+
+	// A valid old snapshot exists at height 5.
+	saveSnapAtHeight(t, dir, oldHeight, "cafecafe")
+
+	// Simulate the partial-rsync replacement: the height-5 file AND its
+	// checksum sidecar are copied over the height-6 primary path, so the
+	// checksum verification passes and only the height check can catch it.
+	oldPath := snapshotPath(dir, oldHeight)
+	newPath := snapshotPath(dir, newHeight)
+	if err := copyFile(oldPath, newPath); err != nil {
+		t.Fatalf("copy snapshot file: %v", err)
+	}
+	if err := copyFile(snapshotChecksumPath(oldPath), snapshotChecksumPath(newPath)); err != nil {
+		t.Fatalf("copy checksum sidecar: %v", err)
+	}
+
+	_, _, err := loadStartupSnapshotWithFallback(dir, newHeight, newHash, log)
+	if err == nil {
+		t.Fatal("stale snapshot content at the current tip path was ACCEPTED — height check bypassed")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected non-NotExist error (corrupt signal), got os.ErrNotExist; full err: %v", err)
+	}
+	if !strings.Contains(err.Error(), "height mismatch") {
+		t.Errorf("expected a height-mismatch rejection, got: %v", err)
+	}
+
+	assertCorruptSnapshotReason(t, err, newHeight, "corrupt_snapshot")
+}
+
+// TestSilentReplacement_WrongHashSameHeight covers mode B: the primary at the
+// current tip path has the correct height but a different TipHashHex (backup
+// from a different chain state).  The hash check must reject it and the error
+// must classify as corrupt_snapshot.
+func TestSilentReplacement_WrongHashSameHeight(t *testing.T) {
+	dir := t.TempDir()
+	log := newCaptureLogger(&bytes.Buffer{})
+
+	const height = uint64(9)
+
+	// The file on disk claims hash "aaaa1111", but the DB tip hash is different.
+	saveSnapAtHeight(t, dir, height, "aaaa1111")
+
+	_, _, err := loadStartupSnapshotWithFallback(dir, height, "bbbb2222", log)
+	if err == nil {
+		t.Fatal("snapshot with mismatched tip hash was ACCEPTED — hash check bypassed")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected non-NotExist error, got os.ErrNotExist; full err: %v", err)
+	}
+	if !strings.Contains(err.Error(), "hash mismatch") {
+		t.Errorf("expected a hash-mismatch rejection, got: %v", err)
+	}
+
+	assertCorruptSnapshotReason(t, err, height, "corrupt_snapshot")
+}
+
+// TestSilentReplacement_StaleSnapshotAtOldHeightIgnored covers mode C: a valid
+// snapshot was saved at height N, the DB tip then advanced to N+1 (e.g. blocks
+// accepted after the last checkpoint), and startup looks for a snapshot at the
+// NEW height.  The stale height-N file must be ignored entirely — never loaded
+// as chain state — and the load must report os.ErrNotExist so the operator
+// sees startup_reason=no_snapshot (clean full-scan, not corruption).
+func TestSilentReplacement_StaleSnapshotAtOldHeightIgnored(t *testing.T) {
+	dir := t.TempDir()
+	log := newCaptureLogger(&bytes.Buffer{})
+
+	const oldHeight, newHeight = uint64(41), uint64(42)
+
+	saveSnapAtHeight(t, dir, oldHeight, "0ddba11c")
+
+	snap, _, err := loadStartupSnapshotWithFallback(dir, newHeight, "5eaf00d5", log)
+	if err == nil {
+		t.Fatalf("expected error, got snapshot at height %d (stale file loaded as current state!)", snap.TipHeight)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected os.ErrNotExist (stale file ignored), got: %v", err)
+	}
+
+	assertCorruptSnapshotReason(t, err, newHeight, "no_snapshot")
+}
