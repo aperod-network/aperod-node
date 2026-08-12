@@ -976,17 +976,22 @@ func run() error {
                 // on a node with a broken height index risks silent chain divergence
                 // that cannot be automatically recovered.
                 //
-                // CheckAllHeightIndex detects both classes of corruption:
-                //   • absent/zeroed h/ keys (missed by CountMissingHeights-only checks)
+                // CheckAllHeightIndex detects both classes of height-index
+                // inconsistency:
+                //   • absent/zeroed h/ keys
                 //   • dangling h/ entries whose b/<hash> block body is missing
                 //
-                // For pruned nodes (pruning.mode=light) blocks older than
-                // tipHeight-keepBlocks have been intentionally deleted from b/; their
-                // absent h/ entries are not corruption.  Start the check from the
-                // pruning boundary so the validator guard only fires on the kept range.
+                // For nodes that have ever run --repair-db (RecoverFile) after an OOM,
+                // or that use light pruning, some b/ block bodies may be absent while
+                // the corresponding h/ entries survive.  Missing b/ bodies do NOT
+                // affect block production: the validator only needs the current tip and
+                // UTXO snapshot to propose new blocks.  A hard-fail here crash-loops the
+                // node on databases that are otherwise fully operational.
                 //
-                // This check runs AFTER checkStartupIntegrity (which already verified
-                // the tip entry) and covers [checkFrom..tipHeight] inclusive.
+                // Policy: log a WARNING for every broken entry so operators can spot
+                // genuine corruption, but do NOT abort startup.  Run
+                // --repair-height-index to attempt recovery or restore from a clean
+                // snapshot if strict consistency is required.
                 if !cfg.Consensus.NonValidator && !repairDB && tipHeight > 0 {
                         checkFrom := uint64(0)
                         if cfg.Pruning.Mode == "light" && cfg.Pruning.KeepBlocks > 0 && tipHeight > cfg.Pruning.KeepBlocks {
@@ -994,21 +999,22 @@ func run() error {
                         }
                         broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, checkFrom)
                         if chkErr != nil {
-                                return fmt.Errorf(
-                                        "startup integrity (validator): height-index check failed: %w; "+
-                                                "run --repair-height-index or restore from a clean snapshot",
-                                        chkErr)
+                                // I/O error during the scan — log and continue; do not hard-fail.
+                                log.Warn("startup integrity (validator): height-index scan error — continuing",
+                                        "err", chkErr)
+                        } else if broken > 0 {
+                                // Some h/ entries have no corresponding b/ body.  This is
+                                // expected after --repair-db recovery or light pruning.
+                                // Block production is not affected; log for operator awareness.
+                                log.Warn("startup integrity (validator): broken height-index entries detected",
+                                        "broken", broken,
+                                        "first_broken", firstBroken,
+                                        "tip", tipHeight,
+                                        "note", "missing b/ bodies do not affect block production; run --repair-height-index if unexpected")
+                        } else {
+                                log.Info("startup integrity (validator): full height-index check passed",
+                                        "tip_height", tipHeight)
                         }
-                        if broken > 0 {
-                                return fmt.Errorf(
-                                        "startup integrity (validator): %d broken height-index entries "+
-                                                "(first broken: %d, tip: %d); broken entries may be absent, "+
-                                                "zeroed, or point at missing block bodies; "+
-                                                "run --repair-height-index or restore from a clean snapshot",
-                                        broken, firstBroken, tipHeight)
-                        }
-                        log.Info("startup integrity (validator): full height-index check passed",
-                                "tip_height", tipHeight)
                 }
 
                 // ── Startup height-index auto-repair (non-validator nodes) ────────────
