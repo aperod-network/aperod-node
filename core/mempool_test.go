@@ -553,3 +553,94 @@ func TestMempool_ConcurrentAddRemove_NoRace(t *testing.T) {
 		t.Errorf("pool.TotalBytes() = %d < 0", pool.TotalBytes())
 	}
 }
+
+// ─── Task #486: fabricated ring-commitment swap is caught by the C-0 check ───
+//
+// TxVerifier's C-0 commitment-binding check requires that at least one ring
+// member PRESENT in the UTXO set has AmountCommit == inp.AmountCommit.  These
+// tests cover the previously untested branch where the ring member IS present
+// in byPubKey but its stored commitment has been swapped for a fabricated one.
+func TestTxVerifier_C0_FabricatedRingCommitmentRejected(t *testing.T) {
+	utxos := core.NewUTXOSet()
+
+	// A known on-chain UTXO with a distinctive, non-zero AmountCommit.
+	var realPub crypto.Point32
+	realPub[0] = 0xAA
+	var realCommit crypto.Commitment
+	realCommit[0] = 0xC0
+	realCommit[1] = 0xFF
+	utxos.Add(&core.UTXO{
+		TxHash:       crypto.Hash32{0x01},
+		OutputIndex:  0,
+		OneTimePub:   realPub,
+		AmountCommit: realCommit,
+		BlockHeight:  1,
+	})
+	if utxos.GetByPubKey(realPub) == nil {
+		t.Fatal("precondition: UTXO not present in byPubKey index")
+	}
+
+	v := core.NewTxVerifier(utxos)
+
+	// buildTx crafts a tx whose ring contains the real on-chain pub key at
+	// slot 0 (the rest are random-looking keys absent from the UTXO set) and
+	// claims the given input AmountCommit.
+	buildTx := func(claimedCommit crypto.Commitment) core.Transaction {
+		ring := makeRing()
+		ring[0] = realPub
+		return core.Transaction{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{
+					KeyImage:     makeKeyImage(486),
+					Ring:         ring,
+					AmountCommit: claimedCommit,
+				},
+			},
+			Outputs: []core.Output{
+				{
+					OneTimePub:   crypto.Point32{0xBB},
+					AmountCommit: crypto.Commitment{},
+				},
+			},
+			Fee:         0,
+			Signatures:  []*crypto.MLSAGSignature{{}},
+			RangeProofs: []*crypto.RangeProof{{}},
+		}
+	}
+
+	// Case 1: fabricated commitment — the ring member is present in the UTXO
+	// set but the claimed inp.AmountCommit does not match its stored commit.
+	// VerifyTx must reject citing the C-0 check.
+	var fabricated crypto.Commitment
+	fabricated[0] = 0xDE
+	fabricated[1] = 0xAD
+	if fabricated == realCommit {
+		t.Fatal("test bug: fabricated commit equals real commit")
+	}
+	tx1 := buildTx(fabricated)
+	err := v.VerifyTx(&tx1)
+	if err == nil {
+		t.Fatal("VerifyTx: expected non-nil error for fabricated ring commitment, got nil")
+	}
+	if !strings.Contains(err.Error(), "C-0 check") {
+		t.Errorf("VerifyTx: expected C-0 check rejection, got: %v", err)
+	}
+	// Must be the C-0 mismatch branch, not the C-0a all-absent branch: the
+	// real ring member IS present in the UTXO set.
+	if strings.Contains(err.Error(), "C-0a") {
+		t.Errorf("VerifyTx: fired C-0a (all-absent) instead of C-0 commitment-binding: %v", err)
+	}
+
+	// Case 2 (control): the same tx with the CORRECT commitment must pass the
+	// C-0 check.  It still fails later (stub ring signature), which proves the
+	// rejection in case 1 came specifically from the commitment binding.
+	tx2 := buildTx(realCommit)
+	ctrlErr := v.VerifyTx(&tx2)
+	if ctrlErr == nil {
+		t.Fatal("control tx with stub ring signature unexpectedly passed full verification")
+	}
+	if strings.Contains(ctrlErr.Error(), "C-0") {
+		t.Errorf("control tx with correct commitment was rejected by C-0/C-0a: %v", ctrlErr)
+	}
+}
