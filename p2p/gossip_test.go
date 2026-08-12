@@ -205,8 +205,20 @@ func tryReadMsg(conn net.Conn, deadline time.Duration) (p2p.MessageType, bool) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		mt, _, err := p2p.ReadMsg(conn)
-		ch <- result{mt, err == nil}
+		for {
+			mt, _, err := p2p.ReadMsg(conn)
+			if err != nil {
+				ch <- result{mt, false}
+				return
+			}
+			if mt == p2p.MsgGetHeaders {
+				// Host's own post-handshake sync request — not a relay;
+				// skip it and keep waiting for the message under test.
+				continue
+			}
+			ch <- result{mt, true}
+			return
+		}
 	}()
 	time.AfterFunc(deadline, func() { conn.Close() })
 	r := <-ch
@@ -428,7 +440,7 @@ func TestHost_SetHeaderProvider_ServesHeaders(t *testing.T) {
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10})
-		msgType, data, err := p2p.ReadMsg(conn)
+		msgType, data, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg GetHeaders: %v", err)
 			return
@@ -468,7 +480,7 @@ func TestHost_NoHeaderProvider_ServesEmpty(t *testing.T) {
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10})
-		msgType, data, err := p2p.ReadMsg(conn)
+		msgType, data, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg: %v", err)
 			return

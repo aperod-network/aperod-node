@@ -392,6 +392,12 @@ type Host struct {
         // Panel notification log.  Capped at stallEventMaxEvents.
         stallEvents []StallEvent
 
+        // keepaliveIntervalNs holds the current live keepalive Ping interval in
+        // nanoseconds.  Updated atomically by SetKeepaliveInterval so the change
+        // is visible to all active peer goroutines on their next ping tick without
+        // any lock or restart.  Initialised from cfg.KeepaliveInterval in NewHost.
+        keepaliveIntervalNs atomic.Int64
+
         // bootnodeLastResolved maps each raw bootnode string (as it appears in
         // cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
         // Updated on every successful DNS resolution in Start() and maintainLoop.
@@ -472,7 +478,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 }
         }
 
-        return &Host{
+        h := &Host{
                 cfg:            cfg,
                 handler:        handler,
                 log:            log,
@@ -489,6 +495,25 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 bootnodeSet:            make(map[string]struct{}),
                 maintainNow:            make(chan struct{}, 1),
         }
+        h.keepaliveIntervalNs.Store(int64(cfg.KeepaliveInterval))
+        return h
+}
+
+// GetKeepaliveInterval returns the current live keepalive Ping interval.
+// Thread-safe; may be called concurrently with SetKeepaliveInterval.
+func (h *Host) GetKeepaliveInterval() time.Duration {
+        return time.Duration(h.keepaliveIntervalNs.Load())
+}
+
+// SetKeepaliveInterval updates the keepalive Ping interval for all active peer
+// connections without restarting the node.  Existing connections pick up the
+// new interval on their next keepalive tick.  d must be in [1s, 15s].
+func (h *Host) SetKeepaliveInterval(d time.Duration) error {
+        if d < time.Second || d > 15*time.Second {
+                return fmt.Errorf("keepalive_interval must be in [1s, 15s], got %s", d)
+        }
+        h.keepaliveIntervalNs.Store(int64(d))
+        return nil
 }
 
 // rebuildBootnodeSet repopulates h.bootnodeSet from h.bootnodeLastResolved.
@@ -1667,7 +1692,8 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // conn.Close defer below).
         keepaliveDone := make(chan struct{})
         go func() {
-                ping  := time.NewTicker(h.cfg.KeepaliveInterval)
+                curKeepalive := h.GetKeepaliveInterval()
+                ping  := time.NewTicker(curKeepalive)
                 sync  := time.NewTicker(3 * time.Second)
                 stall := time.NewTicker(h.cfg.GetBlockStallTimeout)
                 defer ping.Stop()
@@ -1676,12 +1702,27 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 for {
                         select {
                         case <-ping.C:
+                                // Live-configurable keepalive interval: check whether an
+                                // operator has updated the interval via SetKeepaliveInterval.
+                                // When the interval changes we must reset lastPongAt to now
+                                // before applying the new deadline — otherwise a decrease
+                                // (e.g. 10 s → 1 s) would immediately evaluate the shorter
+                                // 2×1 s window against a lastPongAt that was last updated
+                                // under the old 10 s cadence, falsely evicting a healthy peer
+                                // before any ping has even been sent at the new rate.
+                                // Resetting the baseline to now gives the peer a full
+                                // 2×newInterval grace window starting from this tick.
+                                if newInterval := h.GetKeepaliveInterval(); newInterval != curKeepalive {
+                                        peer.lastPongAt.Store(time.Now().UnixNano())
+                                        curKeepalive = newInterval
+                                        ping.Reset(curKeepalive)
+                                }
                                 // Pong-deadline check: if the peer has not replied to our
                                 // keepalive Pings for longer than 2× KeepaliveInterval, the
                                 // connection is considered dead (e.g. a half-open TCP session
                                 // after a peer crash).  Close the connection so the slot is
                                 // freed without waiting for the OS TCP keepalive (~2 h).
-                                pongDeadline := 2 * h.cfg.KeepaliveInterval
+                                pongDeadline := 2 * curKeepalive
                                 lastPong := time.Unix(0, peer.lastPongAt.Load())
                                 if time.Since(lastPong) > pongDeadline {
                                         h.log.Warn("keepalive: peer silent — no pong received within deadline, evicting",

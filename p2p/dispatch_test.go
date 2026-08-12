@@ -50,6 +50,19 @@ func connectAndHandshake(t *testing.T, addr string, fn func(conn net.Conn)) {
 	time.Sleep(50 * time.Millisecond)
 }
 
+// readMsgSkipGetHeaders reads messages from conn, skipping the host's own
+// MsgGetHeaders sync requests.  Since the handshake-race fix, the host sends
+// one unconditional MsgGetHeaders to every peer right after registration, so
+// raw test peers must skip it to reach the response they are asserting on.
+func readMsgSkipGetHeaders(conn net.Conn) (p2p.MessageType, []byte, error) {
+	for {
+		msgType, data, err := p2p.ReadMsg(conn)
+		if err != nil || msgType != p2p.MsgGetHeaders {
+			return msgType, data, err
+		}
+	}
+}
+
 // startHost starts a test host and returns it + its bound address.
 func startHost(t *testing.T) (*p2p.Host, *stubHandler, string) {
 	t.Helper()
@@ -79,7 +92,7 @@ func TestDispatch_Ping(t *testing.T) {
 		// After handshake, send another ping — host should respond with pong
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 		p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{NodeID: "X", Height: 0, Timestamp: time.Now().Unix()})
-		msgType, _, _ := p2p.ReadMsg(conn)
+		msgType, _, _ := readMsgSkipGetHeaders(conn)
 		if msgType != p2p.MsgPong {
 			t.Errorf("expected pong after ping, got %v", msgType)
 		}
@@ -93,7 +106,7 @@ func TestDispatch_GetPeers(t *testing.T) {
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 		p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{})
-		msgType, _, err := p2p.ReadMsg(conn)
+		msgType, _, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg after GetPeers: %v (may have closed)", err)
 			return
@@ -188,7 +201,7 @@ func TestDispatch_GetHeaders(t *testing.T) {
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 100})
-		msgType, _, err := p2p.ReadMsg(conn)
+		msgType, _, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg GetHeaders response: %v", err)
 			return

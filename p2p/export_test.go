@@ -4,7 +4,10 @@
 
 package p2p
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // BadBlockMaxTrackedIPs is the exported alias for badBlockMaxTrackedIPs,
 // available to package p2p_test.
@@ -83,5 +86,46 @@ func HostTriggerMaintain(h *Host) {
 	select {
 	case h.maintainNow <- struct{}{}:
 	default: // tick already pending — maintainLoop will pick it up
+	}
+}
+
+// HostAddKnownPeer seeds addr into the host's peerList so that the
+// MinPeers path inside maintainLoop can re-dial it after a drop.  In
+// production peerList is populated by the MsgPeers peer-exchange
+// protocol; tests that skip the exchange call this helper instead.
+func HostAddKnownPeer(h *Host, addr string) {
+	h.addKnownPeers([]string{addr})
+}
+
+// HostKeepaliveInterval returns the KeepaliveInterval stored in the host's
+// config after NewHost has applied any defaults.  Exported for unit tests that
+// verify the default-application and explicit-value-wiring paths without
+// starting a listener or connecting any peers.
+func HostKeepaliveInterval(h *Host) time.Duration {
+	return h.cfg.KeepaliveInterval
+}
+
+// SetKeepaliveIntervalForTest sets the live keepalive interval atomically
+// without enforcing the [1s, 15s] production range constraint.  Use only in
+// unit tests that need ms-scale intervals to avoid slow wall-clock waits.
+func SetKeepaliveIntervalForTest(h *Host, d time.Duration) {
+	h.keepaliveIntervalNs.Store(int64(d))
+}
+
+// SetListenFunc replaces the TCP listen factory used by Start().  The factory
+// receives the same (network, addr) arguments that net.Listen would receive and
+// must return a valid net.Listener (or an error).  Because the factory runs at
+// the exact point where net.Listen is called — after loadWhitelistFromFile and
+// before tls.NewListener — it is the only reliable place to assert the
+// whitelist-before-listener ordering invariant: if a future refactor moves
+// h.listenFunc above loadWhitelistFromFile the factory executes before the
+// whitelist is populated and any assertion inside it fails immediately.
+//
+// Pass nil to restore the default (net.Listen).
+func SetListenFunc(h *Host, fn func(network, addr string) (net.Listener, error)) {
+	if fn == nil {
+		h.listenFunc = net.Listen
+	} else {
+		h.listenFunc = fn
 	}
 }

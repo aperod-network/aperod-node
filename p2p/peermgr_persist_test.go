@@ -19,7 +19,9 @@ func TestPeerMgr_PersistAndRestore(t *testing.T) {
 
 	// Simulate a restart: fresh PeerMgr pointing at the same file.
 	pm2 := newPeerMgrWithFile(f)
-	pm2.LoadBansFromFile()
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
 
 	if !pm2.IsBanned("1.2.3.4") {
 		t.Error("bare-IP ban must survive restart")
@@ -51,7 +53,9 @@ func TestPeerMgr_ExpiredBansFilteredOnLoad(t *testing.T) {
 	}
 
 	pm := newPeerMgrWithFile(f)
-	pm.LoadBansFromFile()
+	if err := pm.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
 
 	if pm.IsBanned("1.2.3.4") {
 		t.Error("expired ban must not be restored")
@@ -61,19 +65,18 @@ func TestPeerMgr_ExpiredBansFilteredOnLoad(t *testing.T) {
 	}
 }
 
-// TestPeerMgr_CorruptFileHandledGracefully verifies that a corrupt ban file
-// does not prevent the node from starting (fails open with empty ban list).
-func TestPeerMgr_CorruptFileHandledGracefully(t *testing.T) {
+// TestPeerMgr_CorruptFileReturnsFatalError verifies that a corrupt ban file
+// causes LoadBansFromFile to return a non-nil error so that Start() aborts
+// rather than running with an empty ban list (fail-closed semantics).
+func TestPeerMgr_CorruptFileReturnsFatalError(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "bans.json")
 	if err := os.WriteFile(f, []byte("{not valid json at all!!!"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	pm := newPeerMgrWithFile(f)
-	pm.LoadBansFromFile() // must not panic or return an error
-
-	if pm.BannedCount() != 0 {
-		t.Error("corrupt file must result in an empty ban list")
+	if err := pm.LoadBansFromFile(); err == nil {
+		t.Error("corrupt ban file must return a non-nil error — node must not start with a degraded ban list")
 	}
 }
 
@@ -82,7 +85,9 @@ func TestPeerMgr_CorruptFileHandledGracefully(t *testing.T) {
 func TestPeerMgr_MissingFileHandledGracefully(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "nonexistent_bans.json")
 	pm := newPeerMgrWithFile(f)
-	pm.LoadBansFromFile() // must not panic
+	if err := pm.LoadBansFromFile(); err != nil {
+		t.Fatalf("missing file must not return an error (first boot): %v", err)
+	}
 
 	if pm.BannedCount() != 0 {
 		t.Error("missing file must result in an empty ban list")
@@ -104,7 +109,9 @@ func TestPeerMgr_PersistenceDisabledByDash(t *testing.T) {
 
 	// LoadBansFromFile must be a silent no-op.
 	pm2 := newPeerMgrWithFile("-")
-	pm2.LoadBansFromFile()
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile with '-' must not return an error: %v", err)
+	}
 	if pm2.BannedCount() != 0 {
 		t.Error("no bans should be loaded when persistence is disabled")
 	}
@@ -120,7 +127,9 @@ func TestPeerMgr_LiftBanPersisted(t *testing.T) {
 	pm.LiftBan("1.2.3.4")
 
 	pm2 := newPeerMgrWithFile(f)
-	pm2.LoadBansFromFile()
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
 
 	if pm2.IsBanned("1.2.3.4") {
 		t.Error("lifted ban must not re-appear after restart")
@@ -159,7 +168,9 @@ func TestPeerMgr_ConcurrentBansPersistCorrectly(t *testing.T) {
 
 	// Simulate restart.
 	pm2 := newPeerMgrWithFile(f)
-	pm2.LoadBansFromFile()
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
 
 	for _, addr := range addrs {
 		if !pm2.IsBanned(addr) {
@@ -205,7 +216,9 @@ func TestPeerMgr_ConcurrentBanAndLift(t *testing.T) {
 
 	// The final in-memory state and the file must agree.
 	pm2 := newPeerMgrWithFile(f)
-	pm2.LoadBansFromFile()
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
 	inMemory := pm.IsBanned("1.2.3.4")
 	inFile := pm2.IsBanned("1.2.3.4")
 	if inMemory != inFile {

@@ -68,6 +68,189 @@ func TestHost_NewHost_PeerCountZero(t *testing.T) {
 	}
 }
 
+// TestHost_KeepaliveInterval_Default verifies that NewHost applies the
+// production default of 10 s when KeepaliveInterval is left at its zero value.
+// This guards against a future refactor that moves or removes the default so
+// operators who do not set keepalive_interval in node.yaml silently get a
+// different tick rate.
+func TestHost_KeepaliveInterval_Default(t *testing.T) {
+	const want = 10 * time.Second
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	got := p2p.HostKeepaliveInterval(h)
+	if got != want {
+		t.Errorf("KeepaliveInterval default = %v, want %v", got, want)
+	}
+}
+
+// TestHost_KeepaliveInterval_ExplicitValue verifies that an operator-supplied
+// KeepaliveInterval (e.g. 5 s) is preserved by NewHost without being
+// overridden by the default-application logic.
+func TestHost_KeepaliveInterval_ExplicitValue(t *testing.T) {
+	const want = 5 * time.Second
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10, KeepaliveInterval: want}, &stubHandler{}, newTestLogger())
+	got := p2p.HostKeepaliveInterval(h)
+	if got != want {
+		t.Errorf("KeepaliveInterval explicit = %v, want %v", got, want)
+	}
+}
+
+// TestHost_SetKeepaliveInterval_Validation verifies that SetKeepaliveInterval
+// rejects values outside the allowed [1s, 15s] window and accepts boundary and
+// midpoint values without error.
+func TestHost_SetKeepaliveInterval_Validation(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+
+	cases := []struct {
+		d       time.Duration
+		wantErr bool
+	}{
+		{0, true},
+		{500 * time.Millisecond, true},
+		{1 * time.Second, false},        // lower bound — valid
+		{7 * time.Second, false},        // midpoint — valid
+		{15 * time.Second, false},       // upper bound — valid
+		{16 * time.Second, true},
+		{time.Hour, true},
+	}
+	for _, tc := range cases {
+		err := h.SetKeepaliveInterval(tc.d)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("SetKeepaliveInterval(%v): err=%v, wantErr=%v", tc.d, err, tc.wantErr)
+		}
+	}
+}
+
+// TestHost_GetKeepaliveInterval_ReturnsUpdated verifies that GetKeepaliveInterval
+// returns the value most recently stored by SetKeepaliveInterval.
+func TestHost_GetKeepaliveInterval_ReturnsUpdated(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+
+	if err := h.SetKeepaliveInterval(5 * time.Second); err != nil {
+		t.Fatalf("SetKeepaliveInterval: %v", err)
+	}
+	if got := h.GetKeepaliveInterval(); got != 5*time.Second {
+		t.Errorf("GetKeepaliveInterval = %v, want 5s", got)
+	}
+
+	if err := h.SetKeepaliveInterval(1 * time.Second); err != nil {
+		t.Fatalf("SetKeepaliveInterval: %v", err)
+	}
+	if got := h.GetKeepaliveInterval(); got != 1*time.Second {
+		t.Errorf("GetKeepaliveInterval = %v, want 1s", got)
+	}
+}
+
+// TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive verifies that decreasing
+// the live keepalive interval does NOT evict a healthy connected peer whose last
+// Pong arrived more than 2×newInterval ago but within 2×oldInterval (the
+// prior-cadence grace window).
+//
+// Without the lastPongAt-reset fix in the keepalive goroutine, the first tick at
+// the old rate would evaluate "2×newInterval since last Pong" against a baseline
+// that predates the interval change, causing an immediate false eviction.
+//
+// The test uses a ms-scale interval via SetKeepaliveIntervalForTest (bypasses the
+// [1s, 15s] production guard) so the test completes in < 500 ms.  A raw TCP
+// server acts as the remote peer: it completes the asymmetric handshake and then
+// replies to every MsgPing with a MsgPong so the connection stays healthy.
+func TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive(t *testing.T) {
+	// Remote-peer server: accept one connection, do asymmetric handshake,
+	// then echo every Ping with a Pong.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Asymmetric handshake: outbound host sends MsgPing first.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("server: expected MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			return
+		}
+
+		// Serve keepalive pings until the connection closes.
+		for {
+			conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+			mt2, _, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return // connection closed — exit cleanly
+			}
+			if mt2 == p2p.MsgPing {
+				_ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+					NodeID: "server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+				})
+			}
+		}
+	}()
+
+	// Initial keepalive: 100 ms (via test helper — bypasses [1s, 15s] guard).
+	const initialInterval = 100 * time.Millisecond
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          5,
+		NodeID:            "ka-decrease-test",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: initialInterval,
+	}, &stubHandler{}, newTestLogger())
+	if sErr := host.Start(); sErr != nil {
+		t.Fatalf("host.Start: %v", sErr)
+	}
+	defer host.Stop()
+
+	// Dial the server; wait up to 2 s for the connection to be established.
+	host.DialPeer(ln.Addr().String())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if host.PeerCount() != 1 {
+		t.Fatalf("peer never connected")
+	}
+
+	// Sleep for a duration that is:
+	//   > 2 × newInterval (20 ms × 2 = 40 ms)  — would evict under old code
+	//   < 2 × oldInterval (100 ms × 2 = 200 ms) — peer is still healthy
+	// This window is 50 ms.
+	time.Sleep(50 * time.Millisecond)
+
+	// Decrease the interval to 20 ms using the test helper.
+	// Without the lastPongAt reset, the next 100 ms tick (which fires at
+	// ~100 ms from connection start, i.e., ~50 ms from now) would compute:
+	//   pongDeadline = 2×20 ms = 40 ms
+	//   time since lastPongAt ≈ 100 ms > 40 ms → false eviction
+	// With the fix, lastPongAt is reset to now on interval change, so:
+	//   time since lastPongAt ≈ 0 ms < 40 ms → peer stays connected
+	const newInterval = 20 * time.Millisecond
+	p2p.SetKeepaliveIntervalForTest(host, newInterval)
+
+	// Wait two full old-rate ticks (200 ms) so the goroutine has had at least
+	// one opportunity to observe and apply the new interval.
+	time.Sleep(200 * time.Millisecond)
+
+	if host.PeerCount() != 1 {
+		t.Errorf("peer was evicted after interval decrease (want PeerCount=1, got %d)", host.PeerCount())
+	}
+}
+
 func TestHost_BroadcastBlock_NoPeers(t *testing.T) {
 	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
 	priv, pub, _ := crypto.GenerateValidatorKey()

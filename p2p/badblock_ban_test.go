@@ -285,14 +285,21 @@ func TestBadBlockBan_AllConnectionsEvicted(t *testing.T) {
 		t.Errorf("PeerCount = %d after ban; both connections should have been evicted", h.PeerCount())
 	}
 
-	// Verify the second connection is actually closed (read returns an error).
+	// Verify the second connection is actually closed.  The host sends one
+	// unconditional MsgGetHeaders right after registration (handshake-race
+	// fix), so buffered bytes may still be readable — drain them until the
+	// read errors, then distinguish close (EOF/reset) from a still-open
+	// connection (timeout).
 	conn2.SetDeadline(time.Now().Add(300 * time.Millisecond))
-	buf := make([]byte, 1)
-	n, err := conn2.Read(buf)
-	if n > 0 || err == nil {
-		t.Errorf("second connection still readable after IP ban (n=%d err=%v)", n, err)
+	buf := make([]byte, 256)
+	var readErr error
+	for readErr == nil {
+		_, readErr = conn2.Read(buf)
+	}
+	if nerr, ok := readErr.(net.Error); ok && nerr.Timeout() {
+		t.Errorf("second connection still open after IP ban (read timed out instead of EOF/reset)")
 	} else {
-		t.Logf("second connection correctly closed: %v", err)
+		t.Logf("second connection correctly closed: %v", readErr)
 	}
 }
 

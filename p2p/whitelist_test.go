@@ -524,6 +524,78 @@ func TestIpInWhitelist_MixedCIDRAndIP(t *testing.T) {
 	}
 }
 
+// TestStart_WhitelistLoadedBeforeListenerOpens is a regression guard for the
+// ordering invariant in Start():
+//
+//	loadWhitelistFromFile  →  net.Listen  →  tls.NewListener
+//
+// If a future refactor moves net.Listen above the whitelist load, inbound
+// connections can arrive with an empty whitelist (fail-open) before the load
+// finishes.
+//
+// The test detects this by replacing h.listenFunc (the injectable TCP-listen
+// factory) with a custom factory that captures GetPeerWhitelist() at the
+// exact moment of the bind call.  Because the factory IS the listen call, it
+// executes at the true bind boundary — not at an independently-positioned hook.
+// If net.Listen is ever moved before loadWhitelistFromFile, this factory runs
+// before the whitelist is populated and the assertion inside it fails
+// immediately, catching the regression in CI.
+func TestStart_WhitelistLoadedBeforeListenerOpens(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := filepath.Join(dir, "whitelist.json")
+
+	// Write a known whitelist to the sidecar so loadWhitelistFromFile has
+	// something to load (the open-network case would not distinguish orderings).
+	if err := os.WriteFile(wlFile, []byte(`["203.0.113.7", "198.51.100.0/24"]`), 0o600); err != nil {
+		t.Fatalf("setup: write sidecar: %v", err)
+	}
+
+	h := newWLTestHost(t, func(cfg *Config) {
+		cfg.WhitelistFile = wlFile
+	})
+
+	// wlAtBindTime holds the whitelist snapshot captured inside the listen
+	// factory — at the real TCP bind point, not a separate hook position.
+	var wlAtBindTime []string
+
+	SetListenFunc(h, func(network, addr string) (net.Listener, error) {
+		// This executes at the exact point Start() calls h.listenFunc.
+		// If loadWhitelistFromFile ran before us, the whitelist is already
+		// populated.  If not, we capture an empty list and the assertions below
+		// fail, exposing the ordering regression.
+		wlAtBindTime = h.GetPeerWhitelist()
+		// Delegate to real net.Listen so Start() gets a working listener.
+		return net.Listen(network, addr)
+	})
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	// The factory must have been called (Start must have invoked h.listenFunc).
+	if wlAtBindTime == nil {
+		t.Fatal("listen factory was never called — listenFunc may not be wired in Start()")
+	}
+
+	// Both sidecar entries must be present at bind time, proving
+	// loadWhitelistFromFile completed before the listener opened.
+	has := func(want string) bool {
+		for _, e := range wlAtBindTime {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("203.0.113.7") {
+		t.Errorf("ordering regression: 203.0.113.7 not in whitelist at net.Listen time; got %v", wlAtBindTime)
+	}
+	if !has("198.51.100.0/24") {
+		t.Errorf("ordering regression: 198.51.100.0/24 not in whitelist at net.Listen time; got %v", wlAtBindTime)
+	}
+}
+
 // itoa is a tiny helper so the test file has no strconv import.
 func itoa(n int) string {
 	if n == 0 {
