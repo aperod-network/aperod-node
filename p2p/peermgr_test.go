@@ -190,6 +190,79 @@ func TestPeerMgr_ShortConnection_IncreasesBackoff(t *testing.T) {
 	}
 }
 
+// TestPeerMgr_BanIPPort_BlocksAllPorts verifies that banning via an "IP:port"
+// address (e.g. the peer's ephemeral connection address) blocks every port on
+// that IP — not just the specific port that was in the ban call.  This is the
+// canonical-storage guarantee: Ban("IP:port") stores under the bare IP so
+// that future dials to the peer's listen port are also rejected.
+func TestPeerMgr_BanIPPort_BlocksAllPorts(t *testing.T) {
+	pm := newPeerMgr()
+
+	// Ban via the ephemeral connection port that the node observes.
+	pm.Ban("1.2.3.4:56789", "rogue fork", time.Hour)
+
+	// The specific port used in the ban call must be blocked.
+	if !pm.IsBanned("1.2.3.4:56789") {
+		t.Error("IsBanned must be true for the exact port used in Ban()")
+	}
+	// A different port on the same IP must also be blocked.
+	if !pm.IsBanned("1.2.3.4:9333") {
+		t.Error("IsBanned must be true for any other port on the same IP")
+	}
+	// The bare IP must also be blocked.
+	if !pm.IsBanned("1.2.3.4") {
+		t.Error("IsBanned must be true for the bare IP")
+	}
+	// A completely different IP must not be affected.
+	if pm.IsBanned("2.3.4.5:9333") {
+		t.Error("IsBanned must be false for an unrelated IP")
+	}
+	// Exactly one ban entry must be in the map (canonical storage: no duplicates).
+	if n := pm.BannedCount(); n != 1 {
+		t.Errorf("BannedCount = %d after one Ban(IP:port) call, want 1 — canonical storage must produce a single entry", n)
+	}
+}
+
+// TestPeerMgr_LiftBan_IPPort_LiftsByBareIP verifies that lifting a ban using
+// either the full "IP:port" or the bare "IP" address removes the single
+// canonical ban entry, leaving every port on that host unblocked.
+// This is the key regression guard for the reviewer's concern: one LiftBan
+// call must fully reverse a Ban call regardless of which port form is used.
+func TestPeerMgr_LiftBan_IPPort_LiftsByBareIP(t *testing.T) {
+	for _, liftAddr := range []string{"1.2.3.4:56789", "1.2.3.4"} {
+		t.Run("lift_via="+liftAddr, func(t *testing.T) {
+			pm := newPeerMgr()
+			pm.Ban("1.2.3.4:56789", "rogue fork", time.Hour)
+
+			// Pre-condition: multiple ports must be blocked.
+			if !pm.IsBanned("1.2.3.4:56789") || !pm.IsBanned("1.2.3.4:9333") {
+				t.Fatal("pre-condition: ban must be in effect before lift")
+			}
+
+			// One LiftBan call — regardless of whether we pass the port form
+			// or the bare-IP form — must remove the ban completely.
+			removed := pm.LiftBan(liftAddr)
+			if !removed {
+				t.Errorf("LiftBan(%q) returned false; expected true (ban should have existed)", liftAddr)
+			}
+
+			// All ports must now be unblocked.
+			if pm.IsBanned("1.2.3.4:56789") {
+				t.Error("port :56789 still banned after LiftBan — partial lift regression")
+			}
+			if pm.IsBanned("1.2.3.4:9333") {
+				t.Error("port :9333 still banned after LiftBan — partial lift regression")
+			}
+			if pm.IsBanned("1.2.3.4") {
+				t.Error("bare IP still banned after LiftBan — partial lift regression")
+			}
+			if n := pm.BannedCount(); n != 0 {
+				t.Errorf("BannedCount = %d after LiftBan, want 0", n)
+			}
+		})
+	}
+}
+
 // TestPeerMgr_IPBan verifies that banning a bare IP address blocks any
 // "IP:port" connection from that host, regardless of source port.
 func TestPeerMgr_IPBan(t *testing.T) {
