@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,6 +182,7 @@ func TestScan_WritesTxIdxEntries(t *testing.T) {
 	}
 	tipHashHex := fmt.Sprintf("%x", tipHashRaw[:])
 
+	var wg1 sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
 		DataDir:    dir,
 		TipHeight:  tipHeight,
@@ -188,8 +190,10 @@ func TestScan_WritesTxIdxEntries(t *testing.T) {
 		DB:         db,
 		UTXOs:      utxos,
 		Registry:   reg,
+		SnapshotWg: &wg1,
 		Log:        silentLog(),
 	})
+	wg1.Wait()
 	if scanErr != nil {
 		t.Fatalf("runStartupScan: %v", scanErr)
 	}
@@ -212,6 +216,115 @@ func TestScan_WritesTxIdxEntries(t *testing.T) {
 		if uint64(entry.TxIdx) != loc[1] {
 			t.Errorf("LookupTxIdx(%x…): TxIdx=%d, want %d", txHash[:4], entry.TxIdx, loc[1])
 		}
+	}
+}
+
+// TestScan_MissingBlock_HighWaterStopsBeforeGap verifies that when the
+// startup scan tolerates a missing block (within maxMissing), the
+// txidx_complete_height marker is set to the last height before the gap
+// rather than TipHeight.  Without this guard, the background backfill
+// goroutine would see the marker at TipHeight and skip the missing block,
+// leaving its t/ entry permanently absent.
+func TestScan_MissingBlock_HighWaterStopsBeforeGap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	// Build a 5-block chain but omit block 3 to simulate a missing block.
+	db2, err := store.Open(fmt.Sprintf("%s/chain.db", dir))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db2.Close() })
+
+	makeTx2 := func(seed int) core.Transaction {
+		blind, _ := crypto.NewBlindFactor()
+		commit, _ := crypto.Commit(uint64(1_000_000+seed), blind)
+		return core.Transaction{Version: 1, Outputs: []core.Output{{AmountCommit: commit}}}
+	}
+	putRaw := func(b *core.Block) {
+		raw, _ := json.Marshal(b)
+		h := b.Hash()
+		if perr := db2.PutRawBlock(h, b.Header.Height, raw); perr != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, perr)
+		}
+	}
+
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: time.Now().UnixNano(), ValidatorPub: pub,
+		MerkleRoot: core.MerkleRoot(nil),
+	}}
+	if serr := genesis.Header.Sign(priv); serr != nil {
+		t.Fatalf("Sign genesis: %v", serr)
+	}
+	putRaw(genesis)
+	if err := db2.PutTip(genesis.Hash(), 0); err != nil {
+		t.Fatalf("PutTip genesis: %v", err)
+	}
+
+	const tipH = uint64(5)
+	const gapH = uint64(3)
+	parent := genesis
+	for i := uint64(1); i <= tipH; i++ {
+		txs := []core.Transaction{makeTx2(int(i))}
+		hdr := core.BlockHeader{
+			Height: i, PrevHash: parent.Hash(),
+			MerkleRoot: core.MerkleRoot(txs),
+			Timestamp:  time.Now().UnixNano() + int64(i)*1_000_000,
+			Round: uint32(i), ValidatorPub: pub,
+		}
+		if serr := hdr.Sign(priv); serr != nil {
+			t.Fatalf("Sign h=%d: %v", i, serr)
+		}
+		blk := &core.Block{Header: hdr, Txs: txs}
+		if i != gapH { // omit block 3
+			putRaw(blk)
+		}
+		if i == tipH {
+			if err := db2.PutTip(blk.Hash(), tipH); err != nil {
+				t.Fatalf("PutTip tip: %v", err)
+			}
+		}
+		parent = blk
+	}
+
+	tipHashRaw, _, err := db2.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	_, scanErr := runStartupScan(startupScanParams{
+		DataDir:          dir,
+		TipHeight:        tipH,
+		TipHashHex:       fmt.Sprintf("%x", tipHashRaw[:]),
+		DB:               db2,
+		UTXOs:            core.NewUTXOSet(),
+		Registry:         core.NewValidatorRegistry(),
+		MaxMissingBlocks: 10, // tolerate the gap so scan completes
+		SnapshotWg:       &wg,
+		Log:              silentLog(),
+	})
+	wg.Wait() // ensure snapshot goroutine finishes before LevelDB is closed
+	if scanErr != nil {
+		t.Fatalf("runStartupScan: %v", scanErr)
+	}
+
+	// Marker must stop at gapH-1 (= 2), not at TipHeight (= 5).
+	marker, found, loadErr := db2.LoadTxIdxCompleteHeight()
+	if loadErr != nil {
+		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
+	}
+	if !found {
+		t.Fatal("txidx_complete_height absent — marker should have been set to gapH-1")
+	}
+	if marker >= gapH {
+		t.Errorf("txidx_complete_height = %d, want < %d (must stop before the gap at height %d)",
+			marker, gapH, gapH)
 	}
 }
 
@@ -240,6 +353,7 @@ func TestScan_CheckpointResume_MarkerNotAdvancedWithoutPriorCoverage(t *testing.
 		t.Fatalf("GetTip: %v", err)
 	}
 
+	var wg2 sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
 		DataDir:        dir,
 		TipHeight:      tipHeight,
@@ -248,8 +362,10 @@ func TestScan_CheckpointResume_MarkerNotAdvancedWithoutPriorCoverage(t *testing.
 		UTXOs:          core.NewUTXOSet(),
 		Registry:       core.NewValidatorRegistry(),
 		ResumeScanFrom: 3, // scan covers 4..6 only
+		SnapshotWg:     &wg2,
 		Log:            silentLog(),
 	})
+	wg2.Wait()
 	if scanErr != nil {
 		t.Fatalf("runStartupScan: %v", scanErr)
 	}
@@ -291,6 +407,7 @@ func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
+	var wg3 sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
 		DataDir:        dir,
 		TipHeight:      tipHeight,
@@ -299,8 +416,10 @@ func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
 		UTXOs:          core.NewUTXOSet(),
 		Registry:       core.NewValidatorRegistry(),
 		ResumeScanFrom: 3, // scan covers 4..6; marker at 3 makes prefix contiguous
+		SnapshotWg:     &wg3,
 		Log:            silentLog(),
 	})
+	wg3.Wait()
 	if scanErr != nil {
 		t.Fatalf("runStartupScan: %v", scanErr)
 	}
@@ -466,6 +585,7 @@ func TestScan_PersiststxidxCompleteHeight(t *testing.T) {
 		t.Fatalf("GetTip: %v", err)
 	}
 
+	var wg4 sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
 		DataDir:    dir,
 		TipHeight:  tipHeight,
@@ -473,8 +593,10 @@ func TestScan_PersiststxidxCompleteHeight(t *testing.T) {
 		DB:         db,
 		UTXOs:      core.NewUTXOSet(),
 		Registry:   core.NewValidatorRegistry(),
+		SnapshotWg: &wg4,
 		Log:        silentLog(),
 	})
+	wg4.Wait()
 	if scanErr != nil {
 		t.Fatalf("runStartupScan: %v", scanErr)
 	}
