@@ -525,6 +525,36 @@ func (d *DB) GetRawBlockByHeight(height uint64) ([]byte, error) {
         return d.GetRawBlock(hash)
 }
 
+// StoreTxIdxCompleteHeight records that all blocks from height 1 up to and
+// including h have had their per-transaction location written to the t/ index.
+// The value is updated incrementally by the startup scan (scan.go) and the
+// background backfill goroutine (main.go) so that a subsequent restart
+// resumes from where the previous run stopped rather than reprocessing the
+// full history.
+func (d *DB) StoreTxIdxCompleteHeight(h uint64) error {
+        buf := make([]byte, 8)
+        binary.LittleEndian.PutUint64(buf, h)
+        return d.PutMeta("txidx_complete_height", buf)
+}
+
+// LoadTxIdxCompleteHeight returns the highest block height through which the
+// t/ tx-hash index is guaranteed to be fully populated.  Returns (0, false,
+// nil) when no backfill has run yet (first boot or a pre-feature DB); the
+// caller should treat 0 as "nothing indexed yet".
+func (d *DB) LoadTxIdxCompleteHeight() (h uint64, found bool, err error) {
+        v, err := d.GetMeta("txidx_complete_height")
+        if err != nil {
+                return 0, false, err
+        }
+        if v == nil {
+                return 0, false, nil
+        }
+        if len(v) != 8 {
+                return 0, false, fmt.Errorf("store: txidx_complete_height metadata corrupted (%d bytes, want 8)", len(v))
+        }
+        return binary.LittleEndian.Uint64(v), true, nil
+}
+
 // StoreSnapshotSaveDuration persists the wall-clock duration (in milliseconds)
 // of the most recent successful shutdown snapshot save.  The value survives a
 // process restart so checkStartupSnapshotTiming can warn on the next boot when
