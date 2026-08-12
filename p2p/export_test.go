@@ -5,6 +5,7 @@
 package p2p
 
 import (
+	"context"
 	"net"
 	"time"
 )
@@ -127,5 +128,23 @@ func SetListenFunc(h *Host, fn func(network, addr string) (net.Listener, error))
 		h.listenFunc = net.Listen
 	} else {
 		h.listenFunc = fn
+	}
+}
+
+// SetDialFunc replaces the outbound TCP dial function used by dialPeer.
+// The replacement receives a context that BanPeer may cancel while the dial is
+// in progress; the function must honour context cancellation and return
+// context.Canceled (or context.DeadlineExceeded) without establishing a
+// connection.  This lets deterministic concurrency tests inject a blocking
+// dial that the test can release or abort on demand.
+//
+// Pass nil to restore the production default
+// ((&net.Dialer{Timeout: DialTimeout}).DialContext).
+func SetDialFunc(h *Host, fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	if fn == nil {
+		defaultDialer := &net.Dialer{Timeout: DialTimeout}
+		h.dialContextFunc = defaultDialer.DialContext
+	} else {
+		h.dialContextFunc = fn
 	}
 }
