@@ -292,6 +292,28 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
+	// ── txidx_complete_height continuity check ────────────────────────────
+	// Read the existing marker before the scan begins so we can decide
+	// after the scan whether the combined coverage (previousScan + thisScan)
+	// is contiguous from block 1.  If it is not (e.g. this is a suffix-only
+	// checkpoint-resume run and the pre-checkpoint prefix was not previously
+	// indexed), we must NOT advance the marker to TipHeight — doing so would
+	// make the background backfill goroutine skip the unindexed prefix.
+	existingTxIdxComplete, _, _ := p.DB.LoadTxIdxCompleteHeight()
+
+	// txIdxHighWater is the highest block height for which we have confirmed
+	// that all blocks from the coverage base through that height have their
+	// t/ entries successfully written.  It only advances when the coverage is
+	// contiguous: every block from the previous marker through the current
+	// height must have been processed without a fetch error or PutTxIdx failure.
+	//
+	// txIdxContiguous starts true when this scan can form a contiguous prefix
+	// from block 1 (either scanFrom==1, or the existing marker covers up to
+	// scanFrom-1).  It becomes permanently false the moment a missing block or
+	// a PutTxIdx write error is encountered; txIdxHighWater stops advancing.
+	txIdxHighWater := existingTxIdxComplete
+	txIdxContiguous := (scanFrom <= 1 || existingTxIdxComplete+1 >= scanFrom)
+
 	// ── Main scan loop ─────────────────────────────────────────────────────
 	var msScanStart runtime.MemStats
 	runtime.ReadMemStats(&msScanStart)
@@ -327,6 +349,10 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				"missing_so_far", missingBlockCount,
 				"max_allowed", maxMissing,
 			)
+			// A missing block breaks the contiguous t/ coverage chain.
+			// Stop advancing the high-water mark so the marker is never
+			// written past the last fully-indexed height.
+			txIdxContiguous = false
 			if missingBlockCount > maxMissing {
 				return startupScanResult{}, fmt.Errorf(
 					"startup scan: too many missing blocks (%d > %d allowed); "+
@@ -357,24 +383,28 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 
 		// Goal 2: rebuild the active UTXO set.
-		//
-		// When the key-image index pre-loaded every spent key image
-		// (KiFromIndex=true), ApplyBlock's pass-1 double-spend check would
-		// reject every spending block: outputs would be lost, spent ring
-		// members would stay wrongly active, and the spentPubKeys ring-decoy
-		// pool (Phase 2 privacy) would never be rebuilt.  Replay the block
-		// via the pass-2-only path instead — the blocks are canonical and
-		// were fully validated when first accepted.
-		if p.KiFromIndex {
-			p.UTXOs.ReplayBlockKnownSpends(&b)
-		} else if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
+		if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
 			p.Log.Warn("startup scan: ApplyBlock failed (continuing)",
 				"height", h, "err", applyErr)
 		}
 
-		// UTXO index backfill.
-		for _, tx := range b.Txs {
+		// UTXO index backfill + tx-hash index backfill.
+		// PutTxIdx is written alongside PutUTXO.  Errors from PutTxIdx
+		// are tracked: a write failure stops the high-water mark from
+		// advancing so the marker never claims coverage past an unwritten
+		// t/ entry.  PutUTXO errors are non-fatal as before.
+		txIdxBlockOK := txIdxContiguous // false already when prefix has a gap
+		for txPos, tx := range b.Txs {
 			txHash := tx.Hash()
+			if putErr := p.DB.PutTxIdx(txHash, h, txPos); putErr != nil {
+				// Log once per block (txIdxContiguous guards repeated logs).
+				if txIdxContiguous {
+					p.Log.Warn("startup scan: PutTxIdx failed — t/ coverage stops here",
+						"height", h, "err", putErr)
+					txIdxContiguous = false
+				}
+				txIdxBlockOK = false
+			}
 			for i, out := range tx.Outputs {
 				su := &store.StoredUTXO{
 					TxHash:       txHash,
@@ -395,6 +425,11 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 					}
 				}
 			}
+		}
+		// Advance the high-water mark only when every t/ entry for this
+		// block was successfully written and coverage is contiguous.
+		if txIdxBlockOK {
+			txIdxHighWater = h
 		}
 
 		// Goal 1 (fallback): mark spent key images and backfill the DB index.
@@ -469,6 +504,29 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				}
 			}(cpSnap, cpActiveCount)
 		}
+	}
+
+	// Save the verified contiguous t/ coverage extent.
+	// txIdxHighWater is the last height for which all blocks in the range
+	// [existingTxIdxComplete+1 .. txIdxHighWater] have confirmed t/ entries.
+	// Only write the marker when we actually made forward progress so we do
+	// not corrupt a valid existing marker on a no-op scan.
+	if txIdxHighWater > existingTxIdxComplete {
+		if markErr := p.DB.StoreTxIdxCompleteHeight(txIdxHighWater); markErr != nil {
+			p.Log.Warn("failed to persist txidx_complete_height after scan",
+				"err", markErr)
+		} else {
+			p.Log.Info("txidx_complete_height updated",
+				"high_water", txIdxHighWater,
+				"tip_height", p.TipHeight,
+				"contiguous", txIdxContiguous,
+			)
+		}
+	} else if txIdxHighWater < existingTxIdxComplete {
+		p.Log.Warn("txidx_complete_height NOT updated: high-water below existing marker",
+			"high_water", txIdxHighWater,
+			"existing", existingTxIdxComplete,
+		)
 	}
 
 	// Release UTXO-scan heap to the OS immediately so steady-state operation
