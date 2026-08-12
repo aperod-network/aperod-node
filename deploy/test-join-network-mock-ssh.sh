@@ -249,8 +249,10 @@ build_ssh_stub() {
 shift   # drop 'root@IP'
 CMD=\"\$*\"
 # Step 5/7: bootnode injection heredoc — the remote command is just 'bash'.
+# Real ssh propagates the remote exit status, so the stub must too.
 if [[ \"\${CMD}\" == \"bash\" ]]; then
   bash   # execute the heredoc from stdin locally
+  exit \$?
 elif echo \"\${CMD}\" | grep -q 'network/stats'; then
   echo '{\"height\":${height},\"peer_count\":${peer_count},\"syncing\":false}'
 elif echo \"\${CMD}\" | grep -q 'systemctl show'; then
