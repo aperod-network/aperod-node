@@ -2,6 +2,8 @@ package main
 
 import (
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,6 +132,84 @@ func snapshotPrevPath(primaryPath string) string {
 	return strings.TrimSuffix(primaryPath, ".json.gz") + "-prev.json.gz"
 }
 
+// snapshotChecksumPath returns the sidecar file path holding the SHA-256
+// checksum (hex) of the snapshot file at path.  Task #964.
+func snapshotChecksumPath(path string) string {
+	return path + ".sha256"
+}
+
+// writeSnapshotChecksum atomically writes the hex-encoded SHA-256 digest of a
+// snapshot file to its sidecar (temp file + rename, same pattern as the
+// snapshot itself so a crash can never leave a half-written sidecar).
+func writeSnapshotChecksum(path string, digest []byte) error {
+	chkPath := snapshotChecksumPath(path)
+	tmp := chkPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(digest)+"\n"), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, chkPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// copySnapshotChecksum keeps a snapshot's checksum sidecar in sync when the
+// snapshot file itself is copied (primary → prev-backup promotion).
+//
+// When the source has no sidecar (snapshot written by a pre-checksum binary),
+// any stale sidecar at the destination is REMOVED — otherwise a leftover
+// sidecar from an older promotion would make the fresh copy fail verification
+// even though it is perfectly valid.
+func copySnapshotChecksum(src, dst string) {
+	srcChk := snapshotChecksumPath(src)
+	dstChk := snapshotChecksumPath(dst)
+	if _, err := os.Stat(srcChk); err != nil {
+		_ = os.Remove(dstChk)
+		return
+	}
+	_ = copyFile(srcChk, dstChk) // best-effort: a missing sidecar only skips verification
+}
+
+// verifySnapshotChecksum compares the SHA-256 of the snapshot file at path
+// against its sidecar.  Returns nil when the sidecar is absent or malformed
+// (snapshots written by pre-checksum binaries must keep loading — the schema
+// version / height / hash checks still apply), and a descriptive error when
+// the sidecar holds a valid digest that does not match the file content —
+// the signature of a truncated or partially-written snapshot.  Task #964.
+func verifySnapshotChecksum(path string) error {
+	raw, err := os.ReadFile(snapshotChecksumPath(path))
+	if err != nil {
+		return nil // no sidecar — backward compatible, verification skipped
+	}
+	want := strings.TrimSpace(string(raw))
+	if len(want) != sha256.Size*2 {
+		return nil // malformed sidecar — treat as absent rather than blocking startup
+	}
+	if _, err := hex.DecodeString(want); err != nil {
+		return nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("hash snapshot for checksum verification: %w", err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != want {
+		return fmt.Errorf(
+			"snapshot checksum mismatch (path=%s, want=%s, got=%s): "+
+				"file is corrupt, truncated mid-write, or was replaced on disk — "+
+				"falling back instead of serving wrong chain state",
+			path, want, got)
+	}
+	return nil
+}
+
 // copyFile copies src to dst atomically via a temporary file + rename.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -180,6 +260,7 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 		if err := copyFile(path, snapshotPrevPath(path)); err != nil {
 			return fmt.Errorf("write same-height prev backup: %w", err)
 		}
+		copySnapshotChecksum(path, snapshotPrevPath(path))
 	}
 
 	// Best-effort: copy any existing primary at a DIFFERENT height to its own
@@ -203,7 +284,9 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 			if full == path {
 				continue // same height already handled by the guard above
 			}
-			_ = copyFile(full, snapshotPrevPath(full))
+			if copyErr := copyFile(full, snapshotPrevPath(full)); copyErr == nil {
+				copySnapshotChecksum(full, snapshotPrevPath(full))
+			}
 			break // only one other primary should exist at a time
 		}
 	}
@@ -212,7 +295,10 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	if err != nil {
 		return fmt.Errorf("create snapshot tmp: %w", err)
 	}
-	gz := gzip.NewWriter(f)
+	// Hash the exact bytes written to disk (compressed stream) so the sidecar
+	// checksum can later detect truncation or partial writes.  Task #964.
+	hasher := sha256.New()
+	gz := gzip.NewWriter(io.MultiWriter(f, hasher))
 	enc := json.NewEncoder(gz)
 	encErr := enc.Encode(snap)
 	gzCloseErr := gz.Close()
@@ -233,6 +319,15 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("rename snapshot: %w", err)
+	}
+
+	// Write the SHA-256 sidecar AFTER the primary is in place.  A sidecar
+	// write failure must not fail the save (a missing sidecar only skips
+	// verification), but any STALE sidecar from a previous save at this
+	// height must be removed — otherwise the fresh snapshot would fail
+	// verification against the old digest on the next startup.
+	if chkErr := writeSnapshotChecksum(path, hasher.Sum(nil)); chkErr != nil {
+		_ = os.Remove(snapshotChecksumPath(path))
 	}
 	return nil
 }
@@ -257,6 +352,15 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 			"snapshot file is truncated or empty (size=%d bytes, path=%s): "+
 				"likely interrupted mid-write — node will fall back to scan or prev backup",
 			info.Size(), path)
+	}
+	// Verify the SHA-256 sidecar BEFORE deserialising (task #964).  A mismatch
+	// is returned as a descriptive (non-NotExist) error so every caller —
+	// primary, prev-backup, and checkpoint loaders — treats the file as
+	// corrupt and falls back rather than silently serving wrong chain state.
+	// Snapshots without a sidecar (pre-checksum binaries) skip verification.
+	if chkErr := verifySnapshotChecksum(path); chkErr != nil {
+		f.Close()
+		return nil, nil, chkErr
 	}
 	gzr, err = gzip.NewReader(f)
 	if err != nil {
@@ -704,11 +808,11 @@ func deleteOldSnapshots(dataDir string, keep uint64) {
 		name := e.Name()
 		// Remove stale v2 files.
 		if strings.HasPrefix(name, prefix) {
-			if name == keepPrimary {
-				continue // always keep the current primary
+			if name == keepPrimary || name == keepPrimary+".sha256" {
+				continue // always keep the current primary and its checksum sidecar
 			}
-			if bestPrevName != "" && name == bestPrevName {
-				continue // keep the most recent prev backup
+			if bestPrevName != "" && (name == bestPrevName || name == bestPrevName+".sha256") {
+				continue // keep the most recent prev backup and its checksum sidecar
 			}
 			if strings.HasSuffix(name, ".tmp") {
 				continue // skip in-progress temp files written by concurrent goroutines
