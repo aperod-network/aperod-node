@@ -1703,6 +1703,15 @@ func run() error {
                 apiSrv.SetValidatorKey(myKey)
                 apiSrv.SetTxTotal(initialTxTotal)
                 apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
+                // Admin mints are built at block-production time so every mint gets a
+                // unique one-time pub (spend_pub + height*G) → unique key image.
+                apiSrv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+                        h, height, err := engine.ScheduleAdminMint(addr, amountNAPR, timeout)
+                        if err != nil {
+                                return "", 0, err
+                        }
+                        return fmt.Sprintf("%x", h[:]), height, nil
+                })
                 apiSrv.SetStakingPoolFn(func() (uint64, uint64, string) {
                         return engine.StakingPoolRemaining(), engine.StakingPoolInit(), engine.RewardMode()
                 })

@@ -52,6 +52,13 @@ type Server struct {
         // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
         tsRejectedCounter func() int64
 
+        // mintScheduler schedules an admin mint for inclusion in the next produced
+        // block and blocks until it is committed (returning the tx hash hex and
+        // inclusion height) or the timeout expires.  Wired from
+        // consensus.Engine.ScheduleAdminMint in cmd/node after engine start.
+        // nil = this node is not an active validator; admin mints are refused.
+        mintScheduler func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error)
+
         banListFn func() []BanEntry                         // optional; wired to p2p.Host.ListBans by cmd/node
         banLiftFn func(string) bool                         // optional; wired to p2p.Host.LiftBan by cmd/node
         banAddFn  func(addr, reason string, d time.Duration) // optional; wired to p2p.Host.Ban by cmd/node
@@ -422,6 +429,14 @@ func (s *Server) SetPeerWhitelist(entries []string) {
 // SetTimestampRejectedCounter wires a function returning the live count of blocks
 // rejected by the timejacking guard.  Optional — reports 0 when unset.
 func (s *Server) SetTimestampRejectedCounter(f func() int64) { s.tsRejectedCounter = f }
+
+// SetMintScheduler wires the consensus engine's admin-mint scheduler.
+// Call immediately after engine construction, before Start().  When unwired,
+// POST /api/v1/admin/mint returns 503 — mints must never fall back to the
+// legacy height=0 mempool path (shared key image per address).
+func (s *Server) SetMintScheduler(f func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error)) {
+        s.mintScheduler = f
+}
 
 // SetWhitelistGetFunc wires a function returning the current peer whitelist entries.
 // Optional — GET /api/v1/network/whitelist returns 503 when not wired.

@@ -530,6 +530,11 @@ func restLocalPostJSON(t *testing.T, srv *api.Server, path string, body []byte) 
 }
 func TestREST_AdminMint_FractionalAmount(t *testing.T) {
         srv, _ := newTestServer(t)
+        // Stub the engine mint scheduler (in production it is wired to
+        // consensus.Engine.ScheduleAdminMint by cmd/node).
+        srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+                return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 42, nil
+        })
         wk, _ := crypto.GenerateWalletKeys()
         addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 

@@ -143,6 +143,37 @@ type Engine struct {
         newBlockCh chan *core.Block  // incoming blocks from P2P
         newVoteCh  chan FinalizeMsg  // incoming finalization votes
         producedCh chan *core.Block  // blocks produced by this node (for broadcast)
+
+        // ── Admin mint scheduling ────────────────────────────────────────────────
+        // Admin mints must be built at block-production time so the one-time pub
+        // is spend_pub + height*G with the REAL inclusion height.  The legacy path
+        // (BuildMintTx with height=0 via the mempool) gave every mint to the same
+        // address the same one-time pub — and therefore the same key image — so a
+        // single spent/phantom key-image entry permanently blocked all future
+        // mints to that address.
+        mintMu       sync.Mutex
+        mintQueue    []*adminMintReq // waiting to be included in a produced block
+        mintInFlight []*adminMintReq // included in a produced-but-not-yet-committed block
+}
+
+// adminMintOutcome is delivered on adminMintReq.result once the mint's block
+// is committed to the chain (or the build failed).
+type adminMintOutcome struct {
+        txHash crypto.Hash32
+        height uint64
+        err    error
+}
+
+// adminMintReq is one queued admin mint.  result is buffered (capacity 1) so
+// the engine never blocks on a caller that has timed out and gone away.
+type adminMintReq struct {
+        addr      string
+        amount    uint64
+        result    chan adminMintOutcome
+        cancelled bool          // set by ScheduleAdminMint on timeout; guarded by mintMu
+        done      bool          // set when an outcome has been delivered; guarded by mintMu
+        txHash    crypto.Hash32 // set once included in a produced block
+        height    uint64        // ditto
 }
 
 // defaultTailRewardNAPR is the per-block mint once the staking pool is exhausted.
@@ -485,6 +516,9 @@ func (e *Engine) tick() error {
         // incoming blocks — without this, txs would be re-included every block).
         e.pool.RemoveBlock(block)
 
+        // Deliver results for admin mints included in this committed block.
+        e.resolveAdminMintsCommitted(block.Header.Height)
+
         // Persist block to durable storage (if callback configured)
         if e.cfg.OnBlockProduced != nil {
                 e.cfg.OnBlockProduced(block)
@@ -709,6 +743,166 @@ func validateCoinbasePolicy(block *core.Block) error {
         return nil
 }
 
+// ─── Admin mint scheduling ────────────────────────────────────────────────────
+
+// ScheduleAdminMint queues an admin mint and blocks until the mint is included
+// in a committed block (returning its tx hash and inclusion height) or the
+// timeout expires.
+//
+// The mint transaction is built inside produceBlock with the block's own
+// height, so its one-time pub is spend_pub + height*G — cryptographically
+// unique per mint.  This replaces the legacy height=0 mempool path, where all
+// admin mints to one address shared a single key image and one spent/phantom
+// key-image index entry blocked every future mint to that address.
+//
+// On timeout the request is cancelled: if it is still queued it will never be
+// included; if it was already included in an in-flight block, the commit is
+// logged loudly (see resolveAdminMintsCommitted) so operators can record the
+// mint manually.
+func (e *Engine) ScheduleAdminMint(addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
+        if amountNAPR == 0 {
+                return crypto.Hash32{}, 0, fmt.Errorf("mint amount must be > 0")
+        }
+        if e.cfg.RewardAddress != "" && addr == e.cfg.RewardAddress {
+                // The per-block coinbase reward already mints to RewardAddress at
+                // every height — an admin mint in the same block would produce a
+                // second output with the identical one-time pub (same key image),
+                // leaving only one of the two spendable.
+                return crypto.Hash32{}, 0, fmt.Errorf(
+                        "cannot admin-mint to the validator reward address %s: the per-block "+
+                                "coinbase reward would collide with the same one-time pub", addr)
+        }
+        req := &adminMintReq{
+                addr:   addr,
+                amount: amountNAPR,
+                result: make(chan adminMintOutcome, 1),
+        }
+        e.mintMu.Lock()
+        e.mintQueue = append(e.mintQueue, req)
+        e.mintMu.Unlock()
+
+        timer := time.NewTimer(timeout)
+        defer timer.Stop()
+        select {
+        case out := <-req.result:
+                return out.txHash, out.height, out.err
+        case <-timer.C:
+        }
+
+        // Timeout fired.  Take the mutex to reach a single authoritative terminal
+        // state: either the engine already delivered an outcome (req.done — the
+        // commit raced the timer; consume it and report success) or we cancel the
+        // request so it is never included.
+        e.mintMu.Lock()
+        if req.done {
+                e.mintMu.Unlock()
+                out := <-req.result // buffered — outcome already delivered
+                return out.txHash, out.height, out.err
+        }
+        req.cancelled = true
+        for i, q := range e.mintQueue {
+                if q == req {
+                        e.mintQueue = append(e.mintQueue[:i], e.mintQueue[i+1:]...)
+                        break
+                }
+        }
+        e.mintMu.Unlock()
+        return crypto.Hash32{}, 0, fmt.Errorf(
+                "admin mint not committed within %s (no block produced — validator idle, "+
+                        "syncing, or not our slot); the mint was NOT recorded on-chain", timeout)
+}
+
+// takeQueuedAdminMints pops queued admin mints and builds their transactions
+// at the given block height.  Called from produceBlock (engine goroutine only).
+//
+// At most one mint per address is included per block: two mints to the same
+// address at the same height would share one one-time pub / key image.  At
+// most maxTake mints are included in total, so the block never exceeds
+// maxCoinbasesPerBlock once the reward coinbase and any privileged mempool
+// coinbases are counted (a violation would fail the engine's own
+// validateCoinbasePolicy check and stall production forever).  The rest stay
+// queued for the next block.
+//
+// Any entries left in mintInFlight belong to a previously produced block that
+// failed to commit (tick error path) — they are re-queued first so they are
+// rebuilt at the new height.
+func (e *Engine) takeQueuedAdminMints(height uint64, maxTake int) []core.Transaction {
+        e.mintMu.Lock()
+        defer e.mintMu.Unlock()
+
+        if len(e.mintInFlight) > 0 {
+                e.mintQueue = append(e.mintInFlight, e.mintQueue...)
+                e.mintInFlight = nil
+        }
+        if len(e.mintQueue) == 0 || maxTake <= 0 {
+                return nil
+        }
+
+        var txs []core.Transaction
+        seen := make(map[string]bool)
+        remaining := e.mintQueue[:0]
+        for _, req := range e.mintQueue {
+                if req.cancelled {
+                        continue // caller gave up while still queued — drop silently
+                }
+                if len(txs) >= maxTake || seen[req.addr] {
+                        remaining = append(remaining, req) // next block
+                        continue
+                }
+                tx, err := core.BuildMintTx(crypto.Address(req.addr), req.amount, height)
+                if err != nil {
+                        req.done = true
+                        req.result <- adminMintOutcome{err: fmt.Errorf("build mint tx: %w", err)}
+                        continue
+                }
+                seen[req.addr] = true
+                req.txHash = tx.Hash()
+                req.height = height
+                e.mintInFlight = append(e.mintInFlight, req)
+                txs = append(txs, *tx)
+        }
+        e.mintQueue = remaining
+        return txs
+}
+
+// resolveAdminMintsCommitted delivers success outcomes for all in-flight admin
+// mints once their block has been committed to the chain.  Called from tick()
+// after chain.AddBlock succeeds.
+//
+// The cancelled/done transition happens under mintMu so it cannot race the
+// caller's timeout path in ScheduleAdminMint: exactly one of the two sides
+// reaches the terminal state first, and the other observes it.
+func (e *Engine) resolveAdminMintsCommitted(height uint64) {
+        e.mintMu.Lock()
+        inflight := e.mintInFlight
+        e.mintInFlight = nil
+        var orphans []*adminMintReq
+        for _, req := range inflight {
+                if req.cancelled {
+                        orphans = append(orphans, req)
+                        continue
+                }
+                req.done = true
+                // result is buffered (cap 1) — never blocks while holding mintMu.
+                req.result <- adminMintOutcome{txHash: req.txHash, height: req.height}
+        }
+        e.mintMu.Unlock()
+
+        for _, req := range orphans {
+                // The caller timed out but the block committed anyway — the mint
+                // IS on-chain.  Log loudly so operators can record it manually
+                // (the API server that requested it never saw the tx hash).
+                e.log.Error("admin mint committed AFTER caller timeout — record it manually",
+                        "address", req.addr,
+                        "amount_napro", req.amount,
+                        "tx_hash", fmt.Sprintf("%x", req.txHash[:]),
+                        "height", req.height)
+        }
+        if len(inflight) > 0 {
+                e.log.Info("admin mint(s) committed", "count", len(inflight), "height", height)
+        }
+}
+
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
         raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
@@ -766,6 +960,29 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 
         _, tipThisBlock := blockFeeStats(txs, currentBaseFee)
         tips += tipThisBlock
+
+        // Prepend queued admin mints, built at THIS block's height so every mint
+        // gets a unique one-time pub (spend_pub + height*G) and therefore a
+        // unique key image.  Placed before the reward-prepend below, so the final
+        // order is [reward, adminMints..., pool txs...] — all coinbases remain a
+        // block prefix as required by validateCoinbasePolicy.
+        //
+        // Capacity: never exceed maxCoinbasesPerBlock counting the reward coinbase
+        // (added below) and any privileged coinbases already selected from the
+        // pool — an over-limit block would fail our own validateCoinbasePolicy and
+        // stall production forever while the mints re-queue each slot.
+        mintCapacity := maxCoinbasesPerBlock
+        if e.cfg.RewardAddress != "" {
+                mintCapacity--
+        }
+        for i := range txs {
+                if txs[i].IsCoinbase() {
+                        mintCapacity--
+                }
+        }
+        if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
+                txs = append(adminMints, txs...)
+        }
 
         // Prepend coinbase block reward transaction when reward_address is configured.
         if e.cfg.RewardAddress != "" {

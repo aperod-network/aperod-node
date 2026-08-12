@@ -2103,7 +2103,14 @@ type mintResponse struct {
         AmountAPR float64 `json:"amount_apr"`
         Address   string  `json:"address"`
         BlindHex  string  `json:"blind_hex"` // hex-encoded blind factor used for the commitment
+        Height    uint64  `json:"height"`    // block height the mint was committed at
 }
+
+// adminMintWaitTimeout bounds how long restAdminMint waits for the scheduled
+// mint to be committed.  Must stay comfortably below the API server's own
+// 30 s HTTP timeout for /api/v1/admin/mint, and comfortably above the block
+// time (3 s) so a mint queued right after a tick still lands in the next slot.
+const adminMintWaitTimeout = 25 * time.Second
 
 // ─── GET /api/v1/network/identity ────────────────────────────────────────────
 
@@ -2171,28 +2178,22 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        // height=0 is intentional for one-off admin mints: their future block
-        // inclusion height isn't known at submission time (they sit in the
-        // mempool like any other tx). This reproduces the legacy transparent
-        // behavior (mint_pub == spend_pub) and is only unsafe if the exact same
-        // address+amount is minted more than once — see BuildMintTx doc comment.
-        tx, err := core.BuildMintTx(crypto.Address(req.Address), amountNAPR, 0)
+        // Admin mints are scheduled into the next produced block so BuildMintTx
+        // runs with the REAL inclusion height (mint_pub = spend_pub + height*G).
+        // The legacy height=0 mempool path gave every mint to one address the
+        // same one-time pub — and the same key image — so one spent/phantom
+        // key-image entry permanently blocked all future mints to that address.
+        if s.mintScheduler == nil {
+                writeJSONError(w, http.StatusServiceUnavailable,
+                        "admin mint unavailable: this node is not an active validator (mint scheduler not wired)")
+                return
+        }
+        txHashHex, mintHeight, err := s.mintScheduler(req.Address, amountNAPR, adminMintWaitTimeout)
         if err != nil {
-                s.log.Error("admin mint: build tx failed", "err", err)
-                writeJSONError(w, http.StatusInternalServerError, "build mint tx: "+err.Error())
+                s.log.Error("admin mint: schedule failed", "err", err)
+                writeJSONError(w, http.StatusServiceUnavailable, "schedule mint: "+err.Error())
                 return
         }
-
-        // Use AddPrivileged so the coinbase bypasses the external-coinbase rejection
-        // guard in Add().  This endpoint is only reachable from localhost (127.0.0.1:8545).
-        if err := s.mempool.AddPrivileged(*tx); err != nil {
-                s.log.Error("admin mint: mempool add failed", "err", err)
-                writeJSONError(w, http.StatusInternalServerError, "mempool: "+err.Error())
-                return
-        }
-
-        hash := tx.Hash()
-        txHashHex := fmt.Sprintf("%x", hash[:])
 
         // Compute the deterministic blind used in the commitment so the caller
         // can store it and always recover the spend path without relying on the
@@ -2209,13 +2210,16 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
         }
         blindHex := fmt.Sprintf("%x", mintBlind[:])
 
-        s.log.Info("admin mint submitted", "address", req.Address, "amount_apr", req.AmountAPR, "tx_hash", txHashHex)
+        s.log.Info("admin mint committed",
+                "address", req.Address, "amount_apr", req.AmountAPR,
+                "tx_hash", txHashHex, "height", mintHeight)
 
         writeJSON(w, http.StatusCreated, mintResponse{
                 TxHash:    txHashHex,
                 AmountAPR: req.AmountAPR,
                 Address:   req.Address,
                 BlindHex:  blindHex,
+                Height:    mintHeight,
         })
 }
 
