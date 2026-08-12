@@ -142,6 +142,15 @@ func SetPostConnectHook(h *Host, fn func()) {
 	h.postConnectHook = fn
 }
 
+// HostPongGetHeadersTotal returns the number of times the MsgPong handler has
+// passed the cooldown gate and actually called requestHeaders.  It counts only
+// Pong-triggered calls; sync-ticker and stall-detector calls are excluded.
+// Exposed for the pong-cooldown unit test; always zero in production runs that
+// do not call this function.
+func HostPongGetHeadersTotal(h *Host) int64 {
+	return h.pongGetHeadersTotal.Load()
+}
+
 // SetDialFunc replaces the outbound TCP dial function used by dialPeer.
 // The replacement receives a context that BanPeer may cancel while the dial is
 // in progress; the function must honour context cancellation and return
