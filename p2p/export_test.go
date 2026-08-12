@@ -138,13 +138,17 @@ func SetListenFunc(h *Host, fn func(network, addr string) (net.Listener, error))
 // connection.  This lets deterministic concurrency tests inject a blocking
 // dial that the test can release or abort on demand.
 //
-// Pass nil to restore the production default
-// ((&net.Dialer{Timeout: DialTimeout}).DialContext).
+// The write is guarded by h.dialFnMu so it is safe to call concurrently with
+// in-flight dials (which hold h.dialFnMu for read while invoking the function).
+//
+// Pass nil to restore the production default ((&net.Dialer{}).DialContext).
 func SetDialFunc(h *Host, fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	h.dialFnMu.Lock()
 	if fn == nil {
-		defaultDialer := &net.Dialer{Timeout: DialTimeout}
+		defaultDialer := &net.Dialer{}
 		h.dialContextFunc = defaultDialer.DialContext
 	} else {
 		h.dialContextFunc = fn
 	}
+	h.dialFnMu.Unlock()
 }
