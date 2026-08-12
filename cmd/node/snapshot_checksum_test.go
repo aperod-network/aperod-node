@@ -319,6 +319,51 @@ func TestChecksum_PromotionWithoutSourceSidecarDropsStaleDst(t *testing.T) {
 	}
 }
 
+// TestChecksum_PromotionUnreadableSourceSidecarAbortsSave — a source sidecar
+// that exists but cannot be READ during a same-height promotion must abort the
+// save (fail-closed), leaving the original primary and its sidecar intact.
+// Silently promoting would convert a checksum-protected snapshot into an
+// unchecksummed prev backup that later loads with verification skipped.
+func TestChecksum_PromotionUnreadableSourceSidecarAbortsSave(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 000 does not block reads")
+	}
+	dir := t.TempDir()
+	orig := makeSnap(650)
+	orig.TxTotal = 111
+	if err := saveStartupSnapshot(dir, orig); err != nil {
+		t.Fatalf("save original: %v", err)
+	}
+	primary := snapshotPath(dir, 650)
+	chk := snapshotChecksumPath(primary)
+	if err := os.Chmod(chk, 0o000); err != nil {
+		t.Fatalf("chmod sidecar: %v", err)
+	}
+	defer os.Chmod(chk, 0o644)
+
+	updated := makeSnap(650)
+	updated.TxTotal = 222
+	err := saveStartupSnapshot(dir, updated)
+	if err == nil {
+		t.Fatal("same-height save must abort when the primary's sidecar cannot be promoted")
+	}
+	if !strings.Contains(err.Error(), "sidecar") {
+		t.Errorf("error should identify the sidecar promotion failure, got: %v", err)
+	}
+
+	// The original primary must still load once the sidecar is readable again.
+	if chmodErr := os.Chmod(chk, 0o644); chmodErr != nil {
+		t.Fatalf("restore sidecar perms: %v", chmodErr)
+	}
+	snap, loadErr := loadStartupSnapshot(dir, 650, orig.TipHashHex)
+	if loadErr != nil {
+		t.Fatalf("original primary must remain intact after aborted save: %v", loadErr)
+	}
+	if snap.TxTotal != 111 {
+		t.Errorf("original primary TxTotal=%d, want 111 — aborted save must not overwrite it", snap.TxTotal)
+	}
+}
+
 // ─── 6. deleteOldSnapshots keeps sidecars of retained files ──────────────────
 
 func TestChecksum_DeleteOldSnapshotsKeepsSidecars(t *testing.T) {
