@@ -117,6 +117,22 @@ else
 fi
 echo ""
 
+# ── update-node.sh stop-wait loop tests (shell e2e) ──────────────────────────
+# Guards against regressions to the stop-wait-before-cp block introduced to
+# prevent ETXTBSY ("Text file busy") when the node's snapshot flush is still
+# running at deploy time.  Exercises: immediate exit, polling, SIGKILL
+# escalation, ordering (loop before cp), Telegram alert on forced kill.
+echo "--- NodeStopWaitTests"
+if bash "$SCRIPT_DIR/test-update-node-stop-wait.sh"; then
+    echo "PASS: NodeStopWaitTests"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: NodeStopWaitTests (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "=== Results: PASS=$PASS  FAIL=$FAIL ==="
 
