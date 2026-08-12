@@ -169,6 +169,98 @@ func TestChecksum_MismatchIsCorruptNotMissing(t *testing.T) {
 	}
 }
 
+// TestChecksum_MalformedSidecarIsCorrupt — a sidecar that EXISTS but holds
+// garbage must be treated as corruption (verification failure), never as
+// "no sidecar": silently skipping the check would let an altered snapshot
+// slip through behind a scribbled sidecar.
+func TestChecksum_MalformedSidecarIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	snap := makeSnap(450)
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+	path := snapshotPath(dir, 450)
+
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"too short", "abc123\n"},
+		{"right length but not hex", strings.Repeat("zz", sha256.Size) + "\n"},
+		{"empty file", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(snapshotChecksumPath(path), []byte(tc.content), 0644); err != nil {
+				t.Fatalf("write sidecar: %v", err)
+			}
+			_, _, err := loadStartupSnapshotWithFallback(dir, 450, snap.TipHashHex, discardLogger())
+			if err == nil {
+				t.Fatal("malformed sidecar must fail verification, got nil error")
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				t.Errorf("malformed sidecar must surface as corrupt (non-NotExist), got: %v", err)
+			}
+		})
+	}
+}
+
+// TestChecksum_UnreadableSidecarIsCorrupt — a sidecar that exists but cannot
+// be read (permissions) must also be reported as corruption, not silently
+// skipped.
+func TestChecksum_UnreadableSidecarIsCorrupt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 000 does not block reads")
+	}
+	dir := t.TempDir()
+	snap := makeSnap(460)
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+	chk := snapshotChecksumPath(snapshotPath(dir, 460))
+	if err := os.Chmod(chk, 0o000); err != nil {
+		t.Fatalf("chmod sidecar: %v", err)
+	}
+	defer os.Chmod(chk, 0o644) // let TempDir cleanup succeed
+
+	_, _, err := loadStartupSnapshotWithFallback(dir, 460, snap.TipHashHex, discardLogger())
+	if err == nil {
+		t.Fatal("unreadable sidecar must fail verification, got nil error")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Errorf("unreadable sidecar must surface as corrupt (non-NotExist), got: %v", err)
+	}
+}
+
+// TestChecksum_MalformedSidecarFallsBackToPrev — with a valid prev-backup on
+// disk, a malformed primary sidecar must trigger the same recovery path as a
+// digest mismatch: the prev snapshot is served, not the suspect primary.
+func TestChecksum_MalformedSidecarFallsBackToPrev(t *testing.T) {
+	dir := t.TempDir()
+	orig := makeSnap(470)
+	orig.TxTotal = 111
+	if err := saveStartupSnapshot(dir, orig); err != nil {
+		t.Fatalf("save original: %v", err)
+	}
+	updated := makeSnap(470)
+	updated.TxTotal = 222
+	if err := saveStartupSnapshot(dir, updated); err != nil {
+		t.Fatalf("save updated: %v", err)
+	}
+	// Scribble over the primary's sidecar.
+	if err := os.WriteFile(snapshotChecksumPath(snapshotPath(dir, 470)), []byte("garbage"), 0644); err != nil {
+		t.Fatalf("write garbage sidecar: %v", err)
+	}
+
+	snap, _, err := loadStartupSnapshotWithFallback(dir, 470, orig.TipHashHex, discardLogger())
+	if err != nil {
+		t.Fatalf("expected fallback to prev-backup, got error: %v", err)
+	}
+	if snap.TxTotal != 111 {
+		t.Errorf("loaded TxTotal=%d, want 111 (prev-backup)", snap.TxTotal)
+	}
+}
+
 // ─── 5. Promotion carries the sidecar to the prev-backup ─────────────────────
 
 func TestChecksum_PromotionCopiesSidecar(t *testing.T) {
