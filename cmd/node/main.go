@@ -398,6 +398,31 @@ func run() error {
                 log.Warn("config warning", "msg", w)
         }
 
+        // Guard: warn when a relay (non-validator) node has a snapshot tolerance
+        // below 10 %.  Operators who manually rsync chain.db+snapshots outside of
+        // join-network.sh --bootstrap-from often forget to raise this value; the
+        // result is that every snapshot is rejected on startup and the node falls
+        // back to a multi-hour full block scan — with no obvious indication of why.
+        //
+        // The threshold of 10 % matches the value join-network.sh sets automatically.
+        // The warning is intentionally loud (plain stderr line + structured log) so
+        // it is visible in `journalctl -u aperod-node` without grepping.
+        if cfg.Consensus.NonValidator && cfg.Snapshot.UTXOCountTolerancePct < 10 {
+                warnMsg := "[RELAY CONFIG WARNING] snapshot.utxo_count_tolerance_pct is " +
+                        fmt.Sprintf("%.1f", cfg.Snapshot.UTXOCountTolerancePct) +
+                        " but should be >= 10 on a relay node. " +
+                        "Snapshots will be rejected on startup if the UTXO count drifts " +
+                        "by more than the configured percentage, forcing a full block scan " +
+                        "(potentially hours). Set snapshot.utxo_count_tolerance_pct: 10 " +
+                        "in node.yaml and restart."
+                fmt.Fprintln(os.Stderr, warnMsg)
+                log.Warn("[RELAY CONFIG WARNING] utxo_count_tolerance_pct too low for relay node",
+                        "current_value", cfg.Snapshot.UTXOCountTolerancePct,
+                        "recommended_minimum", 10,
+                        "fix", "set snapshot.utxo_count_tolerance_pct: 10 in node.yaml",
+                )
+        }
+
         // ── 3. Open storage ───────────────────────────────────────────────────────
         if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
                 return fmt.Errorf("create data dir: %w", err)
