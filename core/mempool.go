@@ -76,6 +76,12 @@ type Mempool struct {
 	// Maps hex(validatorPubKey) → txHash of the pending stake TX.
 	stakeSenders map[string]crypto.Hash32
 	log          *slog.Logger
+	// evictionsTotal counts every transaction evicted from the pool since
+	// process start (TTL expiry, capacity-pressure fee-rate eviction, and
+	// FIFO fallback).  Exposed via /api/v1/network/stats and /metrics so
+	// operators can detect mempool-flood attacks in real time.  In-memory
+	// only — resets to zero on node restart by design.
+	evictionsTotal uint64
 }
 
 // NewMempool creates a new empty mempool with the given config.
@@ -420,6 +426,15 @@ func (m *Mempool) TotalBytes() int {
 	return m.totalBytes
 }
 
+// EvictionsTotal returns the number of transactions evicted from the pool
+// since process start (TTL expiry + capacity-pressure evictions).
+// The counter is in-memory only and resets on node restart.
+func (m *Mempool) EvictionsTotal() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.evictionsTotal
+}
+
 // SetVerifier wires a TxVerifier into the mempool after creation.
 // Called once the UTXO set has been populated from the stored chain.
 // Until this is called the mempool runs in structural-only mode (dev/test).
@@ -457,6 +472,7 @@ func (m *Mempool) Evict() int {
 				m.totalBytes = 0
 			}
 			delete(m.entries, hash)
+			m.evictionsTotal++
 			removed++
 		}
 	}
@@ -484,6 +500,7 @@ func (m *Mempool) evictOldest() bool {
 		m.totalBytes = 0
 	}
 	delete(m.entries, oldest.Hash)
+	m.evictionsTotal++
 	return true
 }
 
@@ -699,5 +716,6 @@ func (m *Mempool) evictLowestFeeRate() bool {
 		m.totalBytes = 0
 	}
 	delete(m.entries, cheapest.Hash)
+	m.evictionsTotal++
 	return true
 }
