@@ -1360,34 +1360,7 @@ func run() error {
                                         "from_height", completeH+1,
                                         "to_height", backfillTarget,
                                 )
-                                go func(fromH, toH uint64) {
-                                        const progressInterval = uint64(10_000)
-                                        var errCount int
-                                        for h := fromH + 1; h <= toH; h++ {
-                                                raw, fetchErr := db.GetRawBlockByHeight(h)
-                                                if fetchErr != nil || raw == nil {
-                                                        errCount++
-                                                        continue
-                                                }
-                                                var b core.Block
-                                                if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
-                                                        errCount++
-                                                        continue
-                                                }
-                                                for i, tx := range b.Txs {
-                                                        txHash := tx.Hash()
-                                                        _ = db.PutTxIdx(txHash, b.Header.Height, i)
-                                                }
-                                                if h%progressInterval == 0 {
-                                                        _ = db.StoreTxIdxCompleteHeight(h)
-                                                        log.Info("tx index background backfill progress",
-                                                                "height", h, "target", toH)
-                                                }
-                                        }
-                                        _ = db.StoreTxIdxCompleteHeight(toH)
-                                        log.Info("tx index background backfill complete",
-                                                "to_height", toH, "block_errors", errCount)
-                                }(completeH, backfillTarget)
+                                go backfillTxIdxRange(completeH, backfillTarget, db, log)
                         }
                 }
         }
@@ -3254,6 +3227,58 @@ func replayPostSnapshotGap(
                 }
         }
         return
+}
+
+// backfillTxIdxRange writes t/ LevelDB entries for every transaction in every
+// block from fromH+1 through toH.
+//
+// It halts at the first unrecoverable error — block missing from the store,
+// JSON decode failure, or PutTxIdx write failure — to avoid advancing the
+// txidx_complete_height marker past heights whose t/ entries were not actually
+// written.  Only the last successfully indexed height is saved to the marker,
+// so the next restart retries the failed range rather than treating it as done.
+//
+// This function is called in a background goroutine by the snapshot fast-path
+// startup; it is package-level (not inlined) so tests can exercise it directly.
+func backfillTxIdxRange(fromH, toH uint64, db *store.DB, log *slog.Logger) {
+        const progressInterval = uint64(10_000)
+        lastGood := fromH
+        for h := fromH + 1; h <= toH; h++ {
+                raw, fetchErr := db.GetRawBlockByHeight(h)
+                if fetchErr != nil || raw == nil {
+                        log.Warn("tx index background backfill: block fetch failed — halting; will retry next restart",
+                                "height", h, "err", fetchErr)
+                        _ = db.StoreTxIdxCompleteHeight(lastGood)
+                        return
+                }
+                var b core.Block
+                if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
+                        log.Warn("tx index background backfill: block decode failed — halting; will retry next restart",
+                                "height", h, "err", jsonErr)
+                        _ = db.StoreTxIdxCompleteHeight(lastGood)
+                        return
+                }
+                for i, tx := range b.Txs {
+                        txHash := tx.Hash()
+                        if putErr := db.PutTxIdx(txHash, b.Header.Height, i); putErr != nil {
+                                log.Warn("tx index background backfill: PutTxIdx failed — halting; will retry next restart",
+                                        "height", h, "err", putErr)
+                                _ = db.StoreTxIdxCompleteHeight(lastGood)
+                                return
+                        }
+                }
+                lastGood = h
+                if h%progressInterval == 0 {
+                        _ = db.StoreTxIdxCompleteHeight(h)
+                        log.Info("tx index background backfill progress",
+                                "height", h, "target", toH)
+                }
+        }
+        _ = db.StoreTxIdxCompleteHeight(toH)
+        log.Info("tx index background backfill complete",
+                "from_height", fromH+1,
+                "to_height", toH,
+        )
 }
 
 func storeBlock(db *store.DB, b *core.Block) error {
