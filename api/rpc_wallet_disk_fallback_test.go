@@ -11,17 +11,21 @@ package api_test
 //   triggers getTransactionFromDisk(), the wallet would see:
 //     "tx not found on chain or mempool — re-mint required after node restart"
 //
-//   This test sets the in-memory window to 3 blocks and mints a UTXO at
-//   height 1, then advances 4 more blocks to push the mint tx out of the
-//   window.  The mint tx IS indexed in LevelDB via PutTxIdx.  A fresh server
-//   backed by that LevelDB store must succeed on apr_walletSend — exercising
-//   getTransactionFromDisk() to locate the tx.
+// Test design — why each Fallback is blocked except Fallback 2:
 //
-// Pass/fail criteria:
-//   - apr_walletSend succeeds (no error, tx_hash in result)
-//   - No "re-mint required" in the error path
-//   - The full chain.GetTransaction returns !ok before the call (precondition)
-//     — proving that only the disk fallback can supply the tx
+//   Fallback 1 (mempool):   not seeded — mp is empty.
+//   Fallback 2 (PutTxIdx):  ACTIVE — db.PutTxIdx written for the mint tx;
+//                            this is the path under test.
+//   Fallback 3 (GetUTXO):   blocked — db.PutUTXO is never called, so the u/
+//                            prefix has no entry for (mintTxHash, 0).
+//   Fallback 4 (UTXOSet):   blocked — the UTXOSet is seeded with a *fake*
+//                            txHash for the mint UTXO so s.utxos.Get(mintTxHash, 0)
+//                            returns nil, while byPubKey[OneTimePub] still
+//                            holds the correct AmountCommit for VerifyTx C-0.
+//
+// If Fallback 2 is nonfunctional the RPC returns an error; the test fails.
+// The in-memory txIndex of the same chain instance is used in the server so
+// the eviction precondition directly proves chain.GetTransaction would fail.
 
 import (
 	"bytes"
@@ -42,16 +46,15 @@ import (
 func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const (
-		// mintAmount must be large enough to cover the ring-CT fee.  The fee
-		// depends on the serialised tx size; 500_000_000_000 nAPRO (5000 APRO)
-		// leaves ample headroom.
+		// mintAmount must be large enough to cover the ring-CT fee.
+		// 500_000_000_000 nAPRO (5 000 APRO) leaves ample headroom.
 		mintAmount = uint64(500_000_000_000)
 		sendAmount = uint64(1_000_000) // 0.01 APRO — the payment
 
-		// Use a tiny in-memory window so only 4 extra blocks are needed to
-		// evict the mint tx instead of the production 1 000.
+		// Tiny in-memory window so only windowSize+2 blocks are needed to
+		// evict the mint tx rather than the production 1 000.
 		windowSize = uint64(3)
-		mintHeight = uint64(1) // height at which the mint tx lands
+		mintHeight = uint64(1) // block height at which the mint tx lands
 	)
 
 	// ── 1. Keys ───────────────────────────────────────────────────────────────
@@ -78,7 +81,7 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 
 	// ── 3. Build the mint tx for Alice at height=mintHeight ──────────────────
 	// BuildMintTx produces:
-	//   TxPubKey  = zero   (transparent mint)
+	//   TxPubKey   = zero  (transparent mint)
 	//   OneTimePub = spendPub + mintHeight*G
 	//   AmountCommit = Commit(mintAmount, DeterministicMintBlind(spendPub, mintAmount))
 	mintTx, err := core.BuildMintTx(aliceAddr, mintAmount, mintHeight)
@@ -87,7 +90,9 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 	}
 	mintTxHash := mintTx.Hash()
 
-	// ── 4. Helper: sign and store a block ─────────────────────────────────────
+	// ── 4. Helper: sign and persist a block ──────────────────────────────────
+	cb := func() core.Transaction { return core.CoinbaseTx(crypto.Point32(valPub), 1_000_000) }
+
 	makeAndStore := func(t *testing.T, height uint64, prevHash crypto.Hash32, txs []core.Transaction) *core.Block {
 		t.Helper()
 		hdr := core.BlockHeader{
@@ -109,28 +114,28 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 	}
 
 	// ── 5. Build a chain: genesis + mint block + windowSize+1 empty blocks ────
+	// Use the same chain instance in the server (step 8) so the eviction of the
+	// mint tx from txIndex is directly observed by the RPC handler.
 	chain := core.NewChain(windowSize)
-
-	cb := func() core.Transaction { return core.CoinbaseTx(crypto.Point32(valPub), 1_000_000) }
 
 	genesis := makeAndStore(t, 0, crypto.Hash32{}, []core.Transaction{cb()})
 	if err := chain.SetGenesis(genesis); err != nil {
 		t.Fatalf("SetGenesis: %v", err)
 	}
 
-	// Block at height 1 contains: coinbase (idx=0) + mint tx (idx=1).
+	// Block at height 1 contains: coinbase (txIdx=0) + mint tx (txIdx=1).
 	block1 := makeAndStore(t, 1, genesis.Hash(), []core.Transaction{cb(), *mintTx})
 	if err := chain.AddBlock(block1); err != nil {
 		t.Fatalf("AddBlock h=1: %v", err)
 	}
 
-	// Index the mint tx so getTransactionFromDisk() can find it.
-	// mintTx is at position 1 within block1.Txs.
+	// Index the mint tx in LevelDB so getTransactionFromDisk() can find it.
+	// txIdx=1 because mintTx is the second transaction in block1.Txs.
 	if err := db.PutTxIdx(mintTxHash, mintHeight, 1); err != nil {
 		t.Fatalf("PutTxIdx for mint tx: %v", err)
 	}
 
-	// Advance windowSize+1 blocks to evict the mint tx from the in-memory window.
+	// Advance windowSize+1 more blocks to evict the mint tx from txIndex.
 	prev := block1
 	for i := uint64(2); i <= windowSize+2; i++ {
 		blk := makeAndStore(t, i, prev.Hash(), []core.Transaction{cb()})
@@ -140,33 +145,50 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 		prev = blk
 	}
 
-	// ── 6. Precondition: mint tx must NOT be in the in-memory txIndex ─────────
+	// ── 6. Precondition: confirm the mint tx is evicted from in-memory index ──
+	// chain.GetTransaction returning !ok is what triggers the disk fallback.
 	_, _, inMemory := chain.GetTransaction(mintTxHash)
 	if inMemory {
-		t.Fatal("precondition failed: mint tx is still in the in-memory index — " +
-			"the disk-fallback path would not be exercised; adjust windowSize or block count")
+		t.Fatal("precondition failed: mint tx is still in the in-memory txIndex — " +
+			"adjust windowSize or block count so the disk-fallback path is exercised")
 	}
 
-	// ── 7. UTXOSet: register the mint UTXO so VerifyTx C-0 can validate it ───
-	// ApplyBlock adds every output from block1 (coinbase + mint) to byPubKey.
-	// The verifier only needs the real spender's AmountCommit to be present.
+	// ── 7. UTXOSet: seed the C-0 check but block Fallback 4 ──────────────────
+	//
+	// VerifyTx C-0 needs byPubKey[mintPub] → correct AmountCommit to be present.
+	// Fallback 4 (rpc_wallet.go) uses s.utxos.Get(txHash, outIdx) which reads
+	// byIndex.  If the real mintTxHash is in byIndex, Fallback 4 succeeds even
+	// when Fallback 2 (disk PutTxIdx) is broken — making the test a false positive.
+	//
+	// Fix: register the mint UTXO under a sentinel fake txHash so byPubKey has
+	// the correct commitment (C-0 passes) but s.utxos.Get(mintTxHash, 0) returns
+	// nil (Fallback 4 is definitively blocked).
+	var fakeTxHash crypto.Hash32
+	fakeTxHash[0] = 0xde
+	fakeTxHash[1] = 0xad // distinct from mintTxHash; Get(mintTxHash, 0) → nil
+
 	utxos := core.NewUTXOSet()
-	if err := utxos.ApplyBlock(block1); err != nil {
-		t.Fatalf("ApplyBlock mint block: %v", err)
-	}
+	utxos.Add(&core.UTXO{
+		TxHash:       fakeTxHash,              // blocks Fallback 4
+		OutputIndex:  0,
+		OneTimePub:   mintTx.Outputs[0].OneTimePub,
+		TxPubKey:     mintTx.Outputs[0].TxPubKey,
+		AmountCommit: mintTx.Outputs[0].AmountCommit, // satisfies C-0
+		BlockHeight:  mintHeight,
+	})
 
-	// ── 8. Create a fresh server backed by the LevelDB store ─────────────────
-	// The fresh chain has no genesis set, so its txIndex is completely empty.
-	// Every tx lookup MUST go through the disk fallback.
-	freshChain := core.NewChain(windowSize)
+	// ── 8. Create the server with the same (evicted) chain + LevelDB store ────
+	// NOTE: db.PutUTXO is intentionally NOT called, so blockStore.GetUTXO
+	// (Fallback 3) also returns nil.  The only working fallback is Fallback 2.
 	mp := core.NewMempool(core.DefaultMempoolConfig())
-	srv := api.NewServer(":0", freshChain, mp, utxos, testLogger())
-	srv.SetStore(db) // wire LevelDB store → enables getTransactionFromDisk()
+	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetStore(db) // enables getTransactionFromDisk() (Fallback 2)
 
 	// ── 9. Call apr_walletSend via JSON-RPC ──────────────────────────────────
-	// The UTXO is a BuildMintTx output: TxPubKey=zero, blind_hex="" means the
-	// server will derive DeterministicMintBlind(spendPub, mintAmount) — the same
-	// blind that BuildMintTx used — and the pre-flight commitment check passes.
+	// The UTXO is a BuildMintTx output (TxPubKey=zero).  Passing blind_hex=""
+	// tells the server to derive DeterministicMintBlind(spendPub, mintAmount),
+	// which is the same blind BuildMintTx used — the pre-flight commitment check
+	// will match and the ring-CT build succeeds.
 	params := map[string]interface{}{
 		"spend_key_hex":  hex.EncodeToString(aliceKeys.Spend.Private[:]),
 		"view_key_hex":   hex.EncodeToString(aliceKeys.View.Private[:]),
@@ -182,6 +204,7 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 			},
 		},
 	}
+
 	paramsJSON, _ := json.Marshal(params)
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -204,8 +227,9 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 	if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
 		msg := fmt.Sprintf("%v", errObj["message"])
 		t.Fatalf("apr_walletSend returned error: %s\n"+
-			"A 're-mint required' message means the disk fallback (getTransactionFromDisk) "+
-			"did not supply the tx even though PutTxIdx was written for it.", msg)
+			"With Fallback 3 and Fallback 4 both blocked, only Fallback 2 "+
+			"(getTransactionFromDisk via PutTxIdx) can supply the output.\n"+
+			"A 're-mint required' error means that path is not working.", msg)
 	}
 
 	result, ok := resp["result"].(map[string]interface{})
@@ -218,12 +242,11 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 		t.Errorf("tx_hash = %q, want 64-char hex string", txHashStr)
 	}
 
-	// Confirm the payment amount round-trips correctly.
 	if result["payment_amount_napr"] != float64(sendAmount) {
 		t.Errorf("payment_amount_napr = %v, want %d", result["payment_amount_napr"], sendAmount)
 	}
 
 	t.Logf("apr_walletSend via disk fallback succeeded: tx_hash=%s "+
-		"(mint was at height %d, in-memory window=%d, chain tip=%d)",
-		txHashStr, mintHeight, windowSize, windowSize+2)
+		"(mint at height %d evicted from in-memory window=%d; disk PutTxIdx path exercised)",
+		txHashStr, mintHeight, windowSize)
 }
