@@ -458,3 +458,167 @@ func TestSpentDecoyPool_FullScanRebuildsDecoys(t *testing.T) {
 	}
 	t.Logf("full scan: SpentDecoyCount() = %d ✓", utxos.SpentDecoyCount())
 }
+
+// TestSpentDecoyPool_KiFromIndexRebuildsDecoys covers task #1190: the normal
+// production fast path pre-loads every spent key image from the persistent
+// index (KiFromIndex=true) via MarkSpent BEFORE runStartupScan runs.  With the
+// old unconditional ApplyBlock call, pass-1's double-spend check then fired
+// for every spending block — the whole block was skipped, so:
+//   • spentPubKeys (the Phase 2 ring-decoy pool) stayed empty → ring privacy
+//     silently degraded to Phase 1 on every fast-path restart;
+//   • the spending block's own outputs (e.g. change) never entered the active
+//     set;
+//   • the spent ring member stayed wrongly active in byPubKey.
+// The fix routes KiFromIndex=true replays through ReplayBlockKnownSpends
+// (pass-2 only).  This test asserts all three outcomes.
+func TestSpentDecoyPool_KiFromIndexRebuildsDecoys(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	blind, _ := crypto.NewBlindFactor()
+	commit, _ := crypto.Commit(750, blind)
+
+	ki := validKeyImage(t, 7)
+
+	makeBlock := func(height uint64, prevHash crypto.Hash32, txs []core.Transaction) *core.Block {
+		hdr := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prevHash,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(txs),
+		}
+		if err := hdr.Sign(priv); err != nil {
+			t.Fatalf("Sign block h=%d: %v", height, err)
+		}
+		return &core.Block{Header: hdr, Txs: txs}
+	}
+
+	storeBlock := func(b *core.Block) {
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("marshal block h=%d: %v", b.Header.Height, err)
+		}
+		h := b.Hash()
+		if err := db.PutRawBlock(h, b.Header.Height, raw); err != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, err)
+		}
+		if err := db.PutTip(h, b.Header.Height); err != nil {
+			t.Fatalf("PutTip h=%d: %v", b.Header.Height, err)
+		}
+	}
+
+	// Ring: ring[0] is the real UTXO that will be spent.
+	ring := make([]crypto.Point32, crypto.RingSize)
+	for i := range ring {
+		ring[i][0] = 0x70 + byte(i)
+	}
+	// Change output created by the spending transaction — must survive the
+	// KiFromIndex replay into the active set.
+	var changePub crypto.Point32
+	changePub[0] = 0xEE
+
+	// Block 0 (genesis): output at ring[0].
+	blk0 := makeBlock(0, crypto.Hash32{}, []core.Transaction{
+		{
+			Version: core.TxVersionBase,
+			Outputs: []core.Output{
+				{OneTimePub: ring[0], AmountCommit: commit},
+			},
+		},
+	})
+	storeBlock(blk0)
+
+	// Block 1: spends ring[0] and creates a change output.
+	blk1 := makeBlock(1, blk0.Hash(), []core.Transaction{
+		{
+			Version: core.TxVersionBase,
+			Inputs: []core.RingInput{
+				{Ring: ring, AmountCommit: commit, KeyImage: ki},
+			},
+			Outputs: []core.Output{
+				{OneTimePub: changePub, AmountCommit: commit},
+			},
+		},
+	})
+	storeBlock(blk1)
+
+	// ── Restart simulation with the key-image index fast path ─────────────
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+
+	// main.go applies the genesis block before calling runStartupScan.
+	if err := utxos.ApplyBlock(blk0); err != nil {
+		t.Fatalf("pre-scan ApplyBlock blk0 (genesis): %v", err)
+	}
+
+	// Mirror main.go's index preload: every historical key image is loaded
+	// via MarkSpent BEFORE the scan.  This is exactly what made the old
+	// unconditional ApplyBlock reject block 1 as a "double-spend".
+	utxos.MarkSpent(ki)
+	if !utxos.IsSpent(ki) {
+		t.Fatal("pre-condition failed: key image must be marked spent before the scan")
+	}
+
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	blk1Hash := blk1.Hash()
+	var wg sync.WaitGroup
+	result, err := runStartupScan(startupScanParams{
+		DataDir:            dir,
+		TipHeight:          1,
+		TipHashHex:         fmt.Sprintf("%x", blk1Hash[:]),
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        true, // ← the production fast path under test
+		InitTxTotal:        1,
+		Log:                log,
+		SnapshotWg:         &wg,
+		CheckpointInterval: 50000,
+	})
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("runStartupScan: %v", err)
+	}
+	if result.ScanFrom != 1 {
+		t.Errorf("ScanFrom = %d, want 1 (no checkpoint)", result.ScanFrom)
+	}
+
+	// ── Assert 1 (task done-when): the decoy pool is rebuilt ──────────────
+	if utxos.SpentDecoyCount() == 0 {
+		t.Fatal("SpentDecoyCount() == 0 with KiFromIndex=true; " +
+			"ring privacy silently degraded to Phase 1 on the fast-path restart")
+	}
+	t.Logf("KiFromIndex=true: SpentDecoyCount() = %d ✓", utxos.SpentDecoyCount())
+
+	// ── Assert 2: the spent ring member is no longer in the active set ────
+	if utxos.GetByPubKey(ring[0]) != nil {
+		t.Error("spent UTXO ring[0] still present in the active byPubKey index; " +
+			"KiFromIndex replay did not move it to spentPubKeys")
+	}
+
+	// ── Assert 3: the spending block's change output IS in the active set ─
+	if utxos.GetByPubKey(changePub) == nil {
+		t.Error("change output of the spending block missing from the active set; " +
+			"KiFromIndex replay skipped the block's outputs")
+	}
+
+	// The decoys must be sampleable for ring construction.
+	decoys := utxos.SampleDecoys(1, nil)
+	if len(decoys) == 0 {
+		t.Error("SampleDecoys returned no decoys despite non-zero SpentDecoyCount")
+	}
+}
