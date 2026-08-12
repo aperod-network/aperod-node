@@ -1,6 +1,7 @@
 package p2p
 
 import (
+        "context"
         "crypto/tls"
         "encoding/json"
         "fmt"
@@ -425,6 +426,34 @@ type Host struct {
         // nil in production (Start always initialises it).
         maintainNow chan struct{}
 
+        // ── Dial-gate: serialises ban writes with dial initiations ────────────
+        //
+        // dialGateMu is held (briefly) by both dialPeer and BanPeer so that
+        // "check IsBanned, then register intent to dial" is atomic with
+        // "write ban, then cancel in-flight dials."  Without this, a goroutine
+        // can pass IsBanned, have BanPeer run and complete, and then still
+        // initiate a TCP connection to the now-banned address.
+        //
+        // The lock is never held across network I/O; it guards only the tiny
+        // map operations described above.
+        dialGateMu sync.Mutex
+        // dialingIPs maps the canonical bare IP of an in-progress outbound
+        // dial to the set of active cancel functions keyed by a unique dial ID.
+        // BanPeer drains and invokes all cancel functions for the banned IP so
+        // that any in-flight DialContext call is aborted before the TCP
+        // connection is established.
+        dialingIPs map[string]map[uint64]context.CancelFunc
+        // nextDialID is the monotonically increasing ID assigned to each new
+        // in-flight dial so entries can be removed from dialingIPs on exit
+        // without ambiguity.
+        nextDialID atomic.Uint64
+
+        // dialContextFunc is the function used for outbound TCP dials.
+        // In production it is (&net.Dialer{Timeout: DialTimeout}).DialContext.
+        // Tests may replace it with a function that blocks on a channel to
+        // exercise the race between an in-progress dial and a concurrent ban.
+        dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
         // listenFunc is the function used to open the TCP listener in Start().
         // In production it is always net.Listen (set in NewHost).  Tests may
         // replace it with a custom factory whose body runs at the real bind
@@ -478,6 +507,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 }
         }
 
+        defaultDialer := &net.Dialer{Timeout: DialTimeout}
         h := &Host{
                 cfg:            cfg,
                 handler:        handler,
@@ -490,6 +520,8 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 wlNets:         wlNets,
                 wlIPs:          wlIPs,
                 listenFunc:     net.Listen,
+                dialContextFunc: defaultDialer.DialContext,
+                dialingIPs:     make(map[string]map[uint64]context.CancelFunc),
                 bootnodeLastResolved:   make(map[string][]string),
                 bootnodeLastResolvedAt: make(map[string]time.Time),
                 bootnodeSet:            make(map[string]struct{}),
@@ -902,19 +934,37 @@ func (h *Host) DropPeer(addr string) bool {
 	return ok
 }
 
+// cancelInFlightDials cancels every outbound dial currently in progress to ip
+// (canonical bare IP) by invoking and removing the registered CancelFuncs.
+// Must be called while dialGateMu is held.
+func (h *Host) cancelInFlightDials(ip string) {
+        for _, cancel := range h.dialingIPs[ip] {
+                cancel()
+        }
+        delete(h.dialingIPs, ip)
+}
+
 // BanPeer bans the peer at addr for duration d.  The connection (if any) is
 // closed immediately and future dial/accept attempts from that address are
 // rejected.
 //
-// mgr.Ban now also stores a bare-IP entry when addr is "IP:port", so a
-// reconnect on a different source port (e.g. the peer's listen port vs the
-// ephemeral connection port recorded here) is blocked without any extra work.
-// We close ALL active connections whose source IP matches addr's IP — not just
-// the one exact-addr match — to mirror the rogue-fork ban path and ensure no
-// sibling connection from the same host slips through.
+// Ban commitment and dial initiation are serialized under dialGateMu so that
+// no new TCP connection to the banned IP can start after this function
+// returns:
+//   - If a dialPeer goroutine has not yet entered the gate → it will see the
+//     ban inside the gate and abort before calling DialContext.
+//   - If a dialPeer goroutine is already inside the gate (IsBanned passed,
+//     cancel registered, DialContext not yet called) → BanPeer cancels its
+//     context so DialContext returns immediately with context.Canceled.
+//
+// All currently established connections from the same IP are also closed.
 func (h *Host) BanPeer(addr, reason string, d time.Duration) {
-        h.mgr.Ban(addr, reason, d)
         bannedIP := connIP(addr)
+        h.dialGateMu.Lock()
+        h.mgr.Ban(addr, reason, d)
+        h.cancelInFlightDials(bannedIP)
+        h.dialGateMu.Unlock()
+
         h.mu.Lock()
         for a, p := range h.peers {
                 if connIP(a) == bannedIP {
@@ -1421,44 +1471,92 @@ func (h *Host) dialPeer(addr string) {
         if already || count >= h.cfg.MaxPeers {
                 return
         }
+
+        // ── Dial-gate: atomic ban-check + in-flight registration ─────────────
+        //
+        // dialGateMu is also held (write) by BanPeer when it writes a ban and
+        // cancels in-flight dials.  Holding it here (read phase) ensures that
+        // the sequence "IsBanned → false, register intent, dial" is atomic with
+        // "write ban, cancel intents" — so no TCP connection can be initiated
+        // to an IP that has just been banned.
+        //
+        // The mutex is released BEFORE net.DialContext so it is never held
+        // across network I/O.
+        ctx, cancel := context.WithCancel(context.Background())
+        dialID := h.nextDialID.Add(1)
+        canonIP := connIP(addr)
+
+        h.dialGateMu.Lock()
         // Configured bootnodes skip the exponential back-off window so a
         // simultaneous restart of both validators does not leave the network
         // isolated for up to 5 minutes.  The ban list still applies — a
         // bootnode that is actively banned cannot be re-dialled.
         if h.isBootnode(addr) {
                 if h.mgr.IsBanned(addr) {
+                        h.dialGateMu.Unlock()
+                        cancel()
                         h.log.Debug("dialPeer: bootnode is banned", "addr", addr)
                         return
                 }
         } else if !h.mgr.CanDial(addr) {
+                h.dialGateMu.Unlock()
+                cancel()
                 h.log.Debug("dialPeer: addr is banned or in back-off window", "addr", addr)
                 return
         }
+        // Register the cancel func so BanPeer can abort this dial.
+        if h.dialingIPs[canonIP] == nil {
+                h.dialingIPs[canonIP] = make(map[uint64]context.CancelFunc)
+        }
+        h.dialingIPs[canonIP][dialID] = cancel
+        h.dialGateMu.Unlock()
+
+        // Remove the registration when the dial concludes (success or failure).
+        defer func() {
+                h.dialGateMu.Lock()
+                delete(h.dialingIPs[canonIP], dialID)
+                if len(h.dialingIPs[canonIP]) == 0 {
+                        delete(h.dialingIPs, canonIP)
+                }
+                h.dialGateMu.Unlock()
+                cancel()
+        }()
 
         h.log.Debug("dialing peer", "addr", addr)
+        // Establish the TCP connection using the injectable dialContextFunc.
+        // If BanPeer is called while DialContext is in progress, it invokes the
+        // registered cancel func, causing DialContext to return immediately with
+        // context.Canceled — so no TCP socket reaches the remote listener.
+        tcpConn, err := h.dialContextFunc(ctx, "tcp", addr)
+        if err != nil {
+                if ctx.Err() != nil {
+                        h.log.Debug("dial aborted (peer banned during dial)", "addr", addr)
+                } else {
+                        h.log.Warn("dial failed", "addr", addr, "err", err)
+                        h.mgr.OnDialFail(addr)
+                }
+                return
+        }
+
         var conn net.Conn
         if h.cfg.TLSConfig != nil {
-                // Outbound TLS dial: the TLS handshake completes before
-                // handleConn is invoked, so PeerFingerprint is available
-                // immediately on the first call inside handleConn.
-                tlsConn, err := tls.DialWithDialer(
-                        &net.Dialer{Timeout: DialTimeout},
-                        "tcp", addr, h.cfg.TLSConfig,
-                )
-                if err != nil {
-                        h.log.Warn("tls dial failed", "addr", addr, "err", err)
-                        h.mgr.OnDialFail(addr)
+                // Outbound TLS handshake: wrap the TCP conn and negotiate TLS.
+                // HandshakeContext honours the cancel so a ban during the TLS
+                // phase also aborts cleanly.
+                tlsConn := tls.Client(tcpConn, h.cfg.TLSConfig)
+                if err := tlsConn.HandshakeContext(ctx); err != nil {
+                        tcpConn.Close()
+                        if ctx.Err() != nil {
+                                h.log.Debug("tls handshake aborted (peer banned during dial)", "addr", addr)
+                        } else {
+                                h.log.Warn("tls handshake failed", "addr", addr, "err", err)
+                                h.mgr.OnDialFail(addr)
+                        }
                         return
                 }
                 conn = tlsConn
         } else {
-                var err error
-                conn, err = net.DialTimeout("tcp", addr, DialTimeout)
-                if err != nil {
-                        h.log.Warn("dial failed", "addr", addr, "err", err)
-                        h.mgr.OnDialFail(addr)
-                        return
-                }
+                conn = tcpConn
         }
         go h.handleConn(conn, true)
 }
@@ -2041,7 +2139,13 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                                         // also rejected.  IsBanned checks both IP:port and bare
                                         // IP, so this blocks all future connections from the host.
                                         banDuration := h.cfg.BadBlockBanDuration
+                                        // Commit the ban and cancel any in-flight dials to this
+                                        // IP under dialGateMu so that no new TCP connection can
+                                        // be initiated after the ban is written.
+                                        h.dialGateMu.Lock()
                                         h.mgr.Ban(peerIP, "repeated out-of-range blocks (wrong fork)", banDuration)
+                                        h.cancelInFlightDials(peerIP)
+                                        h.dialGateMu.Unlock()
                                         // Close ALL currently established connections from the
                                         // same IP, not just the one that triggered the threshold.
                                         h.mu.Lock()
