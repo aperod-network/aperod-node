@@ -105,6 +105,88 @@ func TestPeerMgr_LiftBan_PersistAndReload(t *testing.T) {
 	}
 }
 
+// TestPeerMgr_LegacySidecar_MigratedOnLoad is the regression fixture for the
+// LoadBansFromFile canonicalisation fix.  It crafts a ban sidecar that
+// contains legacy "IP:port" keys — exactly what older node versions wrote —
+// and verifies that after loading:
+//
+//   - All ports on the banned IP are blocked (cross-port guarantee).
+//   - LiftBan works with both the port form and the bare-IP form.
+//   - No ban entry survives after a successful LiftBan + reload.
+//
+// Without the canonicalisation in LoadBansFromFile, legacy entries remained
+// stored under their original "IP:port" key, making LiftBan("IP") a no-op and
+// leaving the ghost ban after every node restart.
+func TestPeerMgr_LegacySidecar_MigratedOnLoad(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "bans.json")
+
+	// Write a legacy-format sidecar: entries keyed by "IP:port" as older
+	// node versions wrote them.  Also include a bare-IP entry to verify that
+	// the collision-resolution logic (keep furthest expiry) works correctly.
+	legacy := []persistedBan{
+		{Addr: "1.2.3.4:56789", Reason: "rogue fork (legacy)", Until: time.Now().Add(20 * time.Hour)},
+		{Addr: "1.2.3.4", Reason: "rogue fork (bare, shorter)", Until: time.Now().Add(10 * time.Hour)},
+		{Addr: "5.6.7.8:9000", Reason: "spam (legacy, only entry)", Until: time.Now().Add(time.Hour)},
+	}
+	data, _ := json.MarshalIndent(legacy, "", "  ")
+	if err := os.WriteFile(f, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// ── Step 1: load — migration must happen transparently ───────────────────
+	pm := newPeerMgrWithFile(f)
+	if err := pm.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile: %v", err)
+	}
+
+	// 1.2.3.4 collision: legacy entry expiry (20h) > bare-IP entry (10h) →
+	// canonical key "1.2.3.4" must carry the 20-hour ban.
+	for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+		if !pm.IsBanned(check) {
+			t.Errorf("after load: %s must be banned (migrated from legacy sidecar)", check)
+		}
+	}
+	if !pm.IsBanned("5.6.7.8:9000") {
+		t.Error("5.6.7.8:9000 must be banned after legacy sidecar load")
+	}
+	if !pm.IsBanned("5.6.7.8:1234") {
+		t.Error("5.6.7.8:1234 must also be banned (cross-port from canonicalised 5.6.7.8)")
+	}
+	// Exactly 2 canonical entries ("1.2.3.4" and "5.6.7.8") — not 3 (the
+	// collision reduces the two 1.2.3.4 entries to one).
+	if n := pm.BannedCount(); n != 2 {
+		t.Errorf("BannedCount = %d after legacy load, want 2 (canonical entries only)", n)
+	}
+
+	// ── Step 2: LiftBan via port form must fully remove the 1.2.3.4 ban ─────
+	if removed := pm.LiftBan("1.2.3.4:56789"); !removed {
+		t.Error("LiftBan(IP:port) must find and remove the canonical bare-IP entry")
+	}
+	for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+		if pm.IsBanned(check) {
+			t.Errorf("after LiftBan(port form): %s still banned — partial-lift regression", check)
+		}
+	}
+
+	// ── Step 3: re-persist (happens inside LiftBan) then reload ─────────────
+	pm2 := newPeerMgrWithFile(f)
+	if err := pm2.LoadBansFromFile(); err != nil {
+		t.Fatalf("LoadBansFromFile after lift: %v", err)
+	}
+	for _, check := range []string{"1.2.3.4:56789", "1.2.3.4:9333", "1.2.3.4"} {
+		if pm2.IsBanned(check) {
+			t.Errorf("after reload: %s still banned — ghost entry in sidecar after LiftBan", check)
+		}
+	}
+	// 5.6.7.8 is still banned.
+	if !pm2.IsBanned("5.6.7.8") {
+		t.Error("5.6.7.8 must still be banned after reload")
+	}
+	if n := pm2.BannedCount(); n != 1 {
+		t.Errorf("BannedCount after reload = %d, want 1", n)
+	}
+}
+
 // TestPeerMgr_ExpiredBansFilteredOnLoad verifies that bans that expired while
 // the node was down are silently discarded and do not block legitimate peers.
 func TestPeerMgr_ExpiredBansFilteredOnLoad(t *testing.T) {
