@@ -1219,7 +1219,10 @@ func run() error {
                         kiCount++
                         return nil
                 })
-                kiFromIndex = kiIterErr == nil && (kiCount > 0 || tipHeight == 0)
+                // FAIL-CLOSED: only trust the index when iteration succeeded and
+                // the count is consistent with the chain height (see
+                // keyImageIndexTrusted for the full contract).
+                kiFromIndex = keyImageIndexTrusted(kiIterErr, kiCount, tipHeight)
                 if kiFromIndex {
                         storedTotal, loadErr := db.LoadTxTotal()
                         if loadErr != nil {
