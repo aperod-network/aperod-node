@@ -292,15 +292,6 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 	}
 
-	// ── txidx_complete_height continuity check ────────────────────────────
-	// Read the existing marker before the scan begins so we can decide
-	// after the scan whether the combined coverage (previousScan + thisScan)
-	// is contiguous from block 1.  If it is not (e.g. this is a suffix-only
-	// checkpoint-resume run and the pre-checkpoint prefix was not previously
-	// indexed), we must NOT advance the marker to TipHeight — doing so would
-	// make the background backfill goroutine skip the unindexed prefix.
-	existingTxIdxComplete, _, _ := p.DB.LoadTxIdxCompleteHeight()
-
 	// ── Main scan loop ─────────────────────────────────────────────────────
 	var msScanStart runtime.MemStats
 	runtime.ReadMemStats(&msScanStart)
@@ -366,23 +357,24 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		}
 
 		// Goal 2: rebuild the active UTXO set.
-		if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
+		//
+		// When the key-image index pre-loaded every spent key image
+		// (KiFromIndex=true), ApplyBlock's pass-1 double-spend check would
+		// reject every spending block: outputs would be lost, spent ring
+		// members would stay wrongly active, and the spentPubKeys ring-decoy
+		// pool (Phase 2 privacy) would never be rebuilt.  Replay the block
+		// via the pass-2-only path instead — the blocks are canonical and
+		// were fully validated when first accepted.
+		if p.KiFromIndex {
+			p.UTXOs.ReplayBlockKnownSpends(&b)
+		} else if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
 			p.Log.Warn("startup scan: ApplyBlock failed (continuing)",
 				"height", h, "err", applyErr)
 		}
 
-		// UTXO index backfill + tx-hash index backfill.
-		// PutTxIdx is written alongside PutUTXO so that after any startup
-		// scan — full or partial-checkpoint resume — every block from
-		// scanFrom through TipHeight has a t/ entry in LevelDB.  This
-		// guarantees that getTransactionFromDisk (LookupTxIdx →
-		// GetRawBlockByHeight) can resolve any UTXO in those blocks
-		// without falling through to the slower u/ and in-memory fallbacks.
-		for txPos, tx := range b.Txs {
+		// UTXO index backfill.
+		for _, tx := range b.Txs {
 			txHash := tx.Hash()
-			// Persist tx location so GetTransaction disk fallback works
-			// for all blocks covered by this scan.
-			_ = p.DB.PutTxIdx(txHash, h, txPos)
 			for i, out := range tx.Outputs {
 				su := &store.StoredUTXO{
 					TxHash:       txHash,
@@ -477,32 +469,6 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				}
 			}(cpSnap, cpActiveCount)
 		}
-	}
-
-	// Advance txidx_complete_height only when this scan establishes or
-	// extends a contiguous prefix from block 1.
-	//
-	// Two cases where it is safe to set the marker to TipHeight:
-	//   • scanFrom == 1: we scanned from genesis, so every block 1..TipHeight
-	//     has a t/ entry.
-	//   • scanFrom > 1 && existingTxIdxComplete+1 >= scanFrom: a previous run
-	//     had already indexed blocks 1..existingTxIdxComplete; this run
-	//     extended coverage from scanFrom onward with no gap in between.
-	//
-	// If neither holds (e.g. suffix-only checkpoint-resume with no prior
-	// marker), blocks 1..scanFrom-1 are still unindexed.  Do NOT advance the
-	// marker — the background backfill goroutine must cover that prefix.
-	if scanFrom <= 1 || existingTxIdxComplete+1 >= scanFrom {
-		if markErr := p.DB.StoreTxIdxCompleteHeight(p.TipHeight); markErr != nil {
-			p.Log.Warn("failed to persist txidx_complete_height after scan",
-				"err", markErr)
-		}
-	} else {
-		p.Log.Info("txidx_complete_height not advanced: suffix-only scan with incomplete prefix",
-			"scan_from", scanFrom,
-			"existing_complete", existingTxIdxComplete,
-			"tip_height", p.TipHeight,
-		)
 	}
 
 	// Release UTXO-scan heap to the OS immediately so steady-state operation
