@@ -248,14 +248,22 @@ type Peer struct {
 
         // lastHeadersRequestedAt is the Unix nanosecond timestamp of the most
         // recent requestHeaders call that was triggered from a MsgPong handler.
-        // Used to enforce a per-peer cooldown (≥ KeepaliveInterval) so that a
-        // peer reporting a height just 1 block ahead of ours — a normal
-        // propagation-delay situation — does not cause a requestHeaders storm on
-        // every keepalive Pong.  Zero means no Pong-triggered request has been
-        // sent yet, which lets the very first Pong with a height gap fire
-        // immediately (preserving the self-heal behaviour).
+        // Used together with lastHeadersRequestedAtHeight to implement the
+        // Pong-triggered requestHeaders cooldown; see the MsgPong dispatch
+        // handler for the full decision logic.
         // Updated atomically by the dispatch goroutine; no mutex needed.
         lastHeadersRequestedAt atomic.Int64
+
+        // lastHeadersRequestedAtHeight is the peer-reported height that was
+        // current when the most recent Pong-triggered requestHeaders was sent.
+        // The MsgPong handler only fires a new requestHeaders when the peer
+        // advances strictly beyond this value (new relevant state) OR when the
+        // 2×KeepaliveInterval self-heal window has elapsed (covers the case
+        // where the first request was silently dropped during UTXO rebuild).
+        // Zero means no Pong-triggered request has been sent yet, so the first
+        // Pong with a height gap always fires immediately.
+        // Updated atomically by the dispatch goroutine; no mutex needed.
+        lastHeadersRequestedAtHeight atomic.Uint64
 
         // pendingBlocksMu guards pendingBlocks.  All access must hold this mutex.
         pendingBlocksMu sync.Mutex
@@ -522,6 +530,14 @@ type Host struct {
         // Ordering invariant (must never regress):
         //   loadWhitelistFromFile  ->  listenFunc / net.Listen  ->  tls.NewListener
         listenFunc func(network, addr string) (net.Listener, error)
+
+        // pongGetHeadersTotal counts how many times the MsgPong handler has
+        // passed the cooldown gate and actually called requestHeaders.  It does
+        // NOT count requestHeaders calls from the sync ticker or stall
+        // detector.  Incremented atomically so tests can read it without a
+        // lock.  Only meaningful in test scenarios; always zero in production
+        // code that does not inspect it.
+        pongGetHeadersTotal atomic.Int64
 }
 
 // NewHost creates a new p2p host.
@@ -2225,18 +2241,23 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 // detects the height gap and restarts the sync pipeline automatically,
                 // without requiring a manual restart.
                 //
-                // Cooldown: when the gap is exactly 1 block the peer likely just
-                // produced a new block whose MsgBlock is still in flight.  Firing
-                // requestHeaders on every subsequent Pong until that block arrives
-                // creates noisy chatter under a fast keepalive interval.  We
-                // suppress repeated Pong-triggered calls within one KeepaliveInterval
-                // so the self-heal benefit is preserved (fires once per interval)
-                // while back-to-back redundant requests are eliminated.
+                // Cooldown: only fire when the peer has advanced to a height we have
+                // not yet requested headers for (new relevant state).  This suppresses
+                // back-to-back redundant requests when the peer stays 1 block ahead
+                // while its MsgBlock is still in flight — a scenario where every
+                // regular keepalive Pong would otherwise fire a request.  A
+                // 2×KeepaliveInterval fallback preserves the self-heal benefit: if
+                // the first request was silently dropped (e.g. during UTXO rebuild)
+                // the node retries after at most two keepalive cycles.
                 if msg.Height > h.handler.CurrentHeight() {
                         nowNs := time.Now().UnixNano()
-                        cooldownNs := int64(h.GetKeepaliveInterval())
-                        if nowNs-peer.lastHeadersRequestedAt.Load() >= cooldownNs {
+                        lastReqHeight := peer.lastHeadersRequestedAtHeight.Load()
+                        lastReqNs := peer.lastHeadersRequestedAt.Load()
+                        selfHealNs := int64(2 * h.GetKeepaliveInterval())
+                        if msg.Height > lastReqHeight || nowNs-lastReqNs >= selfHealNs {
                                 peer.lastHeadersRequestedAt.Store(nowNs)
+                                peer.lastHeadersRequestedAtHeight.Store(msg.Height)
+                                h.pongGetHeadersTotal.Add(1)
                                 h.requestHeaders(peer)
                         }
                 }
