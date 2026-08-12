@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -304,23 +305,30 @@ func TestStartupScanGCCadenceSingleBlockMultipleThresholds(t *testing.T) {
 // task #1485: when a relay node loads from a partial snapshot whose
 // Registry.Validators is nil (a snapshot produced before registry snapshotting
 // was added), the startup scan seeds the registry from observed block-producer
-// pubkeys so the consensus engine can accept new blocks from that validator.
+// pubkeys — and a relay consensus engine built from that registry then accepts
+// a freshly signed block from the producer, advancing the chain.
 //
 // Scenario:
 //  1. Build a chain of 10 blocks, all signed by one known validator key.
-//  2. Construct a partial snapshot at height 5 with an empty Registry.Validators
-//     (simulating a pre-registry-era snapshot file).
+//  2. Construct a realistic partial snapshot at height 5: its UTXO set is the
+//     genuine state after applying blocks 1–5, but Registry.Validators is nil
+//     (simulating a snapshot file written before the registry field existed).
 //  3. Call runStartupScan — it finds the partial snapshot, restores the empty
-//     registry, then scans headers for heights 6–10.
-//  4. After the scan the "observed-producer fallback" in scan.go seeds the
-//     validator's pubkey as Active (because no stake txs exist and active == 0).
-//  5. Assert ≥1 active validator and that its pubkey matches the block producer.
+//     registry + snapshot UTXOs, then scans blocks 6–10.
+//  4. Assert the observed-producer fallback seeded ≥1 active validator whose
+//     pubkey matches the block producer, and that the UTXO set is complete.
+//  5. Build a relay consensus.Engine (MyKey=nil, exactly like main.go's
+//     non-validator path) from the scanned registry, replay the chain into it,
+//     submit a NEW block at height 11 signed by the producer, and assert the
+//     relay chain advances to height 11.
 //
-// The test would fail on the un-patched code because GetActiveValidators() would
-// return an empty slice, leaving the consensus engine with no known validators.
+// Without the fix in scan.go, GetActiveValidators() returns an empty slice
+// after step 3, isKnownValidator() fails for every incoming block, and step 5
+// times out with the chain stuck at height 10.
 func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 	const chainHeight = 10   // total blocks produced by the validator
 	const snapAtHeight = 5   // intermediate snapshot that pre-dates registry data
+	const outsPerBlock = 2   // coinbase outputs per block
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -329,37 +337,45 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 
 	dir := t.TempDir()
 
-	// Build a 10-block chain; each block has one coinbase output so the DB is
-	// non-trivial, but the exact output count does not matter for this test.
 	outputCounts := make([]int, chainHeight)
 	for i := range outputCounts {
-		outputCounts[i] = 2
+		outputCounts[i] = outsPerBlock
 	}
 	db, tip := buildVariedChain(t, dir, outputCounts, priv, pub)
 
-	// Fetch the block at snapAtHeight so we can record its exact hash in the
-	// snapshot.  runStartupScan's hash-consistency check requires the snapshot's
-	// TipHashHex to match the block stored in LevelDB at that height.
-	rawAt5, fetchErr := db.GetRawBlockByHeight(snapAtHeight)
-	if fetchErr != nil || rawAt5 == nil {
-		t.Fatalf("GetRawBlockByHeight(%d): err=%v, raw=%v", snapAtHeight, fetchErr, rawAt5)
+	// ── Step 2: build a realistic pre-registry snapshot at height 5 ───────────
+	// Apply blocks 1–5 to a scratch UTXO set so the snapshot carries the true
+	// UTXO state at that height — exactly what an old binary would have saved.
+	// Also collect the blocks for the relay-chain replay in step 5.
+	preUTXOs := core.NewUTXOSet()
+	blocksByHeight := make([]*core.Block, chainHeight+1) // index = height
+	for h := uint64(0); h <= chainHeight; h++ {
+		raw, fetchErr := db.GetRawBlockByHeight(h)
+		if fetchErr != nil || raw == nil {
+			t.Fatalf("GetRawBlockByHeight(%d): err=%v", h, fetchErr)
+		}
+		var b core.Block
+		if uerr := json.Unmarshal(raw, &b); uerr != nil {
+			t.Fatalf("unmarshal block at height %d: %v", h, uerr)
+		}
+		blocksByHeight[h] = &b
+		if h >= 1 && h <= snapAtHeight {
+			if aerr := preUTXOs.ApplyBlock(&b); aerr != nil {
+				t.Fatalf("ApplyBlock h=%d: %v", h, aerr)
+			}
+		}
 	}
-	var blkAt5 core.Block
-	if err := json.Unmarshal(rawAt5, &blkAt5); err != nil {
-		t.Fatalf("unmarshal block at height %d: %v", snapAtHeight, err)
-	}
-	hashAt5 := blkAt5.Hash()
+	hashAt5 := blocksByHeight[snapAtHeight].Hash()
 	tipHashHex5 := fmt.Sprintf("%x", hashAt5[:])
 
-	// Build the partial snapshot: UTXOs are empty (fine — the full scan will
-	// rebuild them), and Registry.Validators is nil to simulate a snapshot that
-	// was written before the registry field existed.
+	// The snapshot has genuine UTXOs but a nil Validators map — the exact shape
+	// of a checkpoint written before registry snapshotting was added.
 	oldSnap := startupSnapshot{
 		Version:    snapVersion,
 		TipHeight:  snapAtHeight,
 		TipHashHex: tipHashHex5,
 		TxTotal:    0,
-		UTXOs:      core.UTXOSnapshot{}, // empty — scan will rebuild
+		UTXOs:      preUTXOs.TakeSnapshot(),
 		Registry: core.RegistrySnapshot{
 			Validators: nil, // deliberately nil: pre-registry-era snapshot
 		},
@@ -368,8 +384,7 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 		t.Fatalf("saveStartupSnapshot: %v", err)
 	}
 
-	// Set up a fresh UTXOSet and an empty ValidatorRegistry — exactly what the
-	// node creates on startup before loading any snapshot.
+	// ── Step 3: startup scan, exactly as a restarting relay node runs it ──────
 	utxos := core.NewUTXOSet()
 	registry := core.NewValidatorRegistry()
 	registry.SetUTXOSet(utxos)
@@ -379,7 +394,7 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 	tipHashHex := fmt.Sprintf("%x", tip.Hash())
 
 	var snapWg sync.WaitGroup
-	_, scanErr := runStartupScan(startupScanParams{
+	res, scanErr := runStartupScan(startupScanParams{
 		DataDir:     dir,
 		TipHeight:   tip.Header.Height,
 		TipHashHex:  tipHashHex,
@@ -396,14 +411,23 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 	if scanErr != nil {
 		t.Fatalf("runStartupScan: %v", scanErr)
 	}
+	// The scan must have resumed from the partial snapshot, not from block 1.
+	if want := uint64(snapAtHeight + 1); res.ScanFrom != want {
+		t.Fatalf("scan resumed from %d, want %d (partial snapshot was not used)",
+			res.ScanFrom, want)
+	}
+	// The rebuilt UTXO set must be complete: snapshot state (blocks 1–5) plus
+	// the scanned range (blocks 6–10).
+	if wantUTXOs := chainHeight * outsPerBlock; utxos.Count() != wantUTXOs {
+		t.Fatalf("UTXO count after scan = %d, want %d (snapshot + scanned range)",
+			utxos.Count(), wantUTXOs)
+	}
 
-	// ── Assertion 1: at least one active validator ────────────────────────────
+	// ── Step 4: the observed-producer fallback seeded the registry ────────────
 	activeValidators := registry.GetActiveValidators()
 	if len(activeValidators) == 0 {
 		t.Fatal("registry has no active validators after scan — relay node would reject all new blocks")
 	}
-
-	// ── Assertion 2: the seeded pubkey matches the block producer ─────────────
 	wantHex := fmt.Sprintf("%x", []byte(pub))
 	found := false
 	for _, v := range activeValidators {
@@ -413,10 +437,57 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("active validators do not include the known block producer pubkey %s; got %d validator(s)",
-			wantHex[:16]+"…", len(activeValidators))
+		t.Fatalf("active validators do not include the known block producer pubkey %s…; got %d validator(s)",
+			wantHex[:16], len(activeValidators))
 	}
 
-	t.Logf("relay-node old-snapshot bootstrap: %d active validator(s) seeded from observed block producers",
-		len(activeValidators))
+	// ── Step 5: relay engine built from the seeded registry accepts a new block
+	// Mirrors main.go's NonValidator=true path: Config.Validators comes from the
+	// registry's active set, MyKey is nil (never produces blocks).
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(blocksByHeight[0]); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
+	}
+	for h := uint64(1); h <= chainHeight; h++ {
+		if err := relayChain.AddBlock(blocksByHeight[h]); err != nil {
+			t.Fatalf("relay AddBlock h=%d: %v", h, err)
+		}
+	}
+
+	relayMp := core.NewMempool(core.DefaultMempoolConfig())
+	relayEng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   activeValidators, // seeded by the observed-producer fallback
+		Registry:     registry,
+		MyKey:        nil, // non-validator relay: never produces blocks
+	}, relayChain, relayMp, discardLog())
+	relayEng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	relayStop := make(chan struct{})
+	go relayEng.Run(relayStop)
+	defer close(relayStop)
+
+	// A brand-new block at height 11 arrives from the producer after restart.
+	newBlk := makeSignedBlk(t, chainHeight+1, tip.Hash(), priv, pub)
+	relayEng.NewBlockCh() <- newBlk
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("relay chain height = %d after 2 s, want %d; "+
+				"the engine rejected the new block despite the registry being "+
+				"seeded from observed block producers (task #1485 regression)",
+				relayChain.Height(), chainHeight+1)
+		default:
+			if relayChain.Height() == chainHeight+1 {
+				t.Logf("relay-node old-snapshot bootstrap: %d validator(s) seeded; "+
+					"new block %d accepted, chain advanced",
+					len(activeValidators), chainHeight+1)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 }
