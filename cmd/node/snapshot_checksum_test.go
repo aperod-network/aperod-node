@@ -350,6 +350,11 @@ func TestChecksum_PromotionUnreadableSourceSidecarAbortsSave(t *testing.T) {
 	if !strings.Contains(err.Error(), "sidecar") {
 		t.Errorf("error should identify the sidecar promotion failure, got: %v", err)
 	}
+	// The staged sequence promotes the sidecar BEFORE the file, so the aborted
+	// promotion must not have published a prev snapshot at all.
+	if _, statErr := os.Stat(snapshotPrevPath(primary)); statErr == nil {
+		t.Error("aborted promotion must not leave a prev snapshot file behind")
+	}
 
 	// The original primary must still load once the sidecar is readable again.
 	if chmodErr := os.Chmod(chk, 0o644); chmodErr != nil {
@@ -361,6 +366,68 @@ func TestChecksum_PromotionUnreadableSourceSidecarAbortsSave(t *testing.T) {
 	}
 	if snap.TxTotal != 111 {
 		t.Errorf("original primary TxTotal=%d, want 111 — aborted save must not overwrite it", snap.TxTotal)
+	}
+}
+
+// TestChecksum_SidecarWriteFailureAbortsSave — when the sidecar cannot be
+// written, the save must FAIL and the snapshot must not be published: a
+// current-binary snapshot without its checksum would be indistinguishable
+// from a legacy sidecar-less file and would bypass verification on restart.
+func TestChecksum_SidecarWriteFailureAbortsSave(t *testing.T) {
+	dir := t.TempDir()
+	path := snapshotPath(dir, 800)
+	// A directory at the sidecar path makes the atomic tmp→sidecar rename fail.
+	if err := os.Mkdir(snapshotChecksumPath(path), 0o755); err != nil {
+		t.Fatalf("mkdir at sidecar path: %v", err)
+	}
+
+	err := saveStartupSnapshot(dir, makeSnap(800))
+	if err == nil {
+		t.Fatal("save must fail when the checksum sidecar cannot be written")
+	}
+	if !strings.Contains(err.Error(), "sidecar") {
+		t.Errorf("error should identify the sidecar write failure, got: %v", err)
+	}
+	// The snapshot must NOT have been published (staged order: sidecar first).
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Error("snapshot must not be published without its checksum sidecar")
+	}
+}
+
+// TestChecksum_PromotionDstSidecarFailureLeavesNoPrevFile — a destination
+// sidecar write failure during same-height promotion must abort BEFORE the
+// prev snapshot file is copied, so no unverifiable prev backup exists.
+func TestChecksum_PromotionDstSidecarFailureLeavesNoPrevFile(t *testing.T) {
+	dir := t.TempDir()
+	orig := makeSnap(810)
+	orig.TxTotal = 111
+	if err := saveStartupSnapshot(dir, orig); err != nil {
+		t.Fatalf("save original: %v", err)
+	}
+	primary := snapshotPath(dir, 810)
+	prev := snapshotPrevPath(primary)
+	// Block the prev sidecar rename with a directory in its place.
+	if err := os.Mkdir(snapshotChecksumPath(prev), 0o755); err != nil {
+		t.Fatalf("mkdir at prev sidecar path: %v", err)
+	}
+
+	updated := makeSnap(810)
+	updated.TxTotal = 222
+	err := saveStartupSnapshot(dir, updated)
+	if err == nil {
+		t.Fatal("same-height save must abort when the prev sidecar cannot be written")
+	}
+	// No prev snapshot file may exist (sidecar is promoted first).
+	if _, statErr := os.Stat(prev); statErr == nil {
+		t.Error("aborted promotion must not publish a prev snapshot file")
+	}
+	// The original primary must remain intact and verifiable.
+	snap, loadErr := loadStartupSnapshot(dir, 810, orig.TipHashHex)
+	if loadErr != nil {
+		t.Fatalf("original primary must still load after aborted save: %v", loadErr)
+	}
+	if snap.TxTotal != 111 {
+		t.Errorf("original primary TxTotal=%d, want 111", snap.TxTotal)
 	}
 }
 
