@@ -215,6 +215,227 @@ func TestScan_WritesTxIdxEntries(t *testing.T) {
 	}
 }
 
+// TestScan_CheckpointResume_MarkerNotAdvancedWithoutPriorCoverage verifies
+// that when the startup scan resumes only from a suffix (ResumeScanFrom > 0)
+// and there is no prior txidx_complete_height marker covering the prefix,
+// the marker is NOT advanced to TipHeight.  Advancing it would tell the
+// background backfill goroutine that the prefix is already indexed when it
+// is not — leaving those t/ entries permanently missing.
+func TestScan_CheckpointResume_MarkerNotAdvancedWithoutPriorCoverage(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	// Build a 6-block chain.  No t/ entries are written (no storeBlock call).
+	db, tipHeight := buildScanTxIdxChain(t, dir, priv, pub, 6, 2)
+
+	// No prior marker — prefix (heights 1-3) has never been indexed.
+	// Scan resumes only from height 4 (ResumeScanFrom=3).
+	tipHashRaw, _, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	_, scanErr := runStartupScan(startupScanParams{
+		DataDir:        dir,
+		TipHeight:      tipHeight,
+		TipHashHex:     fmt.Sprintf("%x", tipHashRaw[:]),
+		DB:             db,
+		UTXOs:          core.NewUTXOSet(),
+		Registry:       core.NewValidatorRegistry(),
+		ResumeScanFrom: 3, // scan covers 4..6 only
+		Log:            silentLog(),
+	})
+	if scanErr != nil {
+		t.Fatalf("runStartupScan: %v", scanErr)
+	}
+
+	// Marker must NOT be at TipHeight — the prefix 1..3 is still unindexed.
+	h, found, loadErr := db.LoadTxIdxCompleteHeight()
+	if loadErr != nil {
+		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
+	}
+	if found && h >= tipHeight {
+		t.Errorf("txidx_complete_height = %d, want < %d: marker advanced to TipHeight despite uncovered prefix",
+			h, tipHeight)
+	}
+}
+
+// TestScan_CheckpointResume_MarkerAdvancedWhenContiguous verifies the
+// complementary case: when the existing marker establishes coverage through
+// scanFrom-1, the combined coverage is contiguous and it is safe to advance
+// the marker to TipHeight after the suffix scan.
+func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	db, tipHeight := buildScanTxIdxChain(t, dir, priv, pub, 6, 2)
+
+	// Simulate a previous full scan that covered heights 1-3 and left the
+	// marker at 3.  The current run resumes from 4 (ResumeScanFrom=3).
+	if err := db.StoreTxIdxCompleteHeight(3); err != nil {
+		t.Fatalf("StoreTxIdxCompleteHeight: %v", err)
+	}
+
+	tipHashRaw, _, err := db.GetTip()
+	if err != nil {
+		t.Fatalf("GetTip: %v", err)
+	}
+
+	_, scanErr := runStartupScan(startupScanParams{
+		DataDir:        dir,
+		TipHeight:      tipHeight,
+		TipHashHex:     fmt.Sprintf("%x", tipHashRaw[:]),
+		DB:             db,
+		UTXOs:          core.NewUTXOSet(),
+		Registry:       core.NewValidatorRegistry(),
+		ResumeScanFrom: 3, // scan covers 4..6; marker at 3 makes prefix contiguous
+		Log:            silentLog(),
+	})
+	if scanErr != nil {
+		t.Fatalf("runStartupScan: %v", scanErr)
+	}
+
+	// Marker must equal TipHeight now that coverage is 1..6.
+	h, found, loadErr := db.LoadTxIdxCompleteHeight()
+	if loadErr != nil {
+		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
+	}
+	if !found {
+		t.Fatal("txidx_complete_height absent after contiguous-resume scan")
+	}
+	if h != tipHeight {
+		t.Errorf("txidx_complete_height = %d, want %d (TipHeight)", h, tipHeight)
+	}
+}
+
+// TestBackfillTxIdxRange_HaltsOnFetchError verifies that backfillTxIdxRange
+// stops at the first missing block and retains the marker at the last
+// successfully indexed height rather than advancing it past the gap.  On the
+// next restart the goroutine will retry from the retained marker.
+func TestBackfillTxIdxRange_HaltsOnFetchError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+
+	// Build a 5-block chain but deliberately omit block at height 3 to
+	// simulate a missing / corrupted block in the store.
+	db, err2 := store.Open(fmt.Sprintf("%s/chain.db", dir))
+	if err2 != nil {
+		t.Fatalf("store.Open: %v", err2)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	makeTx := func(seed int) core.Transaction {
+		blind, berr := crypto.NewBlindFactor()
+		if berr != nil {
+			t.Fatalf("NewBlindFactor: %v", berr)
+		}
+		commit, cerr := crypto.Commit(uint64(1_000_000+seed), blind)
+		if cerr != nil {
+			t.Fatalf("Commit: %v", cerr)
+		}
+		return core.Transaction{
+			Version: 1,
+			Outputs: []core.Output{{AmountCommit: commit}},
+		}
+	}
+
+	genesis := &core.Block{
+		Header: core.BlockHeader{
+			Height:       0,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(nil),
+		},
+	}
+	if serr := genesis.Header.Sign(priv); serr != nil {
+		t.Fatalf("Sign genesis: %v", serr)
+	}
+	storeRaw := func(b *core.Block) {
+		raw, _ := json.Marshal(b)
+		h := b.Hash()
+		if perr := db.PutRawBlock(h, b.Header.Height, raw); perr != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, perr)
+		}
+	}
+	storeRaw(genesis)
+
+	parent := genesis
+	const totalBlocks = 5
+	const missingHeight = 3
+	for i := 1; i <= totalBlocks; i++ {
+		txs := []core.Transaction{makeTx(i)}
+		hdr := core.BlockHeader{
+			Height:       uint64(i),
+			PrevHash:     parent.Hash(),
+			MerkleRoot:   core.MerkleRoot(txs),
+			Timestamp:    time.Now().UnixNano() + int64(i)*1_000_000,
+			Round:        uint32(i),
+			ValidatorPub: pub,
+		}
+		if serr := hdr.Sign(priv); serr != nil {
+			t.Fatalf("Sign h=%d: %v", i, serr)
+		}
+		blk := &core.Block{Header: hdr, Txs: txs}
+		if i != missingHeight { // skip block 3 to simulate a gap
+			storeRaw(blk)
+		}
+		parent = blk
+	}
+
+	// Run the backfill from 0 through 5; it should halt at height 3.
+	backfillTxIdxRange(0, totalBlocks, db, silentLog())
+
+	// Marker must be at 2 (last fully indexed height before the gap).
+	marker, found, loadErr := db.LoadTxIdxCompleteHeight()
+	if loadErr != nil {
+		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
+	}
+	if !found {
+		t.Fatal("txidx_complete_height absent after partial backfill")
+	}
+	if marker != missingHeight-1 {
+		t.Errorf("txidx_complete_height = %d, want %d (last good height before missing block)",
+			marker, missingHeight-1)
+	}
+
+	// Heights 4 and 5 must NOT have t/ entries (backfill halted before them).
+	for h := uint64(missingHeight + 1); h <= totalBlocks; h++ {
+		raw, rerr := db.GetRawBlockByHeight(h)
+		if rerr != nil || raw == nil {
+			continue // also missing — skip
+		}
+		var b core.Block
+		if jerr := json.Unmarshal(raw, &b); jerr != nil {
+			continue
+		}
+		for i, tx := range b.Txs {
+			entry, lerr := db.LookupTxIdx(tx.Hash())
+			if lerr != nil {
+				t.Errorf("LookupTxIdx at height %d tx %d: %v", h, i, lerr)
+				continue
+			}
+			if entry != nil {
+				t.Errorf("height %d tx %d has t/ entry after halted backfill — marker semantics broken", h, i)
+			}
+		}
+	}
+}
+
 // TestScan_PersiststxidxCompleteHeight checks that runStartupScan persists the
 // txidx_complete_height marker at the scan's TipHeight so the background
 // backfill goroutine knows that range is already covered and skips it.
