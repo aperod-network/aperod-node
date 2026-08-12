@@ -937,29 +937,33 @@ func run() error {
                 }
 
                 // ── Validator startup full height-index check ─────────────────────────
-                // Validators must be bootstrapped from a clean snapshot.  Any missing
-                // h/ entry below the tip is a hard-fail: producing a block on a node
-                // with a corrupt height index risks silent chain divergence that
-                // cannot be automatically recovered.  CountMissingHeights is a cheap
-                // O(n) h/-range scan that terminates immediately after finding the
-                // first gap, so it adds negligible startup time even on large chains.
+                // Validators must be bootstrapped from a clean snapshot.  Any corrupt
+                // h/ entry below the tip — whether absent, zeroed, or pointing at a
+                // missing block body (dangling) — is a hard-fail: producing a block
+                // on a node with a broken height index risks silent chain divergence
+                // that cannot be automatically recovered.
+                //
+                // CheckAllHeightIndex detects both classes of corruption:
+                //   • absent/zeroed h/ keys (missed by CountMissingHeights-only checks)
+                //   • dangling h/ entries whose b/<hash> block body is missing
                 //
                 // This check runs AFTER checkStartupIntegrity (which already verified
-                // the tip entry itself) so it covers only the sub-tip range [1..tip-1].
-                if !cfg.Consensus.NonValidator && !repairDB && tipHeight > 1 {
-                        missing, firstMissing, cntErr := db.CountMissingHeights(tipHeight - 1)
-                        if cntErr != nil {
+                // the tip entry) and covers [0..tipHeight] inclusive.
+                if !cfg.Consensus.NonValidator && !repairDB && tipHeight > 0 {
+                        broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight)
+                        if chkErr != nil {
                                 return fmt.Errorf(
-                                        "startup integrity (validator): height-index scan failed: %w; "+
+                                        "startup integrity (validator): height-index check failed: %w; "+
                                                 "run --repair-height-index or restore from a clean snapshot",
-                                        cntErr)
+                                        chkErr)
                         }
-                        if missing > 0 {
+                        if broken > 0 {
                                 return fmt.Errorf(
-                                        "startup integrity (validator): %d missing height-index entries "+
-                                                "(first missing: %d, tip: %d); "+
+                                        "startup integrity (validator): %d broken height-index entries "+
+                                                "(first broken: %d, tip: %d); broken entries may be absent, "+
+                                                "zeroed, or point at missing block bodies; "+
                                                 "run --repair-height-index or restore from a clean snapshot",
-                                        missing, firstMissing, tipHeight)
+                                        broken, firstBroken, tipHeight)
                         }
                         log.Info("startup integrity (validator): full height-index check passed",
                                 "tip_height", tipHeight)
