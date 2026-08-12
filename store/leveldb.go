@@ -728,6 +728,131 @@ func (d *DB) LookupTxIdx(txHash crypto.Hash32) (*TxIdxEntry, error) {
         }, nil
 }
 
+// RepairAllHeightIndex scans every block stored in the b/ namespace, builds a
+// height→hash map from the actual block data, then sweeps h/<height> for every
+// height in [0..tipHeight] and rewrites any entry that is absent or points at
+// the wrong hash.
+//
+// The b/ key suffix is always the 32-byte block hash; the JSON body contains
+// the height (either as a top-level "height" field for StoredBlock or nested
+// under "Header"."Height" for a serialised core.Block).  Both shapes are probed
+// so the function works regardless of which write path populated the store.
+//
+// progress is called with (scanned, tipHeight) after every 10 000 heights so
+// operators can see that the sweep is making progress; pass nil to skip.
+//
+// Returns the number of h/ entries that were written and the first non-fatal
+// per-height error (the sweep continues past individual errors).
+func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total uint64)) (repaired uint64, err error) {
+        // heightProbe covers both storage shapes:
+        //   StoredBlock  — top-level "height" field
+        //   core.Block   — "Header"."Height" nested field (capital letters, no JSON tags)
+        type heightProbe struct {
+                Height uint64 `json:"height"`
+                Header struct {
+                        Height uint64 `json:"Height"`
+                } `json:"Header"`
+        }
+
+        // Phase 1: build height→hash from b/ block data.
+        // The last 32 bytes of each b/ key are the canonical block hash; the
+        // JSON body supplies the height so we never rely on the h/ index we are
+        // about to repair.
+        byHeight := make(map[uint64]crypto.Hash32, int(tipHeight)+1)
+        iter := d.db.NewIterator(util.BytesPrefix(prefixBlock), nil)
+        for iter.Next() {
+                key := iter.Key()
+                if len(key) < len(prefixBlock)+32 {
+                        continue
+                }
+                var probe heightProbe
+                if jsonErr := json.Unmarshal(iter.Value(), &probe); jsonErr != nil {
+                        continue // corrupt or incompatible entry; skip
+                }
+                h := probe.Height
+                if h == 0 {
+                        h = probe.Header.Height
+                }
+                if h > tipHeight {
+                        continue // beyond tip — ignore
+                }
+                var hash crypto.Hash32
+                copy(hash[:], key[len(prefixBlock):])
+                byHeight[h] = hash
+        }
+        iter.Release()
+        if iterErr := iter.Error(); iterErr != nil {
+                return 0, fmt.Errorf("repair-height-index: scan block namespace: %w", iterErr)
+        }
+
+        // Phase 2: sweep h/<height> for every height in [0..tipHeight].
+        var firstErr error
+        for h := uint64(0); h <= tipHeight; h++ {
+                if progress != nil && h%10000 == 0 {
+                        progress(h, tipHeight)
+                }
+                want, known := byHeight[h]
+                if !known {
+                        // No block data found for this height — cannot repair.
+                        continue
+                }
+                existing, getErr := d.get(heightKey(h))
+                if getErr != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("read height key %d: %w", h, getErr)
+                        }
+                        continue
+                }
+                var existingHash crypto.Hash32
+                if len(existing) == 32 {
+                        copy(existingHash[:], existing)
+                }
+                if existingHash == want {
+                        continue // already correct
+                }
+                // Entry is absent (all-zeros) or mismatched — rewrite with fsync.
+                if repErr := d.putSync(heightKey(h), want[:]); repErr != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
+                        }
+                        continue
+                }
+                repaired++
+        }
+        if progress != nil {
+                progress(tipHeight, tipHeight)
+        }
+        return repaired, firstErr
+}
+
+// StoreHeightIndexSentinel records the tip height at which the full
+// height-index repair sweep last completed.  Its presence on next startup
+// tells the auto-repair path that the index has already been verified and
+// does not need to be re-scanned from scratch.
+func (d *DB) StoreHeightIndexSentinel(tipHeight uint64) error {
+        buf := make([]byte, 8)
+        binary.LittleEndian.PutUint64(buf, tipHeight)
+        return d.PutMeta("height_index_sentinel", buf)
+}
+
+// LoadHeightIndexSentinel returns the tip height stored by the last
+// StoreHeightIndexSentinel call.  Returns (0, false, nil) when no sentinel
+// exists — this is the expected state on a freshly rsync'd node and triggers
+// the startup auto-repair sweep.
+func (d *DB) LoadHeightIndexSentinel() (tipHeight uint64, found bool, err error) {
+        v, err := d.GetMeta("height_index_sentinel")
+        if err != nil {
+                return 0, false, err
+        }
+        if v == nil {
+                return 0, false, nil
+        }
+        if len(v) != 8 {
+                return 0, false, fmt.Errorf("store: height_index_sentinel corrupted (%d bytes, want 8)", len(v))
+        }
+        return binary.LittleEndian.Uint64(v), true, nil
+}
+
 // CountMissingHeights returns the number of missing h/ height-index entries in
 // the range [1, tipHeight] by iterating the sorted height-prefix keys in one
 // pass.  It also returns the lowest missing height (firstMissing = 0 when
