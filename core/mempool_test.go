@@ -13,6 +13,7 @@ package core_test
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -437,6 +438,65 @@ func TestCleanStaleTmpFiles(t *testing.T) {
 	n := pool.Load(dir, log)
 	if n != 0 {
 		t.Fatalf("expected 0 restored txs after cleanup, got %d", n)
+	}
+}
+
+// ─── Task #487: double-spent key image is caught before entering the mempool ─
+//
+// Wires a TxVerifier backed by a UTXOSet with an already-spent key image into
+// the mempool, then submits a transaction reusing that key image and asserts
+// that Add() rejects it with the double-spend error BEFORE the tx is stored.
+// A regression to the VerifyTx step-3 IsSpent guard would let double-spends
+// sit in the mempool until block-apply time.
+func TestMempool_RejectsDoubleSpentKeyImageBeforeEntry(t *testing.T) {
+	cfg := core.MempoolConfig{
+		MaxSize:        100,
+		MaxBytes:       256 * 1024 * 1024,
+		MaxTxSize:      1_000_000,
+		BaseFeePerByte: 0, // fee policy is not under test
+	}
+	pool := core.NewMempool(cfg, silentLogger())
+
+	// Populate a UTXO set and mark one key image as spent.
+	utxos := core.NewUTXOSet()
+	const spentIdx = 7
+	spentKI := makeKeyImage(spentIdx)
+	utxos.MarkSpent(spentKI)
+	if !utxos.IsSpent(spentKI) {
+		t.Fatal("precondition: MarkSpent did not register the key image as spent")
+	}
+
+	// Wire the verifier into the mempool (same path production uses).
+	pool.SetVerifier(core.NewTxVerifier(utxos))
+
+	// A tx reusing the spent key image must be rejected by Add().
+	tx := makeTx(0, spentIdx) // same kiIdx → same key image as spentKI
+	err := pool.Add(tx)
+	if err == nil {
+		t.Fatal("Add: expected error for tx with already-spent key image, got nil")
+	}
+	if !strings.Contains(err.Error(), "double-spend") {
+		t.Errorf("Add: expected double-spend rejection, got: %v", err)
+	}
+
+	// The rejected tx must never have entered the pool.
+	if _, found := pool.Get(tx.Hash()); found {
+		t.Error("rejected double-spend tx is present in the mempool")
+	}
+	if pool.Count() != 0 {
+		t.Errorf("mempool count = %d after rejection, want 0", pool.Count())
+	}
+
+	// Control: a tx with a FRESH key image must NOT trip the double-spend
+	// guard.  It still fails later in VerifyTx (stub ring members are absent
+	// from the UTXO set → C-0a), which proves the spent-KI rejection above
+	// fired specifically on the double-spend check, not on some later step.
+	freshErr := pool.Add(makeTx(0, spentIdx+1))
+	if freshErr == nil {
+		t.Fatal("control tx unexpectedly passed full verification with stub proofs")
+	}
+	if strings.Contains(freshErr.Error(), "double-spend") {
+		t.Errorf("control tx with fresh key image was rejected as double-spend: %v", freshErr)
 	}
 }
 
