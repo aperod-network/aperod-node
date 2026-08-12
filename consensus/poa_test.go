@@ -358,3 +358,121 @@ func TestTimejackingGuard_FutureBlockRejected(t *testing.T) {
 	}
 	t.Log("OK: block with 30 s future timestamp correctly rejected by timejacking guard")
 }
+
+// TestTimejackingBan_PeerBannedAfterThreshold verifies that a rogue peer
+// sending future-timestamped blocks is automatically banned once the
+// TimestampBanThreshold is crossed.
+//
+// The test wires a ban callback via consensus.Config.OnTimestampBan and sends
+// threshold+1 future-timestamped blocks from the same validator.  It confirms:
+//
+//  1. Each block is rejected (chain stays at genesis height 0).
+//  2. The OnTimestampBan callback fires once the threshold is reached and on
+//     every subsequent rejection from the same sender — never before.
+//  3. The callback receives the correct ValidatorPub and an increasing count.
+func TestTimejackingBan_PeerBannedAfterThreshold(t *testing.T) {
+	const threshold = 3 // small value for a fast test
+
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal("GenerateValidatorKey:", err)
+	}
+
+	genesisHdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: validatorPub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := genesisHdr.Sign(validatorPriv); err != nil {
+		t.Fatal("sign genesis:", err)
+	}
+	genesis := &core.Block{Header: genesisHdr}
+
+	chain := core.NewChain()
+	if err := chain.SetGenesis(genesis); err != nil {
+		t.Fatal("SetGenesis:", err)
+	}
+
+	// Track ban-callback invocations so the test can assert on them.
+	type banCall struct {
+		pub   crypto.ValidatorPubKey
+		count int
+	}
+	banCh := make(chan banCall, 20)
+
+	utxos := core.NewUTXOSet()
+	reg := core.NewValidatorRegistry()
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	eng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		Validators:   []crypto.ValidatorPubKey{validatorPub},
+		Registry:     reg,
+		MyKey:        nil, // relay — never produces blocks
+
+		TimestampBanThreshold: threshold,
+		OnTimestampBan: func(pub crypto.ValidatorPubKey, count int) {
+			banCh <- banCall{pub: pub, count: count}
+		},
+	}, chain, mp, newNopLogger())
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go eng.Run(stop)
+
+	futureTs := time.Now().Add(30 * time.Second).UnixNano()
+
+	// Send exactly threshold-1 future blocks — callback must NOT fire yet.
+	for i := 0; i < threshold-1; i++ {
+		block := buildSignedBlock(t, genesis, futureTs, validatorPriv, validatorPub)
+		eng.NewBlockCh() <- block
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case call := <-banCh:
+		t.Fatalf("OnTimestampBan fired too early: got count=%d after only %d blocks (threshold=%d)",
+			call.count, threshold-1, threshold)
+	default:
+		// Good: callback has not fired yet.
+	}
+	if n := eng.TimestampRejectedCount(); int(n) != threshold-1 {
+		t.Errorf("TimestampRejectedCount = %d, want %d after %d rejections",
+			n, threshold-1, threshold-1)
+	}
+
+	// Send the block that crosses the threshold — callback MUST fire now.
+	eng.NewBlockCh() <- buildSignedBlock(t, genesis, futureTs, validatorPriv, validatorPub)
+	select {
+	case call := <-banCh:
+		if !call.pub.Equals(validatorPub) {
+			t.Errorf("OnTimestampBan got wrong ValidatorPub")
+		}
+		if call.count != threshold {
+			t.Errorf("OnTimestampBan count = %d, want %d", call.count, threshold)
+		}
+		t.Logf("OK: OnTimestampBan fired with count=%d at threshold=%d", call.count, threshold)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("OnTimestampBan did not fire within 500 ms after threshold was crossed")
+	}
+
+	// Send one more — callback must fire again (count = threshold+1).
+	eng.NewBlockCh() <- buildSignedBlock(t, genesis, futureTs, validatorPriv, validatorPub)
+	select {
+	case call := <-banCh:
+		if call.count != threshold+1 {
+			t.Errorf("OnTimestampBan count = %d on second crossing, want %d", call.count, threshold+1)
+		}
+		t.Logf("OK: OnTimestampBan fired again with count=%d", call.count)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("OnTimestampBan did not fire for second post-threshold block within 500 ms")
+	}
+
+	// Chain must still be at genesis — all future blocks were rejected.
+	if chain.Height() != 0 {
+		t.Errorf("chain height = %d, want 0; rogue future blocks must not advance the chain", chain.Height())
+	}
+	t.Log("OK: rogue peer correctly banned after threshold future-timestamped blocks")
+}

@@ -10,6 +10,8 @@ import (
         "os"
         "path/filepath"
         "runtime/debug"
+        "strconv"
+        "strings"
         "sync"
         "sync/atomic"
         "time"
@@ -79,6 +81,17 @@ type Config struct {
         // BadBlockBanDuration is how long the ban lasts after the threshold is
         // exceeded.  Default: 24h.
         BadBlockBanDuration time.Duration
+        // TimestampBanThreshold is the number of future-timestamped MsgBlock
+        // messages that a single source IP may send before the host disconnects
+        // and bans that IP.  Each block whose timestamp exceeds
+        // maxTimestampSkewNs (15 s forward) is counted as a strike; strikes
+        // older than badBlockStrikeTTL (1 h) are discarded.
+        // 0 = disabled (default for unit tests); production nodes should set 5.
+        TimestampBanThreshold int
+        // TimestampBanDuration is how long the ban lasts once
+        // TimestampBanThreshold is exceeded.  0 defaults to 1 h (applied in
+        // NewHost when TimestampBanThreshold > 0).
+        TimestampBanDuration time.Duration
         // GetBlockStallTimeout is how long the relay waits for a MsgBlock
         // response after sending MsgGetBlock before it considers the request
         // stalled.  On stall detection the node logs a WARN and re-issues a
@@ -295,6 +308,11 @@ func (p *Peer) Send(msgType MessageType, payload interface{}) error {
 // records are pruned in maintainLoop.
 const badBlockStrikeTTL = time.Hour
 
+// hostMaxClockSkewNs is the maximum allowed forward skew (in nanoseconds) for
+// a block's timestamp before it is counted as a future-timestamp strike.
+// Must stay in sync with consensus.maxClockSkewNs (15 s).
+const hostMaxClockSkewNs = int64(15 * 1_000_000_000)
+
 // stableConnTime is the minimum duration a peer must stay connected before its
 // dial back-off counter is reset.  Peers that connect and disconnect faster
 // than this threshold are considered flapping and keep their failure count so
@@ -437,6 +455,14 @@ type Host struct {
         // Panel notification log.  Capped at stallEventMaxEvents.
         stallEvents []StallEvent
 
+        // tsMu guards tsStrikeCounts.  It is separate from badBlockMu so the
+        // two independent counters can be updated without contention.
+        tsMu sync.Mutex
+        // tsStrikeCounts tracks future-timestamp strikes per source IP.
+        // Entries expire after badBlockStrikeTTL; the map is capped at
+        // badBlockMaxTrackedIPs so a distributed attacker cannot exhaust memory.
+        tsStrikeCounts map[string]badBlockStrike
+
         // keepaliveIntervalNs holds the current live keepalive Ping interval in
         // nanoseconds.  Updated atomically by SetKeepaliveInterval so the change
         // is visible to all active peer goroutines on their next ping tick without
@@ -565,6 +591,9 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.TxRateBurst > 0 && cfg.TxRateBanDuration == 0 {
                 cfg.TxRateBanDuration = time.Hour
         }
+        if cfg.TimestampBanThreshold > 0 && cfg.TimestampBanDuration == 0 {
+                cfg.TimestampBanDuration = time.Hour
+        }
         // Note: TxRateBurst = 0 means "tx rate limiting disabled" — no default
         // is applied here so that unit tests constructing p2p.Config{} directly
         // are not throttled.  Production nodes get the defaults via
@@ -601,6 +630,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 mgr:            newPeerMgrWithFile(cfg.BanFile),
                 gossip:         NewGossipFilter(),
                 badBlockCounts: make(map[string]badBlockStrike),
+                tsStrikeCounts: make(map[string]badBlockStrike),
                 wlNets:         wlNets,
                 wlIPs:          wlIPs,
                 listenFunc:     net.Listen,
@@ -1220,7 +1250,50 @@ func (h *Host) Start() error {
                         }
                 }(addr)
         }
+
+        // Fast-redial known-good whitelist peers (#2008).  Whitelist entries are
+        // usually bare IPs or CIDRs (inbound access control only) and are NOT
+        // dialable; those are skipped.  But an operator may list a trusted peer as
+        // a dialable "host:port" address; dial those immediately at startup too so
+        // a restarted node reconnects without waiting for the first maintain tick.
+        // dialPeer enforces the ban list and MaxPeers/MaxPeersPerIP limits, so this
+        // cannot dial a banned peer or exceed connection caps.
+        for _, entry := range h.GetPeerWhitelist() {
+                addr, ok := dialableWhitelistAddr(entry)
+                if !ok {
+                        continue
+                }
+                go func(a string) {
+                        resolved, err := resolveBootnode(a)
+                        if err != nil {
+                                h.log.Debug("whitelist peer resolve failed", "addr", a, "err", err)
+                                return
+                        }
+                        for _, r := range resolved {
+                                h.dialPeer(r)
+                        }
+                }(addr)
+        }
         return nil
+}
+
+// dialableWhitelistAddr reports whether a whitelist entry looks like a dialable
+// "host:port" address (an IP literal or DNS hostname followed by a decimal port
+// in [1,65535]).  Bare IPs and CIDR ranges (the common whitelist form used for
+// inbound access control) return ok=false so they are never dialled outbound.
+func dialableWhitelistAddr(entry string) (addr string, ok bool) {
+        // CIDR entries contain '/' and are not dialable.
+        if strings.ContainsRune(entry, '/') {
+                return "", false
+        }
+        host, port, err := net.SplitHostPort(entry)
+        if err != nil || host == "" {
+                return "", false
+        }
+        if n, convErr := strconv.Atoi(port); convErr != nil || n < 1 || n > 65535 {
+                return "", false
+        }
+        return entry, true
 }
 
 // Stop shuts down the host gracefully.
@@ -1487,6 +1560,15 @@ func (h *Host) maintainLoop() {
                 }
                 h.badBlockMu.Unlock()
 
+                // Prune stale future-timestamp strike records by the same TTL.
+                h.tsMu.Lock()
+                for ip, s := range h.tsStrikeCounts {
+                        if now.Sub(s.lastSeen) > badBlockStrikeTTL {
+                                delete(h.tsStrikeCounts, ip)
+                        }
+                }
+                h.tsMu.Unlock()
+
                 h.mu.RLock()
                 count := len(h.peers)
                 known := make([]string, len(h.peerList))
@@ -1620,30 +1702,20 @@ func (h *Host) DialPeer(addr string) {
 }
 
 func (h *Host) dialPeer(addr string) {
-        h.mu.RLock()
-        _, already := h.peers[addr]
-        count := len(h.peers)
-        h.mu.RUnlock()
-
-        if already || count >= h.cfg.MaxPeers {
-                return
-        }
-
-        // ── Dial-gate: atomic ban-check + in-flight registration ─────────────
+        // Outbound admission gate (#2008): both the total MaxPeers cap and the
+        // per-IP MaxPeersPerIP cap are enforced atomically under dialGateMu, which
+        // counts established peers PLUS in-flight outbound reservations (dialingIPs).
+        // Doing the check + reservation in one critical section prevents concurrent
+        // dials (e.g. many whitelist redials at startup) from each independently
+        // observing free capacity and all connecting, which would exceed the caps.
+        // dialPeer previously enforced MaxPeers only via a racy pre-check and never
+        // enforced MaxPeersPerIP on the outbound path at all.
         //
         // dialGateMu is also held (write) by BanPeer when it writes a ban and
         // cancels in-flight dials.  Holding it here (read phase) ensures that
         // the sequence "IsBanned → false, register intent, dial" is atomic with
         // "write ban, cancel intents" — so no TCP connection can be initiated
         // to an IP that has just been banned.
-        //
-        // The mutex is released BEFORE net.DialContext so it is never held
-        // across network I/O.
-        // The context carries the total dial+handshake deadline (DialTimeout)
-        // so that both the TCP connect and the TLS handshake are bounded even
-        // when the remote peer accepts TCP but stalls the TLS negotiation.
-        // BanPeer cancels the same context (via the cancel func registered in
-        // dialingIPs) so in-flight dials abort immediately when the peer is banned.
         ctx, cancel := context.WithTimeout(context.Background(), DialTimeout)
         dialID := h.nextDialID.Add(1)
         canonIP := connIP(addr)
@@ -1666,7 +1738,56 @@ func (h *Host) dialPeer(addr string) {
                 h.log.Debug("dialPeer: addr is banned or in back-off window", "addr", addr)
                 return
         }
-        // Register the cancel func so BanPeer can abort this dial.
+
+        // Capacity check: count established peers (guarded by h.mu) and add the
+        // in-flight outbound reservations already registered in dialingIPs. Lock
+        // order dialGateMu -> h.mu matches BanPeer/banTxFlooder (they release
+        // dialGateMu before taking h.mu, so nesting h.mu inside dialGateMu here is
+        // the only nesting direction and cannot deadlock).
+        if h.cfg.MaxPeers > 0 || h.cfg.MaxPeersPerIP > 0 {
+                h.mu.RLock()
+                _, already := h.peers[addr]
+                totalPeers := len(h.peers)
+                perIPPeers := 0
+                if h.cfg.MaxPeersPerIP > 0 {
+                        for peerAddr := range h.peers {
+                                if connIP(peerAddr) == canonIP {
+                                        perIPPeers++
+                                }
+                        }
+                }
+                h.mu.RUnlock()
+
+                // In-flight outbound reservations (this dial not yet registered).
+                totalInflight := 0
+                for _, m := range h.dialingIPs {
+                        totalInflight += len(m)
+                }
+                perIPInflight := len(h.dialingIPs[canonIP])
+
+                if already {
+                        h.dialGateMu.Unlock()
+                        cancel()
+                        return
+                }
+                if h.cfg.MaxPeers > 0 && totalPeers+totalInflight >= h.cfg.MaxPeers {
+                        h.dialGateMu.Unlock()
+                        cancel()
+                        h.log.Debug("dialPeer: MaxPeers reached (incl. in-flight dials)",
+                                "addr", addr, "peers", totalPeers, "inflight", totalInflight, "max", h.cfg.MaxPeers)
+                        return
+                }
+                if h.cfg.MaxPeersPerIP > 0 && perIPPeers+perIPInflight >= h.cfg.MaxPeersPerIP {
+                        h.dialGateMu.Unlock()
+                        cancel()
+                        h.log.Debug("dialPeer: MaxPeersPerIP reached (incl. in-flight dials)",
+                                "addr", addr, "ip", canonIP, "ip_peers", perIPPeers, "ip_inflight", perIPInflight, "max", h.cfg.MaxPeersPerIP)
+                        return
+                }
+        }
+
+        // Register the cancel func (also the in-flight reservation counted above)
+        // so BanPeer can abort this dial and concurrent dials see the reservation.
         if h.dialingIPs[canonIP] == nil {
                 h.dialingIPs[canonIP] = make(map[uint64]context.CancelFunc)
         }
@@ -2292,25 +2413,129 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                 }
                 block := msgToBlock(msg)
                 if block != nil {
-                        // Rogue-fork spam protection: ban peers that repeatedly send
-                        // blocks far ahead of our tip (wrong-fork / CPU-waste attack).
-                        // Counter and ban are keyed by bare IP so a reconnect on a new
-                        // source port does not bypass the enforcement.
                         ourTip := h.handler.CurrentHeight()
                         peerIP := connIP(peer.addr)
-                        // A strike is only warranted when the received block is far
-                        // ahead of our tip AND the sending peer itself is NOT far ahead
-                        // of us.  A peer that is genuinely further along (peer.height >
-                        // ourTip+BadBlockHeightLead) is a node we are actively syncing
-                        // from; the blocks it sends at its own tip arrive via gossip
-                        // before our sync pipeline has applied the intermediate blocks.
-                        // Counting those as strikes would permanently ban the validator
-                        // we are catching up to — the exact bug that caused relay nodes
-                        // started from a snapshot to get banned during the catch-up gap.
+
+                        // ── Step 1: Future-timestamp detection ───────────────────────────────
+                        // This check runs FIRST — before any height-lead or whitelist branch —
+                        // so that out-of-range future-dated blocks from non-whitelisted peers
+                        // are always counted toward the timestamp-ban threshold.
+                        //
+                        // Whitelisted peers (trusted validators) are exempt: a clock-skew
+                        // issue on a known validator must not sever connectivity.  The
+                        // whitelist is read here with the same RLock used by the height-lead
+                        // branch below, adding only a cheap pointer comparison.
+                        //
+                        // If the ban threshold is crossed the function returns immediately;
+                        // otherwise it falls through to the height-lead check so out-of-range
+                        // blocks still accumulate wrong-fork strikes normally.
+                        if h.cfg.TimestampBanThreshold > 0 {
+                                nowNs := time.Now().UnixNano()
+                                isFutureTs := block.Header.Timestamp-nowNs > hostMaxClockSkewNs
+
+                                // Determine whitelist status once (needed for both ts and
+                                // height-lead exemptions in this block).
+                                var tsWhitelisted bool
+                                if isFutureTs {
+                                        h.wlMu.RLock()
+                                        wlNets := h.wlNets
+                                        wlIPs := h.wlIPs
+                                        h.wlMu.RUnlock()
+                                        if (len(wlNets) > 0 || len(wlIPs) > 0) {
+                                                if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
+                                                        tsWhitelisted = true
+                                                }
+                                        }
+                                }
+
+                                if isFutureTs && !tsWhitelisted {
+                                        h.tsMu.Lock()
+                                        tsStrike := h.tsStrikeCounts[peerIP]
+                                        if !tsStrike.lastSeen.IsZero() && time.Since(tsStrike.lastSeen) > badBlockStrikeTTL {
+                                                tsStrike.count = 0
+                                        }
+                                        _, alreadyTracked := h.tsStrikeCounts[peerIP]
+                                        if alreadyTracked || len(h.tsStrikeCounts) < badBlockMaxTrackedIPs {
+                                                tsStrike.count++
+                                                tsStrike.lastSeen = time.Now()
+                                                h.tsStrikeCounts[peerIP] = tsStrike
+                                        }
+                                        tsCount := tsStrike.count
+                                        h.tsMu.Unlock()
+
+                                        h.log.Debug("future-timestamp block from peer",
+                                                "peer", peer.addr,
+                                                "ip", peerIP,
+                                                "block_height", block.Header.Height,
+                                                "skew_ms", (block.Header.Timestamp-nowNs)/1_000_000,
+                                                "count", tsCount)
+
+                                        if tsCount >= h.cfg.TimestampBanThreshold {
+                                                const reason = "repeated future-timestamped blocks (timejacking attack)"
+                                                banDuration := h.cfg.TimestampBanDuration
+                                                h.dialGateMu.Lock()
+                                                h.mgr.Ban(peerIP, reason, banDuration)
+                                                h.cancelInFlightDials(peerIP)
+                                                h.dialGateMu.Unlock()
+                                                h.mu.Lock()
+                                                for addr, p := range h.peers {
+                                                        if connIP(addr) == peerIP {
+                                                                p.conn.Close()
+                                                                delete(h.peers, addr)
+                                                        }
+                                                }
+                                                h.mu.Unlock()
+                                                h.tsMu.Lock()
+                                                delete(h.tsStrikeCounts, peerIP)
+                                                h.tsMu.Unlock()
+                                                h.log.Info("peer IP banned for future-timestamp blocks",
+                                                        "ip", peerIP, "addr", peer.addr, "duration", banDuration,
+                                                        "violations", tsCount)
+                                                h.banEventMu.Lock()
+                                                h.banEvents = append(h.banEvents, BanEvent{
+                                                        IP:              peerIP,
+                                                        PeerAddr:        peer.addr,
+                                                        PeerID:          peer.id,
+                                                        Reason:          reason,
+                                                        Violations:      tsCount,
+                                                        BanDurationSecs: int64(banDuration.Seconds()),
+                                                        At:              time.Now(),
+                                                })
+                                                if len(h.banEvents) > banEventMaxEvents {
+                                                        h.banEvents = h.banEvents[len(h.banEvents)-banEventMaxEvents:]
+                                                }
+                                                h.banEventMu.Unlock()
+                                                return nil
+                                        }
+                                        // Threshold not yet crossed; fall through to height-lead check.
+                                        // The consensus engine will also reject the block independently.
+                                } else if !isFutureTs {
+                                        // Normal timestamp: reset any accumulated strikes for this IP.
+                                        h.tsMu.Lock()
+                                        if _, ok := h.tsStrikeCounts[peerIP]; ok {
+                                                delete(h.tsStrikeCounts, peerIP)
+                                        }
+                                        h.tsMu.Unlock()
+                                }
+                        }
+
+                        // ── Step 2: Rogue-fork / height-lead spam protection ─────────────────
+                        // Ban peers that repeatedly send blocks far ahead of our tip
+                        // (wrong-fork / CPU-waste attack).  Counter and ban are keyed by
+                        // bare IP so a reconnect on a new source port does not bypass the
+                        // enforcement.
+                        //
+                        // A strike is only warranted when the received block is far ahead of
+                        // our tip AND the sending peer itself is NOT far ahead of us.  A peer
+                        // that is genuinely further along (peer.height > ourTip+lead) is a
+                        // node we are actively syncing from; the blocks it sends at its own
+                        // tip arrive via gossip before our sync pipeline has applied the
+                        // intermediate blocks.  Counting those as strikes would permanently
+                        // ban the validator we are catching up to.
                         //
                         // Rogue peers that fabricate future-height blocks announce a
-                        // peer.height that is at or below our tip (they pretend to be
-                        // at the same height), so the second condition catches them.
+                        // peer.height at or below our tip (they pretend to be at the same
+                        // height), so the second condition catches them.
                         if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead &&
                                 peer.height <= ourTip+h.cfg.BadBlockHeightLead {
                                 // Whitelisted peers are trusted validators; skip the
@@ -2439,22 +2664,31 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
                         // stall-detection ticker does not log a false warning for a
                         // block that arrived normally.  Each Peer tracks only the
                         // requests it sent, so deleting here is always safe.
+                        // batchDone is true when the last block of the current
+                        // GetHeaders batch has arrived; it gates the re-trigger below.
                         blockHash := block.Hash()
                         peer.pendingBlocksMu.Lock()
                         delete(peer.pendingBlocks, blockHash)
+                        batchDone := len(peer.pendingBlocks) == 0
                         peer.pendingBlocksMu.Unlock()
 
                         // Gossip relay: forward to all other peers the first time we see this block.
                         isNew := h.gossip.MarkAndCheck(blockHash)
                         h.handler.OnBlock(block)
-                        // If this block extended our tip and we're still behind
-                        // this peer, immediately request the next header batch so
-                        // sync progresses without waiting for the next Pong cycle.
-                        // Without this, only the first block in a 500-header batch
-                        // gets applied (AddBlock requires strict ordering) and the
-                        // node stalls indefinitely when resyncing a large gap.
-                        if newTip := h.handler.CurrentHeight(); newTip > ourTip && newTip < peer.height {
-                                h.requestHeaders(peer)
+                        // Re-trigger requestHeaders exactly once per received batch —
+                        // only when pendingBlocks drains to zero (all blocks in the
+                        // current GetHeaders batch have arrived).  Firing on every
+                        // individual block produces O(n) GetHeaders requests per
+                        // 500-block batch → O(n²) total headers sent back by the
+                        // validator during cold-start catch-up.  Waiting for batch
+                        // completion reduces this to one request per batch with no
+                        // loss of sync progress: the final block's OnBlock() call
+                        // advances CurrentHeight() to lastBatchEnd, which is the
+                        // common ancestor the next GetHeaders needs.
+                        if batchDone {
+                                if newTip := h.handler.CurrentHeight(); newTip > ourTip && newTip < peer.height {
+                                        h.requestHeaders(peer)
+                                }
                         }
                         if isNew {
                                 sb := blockToMsg(block)

@@ -55,6 +55,22 @@ type Config struct {
         // Zero (default) disables the deviation check.
         OracleMaxDeviation float64
 
+        // TimestampBanThreshold is the number of future-timestamped blocks that
+        // must be received from the same validator public key before OnTimestampBan
+        // is called.  0 disables per-validator ban tracking (the global
+        // TimestampRejectedCount counter is always incremented regardless).
+        // Default when left at 0: ban callback is never invoked.
+        // Recommended production value: 5.
+        TimestampBanThreshold int
+        // OnTimestampBan, when non-nil, is called the first time a validator's
+        // per-validator timestamp-rejection count crosses TimestampBanThreshold,
+        // and again on every subsequent rejection from the same validator.
+        // pub identifies the offending block signer; count is the total number
+        // of future-timestamped blocks received from that validator since start.
+        // The callback is invoked from the engine goroutine; it must not block.
+        // Typical implementation: disconnect and ban the peer by source IP.
+        OnTimestampBan func(pub crypto.ValidatorPubKey, count int)
+
         // StakingPoolNAPR is the total pre-allocated validator reward pool in nAPRO.
         // When > 0, block rewards are drawn from this pool rather than minted as new
         // tokens, keeping Total Supply at 10 B (deflationary from day 1).
@@ -125,6 +141,14 @@ type Engine struct {
         // the timejacking guard since node start.  Incremented atomically; safe to
         // read from outside the engine goroutine (e.g. the API server).
         timestampRejected int64
+
+        // tsMu guards tsPerValidator so concurrent reads (API) cannot race the
+        // engine goroutine's writes inside handleIncomingBlock.
+        tsMu sync.Mutex
+        // tsPerValidator tracks how many future-timestamped blocks the engine has
+        // received per block signer (keyed by hex-encoded ValidatorPub ID).
+        // Only populated when cfg.TimestampBanThreshold > 0.
+        tsPerValidator map[string]int
 
         // oracleConsecFails is the number of consecutive oracle fetch failures.
         // Incremented atomically on each failure in fetchOraclePrice; reset to 0 on
@@ -197,6 +221,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
                 newBlockCh:        make(chan *core.Block, 600),
                 newVoteCh:         make(chan FinalizeMsg, 256),
                 producedCh:        make(chan *core.Block, 64),
+                tsPerValidator:    make(map[string]int),
         }
         // Seed the registry with genesis validators so they start Active.
         if cfg.Registry != nil && len(cfg.Validators) > 0 {
@@ -1073,7 +1098,29 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
         nowNs := time.Now().UTC().UnixNano()
         skewNs := block.Header.Timestamp - nowNs
         if skewNs > maxClockSkewNs {
-                atomic.AddInt64(&e.timestampRejected, 1)
+                total := atomic.AddInt64(&e.timestampRejected, 1)
+
+                // Per-validator ban tracking: count rejections per block signer so a
+                // rogue peer cannot flood future-timestamped blocks indefinitely.
+                // Once the count crosses cfg.TimestampBanThreshold, OnTimestampBan is
+                // called on every subsequent rejection so the caller can escalate
+                // (e.g. disconnect and ban the peer's TCP connection).
+                if e.cfg.TimestampBanThreshold > 0 && e.cfg.OnTimestampBan != nil {
+                        pubID := block.Header.ValidatorPub.ID()
+                        e.tsMu.Lock()
+                        e.tsPerValidator[pubID]++
+                        count := e.tsPerValidator[pubID]
+                        e.tsMu.Unlock()
+                        if count >= e.cfg.TimestampBanThreshold {
+                                e.log.Warn("timejacking ban threshold crossed",
+                                        "validator", pubID,
+                                        "per_validator_count", count,
+                                        "global_total", total,
+                                        "threshold", e.cfg.TimestampBanThreshold)
+                                e.cfg.OnTimestampBan(block.Header.ValidatorPub, count)
+                        }
+                }
+
                 return fmt.Errorf("block %d: timestamp too far from local clock (skew %dms, max %dms)",
                         block.Header.Height, skewNs/1_000_000, maxClockSkewNs/1_000_000)
         }

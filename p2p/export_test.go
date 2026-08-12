@@ -197,3 +197,15 @@ func HostPeersToAdvertise(h *Host) []string {
 func HostBanPeer(h *Host, addr, reason string, d time.Duration) {
 	h.mgr.Ban(addr, reason, d)
 }
+
+// TimestampStrikeCount returns the number of IPs currently tracked in the
+// future-timestamp strike map.  Exported for testing only.
+func (h *Host) TimestampStrikeCount() int {
+	h.tsMu.Lock()
+	defer h.tsMu.Unlock()
+	return len(h.tsStrikeCounts)
+}
+
+// HostMaxClockSkewNs is the exported alias for hostMaxClockSkewNs so tests can
+// build future-timestamp values relative to the exact production threshold.
+const HostMaxClockSkewNs = hostMaxClockSkewNs

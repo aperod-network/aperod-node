@@ -191,6 +191,16 @@ type P2PConfig struct {
 	// BadBlockBanDuration is how long a peer IP is banned after exceeding
 	// BadBlockBanThreshold.  Default: 24h.
 	BadBlockBanDuration time.Duration `yaml:"bad_block_ban_duration"`
+	// TimestampBanThreshold is the number of MsgBlock messages with a timestamp
+	// more than 15 s in the future that a single source IP may send before it is
+	// temporarily banned.  Timejacking attacks — where a rogue peer floods
+	// future-dated blocks to shift the chain tip's perception of time — are
+	// blocked at the P2P dispatch layer once this threshold is crossed.
+	// Default: 5.  Set to 0 to disable timestamp-based banning.
+	TimestampBanThreshold int `yaml:"timestamp_ban_threshold"`
+	// TimestampBanDuration is how long a peer IP stays banned after exceeding
+	// TimestampBanThreshold future-timestamp strikes.  Default: 1h.
+	TimestampBanDuration time.Duration `yaml:"timestamp_ban_duration"`
 	// BanFile is the path to the JSON file where active P2P bans are
 	// persisted across restarts.  When empty, defaults to
 	// <data_dir>/p2p_bans.json.  Set to "-" to disable persistence.
@@ -326,10 +336,12 @@ func DefaultConfig() *Config {
 			MaxPeersPerIP:        3,  // eclipse/partition guard: max 3 connections per source IP
 			MinOutbound:          4,  // always keep 4 slots free for outbound dial-outs
 			MaxPendingHandshakes: 20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
-			BadBlockHeightLead:   1000,
-			BadBlockBanThreshold: 5,
-			BadBlockBanDuration:  24 * time.Hour,
-			MaxBlockIngestPerSec: 50,       // cap sync-peer block delivery to prevent CPU spikes
+			BadBlockHeightLead:    1000,
+			BadBlockBanThreshold:  5,
+			BadBlockBanDuration:   24 * time.Hour,
+			TimestampBanThreshold: 5,       // ban peers that send 5+ future-timestamped blocks
+			TimestampBanDuration:  time.Hour,
+			MaxBlockIngestPerSec:  50,      // cap sync-peer block delivery to prevent CPU spikes
 TxRateBurst:          50,       // per-IP tx burst allowance (mempool-flood guard)
 TxRateSustained:      10,       // per-IP sustained tx/sec after burst is spent
 TxRateBanThreshold:   100,      // sustained violations before a temporary ban
@@ -528,6 +540,22 @@ func (c *Config) Validate() error {
 			c.P2P.BadBlockHeightLead, maxSafeHeightLead,
 		)
 	}
+	// Timestamp-ban knob validation.
+	if c.P2P.TimestampBanThreshold < 0 {
+		return fmt.Errorf(
+			"p2p.timestamp_ban_threshold (%d) must not be negative — "+
+				"use 0 to disable timestamp banning or a positive value (recommended: 5)",
+			c.P2P.TimestampBanThreshold,
+		)
+	}
+	if c.P2P.TimestampBanDuration < 0 {
+		return fmt.Errorf(
+			"p2p.timestamp_ban_duration (%v) must not be negative — "+
+				"negative durations create instantly-expired bans; use 0 for the default (1h)",
+			c.P2P.TimestampBanDuration,
+		)
+	}
+
 	// GetBlockStallTimeout: zero means "use the built-in default (15s)".
 	// Negative values would reach p2p.NewHost and cause time.NewTicker to panic
 	// on the first connection; reject them at config-load time instead.
