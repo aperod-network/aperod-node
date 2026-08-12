@@ -259,25 +259,28 @@ func (pm *PeerMgr) OnDialSuccess(addr string) {
 	delete(pm.dialStates, addr)
 }
 
+// banKey returns the canonical map key for addr.
+// When addr is a valid "IP:port" string, the bare IP is returned so that all
+// source ports on the same host share one ban entry.  Non-IP hostnames (e.g.
+// synthetic test addresses) and bare IPs are returned unchanged.
+func banKey(addr string) string {
+	if ip, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(ip) != nil {
+		return ip
+	}
+	return addr
+}
+
 // Ban adds addr to the ban list for duration d with a human-readable reason.
-// When addr is an "IP:port" string, a bare-IP ban is stored in addition to the
-// exact address so that reconnects on any source port are also rejected.
-// IsBanned checks both the full "IP:port" key and the bare IP, but Ban must
-// write the bare-IP entry so that a dial attempt using a *different* port (e.g.
-// the peer's listen port vs its ephemeral connection port) is also blocked.
+// When addr is a valid "IP:port" string, the ban is stored under the bare IP
+// so that every source port on the same host is covered by a single entry.
+// This keeps ListBans, LiftBan, and persistence coherent — one logical ban,
+// one entry, one lift action.
 // The updated ban list is persisted to disk (when a ban file is configured)
 // after the mutex is released so disk I/O never blocks the caller.
 func (pm *PeerMgr) Ban(addr, reason string, d time.Duration) {
-	entry := banEntry{reason: reason, until: time.Now().Add(d)}
+	key := banKey(addr)
 	pm.mu.Lock()
-	pm.banned[addr] = entry
-	// Also record a bare-IP ban so that future dials to any port on the same
-	// host are blocked even when addr carries an ephemeral source port.
-	// net.ParseIP guards against non-IP hostnames (e.g. synthetic test
-	// addresses like "a:1") that would otherwise produce a spurious extra entry.
-	if ip, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(ip) != nil {
-		pm.banned[ip] = entry
-	}
+	pm.banned[key] = banEntry{reason: reason, until: time.Now().Add(d)}
 	pm.mu.Unlock()
 	pm.persistBans()
 }
@@ -362,15 +365,19 @@ func (pm *PeerMgr) ListBans() []BanInfo {
 	return out
 }
 
-// LiftBan removes the ban for addr (exact match only).
+// LiftBan removes the ban for addr.
+// When addr is a valid "IP:port" string, the canonical bare-IP key is used so
+// that a caller passing either the full "IP:port" or the bare "IP" consistently
+// removes the same entry that Ban() and ListBans() use.
 // Returns true when a ban was found and removed; false when addr was not banned.
 // The updated ban list is persisted to disk (when a ban file is configured)
 // after the mutex is released.
 func (pm *PeerMgr) LiftBan(addr string) bool {
+	key := banKey(addr)
 	pm.mu.Lock()
-	_, ok := pm.banned[addr]
+	_, ok := pm.banned[key]
 	if ok {
-		delete(pm.banned, addr)
+		delete(pm.banned, key)
 	}
 	pm.mu.Unlock()
 	if ok {
