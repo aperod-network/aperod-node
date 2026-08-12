@@ -325,33 +325,52 @@ func runRepairHeightIndex() error {
                 }
         }
 
-        repaired, repErr := db.RepairAllHeightIndex(tipHeight, progress)
+        repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, progress)
         fmt.Fprintf(os.Stdout, "\n") // newline after \r progress line
 
-        if repaired > 0 {
-                // Write sentinel so normal startup skips the auto-repair sweep.
+        // Only write the sentinel when the sweep completed without I/O errors
+        // AND without any unrepairable heights (missing block body AND missing
+        // h/ entry).  Silently marking an incomplete sweep as done would allow
+        // subsequent starts to skip the only full verification and boot with
+        // residual corruption.
+        sweepOK := repErr == nil && skipped == 0
+        if sweepOK {
                 if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
                         fmt.Fprintf(os.Stderr,
                                 "repair-height-index: warning: failed to write sentinel: %v\n", sentErr)
                 }
+        }
+
+        if skipped > 0 {
+                fmt.Fprintf(os.Stderr,
+                        "repair-height-index: %d height(s) could not be repaired "+
+                                "(block body missing from b/ namespace) — sentinel NOT written; "+
+                                "restore from a clean snapshot for those heights\n",
+                        skipped)
+        }
+        if repaired > 0 {
                 fmt.Fprintf(os.Stdout,
                         "repair-height-index: repaired %d height-index entries "+
-                                "(tip_height=%d) — start normally\n",
-                        repaired, tipHeight)
+                                "(tip_height=%d, skipped=%d)\n",
+                        repaired, tipHeight, skipped)
         } else {
-                // Index was already consistent; still write the sentinel so
-                // subsequent starts also skip the (now unnecessary) sweep.
-                if sentErr := db.StoreHeightIndexSentinel(tipHeight); sentErr != nil {
-                        fmt.Fprintf(os.Stderr,
-                                "repair-height-index: warning: failed to write sentinel: %v\n", sentErr)
-                }
                 fmt.Fprintf(os.Stdout,
-                        "repair-height-index: height index already consistent "+
-                                "(tip_height=%d, 0 entries repaired) — start normally\n",
-                        tipHeight)
+                        "repair-height-index: height index consistent "+
+                                "(tip_height=%d, 0 entries repaired, skipped=%d)\n",
+                        tipHeight, skipped)
+        }
+        if !sweepOK {
+                fmt.Fprintf(os.Stdout,
+                        "repair-height-index: sweep incomplete — start normally only after resolving the gaps above\n")
+        } else {
+                fmt.Fprintf(os.Stdout,
+                        "repair-height-index: sweep complete — start normally\n")
         }
         if repErr != nil {
                 return fmt.Errorf("repair-height-index: %w", repErr)
+        }
+        if skipped > 0 {
+                return fmt.Errorf("repair-height-index: %d height(s) unrepairable (block body missing)", skipped)
         }
         return nil
 }
@@ -917,38 +936,75 @@ func run() error {
                         return nil
                 }
 
+                // ── Validator startup full height-index check ─────────────────────────
+                // Validators must be bootstrapped from a clean snapshot.  Any missing
+                // h/ entry below the tip is a hard-fail: producing a block on a node
+                // with a corrupt height index risks silent chain divergence that
+                // cannot be automatically recovered.  CountMissingHeights is a cheap
+                // O(n) h/-range scan that terminates immediately after finding the
+                // first gap, so it adds negligible startup time even on large chains.
+                //
+                // This check runs AFTER checkStartupIntegrity (which already verified
+                // the tip entry itself) so it covers only the sub-tip range [1..tip-1].
+                if !cfg.Consensus.NonValidator && !repairDB && tipHeight > 1 {
+                        missing, firstMissing, cntErr := db.CountMissingHeights(tipHeight - 1)
+                        if cntErr != nil {
+                                return fmt.Errorf(
+                                        "startup integrity (validator): height-index scan failed: %w; "+
+                                                "run --repair-height-index or restore from a clean snapshot",
+                                        cntErr)
+                        }
+                        if missing > 0 {
+                                return fmt.Errorf(
+                                        "startup integrity (validator): %d missing height-index entries "+
+                                                "(first missing: %d, tip: %d); "+
+                                                "run --repair-height-index or restore from a clean snapshot",
+                                        missing, firstMissing, tipHeight)
+                        }
+                        log.Info("startup integrity (validator): full height-index check passed",
+                                "tip_height", tipHeight)
+                }
+
                 // ── Startup height-index auto-repair (non-validator nodes) ────────────
                 // On the first start after an rsync bootstrap the
                 // height_index_sentinel metadata key is absent.  Run a full sweep of
                 // the b/ namespace and repair any h/ entry that is missing or zeroed
                 // at heights below the tip — gaps that the tip-only integrity check
                 // above cannot fix.  After a successful sweep the sentinel is written
-                // so subsequent restarts skip this (potentially slow) scan.
+                // so subsequent restarts skip this scan.
                 //
-                // Validators do NOT run this path: they must be bootstrapped from a
-                // clean snapshot and any gap below the tip is a hard-fail requiring
-                // operator intervention.  The sentinel also has no meaning for
-                // --repair-db runs (which already do a full UTXO rebuild and exit
-                // early via the done==true branch above).
+                // The sentinel represents "I've verified and corrected the initial
+                // rsync data".  Blocks added after the sentinel was written use the
+                // atomic PutRawBlock (b/ + h/ in a single fsynced batch), so ordinary
+                // chain growth does NOT require a new sweep — the sentinel remains
+                // valid regardless of how many blocks accumulate after it.
+                //
+                // The sentinel is only written when the sweep completes with no I/O
+                // errors AND no heights that needed repair but had no block body.
+                // A partial sweep leaves the sentinel absent so the next restart
+                // retries rather than skipping on corrupted data.
                 if cfg.Consensus.NonValidator && !repairDB {
-                        sentinelHeight, sentinelFound, sentErr := db.LoadHeightIndexSentinel()
+                        _, sentinelFound, sentErr := db.LoadHeightIndexSentinel()
                         if sentErr != nil {
                                 log.Warn("startup: failed to read height-index sentinel",
                                         "err", sentErr)
                         }
-                        // Run repair when sentinel is absent or was written at a lower
-                        // height than the current tip (the chain has grown since the last
-                        // sweep and may have gained new corrupt entries via incremental rsync).
-                        if !sentinelFound || sentinelHeight < tipHeight {
-                                log.Info("startup: running height-index repair sweep (sentinel absent or stale)",
-                                        "tip_height", tipHeight,
-                                        "sentinel_height", sentinelHeight,
-                                        "sentinel_found", sentinelFound,
-                                )
-                                repaired, sweepErr := db.RepairAllHeightIndex(tipHeight, nil)
+                        // Only sweep when the sentinel is absent (first start after rsync).
+                        // If the sentinel was written at any prior height it means the
+                        // initial rsync data was already verified; new blocks since then
+                        // are atomically written and need no sweep.
+                        if !sentinelFound {
+                                log.Info("startup: height-index sentinel absent — running repair sweep",
+                                        "tip_height", tipHeight)
+                                repaired, skipped, sweepErr := db.RepairAllHeightIndex(tipHeight, nil)
+                                sweepComplete := sweepErr == nil && skipped == 0
                                 if sweepErr != nil {
-                                        log.Warn("startup: height-index sweep completed with errors",
-                                                "repaired", repaired, "err", sweepErr)
+                                        log.Warn("startup: height-index sweep completed with I/O errors",
+                                                "repaired", repaired, "skipped", skipped, "err", sweepErr)
+                                } else if skipped > 0 {
+                                        log.Warn("startup: height-index sweep incomplete — some heights have no block body",
+                                                "repaired", repaired, "skipped", skipped,
+                                                "tip_height", tipHeight)
                                 } else if repaired > 0 {
                                         log.Info("startup: height-index sweep repaired missing entries",
                                                 "repaired", repaired, "tip_height", tipHeight)
@@ -956,11 +1012,13 @@ func run() error {
                                         log.Info("startup: height-index sweep complete — index consistent",
                                                 "tip_height", tipHeight)
                                 }
-                                // Write sentinel regardless of errors so we do not repeat
-                                // the full sweep on every restart when the store is healthy.
-                                if sentErr2 := db.StoreHeightIndexSentinel(tipHeight); sentErr2 != nil {
-                                        log.Warn("startup: failed to write height-index sentinel",
-                                                "err", sentErr2)
+                                // Write sentinel only after a fully successful sweep so that
+                                // a partial repair is retried on the next restart.
+                                if sweepComplete {
+                                        if sentErr2 := db.StoreHeightIndexSentinel(tipHeight); sentErr2 != nil {
+                                                log.Warn("startup: failed to write height-index sentinel",
+                                                        "err", sentErr2)
+                                        }
                                 }
                         }
                 }
