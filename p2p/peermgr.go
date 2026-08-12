@@ -260,11 +260,24 @@ func (pm *PeerMgr) OnDialSuccess(addr string) {
 }
 
 // Ban adds addr to the ban list for duration d with a human-readable reason.
+// When addr is an "IP:port" string, a bare-IP ban is stored in addition to the
+// exact address so that reconnects on any source port are also rejected.
+// IsBanned checks both the full "IP:port" key and the bare IP, but Ban must
+// write the bare-IP entry so that a dial attempt using a *different* port (e.g.
+// the peer's listen port vs its ephemeral connection port) is also blocked.
 // The updated ban list is persisted to disk (when a ban file is configured)
 // after the mutex is released so disk I/O never blocks the caller.
 func (pm *PeerMgr) Ban(addr, reason string, d time.Duration) {
+	entry := banEntry{reason: reason, until: time.Now().Add(d)}
 	pm.mu.Lock()
-	pm.banned[addr] = banEntry{reason: reason, until: time.Now().Add(d)}
+	pm.banned[addr] = entry
+	// Also record a bare-IP ban so that future dials to any port on the same
+	// host are blocked even when addr carries an ephemeral source port.
+	// net.ParseIP guards against non-IP hostnames (e.g. synthetic test
+	// addresses like "a:1") that would otherwise produce a spurious extra entry.
+	if ip, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(ip) != nil {
+		pm.banned[ip] = entry
+	}
 	pm.mu.Unlock()
 	pm.persistBans()
 }
