@@ -151,7 +151,7 @@ func TestDispatch_Block(t *testing.T) {
 		time.Sleep(80 * time.Millisecond)
 	})
 
-	if len(handler.blocks) == 0 {
+	if handler.blockCount() == 0 {
 		t.Error("OnBlock not called")
 	}
 }
@@ -169,7 +169,7 @@ func TestDispatch_Tx(t *testing.T) {
 		time.Sleep(80 * time.Millisecond)
 	})
 
-	if len(handler.txs) == 0 {
+	if handler.txCount() == 0 {
 		t.Error("OnTransaction not called")
 	}
 }
@@ -189,7 +189,7 @@ func TestDispatch_Vote(t *testing.T) {
 		time.Sleep(80 * time.Millisecond)
 	})
 
-	if len(handler.votes) == 0 {
+	if handler.voteCount() == 0 {
 		t.Error("OnVote not called")
 	}
 }
