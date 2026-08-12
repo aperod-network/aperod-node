@@ -1335,6 +1335,61 @@ func run() error {
                 initialTxTotal = scanResult.TxTotal
                 _ = kiCount // already logged above; kept for the key-image index path
                 } // end !snapLoaded
+
+                // ── Background tx-hash index backfill (snapshot fast path) ────────────
+                // When the snapshot fast path skips the full startup block scan, blocks
+                // outside the in-memory chain window may lack t/ entries if they were
+                // accepted before PutTxIdx was introduced or if their SST entries were
+                // lost to an OOM-kill + RecoverFile cycle.  Without t/ entries,
+                // getTransactionFromDisk (LookupTxIdx) cannot resolve those txs and
+                // falls through to the slower u/ GetUTXO and in-memory UTXO fallbacks.
+                //
+                // This goroutine scans pre-window blocks (heights 1 … startLoad-1) in
+                // the background and writes any missing t/ entries.  Progress is tracked
+                // by the txidx_complete_height marker so each restart resumes from where
+                // the previous run stopped — the first run after upgrading does the heavy
+                // scan; subsequent boots that are already complete are instant.
+                //
+                // Blocks inside the chain window (≥ startLoad) already have t/ entries
+                // written by storeBlock at acceptance time and are excluded.
+                if snapLoaded && startLoad > 1 {
+                        completeH, _, _ := db.LoadTxIdxCompleteHeight()
+                        backfillTarget := startLoad - 1
+                        if completeH < backfillTarget {
+                                log.Info("tx index background backfill queued",
+                                        "from_height", completeH+1,
+                                        "to_height", backfillTarget,
+                                )
+                                go func(fromH, toH uint64) {
+                                        const progressInterval = uint64(10_000)
+                                        var errCount int
+                                        for h := fromH + 1; h <= toH; h++ {
+                                                raw, fetchErr := db.GetRawBlockByHeight(h)
+                                                if fetchErr != nil || raw == nil {
+                                                        errCount++
+                                                        continue
+                                                }
+                                                var b core.Block
+                                                if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
+                                                        errCount++
+                                                        continue
+                                                }
+                                                for i, tx := range b.Txs {
+                                                        txHash := tx.Hash()
+                                                        _ = db.PutTxIdx(txHash, b.Header.Height, i)
+                                                }
+                                                if h%progressInterval == 0 {
+                                                        _ = db.StoreTxIdxCompleteHeight(h)
+                                                        log.Info("tx index background backfill progress",
+                                                                "height", h, "target", toH)
+                                                }
+                                        }
+                                        _ = db.StoreTxIdxCompleteHeight(toH)
+                                        log.Info("tx index background backfill complete",
+                                                "to_height", toH, "block_errors", errCount)
+                                }(completeH, backfillTarget)
+                        }
+                }
         }
 
         // Release all block objects decoded during the startup scan.  The GC is
