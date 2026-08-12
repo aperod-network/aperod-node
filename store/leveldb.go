@@ -741,9 +741,15 @@ func (d *DB) LookupTxIdx(txHash crypto.Hash32) (*TxIdxEntry, error) {
 // progress is called with (scanned, tipHeight) after every 10 000 heights so
 // operators can see that the sweep is making progress; pass nil to skip.
 //
-// Returns the number of h/ entries that were written and the first non-fatal
-// per-height error (the sweep continues past individual errors).
-func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total uint64)) (repaired uint64, err error) {
+// Returns:
+//   - repaired: number of h/ entries successfully rewritten.
+//   - skipped:  number of heights whose h/ was absent/mismatched but whose
+//               block body was also absent from b/ — these could NOT be
+//               repaired.  A non-zero skipped count means the sweep is
+//               incomplete; callers must NOT treat the sweep as fully
+//               successful and must not write the height-index sentinel.
+//   - err:      first I/O error encountered (sweep continues past errors).
+func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total uint64)) (repaired uint64, skipped uint64, err error) {
         // heightProbe covers both storage shapes:
         //   StoredBlock  — top-level "height" field
         //   core.Block   — "Header"."Height" nested field (capital letters, no JSON tags)
@@ -782,7 +788,7 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
         }
         iter.Release()
         if iterErr := iter.Error(); iterErr != nil {
-                return 0, fmt.Errorf("repair-height-index: scan block namespace: %w", iterErr)
+                return 0, 0, fmt.Errorf("repair-height-index: scan block namespace: %w", iterErr)
         }
 
         // Phase 2: sweep h/<height> for every height in [0..tipHeight].
@@ -792,10 +798,7 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
                         progress(h, tipHeight)
                 }
                 want, known := byHeight[h]
-                if !known {
-                        // No block data found for this height — cannot repair.
-                        continue
-                }
+
                 existing, getErr := d.get(heightKey(h))
                 if getErr != nil {
                         if firstErr == nil {
@@ -807,10 +810,20 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
                 if len(existing) == 32 {
                         copy(existingHash[:], existing)
                 }
-                if existingHash == want {
+                if known && existingHash == want {
                         continue // already correct
                 }
-                // Entry is absent (all-zeros) or mismatched — rewrite with fsync.
+                if existingHash != (crypto.Hash32{}) && !known {
+                        // h/ has a non-zero entry but b/ has no data — the h/ entry
+                        // could be valid (we just didn't find the block); leave it alone.
+                        continue
+                }
+                if !known {
+                        // h/ is absent/zero AND b/ has no data — cannot repair.
+                        skipped++
+                        continue
+                }
+                // h/ is absent/zero or mismatched, and b/ has the block — rewrite.
                 if repErr := d.putSync(heightKey(h), want[:]); repErr != nil {
                         if firstErr == nil {
                                 firstErr = fmt.Errorf("repair height %d: %w", h, repErr)
@@ -822,7 +835,7 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
         if progress != nil {
                 progress(tipHeight, tipHeight)
         }
-        return repaired, firstErr
+        return repaired, skipped, firstErr
 }
 
 // StoreHeightIndexSentinel records the tip height at which the full
