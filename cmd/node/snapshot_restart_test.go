@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2275,5 +2276,191 @@ func TestTruncatedSnapshotFallsBackToBlockScan(t *testing.T) {
 				t.Errorf("expected error containing %q, got: %v", tc.wantSub, loadErr)
 			}
 		})
+	}
+}
+
+// ─── Task #1083: corrupt primary + NO valid prev-backup → full scan, not exit ─
+
+// TestCorruptPrimaryNoPrevBackupStartsWithFullScan verifies the done-when of
+// task #1083: when the primary snapshot fails checksum verification and NO
+// prev-backup exists (e.g. the disk filled during the backup copy), startup
+// must treat the situation as "no snapshot available" — log the operator
+// warning and proceed with the full block scan — instead of exiting.
+//
+// The test runs the exact production sequence: tryLoadStartupSnapshot (must
+// error, non-fatally) followed by runStartupScan (must SUCCEED from block 1),
+// mirroring main.go where serr != nil merely leaves snapLoaded=false.
+func TestCorruptPrimaryNoPrevBackupStartsWithFullScan(t *testing.T) {
+	dir := t.TempDir()
+	db, blocks := buildChainInStore(t, dir, 4) // genesis + 4 blocks → tip height 4
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	// Save a real snapshot (writes the .sha256 sidecar), then bit-flip the
+	// primary so checksum verification fails.  No prev-backup exists — this
+	// was the FIRST save at this height, so the promotion step was skipped.
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot: %v", err)
+	}
+	primary := snapshotPath(dir, tipHeight)
+	raw, err := os.ReadFile(primary)
+	if err != nil {
+		t.Fatalf("read primary: %v", err)
+	}
+	raw[len(raw)/2] ^= 0x01
+	if err := os.WriteFile(primary, raw, 0644); err != nil {
+		t.Fatalf("corrupt primary: %v", err)
+	}
+	if _, statErr := os.Stat(snapshotPrevPath(primary)); !os.IsNotExist(statErr) {
+		t.Fatalf("pre-condition violated: prev-backup must not exist (stat err=%v)", statErr)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// ── Production step 1: tryLoadStartupSnapshot (main.go fast path). ──────
+	// Must return a distinct non-NotExist error — and main.go must NOT treat
+	// it as fatal (there is no error-return branch: snapLoaded stays false).
+	loadedSnap, _, serr := tryLoadStartupSnapshot(dir, tipHeight, tipHashHex, log)
+	if serr == nil || loadedSnap != nil {
+		t.Fatalf("expected corrupt-primary error, got snap=%v err=%v", loadedSnap, serr)
+	}
+	if os.IsNotExist(serr) {
+		t.Fatalf("corrupt primary with no prev must NOT be os.ErrNotExist (would hide corruption): %v", serr)
+	}
+	if !strings.Contains(serr.Error(), "no prev-backup available") {
+		t.Errorf("expected 'primary corrupt … no prev-backup available' error, got: %v", serr)
+	}
+
+	// Operator-visible warning must be logged with the corrupt_snapshot reason.
+	if !logContainsMsg(&logBuf, "snapshot corrupt or unreadable — falling back to full block scan") {
+		t.Errorf("operator warning about unreadable snapshot not logged\nlog:\n%s", logBuf.String())
+	}
+	if !logContainsFieldValue(&logBuf, "startup_reason", "corrupt_snapshot") {
+		t.Errorf("startup_reason=corrupt_snapshot not logged\nlog:\n%s", logBuf.String())
+	}
+
+	// ── Production step 2: full block scan proceeds and SUCCEEDS. ───────────
+	// Mirrors main.go: snapLoaded=false → !snapLoaded branch → runStartupScan.
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+
+	var wg sync.WaitGroup
+	result, scanErr := runStartupScan(startupScanParams{
+		DataDir:          dir,
+		TipHeight:        tipHeight,
+		TipHashHex:       tipHashHex,
+		DB:               db,
+		UTXOs:            utxos,
+		Registry:         registry,
+		KiFromIndex:      false,
+		InitTxTotal:      0,
+		Log:              log,
+		SnapshotWg:       &wg,
+		MaxMissingBlocks: 0,
+	})
+	wg.Wait()
+	if scanErr != nil {
+		t.Fatalf("runStartupScan must succeed after corrupt-snapshot fallback (node would refuse to start): %v", scanErr)
+	}
+	if result.ScanFrom != 1 {
+		t.Errorf("ScanFrom = %d, want 1 (corrupt primary must not act as a partial checkpoint)", result.ScanFrom)
+	}
+}
+
+// TestCorruptPrimaryAndCorruptPrevBackupStartsWithFullScan covers the harder
+// variant: BOTH the primary and its prev-backup fail checksum verification
+// (disk filled mid-backup-copy, corrupting both).  The fallback loader must
+// return the "prev-backup also failed" error — still non-fatal — and the full
+// block scan must run and succeed.
+func TestCorruptPrimaryAndCorruptPrevBackupStartsWithFullScan(t *testing.T) {
+	dir := t.TempDir()
+	db, blocks := buildChainInStore(t, dir, 3) // tip height 3
+
+	tip := blocks[len(blocks)-1]
+	tipHeight := tip.Header.Height
+	tipHashArr := tip.Hash()
+	tipHashHex := fmt.Sprintf("%x", tipHashArr[:])
+
+	snap := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+		UTXOs:      core.UTXOSnapshot{},
+		Registry:   core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{}},
+	}
+	// Save twice at the same height: the second save promotes the first
+	// primary (and its sidecar) to the prev-backup.
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot (1st): %v", err)
+	}
+	if err := saveStartupSnapshot(dir, snap); err != nil {
+		t.Fatalf("saveStartupSnapshot (2nd): %v", err)
+	}
+	primary := snapshotPath(dir, tipHeight)
+	prev := snapshotPrevPath(primary)
+	for _, p := range []string{primary, prev} {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		raw[len(raw)/2] ^= 0x01
+		if err := os.WriteFile(p, raw, 0644); err != nil {
+			t.Fatalf("corrupt %s: %v", p, err)
+		}
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	loadedSnap, _, serr := tryLoadStartupSnapshot(dir, tipHeight, tipHashHex, log)
+	if serr == nil || loadedSnap != nil {
+		t.Fatalf("expected error when primary AND prev are corrupt, got snap=%v err=%v", loadedSnap, serr)
+	}
+	if os.IsNotExist(serr) {
+		t.Fatalf("double corruption must not be reported as missing: %v", serr)
+	}
+	if !strings.Contains(serr.Error(), "prev-backup also failed") {
+		t.Errorf("expected 'prev-backup also failed' error, got: %v", serr)
+	}
+	if !logContainsFieldValue(&logBuf, "startup_reason", "corrupt_snapshot") {
+		t.Errorf("startup_reason=corrupt_snapshot not logged\nlog:\n%s", logBuf.String())
+	}
+
+	// Full scan still proceeds and succeeds — the node starts slow, not never.
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	var wg sync.WaitGroup
+	result, scanErr := runStartupScan(startupScanParams{
+		DataDir:          dir,
+		TipHeight:        tipHeight,
+		TipHashHex:       tipHashHex,
+		DB:               db,
+		UTXOs:            utxos,
+		Registry:         registry,
+		KiFromIndex:      false,
+		InitTxTotal:      0,
+		Log:              log,
+		SnapshotWg:       &wg,
+		MaxMissingBlocks: 0,
+	})
+	wg.Wait()
+	if scanErr != nil {
+		t.Fatalf("runStartupScan must succeed when both snapshot copies are corrupt: %v", scanErr)
+	}
+	if result.ScanFrom != 1 {
+		t.Errorf("ScanFrom = %d, want 1 (corrupt copies must not act as partial checkpoints)", result.ScanFrom)
 	}
 }
