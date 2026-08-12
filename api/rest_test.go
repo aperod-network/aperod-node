@@ -1072,6 +1072,42 @@ func TestREST_ScanOutputs_Pagination(t *testing.T) {
 	}
 }
 
+// TestREST_ScanOutputs_SkipCoinbase verifies that ?skip_coinbase=true omits
+// coinbase outputs and that callers without the param still receive them.
+func TestREST_ScanOutputs_SkipCoinbase(t *testing.T) {
+	srv, _ := buildChainServer(t, 3) // genesis + 3 blocks, each with a coinbase tx
+
+	// Without skip_coinbase — all outputs returned, at least some are coinbase.
+	_, respAll := restGet(t, srv, "/api/v1/scan/outputs?from_height=0&limit=50")
+	allOutputs, _ := respAll["outputs"].([]interface{})
+	coinbaseCount := 0
+	for _, raw := range allOutputs {
+		entry := raw.(map[string]interface{})
+		if cb, _ := entry["is_coinbase"].(bool); cb {
+			coinbaseCount++
+		}
+	}
+	if coinbaseCount == 0 {
+		t.Fatal("expected at least one coinbase output without skip_coinbase")
+	}
+
+	// With skip_coinbase=true — no coinbase outputs in the response.
+	code, respSkip := restGet(t, srv, "/api/v1/scan/outputs?from_height=0&limit=50&skip_coinbase=true")
+	if code != http.StatusOK {
+		t.Fatalf("skip_coinbase: status = %d, want 200", code)
+	}
+	skippedOutputs, _ := respSkip["outputs"].([]interface{})
+	for i, raw := range skippedOutputs {
+		entry := raw.(map[string]interface{})
+		if cb, _ := entry["is_coinbase"].(bool); cb {
+			t.Errorf("skip_coinbase=true: output[%d] has is_coinbase=true", i)
+		}
+	}
+	// output_count in the envelope must equal the filtered slice length.
+	// (The field is not present in the current response; len(outputs) is the source of truth.)
+	_ = skippedOutputs
+}
+
 // TestREST_AddressScan_PostViewKey verifies POST /api/v1/address/{addr}/scan
 // with the view key in the request body discovers stealth outputs and decodes amounts.
 func TestREST_AddressScan_PostViewKey(t *testing.T) {
