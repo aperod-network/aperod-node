@@ -938,34 +938,6 @@ func (d *DB) CheckAllHeightIndex(tipHeight uint64) (broken uint64, firstBroken u
         return broken, firstBroken, nil
 }
 
-// StoreHeightIndexSentinel records the tip height at which the full
-// height-index repair sweep last completed.  Its presence on next startup
-// tells the auto-repair path that the index has already been verified and
-// does not need to be re-scanned from scratch.
-func (d *DB) StoreHeightIndexSentinel(tipHeight uint64) error {
-        buf := make([]byte, 8)
-        binary.LittleEndian.PutUint64(buf, tipHeight)
-        return d.PutMeta("height_index_sentinel", buf)
-}
-
-// LoadHeightIndexSentinel returns the tip height stored by the last
-// StoreHeightIndexSentinel call.  Returns (0, false, nil) when no sentinel
-// exists — this is the expected state on a freshly rsync'd node and triggers
-// the startup auto-repair sweep.
-func (d *DB) LoadHeightIndexSentinel() (tipHeight uint64, found bool, err error) {
-        v, err := d.GetMeta("height_index_sentinel")
-        if err != nil {
-                return 0, false, err
-        }
-        if v == nil {
-                return 0, false, nil
-        }
-        if len(v) != 8 {
-                return 0, false, fmt.Errorf("store: height_index_sentinel corrupted (%d bytes, want 8)", len(v))
-        }
-        return binary.LittleEndian.Uint64(v), true, nil
-}
-
 // CountMissingHeights returns the number of missing h/ height-index entries in
 // the range [1, tipHeight] by iterating the sorted height-prefix keys in one
 // pass.  It also returns the lowest missing height (firstMissing = 0 when
