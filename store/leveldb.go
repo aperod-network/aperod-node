@@ -357,6 +357,22 @@ func (d *DB) MarkKeyImageSpent(ki crypto.KeyImage) error {
         return d.put(key, []byte{0x01})
 }
 
+// DeleteKeyImage removes a key image from the spent index.  Both the
+// canonical and the raw byte forms are deleted so entries written via the
+// MarkKeyImageSpent fallback path are also purged.  Used by the
+// --rebuild-key-images repair flow to remove phantom "spent" entries that
+// never appeared in any confirmed transaction (Task #1929).
+func (d *DB) DeleteKeyImage(ki crypto.KeyImage) error {
+        if canonical, err := crypto.CanonicalKeyImage(ki); err == nil {
+                key := append(append([]byte{}, prefixKeyImage...), canonical[:]...)
+                if delErr := d.db.Delete(key, nil); delErr != nil {
+                        return delErr
+                }
+        }
+        rawKey := append(append([]byte{}, prefixKeyImage...), ki[:]...)
+        return d.db.Delete(rawKey, nil)
+}
+
 // IsKeyImageSpent returns true if the key image has been recorded as spent.
 // Normalises to the canonical representative before lookup so that any
 // torsion variant of a spent key image is correctly detected as spent.

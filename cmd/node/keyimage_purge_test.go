@@ -1,0 +1,96 @@
+package main
+
+// keyimage_purge_test.go — verifies that rebuildKeyImagesFromBlocks removes
+// phantom "spent" entries from the persistent LevelDB k/ index (Task #1929).
+//
+// Scenario: the k/ index holds two entries — one for a key image that appears
+// in a confirmed transaction, and one phantom entry that never appeared in any
+// block (e.g. written for a transaction that was lost in an OOM kill before it
+// was confirmed).  After the rebuild:
+//
+//   - the confirmed key image must remain spent (index + in-memory set)
+//   - the phantom entry must be purged from the index and absent from the
+//     in-memory set, making the wrongly-blocked UTXO spendable again
+//   - a confirmed key image that was MISSING from the index must be
+//     re-persisted (index completeness repair)
+
+import (
+	"encoding/json"
+	"log/slog"
+	"path/filepath"
+	"testing"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
+)
+
+func TestRebuildKeyImagesPurgesPhantomIndexEntries(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var confirmedKI, missingKI, phantomKI crypto.KeyImage
+	confirmedKI[0] = 0xC1
+	missingKI[0] = 0xC2
+	phantomKI[0] = 0xF1
+
+	// Block 1 contains a tx spending confirmedKI and missingKI.
+	blk := &core.Block{}
+	blk.Header.Height = 1
+	blk.Txs = []core.Transaction{{
+		Inputs: []core.RingInput{
+			{KeyImage: confirmedKI},
+			{KeyImage: missingKI},
+		},
+	}}
+	raw, err := json.Marshal(blk)
+	if err != nil {
+		t.Fatalf("marshal block: %v", err)
+	}
+	if err := db.PutRawBlock(blk.Hash(), 1, raw); err != nil {
+		t.Fatalf("PutRawBlock: %v", err)
+	}
+
+	// Index state before repair: confirmed + phantom present, missing absent.
+	if err := db.MarkKeyImageSpent(confirmedKI); err != nil {
+		t.Fatalf("MarkKeyImageSpent(confirmed): %v", err)
+	}
+	if err := db.MarkKeyImageSpent(phantomKI); err != nil {
+		t.Fatalf("MarkKeyImageSpent(phantom): %v", err)
+	}
+
+	utxos := core.NewUTXOSet()
+	// Simulate the poisoned in-memory state loaded from a stale snapshot.
+	utxos.MarkSpent(phantomKI)
+
+	count, err := rebuildKeyImagesFromBlocks(db, 1, utxos, slog.Default())
+	if err != nil {
+		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 confirmed key images, got %d", count)
+	}
+
+	// In-memory set: confirmed spent, phantom cleared.
+	if !utxos.IsSpent(confirmedKI) {
+		t.Error("confirmed key image must remain spent in memory")
+	}
+	if utxos.IsSpent(phantomKI) {
+		t.Error("phantom key image must be cleared from the in-memory set")
+	}
+
+	// Persistent k/ index: phantom purged, confirmed kept, missing restored.
+	if spent, err := db.IsKeyImageSpent(phantomKI); err != nil || spent {
+		t.Errorf("phantom key image must be purged from index (spent=%v err=%v)", spent, err)
+	}
+	if spent, err := db.IsKeyImageSpent(confirmedKI); err != nil || !spent {
+		t.Errorf("confirmed key image must remain in index (spent=%v err=%v)", spent, err)
+	}
+	if spent, err := db.IsKeyImageSpent(missingKI); err != nil || !spent {
+		t.Errorf("missing confirmed key image must be re-persisted (spent=%v err=%v)", spent, err)
+	}
+}

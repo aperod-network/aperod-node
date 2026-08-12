@@ -31,6 +31,9 @@ type walletSendParams struct {
 
 type walletSendResult struct {
         TxHash             string `json:"tx_hash"`
+        // TotalFeeNAPR is the exact fee charged by the builder (size × base fee),
+        // so wallets can display the real fee instead of a pre-send estimate.
+        TotalFeeNAPR       uint64 `json:"total_fee_napr"`
         ChangeAmtNAPR      uint64 `json:"change_amount_napr"`
         ChangeOutIdx       int    `json:"change_out_idx"`
         ChangeBlindHex     string `json:"change_blind_hex"`
@@ -423,11 +426,17 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         // Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
         verifier := core.NewTxVerifier(s.utxos)
         if err := verifier.VerifyTx(&result.Tx); err != nil {
+                if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
+                        return nil, fmt.Errorf("verify: %w", dsErr)
+                }
                 return nil, fmt.Errorf("verify: %w", err)
         }
 
         // ── 7. Submit to mempool ──────────────────────────────────────────────────
         if err := s.mempool.Add(result.Tx); err != nil {
+                if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
+                        return nil, fmt.Errorf("mempool: %w", dsErr)
+                }
                 return nil, fmt.Errorf("mempool: %w", err)
         }
 
@@ -440,6 +449,7 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
 
         return walletSendResult{
                 TxHash:             fmt.Sprintf("%x", txHash[:]),
+                TotalFeeNAPR:       result.TotalFee,
                 ChangeAmtNAPR:      result.ChangeAmount,
                 ChangeOutIdx:       result.ChangeOutIdx,
                 ChangeBlindHex:     changeBlindHex,
@@ -449,6 +459,36 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 DecoyCount:         result.RealDecoyCount,
                 FallbackDecoyCount: result.FallbackDecoyCount,
         }, nil
+}
+
+// describeSpentInput checks each real input of a freshly built transaction
+// against the chain key-image set and, when one is flagged as spent, returns
+// an error that names the exact source UTXO (tx hash + output index).
+//
+// Wallets use this reference to skip only the failing candidate instead of
+// discarding all of them (Task #1928).  The message also carries a phantom
+// hint: after an OOM kill the persistent key-image index can hold entries for
+// key images that never appeared in any confirmed transaction (Task #1929);
+// operators repair that with `aperod-node --rebuild-key-images`.
+//
+// Returns nil when no input is flagged (the original error was unrelated).
+func describeSpentInput(utxos *core.UTXOSet, result *core.BuildResult) error {
+        if utxos == nil || result == nil {
+                return nil
+        }
+        for i, inp := range result.Tx.Inputs {
+                if !utxos.IsSpent(inp.KeyImage) {
+                        continue
+                }
+                if i < len(result.SelectedUTXOs) {
+                        su := result.SelectedUTXOs[i]
+                        return fmt.Errorf(
+                                "key image already spent for utxo %x[%d] — if this UTXO has no confirmed spend on-chain, the key-image index holds a phantom entry; run aperod-node --rebuild-key-images",
+                                su.TxHash[:], su.OutputIndex)
+                }
+                return fmt.Errorf("key image already spent at input %d", i)
+        }
+        return nil
 }
 
 // ─── hex decode helpers ───────────────────────────────────────────────────────

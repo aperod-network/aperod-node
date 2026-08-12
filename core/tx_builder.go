@@ -82,6 +82,12 @@ type BuildResult struct {
         // A non-zero value means privacy is degraded: the ring contains provably
         // fake members that can be distinguished from real UTXOs.
         FallbackDecoyCount int
+        // SelectedUTXOs are the owned UTXOs that were consumed as real inputs,
+        // ordered identically to Tx.Inputs.  Callers use this to map a
+        // per-input verification failure (e.g. "double-spend at input i") back
+        // to the exact source UTXO (TxHash, OutputIndex) so wallets can skip
+        // only the failing candidate instead of discarding all of them.
+        SelectedUTXOs []OwnedUTXO
 }
 
 // Build constructs a signed RingCT transaction.
@@ -349,6 +355,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 PayOutIdx:          0,
                 RealDecoyCount:     totalRealDecoys,
                 FallbackDecoyCount: totalFallbackDecoys,
+                SelectedUTXOs:      selected,
         }, nil
 }
 

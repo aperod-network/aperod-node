@@ -1891,6 +1891,17 @@ func run() error {
                                 apiSrv.SetWhitelistGetFunc(host.GetPeerWhitelist)
                                 apiSrv.SetWhitelistAddFunc(host.AddToWhitelist)
                                 apiSrv.SetWhitelistRemoveFunc(host.RemoveFromWhitelist)
+                                // Wire live keepalive-interval tuning so the Admin Panel
+                                // can adjust it without a node restart.
+                                apiSrv.SetP2PKeepaliveGetFunc(host.GetKeepaliveInterval)
+                                apiSrv.SetP2PKeepaliveSetFunc(host.SetKeepaliveInterval)
+                                // Wire static rogue-fork ban parameters so the Admin Panel
+                                // can display the values configured in node.yaml.
+                                apiSrv.SetP2PBanConfig(
+                                        cfg.P2P.BadBlockBanThreshold,
+                                        int64(cfg.P2P.BadBlockBanDuration.Seconds()),
+                                        cfg.P2P.BadBlockHeightLead,
+                                )
                                 // Wire whitelist-exemption event log for the Admin Panel.
                                 apiSrv.SetWhitelistExemptFunc(func(since time.Time) []api.WhitelistExemptionEntry {
                                         evts := host.GetWhitelistExemptions(since)
@@ -2775,6 +2786,10 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
 func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *core.UTXOSet, log *slog.Logger) (int, error) {
         utxos.ClearKeyImages()
         count := 0
+        // valid holds every key image that appears in a confirmed transaction,
+        // in both raw and canonical form, so the LevelDB k/ index purge below
+        // recognises entries written via either MarkKeyImageSpent path.
+        valid := make(map[crypto.KeyImage]bool)
         for h := uint64(1); h <= tipHeight; h++ {
                 if h%100000 == 0 {
                         log.Info("--rebuild-key-images: scanning blocks",
@@ -2791,10 +2806,49 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                 for _, tx := range blk.Txs {
                         for _, inp := range tx.Inputs {
                                 utxos.MarkSpent(inp.KeyImage)
+                                valid[inp.KeyImage] = true
+                                if canonical, cErr := crypto.CanonicalKeyImage(inp.KeyImage); cErr == nil {
+                                        valid[canonical] = true
+                                }
                                 count++
                         }
                 }
         }
+
+        // ── Purge phantom entries from the persistent k/ index (Task #1929) ──
+        // The in-memory rebuild above fixes the snapshot, but startups WITHOUT a
+        // snapshot load key images from the LevelDB k/ index — if phantom
+        // entries stay there, the same UTXOs become unspendable again after the
+        // next snapshot loss (exactly the OOM-kill scenario this flag repairs).
+        removed := 0
+        purgeErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
+                if valid[ki] {
+                        return nil
+                }
+                if canonical, cErr := crypto.CanonicalKeyImage(ki); cErr == nil && valid[canonical] {
+                        return nil
+                }
+                if delErr := blockStore.DeleteKeyImage(ki); delErr != nil {
+                        log.Warn("--rebuild-key-images: failed to delete phantom key image from index",
+                                "key_image", fmt.Sprintf("%x", ki[:8]), "err", delErr)
+                        return nil
+                }
+                removed++
+                return nil
+        })
+        if purgeErr != nil {
+                log.Warn("--rebuild-key-images: k/ index purge incomplete", "err", purgeErr)
+        }
+        // Re-persist every confirmed key image so the index is complete even if
+        // some entries were missing before the repair.
+        for ki := range valid {
+                if kiErr := blockStore.MarkKeyImageSpent(ki); kiErr != nil {
+                        log.Warn("--rebuild-key-images: failed to persist key image",
+                                "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
+                }
+        }
+        log.Info("--rebuild-key-images: persistent index reconciled",
+                "phantom_entries_removed", removed, "confirmed_key_images", count)
         return count, nil
 }
 
