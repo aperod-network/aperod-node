@@ -8,8 +8,12 @@
 #
 #    timeout.conf     — TimeoutStopSec=900 (15 min shutdown window
 #                       so the UTXO snapshot can flush to disk)
-#    gomemlimit.conf  — GOMEMLIMIT=5368709120 (5 GiB Go heap cap
-#                       to prevent OOM-kill and corrupt snapshots)
+#    gomemlimit.conf  — GOMEMLIMIT=<canonical> (Go heap cap to
+#                       prevent OOM-kill and corrupt snapshots).
+#                       The value is read from the canonical
+#                       drop-in file (gomemlimit.conf) that ships
+#                       alongside this script — the single source
+#                       of truth for the production limit.
 #
 #  Safe to call multiple times; only rewrites a file when its
 #  content has changed.  Calls `systemctl daemon-reload` at the
@@ -21,10 +25,13 @@
 #    bash "${INSTALL_DIR}/deploy/ensure-dropin.sh"
 #
 #  Injectable seams for testing (override via environment):
-#    DROPIN_DIR   — directory that holds the .conf files
-#                   (default: /etc/systemd/system/aperod-node.service.d)
-#    SYSTEMCTL    — systemctl binary/stub
-#                   (default: systemctl)
+#    DROPIN_DIR       — directory that holds the installed .conf files
+#                       (default: /etc/systemd/system/aperod-node.service.d)
+#    SYSTEMCTL        — systemctl binary/stub
+#                       (default: systemctl)
+#    CANONICAL_DROPIN — repo drop-in file holding the source-of-truth
+#                       GOMEMLIMIT value
+#                       (default: <script dir>/gomemlimit.conf)
 # ============================================================
 set -euo pipefail
 
@@ -37,6 +44,26 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 # ── Injectable seams (overridable for tests) ───────────────
 DROPIN_DIR="${DROPIN_DIR:-/etc/systemd/system/aperod-node.service.d}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+
+# ── Canonical GOMEMLIMIT source of truth ───────────────────
+# The expected GOMEMLIMIT is read from the canonical drop-in file that ships
+# in this directory (gomemlimit.conf) rather than being hard-coded here, so
+# bumping the production limit only requires editing one place.
+# CANONICAL_DROPIN — overridable so tests can point at a temp file.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CANONICAL_DROPIN="${CANONICAL_DROPIN:-${SCRIPT_DIR}/gomemlimit.conf}"
+
+if [[ ! -f "${CANONICAL_DROPIN}" ]]; then
+  echo -e "${RED}[ERR]${NC}   Canonical drop-in not found: ${CANONICAL_DROPIN}" >&2
+  echo -e "${RED}[ERR]${NC}   This file holds the source-of-truth GOMEMLIMIT value. Restore it from the repo." >&2
+  exit 1
+fi
+
+GOMEMLIMIT_VALUE=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${CANONICAL_DROPIN}" | head -1 | cut -d= -f2)
+if [[ -z "${GOMEMLIMIT_VALUE}" ]]; then
+  echo -e "${RED}[ERR]${NC}   Could not parse GOMEMLIMIT from canonical drop-in: ${CANONICAL_DROPIN}" >&2
+  exit 1
+fi
 
 # ── Helper: write file only when content differs ──────────
 write_if_changed() {
@@ -70,12 +97,12 @@ TimeoutStopSec=900"
 write_if_changed "${DROPIN_DIR}/timeout.conf" "${TIMEOUT_CONTENT}"
 
 # ── gomemlimit.conf ───────────────────────────────────────
-# GOMEMLIMIT caps the Go heap at 5 GiB so the runtime triggers
-# GC before the kernel OOM-killer fires.  Without this cap the
-# node's RSS can grow past available RAM, triggering SIGKILL
-# and corrupting the LevelDB snapshot.
+# GOMEMLIMIT caps the Go heap so the runtime triggers GC before the kernel
+# OOM-killer fires.  Without this cap the node's RSS can grow past available
+# RAM, triggering SIGKILL and corrupting the LevelDB snapshot.  The value is
+# taken from the canonical drop-in file (single source of truth).
 GOMEMLIMIT_CONTENT="[Service]
-Environment=\"GOMEMLIMIT=5368709120\""
+Environment=\"GOMEMLIMIT=${GOMEMLIMIT_VALUE}\""
 
 write_if_changed "${DROPIN_DIR}/gomemlimit.conf" "${GOMEMLIMIT_CONTENT}"
 

@@ -387,6 +387,7 @@ func run() error {
                 os.Getenv("GOMEMLIMIT"),
                 configMemLimitApplied,
                 strictMemLimit,
+                cfg.MemoryLimitDisabled,
                 "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf",
                 log,
         ); err != nil {
@@ -2150,13 +2151,27 @@ func run() error {
         performShutdown(stop, engineDone, db, utxos, registry, cfg.DataDir, log, apiSrv)
 
         // Persist pending mempool transactions so they survive the restart.
-        if mpErr := mempool.Save(cfg.DataDir); mpErr != nil {
+        saveMempoolOnShutdown(mempool, cfg.DataDir, log)
+
+        return nil
+}
+
+// saveMempoolOnShutdown persists the mempool to dataDir during a graceful
+// shutdown and reports the outcome to the log.  A Save() failure MUST be
+// surfaced at WARN level (task #1625): losing the mempool silently on shutdown
+// makes it impossible to tell — from the journal alone — whether pending
+// transactions were preserved across a restart.  On success it logs the number
+// of persisted transactions at INFO level.
+//
+// This is the exact code path the SIGTERM/SIGINT handler in run() invokes; it
+// is extracted into a named function so it can be tested in isolation with a
+// non-writable data directory (see shutdown_save_log_test.go).
+func saveMempoolOnShutdown(mempool *core.Mempool, dataDir string, log *slog.Logger) {
+        if mpErr := mempool.Save(dataDir); mpErr != nil {
                 log.Warn("shutdown: failed to save mempool", "err", mpErr)
         } else {
                 log.Info("shutdown: mempool saved", "pending_txs", mempool.Count())
         }
-
-        return nil
 }
 
 // performShutdown stops the consensus engine and saves a startup snapshot so
@@ -2535,7 +2550,7 @@ func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
 //	                        included in the suggested fix message so operators know
 //	                        exactly which file to recreate
 //	log                  – structured logger
-func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bool, dropinPath string, log *slog.Logger) error {
+func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bool, memLimitDisabled bool, dropinPath string, log *slog.Logger) error {
         const warnMsg = "GOMEMLIMIT is not set — node may OOM under load"
 
         // A limit applied via node.yaml memory_limit_bytes satisfies the check
@@ -2562,6 +2577,19 @@ func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bo
                         "fix", fix,
                 )
                 return fmt.Errorf("refusing to start without GOMEMLIMIT (--strict-memlimit is set): %s", fix)
+        }
+
+        // The operator has declared that running uncapped is intentional
+        // (memory_limit_disabled: true in node.yaml).  Downgrade the warning to
+        // DEBUG so the journal is not spammed with a WARN on every startup while
+        // still leaving a trace for anyone who enables debug logging.
+        if memLimitDisabled {
+                log.Debug(warnMsg,
+                        "gomemlimit_value", gomlimitEnv,
+                        "memory_limit_disabled", true,
+                        "fix", fix,
+                )
+                return nil
         }
 
         log.Warn(warnMsg,

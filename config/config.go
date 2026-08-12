@@ -95,6 +95,16 @@ type Config struct {
 	// Set to 0 (default) to rely solely on the GOMEMLIMIT env var.
 	MemoryLimitBytes int64 `yaml:"memory_limit_bytes"`
 
+	// MemoryLimitDisabled, when true, tells the node that running without any
+	// memory cap (neither GOMEMLIMIT nor memory_limit_bytes) is intentional.
+	// The startup guard then logs the "GOMEMLIMIT is not set" message at DEBUG
+	// level instead of WARN, silencing the warning for operators who have
+	// deliberately chosen to run uncapped (e.g. containers with an external
+	// cgroup limit).  It is contradictory to set this together with a positive
+	// memory_limit_bytes; that combination is rejected in Validate().
+	// Default: false.
+	MemoryLimitDisabled bool `yaml:"memory_limit_disabled"`
+
 	// GCPercent sets the Go garbage-collector target percentage via
 	// debug.SetGCPercent.  The runtime triggers a GC cycle when the live
 	// heap has grown by this percentage since the previous cycle.
@@ -450,6 +460,18 @@ func (c *Config) Validate() error {
 			"memory_limit_bytes (%d) is below the safe floor of %d (512 MiB) — "+
 				"values this small cause instant GC thrash; set 0 to disable or use >= 512 MiB",
 			c.MemoryLimitBytes, minSafeMemoryLimit,
+		)
+	}
+	// memory_limit_disabled says "running uncapped is intentional"; it is
+	// contradictory to also request an in-process cap via memory_limit_bytes.
+	// Reject the combination rather than silently ignoring one of the two
+	// settings, so the operator's intent is never ambiguous.
+	if c.MemoryLimitDisabled && c.MemoryLimitBytes > 0 {
+		return fmt.Errorf(
+			"memory_limit_disabled is true but memory_limit_bytes (%d) is also set — "+
+				"these are contradictory; set memory_limit_disabled: false to apply the cap, "+
+				"or memory_limit_bytes: 0 to run intentionally uncapped",
+			c.MemoryLimitBytes,
 		)
 	}
 	// Peer whitelist: every entry must be a valid IP address or CIDR range.

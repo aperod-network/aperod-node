@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -57,7 +59,7 @@ func TestValidate_BadBlockKnobs(t *testing.T) {
 			wantError: false,
 		},
 		{
-			name:      "custom valid combination is accepted",
+			name: "custom valid combination is accepted",
 			mutate: func(cfg *Config) {
 				cfg.P2P.BadBlockBanThreshold = 3
 				cfg.P2P.BadBlockHeightLead = 500
@@ -270,5 +272,104 @@ func TestValidate_MemoryLimitBytes(t *testing.T) {
 				t.Errorf("Validate() returned unexpected error for memory_limit_bytes=%d: %v", tc.value, err)
 			}
 		})
+	}
+}
+
+// TestValidate_MemoryLimitDisabled covers task #1710: memory_limit_disabled is
+// intended to silence the startup GOMEMLIMIT warning when running uncapped is
+// deliberate.  Setting it together with a positive memory_limit_bytes is
+// contradictory and must be rejected; every other combination is accepted.
+func TestValidate_MemoryLimitDisabled(t *testing.T) {
+	const mib512 = 512 * 1024 * 1024
+
+	tests := []struct {
+		name       string
+		disabled   bool
+		limitBytes int64
+		wantError  bool
+	}{
+		{
+			name:      "disabled true with zero limit is accepted",
+			disabled:  true,
+			wantError: false,
+		},
+		{
+			name:      "disabled false with zero limit is accepted",
+			disabled:  false,
+			wantError: false,
+		},
+		{
+			name:       "disabled false with positive limit is accepted",
+			disabled:   false,
+			limitBytes: mib512,
+			wantError:  false,
+		},
+		{
+			name:       "disabled true with positive limit is rejected (contradictory)",
+			disabled:   true,
+			limitBytes: mib512,
+			wantError:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.MemoryLimitDisabled = tc.disabled
+			cfg.MemoryLimitBytes = tc.limitBytes
+
+			err := cfg.Validate()
+			if tc.wantError && err == nil {
+				t.Errorf("Validate() returned nil, want error for disabled=%v limit=%d", tc.disabled, tc.limitBytes)
+			}
+			if !tc.wantError && err != nil {
+				t.Errorf("Validate() returned unexpected error for disabled=%v limit=%d: %v", tc.disabled, tc.limitBytes, err)
+			}
+		})
+	}
+}
+
+// TestMemoryLimitDisabledParsesFromYAML verifies the memory_limit_disabled
+// field round-trips through the YAML loader (task #1710).
+func TestMemoryLimitDisabledParsesFromYAML(t *testing.T) {
+	dir := t.TempDir()
+
+	// Explicit true must be parsed as true.
+	pTrue := filepath.Join(dir, "node_true.yaml")
+	if err := os.WriteFile(pTrue, []byte("memory_limit_disabled: true\n"), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	cTrue, err := Load(pTrue)
+	if err != nil {
+		t.Fatalf("Load(true): %v", err)
+	}
+	if !cTrue.MemoryLimitDisabled {
+		t.Errorf("memory_limit_disabled = false, want true")
+	}
+
+	// Explicit false must be parsed as false.
+	pFalse := filepath.Join(dir, "node_false.yaml")
+	if err := os.WriteFile(pFalse, []byte("memory_limit_disabled: false\n"), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	cFalse, err := Load(pFalse)
+	if err != nil {
+		t.Fatalf("Load(false): %v", err)
+	}
+	if cFalse.MemoryLimitDisabled {
+		t.Errorf("memory_limit_disabled = true, want false")
+	}
+
+	// Omitted field must default to false.
+	pOmit := filepath.Join(dir, "node_omit.yaml")
+	if err := os.WriteFile(pOmit, []byte("network: testnet\n"), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	cOmit, err := Load(pOmit)
+	if err != nil {
+		t.Fatalf("Load(omit): %v", err)
+	}
+	if cOmit.MemoryLimitDisabled {
+		t.Errorf("memory_limit_disabled default = true, want false")
 	}
 }

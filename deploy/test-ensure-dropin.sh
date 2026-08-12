@@ -7,7 +7,9 @@
 #  Tests verify:
 #    1. Both drop-in files are created on first run.
 #    2. timeout.conf has [Service] + TimeoutStopSec=900.
-#    3. gomemlimit.conf has [Service] + Environment="GOMEMLIMIT=5368709120".
+#    3. gomemlimit.conf has [Service] + Environment="GOMEMLIMIT=<canonical>",
+#       where the expected value is parsed from a temp canonical drop-in file
+#       (CANONICAL_DROPIN seam) — decoupled from any hard-coded literal.
 #    4. A second run is idempotent: file content is unchanged (mtime stable).
 #    5. daemon-reload is called on every run, even when nothing changed.
 #    6. Static analysis: ensure-dropin.sh calls ${SYSTEMCTL} daemon-reload.
@@ -43,6 +45,15 @@ fi
 TMPDIR_TEST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
+# ── Canonical drop-in (source of truth) injected via CANONICAL_DROPIN seam ────
+# ensure-dropin.sh parses the expected GOMEMLIMIT from this file instead of a
+# hard-coded literal.  Point it at a temp file with a known value so the tests
+# stay decoupled from whatever the repo's production number happens to be.
+EXPECTED_GOMEMLIMIT="5905580032"
+CANONICAL_DROPIN_FILE="$TMPDIR_TEST/canonical-gomemlimit.conf"
+printf '[Service]\nEnvironment="GOMEMLIMIT=%s"\n' "$EXPECTED_GOMEMLIMIT" \
+  > "$CANONICAL_DROPIN_FILE"
+
 # ---------------------------------------------------------------------------
 # make_fake_bin CMD LOG_FILE
 #   Creates a stub binary for CMD in a fresh temp dir.  Every invocation
@@ -74,6 +85,7 @@ run_ensure_dropin() {
 
   DROPIN_DIR="$dropin_dir" \
   SYSTEMCTL="$fake_sc_dir/systemctl" \
+  CANONICAL_DROPIN="$CANONICAL_DROPIN_FILE" \
   bash "$ENSURE_SH"
 }
 
@@ -123,7 +135,7 @@ fi
 # =============================================================================
 # Test 3: gomemlimit.conf has correct content
 # =============================================================================
-section "Test 3: gomemlimit.conf has [Service] and Environment=\"GOMEMLIMIT=5368709120\""
+section "Test 3: gomemlimit.conf has [Service] and Environment=\"GOMEMLIMIT=<canonical>\" (parsed from CANONICAL_DROPIN)"
 
 if grep -q "^\[Service\]$" "$T1_DIR/gomemlimit.conf" 2>/dev/null; then
   pass "[Service] header found in gomemlimit.conf"
@@ -131,10 +143,67 @@ else
   fail "[Service] header NOT found in gomemlimit.conf (content: $(cat "$T1_DIR/gomemlimit.conf" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q '^Environment="GOMEMLIMIT=5368709120"$' "$T1_DIR/gomemlimit.conf" 2>/dev/null; then
-  pass "Environment=\"GOMEMLIMIT=5368709120\" found in gomemlimit.conf"
+# The written value must equal the canonical value ensure-dropin.sh parsed from
+# CANONICAL_DROPIN_FILE (not a hard-coded literal).  If ensure-dropin.sh ever
+# reverts to hard-coding a different number, this assertion fails.
+if grep -q "^Environment=\"GOMEMLIMIT=${EXPECTED_GOMEMLIMIT}\"$" "$T1_DIR/gomemlimit.conf" 2>/dev/null; then
+  pass "Environment=\"GOMEMLIMIT=${EXPECTED_GOMEMLIMIT}\" (canonical value) found in gomemlimit.conf"
 else
-  fail "Environment=\"GOMEMLIMIT=5368709120\" NOT found (content: $(cat "$T1_DIR/gomemlimit.conf" 2>/dev/null || echo '<missing>'))"
+  fail "Environment=\"GOMEMLIMIT=${EXPECTED_GOMEMLIMIT}\" NOT found (content: $(cat "$T1_DIR/gomemlimit.conf" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 3b: the written GOMEMLIMIT tracks the canonical file (proves the value
+#          is parsed from CANONICAL_DROPIN, not hard-coded in ensure-dropin.sh)
+# =============================================================================
+section "Test 3b: written GOMEMLIMIT tracks the canonical drop-in value"
+
+T3B_DIR=$(mktemp -d "$TMPDIR_TEST/t3b-XXXXXXXX")
+T3B_SC_LOG="$TMPDIR_TEST/t3b-sc.log"
+T3B_CANON="$TMPDIR_TEST/t3b-canonical.conf"
+T3B_VALUE="4294967296"   # arbitrary distinct value (4 GiB)
+printf '[Service]\nEnvironment="GOMEMLIMIT=%s"\n' "$T3B_VALUE" > "$T3B_CANON"
+
+T3B_FAKE_SC=$(make_fake_bin "systemctl" "$T3B_SC_LOG")
+if DROPIN_DIR="$T3B_DIR" \
+   SYSTEMCTL="$T3B_FAKE_SC/systemctl" \
+   CANONICAL_DROPIN="$T3B_CANON" \
+   bash "$ENSURE_SH" >/dev/null 2>&1; then
+  if grep -q "^Environment=\"GOMEMLIMIT=${T3B_VALUE}\"$" "$T3B_DIR/gomemlimit.conf" 2>/dev/null; then
+    pass "written value follows the canonical file (GOMEMLIMIT=${T3B_VALUE})"
+  else
+    fail "written value did NOT follow canonical file (content: $(cat "$T3B_DIR/gomemlimit.conf" 2>/dev/null || echo '<missing>'))"
+  fi
+else
+  fail "ensure-dropin.sh exited non-zero with a valid canonical drop-in"
+fi
+
+# =============================================================================
+# Test 3c: ensure-dropin.sh dies when the canonical drop-in is missing
+# =============================================================================
+section "Test 3c: ensure-dropin.sh fails fast when CANONICAL_DROPIN is missing"
+
+T3C_DIR=$(mktemp -d "$TMPDIR_TEST/t3c-XXXXXXXX")
+T3C_SC_LOG="$TMPDIR_TEST/t3c-sc.log"
+T3C_FAKE_SC=$(make_fake_bin "systemctl" "$T3C_SC_LOG")
+T3C_MISSING="$TMPDIR_TEST/t3c-does-not-exist.conf"   # never created
+
+T3C_EXIT=0
+DROPIN_DIR="$T3C_DIR" \
+SYSTEMCTL="$T3C_FAKE_SC/systemctl" \
+CANONICAL_DROPIN="$T3C_MISSING" \
+bash "$ENSURE_SH" >/dev/null 2>&1 || T3C_EXIT=$?
+
+if [[ "$T3C_EXIT" -ne 0 ]]; then
+  pass "ensure-dropin.sh exited non-zero ($T3C_EXIT) when canonical drop-in absent"
+else
+  fail "ensure-dropin.sh should have failed with a missing canonical drop-in but exited 0"
+fi
+
+if [[ ! -f "$T3C_DIR/gomemlimit.conf" ]]; then
+  pass "no gomemlimit.conf written when canonical value could not be resolved"
+else
+  fail "gomemlimit.conf was written despite the canonical drop-in being absent"
 fi
 
 # =============================================================================

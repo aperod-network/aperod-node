@@ -257,7 +257,7 @@ if echo "$CMD" | grep -q "network/stats"; then
 elif echo "$CMD" | grep -q "curl"; then
   echo '\''{"ok":true}'\''
 elif echo "$CMD" | grep -q "systemctl show aperod-node"; then
-  echo "Environment=GOMEMLIMIT=5368709120"
+  echo "Environment=GOMEMLIMIT=5905580032"
   echo "TimeoutStopUSec=15min"
 elif echo "$CMD" | grep -q "test -f"; then
   echo "yes"
@@ -365,7 +365,7 @@ if echo \"\$CMD\" | grep -q 'network/stats'; then
     echo '{\"height\":77,\"peer_count\":1,\"syncing\":false}'
   fi
 elif echo \"\$CMD\" | grep -q 'systemctl show aperod-node'; then
-  echo 'Environment=GOMEMLIMIT=5368709120'
+  echo 'Environment=GOMEMLIMIT=5905580032'
   echo 'TimeoutStopUSec=15min'
 elif echo \"\$CMD\" | grep -q 'test -f'; then
   echo 'yes'
@@ -450,7 +450,7 @@ if echo "$CMD" | grep -q "network/stats"; then
   echo ""
 elif echo "$CMD" | grep -q "systemctl show aperod-node"; then
   # Satisfy verify-dropin.sh GOMEMLIMIT and TimeoutStopUSec checks.
-  echo "Environment=GOMEMLIMIT=5368709120"
+  echo "Environment=GOMEMLIMIT=5905580032"
   echo "TimeoutStopUSec=15min"
 elif echo "$CMD" | grep -q "test -f"; then
   # Satisfy verify-dropin.sh drop-in file existence checks.
@@ -677,6 +677,114 @@ if echo "${NI_OUTPUT}" | grep -q "install"; then
   pass "NI3: output contains install instruction (install-validator.sh or install-node.sh)"
 else
   fail "NI3: expected install instruction in output. Got:\n${NI_OUTPUT}"
+fi
+
+# =============================================================================
+# ── BOOTSTRAP HEALTH-WAIT TIMEOUT — local API never comes up → exit 1 + Таймаут
+# =============================================================================
+section "Bootstrap health-wait timeout — local API never responds → exit 1 + Таймаут warning"
+# This exercises the step-9 health-wait loop in --bootstrap-from mode of
+# join-network.sh.  After chain.db + snapshot are rsynced and the local node is
+# (re)started, the script polls the LOCAL API via curl.  When curl always
+# returns an empty string the loop exhausts all HEALTH_MAX_ATTEMPTS and the
+# script must exit 1 with the "Таймаут" warning.  Previously untested — the
+# timeout branch (exit 1 + "Таймаут") had no coverage.
+
+BT_DIR="${TMPDIR_TEST}/bt"
+BT_DATA="${BT_DIR}/data"
+BT_BIN="${BT_DIR}/bin"
+BT_YAML="${BT_DIR}/node.yaml"
+BT_CONFIG="${BT_DIR}/node-config.sh"
+
+mkdir -p "${BT_DATA}/chain.db"
+touch "${BT_DATA}/chain.db/CURRENT"
+# Fake snapshot so the height-detection glob in step 4b finds something.
+touch "${BT_DATA}/snapshot-v2-100.json.gz"
+printf 'network: testnet\n' > "${BT_YAML}"
+# node-config.sh stub: accept every subcommand as a no-op success.
+printf '#!/usr/bin/env bash\nexit 0\n' > "${BT_CONFIG}"
+chmod +x "${BT_CONFIG}"
+
+# systemctl: local stop succeeds, is-active returns 1 (stopped), enable/start OK.
+make_stub "${BT_BIN}" "systemctl" '
+case "$*" in
+  *"stop aperod-node"*)  exit 0 ;;
+  *"is-active"*)         exit 1 ;;
+  *)                     exit 0 ;;
+esac
+'
+
+# ssh stub (remote validator side):
+#   • network/stats (step 1 validator tip read) → valid JSON
+#   • data-dir / chain.db existence checks       → exit 0 (present)
+#   • systemctl start (validator restart)        → "started"
+#   • bare "bash" heredoc (remote stop)          → drain stdin, "stopped"
+#   • anything else                              → neutral success
+make_stub "${BT_BIN}" "ssh" '
+shift   # drop root@IP
+CMD="$*"
+if echo "$CMD" | grep -q "network/stats"; then
+  echo "{\"tip_height\":200,\"height\":200,\"peer_count\":1}"
+elif echo "$CMD" | grep -qE "\[ -d "; then
+  exit 0
+elif echo "$CMD" | grep -q "systemctl start"; then
+  echo "started"
+elif [[ "$CMD" == "bash" ]]; then
+  cat >/dev/null
+  echo "stopped"
+else
+  cat >/dev/null
+  echo "ok"
+fi
+exit 0
+'
+
+# rsync / chown: succeed silently.
+make_stub "${BT_BIN}" "rsync" 'exit 0'
+make_stub "${BT_BIN}" "chown" 'exit 0'
+
+# sleep: no-op so the health-wait loop finishes instantly.
+make_stub "${BT_BIN}" "sleep" 'exit 0'
+
+# curl: ALWAYS returns an empty string → local API never becomes ready.
+make_stub "${BT_BIN}" "curl" 'echo ""; exit 0'
+
+BT_EXIT=0
+BT_OUTPUT=$(
+  env \
+    PATH="${BT_BIN}:${PATH}" \
+    SECONDARY_DATA_DIR="${BT_DATA}" \
+    LOCAL_DATA_DIR="${BT_DATA}" \
+    LOCAL_NODE_YAML="${BT_YAML}" \
+    LOCAL_NODE_CONFIG_SH="${BT_CONFIG}" \
+    PRIMARY_DATA_DIR="${BT_DATA}" \
+    VALIDATOR_DATA_DIR="${BT_DATA}" \
+    HEALTH_MAX_ATTEMPTS=4 \
+    HEALTH_WAIT_SECS=0 \
+    bash "${JOIN_SH}" "--bootstrap-from=192.0.2.2" 2>&1
+) || BT_EXIT=$?
+
+# ── Assertion BT1: script exits 1 after the bootstrap health-wait timeout ─────
+if [[ ${BT_EXIT} -eq 1 ]]; then
+  pass "BT1: bootstrap mode exited 1 after local API health-wait timeout"
+else
+  fail "BT1: expected exit 1 after bootstrap health-wait timeout but got ${BT_EXIT}. Output:\n${BT_OUTPUT}"
+fi
+
+# ── Assertion BT2: output contains the Russian "Таймаут" warning ──────────────
+if echo "${BT_OUTPUT}" | grep -q "Таймаут"; then
+  pass "BT2: output contains 'Таймаут' warning"
+else
+  fail "BT2: expected 'Таймаут' in output. Got:\n${BT_OUTPUT}"
+fi
+
+# ── Assertion BT3: all HEALTH_MAX_ATTEMPTS were exhausted ─────────────────────
+# The loop prints "API ещё не готов" on every failed poll (STATS empty).
+BT_POLL_COUNT=$(echo "${BT_OUTPUT}" | grep -c "ещё не готов" || true)
+if [[ "${BT_POLL_COUNT}" -ge 4 ]]; then
+  pass "BT3: bootstrap health-wait loop ran ${BT_POLL_COUNT} iterations (all attempts exhausted)"
+else
+  fail "BT3: expected ≥4 'ещё не готов' lines but counted ${BT_POLL_COUNT}. Output:\n${BT_OUTPUT}"
 fi
 
 # =============================================================================

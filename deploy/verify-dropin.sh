@@ -24,8 +24,25 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERR]${NC}   $*"; exit 1; }
 
-# Expected values
-EXPECTED_GOMEMLIMIT="5368709120"
+# ── Expected values ──────────────────────────────────────────
+# EXPECTED_GOMEMLIMIT is read from the canonical drop-in file that ships in
+# this directory (gomemlimit.conf) rather than being hard-coded here.  That
+# file is the single source of truth for the production value, so bumping the
+# limit only requires editing one place and this check never goes stale.
+#
+# CANONICAL_DROPIN — overridable so tests can point at a temp file.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CANONICAL_DROPIN="${CANONICAL_DROPIN:-${SCRIPT_DIR}/gomemlimit.conf}"
+
+[[ -f "${CANONICAL_DROPIN}" ]] \
+  || die "Canonical drop-in not found: ${CANONICAL_DROPIN}
+  This file holds the source-of-truth GOMEMLIMIT value. Restore it from the repo."
+
+EXPECTED_GOMEMLIMIT=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${CANONICAL_DROPIN}" \
+  | head -1 | cut -d= -f2)
+[[ -n "${EXPECTED_GOMEMLIMIT}" ]] \
+  || die "Could not parse GOMEMLIMIT from canonical drop-in: ${CANONICAL_DROPIN}"
+
 EXPECTED_TIMEOUT="900"
 
 TARGET_IP="${1:-}"

@@ -64,6 +64,40 @@ send_telegram_alert() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: kill whatever holds a TCP port and WAIT until it is actually free.
+#
+# A bare `fuser -k` + `sleep 1` is not enough: the old listener may take a few
+# seconds to release the socket (graceful shutdown, FIN_WAIT).  If pm2 starts
+# the new process while the port is still held, it crashes with EADDRINUSE and
+# pm2 retries — each collision burns one restart against the post-deploy
+# health-check threshold (observed: 5 restarts in 10 s, exactly at the limit).
+# Polling until the port is free makes the subsequent start collision-free.
+# ---------------------------------------------------------------------------
+wait_port_free() {
+  local port="$1" timeout="${2:-10}" waited=0
+  if ! fuser "${port}/tcp" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  Port ${port} is in use — killing orphaned process..."
+  fuser -k "${port}/tcp" 2>/dev/null || true
+  while fuser "${port}/tcp" >/dev/null 2>&1; do
+    if (( waited >= timeout )); then
+      echo "  WARNING: port ${port} still busy after ${timeout}s — sending SIGKILL..."
+      fuser -k -KILL "${port}/tcp" 2>/dev/null || true
+      sleep 1
+      if fuser "${port}/tcp" >/dev/null 2>&1; then
+        echo "  ERROR: port ${port} could not be freed" >&2
+        return 1
+      fi
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "  Port ${port} is free (waited ${waited}s)."
+}
+
+# ---------------------------------------------------------------------------
 # Step 1: Pull latest source
 # ---------------------------------------------------------------------------
 echo "==> [1/4] Pulling latest source as aperod..."
@@ -100,6 +134,18 @@ _sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-ap
 # Step 2: Rebuild TypeScript — if this fails, abort before touching pm2.
 # ---------------------------------------------------------------------------
 echo "==> [2/4] Rebuilding TypeScript as aperod..."
+
+# Self-heal the known EACCES failure mode: if the API was ever started as
+# root (emergency `node dist/index.mjs`, stale root PID), dist/ becomes
+# root-owned and the aperod-user build fails with
+# "EACCES: permission denied, unlink dist/index.mjs".  Fix ownership before
+# building instead of aborting the deploy.
+API_DIST="${APEROD_DIR}/artifacts/api-server/dist"
+if [[ -d "${API_DIST}" ]] && find "${API_DIST}" ! -user aperod -print -quit | grep -q .; then
+  echo "  [fix] ${API_DIST} contains non-aperod-owned files — chown -R aperod:aperod"
+  chown -R aperod:aperod "${API_DIST}"
+fi
+
 if ! sudo -u aperod bash -c "cd '$APEROD_DIR' && pnpm --filter '$API_FILTER' run build"; then
   echo ""
   echo "✗ Build failed — pm2 NOT restarted. Fix the error and re-run update-api.sh" >&2
@@ -119,14 +165,15 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> [3/4] Restarting PM2 process '$PM2_APP'..."
 # Kill any orphaned Node.js process still holding port 3001 (can happen when a
-# previous PM2 daemon was killed but its child process survived). Without this,
-# the new process crashes immediately with EADDRINUSE and PM2 enters a crash loop.
+# previous PM2 daemon was killed but its child process survived) and wait until
+# the port is genuinely free. Without this, the new process crashes immediately
+# with EADDRINUSE and PM2 enters a crash loop.
 API_PORT="${API_PORT:-3001}"
-if fuser "${API_PORT}/tcp" >/dev/null 2>&1; then
-  echo "  Port ${API_PORT} is in use — killing orphaned process..."
-  fuser -k "${API_PORT}/tcp" 2>/dev/null || true
-  sleep 1
-fi
+wait_port_free "$API_PORT" "${PORT_FREE_TIMEOUT:-10}" || {
+  send_telegram_alert "⚠️ <b>aperod-api deploy</b>: port ${API_PORT} could not be freed on $(hostname); pm2 NOT restarted."
+  echo "✗ Aborting before pm2 restart — old process still holds port ${API_PORT}." >&2
+  exit 1
+}
 
 # If the process is not yet registered in PM2 (e.g. after server reboot or
 # accidental `pm2 delete`), `pm2 restart` exits non-zero with "not found".
@@ -139,14 +186,14 @@ else
   # Delete any stale/corrupted entry before starting fresh to avoid the
   # "Cannot read properties of undefined (reading 'pm2_env')" TypeError.
   pm2 delete "$PM2_APP" 2>/dev/null || true
-  # Kill the port again in the fallback path — the earlier kill ran before the
+  # Free the port again in the fallback path — the earlier wait ran before the
   # failed pm2 restart, but a brief race or a surviving zombie could have
   # re-bound it by the time we reach pm2 start.
-  if fuser "${API_PORT}/tcp" >/dev/null 2>&1; then
-    echo "  Port ${API_PORT} still in use before fresh start — killing..."
-    fuser -k "${API_PORT}/tcp" 2>/dev/null || true
-    sleep 1
-  fi
+  wait_port_free "$API_PORT" "${PORT_FREE_TIMEOUT:-10}" || {
+    send_telegram_alert "⚠️ <b>aperod-api deploy</b>: port ${API_PORT} could not be freed on $(hostname); pm2 start skipped."
+    echo "✗ Aborting fresh start — port ${API_PORT} still busy." >&2
+    exit 1
+  }
   # pm2 start from a bare ecosystem file loses the env vars that were in the
   # previous process descriptor (DATABASE_URL, SESSION_SECRET, etc.).
   # Source /opt/aperod/.env first so the new process inherits them.

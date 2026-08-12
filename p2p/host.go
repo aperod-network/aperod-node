@@ -2666,13 +2666,30 @@ func (h *Host) handleGetBlock(peer *Peer, msg GetBlockMsg) error {
 }
 
 func (h *Host) handleGetPeers(peer *Peer) error {
+        return peer.Send(MsgPeers, PeersMsg{Addrs: h.peersToAdvertise()})
+}
+
+// peersToAdvertise returns the list of connected peer addresses that are safe
+// to share via the MsgPeers peer-exchange protocol.  Any address whose bare IP
+// is currently banned is filtered out: advertising it would let a peer we have
+// banned locally propagate back into the network through peer exchange,
+// undermining the ban.  IsBanned checks the bare IP so a ban registered against
+// "1.2.3.4" hides every source port from the same host.
+func (h *Host) peersToAdvertise() []string {
         h.mu.RLock()
-        addrs := make([]string, 0, len(h.peers))
+        candidates := make([]string, 0, len(h.peers))
         for addr := range h.peers {
-                addrs = append(addrs, addr)
+                candidates = append(candidates, addr)
         }
         h.mu.RUnlock()
-        return peer.Send(MsgPeers, PeersMsg{Addrs: addrs})
+        addrs := make([]string, 0, len(candidates))
+        for _, addr := range candidates {
+                if h.mgr.IsBanned(addr) {
+                        continue
+                }
+                addrs = append(addrs, addr)
+        }
+        return addrs
 }
 
 // maxKnownPeers caps the peerList to prevent memory exhaustion from

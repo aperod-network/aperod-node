@@ -172,3 +172,28 @@ func SetDialFunc(h *Host, fn func(ctx context.Context, network, addr string) (ne
 	}
 	h.dialFnMu.Unlock()
 }
+
+// HostSeedConnectedPeer inserts a synthetic connected peer keyed by addr into
+// the host's peer table without going through the network handshake.  Used by
+// the banned-peer-exchange test to place a peer whose IP can then be banned
+// independently of any real connection.  The peer has a nil conn; callers must
+// not trigger any code path that writes to the peer.
+func HostSeedConnectedPeer(h *Host, addr string) {
+	h.mu.Lock()
+	h.peers[addr] = &Peer{addr: addr}
+	h.mu.Unlock()
+}
+
+// HostPeersToAdvertise returns the addresses the host would include in an
+// outbound MsgPeers reply (banned IPs filtered out).  Exercises the exact
+// production filter used by the MsgGetPeers handler.
+func HostPeersToAdvertise(h *Host) []string {
+	return h.peersToAdvertise()
+}
+
+// HostBanPeer bans addr via the host's PeerMgr for duration d.  Exported so the
+// banned-peer-exchange test can register a ban without a full BanPeer call
+// (which also tears down connections and cancels dials).
+func HostBanPeer(h *Host, addr, reason string, d time.Duration) {
+	h.mgr.Ban(addr, reason, d)
+}

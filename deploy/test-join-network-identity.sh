@@ -154,7 +154,7 @@ fi
 # verify-dropin.sh: 'systemctl show aperod-node' — return fake output with
 # the expected GOMEMLIMIT and TimeoutStopUSec values so the verify step passes.
 if echo \"\${CMD}\" | grep -q 'systemctl show aperod-node'; then
-  printf 'Environment=GOMEMLIMIT=5368709120\nTimeoutStopUSec=15min\n'
+  printf 'Environment=GOMEMLIMIT=5905580032\nTimeoutStopUSec=15min\n'
   exit 0
 fi
 
@@ -476,7 +476,7 @@ fi
 
 # verify-dropin.sh: systemctl show + drop-in file checks
 if echo \"\${CMD}\" | grep -q 'systemctl show aperod-node'; then
-  printf 'Environment=GOMEMLIMIT=5368709120\nTimeoutStopUSec=15min\n'
+  printf 'Environment=GOMEMLIMIT=5905580032\nTimeoutStopUSec=15min\n'
   exit 0
 fi
 if echo \"\${CMD}\" | grep -q 'gomemlimit\.conf\|timeout\.conf'; then
