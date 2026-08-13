@@ -63,6 +63,11 @@ type mempoolEntry struct {
 	privileged bool
 }
 
+// bannedTxTTL is how long a banned tx hash is kept.  After expiry it may be
+// re-accepted if somehow the underlying issue was resolved; in practice an
+// invalid ring-sig tx will be re-banned within one block slot.
+const bannedTxTTL = 24 * time.Hour
+
 // Mempool is a thread-safe pool of pending (unconfirmed) transactions.
 type Mempool struct {
 	mu         sync.RWMutex
@@ -82,6 +87,12 @@ type Mempool struct {
 	// operators can detect mempool-flood attacks in real time.  In-memory
 	// only — resets to zero on node restart by design.
 	evictionsTotal uint64
+	// bannedHashes tracks tx hashes that have been banned from the pool because
+	// they failed block production (e.g. invalid ring sig after snapshot repair,
+	// missing ring member UTXOs, etc.).  Banned txes are rejected in Add() so
+	// P2P peers cannot re-inject them and cause phantom key-image locks.
+	// Expires after bannedTxTTL; cleaned during Evict().
+	bannedHashes map[crypto.Hash32]time.Time
 }
 
 // NewMempool creates a new empty mempool with the given config.
@@ -98,6 +109,7 @@ func NewMempool(cfg MempoolConfig, logger ...*slog.Logger) *Mempool {
 		entries:      make(map[crypto.Hash32]*mempoolEntry),
 		keyImages:    make(map[crypto.KeyImage]crypto.Hash32),
 		stakeSenders: make(map[string]crypto.Hash32),
+		bannedHashes: make(map[crypto.Hash32]time.Time),
 		log:          l,
 	}
 }
@@ -168,6 +180,14 @@ func (m *Mempool) Add(tx Transaction) error {
 
 	if _, exists := m.entries[hash]; exists {
 		return fmt.Errorf("mempool: duplicate tx %x", hash[:8])
+	}
+
+	// Reject banned txes (e.g. those that failed block production due to an
+	// invalid ring sig after a snapshot repair / UTXO-set correction).
+	// This prevents P2P peers from re-injecting permanently invalid txes and
+	// causing phantom key-image locks that block legitimate withdrawals.
+	if _, banned := m.bannedHashes[hash]; banned {
+		return fmt.Errorf("mempool: tx %x is banned — failed block production and cannot be re-accepted", hash[:8])
 	}
 
 	// C-4: per-address stake-TX rate limit.
@@ -419,6 +439,41 @@ func (m *Mempool) Count() int {
 	return len(m.entries)
 }
 
+// BanTx removes a transaction from the pool and bans it from re-entry for
+// bannedTxTTL (24 h).  The consensus engine calls this when a tx fails block
+// production (e.g. invalid ring sig after a UTXO-set / snapshot repair) so
+// that P2P peers cannot re-inject it and recreate a phantom key-image lock.
+//
+// Safe to call with a hash that is not currently in the pool (ban-only mode,
+// e.g. for a tx that was never accepted but must be blocked pre-emptively).
+func (m *Mempool) BanTx(hash crypto.Hash32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, ok := m.entries[hash]; ok {
+		for _, inp := range entry.Tx.Inputs {
+			delete(m.keyImages, inp.KeyImage)
+		}
+		m.removeStakeSenderLocked(entry)
+		m.totalBytes -= entry.Size
+		if m.totalBytes < 0 {
+			m.totalBytes = 0
+		}
+		delete(m.entries, hash)
+		m.evictionsTotal++
+	}
+	m.bannedHashes[hash] = time.Now()
+	m.log.Warn("mempool: tx banned — rejected from P2P re-entry for 24 h",
+		"hash", fmt.Sprintf("%x", hash[:8]))
+}
+
+// IsBanned reports whether a tx hash is currently banned.
+func (m *Mempool) IsBanned(hash crypto.Hash32) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.bannedHashes[hash]
+	return ok
+}
+
 // TotalBytes returns the current total byte size of all pending transactions.
 func (m *Mempool) TotalBytes() int {
 	m.mu.RLock()
@@ -455,7 +510,7 @@ func (m *Mempool) Hashes() []crypto.Hash32 {
 	return out
 }
 
-// Evict removes transactions older than TTL.
+// Evict removes transactions older than TTL and cleans up expired ban entries.
 func (m *Mempool) Evict() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -474,6 +529,12 @@ func (m *Mempool) Evict() int {
 			delete(m.entries, hash)
 			m.evictionsTotal++
 			removed++
+		}
+	}
+	// Expire old ban entries so the map doesn't grow unboundedly.
+	for hash, bannedAt := range m.bannedHashes {
+		if now.Sub(bannedAt) > bannedTxTTL {
+			delete(m.bannedHashes, hash)
 		}
 	}
 	return removed
