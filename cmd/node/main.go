@@ -260,6 +260,39 @@ func runCheckStore() error {
         return nil
 }
 
+// ─── Rsync-in-progress sentinel ──────────────────────────────────────────────
+//
+// join-network.sh writes .rsync-in-progress to the data directory before any
+// rsync transfer begins and removes it once the transfer finishes.  The sentinel
+// lets the node detect when it has been started against a partially-written
+// LevelDB and refuse to proceed rather than silently diverge from the canonical
+// chain.
+
+// rsyncSentinelPath returns the path of the rsync-in-progress sentinel file.
+func rsyncSentinelPath(dataDir string) string {
+        return filepath.Join(dataDir, ".rsync-in-progress")
+}
+
+// checkRsyncSentinel returns a descriptive error when the rsync sentinel is
+// present in dataDir, and nil when it is absent (safe to start).
+func checkRsyncSentinel(dataDir string) error {
+        sentinelPath := rsyncSentinelPath(dataDir)
+        if _, statErr := os.Stat(sentinelPath); statErr == nil {
+                return fmt.Errorf(
+                        "startup blocked: %s exists\n"+
+                                "This file is written by join-network.sh before rsync begins and\n"+
+                                "removed only after a successful transfer.  Starting the node now\n"+
+                                "would open a half-written LevelDB and produce a divergent chain.\n"+
+                                "\n"+
+                                "Options:\n"+
+                                "  (a) Wait for join-network.sh to finish — it will remove the file.\n"+
+                                "  (b) If no rsync is running, remove the file manually and retry:\n"+
+                                "        rm %s",
+                        sentinelPath, sentinelPath)
+        }
+        return nil
+}
+
 // ─── Height-index sentinel (file-based) ──────────────────────────────────────
 //
 // The sentinel is stored as a plain file at <dataDir>/height_index_verified,
@@ -706,6 +739,21 @@ func run() error {
         // ── 3. Open storage ───────────────────────────────────────────────────────
         if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
                 return fmt.Errorf("create data dir: %w", err)
+        }
+
+        // Guard: refuse to start when join-network.sh left a .rsync-in-progress
+        // sentinel in the data directory.  The sentinel is written immediately
+        // before rsync begins (push mode and bootstrap mode) and removed only
+        // after a successful transfer.  Starting against a half-written LevelDB
+        // produces a divergent chain that is hard to recover from — this hard
+        // refusal is cheaper than any recovery procedure.
+        //
+        // Operators can unblock startup by either:
+        //   (a) waiting for join-network.sh to finish and remove the file, or
+        //   (b) removing the file manually after confirming no rsync is running:
+        //         rm <data-dir>/.rsync-in-progress
+        if err := checkRsyncSentinel(cfg.DataDir); err != nil {
+                return err
         }
 
         // Remove any orphaned snapshot .tmp files left by a previous crash
@@ -1277,6 +1325,21 @@ func run() error {
                 // BEFORE the load so the directory contains only complete files.
                 cleanStaleSnapshotTmpFiles(cfg.DataDir, log)
                 snapLoaded := false
+
+                // ── Unclean-shutdown detection ───────────────────────────────────────
+                // The SIGTERM handler writes a clean_shutdown marker file after saving the
+                // snapshot.  If the file is absent the previous run did not reach that code
+                // path — the canonical OOM / SIGKILL scenario.  Consuming the marker here
+                // means the CURRENT run is considered unverified until its own marker is
+                // written at shutdown.
+                wasOOMRestart := !readAndDeleteCleanShutdownMarker(cfg.DataDir)
+                if wasOOMRestart {
+                        log.Info("startup: no clean-shutdown marker — previous shutdown may have been unclean (OOM/SIGKILL); " +
+                                "AmountCommit validation will run if snapshot is recent")
+                } else {
+                        log.Info("startup: clean-shutdown marker found — previous shutdown was graceful")
+                }
+
                 // rescueSnap is set when a snapshot is readable but the UTXO-count check
                 // fails.  It is consumed below (before the !snapLoaded block) to seed the
                 // in-memory UTXO + key-image state so the block scan covers only the few
@@ -1365,6 +1428,7 @@ func run() error {
                                                         TipHeight:  snap.TipHeight,
                                                         TipHashHex: snap.TipHashHex,
                                                         TxTotal:    txTotRec,
+                                                        SavedAt:    time.Now(),
                                                         UTXOs:      utxos.TakeSnapshot(),
                                                         Registry:   registry.TakeSnapshot(),
                                                 }
@@ -1377,6 +1441,60 @@ func run() error {
                                         } else {
                                                 log.Info("snapshot reconcile: in-memory UTXO set matches disk store",
                                                         "checked", recChecked)
+                                        }
+
+                                        // ── OOM-window AmountCommit raw-block validation ──────────────
+                                        // ReconcileWithStore above cross-checks each UTXO against the
+                                        // u/ disk store, but after an OOM kill the u/ store can itself
+                                        // carry the corrupted value that was written from the same
+                                        // partially-corrupted in-memory state.  When both the snapshot
+                                        // and the u/ store agree on a wrong AmountCommit the reconcile
+                                        // pass silently passes, leaving the UTXO unspendable until a
+                                        // user hits the "forged commitment" error (C-0 failure).
+                                        //
+                                        // The raw block data is the authoritative source of truth:
+                                        // block bytes are written atomically during consensus and are
+                                        // never updated in-place.  We only pay the cost of reading
+                                        // every block when a snapshot was saved within oomWindow of
+                                        // this restart (the "OOM window"), i.e. when the in-memory
+                                        // state that was snapshotted could plausibly have been
+                                        // captured during or shortly before the OOM.  If the snapshot
+                                        // is hours old, any in-memory corruption happened after the
+                                        // snapshot was taken and is already absent from it.
+                                        const oomWindow = 30 * time.Minute
+                                        if wasOOMRestart && !snap.SavedAt.IsZero() &&
+                                                time.Since(snap.SavedAt) < oomWindow {
+                                                log.Info("startup: OOM window — validating snapshot AmountCommits against raw block data",
+                                                        "snap_saved_at", snap.SavedAt.UTC().Format(time.RFC3339),
+                                                        "age", time.Since(snap.SavedAt).Round(time.Second).String())
+                                                acChecked, acFixed := validateAmountCommitsFromBlocks(utxos, db, log)
+                                                if acFixed > 0 {
+                                                        log.Warn("startup: OOM AmountCommit validation: mismatches patched from raw blocks",
+                                                                "checked", acChecked, "fixed", acFixed)
+                                                        // Persist corrected snapshot so subsequent restarts start clean.
+                                                        oomTxTot, _ := db.LoadTxTotal()
+                                                        oomSnap := startupSnapshot{
+                                                                Version:    snapVersion,
+                                                                TipHeight:  snap.TipHeight,
+                                                                TipHashHex: snap.TipHashHex,
+                                                                TxTotal:    oomTxTot,
+                                                                SavedAt:    time.Now(),
+                                                                UTXOs:      utxos.TakeSnapshot(),
+                                                                Registry:   registry.TakeSnapshot(),
+                                                        }
+                                                        if saveErr := saveStartupSnapshot(cfg.DataDir, oomSnap); saveErr != nil {
+                                                                log.Warn("startup: OOM validate: failed to save corrected snapshot", "err", saveErr)
+                                                        } else {
+                                                                log.Info("startup: OOM validate: corrected snapshot saved")
+                                                        }
+                                                } else {
+                                                        log.Info("startup: OOM AmountCommit validation: all values match raw blocks",
+                                                                "checked", acChecked)
+                                                }
+                                        } else if wasOOMRestart && snap.SavedAt.IsZero() {
+                                                log.Info("startup: OOM restart detected but snapshot has no SavedAt timestamp " +
+                                                        "(written by older binary) — skipping raw-block AmountCommit validation; " +
+                                                        "run --rebuild-key-images if transfers fail with 'forged commitment'")
                                         }
 
                                         // ── --rebuild-key-images: fix stale snapshot key-image set ──
@@ -1403,6 +1521,7 @@ func run() error {
                                                         TipHeight:  snap.TipHeight,
                                                         TipHashHex: snap.TipHashHex,
                                                         TxTotal:    txTotKI,
+                                                        SavedAt:    time.Now(),
                                                         UTXOs:      utxos.TakeSnapshot(),
                                                         Registry:   registry.TakeSnapshot(),
                                                 }
@@ -1982,6 +2101,7 @@ func run() error {
                                 TipHeight:  h,
                                 TipHashHex: fmt.Sprintf("%x", hash[:]),
                                 TxTotal:    txTot,
+                                SavedAt:    time.Now(),
                                 UTXOs:      utxos.TakeSnapshot(),
                                 Registry:   engine.Registry().TakeSnapshot(),
                         }
@@ -2419,6 +2539,20 @@ func run() error {
                                         }
                                         return out
                                 })
+                                // Wire malformed/stale bootnode warning events for the Admin Panel.
+                                apiSrv.SetBootnodeWarnEventFunc(func(since time.Time) []api.BootnodeWarnEntry {
+                                        evts := host.GetBootnodeWarnEvents(since)
+                                        out := make([]api.BootnodeWarnEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.BootnodeWarnEntry{
+                                                        Bootnode: e.Bootnode,
+                                                        Err:      e.Err,
+                                                        AgeSecs:  e.AgeSecs,
+                                                        At:       e.At,
+                                                }
+                                        }
+                                        return out
+                                })
                                 // Seed the static /api/v1/status display from current live list.
                                 apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
@@ -2702,6 +2836,7 @@ func saveShutdownSnapshotWithPaths(
                 TipHeight:  shutTipHeight,
                 TipHashHex: fmt.Sprintf("%x", shutTipHash[:]),
                 TxTotal:    shutTxTotal,
+                SavedAt:    time.Now(),
                 UTXOs:      utxos.TakeSnapshot(),
                 Registry:   registry.TakeSnapshot(),
         }
@@ -2716,6 +2851,14 @@ func saveShutdownSnapshotWithPaths(
                         apiSrv.SetSnapshotFailed(saveErr)
                 }
                 return
+        }
+        // Record a clean-shutdown marker so the next startup knows this
+        // shutdown was graceful and can skip the OOM-window AmountCommit
+        // validation.  Non-fatal: an absent marker causes validation to run
+        // (fail-closed).
+        if markerErr := writeCleanShutdownMarker(dataDir); markerErr != nil {
+                log.Warn("shutdown: failed to write clean-shutdown marker (next startup will validate AmountCommits)",
+                        "err", markerErr)
         }
         if apiSrv != nil {
                 apiSrv.SetSnapshotSaved(shutTipHeight)
@@ -3902,4 +4045,159 @@ func storeBlock(db *store.DB, b *core.Block) error {
                 }
         }
         return nil
+}
+
+
+// validateAmountCommitsFromBlocks validates the AmountCommit field of every
+// active and staked UTXO in utxos against the authoritative raw block bytes
+// on disk.  For each mismatch found it:
+//
+//  1. Patches the in-memory UTXO set so transfers succeed on THIS startup.
+//  2. Persists the corrected AmountCommit to the u/ LevelDB record so that
+//     on the next graceful startup ReconcileWithStore does not overwrite the
+//     repaired value with the still-corrupt disk record.
+//
+// A mismatch is counted as "fixed" only when BOTH the in-memory patch AND the
+// store write succeed.  If the store write fails the in-memory patch is still
+// applied (transfers work for this run) but the log records an explicit warning
+// that the repair is not durable — the operator must investigate the LevelDB
+// error or rerun with --repair-db.
+//
+// Called during the OOM-window startup check when a snapshot was saved within
+// 30 minutes of an unclean shutdown.  Raw block bytes are the only source
+// never modified in-place after acceptance.
+//
+// For efficiency UTXOs are grouped by BlockHeight so each block is fetched at
+// most once.  Heights whose block is missing (pruned) are skipped silently.
+//
+// Returns (checked, fixed): UTXOs compared and fully-durable mismatches repaired.
+func validateAmountCommitsFromBlocks(
+        utxos *core.UTXOSet,
+        db *store.DB,
+        log *slog.Logger,
+) (checked, fixed int) {
+        // Take a read-only snapshot so we can iterate without holding the mutex
+        // while performing potentially slow block reads from disk.
+        snap := utxos.TakeSnapshot()
+        if len(snap.ActiveUTXOs) == 0 && len(snap.StakedUTXOs) == 0 {
+                return
+        }
+
+        // isStaked distinguishes which in-memory patch call to use.
+        type utxoRef struct {
+                txHash      crypto.Hash32
+                outputIndex uint32
+                oneTimePub  crypto.Point32 // used only for active UTXOs
+                commit      crypto.Commitment
+                staked      bool
+        }
+
+        // Group by BlockHeight so each block is fetched at most once.
+        byHeight := make(map[uint64][]utxoRef, 64)
+        for _, u := range snap.ActiveUTXOs {
+                byHeight[u.BlockHeight] = append(byHeight[u.BlockHeight], utxoRef{
+                        txHash:      u.TxHash,
+                        outputIndex: u.OutputIndex,
+                        oneTimePub:  u.OneTimePub,
+                        commit:      u.AmountCommit,
+                        staked:      false,
+                })
+        }
+        for _, u := range snap.StakedUTXOs {
+                byHeight[u.BlockHeight] = append(byHeight[u.BlockHeight], utxoRef{
+                        txHash:      u.TxHash,
+                        outputIndex: u.OutputIndex,
+                        oneTimePub:  u.OneTimePub,
+                        commit:      u.AmountCommit,
+                        staked:      true,
+                })
+        }
+
+        for height, refs := range byHeight {
+                raw, err := db.GetRawBlockByHeight(height)
+                if err != nil || raw == nil {
+                        // Block may be pruned or absent — skip silently.
+                        continue
+                }
+                var blk core.Block
+                if err := json.Unmarshal(raw, &blk); err != nil {
+                        log.Warn("amountcommit validate: block unmarshal failed — skipping height",
+                                "height", height, "err", err)
+                        continue
+                }
+
+                // Build (txHash, outputIndex) → full output map for this block.
+                type outKey struct {
+                        TxHash      crypto.Hash32
+                        OutputIndex uint32
+                }
+                type outVal struct {
+                        commit     crypto.Commitment
+                        oneTimePub crypto.Point32
+                        txPubKey   crypto.Point32
+                        encAmount  [8]byte
+                }
+                onChain := make(map[outKey]outVal, len(blk.Txs)*2)
+                for _, tx := range blk.Txs {
+                        txHash := tx.Hash()
+                        for i, out := range tx.Outputs {
+                                onChain[outKey{TxHash: txHash, OutputIndex: uint32(i)}] = outVal{
+                                        commit:     out.AmountCommit,
+                                        oneTimePub: out.OneTimePub,
+                                        txPubKey:   out.TxPubKey,
+                                        encAmount:  out.EncAmount,
+                                }
+                        }
+                }
+
+                for _, ref := range refs {
+                        ov, found := onChain[outKey{TxHash: ref.txHash, OutputIndex: ref.outputIndex}]
+                        if !found {
+                                // Output not found at this height — skip to avoid false positives.
+                                continue
+                        }
+                        checked++
+                        if ref.commit == ov.commit {
+                                continue
+                        }
+                        log.Warn("amountcommit validate: snapshot AmountCommit differs from raw block — patching",
+                                "tx_hash",      fmt.Sprintf("%x", ref.txHash[:]),
+                                "out_idx",      ref.outputIndex,
+                                "block_height", height,
+                                "staked",       ref.staked,
+                                "snap_commit",  fmt.Sprintf("%x", ref.commit[:]),
+                                "block_commit", fmt.Sprintf("%x", ov.commit[:]))
+
+                        // 1. Patch the in-memory UTXO set so transfers succeed
+                        //    immediately on this startup regardless of store write outcome.
+                        if ref.staked {
+                                utxos.PatchStakedAmountCommit(ref.txHash, ref.outputIndex, ov.commit)
+                        } else {
+                                utxos.PatchAmountCommit(ref.oneTimePub, ov.commit)
+                        }
+
+                        // 2. Persist the corrected AmountCommit to the u/ store so that
+                        //    ReconcileWithStore on the next graceful startup does not
+                        //    overwrite the in-memory/snapshot value with the still-corrupt
+                        //    disk record.  Read-modify-write preserves all other fields.
+                        su, getErr := db.GetUTXO(ref.txHash, ref.outputIndex)
+                        if getErr != nil || su == nil {
+                                log.Warn("amountcommit validate: in-memory patched but u/ store read failed — repair not durable",
+                                        "tx_hash", fmt.Sprintf("%x", ref.txHash[:]),
+                                        "out_idx", ref.outputIndex,
+                                        "err",     getErr)
+                                continue // not counted as fully fixed
+                        }
+                        su.AmountCommit = ov.commit
+                        if putErr := db.PutUTXO(ref.txHash, ref.outputIndex, su); putErr != nil {
+                                log.Warn("amountcommit validate: in-memory patched but u/ store write failed — repair not durable",
+                                        "tx_hash", fmt.Sprintf("%x", ref.txHash[:]),
+                                        "out_idx", ref.outputIndex,
+                                        "err",     putErr)
+                                continue // not counted as fully fixed
+                        }
+                        fixed++
+                }
+        }
+        return
 }
