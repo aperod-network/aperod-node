@@ -1740,6 +1740,37 @@ func run() error {
                 "unspent_outputs", utxos.Count(),
         )
 
+        // ── Startup UTXO store gap detection ─────────────────────────────────────
+        // Sample the most recent 100 blocks and cross-reference every unspent
+        // output against the u/ LevelDB prefix.  If any u/ entries are missing
+        // the operator must run --repair-db before a withdrawal attempt triggers
+        // the "Balance temporarily unavailable" error.  The sample keeps startup
+        // overhead below 1 second; rebuildMissingUTXOs in --repair-db mode scans
+        // the full chain.  Skip this on genesis (tipHeight == 0) and in repair
+        // mode (rebuildMissingUTXOs has already re-populated all missing entries).
+        if tipHeight > 0 && !repairDB {
+                const sampleTail = uint64(100)
+                gapCount, gapErr := sampleUTXOStoreGaps(db, tipHeight, sampleTail, log)
+                if gapErr != nil {
+                        log.Warn("startup UTXO store gap sample: read error — continuing",
+                                "err", gapErr)
+                }
+                if gapCount > 0 {
+                        log.Warn("UTXO store gap detected — u/ entries missing; run --repair-db before any transfer",
+                                "missing_entries", gapCount,
+                                "sampled_blocks", sampleTail,
+                                "tip_height", tipHeight,
+                                "hint", "aperod-node --repair-db")
+                } else {
+                        log.Info("startup UTXO store gap sample: no gaps detected",
+                                "sampled_blocks", sampleTail,
+                                "tip_height", tipHeight)
+                }
+                if apiSrv != nil {
+                        apiSrv.SetUTXOStoreMissing(gapCount)
+                }
+        }
+
         // ── 7. Setup consensus engine ─────────────────────────────────────────────
         // host is declared here so OnBlockProduced can reference it
         // (assigned after engine creation; closure captures by reference).
@@ -3355,6 +3386,64 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         log.Info("--rebuild-key-images: persistent index reconciled",
                 "phantom_entries_removed", removed, "confirmed_key_images", count)
         return count, nil
+}
+
+// sampleUTXOStoreGaps samples the most recent sampleBlocks blocks from the chain
+// and counts outputs that are absent from the u/ (UTXO store) LevelDB prefix
+// despite not being marked as spent in the su/ index.  A non-zero return value
+// means the operator should run --repair-db to restore the missing entries before
+// any withdrawal attempt triggers the "Balance temporarily unavailable" error.
+//
+// The function is intentionally capped at sampleBlocks so startup overhead stays
+// well under 1 second on production chains.  rebuildMissingUTXOs performs the
+// same check across the ENTIRE chain when --repair-db is requested.
+func sampleUTXOStoreGaps(blockStore *store.DB, tipHeight uint64, sampleBlocks uint64, log *slog.Logger) (int64, error) {
+        if tipHeight == 0 {
+                return 0, nil
+        }
+        startHeight := uint64(0)
+        if tipHeight >= sampleBlocks {
+                startHeight = tipHeight - sampleBlocks + 1
+        }
+
+        var missing int64
+        var firstErr error
+        for h := startHeight; h <= tipHeight; h++ {
+                raw, err := blockStore.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        if err != nil && firstErr == nil {
+                                firstErr = fmt.Errorf("height %d: %w", h, err)
+                        }
+                        continue
+                }
+                var b core.Block
+                if err := json.Unmarshal(raw, &b); err != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("unmarshal height %d: %w", h, err)
+                        }
+                        continue
+                }
+                for _, tx := range b.Txs {
+                        txHash := tx.Hash()
+                        for outIdx := range tx.Outputs {
+                                if blockStore.IsUTXOSpent(txHash, uint32(outIdx)) {
+                                        continue // su/ entry present — output was consumed
+                                }
+                                u, _ := blockStore.GetUTXO(txHash, uint32(outIdx))
+                                if u == nil {
+                                        missing++
+                                }
+                        }
+                }
+        }
+        if missing > 0 {
+                log.Warn("startup UTXO store gap sample: found missing u/ entries",
+                        "missing", missing,
+                        "sampled_from", startHeight,
+                        "sampled_to", tipHeight,
+                )
+        }
+        return missing, firstErr
 }
 
 // rebuildMissingUTXOs scans every stored block from height 0 to tipHeight and
