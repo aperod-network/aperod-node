@@ -1114,6 +1114,17 @@ func run() error {
                 // waiting for the scan to reach the affected heights hours later.
                 // The count is also published on /api/v1/status so the admin panel
                 // can surface it without requiring log access.
+                //
+                // Auto-repair: when gaps are detected we attempt to rebuild the
+                // height index (h/ entries) from the block bodies (b/ namespace)
+                // that were written atomically in the same fsynced batch.  This is
+                // the typical crash-kill symptom: the WAL was fsynced but LevelDB
+                // had not yet compacted the h/ entries into the SST when the
+                // process was killed.  RepairAllHeightIndex fixes those h/ entries
+                // in-place without closing and reopening the DB (no --repair-db
+                // required).  After repair recentBlocks is reloaded so FastForward
+                // uses the now-complete height index.  The sentinel file is removed
+                // so the next restart re-verifies the repaired state.
                 {
                         missingCount, firstMissing, lastMissing := countMissingBlocksInWindow(db, tipHeight, chainMaxBlocks)
                         if missingCount > 0 {
@@ -1122,6 +1133,38 @@ func run() error {
                                         "first_missing", firstMissing,
                                         "last_missing",  lastMissing,
                                 )
+                                // Attempt automatic height-index repair before giving up.
+                                log.Info("startup: auto-repairing height index to fix detected gaps",
+                                        "missing_count", missingCount,
+                                        "first_missing", firstMissing,
+                                )
+                                repaired, skipped, sweepErr := db.RepairAllHeightIndex(tipHeight, nil)
+                                switch {
+                                case sweepErr != nil:
+                                        log.Warn("startup: height-index auto-repair completed with I/O errors",
+                                                "repaired", repaired, "skipped", skipped, "err", sweepErr)
+                                case skipped > 0:
+                                        log.Warn("startup: height-index auto-repair: some heights unrepairable (block body absent)",
+                                                "repaired", repaired, "skipped", skipped,
+                                                "hint", "run --repair-db to attempt WAL-level recovery")
+                                default:
+                                        log.Info("startup: height-index auto-repair complete",
+                                                "repaired", repaired, "tip_height", tipHeight)
+                                }
+                                // Clear the sentinel so the next restart re-verifies the
+                                // repaired index rather than skipping the sweep.
+                                _ = os.Remove(heightIndexSentinelPath(cfg.DataDir))
+                                // Reload recentBlocks with the repaired height index.
+                                recentBlocks = loadRecentBlocksFromStore(db, tipHeight, log, chainMaxBlocks)
+                                // Re-count to see whether repair resolved all gaps.
+                                missingCount, firstMissing, lastMissing = countMissingBlocksInWindow(db, tipHeight, chainMaxBlocks)
+                                if missingCount > 0 {
+                                        log.Warn("startup: gaps remain after auto-repair — block bodies may be unrecoverable",
+                                                "remaining_missing", missingCount,
+                                                "first_missing", firstMissing,
+                                                "hint", "run --repair-db to recover data still in the LevelDB WAL",
+                                        )
+                                }
                         }
                         if apiSrv != nil {
                                 apiSrv.SetStoreMissingBlocks(int64(missingCount))
