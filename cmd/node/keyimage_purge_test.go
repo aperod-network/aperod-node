@@ -67,7 +67,7 @@ func TestRebuildKeyImagesPurgesPhantomIndexEntries(t *testing.T) {
 	// Simulate the poisoned in-memory state loaded from a stale snapshot.
 	utxos.MarkSpent(phantomKI)
 
-	count, err := rebuildKeyImagesFromBlocks(db, 1, utxos, false, slog.Default())
+	count, _, err := rebuildKeyImagesFromBlocks(db, 1, utxos, false, slog.Default())
 	if err != nil {
 		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
 	}
 
 	utxos := core.NewUTXOSet()
-	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, false, slog.Default()); err != nil {
+	if _, _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, false, slog.Default()); err != nil {
 		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestRebuildKeyImagesForcePurgeOnIncompleteScan(t *testing.T) {
 	utxos := core.NewUTXOSet()
 	utxos.MarkSpent(phantomKI) // simulate stale snapshot entry
 
-	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, true, slog.Default()); err != nil {
+	if _, _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, true, slog.Default()); err != nil {
 		t.Fatalf("rebuildKeyImagesFromBlocks(forcePurge=true): %v", err)
 	}
 
