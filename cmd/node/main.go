@@ -1448,6 +1448,62 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
+                                        // ── Phantom key-image detection ──────────────────────────────
+                                        // An OOM-kill can save a snapshot that includes key images from
+                                        // in-flight mempool transactions that were never confirmed.  On
+                                        // restart those phantom entries mark live UTXOs as "spent",
+                                        // blocking withdrawals with "key image already spent" until the
+                                        // operator runs --rebuild-key-images.
+                                        //
+                                        // Compare the in-memory KI set (just restored from snapshot)
+                                        // against the persistent LevelDB index (only confirmed on-chain
+                                        // spends).  Any KI in memory but absent from LevelDB is a
+                                        // phantom.  The count is exposed on /api/v1/status so the API
+                                        // server monitor can fire a Telegram alert immediately on startup
+                                        // rather than waiting for the first failed withdrawal attempt.
+                                        go func() {
+                                                // Phase 1: collect the in-memory KI slice (read lock held only
+                                                // during the fast in-memory traversal — no I/O while locked).
+                                                // 32 B/entry × ~982 K entries ≈ 31 MB peak; released via
+                                                // inMemKIs = nil before the function returns.
+                                                var inMemKIs []crypto.KeyImage
+                                                utxos.IterKeyImages(func(ki crypto.KeyImage) {
+                                                        inMemKIs = append(inMemKIs, ki)
+                                                })
+                                                if len(inMemKIs) == 0 {
+                                                        log.Info("startup: phantom-ki-check skipped — no key images in snapshot")
+                                                        return
+                                                }
+                                                // Phase 2: per-KI point-lookup against the persistent LevelDB
+                                                // index.  IsKeyImageSpent does one O(log n) LevelDB Get per
+                                                // key — no full index scan, no large intermediate map.
+                                                phantom := 0
+                                                checked := len(inMemKIs)
+                                                for _, ki := range inMemKIs {
+                                                        confirmed, lookupErr := db.IsKeyImageSpent(ki)
+                                                        if lookupErr != nil {
+                                                                // Read error: assume confirmed to avoid false positives.
+                                                                continue
+                                                        }
+                                                        if !confirmed {
+                                                                phantom++
+                                                        }
+                                                }
+                                                inMemKIs = nil // release the temporary slice
+                                                if phantom > 0 {
+                                                        log.Warn("startup: phantom key images detected — active UTXOs may be blocked",
+                                                                "phantom_count", phantom,
+                                                                "checked", checked,
+                                                                "hint", "run --rebuild-key-images to clear stale entries and restore affected UTXOs")
+                                                        if apiSrv != nil {
+                                                                apiSrv.SetPhantomKICount(phantom)
+                                                        }
+                                                } else {
+                                                        log.Info("startup: phantom-ki-check passed — all snapshot key images confirmed on-chain",
+                                                                "checked", checked)
+                                                }
+                                        }()
+
                                         // ── Snapshot ↔ disk-store reconciliation ─────────────────────
                                         // A snapshot can carry corrupted UTXO fields indefinitely: a bad
                                         // write into the in-memory set is persisted at the next snapshot
