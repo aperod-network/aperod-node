@@ -340,6 +340,25 @@ const banEventMaxEvents = 200
 // events so memory cannot grow unboundedly during prolonged sync storms.
 const stallEventMaxEvents = 200
 
+// bootnodeWarnEventMaxEvents caps the in-memory ring buffer for malformed/stale
+// bootnode warning events.
+const bootnodeWarnEventMaxEvents = 100
+
+// BootnodeWarnEvent records one malformed or stale bootnode warning emitted
+// by maintainLoop.  Stored in a ring buffer and exposed via GetBootnodeWarnEvents
+// so the API server can poll and surface them in the Admin Panel notification log.
+type BootnodeWarnEvent struct {
+	// Bootnode is the raw bootnode string from node.yaml (host:port or domain:port).
+	Bootnode string    `json:"bootnode"`
+	// Err is the human-readable reason the bootnode could not be resolved.
+	// Empty when the warn is "stale" (last successful resolution is too old).
+	Err      string    `json:"err"`
+	// AgeSecs is how many seconds ago the last successful DNS resolution occurred
+	// (0 when Err is non-empty and no prior resolution has succeeded).
+	AgeSecs  int64     `json:"age_secs"`
+	At       time.Time `json:"at"`
+}
+
 // StallEvent records a single block-fetch stall event emitted when the
 // GetBlockStallTimeout fires without a MsgBlock response from a peer.
 // Stored in a ring buffer and exposed via GetStallEvents so the API server
@@ -454,6 +473,14 @@ type Host struct {
         // stallEvents is a ring buffer of block-fetch stall events for the Admin
         // Panel notification log.  Capped at stallEventMaxEvents.
         stallEvents []StallEvent
+
+        // bootnodeWarnEventMu guards bootnodeWarnEvents so maintainLoop can append
+        // events concurrently with the API server reading them.
+        bootnodeWarnEventMu sync.Mutex
+        // bootnodeWarnEvents is a ring buffer of malformed/stale bootnode warning
+        // events for the Admin Panel notification log.
+        // Capped at bootnodeWarnEventMaxEvents.
+        bootnodeWarnEvents []BootnodeWarnEvent
 
         // tsMu guards tsStrikeCounts.  It is separate from badBlockMu so the
         // two independent counters can be updated without contention.
@@ -731,6 +758,21 @@ func (h *Host) GetStallEvents(since time.Time) []StallEvent {
         defer h.stallEventMu.Unlock()
         out := make([]StallEvent, 0)
         for _, e := range h.stallEvents {
+                if !e.At.Before(since) {
+                        out = append(out, e)
+                }
+        }
+        return out
+}
+
+// GetBootnodeWarnEvents returns all bootnode-warning events that occurred at or
+// after since.  Thread-safe; safe to call concurrently with maintainLoop.
+// Returns an empty (non-nil) slice when no events match.
+func (h *Host) GetBootnodeWarnEvents(since time.Time) []BootnodeWarnEvent {
+        h.bootnodeWarnEventMu.Lock()
+        defer h.bootnodeWarnEventMu.Unlock()
+        out := make([]BootnodeWarnEvent, 0)
+        for _, e := range h.bootnodeWarnEvents {
                 if !e.At.Before(since) {
                         out = append(out, e)
                 }
@@ -1621,6 +1663,20 @@ func (h *Host) maintainLoop() {
                         resolved, err := resolveBootnode(raw)
                         if err != nil {
                                 h.log.Warn("bootnode dns resolve failed", "bootnode", raw, "err", err)
+                                // Also append to the Admin Panel notification ring buffer so
+                                // operators can spot malformed bootnode addresses without SSH.
+                                dnsFail := BootnodeWarnEvent{
+                                        Bootnode: raw,
+                                        Err:      err.Error(),
+                                        AgeSecs:  0,
+                                        At:       time.Now(),
+                                }
+                                h.bootnodeWarnEventMu.Lock()
+                                h.bootnodeWarnEvents = append(h.bootnodeWarnEvents, dnsFail)
+                                if len(h.bootnodeWarnEvents) > bootnodeWarnEventMaxEvents {
+                                        h.bootnodeWarnEvents = h.bootnodeWarnEvents[len(h.bootnodeWarnEvents)-bootnodeWarnEventMaxEvents:]
+                                }
+                                h.bootnodeWarnEventMu.Unlock()
                                 continue // DNS failure: preserve last-known addrs
                         }
                         freshResults = append(freshResults, rawResult{raw, resolved})
@@ -1652,6 +1708,8 @@ func (h *Host) maintainLoop() {
                 // than MaxStaleBootnodeAge.  The warning fires on every discovery
                 // tick while the condition persists so operators see it clearly
                 // in logs without having to search for the original failure.
+                // Also append a BootnodeWarnEvent to the ring buffer so the
+                // Admin Panel notification log can surface these without SSH access.
                 tickNow := time.Now()
                 for _, ss := range staleSamples {
                         age := tickNow.Sub(ss.lastAt)
@@ -1661,6 +1719,18 @@ func (h *Host) maintainLoop() {
                                         "age", age.Round(time.Second),
                                         "max_stale_bootnode_age", h.cfg.MaxStaleBootnodeAge,
                                 )
+                                ev := BootnodeWarnEvent{
+                                        Bootnode: ss.raw,
+                                        Err:      "",
+                                        AgeSecs:  int64(age.Seconds()),
+                                        At:       tickNow,
+                                }
+                                h.bootnodeWarnEventMu.Lock()
+                                h.bootnodeWarnEvents = append(h.bootnodeWarnEvents, ev)
+                                if len(h.bootnodeWarnEvents) > bootnodeWarnEventMaxEvents {
+                                        h.bootnodeWarnEvents = h.bootnodeWarnEvents[len(h.bootnodeWarnEvents)-bootnodeWarnEventMaxEvents:]
+                                }
+                                h.bootnodeWarnEventMu.Unlock()
                         }
                 }
 
