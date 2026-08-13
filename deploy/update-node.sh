@@ -203,10 +203,10 @@ if [[ ! -f "${BINARY_DST}" && ! -f "${SERVICE_FILE}" ]]; then
   echo "  update-node.sh is for upgrading an already-running Aperod node." >&2
   echo "  For a first-time installation run install-node.sh instead." >&2
 
-  send_telegram_alert "⚠️ <b>aperod-node update ABORTED</b>
-Server: $(hostname)
-No binary at <code>${BINARY_DST}</code> and no service file at <code>${SERVICE_FILE}</code>.
-This looks like a fresh server — run <code>install-node.sh</code> instead of <code>update-node.sh</code>."
+  send_telegram_alert "⚠️ <b>aperod-node: обновление ПРЕРВАНО</b>
+Сервер: $(hostname)
+Бинарник не найден: <code>${BINARY_DST}</code>, файл сервиса: <code>${SERVICE_FILE}</code>.
+Похоже, это новый сервер — запустите <code>install-node.sh</code> вместо <code>update-node.sh</code>."
 
   exit 1
 fi
@@ -356,12 +356,12 @@ if [[ -f "${NODE_YAML}" ]]; then
     echo "     bad_block_height_lead: 1000" >&2
     echo "   Then restart the node for the change to take effect." >&2
     echo ""
-    send_telegram_alert "⚠️ <b>aperod-node: dangerous ban defaults detected</b>
-Server: $(hostname)
-<code>${NODE_YAML}</code> still has the pre-August-2026 permissive values:
-bad_block_ban_threshold=${_ban_threshold:-&lt;not set&gt;}  (safe: 5)
-bad_block_height_lead=${_height_lead:-&lt;not set&gt;}  (safe: 1000)
-These disable rogue-peer protection. Edit node.yaml and restart the node."
+    send_telegram_alert "⚠️ <b>aperod-node: опасные значения бан-порогов</b>
+Сервер: $(hostname)
+В <code>${NODE_YAML}</code> ещё стоят разрешающие значения до августа 2026:
+bad_block_ban_threshold=${_ban_threshold:-&lt;не задано&gt;}  (безопасно: 5)
+bad_block_height_lead=${_height_lead:-&lt;не задано&gt;}  (безопасно: 1000)
+Защита от мошеннических пиров отключена. Исправьте node.yaml и перезапустите ноду."
   else
     echo "  [ok] node.yaml ban thresholds look safe (bad_block_ban_threshold=${_ban_threshold:-default}, bad_block_height_lead=${_height_lead:-default})."
   fi
@@ -432,10 +432,10 @@ if ! sudo -u aperod bash -c "export PATH=\$PATH:/usr/local/go/bin; cd '${BLOCKCH
   echo ""
   echo "✗ Build failed — service NOT stopped. The old binary is still running." >&2
 
-  send_telegram_alert "⚠️ <b>aperod-node build FAILED</b>
-Server: $(hostname)
-The service was <b>NOT stopped</b> — the old binary is still running.
-Fix the Go error and re-run <code>update-node.sh</code>."
+  send_telegram_alert "⚠️ <b>aperod-node: сборка ПРОВАЛИЛАСЬ</b>
+Сервер: $(hostname)
+Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает.
+Исправьте ошибку Go и запустите <code>update-node.sh</code> повторно."
 
   exit 1
 fi
@@ -497,11 +497,11 @@ if [[ "${_binary_is_dynamic}" == "true" ]]; then
   echo "  Fix: ensure CGO_ENABLED=0 is set in the Makefile build-node target," >&2
   echo "  then re-run update-node.sh." >&2
 
-  send_telegram_alert "⚠️ <b>aperod-node static-link check FAILED</b>
-Server: $(hostname)
-The freshly built binary at <code>${BINARY_SRC}</code> is dynamically linked.
-The service was <b>NOT stopped</b> — the old binary is still running.
-Fix: ensure <code>CGO_ENABLED=0</code> in the Makefile <code>build-node</code> target, then re-run <code>update-node.sh</code>."
+  send_telegram_alert "⚠️ <b>aperod-node: проверка статической линковки ПРОВАЛИЛАСЬ</b>
+Сервер: $(hostname)
+Новый бинарник <code>${BINARY_SRC}</code> динамически слинкован.
+Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает.
+Исправление: убедитесь, что в Makefile цели <code>build-node</code> установлен <code>CGO_ENABLED=0</code>, затем запустите <code>update-node.sh</code> повторно."
 
   exit 1
 fi
@@ -655,11 +655,11 @@ if ! preflight_validator_key "${_vkey_path}"; then
   echo "✗ Validator-key preflight FAILED — the service was NOT stopped." >&2
   echo "  The old binary is still running. Fix the key file, then re-run update-node.sh." >&2
   echo "  Manual recovery: chmod go-rwx ${_vkey_path:-<validator.key>} && chown aperod:aperod ${_vkey_path:-<validator.key>}" >&2
-  send_telegram_alert "⚠️ <b>aperod-node validator-key preflight FAILED</b>
-Server: $(hostname)
-The validator key at <code>${_vkey_path:-&lt;unknown&gt;}</code> could not be made safe (chmod go-rwx / chown aperod:aperod).
-The service was <b>NOT stopped</b> — the old binary is still running.
-Fix the key file permissions and re-run <code>update-node.sh</code>."
+  send_telegram_alert "⚠️ <b>aperod-node: preflight ключа валидатора ПРОВАЛИЛСЯ</b>
+Сервер: $(hostname)
+Не удалось обезопасить ключ <code>${_vkey_path:-&lt;неизвестно&gt;}</code> (chmod go-rwx / chown aperod:aperod).
+Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает.
+Исправьте права на файл ключа и запустите <code>update-node.sh</code> повторно."
   exit 1
 fi
 
@@ -681,11 +681,11 @@ if [[ "${SKIP_CONFIG_DRYRUN}" != "1" && -f "${NODE_YAML}" ]]; then
     echo "✗ New binary dry-run FAILED — the service was NOT stopped." >&2
     echo "  The old binary is still running. Fix the reported issue and re-run update-node.sh." >&2
     echo "  Details: ${_dryrun_out}" >&2
-    send_telegram_alert "⚠️ <b>aperod-node config dry-run FAILED</b>
-Server: $(hostname)
-The freshly built binary rejected the live config during <code>--validate-config</code>:
+    send_telegram_alert "⚠️ <b>aperod-node: проверка конфига ПРОВАЛИЛАСЬ</b>
+Сервер: $(hostname)
+Новый бинарник отверг рабочий конфиг при <code>--validate-config</code>:
 <code>${_dryrun_out}</code>
-The service was <b>NOT stopped</b> — the old binary is still running."
+Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает."
     exit 1
   fi
 fi
@@ -698,7 +698,26 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> [3/5] Stopping ${SERVICE_NAME}..."
 systemctl stop "${SERVICE_NAME}" || true   # non-fatal if already stopped
-sleep 1
+# Wait up to 120 s for the service to fully stop before we try to replace the
+# binary.  A single "sleep 1" is not enough: on shutdown the node flushes a
+# UTXO snapshot that can take several minutes.  Copying over a binary that is
+# still mapped into a running process fails with ETXTBSY ("Text file busy").
+_stop_waited=0
+while true; do
+    _st=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)
+    [ "$_st" = "inactive" ] || [ "$_st" = "failed" ] && break
+    if [ "$_stop_waited" -ge 120 ]; then
+        echo "  [warn] ${SERVICE_NAME} still '${_st}' after 120 s — sending SIGKILL to unblock binary swap" >&2
+        systemctl kill --signal=SIGKILL "${SERVICE_NAME}" 2>/dev/null || true
+        sleep 2
+        send_telegram_alert "⚠️ <b>Деплой SIGKILL: ${SERVICE_NAME}</b>
+Сервис всё ещё в состоянии '<code>${_st}</code>' спустя ${_stop_waited}с — отправлен SIGKILL для замены бинарника.
+Проверьте зависание сброса снимка: <code>journalctl -u ${SERVICE_NAME} -n 100 --no-pager</code>"
+        break
+    fi
+    sleep 5
+    _stop_waited=$(( _stop_waited + 5 ))
+done
 
 # ---------------------------------------------------------------------------
 # Step 4: Install binary to the correct system path.
@@ -730,11 +749,11 @@ if [[ -f "${BINARY_DST}" ]]; then
     echo "✗ Could not create backup at ${BINARY_BACKUP} — aborting install to protect the running service." >&2
     echo "  The service was stopped; restarting it now." >&2
     systemctl start "${SERVICE_NAME}" || true
-    send_telegram_alert "⚠️ <b>aperod-node install ABORTED</b>
-Server: $(hostname)
-Could not create backup at <code>${BINARY_BACKUP}</code> (storage full or permissions error).
-Install was aborted; the service has been restarted with the existing binary.
-Fix the issue and re-run <code>update-node.sh</code>."
+    send_telegram_alert "⚠️ <b>aperod-node: установка ПРЕРВАНА</b>
+Сервер: $(hostname)
+Не удалось создать резервную копию <code>${BINARY_BACKUP}</code> (диск заполнен или ошибка прав).
+Установка прервана; сервис перезапущен со старым бинарником.
+Устраните проблему и запустите <code>update-node.sh</code> повторно."
     exit 1
   fi
 fi
@@ -764,15 +783,15 @@ _rollback_install() {
     echo "  Manual recovery: cp <new-binary> ${BINARY_DST} && chmod +x ${BINARY_DST} && systemctl start ${SERVICE_NAME}" >&2
   fi
   if [[ "${_restored}" == "true" && "${_restarted}" == "true" ]]; then
-    _summary="Old binary was restored and service restarted successfully."
+    _summary="Старый бинарник восстановлен и сервис перезапущен."
   elif [[ "${_restored}" == "true" ]]; then
-    _summary="Old binary was restored but service failed to start — check <code>journalctl -u ${SERVICE_NAME}</code>."
+    _summary="Старый бинарник восстановлен, но сервис не запустился — проверьте <code>journalctl -u ${SERVICE_NAME}</code>."
   else
-    _summary="Rollback failed — service is DOWN. Manual recovery required."
+    _summary="Откат не удался — сервис УПАЛ. Требуется ручное восстановление."
   fi
-  send_telegram_alert "🚨 <b>aperod-node install FAILED</b>
-Server: $(hostname)
-Binary copy to <code>${BINARY_DST}</code> failed.
+  send_telegram_alert "🚨 <b>aperod-node: установка ПРОВАЛИЛАСЬ</b>
+Сервер: $(hostname)
+Копирование бинарника в <code>${BINARY_DST}</code> не удалось.
 ${_summary}"
 }
 
@@ -822,10 +841,10 @@ else
     echo "✗ Health check FAILED — node did not respond on ${HEALTH_URL}" >&2
     echo "  Inspect logs: journalctl -u ${SERVICE_NAME} -n 100 --no-pager" >&2
 
-    send_telegram_alert "🚨 <b>aperod-node health check FAILED</b>
-Server: $(hostname)
-Node did not respond on <code>${HEALTH_URL}</code> after $(( HEALTH_MAX_ATTEMPTS * HEALTH_WAIT_SECS ))s.
-Inspect logs: <code>journalctl -u ${SERVICE_NAME} -n 100</code>"
+    send_telegram_alert "🚨 <b>aperod-node: health check ПРОВАЛИЛСЯ</b>
+Сервер: $(hostname)
+Нода не ответила на <code>${HEALTH_URL}</code> за $(( HEALTH_MAX_ATTEMPTS * HEALTH_WAIT_SECS ))с.
+Проверьте логи: <code>journalctl -u ${SERVICE_NAME} -n 100</code>"
 
     exit 1
   fi
