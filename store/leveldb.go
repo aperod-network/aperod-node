@@ -290,6 +290,26 @@ func (d *DB) IterActiveUTXOs(fn func(*StoredUTXO) error) error {
         }
         return iter.Error()
 }
+// IterAllUTXOKeys calls fn(txHash, outIdx) for every entry in the u/ index,
+// including those that have already been marked spent in su/.  Used by
+// --rebuild-spent-index to backfill su/ for UTXOs spent before the index
+// was introduced.
+func (d *DB) IterAllUTXOKeys(fn func(txHash crypto.Hash32, outIdx uint32)) error {
+	iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
+	defer iter.Release()
+	const suffixLen = 32 + 4 // txHash (32 bytes) + outIdx (4 bytes, big-endian)
+	for iter.Next() {
+		suffix := iter.Key()[len(prefixUTXO):]
+		if len(suffix) != suffixLen {
+			continue
+		}
+		var h crypto.Hash32
+		copy(h[:], suffix[:32])
+		outIdx := binary.BigEndian.Uint32(suffix[32:])
+		fn(h, outIdx)
+	}
+	return iter.Error()
+}
 
 // ─── Stake-block height index (sb/) ──────────────────────────────────────────
 //
