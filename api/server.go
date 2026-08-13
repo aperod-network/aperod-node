@@ -169,6 +169,13 @@ type Server struct {
         storeMissingFirstBlock int64
         storeMissingLastBlock  int64
 
+        // utxoStoreMissing is the number of unspent transaction outputs in the
+        // sampled tail of the chain whose u/ (UTXO store) LevelDB entry is absent.
+        // Set once by SetUTXOStoreMissing after the startup gap sample in
+        // cmd/node/main.go.  0 means the store looks healthy; > 0 means the
+        // operator should run --repair-db before any withdrawal is attempted.
+        utxoStoreMissing int64
+
         // snapshotMu guards the snapshot status fields below.
         snapshotMu sync.Mutex
         // lastSnapshotHeight is the block height of the most recently saved snapshot.
@@ -517,6 +524,13 @@ func (s *Server) TimestampRejectedCount() int64 {
 func (s *Server) SetStoreMissingBlocks(n int64)      { atomic.StoreInt64(&s.storeMissingBlocks, n) }
 func (s *Server) SetStoreMissingFirstBlock(n int64)  { atomic.StoreInt64(&s.storeMissingFirstBlock, n) }
 func (s *Server) SetStoreMissingLastBlock(n int64)   { atomic.StoreInt64(&s.storeMissingLastBlock, n) }
+
+// SetUTXOStoreMissing records the number of unspent outputs in the sampled
+// chain tail whose u/ LevelDB entry was absent at startup.  Call once from
+// cmd/node/main.go after sampleUTXOStoreGaps completes.  0 means no gaps.
+// The value is exposed on /api/v1/status so the api-server monitor can fire
+// a Telegram alert before any withdrawal attempt triggers the error path.
+func (s *Server) SetUTXOStoreMissing(n int64) { atomic.StoreInt64(&s.utxoStoreMissing, n) }
 
 // SetTxTotal sets the initial total non-coinbase tx count (call once after
 // loading the chain from disk to avoid an O(n) scan on every stats request).
