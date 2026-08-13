@@ -1448,48 +1448,6 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
-                                        // ── Phantom key-image detection ──────────────────────────────
-                                        // An OOM-kill can save a snapshot that includes key images from
-                                        // in-flight mempool transactions that were never confirmed.  On
-                                        // restart those phantom entries mark live UTXOs as "spent",
-                                        // blocking withdrawals with "key image already spent" until the
-                                        // operator runs --rebuild-key-images.
-                                        //
-                                        // Compare the in-memory KI set (just restored from snapshot)
-                                        // against the persistent LevelDB index (only confirmed on-chain
-                                        // spends).  Any KI in memory but absent from LevelDB is a
-                                        // phantom.  The count is exposed on /api/v1/status so the API
-                                        // server monitor can fire a Telegram alert immediately on startup
-                                        // rather than waiting for the first failed withdrawal attempt.
-                                        go func() {
-                                                confirmed := make(map[crypto.KeyImage]struct{})
-                                                if iterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
-                                                        confirmed[ki] = struct{}{}
-                                                        return nil
-                                                }); iterErr != nil {
-                                                        log.Warn("phantom-ki-check: failed to iterate LevelDB key images",
-                                                                "err", iterErr)
-                                                        return
-                                                }
-                                                phantom := 0
-                                                utxos.IterKeyImages(func(ki crypto.KeyImage) {
-                                                        if _, ok := confirmed[ki]; !ok {
-                                                                phantom++
-                                                        }
-                                                })
-                                                if phantom > 0 {
-                                                        log.Warn("startup: phantom key images detected — active UTXOs blocked",
-                                                                "phantom_count", phantom,
-                                                                "hint", "run --rebuild-key-images to clear stale entries and restore affected UTXOs")
-                                                        if apiSrv != nil {
-                                                                apiSrv.SetPhantomKICount(phantom)
-                                                        }
-                                                } else {
-                                                        log.Info("startup: phantom-ki-check passed — all snapshot key images confirmed on-chain",
-                                                                "checked", len(confirmed))
-                                                }
-                                        }()
-
                                         // ── Snapshot ↔ disk-store reconciliation ─────────────────────
                                         // A snapshot can carry corrupted UTXO fields indefinitely: a bad
                                         // write into the in-memory set is persisted at the next snapshot
