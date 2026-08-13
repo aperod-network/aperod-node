@@ -800,3 +800,20 @@ func (s *UTXOSet) All() []*UTXO {
 	}
 	return out
 }
+
+// IterKeyImages calls fn for every spent key image currently held in the
+// in-memory set (both the historical sorted slice and the runtime recent map).
+// Holds the read lock for the full duration; fn must not acquire any UTXOSet
+// locks.  Used by the startup phantom-key-image check to compare in-memory
+// snapshot state against the persistent LevelDB index without allocating a
+// full copy of the key-image slice.
+func (s *UTXOSet) IterKeyImages(fn func(crypto.KeyImage)) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ki := range s.keyImages.sorted {
+		fn(ki)
+	}
+	for ki := range s.keyImages.recent {
+		fn(ki)
+	}
+}
