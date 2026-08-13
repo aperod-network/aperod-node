@@ -765,6 +765,38 @@ func (h *Host) GetStallEvents(since time.Time) []StallEvent {
         return out
 }
 
+// StaleBootnode describes one bootnode whose DNS has not resolved successfully
+// for longer than MaxStaleBootnodeAge.  Returned by GetStaleBootnodes.
+type StaleBootnode struct {
+        Bootnode   string `json:"bootnode"`
+        AgeSeconds int64  `json:"age_seconds"`
+}
+
+// GetStaleBootnodes returns a snapshot of every configured bootnode whose last
+// successful DNS resolution is older than MaxStaleBootnodeAge.  Returns an
+// empty (non-nil) slice when all bootnodes are healthy.
+// Thread-safe; safe to call concurrently with maintainLoop.
+func (h *Host) GetStaleBootnodes() []StaleBootnode {
+        h.mu.RLock()
+        defer h.mu.RUnlock()
+        now := time.Now()
+        out := make([]StaleBootnode, 0)
+        for _, raw := range h.cfg.Bootnodes {
+                lastAt, ok := h.bootnodeLastResolvedAt[raw]
+                if !ok {
+                        continue
+                }
+                age := now.Sub(lastAt)
+                if age > h.cfg.MaxStaleBootnodeAge {
+                        out = append(out, StaleBootnode{
+                                Bootnode:   raw,
+                                AgeSeconds: int64(age.Seconds()),
+                        })
+                }
+        }
+        return out
+}
+
 // GetBootnodeWarnEvents returns all bootnode-warning events that occurred at or
 // after since.  Thread-safe; safe to call concurrently with maintainLoop.
 // Returns an empty (non-nil) slice when no events match.
