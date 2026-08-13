@@ -136,12 +136,12 @@ if [[ "$DELTA" -gt "$RESTART_THRESHOLD" ]]; then
   echo "✗ RESTART SPIKE: ${PM2_APP} restarted ${DELTA} times since last deploy (threshold=${RESTART_THRESHOLD})." >&2
   echo "  Check logs: pm2 logs ${PM2_APP} --lines 100" >&2
 
-  send_telegram_alert "🚨 <b>aperod-api RESTART SPIKE</b>
-Server: $(hostname)
-Restarts since last deploy: <b>${DELTA}</b> (threshold: ${RESTART_THRESHOLD})
-Current restart count: ${CURRENT_COUNT}
+  send_telegram_alert "🚨 <b>aperod-api: СКАЧОК РЕСТАРТОВ</b>
+Сервер: $(hostname)
+Рестарты с последнего деплоя: <b>${DELTA}</b> (порог: ${RESTART_THRESHOLD})
+Текущее число рестартов: ${CURRENT_COUNT}
 
-Check logs: <code>pm2 logs ${PM2_APP} --lines 100</code>"
+Проверьте логи: <code>pm2 logs ${PM2_APP} --lines 100</code>"
 
   exit 1
 fi
