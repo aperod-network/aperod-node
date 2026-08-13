@@ -3,12 +3,14 @@ package p2p_test
 // Tests for p2p Host: lifecycle, broadcast with 0 peers, full handshake over net.Pipe.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -451,6 +453,40 @@ func TestHost_WhitelistSidecar_EmptyRetainsCfgEntries(t *testing.T) {
 	got := h.GetPeerWhitelist()
 	if len(got) != 1 || got[0] != "1.2.3.4" {
 		t.Errorf("GetPeerWhitelist = %v, want [1.2.3.4] — empty sidecar must not clear node.yaml entries", got)
+	}
+}
+
+// TestHost_WhitelistSidecar_NullBlocksStartup verifies that a sidecar file
+// containing the literal JSON value null causes Start() to return a non-nil
+// error.  A null sidecar (e.g. produced by a buggy serialiser that encodes an
+// uninitialised pointer) is not equivalent to an empty whitelist: if it were
+// silently treated as "no whitelist", the node would open itself to all inbound
+// IPs, defeating the purpose of the whitelist entirely.  The error must be
+// returned rather than logged-and-swallowed so the process does not start.
+func TestHost_WhitelistSidecar_NullBlocksStartup(t *testing.T) {
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// Write a sidecar that contains the JSON literal null.
+	if err := os.WriteFile(wlFile, []byte("null"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-wl-null",
+		UserAgent:     "aperod/test",
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() succeeded with a JSON-null whitelist sidecar; want non-nil error")
+	}
+	if !strings.Contains(err.Error(), "null") {
+		t.Errorf("Start() error %q does not mention 'null'", err.Error())
 	}
 }
 
@@ -2109,16 +2145,15 @@ func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
 		// We use SetReadDeadline (not SetDeadline) so the write goroutine is
 		// never blocked by the same per-message deadline.
 		//
-		// Rate-limit GetHeaders responses: the processBlock re-trigger in host.go
-		// fires for every accepted block during a batch, generating O(n) redundant
-		// GetHeaders requests per batch.  Each response with 500 headers would
-		// cause O(n²) GetBlock traffic that floods the write channel and deadlocks
-		// the TCP connection.  We suppress redundant requests by only serving a
-		// new batch once the relay's best known height has caught up to the end of
-		// the previous batch (lastBatchEnd).  The final block of each batch always
-		// triggers a requestHeaders with bestHeight == lastBatchEnd, which passes
-		// the guard and serves the next batch — exactly the re-trigger chain we
-		// are testing.
+		// Guard against redundant GetHeaders requests: host.go now fires the
+		// processBlock re-trigger only when pendingBlocks drains to zero (batch
+		// end), so the relay sends exactly one GetHeaders per 500-block batch.
+		// The lastBatchEnd guard below is kept as a safety net for any residual
+		// redundant requests (e.g. from the periodic sync ticker) and to prevent
+		// a write-channel flood if the relay ever sends extra requests.  The
+		// final block of each batch arrives with bestHeight == lastBatchEnd,
+		// which passes the guard and drives the next batch — exactly the
+		// re-trigger chain under test.
 		lastBatchEnd := uint64(0) // highest height included in the last batch served
 
 		// sentBlocks deduplicates GetBlock responses.  When redundant requestHeaders
@@ -2253,6 +2288,401 @@ func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
 		t.Logf("✓ relay synced %d-block gap autonomously: tip=%d", gapSize, finalTip)
 	}
 }
+
+// TestSync_RelayNode_CatchesUpDuringLiveProduction verifies that the relay
+// stays synced when the validator keeps producing new blocks while the relay is
+// still catching up from a gap.
+//
+// The test has two explicit phases:
+//
+//  1. Initial catch-up (phase 1): the relay must advance from height 0 to the
+//     snapshot tip (initialGap=500), proving the processBlock re-trigger chains
+//     successive GetHeaders batches while the validator is concurrently producing
+//     new blocks.
+//
+//  2. Live-production delivery (phase 2): after the relay completes phase 1, the
+//     producer goroutine is guaranteed to have appended at least minLiveBlocks new
+//     blocks whose heights exceed the snapshot tip.  The relay must then advance
+//     to those heights, proving that blocks produced after the initial snapshot
+//     were delivered — either via the gossip path (MsgBlock pushed as each block
+//     is produced) or via a fresh processBlock re-trigger that fires when the
+//     first post-snapshot GetHeaders batch completes.
+//
+// A future refactor that breaks one path while leaving the other intact would
+// fail phase 2 while the static-chain gap test (which uses a frozen chain)
+// would continue to pass — this test catches that regression.
+func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
+	const initialGap = 500           // blocks pre-built before relay connects
+	const productionInterval = 50 * time.Millisecond
+	const minLiveBlocks = 15         // live blocks that must exist before phase-2 check
+	const allowedLag = 5             // relay may trail the live tip by this many blocks
+	const catchUpTimeout = 30 * time.Second
+	const liveTimeout = 15 * time.Second
+
+	// ── Build the initial chain: genesis + initialGap blocks ─────────────────
+	priv, pub, keyErr := crypto.GenerateValidatorKey()
+	if keyErr != nil {
+		t.Fatalf("GenerateValidatorKey: %v", keyErr)
+	}
+
+	// chain and byHash are shared between the producer goroutine and the server
+	// goroutine.  Both must hold chainMu when accessing them.
+	var chainMu sync.Mutex
+	chain := make([]*core.Block, 0, initialGap+200)
+	byHash := make(map[crypto.Hash32]*core.Block, initialGap+200)
+
+	var prevHash crypto.Hash32
+	for i := 0; i <= initialGap; i++ {
+		hdr := core.BlockHeader{
+			Height:       uint64(i),
+			PrevHash:     prevHash,
+			ValidatorPub: pub,
+			Timestamp:    time.Now().UnixNano() + int64(i),
+		}
+		if signErr := hdr.Sign(priv); signErr != nil {
+			t.Fatalf("Sign block %d: %v", i, signErr)
+		}
+		b := &core.Block{Header: hdr}
+		chain = append(chain, b)
+		bh := b.Hash()
+		byHash[bh] = b
+		prevHash = bh
+	}
+
+	// gossipCh carries newly produced blocks from the producer goroutine to the
+	// TCP server goroutine so they can be pushed to the relay via MsgBlock.
+	gossipCh := make(chan *core.Block, 256)
+
+	// stopProducing signals the producer goroutine to exit when the test ends.
+	stopProducing := make(chan struct{})
+	defer close(stopProducing)
+
+	// ── Producer goroutine: append a new block every ~50 ms ─────────────────
+	// Runs until stopProducing is closed, guaranteeing the chain is still
+	// growing when phase 2 checks live-production delivery.
+	go func() {
+		ticker := time.NewTicker(productionInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProducing:
+				return
+			case <-ticker.C:
+				chainMu.Lock()
+				tip := chain[len(chain)-1]
+				ph := tip.Hash()
+				nextHeight := tip.Header.Height + 1
+				chainMu.Unlock()
+
+				hdr := core.BlockHeader{
+					Height:       nextHeight,
+					PrevHash:     ph,
+					ValidatorPub: pub,
+					Timestamp:    time.Now().UnixNano(),
+				}
+				if signErr := hdr.Sign(priv); signErr != nil {
+					return
+				}
+				b := &core.Block{Header: hdr}
+				bh := b.Hash()
+
+				chainMu.Lock()
+				chain = append(chain, b)
+				byHash[bh] = b
+				chainMu.Unlock()
+
+				select {
+				case gossipCh <- b:
+				default: // drop if full — relay recovers via GetHeaders re-trigger
+				}
+			}
+		}
+	}()
+
+	// ── Raw TCP "validator" server ────────────────────────────────────────────
+	ln, listenErr := net.Listen("tcp", "127.0.0.1:0")
+	if listenErr != nil {
+		t.Fatalf("validator listen: %v", listenErr)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// done is closed when this goroutine exits, signalling the write goroutine
+		// and the gossip forwarder to stop.  Using a done channel (rather than
+		// closing writeCh) avoids a send-on-closed-channel panic in the forwarder.
+		done := make(chan struct{})
+		defer close(done)
+
+		type writeReq struct {
+			msgType p2p.MessageType
+			payload interface{}
+		}
+		writeCh := make(chan writeReq, 4096)
+
+		// Write goroutine: serialises all writes to conn.
+		go func() {
+			for {
+				select {
+				case req := <-writeCh:
+					conn.SetWriteDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
+					if wErr := p2p.WriteMsg(conn, req.msgType, req.payload); wErr != nil {
+						return
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		// Gossip forwarder: pushes newly produced blocks to the relay via MsgBlock
+		// so the gossip path is exercised as the relay approaches the live tip.
+		go func() {
+			for {
+				select {
+				case b := <-gossipCh:
+					select {
+					case writeCh <- writeReq{p2p.MsgBlock, p2p.BlockToMsg(b)}:
+					case <-done:
+						return
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		// Asymmetric handshake: relay dials us outbound → it sends Ping first.
+		chainMu.Lock()
+		tipAtHandshake := chain[len(chain)-1].Header.Height
+		chainMu.Unlock()
+
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("validator: expected MsgPing got %v err=%v", mt, rdErr)
+			return
+		}
+		writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+			NodeID:    "live-validator",
+			Height:    tipAtHandshake,
+			UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		}}
+
+		// Rate-limit GetHeaders responses (same dedup logic as the 2000-block gap
+		// test): only serve a new batch once the relay's best known height has
+		// caught up to the end of the previous batch, preventing O(n²) traffic.
+		lastBatchEnd := uint64(0)
+		sentBlocks := make(map[crypto.Hash32]bool)
+
+		totalTimeout := catchUpTimeout + liveTimeout
+		for {
+			conn.SetReadDeadline(time.Now().Add(totalTimeout)) //nolint:errcheck
+			msgType, data, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return
+			}
+			switch msgType {
+
+			case p2p.MsgGetHeaders:
+				var req p2p.GetHeadersMsg
+				if uErr := p2p.Unmarshal(data, &req); uErr != nil {
+					t.Logf("validator: unmarshal GetHeaders: %v", uErr)
+					return
+				}
+
+				// Snapshot the chain under the lock so we don't hold it while
+				// building the response.
+				chainMu.Lock()
+				chainSnap := make([]*core.Block, len(chain))
+				copy(chainSnap, chain)
+				chainMu.Unlock()
+
+				// Find the relay's highest known hash in our chain snapshot.
+				bestHeight := uint64(0)
+				for _, hash := range req.KnownHashes {
+					chainMu.Lock()
+					b, ok := byHash[hash]
+					chainMu.Unlock()
+					if ok && b.Header.Height > bestHeight {
+						bestHeight = b.Header.Height
+					}
+				}
+
+				// Suppress redundant requests to avoid O(n²) message explosion.
+				if bestHeight < lastBatchEnd {
+					continue
+				}
+
+				limit := req.Limit
+				if limit <= 0 || limit > 500 {
+					limit = 500
+				}
+				start := int(bestHeight) + 1
+				var hdrs []p2p.SerializedHeader
+				for i := start; i < len(chainSnap) && len(hdrs) < limit; i++ {
+					b := chainSnap[i]
+					hash := b.Hash()
+					hdrs = append(hdrs, p2p.SerializedHeader{
+						Height:       b.Header.Height,
+						Hash:         hash,
+						PrevHash:     b.Header.PrevHash,
+						MerkleRoot:   b.Header.MerkleRoot,
+						Timestamp:    b.Header.Timestamp,
+						Round:        b.Header.Round,
+						ValidatorPub: b.Header.ValidatorPub,
+						Signature:    b.Header.Signature,
+					})
+				}
+				if len(hdrs) > 0 {
+					lastBatchEnd = hdrs[len(hdrs)-1].Height
+					writeCh <- writeReq{p2p.MsgHeaders, p2p.HeadersMsg{Headers: hdrs}}
+				}
+
+			case p2p.MsgGetBlock:
+				var req p2p.GetBlockMsg
+				if uErr := p2p.Unmarshal(data, &req); uErr != nil {
+					t.Logf("validator: unmarshal GetBlock: %v", uErr)
+					return
+				}
+				chainMu.Lock()
+				b, ok := byHash[req.Hash]
+				chainMu.Unlock()
+				if !ok {
+					continue
+				}
+				if sentBlocks[req.Hash] {
+					continue
+				}
+				sentBlocks[req.Hash] = true
+				writeCh <- writeReq{p2p.MsgBlock, p2p.BlockToMsg(b)}
+
+			case p2p.MsgPing:
+				// Reply with the current live tip so the relay's Pong handler
+				// can detect new blocks and re-trigger requestHeaders.
+				chainMu.Lock()
+				liveTip := chain[len(chain)-1].Header.Height
+				chainMu.Unlock()
+				writeCh <- writeReq{p2p.MsgPong, p2p.PingMsg{
+					NodeID:    "live-validator",
+					Height:    liveTip,
+					UserAgent: "test",
+					Timestamp: time.Now().Unix(),
+				}}
+			}
+		}
+	}()
+
+	// ── Relay node starting at height 0 (genesis only) ───────────────────────
+	chainMu.Lock()
+	genesis := chain[0]
+	chainMu.Unlock()
+
+	relayHandler := newGapSyncHandler(genesis)
+	relayHost := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "relay-live-prod-test",
+		UserAgent:            "aperod/test",
+		GetBlockStallTimeout: 2 * time.Second, // short so stall recovery is fast
+		KeepaliveInterval:    2 * time.Second,
+	}, relayHandler, newTestLogger())
+	if err := relayHost.Start(); err != nil {
+		t.Fatalf("relay Start: %v", err)
+	}
+	defer relayHost.Stop()
+
+	// Dial the validator. After the handshake the relay sees peerHeight=initialGap
+	// and immediately calls requestHeaders. The processBlock re-trigger then chains
+	// successive batches while the producer goroutine concurrently appends new
+	// blocks that are also gossiped via MsgBlock.
+	relayHost.DialPeer(ln.Addr().String())
+
+	// ── Phase 1: wait for relay to complete the initial catch-up ─────────────
+	// The relay must reach the snapshot tip (height 500).  This proves the
+	// processBlock re-trigger chains successive GetHeaders batches correctly
+	// while the validator is concurrently producing new blocks.
+	catchUpDeadline := time.Now().Add(catchUpTimeout)
+	for time.Now().Before(catchUpDeadline) {
+		if relayHandler.tipNow() >= initialGap {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	catchUpTip := relayHandler.tipNow()
+	if catchUpTip < initialGap {
+		t.Fatalf("phase 1 failed: relay stalled at %d after %s; want >= %d — "+
+			"processBlock re-trigger may not be chaining batches during live production",
+			catchUpTip, catchUpTimeout, initialGap)
+	}
+	t.Logf("phase 1 \u2713 initial catch-up complete: relay tip=%d", catchUpTip)
+
+	// ── Phase 2: assert relay advances into the live-production region ────────
+	// Wait until the producer has generated at least minLiveBlocks blocks
+	// beyond the snapshot tip — heights that could only exist because the
+	// producer ran after the relay started syncing.
+	liveTarget := uint64(initialGap + minLiveBlocks)
+	waitLive := time.Now().Add(liveTimeout)
+	for time.Now().Before(waitLive) {
+		chainMu.Lock()
+		liveTip := chain[len(chain)-1].Header.Height
+		chainMu.Unlock()
+		if liveTip >= liveTarget {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	chainMu.Lock()
+	confirmedLiveTip := chain[len(chain)-1].Header.Height
+	chainMu.Unlock()
+	if confirmedLiveTip < liveTarget {
+		t.Fatalf("producer did not generate enough live blocks: live tip=%d, want>=%d "+
+			"(producer may have stopped too early)", confirmedLiveTip, liveTarget)
+	}
+
+	// The relay must advance to at least (liveTarget - allowedLag).
+	// Heights in that range only exist because the producer generated them after
+	// the initial snapshot — reaching them proves the relay handled live
+	// production blocks (via gossip MsgBlock or processBlock re-trigger).
+	relayLiveTarget := liveTarget - uint64(allowedLag)
+	for time.Now().Before(waitLive) {
+		if relayHandler.tipNow() >= relayLiveTarget {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	finalRelayTip := relayHandler.tipNow()
+	chainMu.Lock()
+	finalLiveTip := chain[len(chain)-1].Header.Height
+	chainMu.Unlock()
+
+	if finalRelayTip < relayLiveTarget {
+		lag := uint64(0)
+		if finalLiveTip > finalRelayTip {
+			lag = finalLiveTip - finalRelayTip
+		}
+		t.Errorf("phase 2 failed: relay tip=%d did not reach %d "+
+			"(live tip=%d, lag=%d, allowed=%d) — gossip path or processBlock "+
+			"re-trigger to live heights may be broken",
+			finalRelayTip, relayLiveTarget, finalLiveTip, lag, allowedLag)
+	} else {
+		lag := uint64(0)
+		if finalLiveTip > finalRelayTip {
+			lag = finalLiveTip - finalRelayTip
+		}
+		t.Logf("phase 2 \u2713 relay delivered live production blocks: "+
+			"relay tip=%d live tip=%d lag=%d",
+			finalRelayTip, finalLiveTip, lag)
+	}
+}
+
 
 // TestSync_RelayStall_ReissuesGetHeaders verifies that when a relay node sends
 // MsgGetBlock requests that the peer never answers (block pruned, reorg, or
@@ -2942,3 +3372,186 @@ func (h *heightTrackingHandler) CurrentHeight() uint64                 {
 }
 func (h *heightTrackingHandler) CurrentTailHashes(_ int) []crypto.Hash32 { return nil }
 func (h *heightTrackingHandler) GetBlock(_ crypto.Hash32) *core.Block    { return nil }
+
+// TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer verifies that
+// a bootnode whose TCP port is closed (connection refused) is retried on every
+// maintainLoop tick — because bootnodes skip exponential back-off — while a
+// valid peer that completed the P2P handshake stays connected throughout.
+//
+// Scenario:
+//   - validLn: a raw TCP listener that reads MsgPing, writes MsgPong, and holds
+//     the connection open (simulates a good bootnode).
+//   - rogueAddr: a port grabbed from a listener that is immediately closed so
+//     any TCP connect to it gets ECONNREFUSED.
+//   - Both addresses are listed in cfg.Bootnodes.
+//
+// After Start() the host must connect to the valid peer.  After several
+// HostTriggerMaintain ticks the host must (a) still have PeerCount ≥ 1 and
+// (b) have attempted the rogue address at least once per tick, proving that
+// refused-connection bootnodes are retried without panicking and without
+// disrupting established connections.
+func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T) {
+	// ── Valid bootnode: completes handshake and holds the connection ──────────
+	validLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("valid bootnode listen: %v", err)
+	}
+	defer validLn.Close()
+	validAddr := validLn.Addr().String()
+
+	go func() {
+		for {
+			c, acceptErr := validLn.Accept()
+			if acceptErr != nil {
+				return // listener closed — test teardown
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(5 * time.Second))
+				// Outbound host sends MsgPing first (asymmetric handshake).
+				mt, _, rdErr := p2p.ReadMsg(c)
+				if rdErr != nil || mt != p2p.MsgPing {
+					return
+				}
+				if wrErr := p2p.WriteMsg(c, p2p.MsgPong, p2p.PingMsg{
+					NodeID: "valid-bootnode", UserAgent: "test", Timestamp: time.Now().UnixNano(),
+				}); wrErr != nil {
+					return
+				}
+				c.SetDeadline(time.Time{}) // clear — hold open until test ends
+				// Drain keepalive pings so the host doesn't evict the peer.
+				buf := make([]byte, 256)
+				for {
+					c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+					if _, rerr := c.Read(buf); rerr != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+
+	// ── Rogue bootnode: grab a free port then immediately close the listener ──
+	// TCP connects to rogueAddr will receive ECONNREFUSED.
+	rogueLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("rogue bootnode listen: %v", err)
+	}
+	rogueAddr := rogueLn.Addr().String()
+	rogueLn.Close() // from this point on: connection refused
+
+	// ── Host under test ───────────────────────────────────────────────────────
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		MinPeers:   1,
+		NodeID:     "rogue-bootnode-test",
+		UserAgent:  "aperod-test",
+		Bootnodes:  []string{validAddr, rogueAddr},
+	}, &stubHandler{}, newTestLogger())
+
+	// Wrap the default dial function to count attempts to the rogue address.
+	var rogueDials atomic.Int32
+	defaultDialer := &net.Dialer{}
+	p2p.SetDialFunc(host, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == rogueAddr {
+			rogueDials.Add(1)
+		}
+		return defaultDialer.DialContext(ctx, network, addr)
+	})
+
+	if err := host.Start(); err != nil {
+		t.Fatalf("host.Start: %v", err)
+	}
+	defer host.Stop()
+
+	// ── Phase 1: wait for the valid bootnode to be connected ─────────────────
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if host.PeerCount() < 1 {
+		t.Fatalf("valid bootnode never connected (PeerCount=%d after 3 s)", host.PeerCount())
+	}
+	t.Logf("valid bootnode connected: PeerCount=%d", host.PeerCount())
+
+	// ── Phase 2: fire several maintain ticks and let dial goroutines settle ───
+	const ticks = 3
+	for i := 0; i < ticks; i++ {
+		p2p.HostTriggerMaintain(host)
+		time.Sleep(150 * time.Millisecond) // allow dialPeer goroutines to run
+	}
+
+	// ── Assertions ────────────────────────────────────────────────────────────
+	// 1. Valid peer must still be connected — rogue retries must not disrupt it.
+	if host.PeerCount() < 1 {
+		t.Errorf("valid peer was lost during rogue-bootnode retry ticks (PeerCount=%d, want ≥1)",
+			host.PeerCount())
+	} else {
+		t.Logf("✓ valid peer remains connected after %d rogue-retry ticks (PeerCount=%d)",
+			ticks, host.PeerCount())
+	}
+
+	// 2. The rogue address must have been attempted at least (ticks) times
+	//    (Start fires the first dial; each HostTriggerMaintain fires another
+	//    because bootnodes skip exponential back-off).
+	rogueAttempts := rogueDials.Load()
+	if rogueAttempts < int32(ticks) {
+		t.Errorf("rogue bootnode attempted %d times, want ≥%d — "+
+			"maintainLoop must keep retrying refused bootnodes with back-off skipped",
+			rogueAttempts, ticks)
+	} else {
+		t.Logf("✓ rogue bootnode retried %d times across %d ticks (ECONNREFUSED, no panic)",
+			rogueAttempts, ticks)
+	}
+	// 3. Reaching here without a panic proves the node survived all ECONNREFUSED
+	//    dial failures without crashing.
+}
+
+// TestHost_WhitelistSidecar_UnreadableFailsClosed verifies that Start() returns
+// a non-nil error when the whitelist sidecar file exists but cannot be read
+// (e.g. permission denied).  Without this fail-closed behaviour a refactor that
+// accidentally swallows the I/O error would let the node start in open-network
+// mode — accepting inbound connections from all IPs — after a restart.
+//
+// The test is skipped on Windows where file-permission semantics differ and on
+// any platform where the process runs as root (which ignores mode bits).
+func TestHost_WhitelistSidecar_UnreadableFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file permission semantics differ on Windows")
+	}
+	if os.Getuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+
+	dir := t.TempDir()
+	wlFile := dir + "/whitelist.json"
+
+	// Create a valid sidecar file and then remove read permission so that
+	// os.ReadFile returns a "permission denied" error on startup.
+	if err := os.WriteFile(wlFile, []byte(`["10.0.0.1"]`), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if err := os.Chmod(wlFile, 0o000); err != nil {
+		t.Fatalf("chmod sidecar: %v", err)
+	}
+	// Restore permissions after the test so t.TempDir cleanup can delete the file.
+	t.Cleanup(func() { os.Chmod(wlFile, 0o600) }) //nolint:errcheck
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-wl-unreadable",
+		UserAgent:     "aperod/test",
+		WhitelistFile: wlFile,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() succeeded with an unreadable whitelist sidecar — expected a non-nil error (fail-closed)")
+	}
+}
