@@ -209,3 +209,22 @@ func (h *Host) TimestampStrikeCount() int {
 // HostMaxClockSkewNs is the exported alias for hostMaxClockSkewNs so tests can
 // build future-timestamp values relative to the exact production threshold.
 const HostMaxClockSkewNs = hostMaxClockSkewNs
+
+// BadBlockStrikeTTL is the exported alias for badBlockStrikeTTL so tests can
+// advance time relative to the exact production TTL without duplicating the
+// constant.
+const BadBlockStrikeTTL = badBlockStrikeTTL
+
+// SetBadBlockLastSeen overwrites the lastSeen timestamp for ip in the
+// bad-block strike map without changing its strike count.  This lets unit
+// tests simulate elapsed time (e.g. time.Now().Add(-2*BadBlockStrikeTTL))
+// so the TTL expiry path can be exercised without waiting a real hour.
+// No-op when ip is not currently in the map.  Exported for testing only.
+func (h *Host) SetBadBlockLastSeen(ip string, t time.Time) {
+	h.badBlockMu.Lock()
+	defer h.badBlockMu.Unlock()
+	if s, ok := h.badBlockCounts[ip]; ok {
+		s.lastSeen = t
+		h.badBlockCounts[ip] = s
+	}
+}
