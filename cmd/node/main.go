@@ -2539,6 +2539,33 @@ func run() error {
                                         }
                                         return out
                                 })
+                                // Wire malformed/stale bootnode warning events for the Admin Panel.
+                                apiSrv.SetBootnodeWarnEventFunc(func(since time.Time) []api.BootnodeWarnEntry {
+                                        evts := host.GetBootnodeWarnEvents(since)
+                                        out := make([]api.BootnodeWarnEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.BootnodeWarnEntry{
+                                                        Bootnode: e.Bootnode,
+                                                        Err:      e.Err,
+                                                        AgeSecs:  e.AgeSecs,
+                                                        At:       e.At,
+                                                }
+                                        }
+                                        return out
+                                })
+                                // Wire live stale-bootnode status for the /health endpoint so
+                                // the Admin Panel health widget can surface degraded DNS without SSH.
+                                apiSrv.SetStaleBootnodeFn(func() []api.StaleBootnodeEntry {
+                                        nodes := host.GetStaleBootnodes()
+                                        out := make([]api.StaleBootnodeEntry, len(nodes))
+                                        for i, n := range nodes {
+                                                out[i] = api.StaleBootnodeEntry{
+                                                        Bootnode:   n.Bootnode,
+                                                        AgeSeconds: n.AgeSeconds,
+                                                }
+                                        }
+                                        return out
+                                })
                                 // Seed the static /api/v1/status display from current live list.
                                 apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
