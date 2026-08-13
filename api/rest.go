@@ -1869,10 +1869,18 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		// Fallback: check the persistent u/ LevelDB store.  This covers UTXOs from
 		// blocks that pre-date the current in-memory window (e.g. after a restart or
 		// when the UTXOSet was rebuilt from a snapshot that omitted old entries).
+		//
+		// u/ records are intentionally never deleted on spend (utxoMissingReason
+		// needs them to distinguish "never existed" from "spent").  Cross-check
+		// the su/ spent-UTXO index so a spent output is not mis-reported as
+		// exists=true via this fallback path.
 		if su, suErr := s.blockStore.GetUTXO(txHash, outIdx); suErr == nil && su != nil {
-			amountCommit = su.AmountCommit
-			blockHeight = su.BlockHeight
-			found = true
+			if !s.blockStore.IsUTXOSpent(txHash, outIdx) {
+				amountCommit = su.AmountCommit
+				blockHeight = su.BlockHeight
+				found = true
+			}
+			// else: record present in u/ but su/ marks it spent → not found.
 		}
 	}
 
@@ -2445,6 +2453,7 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"tip_height":           tipHeight,
 		"utxo_rebuilding":      atomic.LoadInt32(&s.utxoRebuilding) == 1,
 		"startup_rescue":       atomic.LoadInt32(&s.startupRescue) == 1,
+		"phantom_ki_count":     atomic.LoadInt64(&s.phantomKICount),
 		"store_missing_blocks":      storeMissing,
 		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
