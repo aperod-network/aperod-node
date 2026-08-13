@@ -956,6 +956,44 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
                 txs = append(txs, tx)
         }
 
+        // Pre-screen: re-verify each ring-sig tx against the current UTXO set
+        // BEFORE including it in the block.  A tx that passed Add() when it
+        // entered the mempool may now have an invalid ring sig if the UTXOSet
+        // was corrected after an OOM snapshot repair, or if its ring-member
+        // decoy UTXOs have since been spent or removed (pruning, fork, etc.).
+        //
+        // Rather than letting such a tx stall block production indefinitely
+        // (validator tries → VerifyBlock fails → error → retry forever), we
+        // evict and ban it so that:
+        //   1. This block slot succeeds without the invalid tx.
+        //   2. The freed key image(s) immediately allow legitimate spends from
+        //      the same UTXO to be submitted and mined.
+        //   3. P2P peers cannot re-inject the tx and recreate the phantom
+        //      key-image lock that blocks user withdrawals.
+        if e.txVerifier != nil {
+                screened := txs[:0]
+                for i := range txs {
+                        tx := &txs[i]
+                        if tx.IsCoinbase() || tx.IsStake() {
+                                screened = append(screened, *tx)
+                                continue
+                        }
+                        if err := e.txVerifier.VerifyTx(tx); err != nil {
+                                hash := tx.Hash()
+                                e.log.Warn("produceBlock: banning mempool tx that failed re-verification",
+                                        "hash", hash,
+                                        "height", height,
+                                        "err", err,
+                                )
+                                e.pool.BanTx(hash)
+                                // Do not append — tx is excluded from this block.
+                                continue
+                        }
+                        screened = append(screened, *tx)
+                }
+                txs = screened
+        }
+
         // EIP-1559–style 100% base-fee burn: fees are NOT forwarded to the
         // validator — they are destroyed upon block finalization by never
         // appearing in any output.  Validators earn only the explicit coinbase
