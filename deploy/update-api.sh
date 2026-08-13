@@ -150,10 +150,10 @@ if ! sudo -u aperod bash -c "cd '$APEROD_DIR' && pnpm --filter '$API_FILTER' run
   echo ""
   echo "✗ Build failed — pm2 NOT restarted. Fix the error and re-run update-api.sh" >&2
 
-  send_telegram_alert "⚠️ <b>aperod-api build FAILED</b>
-Server: $(hostname)
-pm2 was <b>NOT</b> restarted — the old binary is still running.
-Fix the TypeScript error and re-run <code>update-api.sh</code>."
+  send_telegram_alert "⚠️ <b>aperod-api: сборка ПРОВАЛИЛАСЬ</b>
+Сервер: $(hostname)
+pm2 <b>НЕ перезапущен</b> — старый бинарник всё ещё работает.
+Исправьте ошибку TypeScript и запустите <code>update-api.sh</code> повторно."
 
   exit 1
 fi
@@ -174,7 +174,7 @@ echo "==> [3/4] Restarting PM2 process '$PM2_APP'..."
 API_PORT="${API_PORT:-3001}"
 pm2 stop "$PM2_APP" 2>/dev/null || true
 wait_port_free "$API_PORT" "${PORT_FREE_TIMEOUT:-10}" || {
-  send_telegram_alert "⚠️ <b>aperod-api deploy</b>: port ${API_PORT} could not be freed on $(hostname); pm2 NOT restarted."
+  send_telegram_alert "⚠️ <b>aperod-api деплой</b>: порт ${API_PORT} не освободился на $(hostname); pm2 НЕ перезапущен."
   echo "✗ Aborting before pm2 restart — old process still holds port ${API_PORT}." >&2
   exit 1
 }
@@ -194,7 +194,7 @@ else
   # failed pm2 restart, but a brief race or a surviving zombie could have
   # re-bound it by the time we reach pm2 start.
   wait_port_free "$API_PORT" "${PORT_FREE_TIMEOUT:-10}" || {
-    send_telegram_alert "⚠️ <b>aperod-api deploy</b>: port ${API_PORT} could not be freed on $(hostname); pm2 start skipped."
+    send_telegram_alert "⚠️ <b>aperod-api деплой</b>: порт ${API_PORT} не освободился на $(hostname); pm2 start пропущен."
     echo "✗ Aborting fresh start — port ${API_PORT} still busy." >&2
     exit 1
   }
