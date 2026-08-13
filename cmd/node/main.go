@@ -537,6 +537,7 @@ func run() error {
         resetTip := false
         repairDB := false
         rebuildKeyImages := false
+        forcePurgeKIIndex := false
         for i, arg := range os.Args[1:] {
                 switch arg {
                 case "--config":
@@ -555,6 +556,17 @@ func run() error {
                         repairDB = true
                 case "--rebuild-key-images":
                         rebuildKeyImages = true
+                case "--force-purge-ki-index":
+                        // Must be combined with --rebuild-key-images.
+                        // On pruned nodes the normal rebuild cannot verify key images
+                        // from unreadable blocks and falls back to the persistent index,
+                        // which may contain phantom entries from partial LevelDB writes.
+                        // This flag purges all unverifiable entries from the persistent
+                        // k/ index and rebuilds in-memory state solely from the readable
+                        // block scan.  SAFE because the UTXO set is the primary
+                        // double-spend guard — any UTXO whose key image we remove was
+                        // already removed from the UTXO set when the block was applied.
+                        forcePurgeKIIndex = true
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
@@ -664,9 +676,7 @@ func run() error {
         }
 
         // Emit any non-fatal configuration warnings now that the logger is ready.
-        for _, w := range cfg.Warnings() {
-                log.Warn("config warning", "msg", w)
-        }
+        emitConfigWarnings(log, cfg)
 
         // Guard: warn when a relay (non-validator) node has a snapshot tolerance
         // below 10 %.  Operators who manually rsync chain.db+snapshots outside of
@@ -1382,7 +1392,7 @@ func run() error {
                                                 log.Info("--rebuild-key-images: clearing stale entries and rebuilding from block scan",
                                                         "tip_height", tipHeight,
                                                         "stale_key_images_in_snapshot", len(snap.UTXOs.KeyImages))
-                                                kiBuilt, kiErr := rebuildKeyImagesFromBlocks(db, tipHeight, utxos, log)
+                                                kiBuilt, kiErr := rebuildKeyImagesFromBlocks(db, tipHeight, utxos, forcePurgeKIIndex, log)
                                                 if kiErr != nil {
                                                         return fmt.Errorf("--rebuild-key-images: %w", kiErr)
                                                 }
@@ -2986,6 +2996,15 @@ func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
 //	                        included in the suggested fix message so operators know
 //	                        exactly which file to recreate
 //	log                  – structured logger
+// emitConfigWarnings iterates over the non-fatal warnings returned by
+// cfg.Warnings() and logs each one at WARN level.  Extracting the loop into
+// this helper makes it directly testable without spinning up a full node.
+func emitConfigWarnings(log *slog.Logger, cfg *config.Config) {
+        for _, w := range cfg.Warnings() {
+                log.Warn("config warning", "msg", w)
+        }
+}
+
 func checkGOMLEMLIMIT(gomlimitEnv string, configLimitApplied bool, strictMode bool, memLimitDisabled bool, dropinPath string, log *slog.Logger) error {
         const warnMsg = "GOMEMLIMIT is not set — node may OOM under load"
 
@@ -3316,7 +3335,14 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
 // by lost transactions (e.g. after an OOM kill before the tx was confirmed in
 // a block).  This makes UTXOs whose key images were erroneously marked "spent"
 // spendable again.
-func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *core.UTXOSet, log *slog.Logger) (int, error) {
+// forcePurge controls behaviour when the block scan is incomplete (pruned
+// node).  When false the function falls back to the persistent k/ index so
+// no confirmed key image is lost.  When true the persistent index is purged
+// of all entries that could not be verified from the readable blocks; this
+// eliminates phantom entries on pruned nodes at the cost of forgetting key
+// images for txes that were confirmed inside the missing block range (safe
+// because those UTXOs are also absent from the UTXO set).
+func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *core.UTXOSet, forcePurge bool, log *slog.Logger) (int, error) {
         utxos.ClearKeyImages()
         count := 0
         // valid holds every key image that appears in a confirmed transaction,
@@ -3378,22 +3404,61 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         // next snapshot loss (exactly the OOM-kill scenario this flag repairs).
         removed := 0
         if !scanComplete {
-                log.Error("--rebuild-key-images: block scan incomplete — skipping phantom purge",
+                log.Error("--rebuild-key-images: block scan incomplete",
                         "unreadable_blocks", unreadable,
                         "hint", "expected on pruned nodes; on archive nodes run --repair-db and re-run")
-                // Still re-persist the confirmed key images we did observe (additive,
-                // safe) so the index is at least as complete as before.
+
+                if forcePurge {
+                        // --force-purge-ki-index: purge the persistent index using only
+                        // the block scan as truth.  Phantom entries from partial LevelDB
+                        // writes are deleted even though we cannot verify them against
+                        // pruned blocks.  Safe because the UTXO set is the primary
+                        // double-spend guard — any UTXO whose KI we remove was already
+                        // removed from the UTXO set when its spending block was applied.
+                        // The in-memory set (utxos) already holds every KI observed in
+                        // the block scan (via MarkSpent above); we do NOT restore from
+                        // the persistent index so phantom entries stay out of memory too.
+                        log.Warn("--rebuild-key-images: force-purging persistent k/ index — unverifiable entries will be removed",
+                                "verified_from_scan", count, "unreadable_blocks", unreadable)
+                        purged := 0
+                        if fpErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
+                                if valid[ki] {
+                                        return nil
+                                }
+                                if canonical, cErr := crypto.CanonicalKeyImage(ki); cErr == nil && valid[canonical] {
+                                        return nil
+                                }
+                                if delErr := blockStore.DeleteKeyImage(ki); delErr != nil {
+                                        log.Warn("--rebuild-key-images: force-purge: failed to delete key image",
+                                                "key_image", fmt.Sprintf("%x", ki[:8]), "err", delErr)
+                                        return nil
+                                }
+                                purged++
+                                return nil
+                        }); fpErr != nil {
+                                log.Warn("--rebuild-key-images: force-purge iteration incomplete", "err", fpErr)
+                        }
+                        // Re-persist verified KIs so the index matches the in-memory set.
+                        for ki := range valid {
+                                if kiErr := blockStore.MarkKeyImageSpent(ki); kiErr != nil {
+                                        log.Warn("--rebuild-key-images: force-purge: failed to persist verified key image",
+                                                "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
+                                }
+                        }
+                        log.Info("--rebuild-key-images: force-purge complete",
+                                "verified_from_scan", count, "phantom_purged", purged)
+                        return count, nil
+                }
+
+                // Normal (safe) path: re-persist confirmed KIs we observed and
+                // restore the rest from the persistent index so no confirmed spend
+                // from a pruned block is forgotten.
                 for ki := range valid {
                         if kiErr := blockStore.MarkKeyImageSpent(ki); kiErr != nil {
                                 log.Warn("--rebuild-key-images: failed to persist key image",
                                         "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
                         }
                 }
-                // CRITICAL: the block scan could not observe key images spent inside
-                // pruned/unreadable blocks, but ClearKeyImages() above already wiped
-                // them from the in-memory set.  Restore every entry from the
-                // persistent k/ index into memory so the rebuilt snapshot does not
-                // lose confirmed spends (which would re-open double-spend windows).
                 restoredFromIndex := 0
                 if iterErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
                         utxos.MarkSpent(ki)
