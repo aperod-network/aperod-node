@@ -56,6 +56,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
         s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
         s.mux.HandleFunc("/api/v1/network/stall-events", s.localOnly(s.restNetworkStallEvents))
+        s.mux.HandleFunc("/api/v1/network/bootnode-warn-events", s.localOnly(s.restNetworkBootnodeWarnEvents))
         s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.restNetworkP2PConfig))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
@@ -1235,6 +1236,42 @@ func (s *Server) restNetworkStallEvents(w http.ResponseWriter, r *http.Request) 
         events := s.stallEventFn(since)
         if events == nil {
                 events = []StallEventEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
+}
+
+// ─── GET /api/v1/network/bootnode-warn-events ─────────────────────────────────
+//
+// Returns malformed or stale bootnode warning events recorded by the P2P layer.
+// Each entry is a configured bootnode that could not be DNS-resolved, or that
+// has not been successfully resolved for longer than MaxStaleBootnodeAge.
+// Accepts an optional `since` query parameter (Unix milliseconds) to fetch only
+// events recorded after that time.
+//
+// Response: { "events": [ { bootnode, err, age_secs, at } ] }
+func (s *Server) restNetworkBootnodeWarnEvents(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.bootnodeWarnEventFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+
+        var since time.Time
+        if raw := r.URL.Query().Get("since"); raw != "" {
+                ms, err := strconv.ParseInt(raw, 10, 64)
+                if err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "since must be a Unix-ms integer")
+                        return
+                }
+                since = time.UnixMilli(ms)
+        }
+
+        events := s.bootnodeWarnEventFn(since)
+        if events == nil {
+                events = []BootnodeWarnEntry{}
         }
         writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
 }
