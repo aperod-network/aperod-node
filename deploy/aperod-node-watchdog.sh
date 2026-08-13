@@ -18,9 +18,13 @@
 #    SUPPORT_BOT_TOKEN      — Telegram bot token for alerts (optional)
 #    SUPPORT_ADMIN_CHAT_ID  — Telegram chat ID for alerts (optional)
 #    PEER_WAIT_MINS         — minutes with peer_count=0 before alerting (default: 10; 0=disable)
+#    DISK_CHECK_PATH        — filesystem to check for free space (default: /)
+#    DISK_WARN_PCT          — alert via Telegram when free space < N % (default: 15; 0=disable)
+#    DISK_CRIT_PCT          — auto-truncate syslog/daemon.log when free space < N % (default: 5; 0=disable)
 #    MOCK_RSS_KB            — inject fake RSS for testing
 #    MOCK_HEIGHT            — inject fake block height for testing
 #    MOCK_PEER_COUNT        — inject fake peer count for testing
+#    MOCK_DISK_FREE_PCT     — inject fake disk-free percentage for testing
 # =============================================================================
 set -euo pipefail
 
@@ -159,6 +163,83 @@ Action: <code>systemctl restart aperod-node</code>
       append_restart_event
       log "aperod-node restarted due to RAM threshold"
       exit 0
+    fi
+  fi
+
+  # ── Disk space guard — alert + emergency cleanup ───────────────────────────
+  # A full disk causes LevelDB write failures → crash-restart loop → even more
+  # logs written → disk fills faster.  The watchdog breaks this cycle by:
+  #   1. Alerting (Telegram) when free space falls below DISK_WARN_PCT (15 %).
+  #   2. Auto-truncating /var/log/syslog and /var/log/daemon.log when free
+  #      space falls below DISK_CRIT_PCT (5 %) so the node can keep running.
+  #
+  # Set DISK_WARN_PCT=0 to disable both alert and auto-cleanup.
+  DISK_CHECK_PATH="${DISK_CHECK_PATH:-/}"
+  DISK_WARN_PCT="${DISK_WARN_PCT:-15}"
+  DISK_CRIT_PCT="${DISK_CRIT_PCT:-5}"
+  LAST_DISK_ALERT_FILE="${STATE_DIR}/watchdog-last-disk-alert"
+
+  if [[ "${DISK_WARN_PCT}" -gt 0 ]]; then
+    if [[ -n "${MOCK_DISK_FREE_PCT:-}" ]]; then
+      DISK_FREE_PCT="${MOCK_DISK_FREE_PCT}"
+    else
+      # df --output=pcent prints "Use%" header + "NN%" — strip both and invert.
+      _used_pct=$(df "${DISK_CHECK_PATH}" --output=pcent 2>/dev/null \
+                  | tail -1 | tr -dc '0-9' || echo "0")
+      DISK_FREE_PCT=$(( 100 - _used_pct ))
+    fi
+
+    log "disk ${DISK_CHECK_PATH}: ${DISK_FREE_PCT}% free (warn<${DISK_WARN_PCT}% crit<${DISK_CRIT_PCT}%)"
+
+    if [[ "${DISK_FREE_PCT}" -lt "${DISK_WARN_PCT}" ]]; then
+      _now_d=$(date +%s)
+      _last_da=0
+      if [[ -f "${LAST_DISK_ALERT_FILE}" ]]; then
+        _last_da=$(cat "${LAST_DISK_ALERT_FILE}" 2>/dev/null | tr -dc '0-9' || echo 0)
+      fi
+
+      if (( ( _now_d - _last_da ) >= ALERT_COOLDOWN_SECS )); then
+        _du_syslog=$(du -sh /var/log/syslog /var/log/daemon.log 2>/dev/null \
+                     | awk '{s+=$1} END {print s"K"}' || echo "?")
+        send_telegram "💾 <b>aperod-node disk space warning</b>
+Server: $(hostname)
+Filesystem: <code>${DISK_CHECK_PATH}</code>
+Free: <b>${DISK_FREE_PCT}%</b> (threshold: ${DISK_WARN_PCT}%)
+Syslog+daemon.log: ~${_du_syslog}
+
+If disk fills completely the node will crash-loop.
+Run: <code>truncate -s 0 /var/log/syslog /var/log/daemon.log</code>"
+        mkdir -p "${STATE_DIR}" 2>/dev/null || true
+        echo "${_now_d}" > "${LAST_DISK_ALERT_FILE}" || true
+        log "Telegram disk-space alert sent (${DISK_FREE_PCT}% free)"
+      else
+        log "Disk alert suppressed (cooldown)"
+      fi
+
+      # ── Critical: auto-cleanup to prevent a crash-loop ──────────────────
+      if [[ "${DISK_CRIT_PCT}" -gt 0 && "${DISK_FREE_PCT}" -lt "${DISK_CRIT_PCT}" ]]; then
+        log "CRITICAL: disk ${DISK_FREE_PCT}% free < ${DISK_CRIT_PCT}% — auto-truncating syslog files"
+        for _logfile in /var/log/syslog /var/log/daemon.log \
+                        /var/log/syslog.1 /var/log/daemon.log.1; do
+          if [[ -f "${_logfile}" ]]; then
+            truncate -s 0 "${_logfile}" 2>/dev/null || true
+            log "  truncated ${_logfile}"
+          fi
+        done
+        journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+        _free_after=$(df "${DISK_CHECK_PATH}" --output=pcent 2>/dev/null \
+                      | tail -1 | tr -dc '0-9' || echo "?")
+        _free_pct_after=$(( 100 - ${_free_after:-0} ))
+        log "auto-cleanup done — disk now ${_free_pct_after}% free"
+        send_telegram "🧹 <b>aperod-node disk auto-cleanup</b>
+Server: $(hostname)
+Triggered at: <b>${DISK_FREE_PCT}%</b> free (critical threshold: ${DISK_CRIT_PCT}%)
+After cleanup: <b>${_free_pct_after}%</b> free
+
+Truncated: /var/log/syslog, /var/log/daemon.log
+Install logrotate to prevent recurrence:
+<code>cp /opt/aperod/blockchain/deploy/aperod-syslog.logrotate /etc/logrotate.d/aperod-syslog</code>"
+      fi
     fi
   fi
 
