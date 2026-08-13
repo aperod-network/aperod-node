@@ -218,6 +218,12 @@ type Server struct {
         // Wired from cmd/node after startup via SetRSSStatsFn.
         // Returns 0 when not wired (non-Linux environments, unit tests).
         rssStatsFn func() int64
+
+        // staleBootnodeFn returns the list of configured bootnodes whose DNS has
+        // not resolved successfully for longer than MaxStaleBootnodeAge.
+        // Wired to p2p.Host.GetStaleBootnodes by cmd/node.
+        // nil = P2P layer not running (field omitted from /health response).
+        staleBootnodeFn func() []StaleBootnodeEntry
 }
 
 // NewServer creates a new API server.
@@ -507,6 +513,21 @@ func (s *Server) SetBootnodeWarnEventFunc(f func(since time.Time) []BootnodeWarn
         s.bootnodeWarnEventFn = f
 }
 
+// StaleBootnodeEntry is one bootnode reported as stale in the /health response.
+// Mirrors p2p.StaleBootnode; defined here to avoid an import cycle.
+type StaleBootnodeEntry struct {
+        Bootnode   string `json:"bootnode"`
+        AgeSeconds int64  `json:"age_seconds"`
+}
+
+// SetStaleBootnodeFn wires a function that returns the list of currently-stale
+// bootnodes (DNS not resolved for longer than MaxStaleBootnodeAge).
+// Wired to p2p.Host.GetStaleBootnodes by cmd/node.
+// Optional — field is omitted from /health when not wired.
+func (s *Server) SetStaleBootnodeFn(f func() []StaleBootnodeEntry) {
+        s.staleBootnodeFn = f
+}
+
 // SetBanEventFunc wires a function that returns peer-ban events recorded since a
 // given time.  Wired to p2p.Host.GetBanEvents by cmd/node.
 // Optional — GET /api/v1/network/ban-events returns 503 when not wired.
@@ -633,8 +654,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
                 rssBytes = s.rssStatsFn()
         }
 
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
+        resp := map[string]interface{}{
                 "status": "ok",
                 "height": s.chain.Height(),
                 "time":   time.Now().UTC().Format(time.RFC3339),
@@ -645,7 +665,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
                         "mempool_count":    s.mempool.Count(),
                         "mempool_bytes":    s.mempool.TotalBytes(),
                 },
-        })
+        }
+        // Include stale_bootnodes when the P2P layer is wired so the Admin
+        // Panel health widget can highlight degraded bootnode DNS without SSH.
+        if s.staleBootnodeFn != nil {
+                stale := s.staleBootnodeFn()
+                if stale == nil {
+                        stale = []StaleBootnodeEntry{}
+                }
+                resp["stale_bootnodes"] = stale
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(resp)
 }
 
 // handleMetrics exposes a minimal Prometheus text-format snapshot of node
