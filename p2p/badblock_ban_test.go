@@ -2142,3 +2142,259 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	}
 	t.Logf("step 4 ✓ legitimate TLS peer %s registered successfully after the flood", legitIP)
 }
+
+// ─── Test: wrong-fork ban records a BanEvent for the API/Telegram alert chain ─
+
+// TestBadBlockBan_BanEventRecorded verifies the full alerting pipeline for a
+// wrong-fork (rogue-block) ban:
+//
+//  1. A peer sends BadBlockBanThreshold out-of-range blocks → auto-ban fires.
+//  2. GetBanEvents() returns a BanEvent whose IP, Violations, and BanDurationSecs
+//     fields are correct.
+//
+// The BanEvent ring buffer is the source the API server polls every 60 s to
+// construct and send the Telegram "peer auto-banned" alert.  If this event is
+// not recorded, the alert chain is silently broken even though the network-level
+// ban (ListBans) still works.
+//
+// This is the Go-side complement to the TypeScript unit tests in
+// peer-ban-monitor.test.ts that verify the polling → Telegram notification leg.
+func TestBadBlockBan_BanEventRecorded(t *testing.T) {
+	const (
+		threshold = 3
+		banDur    = time.Hour
+	)
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-ban-event-recorded",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  banDur,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+	conn, peerIP := connectPeer(t, hostAddr)
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	// Record the time just before sending bad blocks so we can use it as the
+	// since= parameter for GetBanEvents and confirm the event was recorded now.
+	before := time.Now()
+
+	// ourTip = 0 (stubHandler); out-of-range height = ourTip + 1000 + 1 = 1001.
+	// Send exactly threshold bad blocks to trigger the ban.
+	for i := 0; i < threshold; i++ {
+		sendBlockAtHeight(t, conn, 9000)
+	}
+
+	// Wait for the peer to be disconnected after the ban.
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Fatalf("peer was NOT disconnected after %d out-of-range blocks", threshold)
+	}
+
+	// ── Verify GetBanEvents() recorded the event for the API alert chain ──────
+	events := h.GetBanEvents(before)
+	if len(events) == 0 {
+		t.Fatalf("GetBanEvents returned no events after wrong-fork ban of %s — "+
+			"the API/Telegram alert chain is broken", peerIP)
+	}
+
+	found := false
+	for _, ev := range events {
+		if ev.IP != peerIP {
+			continue
+		}
+		found = true
+		t.Logf("BanEvent: ip=%s peer_addr=%s violations=%d ban_duration_secs=%d reason=%q",
+			ev.IP, ev.PeerAddr, ev.Violations, ev.BanDurationSecs, ev.Reason)
+
+		if ev.Violations != threshold {
+			t.Errorf("BanEvent.Violations = %d, want %d", ev.Violations, threshold)
+		}
+		wantMinSecs := int64(banDur.Seconds()) - 5
+		if ev.BanDurationSecs < wantMinSecs {
+			t.Errorf("BanEvent.BanDurationSecs = %d, want ≥ %d (~%v)",
+				ev.BanDurationSecs, wantMinSecs, banDur)
+		}
+		if ev.At.Before(before) {
+			t.Errorf("BanEvent.At (%v) is before the test start time (%v)", ev.At, before)
+		}
+	}
+	if !found {
+		t.Errorf("BanEvent for IP %q not found in %d events: %+v", peerIP, len(events), events)
+	}
+}
+
+// ─── Tests: strike counter TTL resets properly ───────────────────────────────
+
+// TestBadBlockStrike_TTLResetsCounter drives the real MsgBlock dispatch path to
+// confirm that strikes older than BadBlockStrikeTTL are discarded on the next
+// incoming bad block, so a slow attacker that paces their sends to just under
+// the TTL interval can never accumulate strikes past the ban threshold.
+//
+// Sequence:
+//  1. Send (threshold-1) out-of-range MsgBlock messages via the real listener
+//     and handshake path — these register as real strikes inside the dispatch loop.
+//  2. Backdate lastSeen via SetBadBlockLastSeen, simulating elapsed time.
+//  3. Send one more out-of-range MsgBlock — the TTL check in the dispatch loop
+//     must reset the count to 0 before incrementing, yielding count=1.
+//  4. Assert the peer is still connected and no ban was issued (count=1 < threshold).
+//  5. Send (threshold-2) more blocks — count reaches threshold-1 within the new
+//     TTL window — still no ban, proving accumulation works after a TTL reset.
+func TestBadBlockStrike_TTLResetsCounter(t *testing.T) {
+	const threshold = 5
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-ttl-reset",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	conn, peerIP := connectPeer(t, h.ListenAddr())
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	// Step 1: drive threshold-1 real bad blocks through the MsgBlock dispatch path.
+	// ourTip=0 (stubHandler), heightLead=1000 → height 5000 is far out of range.
+	for i := 0; i < threshold-1; i++ {
+		sendBlockAtHeight(t, conn, 5000)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if len(h.ListBans()) != 0 {
+		t.Fatalf("unexpected ban after %d bad blocks (threshold=%d)", threshold-1, threshold)
+	}
+	if h.PeerCount() != 1 {
+		t.Fatalf("peer was disconnected with only %d bad blocks (threshold=%d)", threshold-1, threshold)
+	}
+
+	// Step 2: backdate the strike record so it looks older than BadBlockStrikeTTL,
+	// simulating a slow attacker going quiet for over an hour.
+	expired := time.Now().Add(-(p2p.BadBlockStrikeTTL + time.Second))
+	h.SetBadBlockLastSeen(peerIP, expired)
+
+	// Step 3: send one more real bad block. The MsgBlock dispatch loop checks the
+	// TTL, resets the count to 0, then increments to 1 — well below threshold.
+	// The peer must NOT be banned or disconnected.
+	sendBlockAtHeight(t, conn, 5000)
+	time.Sleep(150 * time.Millisecond)
+
+	if len(h.ListBans()) != 0 {
+		t.Errorf("peer was banned after TTL expiry reset (count should be 1, threshold=%d); bans: %v",
+			threshold, h.ListBans())
+	}
+	if h.PeerCount() != 1 {
+		t.Errorf("peer was disconnected after TTL reset (count=1, threshold=%d); PeerCount=%d",
+			threshold, h.PeerCount())
+	}
+
+	// Step 5: send threshold-2 more blocks — accumulating to threshold-1 within the
+	// fresh TTL window. Still no ban (count = threshold-1 < threshold).
+	for i := 0; i < threshold-2; i++ {
+		sendBlockAtHeight(t, conn, 5000)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if len(h.ListBans()) != 0 {
+		t.Errorf("peer was banned with only threshold-1 strikes after TTL reset; bans: %v", h.ListBans())
+	}
+	if h.PeerCount() != 1 {
+		t.Errorf("PeerCount = %d, want 1 (threshold-1 strikes after reset)", h.PeerCount())
+	}
+	t.Logf("TTL reset verified: %d expired strikes discarded; new window accumulated "+
+		"to %d strikes (threshold=%d) with no ban", threshold-1, threshold-1, threshold)
+}
+
+// TestBadBlockStrike_AccumulatesWithinTTL drives the real MsgBlock dispatch path
+// to confirm the complementary invariant: strikes that arrive within the TTL
+// window DO accumulate toward the ban threshold and eventually trigger a ban.
+// A slow attacker that sends bad blocks more frequently than the TTL will
+// accumulate to the threshold and get banned — they cannot stay under the limit
+// by spreading sends unless they wait longer than BadBlockStrikeTTL each time.
+//
+// Sequence:
+//  1. Send (threshold-1) out-of-range MsgBlock messages — all within the TTL window.
+//     Assert the peer is still connected (no premature ban).
+//  2. Send the threshold-th bad block.
+//     Assert the peer is banned and disconnected (count reached threshold).
+func TestBadBlockStrike_AccumulatesWithinTTL(t *testing.T) {
+	const threshold = 5
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-ttl-accum",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	conn, peerIP := connectPeer(t, h.ListenAddr())
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("peer did not register after handshake")
+	}
+
+	// Step 1: send threshold-1 bad blocks in rapid succession — all within the TTL
+	// window so the strikes accumulate. The peer must not be banned yet.
+	for i := 0; i < threshold-1; i++ {
+		sendBlockAtHeight(t, conn, 5000)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if len(h.ListBans()) != 0 {
+		t.Fatalf("peer was banned after only %d bad blocks (threshold=%d)", threshold-1, threshold)
+	}
+	if h.PeerCount() != 1 {
+		t.Fatalf("peer was disconnected after %d bad blocks (threshold=%d); PeerCount=%d",
+			threshold-1, threshold, h.PeerCount())
+	}
+
+	// Step 2: send the threshold-th bad block. Strikes are still within the TTL
+	// window so the count reaches threshold, triggering the ban + disconnect.
+	sendBlockAtHeight(t, conn, 5000)
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("peer NOT disconnected after %d within-TTL bad blocks (threshold=%d)",
+			threshold, threshold)
+	}
+	found := false
+	for _, b := range h.ListBans() {
+		if b.Addr == peerIP {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ban entry for %q not found after %d within-TTL strikes; all bans: %v",
+			peerIP, threshold, h.ListBans())
+	}
+	t.Logf("within-TTL accumulation verified: %d strikes within %v window triggered ban on %s",
+		threshold, p2p.BadBlockStrikeTTL, peerIP)
+}
