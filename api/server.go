@@ -154,6 +154,16 @@ type Server struct {
         // whether the current process recovered via the rescue path.
         startupRescue int32
 
+        // phantomKICount is the number of key images found in the startup snapshot
+        // that are absent from the persistent LevelDB key-image index.  These
+        // "phantom" entries arise when an OOM kill saves a snapshot that includes
+        // in-flight mempool key images that were never confirmed on-chain.  Each
+        // phantom entry marks a live UTXO as "spent" even though it is active,
+        // blocking all withdrawal attempts for that address until the operator
+        // runs --rebuild-key-images.  Set once by cmd/node after snapshot restore;
+        // 0 means no phantom entries were detected.
+        phantomKICount int64
+
         // syncingHeight and tipHeight track startup block-scan progress so that
         // /api/v1/status can report how far along the replay is.
         // syncingHeight is the last block processed; tipHeight is the total to load.
@@ -260,6 +270,16 @@ func (s *Server) SetUTXOReady() { atomic.StoreInt32(&s.utxoRebuilding, 0) }
 // The flag is never cleared — it is visible on /api/v1/status for the lifetime
 // of the process so operators can confirm the recovery mode at any time.
 func (s *Server) SetStartupRescue() { atomic.StoreInt32(&s.startupRescue, 1) }
+
+// SetPhantomKICount records the number of key images in the startup snapshot
+// that are absent from the persistent LevelDB key-image index (phantom entries).
+// Call once from cmd/node/main.go after the post-snapshot phantom-KI check.
+// The value is exposed on /api/v1/status so the API server monitor can fire a
+// Telegram alert before any withdrawal attempt triggers the "key image spent"
+// error path.  0 means no phantom entries were detected.
+func (s *Server) SetPhantomKICount(n int) {
+        atomic.StoreInt64(&s.phantomKICount, int64(n))
+}
 
 // SetSnapshotSaved records a successful snapshot save at the given chain height.
 // Called by the periodic-save goroutine and the shutdown handler in cmd/node/main.go.
