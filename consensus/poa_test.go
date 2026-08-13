@@ -359,6 +359,152 @@ func TestTimejackingGuard_FutureBlockRejected(t *testing.T) {
 	t.Log("OK: block with 30 s future timestamp correctly rejected by timejacking guard")
 }
 
+// TestCrashRecovery_RelayFillsMultiHourGap is an integration test that
+// simulates the full crash+restart+catch-up cycle for a relay node:
+//
+//  1. A validator produces N blocks whose timestamps span a simulated 4-hour
+//     window, all in the past relative to the current wall clock.
+//  2. A relay node is started with only the genesis block — simulating a
+//     node that crashed and restarted from a snapshot taken before those
+//     blocks were produced.
+//  3. All N historical blocks are fed to the relay's consensus engine
+//     sequentially (as a P2P peer would deliver them during gap-fill).
+//  4. The relay must accept every block: the timejacking guard fires only
+//     for future-timestamped blocks (skewNs > maxClockSkewNs), never for
+//     past-timestamped historical sync blocks.
+//  5. TimestampRejectedCount must be 0 at the end.
+//
+// This guards against the subtle interaction between snapshot loading,
+// gap-resume logic, and the timejacking guard that could silently stall
+// sync on a restarting relay node.
+func TestCrashRecovery_RelayFillsMultiHourGap(t *testing.T) {
+	const (
+		numBlocks   = 20           // blocks the validator produced while relay was offline
+		gapDuration = 4 * time.Hour // simulated outage duration
+	)
+
+	// Generate the validator key pair.
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal("GenerateValidatorKey:", err)
+	}
+
+	// ── Phase 1: Build N historical blocks spanning a 4-hour past window ─────
+	//
+	// Timestamps are evenly spread over [now-4h, now-perBlock] so every block
+	// is safely in the past.  The relay's timejacking guard must not reject any
+	// of them: skewNs = ts - now < 0 for all of them.
+	startTs := time.Now().Add(-gapDuration)
+	perBlock := gapDuration / time.Duration(numBlocks)
+
+	genesisHdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    startTs.UnixNano(),
+		ValidatorPub: validatorPub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := genesisHdr.Sign(validatorPriv); err != nil {
+		t.Fatal("sign genesis:", err)
+	}
+	genesis := &core.Block{Header: genesisHdr}
+
+	// Produce blocks at heights 1..numBlocks with monotonically increasing
+	// past timestamps, each signed by the validator.
+	historicalBlocks := make([]*core.Block, numBlocks)
+	prevBlock := genesis
+	for i := 0; i < numBlocks; i++ {
+		ts := startTs.Add(time.Duration(i+1) * perBlock).UnixNano()
+		hdr := core.BlockHeader{
+			Height:       uint64(i + 1),
+			PrevHash:     prevBlock.Hash(),
+			Round:        uint32(i + 1),
+			Timestamp:    ts,
+			ValidatorPub: validatorPub,
+			MerkleRoot:   core.MerkleRoot(nil),
+		}
+		if err := hdr.Sign(validatorPriv); err != nil {
+			t.Fatalf("sign block height=%d: %v", i+1, err)
+		}
+		historicalBlocks[i] = &core.Block{Header: hdr}
+		prevBlock = historicalBlocks[i]
+	}
+
+	t.Logf("built %d historical blocks: ts range [now-%v .. now-%v]",
+		numBlocks, gapDuration, perBlock)
+
+	// ── Phase 2: Start relay node from genesis (simulates post-crash restart) ─
+	//
+	// The relay has only the genesis block, mirroring a node that loaded a
+	// snapshot taken before the gap and now needs to sync from a peer.
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatal("relay SetGenesis:", err)
+	}
+
+	relayUTXOs := core.NewUTXOSet()
+	relayReg := core.NewValidatorRegistry()
+	relayMp := core.NewMempool(core.DefaultMempoolConfig())
+	relayEng := consensus.NewEngine(consensus.Config{
+		BlockTime:    20 * time.Millisecond,
+		BFTThreshold: 0.667,
+		// Seeded with the genesis validator key so isKnownValidator() returns true.
+		Validators: []crypto.ValidatorPubKey{validatorPub},
+		Registry:   relayReg,
+		MyKey:      nil, // relay node — never produces blocks
+	}, relayChain, relayMp, newNopLogger())
+	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
+
+	relayStop := make(chan struct{})
+	t.Cleanup(func() { close(relayStop) })
+	go relayEng.Run(relayStop)
+
+	// ── Phase 3: Deliver all historical blocks sequentially ───────────────────
+	//
+	// Each block must be accepted before the next can be submitted because
+	// handleIncomingBlock enforces height == tip+1.  We wait for chain
+	// advancement after each delivery so the engine processes them in order.
+	for i, block := range historicalBlocks {
+		wantHeight := uint64(i + 1)
+
+		select {
+		case relayEng.NewBlockCh() <- block:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timeout delivering block height=%d to relay channel", wantHeight)
+		}
+
+		// Poll until chain advances — fail fast if the engine stalls (which would
+		// indicate the timejacking guard incorrectly rejected a past-ts block).
+		deadline := time.After(500 * time.Millisecond)
+		for {
+			if relayChain.Height() >= wantHeight {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("relay stalled at height %d (want %d) — "+
+					"timejacking guard may have incorrectly rejected a past-timestamped block "+
+					"(timestamp ~%v in the past)",
+					relayChain.Height(), wantHeight,
+					time.Since(time.Unix(0, block.Header.Timestamp)))
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}
+
+	// ── Phase 4: Assert zero timestamp rejections and full catch-up ──────────
+	if n := relayEng.TimestampRejectedCount(); n != 0 {
+		t.Errorf("TimestampRejectedCount = %d, want 0; "+
+			"the timejacking guard must never reject past-timestamped historical sync blocks",
+			n)
+	}
+	if got := relayChain.Height(); got != uint64(numBlocks) {
+		t.Errorf("relay chain height = %d, want %d; relay did not fully catch up", got, numBlocks)
+	}
+	t.Logf("OK: relay recovered from genesis to height %d across a simulated %v gap; "+
+		"TimestampRejectedCount=0", numBlocks, gapDuration)
+}
+
 // TestTimejackingBan_PeerBannedAfterThreshold verifies that a rogue peer
 // sending future-timestamped blocks is automatically banned once the
 // TimestampBanThreshold is crossed.
