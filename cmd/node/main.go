@@ -569,8 +569,9 @@ func run() error {
         strictMemLimit := false
         resetTip := false
         repairDB := false
-        rebuildKeyImages := false
+        rebuildKeyImages  := false
         forcePurgeKIIndex := false
+        rebuildSpentIndex := false
         for i, arg := range os.Args[1:] {
                 switch arg {
                 case "--config":
@@ -600,6 +601,13 @@ func run() error {
                         // double-spend guard — any UTXO whose key image we remove was
                         // already removed from the UTXO set when the block was applied.
                         forcePurgeKIIndex = true
+                case "--rebuild-spent-index":
+                        // Backfill the su/ spent-UTXO LevelDB index for outputs that
+                        // were spent before the index existed.  After the full startup
+                        // scan the in-memory UTXOSet is the source of truth; any u/
+                        // entry absent from it is spent and gets an su/ record written.
+                        // Safe to re-run (idempotent); exits when done.
+                        rebuildSpentIndex = true
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
@@ -1531,6 +1539,44 @@ func run() error {
                                                 fmt.Printf(
                                                         "aperod-node: key-image set rebuilt (%d entries) — start normally (without --rebuild-key-images)\n",
                                                         kiBuilt)
+                                                return nil
+                                        }
+
+                                        // ── --rebuild-spent-index: backfill su/ for old spends ───────
+                                        // After the full startup scan the in-memory UTXOSet is the
+                                        // authoritative source of truth.  Any record in the u/ prefix
+                                        // that is absent from the in-memory set was spent at some
+                                        // point before the su/ index was introduced and never received
+                                        // an su/ entry.  Write those missing entries now so the REST
+                                        // endpoint correctly returns 404 for spent UTXOs.
+                                        if rebuildSpentIndex {
+                                                log.Info("--rebuild-spent-index: scanning u/ index", "tip_height", tipHeight)
+                                                var marked, alreadyDone int
+                                                iterErr := db.IterAllUTXOKeys(func(txHash crypto.Hash32, outIdx uint32) {
+                                                        if utxos.Get(txHash, outIdx) != nil {
+                                                                return // still active — skip
+                                                        }
+                                                        if db.IsUTXOSpent(txHash, outIdx) {
+                                                                alreadyDone++
+                                                                return // already in su/
+                                                        }
+                                                        if mErr := db.MarkUTXOSpent(txHash, outIdx); mErr != nil {
+                                                                log.Warn("--rebuild-spent-index: failed to mark spent",
+                                                                        "tx_hash", fmt.Sprintf("%x", txHash[:]),
+                                                                        "out_idx", outIdx, "err", mErr)
+                                                                return
+                                                        }
+                                                        marked++
+                                                })
+                                                if iterErr != nil {
+                                                        return fmt.Errorf("--rebuild-spent-index: %w", iterErr)
+                                                }
+                                                log.Info("--rebuild-spent-index: done",
+                                                        "newly_marked_spent", marked,
+                                                        "already_in_index",   alreadyDone)
+                                                fmt.Printf(
+                                                        "aperod-node: spent-UTXO index rebuilt (%d entries added, %d already present) — start normally (without --rebuild-spent-index)\n",
+                                                        marked, alreadyDone)
                                                 return nil
                                         }
 
@@ -2757,7 +2803,21 @@ func performShutdown(
         close(stop)
         <-engineDone
 
-        // Step 3 + 4: read the final tip and save the snapshot.
+        // Step 3: reclaim as much memory as possible before the snapshot save so
+        // that TakeSnapshot() itself — which serialises the full UTXO set — does
+        // not push RSS above GOMEMLIMIT and trigger an OOM-kill mid-write.  This
+        // mirrors the post-snapshot-load GC already performed on startup.
+        rssBeforeGC := readRSSBytes()
+        runtime.GC()
+        debug.FreeOSMemory()
+        rssAfterGC := readRSSBytes()
+        log.Info("shutdown: GC before snapshot save",
+                "rss_before_mb", rssBeforeGC>>20,
+                "rss_after_mb", rssAfterGC>>20,
+                "rss_freed_mb", (rssBeforeGC-rssAfterGC)>>20,
+        )
+
+        // Step 4: read the final tip and save the snapshot.
         saveShutdownSnapshot(db, utxos, registry, dataDir, log, apiSrv)
 }
 
