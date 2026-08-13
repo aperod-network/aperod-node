@@ -72,12 +72,12 @@ aperod_peer_check() {
     echo "   Check P2P logs : journalctl -u ${SERVICE_NAME} -n 200 --no-pager | grep -i 'p2p\|peer\|dial\|connect'" >&2
     echo "   Live stats     : curl -s ${STATS_URL} | jq ." >&2
 
-    send_telegram_alert "⚠️ <b>aperod-node: zero P2P peers after restart</b>
-Server: $(hostname)
-No peers connected after ${PEER_WAIT_SECS}s.
-The node may be network-isolated (bad TLS config, changed protocol version, or bootnodes unreachable).
-Check: <code>journalctl -u ${SERVICE_NAME} -n 200 | grep -i p2p</code>
-Stats: <code>curl -s ${STATS_URL}</code>"
+    send_telegram_alert "⚠️ <b>aperod-node: ноль P2P-пиров после рестарта</b>
+Сервер: $(hostname)
+Нет подключённых пиров спустя ${PEER_WAIT_SECS}с.
+Нода может быть изолирована от сети (неверный TLS, смена версии протокола или бутноды недоступны).
+Проверьте: <code>journalctl -u ${SERVICE_NAME} -n 200 | grep -i p2p</code>
+Статистика: <code>curl -s ${STATS_URL}</code>"
     echo ""
   fi
 }
