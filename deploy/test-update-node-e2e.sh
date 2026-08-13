@@ -220,8 +220,12 @@ case "$*" in
 
   "is-active --quiet aperod-node"|"is-active aperod-node")
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+      echo "active"
       exit 0
     fi
+    # Output "inactive" so that update-node.sh's stop-wait loop can detect the
+    # string and break immediately instead of waiting the full 120 s timeout.
+    echo "inactive"
     exit 3
     ;;
 
