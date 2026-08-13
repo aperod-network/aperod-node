@@ -74,6 +74,34 @@ _sync_backup_script() {
 
   if [[ "$staged" == true ]] && mv -f "$tmp" "$installed" 2>/dev/null; then
     echo "  [sync] aperod_backup.sh updated: repo → ${install_dir}/ (versions differed)"
+
+    # Self-check: verify the newly installed file is non-empty, executable,
+    # and syntactically valid.  A truncated repo copy (e.g. disk-full during
+    # git pull, partial write, or partial download) would silently leave the
+    # running backup job with a broken script — catch it now, before the next
+    # scheduled backup runs.
+    #
+    # These checks mirror the guards in install-node.sh step 12 and
+    # setup-backup.sh.  Unlike the rest of _sync_backup_script (which is
+    # intentionally non-fatal for infrastructure reasons such as the backup
+    # not being configured on this server), a corrupted installed copy is a
+    # data-integrity problem that must abort the deploy loudly.
+    if [[ ! -s "$installed" ]]; then
+      echo "  [ERROR] aperod_backup.sh self-check FAILED: installed file is empty — possible truncated write" >&2
+      echo "          Path: $installed" >&2
+      return 1
+    fi
+    if [[ ! -x "$installed" ]]; then
+      echo "  [ERROR] aperod_backup.sh self-check FAILED: installed file is not executable after chmod 700" >&2
+      echo "          Path: $installed" >&2
+      return 1
+    fi
+    if ! bash -n "$installed" 2>/dev/null; then
+      echo "  [ERROR] aperod_backup.sh self-check FAILED: bash -n syntax check failed — repo copy may be truncated or corrupted" >&2
+      echo "          Path: $installed" >&2
+      return 1
+    fi
+    echo "  [sync] aperod_backup.sh self-check passed: non-empty, executable, bash -n OK"
   else
     rm -f "$tmp" 2>/dev/null || true
     echo "  [warn] aperod_backup.sh sync FAILED — staging or rename failed; check permissions on ${install_dir}" >&2
