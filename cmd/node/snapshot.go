@@ -104,8 +104,66 @@ type startupSnapshot struct {
 	TipHeight  uint64                `json:"tip_height"`
 	TipHashHex string                `json:"tip_hash"`
 	TxTotal    int64                 `json:"tx_total"`
+	// SavedAt records the wall-clock time when this snapshot was written.
+	// Used at startup to determine whether the snapshot falls within the OOM
+	// window (i.e., was saved close enough to an unclean shutdown that the
+	// in-memory state it captured might have been partially corrupted).
+	// Omitted from snapshots written by older binaries; treated as zero-value.
+	SavedAt    time.Time             `json:"saved_at,omitempty"`
 	UTXOs      core.UTXOSnapshot     `json:"utxos"`
 	Registry   core.RegistrySnapshot `json:"registry"`
+}
+
+// ── Clean-shutdown marker ─────────────────────────────────────────────────────
+//
+// A small sentinel file written by the SIGTERM shutdown path after the snapshot
+// is saved.  Its presence on the next startup means the last shutdown was
+// graceful (no OOM).  Its absence means the node was killed without a chance to
+// run the shutdown handler — the canonical OOM scenario.
+//
+// The file lives next to the snapshot files (not inside chain.db/) so that an
+// operator who rsyncs only chain.db/ does not accidentally carry over a marker
+// from a different machine, which would cause the relay to skip validation.
+
+// cleanShutdownMarkerPath returns the path of the clean-shutdown sentinel file.
+func cleanShutdownMarkerPath(dataDir string) string {
+	return filepath.Join(dataDir, "clean_shutdown")
+}
+
+// writeCleanShutdownMarker records that the last shutdown was graceful so the
+// next startup can skip the OOM-window AmountCommit validation.  Non-fatal on
+// error: an absent marker causes validation to run (fail-closed behaviour).
+func writeCleanShutdownMarker(dataDir string) error {
+	return os.WriteFile(cleanShutdownMarkerPath(dataDir), []byte("1\n"), 0644)
+}
+
+// readAndDeleteCleanShutdownMarker returns true when the clean-shutdown marker
+// file exists AND is successfully removed.  It returns false (treating the
+// shutdown as unclean) in all other cases:
+//
+//   - file absent → previous shutdown was unclean (OOM / SIGKILL)
+//   - stat error → treat as unclean (fail-closed)
+//   - remove fails → marker left on disk; treat as unclean and log so the
+//     operator knows validation is running and why
+//
+// The remove-fail-closed rule is critical: if os.Remove fails (e.g. permissions
+// changed) but we return true, the stale marker survives and every subsequent
+// restart skips AmountCommit validation even after OOM kills.
+func readAndDeleteCleanShutdownMarker(dataDir string) (wasClean bool) {
+	path := cleanShutdownMarkerPath(dataDir)
+	if _, err := os.Stat(path); err != nil {
+		return false // absent → previous shutdown was unclean
+	}
+	if err := os.Remove(path); err != nil {
+		// Cannot consume the marker — treat as unclean (fail-closed).
+		// Log to stderr (logger not yet initialised at call site) so the
+		// operator can diagnose the permission issue.
+		fmt.Fprintf(os.Stderr,
+			"aperod-node: warning: clean-shutdown marker exists but could not be removed (%v); "+
+				"treating previous shutdown as unclean — AmountCommit validation will run\n", err)
+		return false
+	}
+	return true
 }
 
 // snapshotPath returns the canonical file path for a gzip snapshot at height.
