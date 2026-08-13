@@ -1975,6 +1975,11 @@ func run() error {
                                 UTXOs:      utxos.TakeSnapshot(),
                                 Registry:   engine.Registry().TakeSnapshot(),
                         }
+                        // Purge any mempool KIs that were never confirmed on-chain.
+                        // Confirmed KIs are always in the persistent index; mempool-only
+                        // KIs are not.  Without this filter, an OOM kill can freeze a
+                        // valid UTXO permanently (phantom key-image cycle).
+                        filterSnapshotKeyImages(&periodicSnap, db, log)
                         periodicActive := len(periodicSnap.UTXOs.ActiveUTXOs)
                         go func(snap startupSnapshot, height uint64, activeCount int) {
                                 periodicSaveStart := time.Now()
@@ -2616,6 +2621,46 @@ func saveShutdownSnapshot(
                 snapshotDropinDir, snapshotServicePath, 0)
 }
 
+// filterSnapshotKeyImages removes key images from snap.UTXOs that are absent
+// from the persistent LevelDB spent-key-image index (k/ entries).  Confirmed
+// key images are persisted synchronously on block acceptance; unconfirmed ones
+// (e.g. from a mempool transaction that was lost after an OOM-kill or a crash
+// before the block was mined) are only in the in-memory set and must not be
+// written to the snapshot — if saved they permanently mark a valid UTXO as
+// spent, requiring a manual re-mint to recover the balance.
+//
+// Safe fallbacks:
+//   - If IterKeyImages fails, filtering is skipped (all KIs kept).
+//   - If the index is empty (genesis or index not yet built), filtering is
+//     skipped so genesis nodes don't lose their initial KI state.
+func filterSnapshotKeyImages(snap *startupSnapshot, db *store.DB, log *slog.Logger) {
+        confirmed := make(map[crypto.KeyImage]bool)
+        if iterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
+                confirmed[ki] = true
+                return nil
+        }); iterErr != nil {
+                log.Warn("snapshot: could not read key-image index — snapshot KIs unfiltered", "err", iterErr)
+                return
+        }
+        if len(confirmed) == 0 {
+                return // genesis node or index not yet built — nothing to filter
+        }
+        before := len(snap.UTXOs.KeyImages)
+        kept := snap.UTXOs.KeyImages[:0]
+        for _, ki := range snap.UTXOs.KeyImages {
+                if confirmed[ki] {
+                        kept = append(kept, ki)
+                }
+        }
+        snap.UTXOs.KeyImages = kept
+        if purged := before - len(kept); purged > 0 {
+                log.Warn("snapshot: purged unconfirmed key images before save",
+                        "purged", purged,
+                        "remaining", len(kept),
+                        "hint", "mempool KIs that were never confirmed on-chain (e.g. from an OOM kill)")
+        }
+}
+
 // saveShutdownSnapshotWithPaths is the real implementation of saveShutdownSnapshot.
 // dropinDir and servicePath are injectable so tests can supply synthetic systemd
 // config files without touching real /etc paths.
@@ -2650,6 +2695,10 @@ func saveShutdownSnapshotWithPaths(
                 UTXOs:      utxos.TakeSnapshot(),
                 Registry:   registry.TakeSnapshot(),
         }
+        // Purge any mempool KIs that were never confirmed on-chain before
+        // persisting so that an OOM-kill followed by a graceful restart does
+        // not carry forward phantom entries from a previous dirty snapshot.
+        filterSnapshotKeyImages(&shutSnap, db, log)
         snapSaveStart := time.Now()
         if saveErr := saveStartupSnapshot(dataDir, shutSnap); saveErr != nil {
                 log.Warn("shutdown: failed to save snapshot", "err", saveErr)
