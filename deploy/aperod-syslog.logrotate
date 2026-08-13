@@ -1,0 +1,43 @@
+# /etc/logrotate.d/aperod-syslog
+#
+# Prevents /var/log/syslog and /var/log/daemon.log from growing unboundedly
+# on aperod validator nodes.  Crash-restart loops (thousands of systemd restarts
+# in a short period) can generate 20+ GB in these files within hours, filling
+# the disk and causing LevelDB write failures.
+#
+# Install on every validator / relay node:
+#   sudo cp aperod-syslog.logrotate /etc/logrotate.d/aperod-syslog
+#   sudo logrotate -d /etc/logrotate.d/aperod-syslog   # dry-run check
+#
+# Force immediate rotation (e.g. after disk-full recovery):
+#   sudo logrotate -f /etc/logrotate.d/aperod-syslog
+#
+# The `size` directive rotates whenever the file exceeds the limit, regardless
+# of time.  `rotate 2` keeps at most 2 compressed backups (~400 MB worst-case).
+
+/var/log/syslog
+/var/log/daemon.log
+{
+    size 200M
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || \
+          kill -HUP $(cat /var/run/rsyslogd.pid 2>/dev/null) 2>/dev/null || true
+    endscript
+}
+
+/var/log/syslog.1
+/var/log/daemon.log.1
+{
+    size 500M
+    rotate 1
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
