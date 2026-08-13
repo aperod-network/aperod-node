@@ -705,7 +705,9 @@ systemctl stop "${SERVICE_NAME}" || true   # non-fatal if already stopped
 _stop_waited=0
 while true; do
     _st=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)
-    [ "$_st" = "inactive" ] || [ "$_st" = "failed" ] && break
+    # Break when stopped: "inactive", "failed", or empty string (fake systemctl
+    # stubs exit non-zero with no output when the service is not running).
+    [ "$_st" = "inactive" ] || [ "$_st" = "failed" ] || [ -z "$_st" ] && break
     if [ "$_stop_waited" -ge 120 ]; then
         echo "  [warn] ${SERVICE_NAME} still '${_st}' after 120 s — sending SIGKILL to unblock binary swap" >&2
         systemctl kill --signal=SIGKILL "${SERVICE_NAME}" 2>/dev/null || true
