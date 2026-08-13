@@ -2411,6 +2411,7 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"store_missing_blocks":      storeMissing,
 		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
+		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
 	}
 	// Use the live whitelist from the P2P layer when wired; fall back to the
 	// startup snapshot so /api/v1/status is never stale after live edits.
