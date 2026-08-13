@@ -2539,20 +2539,6 @@ func run() error {
                                         }
                                         return out
                                 })
-                                // Wire malformed/stale bootnode warning events for the Admin Panel.
-                                apiSrv.SetBootnodeWarnEventFunc(func(since time.Time) []api.BootnodeWarnEntry {
-                                        evts := host.GetBootnodeWarnEvents(since)
-                                        out := make([]api.BootnodeWarnEntry, len(evts))
-                                        for i, e := range evts {
-                                                out[i] = api.BootnodeWarnEntry{
-                                                        Bootnode: e.Bootnode,
-                                                        Err:      e.Err,
-                                                        AgeSecs:  e.AgeSecs,
-                                                        At:       e.At,
-                                                }
-                                        }
-                                        return out
-                                })
                                 // Seed the static /api/v1/status display from current live list.
                                 apiSrv.SetPeerWhitelist(host.GetPeerWhitelist())
                                 }
