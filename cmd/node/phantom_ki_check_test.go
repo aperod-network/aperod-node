@@ -1,17 +1,20 @@
 package main
 
 // phantom_ki_check_test.go — verifies the startup phantom-key-image detection
-// goroutine introduced to surface stale snapshot entries before any withdrawal
-// attempt fails with "key image already spent".
+// introduced to surface stale snapshot entries before any withdrawal attempt
+// fails with "key image already spent".
 //
-// Three properties are tested:
+// Properties tested:
 //
 //  1. UTXOSet.IterKeyImages visits every KI in both internal tiers (sorted
 //     historical slice + recent runtime map) without holding the lock during
 //     the caller's LevelDB queries.
 //
-//  2. The point-lookup check correctly counts phantom KIs: entries present in
-//     the in-memory set but absent from the persistent LevelDB index.
+//  2. countPhantomKeyImages correctly counts phantom KIs across all three
+//     startup restore paths:
+//     a. Exact-tip snapshot + gap-fill (nominal clean path)
+//     b. Sub-tip snapshot + gap-fill (OOM-kill: blocks accepted after last snapshot)
+//     c. Rescue path (snapshot present but UTXO-count diverged)
 //
 //  3. Server.SetPhantomKICount / phantom_ki_count on /api/v1/status propagate
 //     the count so the API-server monitor can fire a Telegram alert.
@@ -30,26 +33,24 @@ import (
 )
 
 // TestIterKeyImages_BothTiers verifies that IterKeyImages visits KIs from
-// both the compact sorted-slice tier (populated via RestoreFromSnapshot /
-// CompactKeyImages) and the runtime recent-map tier (populated by MarkSpent
-// on a fresh set).  This is the foundation of the bounded-memory phantom check:
-// if either tier were missed, confirmed KIs in the wrong tier would appear as
-// phantoms.
+// both the compact sorted-slice tier (populated via CompactKeyImages) and the
+// runtime recent-map tier (populated by MarkSpent after compaction).  This is
+// the foundation of the bounded-memory phantom check: if either tier were
+// missed, confirmed KIs in the wrong tier would be counted as phantoms.
 func TestIterKeyImages_BothTiers(t *testing.T) {
 	utxos := core.NewUTXOSet()
 
-	// ki1 and ki2 go into the 'recent' map tier (MarkSpent on a new set).
+	// ki1 and ki2 go into the 'recent' map tier initially.
 	var ki1, ki2 crypto.KeyImage
 	ki1[0] = 0x01
 	ki2[0] = 0x02
 	utxos.MarkSpent(ki1)
 	utxos.MarkSpent(ki2)
 
-	// CompactKeyImages moves recent → sorted slice.  After compaction ki1/ki2
-	// live in the sorted tier; new entries added after will go to recent.
+	// CompactKeyImages moves recent → sorted slice.
 	utxos.CompactKeyImages()
 
-	// ki3 is added after compaction, so it lives in the recent tier.
+	// ki3 is added after compaction — lives in the recent tier.
 	var ki3 crypto.KeyImage
 	ki3[0] = 0x03
 	utxos.MarkSpent(ki3)
@@ -60,10 +61,7 @@ func TestIterKeyImages_BothTiers(t *testing.T) {
 		seen[ki] = true
 	})
 
-	// MarkSpent canonicalises before inserting; the canonical form of a small
-	// byte value with the high-order bits zero is the same raw bytes.
 	for _, want := range []crypto.KeyImage{ki1, ki2, ki3} {
-		// The canonical form is what MarkSpent stores; look up the canonical.
 		canonical, _ := crypto.CanonicalKeyImage(want)
 		if !seen[canonical] && !seen[want] {
 			t.Errorf("IterKeyImages did not visit %x", want[:4])
@@ -74,21 +72,17 @@ func TestIterKeyImages_BothTiers(t *testing.T) {
 	}
 }
 
-// TestPhantomKICheck_CountsCorrectly exercises the bounded-memory algorithm
-// used in the startup goroutine:
-//
-//   - Collect in-memory KIs into a local slice (IterKeyImages).
-//   - For each KI, call db.IsKeyImageSpent (point-lookup; no large map).
-//   - Count those absent from LevelDB — they are phantoms.
+// TestPhantomKICheck_CountsCorrectly exercises countPhantomKeyImages with a mix
+// of confirmed and phantom KIs — the core algorithm used by all three restore paths.
 //
 // Setup:
 //
-//	ki_confirmed  — in-memory AND in LevelDB (genuine spend, confirmed on-chain)
-//	ki_phantom1   — in-memory but NOT in LevelDB (phantom from OOM-killed mempool tx)
-//	ki_phantom2   — in-memory but NOT in LevelDB (second phantom)
-//	ki_only_db    — in LevelDB but NOT in-memory (irrelevant to the check)
+//	ki_confirmed — in-memory AND in LevelDB (genuine on-chain spend)
+//	ki_phantom1  — in-memory but NOT in LevelDB (OOM-killed mempool tx)
+//	ki_phantom2  — in-memory but NOT in LevelDB (second phantom)
+//	ki_only_db   — in LevelDB but NOT in-memory (irrelevant to the check)
 //
-// Expected: phantom count = 2; confirmed count = 1; ki_only_db not counted.
+// Expected: phantom=2, checked=3 (ki_only_db is not iterated).
 func TestPhantomKICheck_CountsCorrectly(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "chain.db"))
@@ -103,44 +97,28 @@ func TestPhantomKICheck_CountsCorrectly(t *testing.T) {
 	kiPhantom2[0] = 0xF2
 	kiOnlyDB[0] = 0xDB
 
-	// Persist kiConfirmed and kiOnlyDB into LevelDB.
 	for _, ki := range []crypto.KeyImage{kiConfirmed, kiOnlyDB} {
 		if err := db.MarkKeyImageSpent(ki); err != nil {
 			t.Fatalf("MarkKeyImageSpent: %v", err)
 		}
 	}
 
-	// Restore a UTXOSet with kiConfirmed + both phantoms (simulates snapshot load).
 	utxos := core.NewUTXOSet()
 	utxos.MarkSpent(kiConfirmed)
 	utxos.MarkSpent(kiPhantom1)
 	utxos.MarkSpent(kiPhantom2)
 
-	// Replicate the goroutine logic from main.go exactly:
-	var inMemKIs []crypto.KeyImage
-	utxos.IterKeyImages(func(ki crypto.KeyImage) {
-		inMemKIs = append(inMemKIs, ki)
-	})
-
-	phantom := 0
-	for _, ki := range inMemKIs {
-		confirmed, lookupErr := db.IsKeyImageSpent(ki)
-		if lookupErr != nil {
-			continue // assume confirmed on error — no false positives
-		}
-		if !confirmed {
-			phantom++
-		}
-	}
-	inMemKIs = nil
-
+	phantom, checked := countPhantomKeyImages(db, utxos)
 	if phantom != 2 {
 		t.Errorf("expected 2 phantom KIs, got %d", phantom)
 	}
+	if checked != 3 {
+		t.Errorf("expected 3 checked KIs, got %d", checked)
+	}
 }
 
-// TestPhantomKICheck_NoneWhenAllConfirmed verifies that the check returns zero
-// when every in-memory KI is also present in LevelDB (clean startup).
+// TestPhantomKICheck_NoneWhenAllConfirmed verifies that countPhantomKeyImages
+// returns zero when every in-memory KI is also present in LevelDB (clean startup).
 func TestPhantomKICheck_NoneWhenAllConfirmed(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "chain.db"))
@@ -163,24 +141,108 @@ func TestPhantomKICheck_NoneWhenAllConfirmed(t *testing.T) {
 	utxos.MarkSpent(ki1)
 	utxos.MarkSpent(ki2)
 
-	var inMemKIs []crypto.KeyImage
-	utxos.IterKeyImages(func(ki crypto.KeyImage) {
-		inMemKIs = append(inMemKIs, ki)
-	})
+	phantom, _ := countPhantomKeyImages(db, utxos)
+	if phantom != 0 {
+		t.Errorf("expected 0 phantom KIs when all confirmed, got %d", phantom)
+	}
+}
 
-	phantom := 0
-	for _, ki := range inMemKIs {
-		confirmed, err := db.IsKeyImageSpent(ki)
-		if err != nil {
-			continue
-		}
-		if !confirmed {
-			phantom++
+// TestPhantomKICheck_SubTipPath simulates the sub-tip snapshot + gap-fill restore
+// path: a snapshot below the chain tip is loaded, gap-fill replays confirmed
+// blocks (which adds their KIs to both memory and LevelDB), then
+// countPhantomKeyImages is called.  Phantom KIs from the snapshot that were
+// never confirmed on-chain must be counted.
+func TestPhantomKICheck_SubTipPath(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// kiConfirmed: in snapshot + in LevelDB (confirmed spend from a block
+	// that was replayed by gap-fill).
+	// kiPhantom: in snapshot but never confirmed — not in LevelDB.
+	var kiConfirmed, kiPhantom crypto.KeyImage
+	kiConfirmed[0] = 0xC0
+	kiPhantom[0] = 0xF3
+
+	if err := db.MarkKeyImageSpent(kiConfirmed); err != nil {
+		t.Fatalf("MarkKeyImageSpent: %v", err)
+	}
+
+	// Simulate UTXOSet state after sub-tip restore + gap-fill:
+	// both confirmed and phantom KIs are in the in-memory set.
+	utxos := core.NewUTXOSet()
+	utxos.MarkSpent(kiConfirmed)
+	utxos.MarkSpent(kiPhantom)
+
+	phantom, _ := countPhantomKeyImages(db, utxos)
+	if phantom != 1 {
+		t.Errorf("sub-tip path: expected 1 phantom KI, got %d", phantom)
+	}
+}
+
+// TestPhantomKICheck_RescuePath simulates the rescue snapshot path: a snapshot
+// with a diverged UTXO count seeds KIs into memory; some are confirmed on-chain,
+// one is a phantom.  countPhantomKeyImages must surface the phantom.
+func TestPhantomKICheck_RescuePath(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var kiReal1, kiReal2, kiGhost crypto.KeyImage
+	kiReal1[0] = 0xA1
+	kiReal2[0] = 0xA2
+	kiGhost[0] = 0xE1
+
+	for _, ki := range []crypto.KeyImage{kiReal1, kiReal2} {
+		if err := db.MarkKeyImageSpent(ki); err != nil {
+			t.Fatalf("MarkKeyImageSpent: %v", err)
 		}
 	}
 
+	// After rescue-snapshot restore, in-memory set has all three.
+	utxos := core.NewUTXOSet()
+	utxos.MarkSpent(kiReal1)
+	utxos.MarkSpent(kiReal2)
+	utxos.MarkSpent(kiGhost)
+
+	phantom, _ := countPhantomKeyImages(db, utxos)
+	if phantom != 1 {
+		t.Errorf("rescue path: expected 1 phantom KI, got %d", phantom)
+	}
+}
+
+// TestPhantomKICheck_ExactTipCleanPath verifies the exact-tip snapshot path
+// when all KIs are confirmed — countPhantomKeyImages must return 0.
+func TestPhantomKICheck_ExactTipCleanPath(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var ki1, ki2 crypto.KeyImage
+	ki1[0] = 0xB1
+	ki2[0] = 0xB2
+	for _, ki := range []crypto.KeyImage{ki1, ki2} {
+		if err := db.MarkKeyImageSpent(ki); err != nil {
+			t.Fatalf("MarkKeyImageSpent: %v", err)
+		}
+	}
+
+	utxos := core.NewUTXOSet()
+	utxos.MarkSpent(ki1)
+	utxos.MarkSpent(ki2)
+
+	phantom, _ := countPhantomKeyImages(db, utxos)
 	if phantom != 0 {
-		t.Errorf("expected 0 phantom KIs when all confirmed, got %d", phantom)
+		t.Errorf("exact-tip clean path: expected 0 phantom KIs, got %d", phantom)
 	}
 }
 
@@ -193,8 +255,7 @@ func TestPhantomKICheck_StatusField(t *testing.T) {
 	utxos := core.NewUTXOSet()
 	srv := api.NewServer(":0", chain, mempool, utxos, discardLogger())
 
-	// Before any phantom is reported the field must be zero (absent from response
-	// is also acceptable; we check the encoded JSON).
+	// Before any phantom is reported the field must be zero.
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
 	if rec.Code != http.StatusOK {
