@@ -311,6 +311,148 @@ func TestCompactKeyImages_NewEntriesAfterCompact(t *testing.T) {
         }
 }
 
+// ─── RebuildKeyImages ─────────────────────────────────────────────────────────
+
+// TestRebuildKeyImages_StaleKIRestoresUTXO confirms that the --rebuild-key-images
+// flow (ClearKeyImages + MarkSpent replay from confirmed blocks) removes a stale
+// phantom key image that was blocking an active on-chain UTXO.
+//
+// Production scenario reproduced here:
+//  1. A user sends a transaction.  The Go node processes the ring signature and
+//     adds the key image to the in-memory UTXOSet.
+//  2. Before the transaction is included in a block the node is OOM-killed.
+//  3. The startup snapshot, saved just before the OOM kill, contains the stale
+//     key image even though the transaction was never confirmed on-chain.
+//  4. After restart the UTXO is reported as already-spent (IsSpent == true),
+//     making it unspendable.
+//  5. The operator runs --rebuild-key-images, which calls ClearKeyImages() and
+//     then replays MarkSpent() only for key images found in confirmed blocks.
+//  6. The stale key image is absent from every block, so after the rebuild it is
+//     gone from the set and the UTXO becomes spendable again.
+func TestRebuildKeyImages_StaleKIRestoresUTXO(t *testing.T) {
+        s := core.NewUTXOSet()
+
+        // ── Step 1: create the UTXO that will be "blocked" ────────────────────
+        // Generate a wallet key pair.  Its spend key pair gives us a deterministic
+        // key image we can inject as the phantom entry.
+        kpOwner, err := crypto.GenerateWalletKeys()
+        if err != nil {
+                t.Fatalf("GenerateWalletKeys: %v", err)
+        }
+        staleKI, err := crypto.ComputeKeyImage(kpOwner.Spend.Private, kpOwner.Spend.Public)
+        if err != nil {
+                t.Fatalf("ComputeKeyImage: %v", err)
+        }
+
+        // Register the UTXO in the set (active, unspent).
+        u := &core.UTXO{
+                TxHash:      crypto.HashStr("stale-ki-test-tx"),
+                OutputIndex: 0,
+                OneTimePub:  kpOwner.Spend.Public,
+                BlockHeight: 42,
+        }
+        s.Add(u)
+
+        // ── Step 2: inject the stale key image (simulates OOM-kill snapshot) ──
+        // The stale KI lands in the set the same way a real snapshot restore would:
+        // via MarkSpent, which is what loadStartupSnapshot calls after deserialising
+        // the snapshot's key-image list.
+        s.MarkSpent(staleKI)
+
+        if !s.IsSpent(staleKI) {
+                t.Fatal("pre-condition: stale key image should be marked spent before rebuild")
+        }
+        // The UTXO still exists in the set (it was never actually spent on-chain),
+        // but any attempt to spend it would be rejected because IsSpent returns true.
+        if s.Get(u.TxHash, 0) == nil {
+                t.Fatal("pre-condition: UTXO should still be present in the set")
+        }
+
+        // ── Step 3: create a legitimately spent key image (confirmed on-chain) ──
+        // This key image belongs to a different output that WAS included in a block.
+        // After rebuild it must still be marked spent.
+        kpSpent, _ := crypto.GenerateWalletKeys()
+        legitKI, _ := crypto.ComputeKeyImage(kpSpent.Spend.Private, kpSpent.Spend.Public)
+        // The legitimate KI is NOT injected before the rebuild; it is discovered
+        // during the block-scan replay below (step 4).
+
+        // ── Step 4: simulate rebuildKeyImagesFromBlocks ───────────────────────
+        // The production function (blockchain/cmd/node/main.go) does exactly:
+        //   utxos.ClearKeyImages()
+        //   for each confirmed block:
+        //       for each tx input:
+        //           utxos.MarkSpent(inp.KeyImage)
+        //
+        // We replicate that here with a single confirmed-on-chain key image.
+        // The stale key image is intentionally absent — it was never in a block.
+        s.ClearKeyImages()
+        s.MarkSpent(legitKI) // only the legitimately confirmed key image is replayed
+
+        // ── Step 5: assert the stale key image is gone ────────────────────────
+        if s.IsSpent(staleKI) {
+                t.Fatal("after rebuild: stale key image must no longer be marked spent — UTXO should be unblocked")
+        }
+
+        // ── Step 6: assert the legitimate key image is still spent ────────────
+        if !s.IsSpent(legitKI) {
+                t.Fatal("after rebuild: legitimate on-chain key image must still be marked spent")
+        }
+
+        // ── Step 7: sanity-check UTXO accessibility ───────────────────────────
+        // The blocked UTXO is still in the set (rebuild does not touch the UTXO
+        // data, only the key-image index).  A wallet can now spend it because
+        // IsSpent returns false.
+        if s.Get(u.TxHash, 0) == nil {
+                t.Fatal("after rebuild: blocked UTXO should still be present in the set")
+        }
+}
+
+// TestRebuildKeyImages_MultipleStaleEntries verifies that rebuild clears ALL
+// stale key images, not just one, when several phantom entries were accumulated
+// (e.g. the node restarted multiple times while the same tx was re-submitted).
+func TestRebuildKeyImages_MultipleStaleEntries(t *testing.T) {
+        const numStale = 5
+        s := core.NewUTXOSet()
+
+        staleKIs := make([]crypto.KeyImage, numStale)
+        for i := 0; i < numStale; i++ {
+                kp, _ := crypto.GenerateWalletKeys()
+                ki, _ := crypto.ComputeKeyImage(kp.Spend.Private, kp.Spend.Public)
+                staleKIs[i] = ki
+                s.MarkSpent(ki)
+        }
+
+        // Confirm all stale entries are present before rebuild.
+        for i, ki := range staleKIs {
+                if !s.IsSpent(ki) {
+                        t.Fatalf("pre-condition: stale key image [%d] not marked spent", i)
+                }
+        }
+
+        // One legitimate on-chain key image.
+        kpLegit, _ := crypto.GenerateWalletKeys()
+        legitKI, _ := crypto.ComputeKeyImage(kpLegit.Spend.Private, kpLegit.Spend.Public)
+
+        // Simulate rebuildKeyImagesFromBlocks.
+        s.ClearKeyImages()
+        s.MarkSpent(legitKI)
+
+        // All stale entries must be gone.
+        for i, ki := range staleKIs {
+                if s.IsSpent(ki) {
+                        t.Errorf("after rebuild: stale key image [%d] still marked spent", i)
+                }
+        }
+        // The legitimate entry must remain.
+        if !s.IsSpent(legitKI) {
+                t.Fatal("after rebuild: legitimate key image must still be spent")
+        }
+        // Total count should be exactly 1 (only the legit KI).
+        if got := s.KeyImagesCount(); got != 1 {
+                t.Fatalf("after rebuild: key image count want 1, got %d", got)
+        }
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 func TestMempool_AddGet(t *testing.T) {
