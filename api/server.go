@@ -75,6 +75,10 @@ type Server struct {
         // Wired to p2p.Host.GetStallEvents by cmd/node.
         stallEventFn func(since time.Time) []StallEventEntry
 
+        // bootnodeWarnEventFn returns malformed/stale bootnode warning events since
+        // a given time.  Wired to p2p.Host.GetBootnodeWarnEvents by cmd/node.
+        bootnodeWarnEventFn func(since time.Time) []BootnodeWarnEntry
+
         // peerWhitelist holds the parsed peer_whitelist entries from node.yaml.
         // Stored so /api/v1/status can report them to operators.
         peerWhitelist []string
@@ -394,6 +398,15 @@ type BanEventEntry struct {
         At              time.Time `json:"at"`
 }
 
+// BootnodeWarnEntry is one malformed/stale bootnode warning event returned by the REST API.
+// Mirrors p2p.BootnodeWarnEvent; defined here to avoid an import cycle.
+type BootnodeWarnEntry struct {
+        Bootnode string    `json:"bootnode"`
+        Err      string    `json:"err"`
+        AgeSecs  int64     `json:"age_secs"`
+        At       time.Time `json:"at"`
+}
+
 // WhitelistExemptionEntry is one whitelist-exemption event returned by the REST API.
 // Mirrors p2p.WhitelistExemptionEvent; defined here to avoid an import cycle.
 type WhitelistExemptionEntry struct {
@@ -484,6 +497,14 @@ func (s *Server) SetP2PBanConfig(threshold int, durationSecs int64, heightLead u
 // Optional — GET /api/v1/network/stall-events returns 503 when not wired.
 func (s *Server) SetStallEventFunc(f func(since time.Time) []StallEventEntry) {
         s.stallEventFn = f
+}
+
+// SetBootnodeWarnEventFunc wires a function that returns malformed/stale bootnode
+// warning events recorded since a given time.
+// Wired to p2p.Host.GetBootnodeWarnEvents by cmd/node.
+// Optional — GET /api/v1/network/bootnode-warn-events returns 503 when not wired.
+func (s *Server) SetBootnodeWarnEventFunc(f func(since time.Time) []BootnodeWarnEntry) {
+        s.bootnodeWarnEventFn = f
 }
 
 // SetBanEventFunc wires a function that returns peer-ban events recorded since a
