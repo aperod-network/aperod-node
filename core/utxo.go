@@ -270,6 +270,24 @@ func (s *UTXOSet) PatchAmountCommit(oneTimePub crypto.Point32, correct crypto.Co
 	}
 }
 
+// PatchStakedAmountCommit corrects a stale AmountCommit for a staked UTXO
+// identified by (txHash, outputIndex).  Staked UTXOs are not indexed by
+// OneTimePub (they are absent from byPubKey once burned for staking), so a
+// separate patch path is required.
+//
+// Called by the OOM-window startup validation (validateAmountCommitsFromBlocks)
+// to fix commitments that were captured in the snapshot while the in-memory
+// state was partially corrupted, where the corruption also propagated to the
+// u/ disk store making ReconcileWithStore's first pass insufficient.
+func (s *UTXOSet) PatchStakedAmountCommit(txHash crypto.Hash32, outIdx uint32, correct crypto.Commitment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
+	if u := s.stakedUTXOs[k]; u != nil {
+		u.AmountCommit = correct
+	}
+}
+
 // Remove deletes a UTXO from the set (called when it is spent).
 func (s *UTXOSet) Remove(txHash crypto.Hash32, outIdx uint32) {
 	s.mu.Lock()
