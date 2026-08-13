@@ -67,7 +67,7 @@ func TestRebuildKeyImagesPurgesPhantomIndexEntries(t *testing.T) {
 	// Simulate the poisoned in-memory state loaded from a stale snapshot.
 	utxos.MarkSpent(phantomKI)
 
-	count, err := rebuildKeyImagesFromBlocks(db, 1, utxos, slog.Default())
+	count, err := rebuildKeyImagesFromBlocks(db, 1, utxos, false, slog.Default())
 	if err != nil {
 		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
 	}
 
 	utxos := core.NewUTXOSet()
-	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, slog.Default()); err != nil {
+	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, false, slog.Default()); err != nil {
 		t.Fatalf("rebuildKeyImagesFromBlocks: %v", err)
 	}
 
@@ -150,5 +150,64 @@ func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
 	}
 	if !utxos.IsSpent(confirmedKI) {
 		t.Errorf("scanned key image must be in the in-memory set")
+	}
+}
+
+// TestRebuildKeyImagesForcePurgeOnIncompleteScan verifies that --force-purge-ki-index
+// removes entries from the persistent index that could not be verified from
+// the block scan, even when the scan is incomplete (pruned node scenario).
+// The in-memory set must NOT be restored from the persistent index — only the
+// scan results are trusted.
+func TestRebuildKeyImagesForcePurgeOnIncompleteScan(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	var confirmedKI, phantomKI crypto.KeyImage
+	confirmedKI[0] = 0xC1
+	phantomKI[0] = 0xF0 // unverifiable entry in the persistent index
+
+	// Block at height 2 only — height 1 is missing, so the scan is incomplete.
+	blk := &core.Block{}
+	blk.Header.Height = 2
+	blk.Txs = []core.Transaction{{Inputs: []core.RingInput{{KeyImage: confirmedKI}}}}
+	raw, err := json.Marshal(blk)
+	if err != nil {
+		t.Fatalf("marshal block: %v", err)
+	}
+	if err := db.PutRawBlock(blk.Hash(), 2, raw); err != nil {
+		t.Fatalf("PutRawBlock: %v", err)
+	}
+
+	// phantomKI is in the persistent index but NOT in any readable block.
+	if err := db.MarkKeyImageSpent(phantomKI); err != nil {
+		t.Fatalf("MarkKeyImageSpent phantom: %v", err)
+	}
+
+	utxos := core.NewUTXOSet()
+	utxos.MarkSpent(phantomKI) // simulate stale snapshot entry
+
+	if _, err := rebuildKeyImagesFromBlocks(db, 2, utxos, true, slog.Default()); err != nil {
+		t.Fatalf("rebuildKeyImagesFromBlocks(forcePurge=true): %v", err)
+	}
+
+	// Force-purge must remove the unverifiable entry from the persistent index.
+	if spent, err := db.IsKeyImageSpent(phantomKI); err != nil || spent {
+		t.Errorf("force-purge must remove unverifiable index entry (spent=%v err=%v)", spent, err)
+	}
+	// Confirmed entry must still be in the index.
+	if spent, err := db.IsKeyImageSpent(confirmedKI); err != nil || !spent {
+		t.Errorf("confirmed key image must remain in index (spent=%v err=%v)", spent, err)
+	}
+	// In-memory set must NOT contain the phantom (not restored from index).
+	if utxos.IsSpent(phantomKI) {
+		t.Error("force-purge must not restore unverifiable entry into memory")
+	}
+	// In-memory set must contain the confirmed KI from the scan.
+	if !utxos.IsSpent(confirmedKI) {
+		t.Error("confirmed key image from scan must be in memory")
 	}
 }
