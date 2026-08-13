@@ -890,6 +890,61 @@ func run() error {
                         log.Info("--repair-db: UTXO store verification complete",
                                 "fixed_entries", fixed)
                 }
+
+                // ── Key-image rebuild (--repair-db) ────────────────────────────────
+                // After an OOM kill the snapshot can contain stale key images for
+                // transactions that were hashed but never confirmed in a block.
+                // Rebuilding from authoritative block data eliminates phantom entries
+                // that make UTXOs appear "already spent" even though they are active
+                // on-chain.  Running this here means --repair-db fixes both u/ and ki/
+                // in one command; --rebuild-key-images remains available for ki/-only
+                // repairs when --repair-db is unnecessary.
+                log.Info("--repair-db: rebuilding key-image set from block scan",
+                        "tip_height", tipHeight)
+                kiBuilt, kiAllOK, kiErr := rebuildKeyImagesFromBlocks(db, tipHeight, utxos, false, log)
+                if kiErr != nil || !kiAllOK {
+                        // Do NOT patch the snapshot when the rebuild was incomplete or any
+                        // k/ write failed.  Replacing the snapshot key-image set with a
+                        // partial build could forget genuine spends from unreadable blocks,
+                        // re-opening already-spent outputs — a consensus/double-spend
+                        // regression.  The k/ index updates that did succeed are still
+                        // applied; a subsequent normal startup loads from k/ when no
+                        // matching snapshot is found.
+                        if kiErr != nil {
+                                log.Warn("--repair-db: key-image rebuild failed — snapshot NOT updated",
+                                        "key_images_found", kiBuilt, "err", kiErr,
+                                        "hint", "re-run --repair-db once the underlying error is resolved")
+                        } else {
+                                log.Warn("--repair-db: key-image rebuild incomplete (unreadable blocks or index write failures) — snapshot NOT updated",
+                                        "key_images_found", kiBuilt,
+                                        "hint", "on archive nodes re-run --repair-db; on pruned nodes run --rebuild-key-images --force-purge-ki-index")
+                        }
+                } else {
+                        log.Info("--repair-db: u/ and ki/ both rebuilt",
+                                "key_images_found", kiBuilt)
+
+                        // Patch the on-disk snapshot so the next normal startup loads the
+                        // corrected key-image set instead of the stale snapshot entries.
+                        // Gated on kiAllOK==true: the scan was complete and all k/ writes
+                        // succeeded, so the in-memory set is the authoritative replacement.
+                        // If no snapshot exists the k/ index update is sufficient — the
+                        // next startup loads key images from k/ when no snapshot is found.
+                        repairTipHashHex := fmt.Sprintf("%x", tipHash[:])
+                        if existingSnap, _, snapLoadErr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, repairTipHashHex, log); snapLoadErr == nil {
+                                existingSnap.UTXOs.KeyImages = utxos.TakeSnapshot().KeyImages
+                                existingSnap.SavedAt = time.Now()
+                                if snapSaveErr := saveStartupSnapshot(cfg.DataDir, *existingSnap); snapSaveErr != nil {
+                                        log.Warn("--repair-db: failed to update snapshot with rebuilt key images",
+                                                "err", snapSaveErr)
+                                } else {
+                                        log.Info("--repair-db: snapshot updated with rebuilt key-image set",
+                                                "key_images", len(existingSnap.UTXOs.KeyImages))
+                                }
+                        } else {
+                                log.Info("--repair-db: no existing snapshot to update — key images persisted to k/ index only",
+                                        "hint", "start normally after --repair-db to rebuild the full snapshot")
+                        }
+                }
         }
 
         // Populated during the key-image rebuild scan below; stays 0 for genesis.
@@ -1393,6 +1448,48 @@ func run() error {
                                         runtime.GC()
                                         debug.FreeOSMemory() // return freed pages to OS immediately so GOMEMLIMIT has headroom
 
+                                        // ── Phantom key-image detection ──────────────────────────────
+                                        // An OOM-kill can save a snapshot that includes key images from
+                                        // in-flight mempool transactions that were never confirmed.  On
+                                        // restart those phantom entries mark live UTXOs as "spent",
+                                        // blocking withdrawals with "key image already spent" until the
+                                        // operator runs --rebuild-key-images.
+                                        //
+                                        // Compare the in-memory KI set (just restored from snapshot)
+                                        // against the persistent LevelDB index (only confirmed on-chain
+                                        // spends).  Any KI in memory but absent from LevelDB is a
+                                        // phantom.  The count is exposed on /api/v1/status so the API
+                                        // server monitor can fire a Telegram alert immediately on startup
+                                        // rather than waiting for the first failed withdrawal attempt.
+                                        go func() {
+                                                confirmed := make(map[crypto.KeyImage]struct{})
+                                                if iterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
+                                                        confirmed[ki] = struct{}{}
+                                                        return nil
+                                                }); iterErr != nil {
+                                                        log.Warn("phantom-ki-check: failed to iterate LevelDB key images",
+                                                                "err", iterErr)
+                                                        return
+                                                }
+                                                phantom := 0
+                                                utxos.IterKeyImages(func(ki crypto.KeyImage) {
+                                                        if _, ok := confirmed[ki]; !ok {
+                                                                phantom++
+                                                        }
+                                                })
+                                                if phantom > 0 {
+                                                        log.Warn("startup: phantom key images detected — active UTXOs blocked",
+                                                                "phantom_count", phantom,
+                                                                "hint", "run --rebuild-key-images to clear stale entries and restore affected UTXOs")
+                                                        if apiSrv != nil {
+                                                                apiSrv.SetPhantomKICount(phantom)
+                                                        }
+                                                } else {
+                                                        log.Info("startup: phantom-ki-check passed — all snapshot key images confirmed on-chain",
+                                                                "checked", len(confirmed))
+                                                }
+                                        }()
+
                                         // ── Snapshot ↔ disk-store reconciliation ─────────────────────
                                         // A snapshot can carry corrupted UTXO fields indefinitely: a bad
                                         // write into the in-memory set is persisted at the next snapshot
@@ -1518,9 +1615,23 @@ func run() error {
                                                 log.Info("--rebuild-key-images: clearing stale entries and rebuilding from block scan",
                                                         "tip_height", tipHeight,
                                                         "stale_key_images_in_snapshot", len(snap.UTXOs.KeyImages))
-                                                kiBuilt, kiErr := rebuildKeyImagesFromBlocks(db, tipHeight, utxos, forcePurgeKIIndex, log)
+                                                kiBuilt, kiAllOK, kiErr := rebuildKeyImagesFromBlocks(db, tipHeight, utxos, forcePurgeKIIndex, log)
                                                 if kiErr != nil {
                                                         return fmt.Errorf("--rebuild-key-images: %w", kiErr)
+                                                }
+                                                if !kiAllOK {
+                                                        // Scan was incomplete or some k/ index writes failed.
+                                                        // Do NOT save the snapshot: replacing it with a partial
+                                                        // key-image set could forget genuine spends from blocks
+                                                        // we could not read, re-opening spent outputs.
+                                                        // The k/ index updates that did succeed are persisted.
+                                                        log.Warn("--rebuild-key-images: rebuild incomplete — snapshot NOT saved",
+                                                                "key_images_found", kiBuilt,
+                                                                "hint", "on archive nodes run --repair-db first; on pruned nodes use --force-purge-ki-index")
+                                                        fmt.Printf(
+                                                                "aperod-node: key-image rebuild incomplete (%d entries from readable blocks) — snapshot NOT saved; see log for details\n",
+                                                                kiBuilt)
+                                                        return nil
                                                 }
                                                 log.Info("--rebuild-key-images: rebuild complete", "key_images_found", kiBuilt)
                                                 txTotKI, _ := db.LoadTxTotal()
@@ -3558,7 +3669,15 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
 // eliminates phantom entries on pruned nodes at the cost of forgetting key
 // images for txes that were confirmed inside the missing block range (safe
 // because those UTXOs are also absent from the UTXO set).
-func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *core.UTXOSet, forcePurge bool, log *slog.Logger) (int, error) {
+//
+// Returns (count, allOK, err).  allOK is true only when the block scan
+// was complete (no unreadable or undecodable blocks) AND every k/ index
+// write succeeded.  Callers that gate further actions on a clean rebuild —
+// such as patching an existing snapshot — MUST check allOK in addition to
+// err.  A nil error with allOK==false means the in-memory set was restored
+// via the k/ index fallback (expected on pruned nodes) and is not safe to
+// treat as an authoritative replacement for the existing snapshot.
+func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *core.UTXOSet, forcePurge bool, log *slog.Logger) (int, bool, error) {
         utxos.ClearKeyImages()
         count := 0
         // valid holds every key image that appears in a confirmed transaction,
@@ -3663,7 +3782,9 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                         }
                         log.Info("--rebuild-key-images: force-purge complete",
                                 "verified_from_scan", count, "phantom_purged", purged)
-                        return count, nil
+                        // forcePurge runs on incomplete scans (pruned nodes); the result is
+                        // not safe to use as an authoritative snapshot replacement.
+                        return count, false, nil
                 }
 
                 // Normal (safe) path: re-persist confirmed KIs we observed and
@@ -3681,12 +3802,18 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                         restoredFromIndex++
                         return nil
                 }); iterErr != nil {
-                        return count, fmt.Errorf("restore key images from index after incomplete scan: %w", iterErr)
+                        return count, false, fmt.Errorf("restore key images from index after incomplete scan: %w", iterErr)
                 }
                 log.Info("--rebuild-key-images: in-memory set restored from persistent index (scan incomplete)",
                         "restored_from_index", restoredFromIndex, "from_block_scan", count)
-                return count, nil
+                // Scan was incomplete: not safe to use this set as an authoritative
+                // replacement for an existing snapshot.
+                return count, false, nil
         }
+        // ── Complete-scan branch ──────────────────────────────────────────────────
+        // Track whether all k/ index writes succeeded; a failure here means the
+        // persistent index and the snapshot cannot both be safely updated.
+        allOK := true
         purgeErr := blockStore.IterKeyImages(func(ki crypto.KeyImage) error {
                 if valid[ki] {
                         return nil
@@ -3697,6 +3824,7 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                 if delErr := blockStore.DeleteKeyImage(ki); delErr != nil {
                         log.Warn("--rebuild-key-images: failed to delete phantom key image from index",
                                 "key_image", fmt.Sprintf("%x", ki[:8]), "err", delErr)
+                        allOK = false // phantom entry remains; index is not fully reconciled
                         return nil
                 }
                 removed++
@@ -3704,6 +3832,7 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
         })
         if purgeErr != nil {
                 log.Warn("--rebuild-key-images: k/ index purge incomplete", "err", purgeErr)
+                allOK = false
         }
         // Re-persist every confirmed key image so the index is complete even if
         // some entries were missing before the repair.
@@ -3711,11 +3840,12 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
                 if kiErr := blockStore.MarkKeyImageSpent(ki); kiErr != nil {
                         log.Warn("--rebuild-key-images: failed to persist key image",
                                 "key_image", fmt.Sprintf("%x", ki[:8]), "err", kiErr)
+                        allOK = false
                 }
         }
         log.Info("--rebuild-key-images: persistent index reconciled",
-                "phantom_entries_removed", removed, "confirmed_key_images", count)
-        return count, nil
+                "phantom_entries_removed", removed, "confirmed_key_images", count, "all_writes_ok", allOK)
+        return count, allOK, nil
 }
 
 // sampleUTXOStoreGaps samples the most recent sampleBlocks blocks from the chain
