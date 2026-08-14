@@ -1,6 +1,7 @@
 package api
 
 import (
+        "context"
         "encoding/hex"
         "encoding/json"
         "fmt"
@@ -71,7 +72,11 @@ type walletSendResult struct {
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
 // The Node.js layer handles key derivation and UTXO collection; this method
 // does all cryptographic work and submits the tx to the mempool.
-func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
+//
+// ctx is the HTTP request context.  If the client disconnects before the
+// mempool submission the function returns an error without submitting the tx,
+// preventing the change-blind from being orphaned.
+func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (interface{}, error) {
         var p walletSendParams
         if err := json.Unmarshal(rawParams, &p); err != nil {
                 return nil, fmt.Errorf("params: %w", err)
@@ -541,6 +546,16 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
         }
 
         // ── 7. Submit to mempool ──────────────────────────────────────────────────
+        // Guard: if the HTTP client disconnected while the ring-sig was being
+        // computed (step 5-6), abort now so we never submit a tx whose change
+        // blind will never reach the caller.  The UTXO remains unspent.
+        if err := ctx.Err(); err != nil {
+                s.log.Warn("WALLET_SEND: client disconnected before mempool submit — aborting",
+                        "tx_hash", fmt.Sprintf("%x", result.Tx.Hash()),
+                        "reason", err,
+                )
+                return nil, fmt.Errorf("client disconnected before transaction was submitted: %w", err)
+        }
         if err := s.mempool.Add(result.Tx); err != nil {
                 if isKeyImageConflictErr(err) {
                         if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
