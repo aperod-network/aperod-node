@@ -26,9 +26,12 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-// TestStakeDeposit_E2E_ProducedBlock proves that a v2 stake deposit submitted
+// TestStakeDeposit_E2E_ProducedBlock proves that a v3 stake deposit submitted
 // via mempool.Add survives produceBlock without being silently dropped, is
 // included in the produced block, and triggers registry + UTXO state updates.
+//
+// Uses the V3 payload (237 bytes) which includes a one-time-key ownership proof
+// (F-049 fix), allowing transparent/mint outputs (TxPubKey==zero) to be staked.
 func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	// ── 1. Keys ───────────────────────────────────────────────────────────────
 	// proposerPriv / proposerPub: the block-producing validator (genesis node).
@@ -45,7 +48,8 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	// ── 2. UTXO that the staker will burn as proof ────────────────────────────
 	const stakeAmountNAPR uint64 = 10_000_000_000_000 // 100 000 APRO (MinStakeNAPR)
 
-	// Derive the deterministic blind: same formula the CLI uses.
+	// The test UTXO uses spendPub (= stakerPub bytes) as OneTimePub.
+	// This is a height=0 style admin/legacy mint UTXO, so we use the V1 blind.
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
 	burnBlind, err := crypto.DeterministicMintBlind(spendPub, stakeAmountNAPR)
@@ -68,7 +72,7 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	utxos.Add(&core.UTXO{
 		TxHash:       burnTxHash,
 		OutputIndex:  burnOutIdx,
-		OneTimePub:   spendPub,
+		OneTimePub:   spendPub, // TxPubKey not set → zero (transparent/mint output)
 		AmountCommit: commit,
 	})
 
@@ -78,18 +82,27 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	// Seed the proposer as an active genesis validator.
 	registry.InitFromGenesis([]crypto.ValidatorPubKey{proposerPub}, 10_000_000_000_000)
 
-	// ── 4. Build the v2 stake deposit transaction ─────────────────────────────
+	// ── 4. Build the v3 stake deposit transaction (F-049 fix) ─────────────────
+	// V3 is required for transparent/mint outputs (TxPubKey==zero).
+	// It extends V2 with a 64-byte one-time-key ownership proof.
 	msg := core.StakeSignMsgV2(core.StakeDeposit, stakerPub, stakeAmountNAPR, burnTxHash, burnOutIdx)
 	sig, err := stakerPriv.Sign(msg)
 	if err != nil {
 		t.Fatal("Sign:", err)
 	}
-	extra, err := core.EncodeStakeExtraV2(
+	// The one-time private key for this UTXO is stakerPriv (since OneTimePub == spendPub == stakerPub bytes).
+	// Prove ownership by signing the canonical ownership message.
+	ownershipMsg := core.StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+	oneTimeSig, err := stakerPriv.Sign(ownershipMsg)
+	if err != nil {
+		t.Fatal("Sign (ownership):", err)
+	}
+	extra, err := core.EncodeStakeExtraV3(
 		core.StakeDeposit, stakerPub, stakeAmountNAPR, sig,
-		burnTxHash, burnOutIdx, burnBlind,
+		burnTxHash, burnOutIdx, burnBlind, oneTimeSig,
 	)
 	if err != nil {
-		t.Fatal("EncodeStakeExtraV2:", err)
+		t.Fatal("EncodeStakeExtraV3:", err)
 	}
 	stakeTx := core.Transaction{
 		Version: core.TxVersionStake,
