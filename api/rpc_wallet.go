@@ -8,6 +8,7 @@ import (
 
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/store"
 )
 
 // ─── apr_walletSend params / result ──────────────────────────────────────────
@@ -30,6 +31,16 @@ type walletSendParams struct {
         UTXOs         []walletUTXOInput `json:"utxos"`           // caller-provided spendable UTXOs
 }
 
+// spentInputKI identifies the UTXO that was consumed as the real ring input
+// and carries its key image so the API layer can persist it in utxo_blinds.
+// This enables the Monero-style spent check on the UTXO supply page:
+// if the key image appears in the node's ki/ index the UTXO is definitively spent.
+type spentInputKI struct {
+        TxHash      string `json:"tx_hash"`
+        OutputIndex uint32 `json:"output_index"`
+        KeyImageHex string `json:"key_image_hex"`
+}
+
 type walletSendResult struct {
         TxHash             string `json:"tx_hash"`
         // TotalFeeNAPR is the exact fee charged by the builder (size × base fee),
@@ -49,7 +60,12 @@ type walletSendResult struct {
         // with real decoys and fell back to randomly-generated Phase 1 keys.
         // Zero means full Phase 2 privacy.  Non-zero means the ring contains
         // provably fake members that break anonymity.
-        FallbackDecoyCount int    `json:"fallback_decoy_count"`
+        FallbackDecoyCount int           `json:"fallback_decoy_count"`
+        // SpentKeyImages carries the key image of each real ring input so the
+        // caller can record it in utxo_blinds.key_image_hex.  Checking that value
+        // against GET /api/v1/keyimage/{ki}/is-spent gives an authoritative
+        // Monero-style spent check without needing the wallet's private key.
+        SpentKeyImages     []spentInputKI `json:"spent_key_images,omitempty"`
 }
 
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
@@ -198,6 +214,25 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                                                                         out.OneTimePub,
                                                                                         out.AmountCommit,
                                                                                 )
+                                                                                // Heal the missing u/ LevelDB entry so that
+                                                                                // a subsequent node restart finds this UTXO
+                                                                                // in LevelDB without needing Fallback 4 again.
+                                                                                healEntry := &store.StoredUTXO{
+                                                                                        TxHash:       txHash,
+                                                                                        OutputIndex:  u.OutIdx,
+                                                                                        OneTimePub:   out.OneTimePub,
+                                                                                        TxPubKey:     out.TxPubKey,
+                                                                                        AmountCommit: out.AmountCommit,
+                                                                                        EncAmount:    out.EncAmount,
+                                                                                        BlockHeight:  blk.Header.Height,
+                                                                                }
+                                                                                if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, healEntry); putErr != nil {
+                                                                                        s.log.Warn("fallback4: failed to heal u/ entry in LevelDB",
+                                                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
+                                                                                } else {
+                                                                                        s.log.Info("fallback4: healed missing u/ entry in LevelDB",
+                                                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", blk.Header.Height)
+                                                                                }
                                                                         }
                                                                         break
                                                                 }
@@ -222,6 +257,28 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         loc = core.TxLocation{
                                                 Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
                                                 TxIndex: 0,
+                                        }
+                                        // Best-effort heal: write snapshot fields back to LevelDB so
+                                        // subsequent restarts find this UTXO in u/ without Fallback 4.
+                                        // AmountCommit may be stale (OOM snapshot); ring-verify will
+                                        // catch it — the operator can re-mint to get a clean entry.
+                                        if s.blockStore != nil {
+                                                snapHeal := &store.StoredUTXO{
+                                                        TxHash:       txHash,
+                                                        OutputIndex:  u.OutIdx,
+                                                        OneTimePub:   memUTXO.OneTimePub,
+                                                        TxPubKey:     memUTXO.TxPubKey,
+                                                        AmountCommit: memUTXO.AmountCommit,
+                                                        EncAmount:    memUTXO.EncAmount,
+                                                        BlockHeight:  memUTXO.BlockHeight,
+                                                }
+                                                if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, snapHeal); putErr != nil {
+                                                        s.log.Warn("fallback4: failed to heal u/ entry (snapshot)",
+                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
+                                                } else {
+                                                        s.log.Info("fallback4: healed missing u/ entry from snapshot",
+                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", memUTXO.BlockHeight)
+                                                }
                                         }
                                 }
                         } else {
@@ -452,6 +509,25 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 changeBlindHex = hex.EncodeToString(result.ChangeBlind[:])
         }
 
+        // ── 8a. Build spent-input key-image list (Monero-style) ──────────────
+        // Each real ring input carries its key image in result.Tx.Inputs[i].KeyImage.
+        // We pair it with the source UTXO from result.SelectedUTXOs so the caller
+        // can record KI in utxo_blinds.key_image_hex.  Checking that value against
+        // GET /api/v1/keyimage/{ki}/is-spent gives an authoritative spent check:
+        // a KI present in the ki/ LevelDB index is definitively spent.
+        spentKIs := make([]spentInputKI, 0, len(result.SelectedUTXOs))
+        for i, su := range result.SelectedUTXOs {
+                if i >= len(result.Tx.Inputs) {
+                        break
+                }
+                ki := result.Tx.Inputs[i].KeyImage
+                spentKIs = append(spentKIs, spentInputKI{
+                        TxHash:      fmt.Sprintf("%x", su.TxHash[:]),
+                        OutputIndex: su.OutputIndex,
+                        KeyImageHex: fmt.Sprintf("%x", ki[:]),
+                })
+        }
+
         return walletSendResult{
                 TxHash:             fmt.Sprintf("%x", txHash[:]),
                 TotalFeeNAPR:       result.TotalFee,
@@ -463,6 +539,7 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 PayAmtNAPR:         p.AmountNAPR,
                 DecoyCount:         result.RealDecoyCount,
                 FallbackDecoyCount: result.FallbackDecoyCount,
+                SpentKeyImages:     spentKIs,
         }, nil
 }
 
