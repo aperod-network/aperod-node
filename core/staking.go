@@ -90,7 +90,23 @@ const StakePayloadSize = 105
 // The burn fields prove the depositor owns a real on-chain UTXO whose
 // Pedersen commitment opens to (amount, burnBlind).  The verifier recomputes
 // Commit(amount, burnBlind) and requires it to equal the UTXO's AmountCommit.
+// NOTE: V2 rejects transparent/mint UTXOs (TxPubKey==zero) — use V3 instead.
 const StakePayloadSizeV2 = 173
+
+// StakePayloadSizeV3 is the byte length of tx.Extra for v3 stake deposits.
+// Layout: (all of V2) action(1) + pubkey(32) + amount(8) + sig(64) +
+//
+//	burnTxHash(32) + burnOutIdx(4) + burnBlind(32) +
+//	oneTimeSig(64) = 237
+//
+// The extra oneTimeSig field is an Ed25519 signature from the UTXO's one-time
+// private key over StakeOwnershipSignMsg(burnTxHash, burnOutIdx).  This proves
+// the depositor holds the spend private key for the UTXO — closing the F-049
+// attack where an observer could compute DeterministicMintBlind(spendPub, amount)
+// from public data and claim any validator's block-reward UTXO as their own
+// stake deposit.  V3 also permits transparent/mint outputs (TxPubKey==zero) as
+// long as the ownership proof verifies.
+const StakePayloadSizeV3 = 237
 
 // EncodeStakeExtra packs a withdraw/partial-withdraw operation into 105 bytes.
 // sig must be an ED25519 signature of StakeSignMsg(action, pub, amount).
@@ -187,6 +203,84 @@ func DecodeStakeExtraV2(extra []byte) (
 	burnOutIdx = binary.BigEndian.Uint32(extra[137:141])
 	copy(burnBlind[:], extra[141:173])
 	return
+}
+
+// EncodeStakeExtraV3 packs a UTXO-backed deposit with ownership proof into 237 bytes.
+// sig must be an ED25519 signature of StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx).
+// burnBlind is the Pedersen blinding factor of the burn UTXO.
+// oneTimeSig must be an ED25519 signature of StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+// produced by the one-time private key of the burn UTXO (proves ownership of the UTXO).
+func EncodeStakeExtraV3(
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	oneTimeSig []byte,
+) ([]byte, error) {
+	if len(pub) != 32 {
+		return nil, fmt.Errorf("stake extra v3: pubkey must be 32 bytes, got %d", len(pub))
+	}
+	if len(sig) != 64 {
+		return nil, fmt.Errorf("stake extra v3: signature must be 64 bytes, got %d", len(sig))
+	}
+	if len(oneTimeSig) != 64 {
+		return nil, fmt.Errorf("stake extra v3: oneTimeSig must be 64 bytes, got %d", len(oneTimeSig))
+	}
+	b := make([]byte, StakePayloadSizeV3)
+	b[0] = byte(action)
+	copy(b[1:33], pub)
+	binary.BigEndian.PutUint64(b[33:41], amount)
+	copy(b[41:105], sig)
+	copy(b[105:137], burnTxHash[:])
+	binary.BigEndian.PutUint32(b[137:141], burnOutIdx)
+	copy(b[141:173], burnBlind[:])
+	copy(b[173:237], oneTimeSig)
+	return b, nil
+}
+
+// DecodeStakeExtraV3 unpacks the 237-byte v3 Extra field from a deposit tx.
+func DecodeStakeExtraV3(extra []byte) (
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	oneTimeSig []byte,
+	err error,
+) {
+	if len(extra) != StakePayloadSizeV3 {
+		err = fmt.Errorf("stake extra v3: expected %d bytes, got %d", StakePayloadSizeV3, len(extra))
+		return
+	}
+	action = StakeAction(extra[0])
+	pub = crypto.ValidatorPubKey(extra[1:33])
+	amount = binary.BigEndian.Uint64(extra[33:41])
+	sig = extra[41:105]
+	copy(burnTxHash[:], extra[105:137])
+	burnOutIdx = binary.BigEndian.Uint32(extra[137:141])
+	copy(burnBlind[:], extra[141:173])
+	oneTimeSig = extra[173:237]
+	return
+}
+
+// StakeOwnershipSignMsg returns the canonical signing message for the F-049
+// one-time-key ownership proof included in v3 stake deposits.
+// The depositor signs this message with the one-time private key of the burn UTXO
+// (oneTimePriv = spendPriv + height for mint outputs), proving they hold the spend
+// private key and therefore legitimately own the UTXO.
+func StakeOwnershipSignMsg(burnTxHash crypto.Hash32, burnOutIdx uint32) crypto.Hash32 {
+	oidxb := make([]byte, 4)
+	binary.BigEndian.PutUint32(oidxb, burnOutIdx)
+	return crypto.HashBytes(
+		[]byte("aperod/stake/ownership/v1"),
+		burnTxHash[:],
+		oidxb,
+	)
 }
 
 // StakeSignMsgV2 returns the canonical signing message for a v2 deposit.
@@ -396,9 +490,10 @@ func (r *ValidatorRegistry) SeedFromObservedProducers(pubs []crypto.ValidatorPub
 //
 // Extra payload routing:
 //   - 105 bytes (v1): StakeWithdraw / StakePartialWithdraw only.
-//   - 173 bytes (v2): StakeDeposit only — must include a valid UTXO burn proof.
-//     The verifier recomputes Commit(amount, burnBlind) and requires it to
-//     equal the referenced UTXO's AmountCommit (C-1 full fix).
+//   - 173 bytes (v2): StakeDeposit with stealth (non-zero TxPubKey) UTXOs.
+//     Rejects transparent/mint outputs (TxPubKey==zero) — use v3 instead.
+//   - 237 bytes (v3): StakeDeposit with one-time-key ownership proof (F-049 fix).
+//     Allows transparent/mint outputs; verifies depositor knows the spend key.
 func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error {
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
@@ -431,7 +526,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 			return fmt.Errorf("registry: unknown stake action %d in v1 payload", action)
 		}
 
-	// ── v2: UTXO-backed deposit ───────────────────────────────────────────────
+	// ── v2: UTXO-backed deposit (stealth outputs only) ────────────────────────
 	case StakePayloadSizeV2:
 		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
 		if err != nil {
@@ -457,17 +552,15 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
 				burnTxHash[:8], burnOutIdx)
 		}
-		// F-008 security fix: transparent / mint outputs (TxPubKey == zero) use
-		// DeterministicMintBlind(spendPub, amount) as their blinding factor.
-		// Both inputs are public data — any observer can compute the blind and
-		// pass the Commit check below without owning the private key.
-		// Until StakePayloadV3 adds a full spend-key ownership proof, reject
-		// transparent mint outputs as stake deposits entirely.
+		// F-008 / F-049: transparent/mint outputs (TxPubKey==zero) have a
+		// publicly-derivable blinding factor — any observer can pass the Commit
+		// check below.  V2 therefore rejects such outputs.  Use V3 (237-byte
+		// payload) which adds a one-time-key ownership proof.
 		var zeroPoint crypto.Point32
 		if burnUTXO.TxPubKey == zeroPoint {
-			return fmt.Errorf("registry: transparent/mint outputs (TxPubKey==zero) cannot be " +
-				"used as stake deposits — blinding factor is publicly derivable (F-008); " +
-				"use a stealth payment output for staking")
+			return fmt.Errorf("registry: transparent/mint outputs (TxPubKey==zero) require " +
+				"v3 payload (237 bytes) with one-time-key ownership proof (F-049); " +
+				"use EncodeStakeExtraV3 with StakeOwnershipSignMsg")
 		}
 		// Recompute Commit(amount, burnBlind) and require it to match the UTXO's
 		// on-chain AmountCommit.  If it doesn't, the depositor does not own the
@@ -490,9 +583,68 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		defer r.mu.Unlock()
 		return r.applyDeposit(pub.Hex(), pub, amount, height)
 
+	// ── v3: UTXO-backed deposit with one-time-key ownership proof (F-049) ────
+	case StakePayloadSizeV3:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, oneTimeSig, err := DecodeStakeExtraV3(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("registry: v3 payload (237 bytes) is only valid for StakeDeposit, got action=%d", action)
+		}
+
+		// Verify validator self-signature (same signing msg as v2).
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
+		}
+
+		// ── C-1: verify and burn the referenced UTXO ──────────────────────────
+		if r.utxos == nil {
+			return fmt.Errorf("registry: UTXO set not wired — cannot verify deposit (C-1 check)")
+		}
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return fmt.Errorf("registry: burn commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return fmt.Errorf("registry: burn UTXO %x:%d AmountCommit mismatch (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+
+		// ── F-049: one-time-key ownership proof ───────────────────────────────
+		// Verify that the depositor holds the spend private key for the UTXO.
+		// They sign StakeOwnershipSignMsg(burnTxHash, burnOutIdx) with the
+		// one-time private key (oneTimePriv = spendPriv + height for mints).
+		// This proves ownership even when the blind is publicly derivable.
+		ownershipMsg := StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+		oneTimePub, oneTimeErr := crypto.ValidatorPubKeyFromBytes(burnUTXO.OneTimePub[:])
+		if oneTimeErr != nil {
+			return fmt.Errorf("registry: invalid burn UTXO one-time pub: %w", oneTimeErr)
+		}
+		if !oneTimePub.Verify(ownershipMsg, oneTimeSig) {
+			return fmt.Errorf("registry: UTXO ownership proof failed (F-049): " +
+				"one-time-key signature does not verify against burn UTXO OneTimePub — " +
+				"depositor does not hold the spend private key for this UTXO")
+		}
+
+		// Burn the UTXO.
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return fmt.Errorf("registry: failed to burn stake UTXO: %w", err)
+		}
+
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.applyDeposit(pub.Hex(), pub, amount, height)
+
 	default:
-		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw or %d for deposit)",
-			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
+		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw, %d or %d for deposit)",
+			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
 	}
 }
 
@@ -565,6 +717,11 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 		if burnUTXO == nil {
 			return nil, fmt.Errorf("burn UTXO %x:%d not found in active set", burnTxHash[:8], burnOutIdx)
 		}
+		// F-008/F-049: transparent/mint outputs require v3 with ownership proof.
+		var zeroPoint crypto.Point32
+		if burnUTXO.TxPubKey == zeroPoint {
+			return nil, fmt.Errorf("transparent/mint outputs require v3 payload with ownership proof (F-049)")
+		}
 		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
 		if commitErr != nil {
 			return nil, fmt.Errorf("commitment computation failed: %w", commitErr)
@@ -586,8 +743,55 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 		k := UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}
 		return &k, nil
 
+	case StakePayloadSizeV3:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, oneTimeSig, err := DecodeStakeExtraV3(tx.Extra)
+		if err != nil {
+			return nil, err
+		}
+		if action != StakeDeposit {
+			return nil, fmt.Errorf("v3 payload only valid for StakeDeposit, got action=%d", action)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return nil, fmt.Errorf("invalid v3 stake signature from %s", pub.ID())
+		}
+		if r.utxos == nil {
+			return nil, fmt.Errorf("UTXO set not wired (C-1 check)")
+		}
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return nil, fmt.Errorf("burn UTXO %x:%d not found in active set (C-1)", burnTxHash[:8], burnOutIdx)
+		}
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return nil, fmt.Errorf("commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return nil, fmt.Errorf("burn UTXO %x:%d AmountCommit mismatch (C-1)", burnTxHash[:8], burnOutIdx)
+		}
+		// F-049 ownership proof: one-time key signature.
+		ownershipMsg := StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+		oneTimePub, otErr := crypto.ValidatorPubKeyFromBytes(burnUTXO.OneTimePub[:])
+		if otErr != nil {
+			return nil, fmt.Errorf("invalid burn UTXO one-time pub: %w", otErr)
+		}
+		if !oneTimePub.Verify(ownershipMsg, oneTimeSig) {
+			return nil, fmt.Errorf("UTXO ownership proof failed (F-049): one-time-key sig does not verify")
+		}
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return nil, fmt.Errorf("MarkStaked: %w", err)
+		}
+		key := pub.Hex()
+		if applyErr := r.applyDeposit(key, pub, amount, height); applyErr != nil {
+			r.utxos.UnmarkStaked(burnTxHash, burnOutIdx)
+			return nil, applyErr
+		}
+		k := UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}
+		return &k, nil
+
 	default:
-		return nil, fmt.Errorf("invalid stake extra length %d", len(tx.Extra))
+		return nil, fmt.Errorf("invalid stake extra length %d (expected %d, %d, or %d)",
+			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
 	}
 }
 
@@ -764,7 +968,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 				return fmt.Errorf("stake tx[%d]: unknown action %d", i, action)
 			}
 
-		// ── v2: UTXO-backed deposit ────────────────────────────────────
+		// ── v2: UTXO-backed deposit (stealth outputs only) ───────────────
 		case StakePayloadSizeV2:
 			action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
 			if err != nil {
@@ -791,6 +995,12 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 			if burnUTXO == nil {
 				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d not found in active set (C-1 check)",
 					i, burnTxHash[:8], burnOutIdx)
+			}
+			// F-008/F-049: transparent/mint outputs require v3 with ownership proof.
+			var zeroPoint crypto.Point32
+			if burnUTXO.TxPubKey == zeroPoint {
+				return fmt.Errorf("stake tx[%d]: transparent/mint outputs require v3 payload (237 bytes) "+
+					"with one-time-key ownership proof (F-049)", i)
 			}
 			expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
 			if commitErr != nil {
@@ -829,9 +1039,81 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 			reserved[uk] = i
 			snapshot[key] = se
 
+		// ── v3: UTXO-backed deposit with one-time-key ownership proof (F-049) ─
+		case StakePayloadSizeV3:
+			action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, oneTimeSig, err := DecodeStakeExtraV3(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: decode v3: %w", i, err)
+			}
+			if action != StakeDeposit {
+				return fmt.Errorf("stake tx[%d]: v3 payload only valid for StakeDeposit, got action=%d", i, action)
+			}
+			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+			if !pub.Verify(msg, sig) {
+				return fmt.Errorf("stake tx[%d]: invalid v3 signature from %s", i, pub.ID())
+			}
+			// Within-block duplicate burn UTXO.
+			uk := utxoKey{TxHash: burnTxHash, OutIdx: burnOutIdx}
+			if firstIdx, dup := reserved[uk]; dup {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d already claimed by tx[%d] in this block",
+					i, burnTxHash[:8], burnOutIdx, firstIdx)
+			}
+			if r.utxos == nil {
+				return fmt.Errorf("stake tx[%d]: UTXO set not wired (C-1 check)", i)
+			}
+			burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+			if burnUTXO == nil {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d not found in active set (C-1 check)",
+					i, burnTxHash[:8], burnOutIdx)
+			}
+			expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+			if commitErr != nil {
+				return fmt.Errorf("stake tx[%d]: commitment computation failed: %w", i, commitErr)
+			}
+			if expectedCommit != burnUTXO.AmountCommit {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d AmountCommit mismatch (C-1 check)",
+					i, burnTxHash[:8], burnOutIdx)
+			}
+			// F-049: verify one-time-key ownership proof.
+			ownershipMsg := StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+			oneTimePub, otErr := crypto.ValidatorPubKeyFromBytes(burnUTXO.OneTimePub[:])
+			if otErr != nil {
+				return fmt.Errorf("stake tx[%d]: invalid burn UTXO one-time pub: %w", i, otErr)
+			}
+			if !oneTimePub.Verify(ownershipMsg, oneTimeSig) {
+				return fmt.Errorf("stake tx[%d]: UTXO ownership proof failed (F-049): "+
+					"one-time-key sig does not verify against UTXO OneTimePub", i)
+			}
+			// Stateful deposit checks.
+			if amount < effectiveMin {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO < minimum %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(effectiveMin)/float64(BaseUnitsPerAPR))
+			}
+			if amount > MaxStakeNAPR {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO exceeds cap %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(MaxStakeNAPR)/float64(BaseUnitsPerAPR))
+			}
+			key := pub.Hex()
+			se, existing := snapshot[key]
+			if existing {
+				switch se.status {
+				case ValidatorUnbonding, ValidatorExited:
+					return fmt.Errorf("stake tx[%d]: validator is unbonding/exited; cannot stake", i)
+				default:
+					if se.stakeNAPR > math.MaxUint64-amount {
+						return fmt.Errorf("stake tx[%d]: stake top-up overflow", i)
+					}
+					se.stakeNAPR += amount
+				}
+			} else {
+				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending}
+			}
+			reserved[uk] = i
+			snapshot[key] = se
+
 		default:
-			return fmt.Errorf("stake tx[%d]: invalid extra length %d (expected %d or %d)",
-				i, len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
+			return fmt.Errorf("stake tx[%d]: invalid extra length %d (expected %d, %d, or %d)",
+				i, len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
 		}
 	}
 	return nil
@@ -845,9 +1127,10 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 // Checks performed:
 //   - payload size and decode correctness
 //   - Ed25519 self-signature (binds deposit to a specific UTXO)
-//   - v1 StakeDeposit rejected (C-1 fix: v2 required)
+//   - v1 StakeDeposit rejected (C-1 fix: v2/v3 required)
 //   - UTXO existence in the active set (C-1)
 //   - Pedersen commitment match: Commit(amount, blind) == UTXO.AmountCommit (C-1)
+//   - For v3: one-time-key ownership proof verified (F-049 fix)
 func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
@@ -888,6 +1171,12 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
 				burnTxHash[:8], burnOutIdx)
 		}
+		// F-008/F-049: transparent outputs need ownership proof — use v3.
+		var zeroPoint crypto.Point32
+		if burnUTXO.TxPubKey == zeroPoint {
+			return fmt.Errorf("registry: transparent/mint outputs require v3 payload (237 bytes) " +
+				"with one-time-key ownership proof (F-049)")
+		}
 		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
 		if commitErr != nil {
 			return fmt.Errorf("registry: burn commitment computation failed: %w", commitErr)
@@ -899,9 +1188,49 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 		}
 		return nil
 
+	case StakePayloadSizeV3:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, oneTimeSig, err := DecodeStakeExtraV3(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("registry: v3 payload (237 bytes) is only valid for StakeDeposit, got action=%d", action)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
+		}
+		if r.utxos == nil {
+			return fmt.Errorf("registry: UTXO set not wired — cannot verify deposit (C-1 check)")
+		}
+		burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+		if burnUTXO == nil {
+			return fmt.Errorf("registry: burn UTXO %x:%d not found in active set (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		expectedCommit, commitErr := crypto.Commit(amount, burnBlind)
+		if commitErr != nil {
+			return fmt.Errorf("registry: burn commitment computation failed: %w", commitErr)
+		}
+		if expectedCommit != burnUTXO.AmountCommit {
+			return fmt.Errorf("registry: burn UTXO %x:%d AmountCommit mismatch (C-1 check)",
+				burnTxHash[:8], burnOutIdx)
+		}
+		// F-049: verify one-time-key ownership proof.
+		ownershipMsg := StakeOwnershipSignMsg(burnTxHash, burnOutIdx)
+		oneTimePub, otErr := crypto.ValidatorPubKeyFromBytes(burnUTXO.OneTimePub[:])
+		if otErr != nil {
+			return fmt.Errorf("registry: invalid burn UTXO one-time pub: %w", otErr)
+		}
+		if !oneTimePub.Verify(ownershipMsg, oneTimeSig) {
+			return fmt.Errorf("registry: UTXO ownership proof failed (F-049): " +
+				"one-time-key sig does not verify against UTXO OneTimePub")
+		}
+		return nil
+
 	default:
-		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw or %d for deposit)",
-			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2)
+		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw, %d or %d for deposit)",
+			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
 	}
 }
 
@@ -986,6 +1315,33 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 		// Reconstruct the burn-UTXO descriptor from payload data so MarkStakedKnown
 		// can restore it to the staked set.  The OneTimePub is set to zero — staked
 		// UTXOs are never used as ring decoys, so byPubKey lookup is irrelevant.
+		expectedCommit, _ := crypto.Commit(amount, burnBlind)
+		burnUTXO := &UTXO{
+			TxHash:       burnTxHash,
+			OutputIndex:  burnOutIdx,
+			AmountCommit: expectedCommit,
+		}
+		if r.utxos != nil {
+			r.utxos.MarkStakedKnown(burnTxHash, burnOutIdx, burnUTXO)
+		}
+		key := pub.Hex()
+		return r.applyDeposit(key, pub, amount, height)
+
+	case StakePayloadSizeV3:
+		// V3 replay: same as V2 — sig verified, UTXO existence NOT re-checked
+		// (UTXO was consumed when the block was first applied), ownership proof
+		// NOT re-verified (already verified at apply time).
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, _, err := DecodeStakeExtraV3(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		if action != StakeDeposit {
+			return fmt.Errorf("replay: v3 payload with non-deposit action=%d at height %d", action, height)
+		}
+		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+		if !pub.Verify(msg, sig) {
+			return fmt.Errorf("replay: invalid v3 stake sig from %s at height %d", pub.ID(), height)
+		}
 		expectedCommit, _ := crypto.Commit(amount, burnBlind)
 		burnUTXO := &UTXO{
 			TxHash:       burnTxHash,
