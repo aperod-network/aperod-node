@@ -216,6 +216,106 @@ func TestChainPersistRestore(t *testing.T) {
         t.Logf("chain restored: height=%d utxos=%d", chain2.Height(), utxos2.Count())
 }
 
+// ─── Snapshot save duration round-trip ───────────────────────────────────────
+
+// TestDB_SnapshotSaveDuration_RoundTrip verifies that StoreSnapshotSaveDuration
+// and LoadSnapshotSaveDuration form a correct round-trip for representative
+// values: zero, a typical mid-range value, and the maximum int64.
+func TestDB_SnapshotSaveDuration_RoundTrip(t *testing.T) {
+        dir := t.TempDir()
+        db, err := store.Open(dir)
+        if err != nil {
+                t.Fatalf("open store: %v", err)
+        }
+        defer db.Close()
+
+        cases := []struct {
+                name string
+                ms   int64
+        }{
+                {"zero", 0},
+                {"typical_1234ms", 1234},
+                {"max_int64", 9223372036854775807},
+        }
+
+        for _, tc := range cases {
+                t.Run(tc.name, func(t *testing.T) {
+                        if err := db.StoreSnapshotSaveDuration(tc.ms); err != nil {
+                                t.Fatalf("StoreSnapshotSaveDuration(%d): %v", tc.ms, err)
+                        }
+                        got, found, err := db.LoadSnapshotSaveDuration()
+                        if err != nil {
+                                t.Fatalf("LoadSnapshotSaveDuration: %v", err)
+                        }
+                        if !found {
+                                t.Fatal("LoadSnapshotSaveDuration: found=false after store")
+                        }
+                        if got != tc.ms {
+                                t.Errorf("LoadSnapshotSaveDuration = %d, want %d", got, tc.ms)
+                        }
+                })
+        }
+}
+
+// TestDB_SnapshotSaveDuration_AbsentBeforeFirstStore verifies that
+// LoadSnapshotSaveDuration returns (0, false, nil) on a fresh database that
+// has never had a value written (pre-feature DB or first boot).
+func TestDB_SnapshotSaveDuration_AbsentBeforeFirstStore(t *testing.T) {
+        dir := t.TempDir()
+        db, err := store.Open(dir)
+        if err != nil {
+                t.Fatalf("open store: %v", err)
+        }
+        defer db.Close()
+
+        got, found, err := db.LoadSnapshotSaveDuration()
+        if err != nil {
+                t.Fatalf("LoadSnapshotSaveDuration on empty DB: %v", err)
+        }
+        if found {
+                t.Errorf("expected found=false on empty DB, got found=true (value=%d)", got)
+        }
+        if got != 0 {
+                t.Errorf("expected ms=0 on empty DB, got %d", got)
+        }
+}
+
+// TestDB_SnapshotSaveDuration_SurvivesReopen verifies that the value persisted
+// by StoreSnapshotSaveDuration is readable after the DB is closed and reopened —
+// the core property that makes the restart-survival feature work.
+func TestDB_SnapshotSaveDuration_SurvivesReopen(t *testing.T) {
+        dir := t.TempDir()
+
+        // First open: write the value.
+        db1, err := store.Open(dir)
+        if err != nil {
+                t.Fatalf("open store (first): %v", err)
+        }
+        const wantMs = int64(7890)
+        if err := db1.StoreSnapshotSaveDuration(wantMs); err != nil {
+                t.Fatalf("StoreSnapshotSaveDuration: %v", err)
+        }
+        db1.Close()
+
+        // Second open: the value must still be present.
+        db2, err := store.Open(dir)
+        if err != nil {
+                t.Fatalf("open store (second): %v", err)
+        }
+        defer db2.Close()
+
+        got, found, err := db2.LoadSnapshotSaveDuration()
+        if err != nil {
+                t.Fatalf("LoadSnapshotSaveDuration after reopen: %v", err)
+        }
+        if !found {
+                t.Fatal("LoadSnapshotSaveDuration: found=false after close+reopen — value did not survive restart")
+        }
+        if got != wantMs {
+                t.Errorf("LoadSnapshotSaveDuration after reopen = %d, want %d", got, wantMs)
+        }
+}
+
 // writeTempGenesis creates a minimal genesis YAML file for testing.
 // It generates a fresh validator key so that min_validators=1 is satisfied.
 func writeTempGenesis(t *testing.T) string {
