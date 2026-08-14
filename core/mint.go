@@ -32,10 +32,17 @@ func BuildMintTx(addr crypto.Address, amount uint64, height uint64) (*Transactio
                 return nil, fmt.Errorf("decode address: %w", err)
         }
 
-        // Use a deterministic blind derived from spendPub + amount.
-        // This lets the wallet always recompute the blind and spend the UTXO
-        // without needing an external database to store the random blind.
-        blind, err := crypto.DeterministicMintBlind(spendPub, amount)
+        // Use a deterministic blind derived from spendPub + amount + height.
+        // For height > 0 (block-reward mints) we use V2 which includes height in
+        // the derivation so each block's reward has a distinct blind even for the
+        // same (address, amount) pair.  For height=0 (one-off admin mints) we
+        // keep the legacy V1 formula for backward compatibility with existing UTXOs.
+        var blind crypto.BlindFactor
+        if height > 0 {
+                blind, err = crypto.DeterministicMintBlindV2(spendPub, amount, height)
+        } else {
+                blind, err = crypto.DeterministicMintBlind(spendPub, amount)
+        }
         if err != nil {
                 return nil, fmt.Errorf("deterministic mint blind: %w", err)
         }
