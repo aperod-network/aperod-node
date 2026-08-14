@@ -438,11 +438,25 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
                                 }
                                 // Verify the commitment to catch pre-migration UTXOs (random blind).
                                 recomputed, cErr := crypto.Commit(u.AmountNAPR, blind)
-                                if cErr != nil || recomputed != out.AmountCommit {
+                                if cErr != nil {
                                         return nil, fmt.Errorf(
-                                                "stealth output %s[%d]: commitment mismatch — "+
+                                                "commitment mismatch for tx %s[%d]: amount_napr=%d — deterministic blind computation failed: %w",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, u.AmountNAPR, cErr)
+                                } else if recomputed != out.AmountCommit {
+                                        s.log.Error("DIAG: pre-flight stealth commitment mismatch",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "out_idx", u.OutIdx,
+                                                "amount_napr", u.AmountNAPR,
+                                                "recomputed_commit", fmt.Sprintf("%x", recomputed[:8]),
+                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                                        )
+                                        return nil, fmt.Errorf(
+                                                "commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — "+
                                                         "UTXO predates deterministic blind migration, admin re-mint required",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
+                                                u.AmountNAPR,
+                                                recomputed[:8],
+                                                out.AmountCommit[:8])
                                 }
                         } else {
                                 blind, err = blindFactorFromHex(u.BlindHex)
