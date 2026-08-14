@@ -223,7 +223,9 @@ fi
 # We only write the file when it is missing.  If the operator has already
 # customised it (e.g. to a larger value) we leave it alone.
 # ---------------------------------------------------------------------------
-DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+# Honour an externally-supplied DROPIN_DIR (test seam); fall back to the
+# live systemd drop-in directory only when the caller has not set it.
+DROPIN_DIR="${DROPIN_DIR:-/etc/systemd/system/${SERVICE_NAME}.service.d}"
 TIMEOUT_CONF="${DROPIN_DIR}/timeout.conf"
 mkdir -p "${DROPIN_DIR}"
 
@@ -313,6 +315,81 @@ else
   else
     echo "  [ok] ${TIMEOUT_CONF}: TimeoutStopSec=${_current} is safe (≥ ${TIMEOUT_MIN_SEC}s) — not overwriting."
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 0d: Guarantee gomemlimit.conf drop-in.
+#
+# Step 0c above handles only timeout.conf and intentionally preserves any
+# safe operator-customised value (e.g. infinity).  An operator who runs
+# update-node.sh directly — instead of upgrade-node.sh — would previously
+# skip the gomemlimit.conf guarantee, leaving the node exposed to OOM-kill
+# and snapshot corruption on restart.
+#
+# This step writes (or verifies) gomemlimit.conf ONLY.  It does not touch
+# timeout.conf, preserving whatever safe value Step 0c left in place.
+#
+# The canonical GOMEMLIMIT byte count is read from the repo drop-in file
+# (deploy/gomemlimit.conf) — the single source of truth — so bumping the
+# limit only requires editing one place.  If that file is missing the step
+# is a FATAL preflight failure: we must not restart the node without a
+# confirmed GOMEMLIMIT, so the service is never stopped.
+#
+# Injectable seam: DROPIN_DIR is already set by Step 0c (honouring any
+# externally supplied value) and SYSTEMCTL defaults to `systemctl`.
+# ---------------------------------------------------------------------------
+GOMEMLIMIT_CANONICAL="${DEPLOY_DIR}/gomemlimit.conf"
+GOMEMLIMIT_CONF="${DROPIN_DIR}/gomemlimit.conf"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+
+echo "==> [0d] Ensuring gomemlimit.conf drop-in (OOM protection)..."
+
+if [[ ! -f "${GOMEMLIMIT_CANONICAL}" ]]; then
+  echo "" >&2
+  echo "✗ FATAL: canonical gomemlimit.conf not found at ${GOMEMLIMIT_CANONICAL}." >&2
+  echo "  The GOMEMLIMIT drop-in could NOT be verified." >&2
+  echo "  Without GOMEMLIMIT the restarted node may be OOM-killed and corrupt its snapshot." >&2
+  echo "  The service was NOT stopped. The old binary is still running." >&2
+  echo "  Restore gomemlimit.conf from the repo and re-run update-node.sh." >&2
+  echo "" >&2
+  send_telegram_alert "🚨 <b>aperod-node: обновление ПРЕРВАНО — gomemlimit.conf не найден</b>
+Сервер: $(hostname)
+Файл <code>${GOMEMLIMIT_CANONICAL}</code> отсутствует — GOMEMLIMIT drop-in НЕ проверен.
+Без GOMEMLIMIT нода может быть убита OOM-киллером и повредить снимок UTXO.
+Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает.
+Восстановите gomemlimit.conf из репозитория и запустите <code>update-node.sh</code> повторно."
+  exit 1
+fi
+
+_gomemlimit_value=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${GOMEMLIMIT_CANONICAL}" | head -1 | cut -d= -f2 || true)
+if [[ -z "${_gomemlimit_value}" ]]; then
+  echo "" >&2
+  echo "✗ FATAL: could not parse GOMEMLIMIT value from ${GOMEMLIMIT_CANONICAL}." >&2
+  echo "  The service was NOT stopped. The old binary is still running." >&2
+  echo "" >&2
+  send_telegram_alert "🚨 <b>aperod-node: обновление ПРЕРВАНО — не удалось прочитать GOMEMLIMIT</b>
+Сервер: $(hostname)
+Не удалось распарсить GOMEMLIMIT из <code>${GOMEMLIMIT_CANONICAL}</code>.
+Сервис <b>НЕ остановлен</b>. Проверьте файл и запустите <code>update-node.sh</code> повторно."
+  exit 1
+fi
+
+_gomemlimit_required="[Service]
+Environment=\"GOMEMLIMIT=${_gomemlimit_value}\""
+
+# Write only when content differs (idempotent — no extra daemon-reload on repeat runs).
+_gomemlimit_reload=false
+if [[ -f "${GOMEMLIMIT_CONF}" ]] && [[ "$(cat "${GOMEMLIMIT_CONF}")" == "${_gomemlimit_required}" ]]; then
+  echo "  [ok] ${GOMEMLIMIT_CONF}: already up to date (GOMEMLIMIT=${_gomemlimit_value}) — no change needed."
+else
+  printf '%s\n' "${_gomemlimit_required}" > "${GOMEMLIMIT_CONF}"
+  echo "  [ok] ${GOMEMLIMIT_CONF}: written (GOMEMLIMIT=${_gomemlimit_value})."
+  _gomemlimit_reload=true
+fi
+
+if [[ "${_gomemlimit_reload}" == "true" ]]; then
+  "${SYSTEMCTL}" daemon-reload
+  echo "  [patch] daemon-reload complete — GOMEMLIMIT=${_gomemlimit_value} takes effect after restart."
 fi
 
 # ---------------------------------------------------------------------------

@@ -266,6 +266,125 @@ EOF
   warn "Restart aperod-node to apply: systemctl restart aperod-node"
 }
 
+# ── set-field ────────────────────────────────────────────────────────────────
+# Sets a top-level boolean/string/integer field in node.yaml.
+# Usage: set-field <key> <value>
+# Example: set-field non_validator true
+cmd_set_field() {
+  local key="${1:-}" value="${2:-}"
+  [[ -n "$key" ]]   || die "Usage: $0 set-field <key> <value>"
+  [[ -n "$value" ]] || die "Usage: $0 set-field <key> <value>"
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+  ensure_pyyaml
+
+  local tmp cfg_dir lockfile
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
+  tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+
+  exec 9>"$lockfile"
+  flock -x 9
+
+  trap 'rm -f "${tmp:-}"' EXIT
+
+  python3 - "$CONFIG_FILE" "$key" "$value" "$tmp" <<'EOF'
+import yaml, sys
+
+cfg_path, key, value_s, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Convert string value to appropriate Python type.
+if value_s.lower() == 'true':
+    value = True
+elif value_s.lower() == 'false':
+    value = False
+else:
+    try:
+        value = int(value_s)
+    except ValueError:
+        value = value_s
+
+# Support dotted paths (e.g. "consensus.non_validator") for nested fields.
+parts = key.split('.')
+node = cfg
+for part in parts[:-1]:
+    if part not in node or node[part] is None:
+        node[part] = {}
+    node = node[part]
+node[parts[-1]] = value
+
+with open(out_path, "w") as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+print(f"Set {key}: {value}")
+EOF
+
+  validate_yaml "$tmp" || die "Validation failed — config not written."
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || true
+  backup_config
+  mv "$tmp" "$CONFIG_FILE"
+  ok "node.yaml updated: ${key} = ${value}"
+}
+
+# ── unset-field ───────────────────────────────────────────────────────────────
+# Removes a top-level field from node.yaml.  No-op if the key is not present.
+# Usage: unset-field <key>
+# Example: unset-field non_validator
+cmd_unset_field() {
+  local key="${1:-}"
+  [[ -n "$key" ]] || die "Usage: $0 unset-field <key>"
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+  ensure_pyyaml
+
+  local tmp cfg_dir lockfile
+  cfg_dir="$(dirname "$CONFIG_FILE")"
+  lockfile="${cfg_dir}/.node-config.lock"
+  tmp=$(mktemp "${cfg_dir}/.node-config-XXXXXX")
+
+  exec 9>"$lockfile"
+  flock -x 9
+
+  trap 'rm -f "${tmp:-}"' EXIT
+
+  python3 - "$CONFIG_FILE" "$key" "$tmp" <<'EOF'
+import yaml, sys
+
+cfg_path, key, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Support dotted paths (e.g. "consensus.non_validator") for nested fields.
+parts = key.split('.')
+node = cfg
+for part in parts[:-1]:
+    if not isinstance(node.get(part), dict):
+        print(f"{key} not present — nothing to do")
+        with open(out_path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+        sys.exit(0)
+    node = node[part]
+
+leaf = parts[-1]
+if leaf not in node:
+    print(f"{key} not present — nothing to do")
+    with open(out_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    sys.exit(0)
+
+del node[leaf]
+
+with open(out_path, "w") as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+print(f"Removed: {key}")
+EOF
+
+  validate_yaml "$tmp" || die "Validation failed — config not written."
+  chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || true
+  backup_config
+  mv "$tmp" "$CONFIG_FILE"
+  ok "node.yaml updated: removed ${key}"
+}
+
 # ── set-snapshot-tolerance ───────────────────────────────────────────────────
 # Raises snapshot.utxo_count_tolerance_pct to the given value (never lowers it).
 # Used by join-network.sh --bootstrap-from so rsync-bootstrapped relay nodes
@@ -396,6 +515,8 @@ case "$SUBCMD" in
   list-bootnodes)         cmd_list ;;
   add-bootnode)           cmd_add "${1:-}" ;;
   remove-bootnode)        cmd_remove "${1:-}" ;;
+  set-field)              cmd_set_field "${1:-}" "${2:-}" ;;
+  unset-field)            cmd_unset_field "${1:-}" ;;
   set-snapshot-tolerance) cmd_set_snapshot_tolerance "${1:-}" ;;
   restore-backup)         cmd_restore_backup ;;
   help|--help|-h)
@@ -405,6 +526,8 @@ case "$SUBCMD" in
     echo "  list-bootnodes                — List current bootnodes in node.yaml"
     echo "  add-bootnode    <addr>        — Safely append a bootnode"
     echo "  remove-bootnode <addr>        — Remove a bootnode by exact match"
+    echo "  set-field       <key> <value> — Set a top-level field (bool/int/string)"
+    echo "  unset-field     <key>         — Remove a top-level field (no-op if absent)"
     echo "  set-snapshot-tolerance <pct> — Raise snapshot.utxo_count_tolerance_pct (never lowers)"
     echo "  restore-backup                — Roll back to the most-recent pre-write backup"
     echo ""
