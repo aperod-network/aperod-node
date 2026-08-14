@@ -207,9 +207,10 @@ func TestSpentDecoyPool_FallbackDecoyCount_ExactMinimum(t *testing.T) {
 	}
 	mintOut := mintTx.Outputs[0]
 
-	mintBlind, err := crypto.DeterministicMintBlind(aliceSpendPub, mintAmount)
+	// BuildMintTx with mintHeight > 0 uses DeterministicMintBlindV2 (F-049 fix).
+	mintBlind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, mintAmount, mintHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 
 	owned := []OwnedUTXO{{
@@ -306,9 +307,10 @@ func TestSpentDecoyPool_FallbackDecoyCount_BelowMinimum(t *testing.T) {
 	}
 	mintOut := mintTx.Outputs[0]
 
-	mintBlind, err := crypto.DeterministicMintBlind(aliceSpendPub, mintAmount)
+	// BuildMintTx with mintHeight > 0 uses DeterministicMintBlindV2 (F-049 fix).
+	mintBlind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, mintAmount, mintHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 
 	owned := []OwnedUTXO{{
