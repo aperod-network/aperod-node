@@ -16,6 +16,7 @@ import (
         "github.com/aperod/aperod/api"
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
+        "github.com/aperod/aperod/store"
 )
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -1192,4 +1193,54 @@ func TestREST_NetworkBanByAddr_LoopbackHost(t *testing.T) {
         if code != http.StatusNotFound {
                 t.Fatalf("expected 404 (no active ban), got %d", code)
         }
+}
+
+// TestREST_UTXO_InMemorySpentCheck confirms that /api/v1/utxo/{hash}/{idx} returns
+// 404 when the UTXO is present in the in-memory UTXOSet but the su/ spent-UTXO
+// index (via blockStore) marks it as spent.  This guards the bug where the
+// in-memory fast path skipped the IsUTXOSpent cross-check that the disk fallback
+// always applied, causing spent outputs to be reported as exists=true.
+func TestREST_UTXO_InMemorySpentCheck(t *testing.T) {
+	srv, utxos := buildUTXOServer(t)
+
+	// Open a real LevelDB store so IsUTXOSpent has a backing su/ index.
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	srv.SetStore(db)
+
+	// Register a UTXO in the in-memory set.
+	var txHash crypto.Hash32
+	txHash[0] = 0xDE
+	txHash[1] = 0xAD
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		BlockHeight: 1,
+	})
+
+	// Sanity: not yet marked spent → 200.
+	path := "/api/v1/utxo/" + hex.EncodeToString(txHash[:]) + "/0"
+	code, resp := restGet(t, srv, path)
+	if code != http.StatusOK {
+		t.Fatalf("before spend: status = %d, want 200; resp=%v", code, resp)
+	}
+	if resp["exists"] != true {
+		t.Fatalf("before spend: exists = %v, want true", resp["exists"])
+	}
+
+	// Mark the UTXO spent in the su/ index.
+	if err := db.MarkUTXOSpent(txHash, 0); err != nil {
+		t.Fatalf("MarkUTXOSpent: %v", err)
+	}
+
+	// Now the same UTXO must be reported as not-found (exists=false / 404)
+	// even though it is still in the in-memory UTXOSet.
+	code, resp = restGet(t, srv, path)
+	if code != http.StatusNotFound {
+		t.Fatalf("after spend: status = %d, want 404; resp=%v", code, resp)
+	}
 }
