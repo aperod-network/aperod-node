@@ -209,6 +209,14 @@ type Server struct {
         // shutdown time.  Zero when systemd is not the supervisor or the value
         // cannot be determined.
         lastSnapshotTimeoutSec float64
+        // snapshotTimingFromPrevious is true when lastSnapshotSaveDurMs and
+        // lastSnapshotTimeoutSec were restored from the LevelDB metadata written
+        // by the previous process's shutdown handler — i.e. the current process
+        // has not yet completed its own shutdown snapshot and the timing data
+        // shown to operators is from the prior run.
+        // Cleared to false as soon as SetSnapshotTimings is called during the
+        // current session (i.e. after the first in-process snapshot save).
+        snapshotTimingFromPrevious bool
 
         // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
         // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
@@ -302,6 +310,20 @@ func (s *Server) SetSnapshotTimings(dur time.Duration, timeoutSec float64) {
         s.snapshotMu.Lock()
         s.lastSnapshotSaveDurMs = dur.Milliseconds()
         s.lastSnapshotTimeoutSec = timeoutSec
+        s.snapshotTimingFromPrevious = false
+        s.snapshotMu.Unlock()
+}
+
+// SetSnapshotTimingsFromPreviousShutdown pre-populates the snapshot timing
+// fields from values persisted to LevelDB by the previous process's shutdown
+// handler.  Unlike SetSnapshotTimings, this sets snapshotTimingFromPrevious
+// to true so the API (and Admin Panel) can label the data accordingly.
+// Call this once at startup, before the first in-process snapshot save.
+func (s *Server) SetSnapshotTimingsFromPreviousShutdown(dur time.Duration, timeoutSec float64) {
+        s.snapshotMu.Lock()
+        s.lastSnapshotSaveDurMs = dur.Milliseconds()
+        s.lastSnapshotTimeoutSec = timeoutSec
+        s.snapshotTimingFromPrevious = true
         s.snapshotMu.Unlock()
 }
 

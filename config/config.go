@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -64,6 +66,42 @@ type SnapshotConfig struct {
 	MaxMissingBlocks uint64 `yaml:"max_missing_blocks"`
 }
 
+// MaintenanceConfig controls the node's scheduled maintenance window.
+type MaintenanceConfig struct {
+	// RestartAt is the UTC time at which the node sends a graceful SIGTERM to
+	// itself for a nightly RAM-reclaim restart (HH:MM, 24-hour clock, UTC).
+	// Go heap fragmentation accumulates ~1.3 GB/h in production; a nightly
+	// restart clears it before memory pressure builds.
+	// Default: "04:00".  Set to "" to disable the in-process nightly restart
+	// (e.g. when the operator manages scheduling via an external systemd timer).
+	RestartAt string `yaml:"restart_at"`
+}
+
+// ParseRestartAt parses a "HH:MM" UTC time string and returns (hour, minute, nil)
+// on success, or an error when the format or values are invalid.
+// An empty string is rejected; callers must check for empty before calling.
+// The function is exported so main.go can extract parsed values after
+// Validate() has already confirmed the format.
+func ParseRestartAt(s string) (int, int, error) {
+	if s == "" {
+		return 0, 0, fmt.Errorf("restart_at must not be empty")
+	}
+	idx := strings.IndexByte(s, ':')
+	if idx < 0 || idx == 0 || idx == len(s)-1 {
+		return 0, 0, fmt.Errorf("invalid format %q: want HH:MM (e.g. \"04:00\")", s)
+	}
+	hStr, mStr := s[:idx], s[idx+1:]
+	h, err := strconv.Atoi(hStr)
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, fmt.Errorf("invalid hour in %q: want 00–23", s)
+	}
+	m, err := strconv.Atoi(mStr)
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid minute in %q: want 00–59", s)
+	}
+	return h, m, nil
+}
+
 // PprofConfig controls the Go pprof HTTP diagnostic endpoint.
 // The endpoint exposes CPU/heap/goroutine profiles and should only ever
 // bind to localhost (127.0.0.1).  It is disabled by default.
@@ -86,7 +124,8 @@ type Config struct {
 	Genesis   GenesisRef      `yaml:"genesis"`
 	Pruning   PruningConfig   `yaml:"pruning"`
 	Snapshot  SnapshotConfig  `yaml:"snapshot"`
-	Pprof     PprofConfig     `yaml:"pprof"`
+	Pprof       PprofConfig       `yaml:"pprof"`
+	Maintenance MaintenanceConfig `yaml:"maintenance"`
 	// MemoryLimitBytes, when positive, is passed to runtime/debug.SetMemoryLimit
 	// at startup if the GOMEMLIMIT environment variable is not already set.
 	// This lets operators running outside of systemd (Docker, bare shell, CI)
@@ -373,6 +412,9 @@ TxRateBanDuration:    time.Hour,
 		},
 		MaxInMemoryBlocks:       1_000,
 		MempoolEvictIntervalSec: 300,
+		Maintenance: MaintenanceConfig{
+			RestartAt: "04:00",
+		},
 	}
 }
 
@@ -436,6 +478,20 @@ func (c *Config) Warnings() []string {
 				"a very large height lead reduces sensitivity to rogue-fork spam and may allow adversarial "+
 				"peers to avoid ban detection for extended periods; recommended value: 500–2000",
 			c.P2P.BadBlockHeightLead, safeHeightLead,
+		))
+	}
+	// A very short ban duration means a rogue peer is unbanned within seconds
+	// of each strike window and effectively faces no penalty.  Warn when the
+	// operator has explicitly set bad_block_ban_duration to a value below the
+	// safe minimum (1 hour).  The zero value means "use the default" (24 h)
+	// and is therefore never flagged.
+	const safeBanDuration = time.Hour
+	if c.P2P.BadBlockBanDuration > 0 && c.P2P.BadBlockBanDuration < safeBanDuration {
+		ws = append(ws, fmt.Sprintf(
+			"p2p.bad_block_ban_duration is %s, which is below the recommended safe minimum of %s — "+
+				"a very short ban duration effectively disables the rogue-fork ban because a misbehaving "+
+				"peer is unbanned almost immediately after each strike window; recommended value: 24h",
+			c.P2P.BadBlockBanDuration, safeBanDuration,
 		))
 	}
 	return ws
@@ -582,6 +638,11 @@ func (c *Config) Validate() error {
 			c.P2P.KeepaliveInterval, keepaliveMin, keepaliveMax,
 		)
 	}
+	if c.Maintenance.RestartAt != "" {
+		if _, _, err := ParseRestartAt(c.Maintenance.RestartAt); err != nil {
+			return fmt.Errorf("maintenance.restart_at %w", err)
+		}
+	}
 	if c.Pprof.Enabled {
 		addr := c.Pprof.ListenAddr
 		if addr == "" {
@@ -610,8 +671,8 @@ func (c *Config) Validate() error {
 // value of 300) or because the operator explicitly wrote
 // mempool_evict_interval_sec: 0 to request the default behaviour.
 func ResolveMempoolEvictInterval(sec uint64) time.Duration {
-        if sec == 0 {
-                return 5 * time.Minute
-        }
-        return time.Duration(sec) * time.Second
+	if sec == 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(sec) * time.Second
 }

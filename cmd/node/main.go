@@ -1034,12 +1034,22 @@ func run() error {
                 )
                 // Feed the persisted timing into the API server so /api/v1/status
                 // returns a non-zero snapshot_save_duration_ms on the very first
-                // request after restart.
+                // request after restart, stamped as "from previous shutdown".
+                // Prefer the persisted TimeoutStopSec from the previous shutdown
+                // (matches the environment that produced the save duration); fall
+                // back to the current systemd reading if no persisted value exists.
                 if apiSrv != nil {
-                        const dropinDir  = "/etc/systemd/system/aperod-node.service.d"
-                        const svcPath    = "/etc/systemd/system/aperod-node.service"
-                        timeoutSec, _ := readEffectiveTimeoutStopSec(dropinDir, svcPath)
-                        apiSrv.SetSnapshotTimings(
+                        const dropinDir = "/etc/systemd/system/aperod-node.service.d"
+                        const svcPath   = "/etc/systemd/system/aperod-node.service"
+                        timeoutSec, timeoutFound, timeoutLoadErr := db.LoadSnapshotTimeoutSec()
+                        if timeoutLoadErr != nil {
+                                log.Warn("startup: failed to load last_snap_timeout_sec from DB", "err", timeoutLoadErr)
+                        }
+                        if !timeoutFound || timeoutSec == 0 {
+                                // No persisted timeout — fall back to current systemd reading.
+                                timeoutSec, _ = readEffectiveTimeoutStopSec(dropinDir, svcPath)
+                        }
+                        apiSrv.SetSnapshotTimingsFromPreviousShutdown(
                                 time.Duration(savedSnapMs)*time.Millisecond,
                                 timeoutSec,
                         )
@@ -2432,6 +2442,23 @@ func run() error {
                 }
         }()
 
+        // Nightly restart scheduler: at maintenance.restart_at (UTC, HH:MM) the
+        // node sends SIGTERM to itself for a graceful RAM-reclaim restart.  Go
+        // heap fragmentation grows ~1.3 GB/h in production; a nightly SIGTERM
+        // triggers a clean snapshot-save → restart before memory pressure builds.
+        // The scheduler respects the stop channel so a concurrent external
+        // SIGTERM (operator or watchdog) simply cancels the pending self-restart.
+        if cfg.Maintenance.RestartAt != "" {
+                h, m, _ := config.ParseRestartAt(cfg.Maintenance.RestartAt) // already validated by Validate()
+                go runNightlyRestartScheduler(stop, h, m, time.Now, time.After, func() {
+                        log.Info("nightly restart: sending SIGTERM to self for scheduled RAM-reclaim restart",
+                                "restart_at", fmt.Sprintf("%02d:%02d UTC", h, m))
+                        if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+                                log.Warn("nightly restart: failed to send SIGTERM to self", "err", err)
+                        }
+                }, log)
+        }
+
         if apiSrv != nil {
                 // Wire engine-dependent options now that the consensus engine exists.
                 apiSrv.SetRegistry(engine.Registry())
@@ -3155,6 +3182,16 @@ func saveShutdownSnapshotWithPaths(
         // configured TimeoutStopSec before the next shutdown (proactive warning).
         if durErr := db.StoreSnapshotSaveDuration(snapSaveDur.Milliseconds()); durErr != nil {
                 log.Warn("shutdown: failed to persist last_snap_save_ms metadata", "err", durErr)
+        }
+        // Persist the effective TimeoutStopSec alongside the save duration so
+        // the next startup can restore the full timing context (duration + timeout)
+        // without re-reading systemd config — and mark the values as
+        // "from previous shutdown" in /api/v1/status immediately on boot.
+        {
+                timeoutSec, _ := readEffectiveTimeoutStopSec(dropinDir, servicePath)
+                if toutErr := db.StoreSnapshotTimeoutSec(timeoutSec); toutErr != nil {
+                        log.Warn("shutdown: failed to persist last_snap_timeout_sec metadata", "err", toutErr)
+                }
         }
 }
 

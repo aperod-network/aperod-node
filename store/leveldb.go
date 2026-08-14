@@ -6,6 +6,7 @@ import (
         "encoding/binary"
         "encoding/json"
         "fmt"
+        "math"
 
         "github.com/aperod/aperod/crypto"
         "github.com/syndtr/goleveldb/leveldb"
@@ -290,25 +291,26 @@ func (d *DB) IterActiveUTXOs(fn func(*StoredUTXO) error) error {
         }
         return iter.Error()
 }
+
 // IterAllUTXOKeys calls fn(txHash, outIdx) for every entry in the u/ index,
 // including those that have already been marked spent in su/.  Used by
 // --rebuild-spent-index to backfill su/ for UTXOs spent before the index
 // was introduced.
 func (d *DB) IterAllUTXOKeys(fn func(txHash crypto.Hash32, outIdx uint32)) error {
-	iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
-	defer iter.Release()
-	const suffixLen = 32 + 4 // txHash (32 bytes) + outIdx (4 bytes, big-endian)
-	for iter.Next() {
-		suffix := iter.Key()[len(prefixUTXO):]
-		if len(suffix) != suffixLen {
-			continue
-		}
-		var h crypto.Hash32
-		copy(h[:], suffix[:32])
-		outIdx := binary.BigEndian.Uint32(suffix[32:])
-		fn(h, outIdx)
-	}
-	return iter.Error()
+        iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
+        defer iter.Release()
+        const suffixLen = 32 + 4 // txHash (32 bytes) + outIdx (4 bytes, big-endian)
+        for iter.Next() {
+                suffix := iter.Key()[len(prefixUTXO):]
+                if len(suffix) != suffixLen {
+                        continue
+                }
+                var h crypto.Hash32
+                copy(h[:], suffix[:32])
+                outIdx := binary.BigEndian.Uint32(suffix[32:])
+                fn(h, outIdx)
+        }
+        return iter.Error()
 }
 
 // ─── Stake-block height index (sb/) ──────────────────────────────────────────
@@ -601,6 +603,36 @@ func (d *DB) LoadSnapshotSaveDuration() (ms int64, found bool, err error) {
 		return 0, false, fmt.Errorf("store: last_snap_save_ms metadata corrupted (%d bytes, want 8)", len(v))
 	}
 	return int64(binary.LittleEndian.Uint64(v)), true, nil
+}
+
+// StoreSnapshotTimeoutSec persists the effective systemd TimeoutStopSec (in
+// seconds) that was in effect when the last shutdown snapshot was taken.
+// Storing it alongside the save duration lets the next boot pre-populate
+// /api/v1/status with a realistic timeout-ratio even before systemd is
+// consulted on the new boot.  A value of 0 means the timeout was unknown.
+func (d *DB) StoreSnapshotTimeoutSec(sec float64) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, math.Float64bits(sec))
+	return d.PutMeta("last_snap_timeout_sec", buf)
+}
+
+// LoadSnapshotTimeoutSec returns the persisted effective TimeoutStopSec that
+// was active during the last shutdown snapshot save.
+// Returns (0, false, nil) when no value has been stored yet (e.g. first boot
+// or a pre-feature DB), or (0, true, nil) when the stored value is zero
+// (timeout was unknown at save time).
+func (d *DB) LoadSnapshotTimeoutSec() (sec float64, found bool, err error) {
+	v, err := d.GetMeta("last_snap_timeout_sec")
+	if err != nil {
+		return 0, false, err
+	}
+	if v == nil {
+		return 0, false, nil
+	}
+	if len(v) != 8 {
+		return 0, false, fmt.Errorf("store: last_snap_timeout_sec metadata corrupted (%d bytes, want 8)", len(v))
+	}
+	return math.Float64frombits(binary.LittleEndian.Uint64(v)), true, nil
 }
 
 // ─── Iteration helpers ────────────────────────────────────────────────────────

@@ -2539,11 +2539,12 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	// hitting the filesystem.  last_snapshot_saved_at is a Unix timestamp (seconds);
 	// last_snapshot_error is non-empty only when the most recent save failed.
 	s.snapshotMu.Lock()
-	snapH       := s.lastSnapshotHeight
-	snapAt      := s.lastSnapshotSavedAt
-	snapErr     := s.lastSnapshotErrStr
-	snapDurMs   := s.lastSnapshotSaveDurMs
-	snapTimeout := s.lastSnapshotTimeoutSec
+	snapH            := s.lastSnapshotHeight
+	snapAt           := s.lastSnapshotSavedAt
+	snapErr          := s.lastSnapshotErrStr
+	snapDurMs        := s.lastSnapshotSaveDurMs
+	snapTimeout      := s.lastSnapshotTimeoutSec
+	snapFromPrevious := s.snapshotTimingFromPrevious
 	s.snapshotMu.Unlock()
 	resp["last_snapshot_height"] = snapH
 	if !snapAt.IsZero() {
@@ -2561,6 +2562,12 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 			// Round to one decimal place for readability.
 			resp["snapshot_timeout_sec"] = snapTimeout
 			resp["snapshot_ratio_pct"] = math.Round(ratio*10) / 10
+		}
+		// Flag when the timing data was restored from the previous shutdown's
+		// LevelDB metadata — the current process has not yet written its own
+		// snapshot, so the values reflect the prior run.
+		if snapFromPrevious {
+			resp["snapshot_timing_from_previous_shutdown"] = true
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
