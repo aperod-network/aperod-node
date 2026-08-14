@@ -1862,9 +1862,20 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 	found := false
 
 	if utxo != nil {
-		amountCommit = utxo.AmountCommit
-		blockHeight = utxo.BlockHeight
-		found = true
+		// Cross-check the su/ spent-UTXO index even when the UTXO is present
+		// in the in-memory UTXOSet.  The in-memory set does not track spent
+		// status by (txhash, outIdx) — it only tracks spent key images.  A
+		// UTXO can therefore appear in s.utxos while su/ records it as spent
+		// (populated by --rebuild-spent-index or normal block processing),
+		// causing the endpoint to incorrectly report exists=true for a spent
+		// output.  Consistent behaviour: if su/ says spent, report not-found.
+		if s.blockStore != nil && s.blockStore.IsUTXOSpent(txHash, outIdx) {
+			// Spent — fall through to not-found handling.
+		} else {
+			amountCommit = utxo.AmountCommit
+			blockHeight = utxo.BlockHeight
+			found = true
+		}
 	} else if s.blockStore != nil {
 		// Fallback: check the persistent u/ LevelDB store.  This covers UTXOs from
 		// blocks that pre-date the current in-memory window (e.g. after a restart or
