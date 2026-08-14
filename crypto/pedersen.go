@@ -93,6 +93,11 @@ func CommitSum(inputs []Commitment, outputs []Commitment, feeCommit Commitment) 
 // Uses SHA-512("aperod-mint-blind-v1" || spendPub || amount_LE) → SetUniformBytes.
 // This lets the wallet spend a mint UTXO without storing the blind externally —
 // it can always be recomputed from the recipient's spend public key and amount.
+//
+// Deprecated: new block-reward mints (height > 0) must use DeterministicMintBlindV2,
+// which includes the block height so each reward's blind is unique.
+// DeterministicMintBlind is preserved only for height=0 admin mints and
+// backward-compatible recovery of UTXOs created before the V2 migration.
 func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error) {
         h := sha512.New()
         h.Write([]byte("aperod-mint-blind-v1"))
@@ -105,6 +110,42 @@ func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error
         s, err := edwards25519.NewScalar().SetUniformBytes(wide[:])
         if err != nil {
                 return BlindFactor{}, fmt.Errorf("deterministic mint blind: %w", err)
+        }
+        var bf BlindFactor
+        copy(bf[:], s.Bytes())
+        return bf, nil
+}
+
+// DeterministicMintBlindV2 derives a stable blinding factor for transparent
+// block-reward mint outputs.  It extends DeterministicMintBlind by including
+// the block height in the SHA-512 pre-image:
+//
+//	SHA-512("aperod-mint-blind-v2" || spendPub || amount_LE || height_LE) → SetUniformBytes
+//
+// Including height ensures each per-block reward has a unique blind even when
+// (address, amount) repeat across blocks.  This is required for all new mints
+// produced by BuildMintTx with height > 0; height=0 admin mints continue to
+// use DeterministicMintBlind for backward compatibility.
+//
+// Security note: height is on-chain public data, so the blind alone is still
+// derivable given the full UTXO descriptor.  The complete protection against
+// UTXO ownership theft in staking comes from the V3 one-time-key ownership
+// proof in ProcessStakeTx (F-049 fix).
+func DeterministicMintBlindV2(spendPub Point32, amount uint64, height uint64) (BlindFactor, error) {
+        h := sha512.New()
+        h.Write([]byte("aperod-mint-blind-v2"))
+        h.Write(spendPub[:])
+        var ab [8]byte
+        binary.LittleEndian.PutUint64(ab[:], amount)
+        h.Write(ab[:])
+        var hb [8]byte
+        binary.LittleEndian.PutUint64(hb[:], height)
+        h.Write(hb[:])
+        var wide [64]byte
+        copy(wide[:], h.Sum(nil))
+        s, err := edwards25519.NewScalar().SetUniformBytes(wide[:])
+        if err != nil {
+                return BlindFactor{}, fmt.Errorf("deterministic mint blind v2: %w", err)
         }
         var bf BlindFactor
         copy(bf[:], s.Bytes())
