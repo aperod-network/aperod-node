@@ -3,6 +3,7 @@
 package api
 
 import (
+        "context"
         "encoding/hex"
         "encoding/json"
         "fmt"
@@ -776,7 +777,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        result, err := s.dispatch(req.Method, req.Params)
+        result, err := s.dispatch(r.Context(), req.Method, req.Params)
         if err != nil {
                 s.writeError(w, req.ID, errCodeInternal, err.Error())
                 return
@@ -788,7 +789,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
         })
 }
 
-func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, error) {
+func (s *Server) dispatch(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
         switch method {
         case "apr_getNodeInfo":
                 return s.aprGetNodeInfo()
@@ -811,7 +812,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, e
         case "apr_estimateFee":
                 return s.aprEstimateFee(params)
         case "apr_walletSend":
-                return s.aprWalletSend(params)
+                return s.aprWalletSend(ctx, params)
         case "apr_walletBatchSend":
                 return s.aprWalletBatchSend(params)
         case "apr_scanUTXOs":
