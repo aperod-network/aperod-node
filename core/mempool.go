@@ -294,10 +294,11 @@ func (m *Mempool) removeStakeSenderLocked(entry *mempoolEntry) {
 }
 
 // stakeExtraPubKey extracts the validator public key from a stake Extra payload.
-// Handles both v1 (105-byte withdraw/partial-withdraw) and v2 (173-byte deposit)
-// layouts — in both cases the 32-byte pubkey occupies bytes [1:33].
+// Handles v1 (105-byte withdraw/partial-withdraw), v2 (173-byte deposit), and
+// v3 (237-byte deposit with one-time-key ownership proof — F-049 fix) layouts.
+// In all three cases the 32-byte pubkey occupies bytes [1:33].
 func stakeExtraPubKey(extra []byte) (crypto.ValidatorPubKey, error) {
-	if len(extra) != StakePayloadSize && len(extra) != StakePayloadSizeV2 {
+	if len(extra) != StakePayloadSize && len(extra) != StakePayloadSizeV2 && len(extra) != StakePayloadSizeV3 {
 		return nil, fmt.Errorf("stake extra: expected %d or %d bytes, got %d",
 			StakePayloadSize, StakePayloadSizeV2, len(extra))
 	}
