@@ -216,6 +216,60 @@ if [[ ! -f "build/aperod-node" || ! -f "build/aperod" ]]; then
   die "Сборка не удалась — проверьте вывод выше"
 fi
 
+# ── 4b. Проверка статической линковки ────────────────────
+# Если CGO_ENABLED=0 случайно убрали из Makefile, скомпилированный бинарник
+# будет динамически слинкован с glibc хоста сборки. На старых production-хостах
+# (Debian 11, Ubuntu 20.04) с glibc 2.31 он немедленно упадёт при старте.
+#
+# Проверяем ДО установки и запуска сервиса, чтобы ошибка была очевидна,
+# а не проявлялась как crash-loop уже после установки.
+#
+# Основная проверка: ldd (есть на всех glibc-дистрибутивах).
+#   Статический бинарник → "not a dynamic executable"
+#   Динамический бинарник → список зависимостей (проверка срабатывает)
+#
+# Запасная проверка (при отсутствии ldd, например musl Alpine): readelf -l
+# ищет заголовок программы PT_INTERP напрямую в ELF.
+info "Проверяем статическую линковку бинарника aperod-node…"
+
+_binary_is_dynamic=false
+
+if command -v ldd > /dev/null 2>&1; then
+  _ldd_out=$(ldd "build/aperod-node" 2>&1 || true)
+  if echo "${_ldd_out}" | grep -q "not a dynamic executable"; then
+    ok "ldd: бинарник статически слинкован ✓"
+  else
+    _binary_is_dynamic=true
+    echo "  Вывод ldd:" >&2
+    echo "${_ldd_out}" | sed 's/^/    /' >&2
+  fi
+elif command -v readelf > /dev/null 2>&1; then
+  if readelf -l "build/aperod-node" 2>/dev/null | grep -q 'INTERP'; then
+    _binary_is_dynamic=true
+    echo "  readelf: обнаружен сегмент PT_INTERP — бинарник имеет путь к динамическому линкеру" >&2
+  else
+    ok "readelf: сегмент PT_INTERP отсутствует — бинарник статически слинкован ✓"
+  fi
+else
+  warn "Ни ldd, ни readelf не найдены — пропускаем проверку статической линковки."
+  warn "Убедитесь, что в Makefile в цели build-node установлен CGO_ENABLED=0."
+fi
+
+if [[ "${_binary_is_dynamic}" == "true" ]]; then
+  echo "" >&2
+  echo -e "${RED}═══════════════════════════════════════════════════════════${NC}" >&2
+  echo -e "${RED}  Проверка статической линковки ПРОВАЛИЛАСЬ                ${NC}" >&2
+  echo -e "${RED}═══════════════════════════════════════════════════════════${NC}" >&2
+  echo "" >&2
+  echo "  build/aperod-node динамически слинкован." >&2
+  echo "  Установка бинарника ПРЕРВАНА — сервис НЕ будет запущен." >&2
+  echo "" >&2
+  echo "  Исправление: убедитесь, что в Makefile в цели build-node" >&2
+  echo "  установлен CGO_ENABLED=0, затем повторите запуск install-node.sh." >&2
+  echo "" >&2
+  die "Динамически слинкованный бинарник не может быть установлен"
+fi
+
 cp build/aperod-node /usr/local/bin/aperod-node
 cp build/aperod      /usr/local/bin/aperod
 chmod +x /usr/local/bin/aperod-node /usr/local/bin/aperod
@@ -370,6 +424,38 @@ else
   echo -e "║    sudo bash install-node.sh --primary-ip <PRIMARY_IP>   ║"
   echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
   echo
+
+  # ── Safe-mode guard ──────────────────────────────────────────────────────────
+  # Set consensus.non_validator: true so the node cannot produce blocks (and
+  # therefore cannot mine an incompatible genesis) even if the operator ignores
+  # the warning above and manually enables the systemd unit before running
+  # aperod-join.sh.  aperod-join.sh unsets this field after the correct
+  # chain.db is in place and the bootnode has been configured.
+  # The field must be nested under the `consensus:` key to match the Go struct
+  # (config.ConsensusConfig.NonValidator yaml:"non_validator").
+  info "Устанавливаем consensus.non_validator: true (режим реле до выполнения aperod-join.sh)…"
+  if [[ -x "${SCRIPT_DIR}/node-config.sh" ]]; then
+    APEROD_CONFIG="${CONFIG_DIR}/node.yaml" bash "${SCRIPT_DIR}/node-config.sh" \
+      set-field consensus.non_validator true \
+      || die "Не удалось установить consensus.non_validator: true в ${CONFIG_DIR}/node.yaml"
+  else
+    # Fallback: inline Python — mirrors node-config.sh set-field with dotted path.
+    python3 - "${CONFIG_DIR}/node.yaml" <<'PY'
+import sys, yaml, os
+cfg_path = sys.argv[1]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+if cfg.get('consensus') is None:
+    cfg['consensus'] = {}
+cfg['consensus']['non_validator'] = True
+tmp = cfg_path + '.tmp'
+with open(tmp, 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+os.replace(tmp, cfg_path)
+print('[OK]   consensus.non_validator: true written to', cfg_path)
+PY
+  fi
+  ok "consensus.non_validator: true — нода не будет производить блоки до aperod-join.sh"
 fi
 
 # ── 9. Firewall ────────────────────────────────────────────
