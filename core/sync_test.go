@@ -1251,61 +1251,89 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	wantFinalTip := validatorChain.Tip().Hash()
 	t.Logf("✓ phase 5: mined liveBlocks[1:]; validatorChain height=%d", validatorChain.Height())
 
-	// ── Phase 6: broadcast liveRest, observe mid-stream, Stop ────────────────
-	// The broadcast goroutine iterates liveRest calling BroadcastBlock (which
-	// calls p.Send synchronously).  The proxy reads+drops every chunk from the
-	// server socket so the writes complete normally.
+	// ── Phase 6: broadcast liveRest with deterministic Stop-overlap proof ────
 	//
-	// Sequencing:
-	//   a. Goroutine starts (calls BroadcastBlock for liveRest in a loop).
-	//   b. Main goroutine waits for interceptedFirst — the proxy signals this only
-	//      after reading ≥1 chunk from the server socket while in intercept mode.
-	//      This PROVES at least one BroadcastBlock send reached the proxy before Stop.
-	//   c. Assert interceptedFirst was received (hard proof of observation).
-	//   d. Call Stop (concurrent with the goroutine's remaining liveRest iterations).
-	//   e. Drain broadcastDone; close proxyClient so relay sees EOF.
-	broadcastDone := make(chan struct{})
+	// Sequencing (all steps guaranteed by explicit channel synchronization):
+	//
+	//  a. Goroutine broadcasts liveRest[0], closes firstSent, then blocks on
+	//     proceedCh.  The proxy reads+drops the liveRest[0] bytes (intercept mode)
+	//     and closes interceptedFirst — hard proof a block send reached the proxy.
+	//  b. Main goroutine waits for firstSent (liveRest[0] sent) then for
+	//     interceptedFirst (proxy observed it).  Both are required before Stop.
+	//  c. Main goroutine calls Stop (closes all peer conns), then closes proceedCh.
+	//  d. Goroutine unblocks and broadcasts liveRest[1:].  Because Stop already
+	//     closed the peer connections, every p.Send writes to a closed socket and
+	//     returns an error.  postStopBroadcasts is incremented for each call.
+	//  e. After broadcastDone is drained, the test asserts postStopBroadcasts > 0
+	//     — explicit proof that BroadcastBlock was called after validator shutdown.
+	//
+	// The relay's connection stays open throughout (proxy defers client.Close()
+	// until its goroutine exits, which happens when Stop closes the server conn).
+	// proxyClient.Close() is called explicitly to ensure EOF reaches the relay
+	// promptly regardless of proxy goroutine scheduling.
+	firstSent        := make(chan struct{})
+	proceedCh        := make(chan struct{})
+	broadcastDone    := make(chan struct{})
+	postStopBroadcasts := 0 // written only in goroutine, read after <-broadcastDone
+
 	go func() {
 		defer close(broadcastDone)
-		for _, b := range liveRest {
+		hostValidator.BroadcastBlock(liveRest[0]) // send before Stop
+		close(firstSent)                          // signal: liveRest[0] sent
+		<-proceedCh                               // wait for Stop + proceed signal
+		// All calls below happen AFTER Stop() has returned.
+		// The validator's peer connections are closed; p.Send writes to a closed
+		// socket and returns an error immediately.
+		for _, b := range liveRest[1:] {
 			hostValidator.BroadcastBlock(b)
+			postStopBroadcasts++
 		}
 	}()
 
-	// Wait for the proxy to confirm it observed block-send bytes mid-stream.
-	// This is the key assertion that proves BroadcastBlock was active (not just
-	// scheduled) before Stop is called.
+	// a→b: wait for liveRest[0] to be sent by the goroutine.
+	<-firstSent
+
+	// b: wait for proxy to confirm it read liveRest[0] bytes (hard observation proof).
 	select {
 	case <-interceptedFirst:
-		t.Logf("✓ phase 6: proxy observed BroadcastBlock send bytes mid-stream")
+		t.Logf("✓ phase 6: proxy observed liveRest[0] send bytes in intercept mode")
 	case <-time.After(3 * time.Second):
+		close(proceedCh)
 		hostValidator.Stop()
 		<-broadcastDone
 		proxyClient.Close()
-		t.Fatalf("phase 6: proxy did not observe block bytes within 3 s — " +
-			"BroadcastBlock send did not reach the proxy as expected")
+		t.Fatalf("phase 6: proxy did not observe liveRest[0] within 3 s — " +
+			"block bytes did not reach the proxy server socket")
 	}
 
-	// Stop is now called while the broadcast goroutine may still be iterating
-	// over liveRest[1:].  p.Send calls that race with Stop's conn.Close() inside
-	// the peer loop will fail with a write-to-closed-conn error — the intended
-	// mid-stream validator-restart condition.
+	// c: Stop closes all peer connections, then unblock the goroutine.
+	// liveRest[1:] broadcasts (step d) happen after Stop returns.
 	hostValidator.Stop()
-	<-broadcastDone // drain; all BroadcastBlock calls have returned
+	close(proceedCh)
 
-	// Close the proxy's relay-side connection so the relay sees EOF immediately
-	// (the proxy goroutine also defers this on server close, but being explicit
-	// avoids a race between that defer and the PeerHeight poll below).
+	<-broadcastDone // e: drain; all BroadcastBlock calls have returned
+
+	// e (assertion): goroutine MUST have called BroadcastBlock after Stop.
+	// postStopBroadcasts == len(liveRest[1:]) since the goroutine iterates all.
+	if postStopBroadcasts == 0 {
+		t.Errorf("phase 6: no BroadcastBlock calls occurred after Stop — "+
+			"expected %d post-shutdown sends for liveRest[1:]", len(liveRest)-1)
+	}
+	t.Logf("✓ phase 6: %d BroadcastBlock call(s) after Stop (all wrote to closed connections)",
+		postStopBroadcasts)
+
+	// Close the proxy's relay-side connection: relay sees EOF.
+	// The proxy goroutine also defers client.Close() when it reads server EOF,
+	// but being explicit here avoids a race with the PeerHeight poll below.
 	proxyClient.Close()
 
-	// Proxy was in intercept mode throughout phase 6: zero liveRest bytes
-	// reached the relay client.  This is deterministic — not a scheduler race.
+	// Proxy was in intercept mode for all of liveRest: zero bytes reached relay.
 	if relayChain.Height() >= wantFinalHeight {
 		t.Errorf("phase 6: relay height = %d >= wantFinalHeight = %d — "+
 			"proxy did not intercept liveRest as expected",
 			relayChain.Height(), wantFinalHeight)
 	}
-	t.Logf("✓ phase 6: validator stopped mid-broadcast; relay height=%d (want<%d)",
+	t.Logf("✓ phase 6: validator stopped mid-stream; relay height=%d (want<%d)",
 		relayChain.Height(), wantFinalHeight)
 
 	// ── Phase 7: relay detects disconnect ─────────────────────────────────────
