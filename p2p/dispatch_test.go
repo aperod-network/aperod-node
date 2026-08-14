@@ -287,9 +287,8 @@ func TestHandshake_BadPong(t *testing.T) {
 	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	// Read ping
-	p2p.ReadMsg(conn)
-	// Send wrong type (MsgGetPeers instead of pong) → host should drop conn
+	// Asymmetric handshake: dialer must send MsgPing first.
+	// Send wrong type (MsgGetPeers instead of MsgPing) → host should drop conn.
 	p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{})
 	time.Sleep(100 * time.Millisecond)
 }
