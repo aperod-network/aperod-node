@@ -60,6 +60,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.restNetworkP2PConfig))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
+        s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
         s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
         s.mux.HandleFunc("/api/v1/status", s.restStatus)
         // Node-join workflow: export endpoints consumed by aperod-join.sh.
@@ -1784,6 +1785,50 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 // as ring decoys.  count defaults to 120 (8 inputs × 15 decoys) and is capped
 // at 512 to prevent abuse.  The response is safe to cache briefly — callers
 // should request fresh decoys for every transaction.
+// restKeyImageIsSpent checks whether a key image has been recorded as spent
+// in the ki/ LevelDB index.  This is the authoritative Monero-style spent check:
+// a key image present in ki/ belongs to a confirmed ring-sig transaction and its
+// source UTXO can never be spent again.
+//
+// GET /api/v1/keyimage/{ki_hex}/is-spent
+// Response: {"is_spent": true|false}
+func (s *Server) restKeyImageIsSpent(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        // Path: /api/v1/keyimage/{ki_hex}/is-spent
+        // pathSuffix strips the "/api/v1/keyimage/" prefix; the remainder is
+        // "{ki_hex}/is-spent" or just "{ki_hex}".
+        tail := pathSuffix("/api/v1/keyimage/", r.URL.Path)
+        parts := strings.SplitN(tail, "/", 2)
+        kiHex := parts[0]
+        if len(kiHex) != 64 {
+                writeJSONError(w, http.StatusBadRequest,
+                        "key image must be 64 hex characters (32 bytes)")
+                return
+        }
+        b, err := hex.DecodeString(kiHex)
+        if err != nil || len(b) != 32 {
+                writeJSONError(w, http.StatusBadRequest, "invalid key image hex: "+err.Error())
+                return
+        }
+        var ki crypto.KeyImage
+        copy(ki[:], b)
+
+        if s.blockStore == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "block store not available")
+                return
+        }
+        spent, err := s.blockStore.IsKeyImageSpent(ki)
+        if err != nil {
+                writeJSONError(w, http.StatusInternalServerError,
+                        "key image lookup: "+err.Error())
+                return
+        }
+        writeJSON(w, http.StatusOK, map[string]bool{"is_spent": spent})
+}
+
 func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodGet {
                 writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
