@@ -474,8 +474,18 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
                         return nil, fmt.Errorf("commit recompute for %s[%d]: %w",
                                 u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, preErr)
                 } else if preCommit != out.AmountCommit {
-                        return nil, fmt.Errorf("commitment mismatch for tx %s[%d]: stored blind/amount does not reproduce on-chain commitment — re-mint required",
-                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+                        s.log.Error("DIAG: pre-flight commitment mismatch",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                "out_idx", u.OutIdx,
+                                "amount_napr", u.AmountNAPR,
+                                "recomputed_commit", fmt.Sprintf("%x", preCommit[:8]),
+                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                        )
+                        return nil, fmt.Errorf("commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — stored blind/amount does not reproduce on-chain commitment — re-mint required",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
+                                u.AmountNAPR,
+                                preCommit[:8],
+                                out.AmountCommit[:8])
                 }
 
                 // hsScalar is set above for stealth outputs (ECDH shared secret) and for
