@@ -2,6 +2,8 @@ package p2p
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -375,4 +377,64 @@ func TestPeerMgr_ConcurrentBanAndLift(t *testing.T) {
 		t.Errorf("in-memory ban (%v) disagrees with persisted state (%v) after concurrent ban/lift",
 			inMemory, inFile)
 	}
+}
+
+// TestHost_BanPersistsAcrossRestart verifies that a peer banned before a node
+// restart is still blocked immediately after restart — captured at the exact
+// pre-Listen point inside Start(), before any inbound connection can arrive.
+//
+// This is the ban-file analogue of the whitelist ordering test added in task
+// 1589.  SetListenFunc fires after LoadBansFromFile but before net.Listen, so
+// the hook provides the earliest possible deterministic snapshot of the ban
+// state: if a future refactor reorders Start() so that the listener opens
+// before the ban file is loaded, this test fails immediately.
+//
+// The listenFunc returns a sentinel error so Start() aborts cleanly without
+// spawning background goroutines that would outlive the test.
+func TestHost_BanPersistsAcrossRestart(t *testing.T) {
+	banFile := filepath.Join(t.TempDir(), "bans.json")
+
+	// ── Step 1: ban a peer (pre-restart) ─────────────────────────────────────
+	// Use the PeerMgr directly to write a ban entry to banFile without starting
+	// a full Host — this mirrors exactly what BanPeer does via h.mgr.Ban().
+	pm := newPeerMgrWithFile(banFile)
+	pm.Ban("1.2.3.4", "rogue fork", time.Hour)
+	if !pm.IsBanned("1.2.3.4") {
+		t.Fatal("pre-condition: Ban() did not register the ban in-memory")
+	}
+
+	// ── Step 2: simulate restart — new Host with the same BanFile ────────────
+	h := NewHost(Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		BanFile:    banFile,
+	}, wlIntegHandler{}, wlTestLogger())
+
+	// SetListenFunc installs a factory that fires at the exact point where
+	// Start() would call net.Listen — after LoadBansFromFile, before the TCP
+	// listener opens.  Capturing CanDial here is the earliest moment an
+	// inbound connection could be checked against the ban list.
+	var bannedAtListen bool
+	SetListenFunc(h, func(_, _ string) (net.Listener, error) {
+		// CanDial returns false when the address is actively banned.
+		// Use a port that differs from any listening port so IsBanned(bare-IP)
+		// is exercised via the canonical bare-IP lookup path.
+		bannedAtListen = !HostCanDial(h, "1.2.3.4:30303")
+		// Return a sentinel error so Start() aborts cleanly.
+		return nil, errors.New("test sentinel: listener not needed")
+	})
+
+	// Start() sequence: LoadBansFromFile → listenFunc (sentinel) → return err.
+	// We only care about the side-effect (bannedAtListen), not the error itself.
+	if err := h.Start(); err == nil {
+		h.Stop()
+		t.Fatal("Start() succeeded unexpectedly; listenFunc sentinel error was not returned")
+	}
+
+	if !bannedAtListen {
+		t.Error("banned peer was NOT blocked at the pre-Listen point after restart — " +
+			"LoadBansFromFile may not be running before the listener opens, or " +
+			"CanDial is not reflecting the loaded ban correctly")
+	}
+	t.Logf("✓ banned peer correctly blocked at pre-Listen point after restart (CanDial=false)")
 }
