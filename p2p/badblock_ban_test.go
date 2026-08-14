@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2397,4 +2398,241 @@ func TestBadBlockStrike_AccumulatesWithinTTL(t *testing.T) {
 	}
 	t.Logf("within-TTL accumulation verified: %d strikes within %v window triggered ban on %s",
 		threshold, p2p.BadBlockStrikeTTL, peerIP)
+}
+
+// ─── Tests: ban sidecar atomicity ─────────────────────────────────────────────
+
+// banSidecarEntry is a local mirror of the on-disk ban JSON shape used by the
+// ban-sidecar atomicity tests.  It matches the persistedBan struct in peermgr.go
+// and is intentionally kept minimal — we only need to verify the file is a valid,
+// non-null JSON array with an "addr" field per entry.
+type banSidecarEntry struct {
+	Addr   string    `json:"addr"`
+	Reason string    `json:"reason"`
+	Until  time.Time `json:"until"`
+}
+
+// readBanSidecar reads path and returns the decoded ban array plus a nil error
+// on success.  The call fails if the file cannot be read, if the JSON is
+// malformed, or if the top-level value is JSON null (which indicates a
+// truncated or partially-written file).
+func readBanSidecar(path string) ([]banSidecarEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+	// Use json.Unmarshal to a pointer so we can distinguish null from [].
+	var entries []banSidecarEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("JSON decode %q (%d bytes): %w\ncontent: %s",
+			path, len(data), err, data)
+	}
+	// json.Unmarshal leaves entries == nil for JSON null, but a valid empty
+	// array produces a non-nil slice of length 0.  Null indicates a
+	// truncated write — treat it as corrupt.
+	if entries == nil {
+		return nil, fmt.Errorf("ban sidecar %q contains JSON null — not a valid ban array (likely truncated write)", path)
+	}
+	return entries, nil
+}
+
+// TestBanSidecar_AlwaysValidJSONAfterEachBan verifies that the ban sidecar file
+// is always a well-formed, non-null JSON array after every individual Ban call.
+//
+// A regression from the atomic tmp+rename pattern to a direct overwrite would
+// expose a window during which the file is either empty or partially written.
+// Any read during that window must NOT return a corrupt or null document.
+//
+// Strategy: call Ban() N times in sequence and read the sidecar immediately
+// after each call.  The file must decode successfully as a JSON array on every
+// iteration.
+func TestBanSidecar_AlwaysValidJSONAfterEachBan(t *testing.T) {
+	dir := t.TempDir()
+	banFile := filepath.Join(dir, "bans.json")
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "test-ban-sidecar-atomic",
+		UserAgent:  "aperod/test",
+		BanFile:    banFile,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	const numBans = 20
+	for i := 0; i < numBans; i++ {
+		addr := fmt.Sprintf("10.0.0.%d", i+1)
+		p2p.HostBanPeer(h, addr, "sidecar atomicity test", time.Hour)
+
+		entries, err := readBanSidecar(banFile)
+		if err != nil {
+			t.Fatalf("iteration %d: sidecar is not a valid JSON array immediately after Ban(%q): %v",
+				i+1, addr, err)
+		}
+		// The sidecar must contain at least the bans added so far.
+		if len(entries) < i+1 {
+			t.Errorf("iteration %d: sidecar has %d entries, want ≥ %d",
+				i+1, len(entries), i+1)
+		}
+		t.Logf("iteration %d: sidecar valid — %d entries", i+1, len(entries))
+	}
+}
+
+// TestBanSidecar_ConcurrentWritesNeverPartiallyVisible exercises the
+// tmp+rename atomicity guarantee under concurrent load.
+//
+// A reader goroutine polls the sidecar file continuously for the duration of
+// the test, decoding the JSON on every read.  Concurrently, multiple writer
+// goroutines call Ban() in a tight loop.  The reader must NEVER observe a
+// partial write, a truncated file, or a JSON null value — every read must
+// return a valid, non-null JSON array.
+//
+// Run the suite with -race: the Go race detector will surface any unsynchronised
+// access that is not guarded by the persistMu / pm.mu pair.
+func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
+	dir := t.TempDir()
+	banFile := filepath.Join(dir, "bans.json")
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "test-ban-sidecar-concurrent",
+		UserAgent:  "aperod/test",
+		BanFile:    banFile,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	// Seed the first ban so the file exists before the reader starts.
+	p2p.HostBanPeer(h, "10.255.0.0", "seed ban", time.Hour)
+
+	const (
+		writerCount    = 8
+		writesPerWorker = 25
+		testDuration   = 300 * time.Millisecond
+	)
+
+	var (
+		// readerErrors counts how many reads returned a corrupt or null sidecar.
+		readerErrors atomic.Int64
+		// readerReads counts successful valid reads.
+		readerReads atomic.Int64
+		// done signals all goroutines to stop.
+		stop = make(chan struct{})
+	)
+
+	// ── Reader goroutine: polls the file until stop is closed ────────────────
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, err := readBanSidecar(banFile)
+			if err != nil {
+				// Count but don't t.Fatal here — we're on a non-test goroutine.
+				// The error is reported after all goroutines stop.
+				readerErrors.Add(1)
+			} else {
+				readerReads.Add(1)
+			}
+			// Tight polling: no sleep, to maximise the chance of catching a
+			// partial write between the truncate and re-write steps that a
+			// non-atomic implementation would expose.
+			runtime_gosched()
+		}
+	}()
+
+	// ── Writer goroutines: each adds distinct IPs in a tight loop ────────────
+	var wg sync.WaitGroup
+	for w := 0; w < writerCount; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				addr := fmt.Sprintf("192.168.%d.%d", workerID, i+1)
+				p2p.HostBanPeer(h, addr, "concurrent atomicity test", time.Hour)
+			}
+		}(w)
+	}
+
+	// Let writers run; the reader polls concurrently.
+	wg.Wait()
+	// Keep reading for a short window after writes finish to catch any
+	// lingering partially-visible state.
+	time.Sleep(testDuration)
+	close(stop)
+
+	// Give the reader goroutine time to observe the stop signal and exit.
+	time.Sleep(20 * time.Millisecond)
+
+	errors := readerErrors.Load()
+	reads := readerReads.Load()
+	t.Logf("concurrent sidecar test: %d valid reads, %d corrupt reads", reads, errors)
+
+	if errors > 0 {
+		t.Errorf("ban sidecar was read in a corrupt or partially-written state %d time(s) "+
+			"out of %d total reads — atomic write guarantee violated", errors, reads+errors)
+	}
+	if reads == 0 {
+		t.Error("reader goroutine never completed a successful read — check test setup")
+	}
+
+	// Final sanity: sidecar must be valid after all writes complete.
+	entries, err := readBanSidecar(banFile)
+	if err != nil {
+		t.Fatalf("final sidecar read failed: %v", err)
+	}
+	t.Logf("final sidecar: %d entries", len(entries))
+}
+
+// runtime_gosched is a thin wrapper around runtime.Gosched so the reader
+// goroutine yields to other goroutines rather than spinning the CPU to 100%.
+// Defined as a function (not a direct call) to keep the import confined to the
+// helper and avoid adding "runtime" to the top-level import block unnecessarily.
+func runtime_gosched() {
+	// Intentional tight loop without sleep: we want to maximise read frequency
+	// to stress the atomicity of the sidecar write.  A brief yield prevents
+	// the goroutine from starving the writers on single-CPU builds.
+	//
+	// We use a micro-sleep instead of runtime.Gosched() to avoid importing the
+	// runtime package just for this — time.Sleep(0) is equivalent on all
+	// platforms supported by the Go scheduler.
+	time.Sleep(0)
+}
+
+// ─── Test: null-JSON whitelist sidecar blocks startup ────────────────────────
+
+// TestWhitelistSidecar_NullJSONBlocksStartup writes a sidecar containing the
+// literal JSON value `null` and verifies that h.Start() returns a non-nil error.
+// A null sidecar is not a valid empty list; it indicates a truncated or tampered
+// file.  loadWhitelistFromFile must fail-closed rather than silently opening the
+// network to inbound connections.
+func TestWhitelistSidecar_NullJSONBlocksStartup(t *testing.T) {
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, "whitelist.json")
+	if err := os.WriteFile(sidecarPath, []byte("null"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-null-whitelist",
+		UserAgent:     "aperod/test",
+		WhitelistFile: sidecarPath,
+	}, &stubHandler{}, newTestLogger())
+
+	err := h.Start()
+	if err == nil {
+		h.Stop()
+		t.Fatal("Start() returned nil; expected a non-nil error for a null-JSON whitelist sidecar")
+	}
+	t.Logf("Start() correctly rejected null sidecar: %v", err)
 }
