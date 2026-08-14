@@ -951,3 +951,348 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 	t.Logf("✓ phase 5: relay converged without waiting for the stall timer: height=%d tip=%x",
 		gotHeight, gotTip[:8])
 }
+
+// TestSync_RelayNode_MidStreamValidatorRestart verifies that a relay which is
+// actively receiving live blocks from the validator recovers correctly when the
+// validator is abruptly stopped mid-broadcast (simulating a validator restart
+// while blocks are in flight).
+//
+// The test uses a gated TCP proxy between the relay and the validator to
+// deterministically control which live blocks the relay receives.  After the
+// initial catch-up sync, the proxy freezes the validator→relay direction (stops
+// forwarding data and closes the relay's connection) before a single live block
+// is broadcast.  The proxy goroutine acknowledges the freeze via a channel that
+// the test waits on, so it is guaranteed that the relay connection is severed
+// BEFORE any BroadcastBlock call writes live block bytes.  The validator then
+// broadcasts all live blocks while its send goroutines are writing to a TCP
+// socket whose remote end (the proxy relay-side) is closed — producing a
+// genuine "write to a peer that has already disconnected" condition.  Stop is
+// then called while those sends may still be outstanding.
+//
+// Flow:
+//  1. Validator pre-mines numInitial blocks; relay connects directly and
+//     performs the initial catch-up sync via the normal GetHeaders path.
+//  2. All numLive post-initial blocks are added to validatorChain so the
+//     replacement host can serve them all.
+//  3. A gated TCP proxy is started; the relay drops its direct connection and
+//     reconnects through the proxy.  The proxy forwards traffic freely until the
+//     freeze signal, allowing the reconnect handshake to complete.
+//  4. The proxy's validator→relay goroutine freezes (closes the relay-side
+//     connection) and sends frozenAck.  The test waits for frozenAck before
+//     broadcasting — this is the deterministic synchronization barrier that
+//     guarantees the relay will not receive any live block bytes.
+//  5. All numLive live blocks are broadcast.  The relay's TCP connection is
+//     already closed (EOF), so the relay immediately detects the disconnect when
+//     its dispatch goroutine next reads.  The validator's send writes go to a
+//     socket whose remote end is closed; Stop is called while those goroutines
+//     may still be executing (write-to-closed or blocked-in-kernel-buffer).
+//  6. Relay detects disconnect; relay height is asserted < wantFinalHeight
+//     (deterministic: the proxy discarded all live blocks).
+//  7. A replacement validator host starts on a new listen address sharing
+//     validatorChain.  Relay re-dials and performs a GetHeaders sync to recover
+//     all numLive missed blocks.  Relay tip matches validator tip.
+func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	const numInitial = 4 // blocks pre-mined before relay connects
+	const numLive = 6    // live blocks broadcast while the relay conn is frozen
+
+	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
+
+	// ── Build genesis + numInitial blocks on the validator chain ─────────────
+	genesis := buildBlock(t, nil, validatorPriv, validatorPub, 0)
+
+	validatorChain := core.NewChain()
+	if err := validatorChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("validator SetGenesis: %v", err)
+	}
+	prev := genesis
+	for i := 1; i <= numInitial; i++ {
+		b := buildBlock(t, prev, validatorPriv, validatorPub, uint64(i))
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock %d: %v", i, err)
+		}
+		prev = b
+	}
+
+	// ── Relay chain: starts with only genesis ────────────────────────────────
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
+	}
+
+	// ── First validator p2p host ──────────────────────────────────────────────
+	// Do NOT register with t.Cleanup — it is stopped manually in phase 5.
+	validatorHandler := &chainHandler{chain: validatorChain}
+	hostValidator := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "validator",
+		UserAgent:  "aperod/test",
+	}, validatorHandler, log)
+	hostValidator.SetHeaderProvider(validatorChain)
+	if err := hostValidator.Start(); err != nil {
+		t.Fatalf("hostValidator.Start: %v", err)
+	}
+
+	validatorAddr := hostValidator.ListenAddr()
+	if validatorAddr == "" {
+		hostValidator.Stop()
+		t.Skip("ListenAddr not available")
+	}
+
+	// ── Relay p2p host — short KeepaliveInterval so disconnect is detected fast
+	relayHandler := &chainHandler{chain: relayChain}
+	hostRelay := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "relay",
+		UserAgent:            "aperod/test",
+		KeepaliveInterval:    200 * time.Millisecond,
+		GetBlockStallTimeout: 500 * time.Millisecond,
+	}, relayHandler, log)
+	hostRelay.SetHeaderProvider(relayChain)
+	if err := hostRelay.Start(); err != nil {
+		hostValidator.Stop()
+		t.Fatalf("hostRelay.Start: %v", err)
+	}
+	t.Cleanup(hostRelay.Stop)
+
+	// ── Phase 1: initial catch-up sync via a direct connection ───────────────
+	hostRelay.DialPeer(validatorAddr)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= uint64(numInitial) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if relayChain.Height() != uint64(numInitial) {
+		hostValidator.Stop()
+		t.Fatalf("phase 1: relay height = %d, want %d — initial sync timed out",
+			relayChain.Height(), numInitial)
+	}
+	t.Logf("✓ phase 1: relay synced to height=%d", numInitial)
+
+	// ── Phase 2: set up a gated TCP proxy and reconnect the relay through it ──
+	// NOTE: the live blocks are mined in phase 4, AFTER the proxy is frozen.
+	// Mining them here would cause the relay to sync them through the proxy
+	// during phase 3's reconnect, defeating the gap guarantee.
+	//
+	// (The wantFinalHeight and liveBlocks variables are declared here for
+	// readability but populated in phase 4 after the freeze.)
+	//
+	// The proxy intercepts the validator→relay byte stream.  Its forwarding
+	// goroutine runs a tight poll loop with a 10 ms read deadline; when the
+	// freeze channel is closed, the loop exits, closes the relay-side connection
+	// (relay sees EOF), and signals frozenAck.  Because the test waits for
+	// frozenAck BEFORE calling BroadcastBlock, it is guaranteed that the relay
+	// connection is dead before any live block bytes are written — making the
+	// gap deterministic regardless of OS scheduling or kernel buffer sizes.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		hostValidator.Stop()
+		t.Fatalf("phase 3: proxy listen: %v", err)
+	}
+	t.Cleanup(func() { proxyLn.Close() })
+
+	freeze    := make(chan struct{}) // close to stop forwarding and close relay conn
+	frozenAck := make(chan struct{}) // closed by proxy when relay conn is severed
+
+	go func() {
+		client, err := proxyLn.Accept()
+		if err != nil {
+			return
+		}
+		server, err := net.Dial("tcp", validatorAddr)
+		if err != nil {
+			client.Close()
+			return
+		}
+		t.Cleanup(func() { server.Close(); client.Close() })
+
+		// relay→validator: always free (needed for GetHeaders, Ping, etc.)
+		go io.Copy(server, client) //nolint:errcheck
+
+		// validator→relay: forward until freeze, then close relay conn and ack.
+		// The 10 ms read deadline keeps the loop responsive to the freeze signal
+		// without busy-waiting.
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				// Check freeze BEFORE each read so the loop exits cleanly when
+				// there is no pending data (the common case between keepalives).
+				select {
+				case <-freeze:
+					client.Close() // relay sees EOF → dispatch exits → peer removed
+					close(frozenAck)
+					return
+				default:
+				}
+
+				server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+				n, err := server.Read(buf)
+				if n > 0 {
+					// Double-check freeze before forwarding: if freeze raced with
+					// the read above, discard and close rather than forwarding.
+					select {
+					case <-freeze:
+						client.Close()
+						close(frozenAck)
+						return
+					default:
+						client.Write(buf[:n]) //nolint:errcheck
+					}
+				}
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue // short deadline expired with no data — normal
+					}
+					// Server conn closed or real error; mirror to relay and exit.
+					client.Close()
+					select {
+					case <-frozenAck: // already acked
+					default:
+						close(frozenAck) // ack so test doesn't hang
+					}
+					return
+				}
+			}
+		}()
+	}()
+
+	proxyAddr := proxyLn.Addr().String()
+
+	// Drop the direct connection; relay reconnects through the proxy.
+	// The proxy forwards freely during the handshake, so peerHeight is
+	// updated and the relay can confirm the reconnect via PeerHeight(proxyAddr).
+	hostRelay.DropPeer(validatorAddr)
+	hostRelay.DialPeer(proxyAddr)
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := hostRelay.PeerHeight(proxyAddr); ok {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, ok := hostRelay.PeerHeight(proxyAddr); !ok {
+		hostValidator.Stop()
+		t.Fatalf("phase 3: relay did not reconnect through proxy within 5 s")
+	}
+	t.Logf("✓ phase 3: relay connected through proxy (relay height=%d)", relayChain.Height())
+
+	// ── Phase 4: freeze the proxy — deterministic synchronization barrier ─────
+	// Closing freeze causes the proxy's forwarding goroutine to exit its poll
+	// loop, close the relay-side connection, and signal frozenAck.
+	// The test MUST NOT call BroadcastBlock before receiving frozenAck;
+	// otherwise a live block could slip through before the relay conn is closed.
+	close(freeze)
+	select {
+	case <-frozenAck:
+		// Proxy has closed the relay conn; relay will see EOF on its next read.
+	case <-time.After(3 * time.Second):
+		hostValidator.Stop()
+		t.Fatalf("phase 4: proxy did not freeze within 3 s")
+	}
+	t.Logf("✓ phase 4: proxy frozen — relay connection severed before any broadcast")
+
+	// ── Phase 5: mine live blocks, broadcast them, and stop the validator ──────
+	// The live blocks are mined HERE (after the freeze), not before, so that the
+	// relay had no opportunity to sync them through the proxy.
+	// The relay's connection is already dead (EOF), so every BroadcastBlock
+	// write to the relay goes to a socket whose remote end is closed.  The
+	// validator's p.Send calls write to the TCP kernel buffer (writes succeed
+	// locally but the remote end has closed), and Stop is called while those
+	// goroutines may still be executing — providing the genuine mid-stream
+	// stop condition the test targets.
+	liveBlocks := make([]*core.Block, numLive)
+	for i := 0; i < numLive; i++ {
+		height := uint64(numInitial + 1 + i)
+		b := buildBlock(t, prev, validatorPriv, validatorPub, height)
+		if err := validatorChain.AddBlock(b); err != nil {
+			hostValidator.Stop()
+			t.Fatalf("phase 5: validator AddBlock height=%d: %v", height, err)
+		}
+		liveBlocks[i] = b
+		prev = b
+	}
+	wantFinalHeight := uint64(numInitial + numLive)
+	wantFinalTip := validatorChain.Tip().Hash()
+
+	for _, b := range liveBlocks {
+		hostValidator.BroadcastBlock(b)
+	}
+	hostValidator.Stop()
+	t.Logf("✓ phase 5: validator stopped mid-broadcast; relay height so far = %d",
+		relayChain.Height())
+
+	// The relay must not have any of the numLive live blocks: the proxy froze the
+	// validator→relay direction before the first BroadcastBlock was called.
+	if relayChain.Height() >= wantFinalHeight {
+		t.Errorf("phase 5: relay height = %d, already at wantFinalHeight = %d — "+
+			"the proxy did not intercept live blocks as expected",
+			relayChain.Height(), wantFinalHeight)
+	}
+
+	// ── Phase 6: assert the relay detects the disconnect ─────────────────────
+	// The relay-side connection was closed in phase 4; the relay's dispatch
+	// goroutine sees EOF on its next ReadMsg and removes the peer.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, connected := hostRelay.PeerHeight(proxyAddr); !connected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, connected := hostRelay.PeerHeight(proxyAddr); connected {
+		t.Error("phase 6: relay still shows proxy peer as connected after 3 s — disconnect not detected")
+	}
+	t.Logf("✓ phase 6: relay detected disconnect (relay height=%d)", relayChain.Height())
+
+	// ── Phase 7: start a replacement validator and relay re-syncs ─────────────
+	// The replacement shares validatorChain, so it can serve GetHeaders and
+	// GetBlock for all numInitial+numLive blocks.  The relay re-dials and
+	// performs a full GetHeaders sync to recover the numLive missed blocks.
+	validatorHandler2 := &chainHandler{chain: validatorChain}
+	hostValidator2 := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "validator",
+		UserAgent:  "aperod/test",
+	}, validatorHandler2, log)
+	hostValidator2.SetHeaderProvider(validatorChain)
+	if err := hostValidator2.Start(); err != nil {
+		t.Fatalf("phase 7: hostValidator2.Start: %v", err)
+	}
+	t.Cleanup(hostValidator2.Stop)
+
+	newValidatorAddr := hostValidator2.ListenAddr()
+	t.Logf("✓ phase 7: replacement validator started at %s", newValidatorAddr)
+
+	hostRelay.DialPeer(newValidatorAddr)
+
+	deadline = time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= wantFinalHeight {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	gotHeight := relayChain.Height()
+	if gotHeight != wantFinalHeight {
+		t.Errorf("phase 7: relay height = %d, want %d — re-sync after mid-stream validator restart timed out",
+			gotHeight, wantFinalHeight)
+		return
+	}
+
+	gotTip := relayChain.Tip().Hash()
+	if gotTip != wantFinalTip {
+		t.Errorf("phase 7: relay tip hash mismatch:\n  got  %x\n  want %x", gotTip[:8], wantFinalTip[:8])
+		return
+	}
+	t.Logf("✓ phase 7: relay re-synced after mid-stream validator restart: height=%d tip=%x",
+		gotHeight, gotTip[:8])
+}
