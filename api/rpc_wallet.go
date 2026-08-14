@@ -308,11 +308,13 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 // forever, or wallet balance scanning breaks for every legacy reward.
                 var zeroPub crypto.Point32
                 var mintHeightScalar crypto.Scalar32
+                var mintBlockHeight uint64
                 isMintOut := false
                 if out.TxPubKey == zeroPub {
                         if out.OneTimePub == spendPub {
                                 isMintOut = true
                                 mintHeightScalar = crypto.ScalarFromUint64(0)
+                                mintBlockHeight = 0
                         } else {
                                 h := loc.Block.Header.Height
                                 heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
@@ -321,6 +323,7 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                                         if aErr == nil && out.OneTimePub == expectedMintPub {
                                                 isMintOut = true
                                                 mintHeightScalar = crypto.ScalarFromUint64(h)
+                                                mintBlockHeight = h
                                         }
                                 }
                         }
@@ -331,33 +334,78 @@ func (s *Server) aprWalletSend(rawParams json.RawMessage) (interface{}, error) {
                 if isMintOut {
                         hsScalar = mintHeightScalar
                         if u.BlindHex == "" {
-                                blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
-                                if err != nil {
-                                        return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                                }
-                                // Diagnostic: verify recomputed commitment matches on-chain commitment.
-                                // If these differ, spendPub or amountNAPR mismatches the original mint.
-                                recomputedCommit, commitErr := crypto.Commit(u.AmountNAPR, blind)
-                                if commitErr != nil {
-                                        s.log.Error("DIAG: Commit recompute failed",
-                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                "err", commitErr)
-                                } else if recomputedCommit != out.AmountCommit {
-                                        s.log.Error("DIAG: MINT BLIND MISMATCH — recomputed commit != on-chain commit",
-                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                "out_idx", u.OutIdx,
-                                                "amount_napr", u.AmountNAPR,
-                                                "spend_pub_hex", fmt.Sprintf("%x", spendPub[:]),
-                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
-                                                "recomputed_commit", fmt.Sprintf("%x", recomputedCommit[:]),
-                                        )
+                                if mintBlockHeight > 0 {
+                                        // Block-reward mint (height > 0): try V2 blind first (DeterministicMintBlindV2
+                                        // includes height in the derivation — required for UTXOs created after the
+                                        // F-049 fix).  Fall back to V1 for UTXOs minted before the migration.
+                                        blindV2, errV2 := crypto.DeterministicMintBlindV2(spendPub, u.AmountNAPR, mintBlockHeight)
+                                        if errV2 != nil {
+                                                return nil, fmt.Errorf("deterministic mint blind v2 for %s[%d]: %w",
+                                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV2)
+                                        }
+                                        cV2, cErrV2 := crypto.Commit(u.AmountNAPR, blindV2)
+                                        if cErrV2 == nil && cV2 == out.AmountCommit {
+                                                blind = blindV2
+                                                s.log.Info("DIAG: mint blind V2 OK",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "amount_napr", u.AmountNAPR,
+                                                        "height", mintBlockHeight,
+                                                )
+                                        } else {
+                                                // V2 mismatch: this UTXO was created before the F-049 blind migration.
+                                                // Fall back to V1 for backward compatibility.
+                                                blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+                                                if errV1 != nil {
+                                                        return nil, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
+                                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
+                                                }
+                                                blind = blindV1
+                                                cV1, _ := crypto.Commit(u.AmountNAPR, blindV1)
+                                                if cV1 != out.AmountCommit {
+                                                        s.log.Error("DIAG: MINT BLIND MISMATCH — neither V1 nor V2 blind matches on-chain commit",
+                                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                                "out_idx", u.OutIdx,
+                                                                "amount_napr", u.AmountNAPR,
+                                                                "height", mintBlockHeight,
+                                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
+                                                        )
+                                                } else {
+                                                        s.log.Info("DIAG: mint blind V1 fallback OK (pre-migration UTXO)",
+                                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                                "amount_napr", u.AmountNAPR,
+                                                                "height", mintBlockHeight,
+                                                        )
+                                                }
+                                        }
                                 } else {
-                                        s.log.Info("DIAG: mint blind OK",
-                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                "amount_napr", u.AmountNAPR,
-                                                "commit_prefix", fmt.Sprintf("%x", out.AmountCommit[:8]),
-                                        )
+                                        // Legacy/admin mint (height == 0): always use V1.
+                                        blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+                                        if err != nil {
+                                                return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
+                                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                                        }
+                                        // Diagnostic: verify recomputed commitment matches on-chain commitment.
+                                        recomputedCommit, commitErr := crypto.Commit(u.AmountNAPR, blind)
+                                        if commitErr != nil {
+                                                s.log.Error("DIAG: Commit recompute failed",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "err", commitErr)
+                                        } else if recomputedCommit != out.AmountCommit {
+                                                s.log.Error("DIAG: MINT BLIND MISMATCH — recomputed commit != on-chain commit",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "out_idx", u.OutIdx,
+                                                        "amount_napr", u.AmountNAPR,
+                                                        "spend_pub_hex", fmt.Sprintf("%x", spendPub[:]),
+                                                        "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
+                                                        "recomputed_commit", fmt.Sprintf("%x", recomputedCommit[:]),
+                                                )
+                                        } else {
+                                                s.log.Info("DIAG: mint blind OK",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "amount_napr", u.AmountNAPR,
+                                                        "commit_prefix", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                                                )
+                                        }
                                 }
                         } else {
                                 blind, err = blindFactorFromHex(u.BlindHex)
