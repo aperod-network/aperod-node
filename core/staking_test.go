@@ -142,6 +142,7 @@ var _ = binary.LittleEndian
 // the stake registry and UTXO staked-set are correctly restored from committed blocks.
 // This covers the security requirement that a burned stake UTXO cannot be reused as a
 // ring decoy or re-staked after a restart, and that the validator remains registered.
+// Uses V3 payload (237 bytes) because the UTXO is a transparent/mint output (F-049 fix).
 func TestReplayBlockStakeTxs_RestartSafety(t *testing.T) {
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -166,8 +167,7 @@ func TestReplayBlockStakeTxs_RestartSafety(t *testing.T) {
 	}
 
 	// ── "First run" — original node session ──────────────────────────────────
-	// Build and apply a v2 stake deposit (simulates what ApplyBlockStakeTxs does
-	// when a block is first committed).
+	// Build and apply a v3 stake deposit (transparent/mint output — F-049 fix).
 	utxos := core.NewUTXOSet()
 	utxos.Add(&core.UTXO{TxHash: burnHash, OutputIndex: 0, OneTimePub: spendPub, AmountCommit: commit})
 
@@ -176,9 +176,14 @@ func TestReplayBlockStakeTxs_RestartSafety(t *testing.T) {
 	if sigErr != nil {
 		t.Fatalf("Sign: %v", sigErr)
 	}
-	extra, extraErr := core.EncodeStakeExtraV2(core.StakeDeposit, pub, stakeAmt, sig, burnHash, 0, blind)
+	ownershipMsg := core.StakeOwnershipSignMsg(burnHash, 0)
+	oneTimeSig, otErr := priv.Sign(ownershipMsg)
+	if otErr != nil {
+		t.Fatalf("Sign ownership: %v", otErr)
+	}
+	extra, extraErr := core.EncodeStakeExtraV3(core.StakeDeposit, pub, stakeAmt, sig, burnHash, 0, blind, oneTimeSig)
 	if extraErr != nil {
-		t.Fatalf("EncodeStakeExtraV2: %v", extraErr)
+		t.Fatalf("EncodeStakeExtraV3: %v", extraErr)
 	}
 	stakeTx := core.Transaction{Version: core.TxVersionStake, Extra: extra}
 
@@ -311,10 +316,12 @@ func TestRestartSafety_UTXORebuildAndStakeReplay(t *testing.T) {
 	mintBlock.Header.Height = 1
 	mintBlock.Txs = []core.Transaction{mintTx}
 
-	// ── Block 2: stake deposit block ─────────────────────────────────────────
+	// ── Block 2: stake deposit block (V3 — F-049 fix for transparent/mint UTXOs) ──
 	stakeMsg := core.StakeSignMsgV2(core.StakeDeposit, pub, stakeAmt, burnHash, 0)
 	stakeSig, _ := priv.Sign(stakeMsg)
-	stakeExtra, _ := core.EncodeStakeExtraV2(core.StakeDeposit, pub, stakeAmt, stakeSig, burnHash, 0, blind)
+	stakeOwnershipMsg := core.StakeOwnershipSignMsg(burnHash, 0)
+	stakeOneTimeSig, _ := priv.Sign(stakeOwnershipMsg)
+	stakeExtra, _ := core.EncodeStakeExtraV3(core.StakeDeposit, pub, stakeAmt, stakeSig, burnHash, 0, blind, stakeOneTimeSig)
 	stakeBlock := &core.Block{}
 	stakeBlock.Header.Height = 2
 	stakeBlock.Txs = []core.Transaction{
@@ -415,10 +422,12 @@ func TestReplayBlockStakeTxs_GenesisValidatorTopup(t *testing.T) {
 		burnHash[i] = 0xDD
 	}
 
-	// Build top-up tx.
+	// Build top-up tx as V3 (transparent/mint output — F-049 fix requires V3).
 	msg := core.StakeSignMsgV2(core.StakeDeposit, pub, topupAmt, burnHash, 0)
 	sig, _ := priv.Sign(msg)
-	extra, _ := core.EncodeStakeExtraV2(core.StakeDeposit, pub, topupAmt, sig, burnHash, 0, blind)
+	ownerMsg := core.StakeOwnershipSignMsg(burnHash, 0)
+	oneTimeSig, _ := priv.Sign(ownerMsg)
+	extra, _ := core.EncodeStakeExtraV3(core.StakeDeposit, pub, topupAmt, sig, burnHash, 0, blind, oneTimeSig)
 	stakeTx := core.Transaction{Version: core.TxVersionStake, Extra: extra}
 
 	// ── First run: apply top-up to registry seeded with genesis validators ──
