@@ -484,10 +484,10 @@ func TestFaucetUTXOSpendable_Phase1Decoys(t *testing.T) {
 	})
 
 	// ── 4. Recover the blind and one-time private key as the wallet would ─────
-	// DeterministicMintBlind(spendPub, amount) matches what BuildMintTx used.
-	blind, err := crypto.DeterministicMintBlind(aliceSpendPub, faucetAmount)
+	// BuildMintTx with faucetHeight > 0 uses DeterministicMintBlindV2 (F-049 fix).
+	blind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, faucetAmount, faucetHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 
 	// one_time_priv = height_scalar + spend_priv  (for mint outputs)
@@ -1223,9 +1223,10 @@ func TestPhase2Transfer_WithDecoySet_EndToEnd(t *testing.T) {
 	}
 
 	// ── 4. Recover the blind and build the OwnedUTXO ─────────────────────────
-	blind, err := crypto.DeterministicMintBlind(aliceSpendPub, faucetAmount)
+	// BuildMintTx with faucetHeight > 0 uses DeterministicMintBlindV2 (F-049 fix).
+	blind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, faucetAmount, faucetHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 	hsScalar := crypto.ScalarFromUint64(faucetHeight)
 
@@ -1479,9 +1480,10 @@ func TestPhase2Privacy_SurvivesNodeRestart(t *testing.T) {
 	}
 
 	// ── 7. Recover Alice's blind and build OwnedUTXO ────────────────────────
-	aliceBlind, err := crypto.DeterministicMintBlind(aliceSpendPub, aliceAmount)
+	// BuildMintTx with aliceHeight > 0 uses DeterministicMintBlindV2 (F-049 fix).
+	aliceBlind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, aliceAmount, aliceHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 	aliceHsScalar := crypto.ScalarFromUint64(aliceHeight)
 
