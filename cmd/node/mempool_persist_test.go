@@ -105,11 +105,11 @@ func buildProductionTx(t *testing.T) (core.Transaction, *core.UTXOSet) {
 	})
 
 	// 4. Recover Alice's blind and HsScalar so TxBuilder can sign the spend.
-	// DeterministicMintBlind(spendPub, amount) mirrors what BuildMintTx wrote.
+	// BuildMintTx uses DeterministicMintBlindV2 for height > 0 (block-reward path).
 	// For mint outputs, oneTimePriv = spendPriv + height_scalar, so HsScalar = height_scalar.
-	blind, err := crypto.DeterministicMintBlind(aliceSpendPub, faucetAmount)
+	blind, err := crypto.DeterministicMintBlindV2(aliceSpendPub, faucetAmount, faucetHeight)
 	if err != nil {
-		t.Fatalf("DeterministicMintBlind: %v", err)
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
 	}
 	hsScalar := crypto.ScalarFromUint64(faucetHeight)
 
