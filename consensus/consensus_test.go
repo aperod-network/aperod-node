@@ -572,6 +572,56 @@ func TestHandleIncomingBlock_JustOverLimit(t *testing.T) {
 	}
 }
 
+// ─── Proposer-slot enforcement (F-052) ───────────────────────────────────────
+
+// TestEngine_HandleIncomingBlock_WrongProposerRejected verifies that a block
+// signed by a known but non-scheduled validator is rejected (F-052 / Gh0stAnts
+// re-verification finding).  With two validators [pub0, pub1] and round-robin
+// scheduling, round 1 belongs to pub1.  A block at round 1 signed by pub0 must
+// be dropped and the chain must not advance past genesis.
+func TestEngine_HandleIncomingBlock_WrongProposerRejected(t *testing.T) {
+	// Two validators.  Genesis was proposed by priv0/pub0 (round 0).
+	priv0, pub0, _ := crypto.GenerateValidatorKey()
+	priv1, pub1, _ := crypto.GenerateValidatorKey()
+	_ = priv1 // round 1's legitimate proposer — not used in this test
+
+	chain := makeChainWithGenesis(t, priv0, pub0)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub0, pub1}, nil, chain)
+
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+
+	// Round 1 → scheduled proposer is pub1 (index 1 % 2).
+	// We send a block signed by pub0, which is a known validator but NOT the
+	// scheduled proposer for round 1.
+	tip := chain.Tip()
+	hdr := core.BlockHeader{
+		Height:       1,
+		Round:        1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub0, // wrong proposer for round 1
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := hdr.Sign(priv0); err != nil {
+		t.Fatal(err)
+	}
+	eng.NewBlockCh() <- &core.Block{Header: hdr}
+
+	time.Sleep(150 * time.Millisecond)
+
+	if chain.Height() != 0 {
+		t.Errorf("chain advanced to height %d — out-of-turn block must be rejected (F-052 regression)",
+			chain.Height())
+	} else {
+		t.Log("OK: block from non-scheduled proposer rejected, chain stayed at genesis")
+	}
+}
+
 // ─── Non-validator mode ───────────────────────────────────────────────────────
 
 // TestEngine_NonValidatorMode_NeverProducesBlock verifies that an engine
