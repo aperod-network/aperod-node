@@ -602,3 +602,16 @@ func (c *Config) Validate() error {
 	}
 	return nil
 }
+
+// ResolveMempoolEvictInterval converts MempoolEvictIntervalSec into a
+// time.Duration, applying the 5-minute default when the value is zero.
+// A zero value arises either because the field was omitted from node.yaml
+// (YAML leaves the field at its zero value, overriding the DefaultConfig
+// value of 300) or because the operator explicitly wrote
+// mempool_evict_interval_sec: 0 to request the default behaviour.
+func ResolveMempoolEvictInterval(sec uint64) time.Duration {
+        if sec == 0 {
+                return 5 * time.Minute
+        }
+        return time.Duration(sec) * time.Second
+}
