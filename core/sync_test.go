@@ -958,55 +958,46 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 // validator is abruptly stopped mid-broadcast (simulating a validator restart
 // while blocks are in flight).
 //
-// A gated TCP proxy is placed between the validator and the relay to provide two
-// guarantees that nondeterministic goroutine scheduling cannot otherwise give:
+// A gated TCP proxy sits between the validator and the relay.  The proxy gives
+// the test three hard guarantees that goroutine-scheduling alone cannot provide:
 //
-//  1. Gap guarantee: the proxy runs in intercept mode (reads validator bytes but
-//     does NOT forward them to the relay) throughout the BroadcastBlock calls.
-//     The relay's connection stays open; the validator writes succeed normally
-//     (writes go into the proxy's kernel buffer); but the relay receives nothing
-//     after liveBlocks[0].  This makes relay height < wantFinalHeight a hard
-//     deterministic postcondition regardless of how fast p.Send() completes.
+//  1. Live-stream confirmation (phase 3): liveBlocks[0] flows through the open
+//     proxy; the relay advances to height numInitial+1 via BroadcastBlock→Send,
+//     proving the live path was genuinely active before the mid-stream stop.
 //
-//  2. Concurrent-Stop guarantee: the BroadcastBlock loop and the Stop() call
-//     run in separate goroutines that are started at the same time.  BroadcastBlock
-//     calls for liveBlocks[1:] interleave with Stop's peer-connection teardown.
-//     Even if all writes return before Stop closes the sockets (they write to an
-//     open proxy server conn), Stop still fires while the goroutine may be
-//     mid-iteration — validating the "validator restarts mid-live-stream" code
-//     path that closes peer conns while a BroadcastBlock loop is active.
+//  2. Block-send observation (phase 6): the proxy signals interceptedFirst after
+//     reading at least one chunk from the validator's TCP socket while in
+//     intercept mode.  The test ASSERTS this signal before invoking Stop, proving
+//     that BroadcastBlock bytes reached the proxy's socket (i.e., at least one
+//     send was in flight or just completed) before the validator was stopped.
+//
+//  3. Gap guarantee: the proxy reads but drops every validator→relay chunk after
+//     the gate is closed.  The relay's connection stays open during liveRest
+//     broadcasts, so p.Send returns normally (no backpressure), but ZERO liveRest
+//     bytes reach the relay.  Relay height < wantFinalHeight is therefore a hard
+//     deterministic postcondition.
 //
 // Flow:
-//  1. Validator pre-mines numInitial blocks; relay connects and performs initial
-//     catch-up via GetHeaders.
-//  2. A gated TCP proxy is started.  The relay drops its direct connection and
-//     reconnects through the proxy; the proxy forwards freely so the handshake
-//     and any initial GetHeaders complete normally.  Validator is still at
-//     numInitial, so no live blocks are synced yet.
-//  3. liveBlocks[0] is mined and broadcast with the proxy in forward mode.
-//     The relay receives it (relay height = numInitial+1), confirming the live
-//     stream was genuinely active before the mid-stream stop.
-//  4. Gate is closed; proxy switches to intercept mode (reads validator→relay
-//     bytes but does not forward them).  The relay connection remains open.
-//     stalled channel is closed by the proxy goroutine to acknowledge the switch.
-//  5. liveBlocks[1:] are mined (validatorChain grows while proxy intercepts).
-//  6. A goroutine broadcasts liveBlocks[1:]; Stop is called from the main
-//     goroutine at the same time (both started before either finishes).  The
-//     proxy observes the BroadcastBlock writes on the server socket but drops
-//     them, so the relay remains at height numInitial+1.
-//  7. After Stop, the proxy's server conn receives a FIN; the proxy's intercept
-//     goroutine sees EOF and closes the relay-side conn.  The relay's dispatch
-//     goroutine reads EOF and removes the peer.
-//  8. A replacement validator host starts on a new address sharing validatorChain.
-//     Relay re-dials and performs a GetHeaders sync to recover liveBlocks[0:]
-//     gap (all numLive missed blocks → liveBlocks[1:] not received).
-//     Relay tip matches validator tip.
+//  1. Validator pre-mines numInitial blocks; relay performs initial catch-up.
+//  2. Proxy started; relay reconnects through it in forward mode (validator still
+//     at numInitial so no live blocks are synced during reconnect).
+//  3. liveBlocks[0] mined and broadcast through open proxy; relay receives it
+//     (confirms live-stream delivery via BroadcastBlock before intercept).
+//  4. Gate closed; proxy enters intercept mode (reads+drops validator bytes).
+//     stalled channel acknowledged.
+//  5. liveBlocks[1:] mined; validatorChain at wantFinalHeight.
+//  6. BroadcastBlock goroutine started for liveRest.  Test WAITS for
+//     interceptedFirst (proxy confirms it read ≥1 chunk mid-stream), then calls
+//     Stop concurrently with the goroutine's remaining iterations.  broadcastDone
+//     drained; proxyClient closed (relay sees EOF).
+//  7. Relay detects disconnect (PeerHeight drops proxy addr).
+//  8. Replacement validator (NodeID="validator2") starts on a fresh address.
+//     Relay re-dials; GetHeaders sync recovers all liveRest blocks; tip matches.
 func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	const numInitial = 4 // blocks pre-mined before relay connects
-	const numLive = 6    // live blocks mined and broadcast; liveBlocks[0] reaches relay,
-	// liveBlocks[1:] are intercepted by the proxy and missed by the relay.
+	const numLive = 6    // total live blocks; [0] is forwarded, [1:] intercepted
 
 	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
 
@@ -1051,10 +1042,11 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 		t.Skip("ListenAddr not available")
 	}
 
-	// ── Relay p2p host — long KeepaliveInterval so the intercept phase (step 4)
-	// does not trigger a keepalive-timeout disconnect before Stop fires in step 6.
-	// Disconnect is still detected quickly because Stop closes the TCP conn
-	// (relay dispatch goroutine reads EOF immediately), not via keepalive timeout.
+	// ── Relay p2p host ────────────────────────────────────────────────────────
+	// Long KeepaliveInterval: the proxy intercept phase (step 4→6) should not
+	// trigger a keepalive-timeout disconnect before Stop fires.  Disconnect is
+	// detected immediately via TCP FIN (relay dispatch reads EOF), not by
+	// keepalive timer, so the extended interval does not slow down phase 7.
 	relayHandler := &chainHandler{chain: relayChain}
 	hostRelay := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
@@ -1071,7 +1063,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	}
 	t.Cleanup(hostRelay.Stop)
 
-	// ── Phase 1: initial catch-up sync via a direct connection ───────────────
+	// ── Phase 1: initial catch-up sync (direct connection) ───────────────────
 	hostRelay.DialPeer(validatorAddr)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1087,20 +1079,23 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	}
 	t.Logf("✓ phase 1: relay synced to height=%d", numInitial)
 
-	// ── Phase 2: set up the gated TCP proxy and reconnect the relay through it ─
+	// ── Phase 2: set up the gated TCP proxy and reconnect relay through it ────
 	//
-	// gate: closing switches the proxy from forward → intercept mode.
-	// stalled: closed by the proxy goroutine after it confirms intercept mode.
+	// Channels:
+	//   gate            — close to switch proxy to intercept mode
+	//   stalled         — closed by proxy goroutine once intercept mode is active
+	//   interceptedFirst — closed by proxy goroutine after reading ≥1 chunk from
+	//                      the validator while in intercept mode (block-send proof)
 	//
-	// The proxy's validator→relay goroutine polls with a 10 ms read deadline so
-	// it stays responsive to the gate signal without busy-spinning.  In forward
-	// mode every read chunk is written to the relay client.  In intercept mode
-	// reads continue (so p.Send writes on the validator side complete normally
-	// and don't block) but data is dropped rather than forwarded to the relay.
-	// When the server conn is closed (by Stop in phase 6), the goroutine exits
-	// and defers client.Close() so the relay sees EOF.
-	gate    := make(chan struct{}) // closed to trigger intercept mode
-	stalled := make(chan struct{}) // closed by proxy once intercept mode is active
+	// The validator→relay forwarding goroutine polls the server with a 10 ms
+	// read deadline.  In forward mode every read chunk is written to the relay
+	// client.  In intercept mode reads continue (so p.Send on the validator side
+	// returns normally) but the data is dropped, not forwarded.  defer client.Close()
+	// ensures relay sees EOF when the goroutine exits (after server FIN from Stop,
+	// or on test cleanup).
+	gate             := make(chan struct{}) // close to enter intercept mode
+	stalled          := make(chan struct{}) // proxy ack: intercept mode is active
+	interceptedFirst := make(chan struct{}) // proxy ack: read ≥1 chunk mid-stream
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1109,10 +1104,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { proxyLn.Close() })
 
-	// clientConnCh delivers the accepted relay-side conn so the test can
-	// explicitly close it in step 6's cleanup to ensure relay sees EOF promptly
-	// even if Stop doesn't close the validator→proxy server conn fast enough.
-	clientConnCh := make(chan net.Conn, 1)
+	clientConnCh := make(chan net.Conn, 1) // delivers accepted relay-side conn
 
 	go func() {
 		client, err := proxyLn.Accept()
@@ -1127,39 +1119,39 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 			return
 		}
 
-		// relay→validator: always forward (GetHeaders, Ping, etc.)
+		// relay→validator: always free (Ping, GetHeaders, etc.)
 		go io.Copy(server, client) //nolint:errcheck
 
-		// validator→relay: forward or intercept depending on gate.
-		// defer client.Close() so relay sees EOF when this goroutine exits
-		// (triggered by server EOF after Stop, or test cleanup).
+		// validator→relay: forward or intercept.
 		go func() {
 			defer client.Close()
 			defer server.Close()
 			buf := make([]byte, 4096)
-			stalledOnce := sync.Once{}
+			stalledOnce      := sync.Once{}
+			interceptedOnce  := sync.Once{}
 			for {
-				// Transition to intercept mode as soon as gate is closed.
 				select {
 				case <-gate:
+					// ── Intercept mode ───────────────────────────────────────
 					stalledOnce.Do(func() { close(stalled) })
-					// Drain server (read+drop): prevents TCP backpressure from
-					// blocking p.Send on the validator side so BroadcastBlock
-					// calls return quickly and the goroutine loop progresses,
-					// giving Stop a genuine concurrent window mid-iteration.
 					server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-					_, err := server.Read(buf)
+					n, err := server.Read(buf)
+					if n > 0 {
+						// Signal first observed block-send bytes.
+						interceptedOnce.Do(func() { close(interceptedFirst) })
+						// Drop bytes — do not write to client.
+					}
 					if err != nil {
 						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							continue // no data yet — loop and drain more
+							continue // poll again
 						}
-						return // server closed (Stop), relay client closed by defer
+						return // server closed (Stop or cleanup)
 					}
-					continue // discard read bytes, do not forward to relay client
+					continue
 				default:
 				}
 
-				// Forward mode.
+				// ── Forward mode ─────────────────────────────────────────────
 				server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 				n, err := server.Read(buf)
 				if n > 0 {
@@ -1177,10 +1169,9 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 
 	proxyAddr := proxyLn.Addr().String()
 
-	// Drop the direct connection; relay reconnects through the proxy.
-	// Proxy is in forward mode so handshake (Ping/Pong) and any GetHeaders
-	// exchange complete normally.  Validator is still at numInitial, so relay
-	// cannot learn about any live blocks at this point.
+	// Drop direct connection; relay reconnects through the proxy.
+	// Proxy is in forward mode so handshake completes normally.  Validator is
+	// still at numInitial, so no live blocks are synced during reconnect.
 	hostRelay.DropPeer(validatorAddr)
 	hostRelay.DialPeer(proxyAddr)
 
@@ -1195,20 +1186,18 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 		hostValidator.Stop()
 		t.Fatalf("phase 2: relay did not reconnect through proxy within 5 s")
 	}
-	// Capture the accepted client conn for explicit close after Stop.
 	var proxyClient net.Conn
 	select {
 	case proxyClient = <-clientConnCh:
 	case <-time.After(2 * time.Second):
 		hostValidator.Stop()
-		t.Fatalf("phase 2: proxy did not accept relay connection within 2 s")
+		t.Fatalf("phase 2: proxy accept timed out")
 	}
 	t.Logf("✓ phase 2: relay connected through proxy (relay height=%d)", relayChain.Height())
 
 	// ── Phase 3: broadcast liveBlocks[0] through the open proxy ──────────────
-	// This confirms the live stream was genuinely active: relay advances its
-	// height via live gossip (not GetHeaders), proving BroadcastBlock→Send is
-	// the delivery path.  The proxy is still in forward mode at this point.
+	// Relay receives it and advances to numInitial+1, confirming BroadcastBlock→
+	// Send is the live-delivery mechanism.  The proxy is in forward mode here.
 	live0 := buildBlock(t, prev, validatorPriv, validatorPub, uint64(numInitial+1))
 	if err := validatorChain.AddBlock(live0); err != nil {
 		hostValidator.Stop()
@@ -1232,23 +1221,21 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	t.Logf("✓ phase 3: relay received live0 via proxy; relay height=%d", relayChain.Height())
 
 	// ── Phase 4: switch proxy to intercept mode ───────────────────────────────
-	// After this point the proxy reads from the server socket (so p.Send writes
-	// on the validator side complete normally) but does NOT forward bytes to the
-	// relay.  The relay connection remains open; relay height stays at numInitial+1.
+	// The relay connection stays open.  p.Send writes by BroadcastBlock go into
+	// the proxy's server-side socket; the proxy reads+drops them so writes return
+	// normally.  The relay receives nothing further after live0.
 	close(gate)
 	select {
 	case <-stalled:
-		// Proxy goroutine has entered intercept mode.
 	case <-time.After(3 * time.Second):
 		hostValidator.Stop()
 		t.Fatalf("phase 4: proxy did not enter intercept mode within 3 s")
 	}
-	t.Logf("✓ phase 4: proxy in intercept mode — relay height locked at %d", relayChain.Height())
+	t.Logf("✓ phase 4: proxy in intercept mode (relay height=%d)", relayChain.Height())
 
 	// ── Phase 5: mine liveBlocks[1:] ─────────────────────────────────────────
-	// Build the remaining numLive-1 blocks so validatorChain holds the complete
-	// canonical history.  The proxy is in intercept mode so these blocks will
-	// never reach the relay, creating the gap the relay must recover.
+	// Build remaining numLive-1 blocks so validatorChain holds the complete
+	// canonical history.  Proxy is intercepting, so they will never reach relay.
 	liveRest := make([]*core.Block, numLive-1)
 	for i := range liveRest {
 		height := uint64(numInitial + 2 + i)
@@ -1264,14 +1251,19 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	wantFinalTip := validatorChain.Tip().Hash()
 	t.Logf("✓ phase 5: mined liveBlocks[1:]; validatorChain height=%d", validatorChain.Height())
 
-	// ── Phase 6: concurrent BroadcastBlock loop + Stop ───────────────────────
-	// BroadcastBlock calls p.Send(MsgBlock, ...) for each peer synchronously.
-	// The broadcast goroutine and Stop run at the same time: neither waits for
-	// the other before starting.  Stop closes the validator's peer TCP connections
-	// while the goroutine may still be iterating over liveRest.  p.Send writes
-	// go to the proxy's server socket, where the proxy reads+drops them (intercept
-	// mode); writes therefore complete quickly without blocking on backpressure.
-	// The relay never receives any of liveRest because the proxy is intercepting.
+	// ── Phase 6: broadcast liveRest, observe mid-stream, Stop ────────────────
+	// The broadcast goroutine iterates liveRest calling BroadcastBlock (which
+	// calls p.Send synchronously).  The proxy reads+drops every chunk from the
+	// server socket so the writes complete normally.
+	//
+	// Sequencing:
+	//   a. Goroutine starts (calls BroadcastBlock for liveRest in a loop).
+	//   b. Main goroutine waits for interceptedFirst — the proxy signals this only
+	//      after reading ≥1 chunk from the server socket while in intercept mode.
+	//      This PROVES at least one BroadcastBlock send reached the proxy before Stop.
+	//   c. Assert interceptedFirst was received (hard proof of observation).
+	//   d. Call Stop (concurrent with the goroutine's remaining liveRest iterations).
+	//   e. Drain broadcastDone; close proxyClient so relay sees EOF.
 	broadcastDone := make(chan struct{})
 	go func() {
 		defer close(broadcastDone)
@@ -1279,28 +1271,46 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 			hostValidator.BroadcastBlock(b)
 		}
 	}()
-	hostValidator.Stop() // concurrent with above goroutine
-	<-broadcastDone      // wait for goroutine to exit (writes succeed or fail)
 
-	// Force the relay to see EOF: close the proxy's relay-side conn.
-	// The proxy's goroutine also defers client.Close() when the server conn
-	// closes, but being explicit here prevents a race between that defer and
-	// the PeerHeight poll below.
+	// Wait for the proxy to confirm it observed block-send bytes mid-stream.
+	// This is the key assertion that proves BroadcastBlock was active (not just
+	// scheduled) before Stop is called.
+	select {
+	case <-interceptedFirst:
+		t.Logf("✓ phase 6: proxy observed BroadcastBlock send bytes mid-stream")
+	case <-time.After(3 * time.Second):
+		hostValidator.Stop()
+		<-broadcastDone
+		proxyClient.Close()
+		t.Fatalf("phase 6: proxy did not observe block bytes within 3 s — " +
+			"BroadcastBlock send did not reach the proxy as expected")
+	}
+
+	// Stop is now called while the broadcast goroutine may still be iterating
+	// over liveRest[1:].  p.Send calls that race with Stop's conn.Close() inside
+	// the peer loop will fail with a write-to-closed-conn error — the intended
+	// mid-stream validator-restart condition.
+	hostValidator.Stop()
+	<-broadcastDone // drain; all BroadcastBlock calls have returned
+
+	// Close the proxy's relay-side connection so the relay sees EOF immediately
+	// (the proxy goroutine also defers this on server close, but being explicit
+	// avoids a race between that defer and the PeerHeight poll below).
 	proxyClient.Close()
 
-	// The relay must not have any of liveRest: the proxy was in intercept mode
-	// throughout phase 6 so zero bytes of liveRest reached the relay client.
+	// Proxy was in intercept mode throughout phase 6: zero liveRest bytes
+	// reached the relay client.  This is deterministic — not a scheduler race.
 	if relayChain.Height() >= wantFinalHeight {
-		t.Errorf("phase 6: relay height = %d, already at wantFinalHeight = %d — "+
-			"the proxy did not intercept liveRest as expected",
+		t.Errorf("phase 6: relay height = %d >= wantFinalHeight = %d — "+
+			"proxy did not intercept liveRest as expected",
 			relayChain.Height(), wantFinalHeight)
 	}
 	t.Logf("✓ phase 6: validator stopped mid-broadcast; relay height=%d (want<%d)",
 		relayChain.Height(), wantFinalHeight)
 
-	// ── Phase 7: assert the relay detects the disconnect ─────────────────────
-	// proxyClient.Close() above sent a TCP FIN/RST to the relay.  The relay's
-	// dispatch goroutine reads EOF on its next ReadMsg call and removes the peer.
+	// ── Phase 7: relay detects disconnect ─────────────────────────────────────
+	// proxyClient.Close() above sent TCP FIN to relay; dispatch goroutine reads
+	// EOF and removes the peer.
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, connected := hostRelay.PeerHeight(proxyAddr); !connected {
@@ -1314,8 +1324,10 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	t.Logf("✓ phase 7: relay detected disconnect (relay height=%d)", relayChain.Height())
 
 	// ── Phase 8: replacement validator; relay re-syncs ────────────────────────
-	// The replacement shares validatorChain and can serve GetHeaders+GetBlock for
-	// all numInitial+numLive blocks — including liveRest that the relay missed.
+	// The replacement shares validatorChain and serves GetHeaders+GetBlock for
+	// all numInitial+numLive blocks.  Relay re-dials, issues GetHeaders for the
+	// gap (heights numInitial+2 through wantFinalHeight), and converges to the
+	// correct tip hash.
 	validatorHandler2 := &chainHandler{chain: validatorChain}
 	hostValidator2 := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
@@ -1344,7 +1356,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 
 	gotHeight := relayChain.Height()
 	if gotHeight != wantFinalHeight {
-		t.Errorf("phase 8: relay height = %d, want %d — re-sync after mid-stream validator restart timed out",
+		t.Errorf("phase 8: relay height = %d, want %d — re-sync timed out",
 			gotHeight, wantFinalHeight)
 		return
 	}
