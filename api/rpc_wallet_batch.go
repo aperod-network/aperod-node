@@ -146,11 +146,13 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 		// Detect transparent mint output.
 		var zeroPub crypto.Point32
 		var mintHeightScalar crypto.Scalar32
+		var mintBlockHeight uint64
 		isMintOut := false
 		if out.TxPubKey == zeroPub {
 			if out.OneTimePub == spendPub {
 				isMintOut = true
 				mintHeightScalar = crypto.ScalarFromUint64(0)
+				mintBlockHeight = 0
 			} else {
 				h := loc.Block.Header.Height
 				heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
@@ -159,6 +161,7 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 					if aErr == nil && out.OneTimePub == expectedMintPub {
 						isMintOut = true
 						mintHeightScalar = crypto.ScalarFromUint64(h)
+						mintBlockHeight = h
 					}
 				}
 			}
@@ -169,10 +172,33 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 		if isMintOut {
 			hsScalar = mintHeightScalar
 			if u.BlindHex == "" {
-				blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
-				if err != nil {
-					return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
-						u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+				if mintBlockHeight > 0 {
+					// Block-reward mint: try V2 blind (includes height), fall back to V1 for
+					// UTXOs created before the F-049 migration.
+					blindV2, errV2 := crypto.DeterministicMintBlindV2(spendPub, u.AmountNAPR, mintBlockHeight)
+					if errV2 != nil {
+						return nil, fmt.Errorf("deterministic mint blind v2 for %s[%d]: %w",
+							u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV2)
+					}
+					cV2, cErrV2 := crypto.Commit(u.AmountNAPR, blindV2)
+					if cErrV2 == nil && cV2 == out.AmountCommit {
+						blind = blindV2
+					} else {
+						// Fall back to V1 for pre-migration UTXOs.
+						blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+						if errV1 != nil {
+							return nil, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
+								u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
+						}
+						blind = blindV1
+					}
+				} else {
+					// Legacy/admin mint (height == 0): always use V1.
+					blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+					if err != nil {
+						return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
+							u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+					}
 				}
 			} else {
 				blind, err = blindFactorFromHex(u.BlindHex)
