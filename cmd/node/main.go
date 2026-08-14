@@ -564,6 +564,7 @@ func run() error {
 
         // ── 1. Load configuration ─────────────────────────────────────────────────
         cfgPath := "config/testnet.yaml"
+        configFlagExplicit := false
         resetP2PIdentity := false
         validateOnly := false
         strictMemLimit := false
@@ -577,6 +578,7 @@ func run() error {
                 case "--config":
                         if i+2 < len(os.Args) {
                                 cfgPath = os.Args[i+2]
+                                configFlagExplicit = true
                         }
                 case "--reset-p2p-identity":
                         resetP2PIdentity = true
@@ -611,6 +613,33 @@ func run() error {
                 }
         }
         _ = resetP2PIdentity // used below in P2P startup
+
+        // ── repair-db / reset-tip safety guard ───────────────────────────────────
+        // When a maintenance flag (--repair-db, --reset-tip, --rebuild-key-images,
+        // --rebuild-spent-index) is active and the operator did NOT supply an
+        // explicit --config flag, the default config path (config/testnet.yaml)
+        // points to a stale local copy with a ~105 K-block data directory — NOT the
+        // 1 M+ block production chain in /etc/aperod/node.yaml.  Silently scanning
+        // the wrong copy has caused multi-hour repair attempts with no effect on the
+        // live node.
+        //
+        // Fix: if the system config exists at the canonical production path and no
+        // --config was given, print a clear warning, switch to the system config,
+        // and continue.  If the system config does NOT exist this guard is a no-op
+        // so the binary still works correctly in development / CI environments.
+        const systemConfigPath = "/etc/aperod/node.yaml"
+        maintenanceMode := repairDB || resetTip || rebuildKeyImages || rebuildSpentIndex
+        if maintenanceMode && !configFlagExplicit {
+                if _, statErr := os.Stat(systemConfigPath); statErr == nil {
+                        fmt.Fprintf(os.Stderr,
+                                "WARNING: --config was not supplied; defaulting to %s\n"+
+                                        "  The local default (%s) points to a stale development data directory\n"+
+                                        "  and is NOT the production chain.  Switching to system config automatically.\n"+
+                                        "  To silence this warning, pass --config %s explicitly.\n",
+                                systemConfigPath, cfgPath, systemConfigPath)
+                        cfgPath = systemConfigPath
+                }
+        }
 
         cfg, err := config.Load(cfgPath)
         if err != nil {
@@ -2386,10 +2415,7 @@ func run() error {
         // Mempool eviction: remove expired/old transactions every
         // MempoolEvictIntervalSec seconds (default 300 = 5 minutes) so
         // low-fee transactions do not accumulate indefinitely in RAM.
-        mempoolEvictInterval := time.Duration(cfg.MempoolEvictIntervalSec) * time.Second
-        if mempoolEvictInterval <= 0 {
-                mempoolEvictInterval = 5 * time.Minute
-        }
+        mempoolEvictInterval := config.ResolveMempoolEvictInterval(cfg.MempoolEvictIntervalSec)
         go func() {
                 t := time.NewTicker(mempoolEvictInterval)
                 defer t.Stop()
