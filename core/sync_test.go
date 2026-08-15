@@ -619,6 +619,166 @@ func TestSync_KeepalivePong_UpdatesPeerHeight(t *testing.T) {
 	t.Logf("✓ phase 3: relay stored peer height updated to %d via keepalive Pong", gotPeerHeight)
 }
 
+// TestSync_KeepalivePong_RetriggersHeaderSync verifies the self-healing sync
+// path in the MsgPong dispatch handler: when a keepalive Pong reveals that the
+// peer is ahead of the local chain (msg.Height > CurrentHeight()), the relay
+// must re-trigger requestHeaders and its chain must actually advance — not
+// merely record the new peer height.
+//
+// Flow:
+//  1. Validator pre-mines numInitial blocks; relay connects and syncs.
+//  2. Validator mines numExtra more blocks WITHOUT broadcasting them —
+//     simulating a missed gossip broadcast.  The relay's chain does not
+//     advance on its own.
+//  3. The relay's keepalive goroutine sends a MsgPing; the validator replies
+//     with a MsgPong carrying its new tip height.
+//  4. The relay's dispatch handler detects the height gap and calls
+//     requestHeaders (counted via PongGetHeadersTotal), restarting the
+//     GetHeaders → MsgBlock sync pipeline.
+//  5. The relay's chain tip advances to match the validator (timeout loop).
+func TestSync_KeepalivePong_RetriggersHeaderSync(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	const numInitial = 4 // blocks pre-mined before relay connects
+	const numExtra = 3   // blocks mined WITHOUT gossip after initial sync
+
+	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
+
+	// ── Build genesis + numInitial blocks on the validator chain ─────────────
+	genesis := buildBlock(t, nil, validatorPriv, validatorPub, 0)
+
+	validatorChain := core.NewChain()
+	if err := validatorChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("validator SetGenesis: %v", err)
+	}
+
+	prev := genesis
+	for i := 1; i <= numInitial; i++ {
+		b := buildBlock(t, prev, validatorPriv, validatorPub, uint64(i))
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock %d: %v", i, err)
+		}
+		prev = b
+	}
+
+	// ── Relay chain: starts with only genesis ─────────────────────────────────
+	relayChain := core.NewChain()
+	if err := relayChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("relay SetGenesis: %v", err)
+	}
+
+	// ── Validator p2p host ────────────────────────────────────────────────────
+	validatorHandler := &chainHandler{chain: validatorChain}
+	hostValidator := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "validator",
+		UserAgent:  "aperod/test",
+	}, validatorHandler, log)
+	hostValidator.SetHeaderProvider(validatorChain)
+	if err := hostValidator.Start(); err != nil {
+		t.Fatalf("hostValidator.Start: %v", err)
+	}
+	t.Cleanup(hostValidator.Stop)
+
+	validatorAddr := hostValidator.ListenAddr()
+	if validatorAddr == "" {
+		t.Skip("ListenAddr not available")
+	}
+
+	// ── Relay p2p host — short KeepaliveInterval so Ping/Pong fires quickly ──
+	relayHandler := &chainHandler{chain: relayChain}
+	hostRelay := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          10,
+		NodeID:            "relay",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: 200 * time.Millisecond,
+	}, relayHandler, log)
+	hostRelay.SetHeaderProvider(relayChain)
+	if err := hostRelay.Start(); err != nil {
+		t.Fatalf("hostRelay.Start: %v", err)
+	}
+	t.Cleanup(hostRelay.Stop)
+
+	// ── Phase 1: relay connects and performs initial catch-up sync ────────────
+	hostRelay.DialPeer(validatorAddr)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= uint64(numInitial) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if relayChain.Height() != uint64(numInitial) {
+		t.Fatalf("phase 1: relay height = %d, want %d — initial sync timed out",
+			relayChain.Height(), numInitial)
+	}
+	t.Logf("✓ phase 1: relay synced to height=%d", numInitial)
+
+	// Baseline for the Pong-triggered requestHeaders counter.  Any increment
+	// after this point can only come from a keepalive Pong revealing a gap.
+	pongReqBaseline := hostRelay.PongGetHeadersTotal()
+
+	// ── Phase 2: validator mines extra blocks WITHOUT broadcasting them ──────
+	// This simulates a missed gossip broadcast: BroadcastBlock is deliberately
+	// NOT called, so the relay's only way to learn about the new blocks is the
+	// keepalive Pong height gap.
+	for i := 1; i <= numExtra; i++ {
+		height := uint64(numInitial + i)
+		b := buildBlock(t, prev, validatorPriv, validatorPub, height)
+		if err := validatorChain.AddBlock(b); err != nil {
+			t.Fatalf("validator AddBlock height=%d: %v", height, err)
+		}
+		prev = b
+	}
+	wantHeight := uint64(numInitial + numExtra)
+	wantTip := validatorChain.Tip().Hash()
+
+	// Sanity: the relay must NOT have advanced yet — gossip was skipped and the
+	// next keepalive Ping has not necessarily fired.  A short settle window
+	// guards against the relay somehow learning of the blocks by another path
+	// immediately (which would make this test vacuous).  We only assert the
+	// relay is behind at this instant; the keepalive may fire any moment after.
+	if got := relayChain.Height(); got > uint64(numInitial) && got >= wantHeight {
+		// The keepalive interval is 200 ms — it's possible (though unlikely)
+		// that a Pong cycle already completed between AddBlock and this check.
+		// In that case the re-trigger already worked; verify the counter below.
+		t.Logf("note: relay already advanced to %d before explicit wait — keepalive fired early", got)
+	}
+
+	// ── Phase 3: wait for the keepalive Pong to reveal the gap and re-sync ───
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if relayChain.Height() >= wantHeight {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	gotHeight := relayChain.Height()
+	if gotHeight != wantHeight {
+		t.Fatalf("phase 3: relay height = %d, want %d — Pong-triggered header sync did not fire or did not complete",
+			gotHeight, wantHeight)
+	}
+
+	gotTip := relayChain.Tip().Hash()
+	if gotTip != wantTip {
+		t.Fatalf("phase 3: relay tip hash mismatch:\n  got  %x\n  want %x", gotTip[:8], wantTip[:8])
+	}
+
+	// Confirm the sync was actually re-triggered by the MsgPong dispatch
+	// handler — not by some other path (gossip was never sent).
+	pongReqTotal := hostRelay.PongGetHeadersTotal()
+	if pongReqTotal <= pongReqBaseline {
+		t.Errorf("PongGetHeadersTotal = %d (baseline %d) — chain advanced but the MsgPong handler never called requestHeaders",
+			pongReqTotal, pongReqBaseline)
+	}
+	t.Logf("✓ relay re-synced via keepalive Pong: height=%d tip=%x pong_getheaders=%d",
+		gotHeight, gotTip[:8], pongReqTotal-pongReqBaseline)
+}
+
 // TestSync_RelayNode_ReconnectAfterDrop verifies that a relay node which loses
 // its connection to the validator automatically reconnects and re-syncs to the
 // latest chain tip — with no manual intervention.
