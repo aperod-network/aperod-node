@@ -329,6 +329,180 @@ func TestValidate_MemoryLimitDisabled(t *testing.T) {
 	}
 }
 
+// TestWarnings_UnsafeBanValues verifies that Config.Warnings() emits a warning
+// when bad_block_ban_threshold or bad_block_height_lead exceed their safe
+// maximums (50 and 10 000 respectively), and stays silent when values are at
+// or below those limits.
+func TestWarnings_UnsafeBanValues(t *testing.T) {
+	tests := []struct {
+		name            string
+		mutate          func(cfg *Config)
+		wantBanWarn     bool // expect bad_block_ban_threshold warning
+		wantHeightWarn  bool // expect bad_block_height_lead warning
+	}{
+		// --- ban threshold ---
+		{
+			name:        "threshold at safe maximum (50) produces no warning",
+			mutate:      func(cfg *Config) { cfg.P2P.BadBlockBanThreshold = 50 },
+			wantBanWarn: false,
+		},
+		{
+			name:        "threshold below safe maximum produces no warning",
+			mutate:      func(cfg *Config) { cfg.P2P.BadBlockBanThreshold = 10 },
+			wantBanWarn: false,
+		},
+		{
+			name:        "threshold at default (5) produces no warning",
+			mutate:      func(cfg *Config) { cfg.P2P.BadBlockBanThreshold = 5 },
+			wantBanWarn: false,
+		},
+		{
+			name:        "threshold just above safe maximum (51) produces warning",
+			mutate:      func(cfg *Config) { cfg.P2P.BadBlockBanThreshold = 51 },
+			wantBanWarn: true,
+		},
+		{
+			name:        "very large threshold produces warning",
+			mutate:      func(cfg *Config) { cfg.P2P.BadBlockBanThreshold = 10_000 },
+			wantBanWarn: true,
+		},
+		// --- height lead ---
+		{
+			name:           "height lead at safe maximum (10000) produces no warning",
+			mutate:         func(cfg *Config) { cfg.P2P.BadBlockHeightLead = 10_000 },
+			wantHeightWarn: false,
+		},
+		{
+			name:           "height lead below safe maximum produces no warning",
+			mutate:         func(cfg *Config) { cfg.P2P.BadBlockHeightLead = 1_000 },
+			wantHeightWarn: false,
+		},
+		{
+			name:           "height lead just above safe maximum (10001) produces warning",
+			mutate:         func(cfg *Config) { cfg.P2P.BadBlockHeightLead = 10_001 },
+			wantHeightWarn: true,
+		},
+		{
+			name:           "very large height lead produces warning",
+			mutate:         func(cfg *Config) { cfg.P2P.BadBlockHeightLead = 1_000_000 },
+			wantHeightWarn: true,
+		},
+		// --- both fields unsafe ---
+		{
+			name: "both fields above safe limits produce two warnings",
+			mutate: func(cfg *Config) {
+				cfg.P2P.BadBlockBanThreshold = 100
+				cfg.P2P.BadBlockHeightLead = 20_000
+			},
+			wantBanWarn:    true,
+			wantHeightWarn: true,
+		},
+		// --- both fields within limits ---
+		{
+			name: "default config produces no unsafe-ban warnings",
+			mutate: func(_ *Config) {
+				// no mutations; DefaultConfig() values are within safe limits
+			},
+			wantBanWarn:    false,
+			wantHeightWarn: false,
+		},
+	}
+
+	const banSubstr    = "bad_block_ban_threshold"
+	const heightSubstr = "bad_block_height_lead"
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tc.mutate(cfg)
+
+			warnings := cfg.Warnings()
+
+			hasBanWarn := false
+			hasHeightWarn := false
+			for _, w := range warnings {
+				if contains(w, banSubstr) {
+					hasBanWarn = true
+				}
+				if contains(w, heightSubstr) {
+					hasHeightWarn = true
+				}
+			}
+
+			if tc.wantBanWarn && !hasBanWarn {
+				t.Errorf("expected a warning containing %q but got none; warnings=%v",
+					banSubstr, warnings)
+			}
+			if !tc.wantBanWarn && hasBanWarn {
+				t.Errorf("unexpected warning containing %q; warnings=%v",
+					banSubstr, warnings)
+			}
+			if tc.wantHeightWarn && !hasHeightWarn {
+				t.Errorf("expected a warning containing %q but got none; warnings=%v",
+					heightSubstr, warnings)
+			}
+			if !tc.wantHeightWarn && hasHeightWarn {
+				t.Errorf("unexpected warning containing %q; warnings=%v",
+					heightSubstr, warnings)
+			}
+		})
+	}
+}
+
+// contains reports whether substr appears anywhere in s.
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}())
+}
+
+// TestWarnings_UnsafeBanValues_MessageText verifies that the warning messages
+// include both the configured value and the safe-maximum constant so that
+// operators can understand the message without reading the source code.
+func TestWarnings_UnsafeBanValues_MessageText(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.P2P.BadBlockBanThreshold = 200
+	cfg.P2P.BadBlockHeightLead = 50_000
+
+	warnings := cfg.Warnings()
+
+	var banWarn, heightWarn string
+	for _, w := range warnings {
+		if contains(w, "bad_block_ban_threshold") {
+			banWarn = w
+		}
+		if contains(w, "bad_block_height_lead") {
+			heightWarn = w
+		}
+	}
+
+	if banWarn == "" {
+		t.Fatal("expected ban-threshold warning, got none")
+	}
+	if !contains(banWarn, "200") {
+		t.Errorf("ban-threshold warning should contain configured value 200; got: %q", banWarn)
+	}
+	if !contains(banWarn, "50") {
+		t.Errorf("ban-threshold warning should contain safe maximum 50; got: %q", banWarn)
+	}
+
+	if heightWarn == "" {
+		t.Fatal("expected height-lead warning, got none")
+	}
+	if !contains(heightWarn, "50000") {
+		t.Errorf("height-lead warning should contain configured value 50000; got: %q", heightWarn)
+	}
+	if !contains(heightWarn, "10000") {
+		t.Errorf("height-lead warning should contain safe maximum 10000; got: %q", heightWarn)
+	}
+}
+
 // TestMemoryLimitDisabledParsesFromYAML verifies the memory_limit_disabled
 // field round-trips through the YAML loader (task #1710).
 func TestMemoryLimitDisabledParsesFromYAML(t *testing.T) {
@@ -371,5 +545,58 @@ func TestMemoryLimitDisabledParsesFromYAML(t *testing.T) {
 	}
 	if cOmit.MemoryLimitDisabled {
 		t.Errorf("memory_limit_disabled default = true, want false")
+	}
+}
+
+// TestResolveMempoolEvictInterval verifies that the resolved ticker duration
+// matches the operator-configured value, falls back to 5 minutes when the
+// field is absent (YAML zero-value), and falls back to 5 minutes when the
+// operator explicitly writes mempool_evict_interval_sec: 0.
+func TestResolveMempoolEvictInterval(t *testing.T) {
+	// minimalYAML provides the fields that Load() needs to succeed without
+	// relying on defaults for required settings (network, data_dir, block_time).
+	const minimalYAML = "network: testnet\ndata_dir: ./data\nconsensus:\n  block_time: 1s\n"
+
+	tests := []struct {
+		name     string
+		extra    string        // appended to minimalYAML
+		wantDur  time.Duration
+	}{
+		{
+			name:    "explicit 60s is respected",
+			extra:   "mempool_evict_interval_sec: 60\n",
+			wantDur: 60 * time.Second,
+		},
+		{
+			name:    "absent field resolves to 300s default",
+			extra:   "",
+			wantDur: 300 * time.Second,
+		},
+		{
+			name:    "explicit 0 falls back to 300s default",
+			extra:   "mempool_evict_interval_sec: 0\n",
+			wantDur: 300 * time.Second,
+		},
+	}
+
+	dir := t.TempDir()
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(dir, tc.name+".yaml")
+			content := minimalYAML + tc.extra
+			if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(p)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got := ResolveMempoolEvictInterval(cfg.MempoolEvictIntervalSec)
+			if got != tc.wantDur {
+				t.Errorf("ResolveMempoolEvictInterval(%d) = %v, want %v",
+					cfg.MempoolEvictIntervalSec, got, tc.wantDur)
+			}
+		})
 	}
 }
