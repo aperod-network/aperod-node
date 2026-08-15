@@ -5,6 +5,8 @@ package p2p_test
 
 import (
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,8 +202,8 @@ func rawHandshake(t *testing.T, conn net.Conn) bool {
 // Returns (msgType, true) if a message arrived before deadline, or (0, false) on timeout.
 func tryReadMsg(conn net.Conn, deadline time.Duration) (p2p.MessageType, bool) {
 	type result struct {
-		mt  p2p.MessageType
-		ok  bool
+		mt p2p.MessageType
+		ok bool
 	}
 	ch := make(chan result, 1)
 	go func() {
@@ -501,3 +503,470 @@ func TestHost_NoHeaderProvider_ServesEmpty(t *testing.T) {
 		}
 	})
 }
+
+// ─── BroadcastBlock retry on transient send failure ──────────────────────────
+
+func TestHost_BroadcastBlock_TransientFailure_RetriesOnce(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            10,
+		NodeID:              "retry-host",
+		UserAgent:           "aperod/test",
+		BroadcastRetryDelay: 50 * time.Millisecond,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	addr := host.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr unavailable")
+	}
+
+	conn := rawConnect(t, addr)
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond) // ensure peer registered
+
+	// Hook: fail the FIRST MsgBlock send only, pass everything else through.
+	var mu sync.Mutex
+	blockSends := 0
+	p2p.HostSetSendHook(host, func(p *p2p.Peer, mt p2p.MessageType, payload interface{}) (int, error) {
+		if mt != p2p.MsgBlock {
+			return p.PeerSendN(mt, payload)
+		}
+		mu.Lock()
+		blockSends++
+		first := blockSends == 1
+		mu.Unlock()
+		if first {
+			return 0, &fakeTimeoutErr{} // transient: timeout before any bytes hit the wire
+		}
+		return p.PeerSendN(mt, payload)
+	})
+
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 123, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	block := &core.Block{Header: hdr}
+
+	host.BroadcastBlock(block)
+
+	// The peer must still receive the block quickly via the single retry.
+	mt, ok := tryReadMsg(conn, 2*time.Second)
+	if !ok {
+		t.Fatal("peer never received the block despite retry")
+	}
+	if mt != p2p.MsgBlock {
+		t.Fatalf("peer received %v, want MsgBlock", mt)
+	}
+	mu.Lock()
+	sends := blockSends
+	mu.Unlock()
+	if sends != 2 {
+		t.Errorf("MsgBlock send attempts = %d, want exactly 2 (initial + one retry)", sends)
+	}
+}
+
+func TestHost_BroadcastBlock_PeerEvicted_NoRetry(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            10,
+		NodeID:              "evict-host",
+		UserAgent:           "aperod/test",
+		BroadcastRetryDelay: 80 * time.Millisecond,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	addr := host.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr unavailable")
+	}
+
+	conn := rawConnect(t, addr)
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	peers := p2p.HostPeers(host)
+	if len(peers) != 1 {
+		t.Skipf("expected 1 registered peer, got %d", len(peers))
+	}
+	peerAddr := peers[0].PeerAddr()
+
+	// Hook: every MsgBlock send fails; count attempts.
+	var mu sync.Mutex
+	blockSends := 0
+	p2p.HostSetSendHook(host, func(p *p2p.Peer, mt p2p.MessageType, payload interface{}) (int, error) {
+		if mt != p2p.MsgBlock {
+			return p.PeerSendN(mt, payload)
+		}
+		mu.Lock()
+		blockSends++
+		mu.Unlock()
+		return 0, &fakeTimeoutErr{} // transient, so a retry WOULD be scheduled
+	})
+
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 124, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	block := &core.Block{Header: hdr}
+
+	host.BroadcastBlock(block)
+	// Evict the peer BEFORE the retry delay elapses.
+	host.DropPeer(peerAddr)
+
+	time.Sleep(300 * time.Millisecond) // well past the retry delay
+
+	mu.Lock()
+	sends := blockSends
+	mu.Unlock()
+	if sends != 1 {
+		t.Errorf("MsgBlock send attempts = %d, want exactly 1 (no retry after eviction)", sends)
+	}
+}
+
+func TestHost_BroadcastRetryDelay_Default(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	if got := p2p.HostBroadcastRetryDelay(host); got != 200*time.Millisecond {
+		t.Errorf("default BroadcastRetryDelay = %v, want 200ms", got)
+	}
+}
+
+// fakeTimeoutErr is a net.Error with Timeout()==true, simulating a transient
+// write timeout on a congested socket.
+type fakeTimeoutErr struct{}
+
+func (e *fakeTimeoutErr) Error() string   { return "simulated transient write timeout" }
+func (e *fakeTimeoutErr) Timeout() bool   { return true }
+func (e *fakeTimeoutErr) Temporary() bool { return true }
+
+func TestHost_BroadcastBlock_PermanentFailure_NoRetry(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            10,
+		NodeID:              "perm-host",
+		UserAgent:           "aperod/test",
+		BroadcastRetryDelay: 50 * time.Millisecond,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	addr := host.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr unavailable")
+	}
+
+	conn := rawConnect(t, addr)
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Hook: every MsgBlock send fails with a permanent closed-connection
+	// error — a retry must NOT be scheduled.
+	var mu sync.Mutex
+	blockSends := 0
+	p2p.HostSetSendHook(host, func(p *p2p.Peer, mt p2p.MessageType, payload interface{}) (int, error) {
+		if mt != p2p.MsgBlock {
+			return p.PeerSendN(mt, payload)
+		}
+		mu.Lock()
+		blockSends++
+		mu.Unlock()
+		return 0, net.ErrClosed
+	})
+
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 125, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	host.BroadcastBlock(&core.Block{Header: hdr})
+
+	time.Sleep(300 * time.Millisecond) // well past the retry delay
+
+	mu.Lock()
+	sends := blockSends
+	mu.Unlock()
+	if sends != 1 {
+		t.Errorf("MsgBlock send attempts = %d, want exactly 1 (no retry for permanent error)", sends)
+	}
+}
+
+func TestHost_BroadcastBlock_ConcurrentEviction_NoSendAfterDrop(t *testing.T) {
+	// Coordinated race test: DropPeer is fired concurrently around the retry
+	// delay.  Because retryBlockSend holds the peer-table read lock across
+	// both the registration check and the send, DropPeer (which takes the
+	// write lock) cannot complete while a retry send is in flight — so a
+	// send observed AFTER DropPeer returned is a correctness violation.
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            10,
+		NodeID:              "race-host",
+		UserAgent:           "aperod/test",
+		BroadcastRetryDelay: 30 * time.Millisecond,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	addr := host.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr unavailable")
+	}
+
+	conn := rawConnect(t, addr)
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	peers := p2p.HostPeers(host)
+	if len(peers) != 1 {
+		t.Skipf("expected 1 registered peer, got %d", len(peers))
+	}
+	peerAddr := peers[0].PeerAddr()
+
+	var dropped atomic.Bool
+	var violation atomic.Bool
+	p2p.HostSetSendHook(host, func(p *p2p.Peer, mt p2p.MessageType, payload interface{}) (int, error) {
+		if mt != p2p.MsgBlock {
+			return p.PeerSendN(mt, payload)
+		}
+		if dropped.Load() {
+			violation.Store(true)
+		}
+		return 0, &fakeTimeoutErr{} // always transient failure
+	})
+
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 126, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	host.BroadcastBlock(&core.Block{Header: hdr})
+
+	// Race the eviction against the retry timer.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		host.DropPeer(peerAddr)
+		dropped.Store(true)
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	if violation.Load() {
+		t.Error("retry send attempted AFTER DropPeer completed — eviction race")
+	}
+}
+
+// ─── Partial-write safety ─────────────────────────────────────────────────────
+
+// partialWriteConn wraps a net.Conn and, on the Nth Write call matching a
+// large frame, writes only the first cutoff bytes to the underlying conn and
+// returns a timeout error — deterministically simulating a mid-frame write
+// timeout on a congested socket.
+type partialWriteConn struct {
+	net.Conn
+	cutoff int
+	fired  bool
+}
+
+func (c *partialWriteConn) Write(b []byte) (int, error) {
+	if !c.fired && len(b) > c.cutoff {
+		c.fired = true
+		n, _ := c.Conn.Write(b[:c.cutoff])
+		return n, &fakeTimeoutErr{}
+	}
+	return c.Conn.Write(b)
+}
+
+func TestWriteMsgN_PartialWrite_ReportsBytesWritten(t *testing.T) {
+	// Transport-level check: writeMsgN must report exactly how many bytes
+	// reached the wire so callers can detect a poisoned stream.
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	// Drain the reader side so Pipe writes don't block.
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	pw := &partialWriteConn{Conn: client, cutoff: 2}
+	n, err := p2p.WriteMsgN(pw, p2p.MsgPing, p2p.PingMsg{NodeID: "x"})
+	if err == nil {
+		t.Fatal("expected simulated partial-write error")
+	}
+	if n != 2 {
+		t.Fatalf("WriteMsgN reported n=%d, want 2 (bytes actually written)", n)
+	}
+}
+
+func TestHost_BroadcastBlock_PartialWrite_ClosesConn_NoRetry(t *testing.T) {
+	// A mid-frame partial write poisons the stream framing: the host must
+	// close the connection and must NOT retry on the same stream.
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            10,
+		NodeID:              "partial-host",
+		UserAgent:           "aperod/test",
+		BroadcastRetryDelay: 40 * time.Millisecond,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	addr := host.ListenAddr()
+	if addr == "" {
+		t.Skip("ListenAddr unavailable")
+	}
+
+	conn := rawConnect(t, addr)
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if host.PeerCount() != 1 {
+		t.Skipf("expected 1 peer, got %d", host.PeerCount())
+	}
+
+	// Hook: first MsgBlock send reports a partial write (3 bytes hit the
+	// wire before the timeout); count every MsgBlock attempt.
+	var mu sync.Mutex
+	blockSends := 0
+	p2p.HostSetSendHook(host, func(p *p2p.Peer, mt p2p.MessageType, payload interface{}) (int, error) {
+		if mt != p2p.MsgBlock {
+			return p.PeerSendN(mt, payload)
+		}
+		mu.Lock()
+		blockSends++
+		mu.Unlock()
+		return 3, &fakeTimeoutErr{} // partial frame written, then timeout
+	})
+
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 127, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	host.BroadcastBlock(&core.Block{Header: hdr})
+
+	// No retry must fire, and the poisoned connection must be torn down.
+	time.Sleep(250 * time.Millisecond)
+	mu.Lock()
+	sends := blockSends
+	mu.Unlock()
+	if sends != 1 {
+		t.Errorf("MsgBlock send attempts = %d, want exactly 1 (no retry after partial write)", sends)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for host.PeerCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := host.PeerCount(); got != 0 {
+		t.Errorf("PeerCount = %d, want 0 (poisoned connection must be closed/evicted)", got)
+	}
+}
+
+func TestPeer_SendN_PartialWrite_PoisonsAtomically_ConcurrentSendRejected(t *testing.T) {
+	// Production-path regression test for the lock-release race: a partial
+	// write must poison the peer and close the connection while STILL
+	// holding the per-peer write lock, so a concurrent Send that is already
+	// blocked on that lock can never append a new frame to the broken
+	// stream.  We verify by counting underlying Write calls: exactly one.
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() { // drain reader so Pipe writes don't block
+		buf := make([]byte, 4096)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	inFirstWrite := make(chan struct{})
+	release := make(chan struct{})
+	var writeCalls atomic.Int32
+	pw := &racePartialConn{
+		Conn:         client,
+		inFirstWrite: inFirstWrite,
+		release:      release,
+		writeCalls:   &writeCalls,
+	}
+	peer := p2p.NewTestPeer(pw, "test-peer")
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := peer.PeerSendN(p2p.MsgBlock, p2p.PingMsg{NodeID: "first"})
+		firstDone <- err
+	}()
+
+	<-inFirstWrite // first send is mid-Write, holding the peer lock
+
+	secondDone := make(chan error, 1)
+	go func() {
+		// This Send blocks on the peer write lock until the first
+		// (partial, poisoning) send finishes — then must be rejected.
+		secondDone <- peer.Send(p2p.MsgBlock, p2p.PingMsg{NodeID: "second"})
+	}()
+	time.Sleep(50 * time.Millisecond) // let the second sender queue on p.mu
+	close(release)                    // first Write now returns partial+timeout
+
+	if err := <-firstDone; err == nil {
+		t.Fatal("first send must fail with the simulated partial-write error")
+	}
+	err2 := <-secondDone
+	if err2 == nil {
+		t.Fatal("second send on a poisoned stream must be rejected")
+	}
+	if !peer.PeerPoisoned() {
+		t.Error("peer must be marked poisoned after the partial write")
+	}
+	if got := writeCalls.Load(); got != 1 {
+		t.Errorf("underlying Write calls = %d, want exactly 1 (no frame after the partial one)", got)
+	}
+}
+
+// racePartialConn: the FIRST Write signals inFirstWrite, waits for release,
+// writes 2 bytes to the underlying conn and returns a timeout error.  All
+// Write calls are counted; subsequent Writes pass through (they must never
+// happen on a poisoned stream).
+type racePartialConn struct {
+	net.Conn
+	inFirstWrite chan struct{}
+	release      chan struct{}
+	writeCalls   *atomic.Int32
+	fired        bool
+}
+
+func (c *racePartialConn) Write(b []byte) (int, error) {
+	c.writeCalls.Add(1)
+	if !c.fired {
+		c.fired = true
+		close(c.inFirstWrite)
+		<-c.release
+		n, _ := c.Conn.Write(b[:2])
+		return n, &fakeTimeoutErr{}
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *racePartialConn) SetWriteDeadline(time.Time) error { return nil }
