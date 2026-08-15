@@ -2719,6 +2719,16 @@ func run() error {
                                 // can adjust it without a node restart.
                                 apiSrv.SetP2PKeepaliveGetFunc(host.GetKeepaliveInterval)
                                 apiSrv.SetP2PKeepaliveSetFunc(host.SetKeepaliveInterval)
+                                // Task #1910 — persist keepalive tuning to node.yaml
+                                // (atomic tmp+rename) so it survives a node restart,
+                                // and expose the persisted yaml value so the Admin
+                                // Panel can flag live≠yaml drift.
+                                apiSrv.SetP2PKeepalivePersistFunc(func(d time.Duration) error {
+                                        return persistKeepaliveInterval(cfgPath, d)
+                                })
+                                apiSrv.SetP2PKeepaliveYAMLFunc(func() (time.Duration, error) {
+                                        return readYAMLKeepaliveInterval(cfgPath)
+                                })
                                 // Wire static rogue-fork ban parameters so the Admin Panel
                                 // can display the values configured in node.yaml.
                                 apiSrv.SetP2PBanConfig(
