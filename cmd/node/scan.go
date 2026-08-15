@@ -151,6 +151,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			TipHeight:  p.TipHeight,
 			TipHashHex: p.TipHashHex,
 			TxTotal:    p.InitTxTotal,
+			SavedAt:    time.Now(),
 			UTXOs:      p.UTXOs.TakeSnapshot(),
 			Registry:   p.Registry.TakeSnapshot(),
 		}
@@ -489,6 +490,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 				TipHeight:  h,
 				TipHashHex: fmt.Sprintf("%x", cpHashArr[:]),
 				TxTotal:    cpTxTotal,
+				SavedAt:    time.Now(),
 				UTXOs:      p.UTXOs.TakeSnapshot(),
 				Registry:   p.Registry.TakeSnapshot(),
 			}
@@ -620,6 +622,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			TipHeight:  p.TipHeight,
 			TipHashHex: p.TipHashHex,
 			TxTotal:    txTotal,
+			SavedAt:    time.Now(),
 			UTXOs:      p.UTXOs.TakeSnapshot(),
 			Registry:   p.Registry.TakeSnapshot(),
 		}
