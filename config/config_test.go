@@ -600,3 +600,88 @@ func TestResolveMempoolEvictInterval(t *testing.T) {
 		})
 	}
 }
+
+// TestWarnings_BootnodeNotWhitelisted verifies that Warnings() emits a warning
+// when a bootnode IP is not covered by peer_whitelist and bad_block_ban_threshold
+// is non-zero, and stays silent when the bootnode IP is whitelisted or when
+// the threshold is zero (banning disabled).
+func TestWarnings_BootnodeNotWhitelisted(t *testing.T) {
+	tests := []struct {
+		name        string
+		bootnodes   []string
+		whitelist   []string
+		threshold   int
+		wantWarning bool
+	}{
+		{
+			name:        "bootnode not in whitelist — warn",
+			bootnodes:   []string{"89.169.53.128:30303"},
+			whitelist:   []string{},
+			threshold:   5,
+			wantWarning: true,
+		},
+		{
+			name:        "bootnode in whitelist by IP — no warn",
+			bootnodes:   []string{"89.169.53.128:30303"},
+			whitelist:   []string{"89.169.53.128"},
+			threshold:   5,
+			wantWarning: false,
+		},
+		{
+			name:        "bootnode covered by CIDR — no warn",
+			bootnodes:   []string{"89.169.53.128:30303"},
+			whitelist:   []string{"89.169.53.0/24"},
+			threshold:   5,
+			wantWarning: false,
+		},
+		{
+			name:        "threshold zero (banning disabled) — no warn even without whitelist",
+			bootnodes:   []string{"89.169.53.128:30303"},
+			whitelist:   []string{},
+			threshold:   0,
+			wantWarning: false,
+		},
+		{
+			name:        "no bootnodes — no warn",
+			bootnodes:   []string{},
+			whitelist:   []string{},
+			threshold:   5,
+			wantWarning: false,
+		},
+		{
+			name:        "DNS bootnode skipped — no warn",
+			bootnodes:   []string{"bootnode.aperod.com:30303"},
+			whitelist:   []string{},
+			threshold:   5,
+			wantWarning: false,
+		},
+		{
+			name:        "multiple bootnodes — warns only for uncovered IP",
+			bootnodes:   []string{"89.169.53.128:30303", "10.0.0.1:30303"},
+			whitelist:   []string{"89.169.53.128"},
+			threshold:   5,
+			wantWarning: true, // 10.0.0.1 not covered
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.P2P.Bootnodes = tc.bootnodes
+			cfg.P2P.PeerWhitelist = tc.whitelist
+			cfg.P2P.BadBlockBanThreshold = tc.threshold
+
+			warnings := cfg.Warnings()
+			hasBootnodeWarn := false
+			for _, w := range warnings {
+				if contains(w, "peer_whitelist") && contains(w, "bootnode") {
+					hasBootnodeWarn = true
+				}
+			}
+			if hasBootnodeWarn != tc.wantWarning {
+				t.Errorf("Warnings() bootnode warning = %v, want %v\nwarnings: %v",
+					hasBootnodeWarn, tc.wantWarning, warnings)
+			}
+		})
+	}
+}
