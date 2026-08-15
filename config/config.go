@@ -501,6 +501,61 @@ func (c *Config) Warnings() []string {
 			c.P2P.BadBlockBanDuration, safeBanDuration,
 		))
 	}
+	// Bootnode-whitelist cross-check: when the bad-block ban is active and
+	// bootnodes are configured, every bootnode IP should appear in peer_whitelist.
+	// If a relay node falls significantly behind the validator, gossip blocks from
+	// the validator will arrive above the relay's tip, accumulate bad-block strikes,
+	// and trigger a ban that severs the only sync path.  DNS bootnodes are skipped
+	// because they cannot be resolved at config-load time.
+	if len(c.P2P.Bootnodes) > 0 && c.P2P.BadBlockBanThreshold != 0 {
+		var wlIPs []net.IP
+		var wlNets []*net.IPNet
+		for _, entry := range c.P2P.PeerWhitelist {
+			if ip := net.ParseIP(entry); ip != nil {
+				wlIPs = append(wlIPs, ip)
+			} else if _, cidr, err := net.ParseCIDR(entry); err == nil {
+				wlNets = append(wlNets, cidr)
+			}
+		}
+		banDur := c.P2P.BadBlockBanDuration
+		if banDur == 0 {
+			banDur = 24 * time.Hour
+		}
+		for _, bn := range c.P2P.Bootnodes {
+			host, _, err := net.SplitHostPort(bn)
+			if err != nil {
+				continue
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				continue // DNS bootnode — cannot resolve at config-load time
+			}
+			covered := false
+			for _, wlIP := range wlIPs {
+				if wlIP.Equal(ip) {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				for _, cidr := range wlNets {
+					if cidr.Contains(ip) {
+						covered = true
+						break
+					}
+				}
+			}
+			if !covered {
+				ws = append(ws, fmt.Sprintf(
+					"bootnode %s is not in p2p.peer_whitelist — if this relay node falls "+
+						"behind the validator, gossip blocks from %s will accumulate "+
+						"bad-block strikes and trigger a %s ban that blocks all header-sync; "+
+						"add %q to p2p.peer_whitelist",
+					host, host, banDur, host,
+				))
+			}
+		}
+	}
 	return ws
 }
 
