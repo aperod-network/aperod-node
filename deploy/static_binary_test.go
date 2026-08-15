@@ -147,6 +147,57 @@ func TestCliBinaryIsStatic(t *testing.T) {
 	assertLddStatic(t, cliBin)
 }
 
+// TestExplorerIndexerBinaryIsStatic builds aperod-explorer-indexer via
+// `make build-explorer-indexer` and then asserts the resulting binary is fully
+// statically linked (no PT_INTERP ELF program header, no dynamic-linker
+// dependency).
+func TestExplorerIndexerBinaryIsStatic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("ELF static-link check is Linux-specific; skipping on Windows")
+	}
+	if runtime.GOOS == "darwin" {
+		t.Skip("ELF static-link check does not apply to macOS Mach-O binaries; skipping")
+	}
+
+	// Locate make.
+	makeBin, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make not found in PATH; skipping TestExplorerIndexerBinaryIsStatic")
+	}
+
+	// The test lives in blockchain/deploy/; the Makefile is one level up.
+	deployDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("cannot determine deploy directory: %v", err)
+	}
+	blockchainDir := filepath.Dir(deployDir)
+	makefilePath := filepath.Join(blockchainDir, "Makefile")
+	if _, err := os.Stat(makefilePath); os.IsNotExist(err) {
+		t.Skipf("Makefile not found at %s; skipping TestExplorerIndexerBinaryIsStatic", makefilePath)
+	}
+
+	indexerBin := filepath.Join(blockchainDir, "build", "aperod-explorer-indexer")
+
+	// ── Step 1: build aperod-explorer-indexer via the Makefile ───────────────
+	t.Log("running make build-explorer-indexer …")
+	buildCmd := exec.Command(makeBin, "build-explorer-indexer")
+	buildCmd.Dir = blockchainDir
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("make build-explorer-indexer failed: %v\n%s", err, string(out))
+	}
+	t.Logf("make build-explorer-indexer succeeded → %s", indexerBin)
+
+	if _, err := os.Stat(indexerBin); os.IsNotExist(err) {
+		t.Fatalf("build/aperod-explorer-indexer not found after make build-explorer-indexer")
+	}
+
+	// ── Step 2: parse ELF program headers ────────────────────────────────────
+	assertNoInterp(t, indexerBin)
+
+	// ── Step 3: confirm with ldd (best-effort) ────────────────────────────────
+	assertLddStatic(t, indexerBin)
+}
+
 // assertNoInterp opens path as an ELF file and fails the test if any
 // PT_INTERP (dynamic-linker path) program header is found.
 func assertNoInterp(t *testing.T, path string) {
