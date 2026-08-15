@@ -159,9 +159,11 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 		s.spentPubKeys[u.OneTimePub] = u
 	}
 
-	// restoreFromSlice copies the slice and sorts it once (O(n log n)) rather
-	// than building a map entry-by-entry; this is also the primary RAM saving:
-	// the sorted-slice approach needs 32 B/entry vs ~150 B/entry for a Go map.
+	// restoreFromSlice is a no-op in the LevelDB-backed design: historical
+	// key images are read from kiDB on demand rather than pre-loaded into RAM.
+	// The call is kept for snapshot-format compatibility; old snapshots' KeyImages
+	// field is silently ignored, which also eliminates phantom-KI bugs (mempool
+	// entries that used to permanently block valid UTXOs after OOM kills).
 	s.keyImages.restoreFromSlice(snap.KeyImages)
 
 	// Rebuild the rollback journal from the snapshot.  Old snapshots that
