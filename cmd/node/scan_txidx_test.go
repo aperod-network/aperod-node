@@ -437,11 +437,16 @@ func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
 	}
 }
 
-// TestBackfillTxIdxRange_HaltsOnFetchError verifies that backfillTxIdxRange
-// stops at the first missing block and retains the marker at the last
-// successfully indexed height rather than advancing it past the gap.  On the
-// next restart the goroutine will retry from the retained marker.
-func TestBackfillTxIdxRange_HaltsOnFetchError(t *testing.T) {
+// TestBackfillTxIdxRange_SkipsMissingBlockData verifies that backfillTxIdxRange
+// skips a height whose raw-block data is absent from the store (GetRawBlockByHeight
+// returns nil, nil) and continues indexing all subsequent blocks.
+//
+// This matters in production: after --repair-db some heights may have their
+// height-index entry (b/ prefix) intact but the corresponding raw-block data
+// (r/ prefix) absent.  The old behaviour halted permanently at such a height;
+// the new behaviour skips the gap and indexes the remaining chain so the tx
+// index marker eventually reaches tipHeight.
+func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
@@ -451,7 +456,7 @@ func TestBackfillTxIdxRange_HaltsOnFetchError(t *testing.T) {
 	}
 
 	// Build a 5-block chain but deliberately omit block at height 3 to
-	// simulate a missing / corrupted block in the store.
+	// simulate raw-block data absent for that height.
 	db, err2 := store.Open(fmt.Sprintf("%s/chain.db", dir))
 	if err2 != nil {
 		t.Fatalf("store.Open: %v", err2)
@@ -496,6 +501,8 @@ func TestBackfillTxIdxRange_HaltsOnFetchError(t *testing.T) {
 	parent := genesis
 	const totalBlocks = 5
 	const missingHeight = 3
+	// txsByHeight records the transactions stored at each height for later verification.
+	txsByHeight := make(map[int]core.Transaction)
 	for i := 1; i <= totalBlocks; i++ {
 		txs := []core.Transaction{makeTx(i)}
 		hdr := core.BlockHeader{
@@ -510,48 +517,51 @@ func TestBackfillTxIdxRange_HaltsOnFetchError(t *testing.T) {
 			t.Fatalf("Sign h=%d: %v", i, serr)
 		}
 		blk := &core.Block{Header: hdr, Txs: txs}
-		if i != missingHeight { // skip block 3 to simulate a gap
+		txsByHeight[i] = txs[0]
+		if i != missingHeight { // omit block 3 to simulate a raw-data gap
 			storeRaw(blk)
 		}
 		parent = blk
 	}
 
-	// Run the backfill from 0 through 5; it should halt at height 3.
+	// Run the backfill from 0 through 5.  Block 3 data is absent but the
+	// backfill should skip it (WARN) and continue indexing 4 and 5.
 	backfillTxIdxRange(0, totalBlocks, db, silentLog())
 
-	// Marker must be at 2 (last fully indexed height before the gap).
+	// Marker must reach totalBlocks (backfill completed despite the gap).
 	marker, found, loadErr := db.LoadTxIdxCompleteHeight()
 	if loadErr != nil {
 		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
 	}
 	if !found {
-		t.Fatal("txidx_complete_height absent after partial backfill")
+		t.Fatal("txidx_complete_height absent after backfill")
 	}
-	if marker != missingHeight-1 {
-		t.Errorf("txidx_complete_height = %d, want %d (last good height before missing block)",
-			marker, missingHeight-1)
+	if marker != uint64(totalBlocks) {
+		t.Errorf("txidx_complete_height = %d, want %d (backfill must reach toH despite gap)",
+			marker, totalBlocks)
 	}
 
-	// Heights 4 and 5 must NOT have t/ entries (backfill halted before them).
-	for h := uint64(missingHeight + 1); h <= totalBlocks; h++ {
-		raw, rerr := db.GetRawBlockByHeight(h)
-		if rerr != nil || raw == nil {
-			continue // also missing — skip
-		}
-		var b core.Block
-		if jerr := json.Unmarshal(raw, &b); jerr != nil {
+	// Heights 1, 2, 4, 5 must all have t/ entries (backfill continued past gap).
+	for _, h := range []int{1, 2, 4, 5} {
+		tx := txsByHeight[h]
+		entry, lerr := db.LookupTxIdx(tx.Hash())
+		if lerr != nil {
+			t.Errorf("LookupTxIdx at height %d: %v", h, lerr)
 			continue
 		}
-		for i, tx := range b.Txs {
-			entry, lerr := db.LookupTxIdx(tx.Hash())
-			if lerr != nil {
-				t.Errorf("LookupTxIdx at height %d tx %d: %v", h, i, lerr)
-				continue
-			}
-			if entry != nil {
-				t.Errorf("height %d tx %d has t/ entry after halted backfill — marker semantics broken", h, i)
-			}
+		if entry == nil {
+			t.Errorf("height %d tx not indexed — backfill should have continued past missing block 3", h)
 		}
+	}
+
+	// Height 3 was missing — its tx is not indexed (nothing to index).
+	tx3 := txsByHeight[missingHeight]
+	entry3, lerr3 := db.LookupTxIdx(tx3.Hash())
+	if lerr3 != nil {
+		t.Errorf("LookupTxIdx at height 3: %v", lerr3)
+	}
+	if entry3 != nil {
+		t.Errorf("height 3 tx has t/ entry but the block data was absent — should not be indexed")
 	}
 }
 
