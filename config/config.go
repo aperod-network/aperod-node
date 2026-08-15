@@ -302,6 +302,12 @@ type P2PConfig struct {
 	//
 	// Default: 15s.  Set to 0 to use the default.
 	GetBlockStallTimeout time.Duration `yaml:"get_block_stall_timeout"`
+	// MaxDialBackoff is the maximum interval between successive dial attempts
+	// to an unreachable bootnode.  After each failed dial the wait grows
+	// exponentially from 5 s and is capped at MaxDialBackoff so the relay
+	// always reconnects within a bounded window when the validator comes back.
+	// Default: 5m.  Set to 0 to use the default.
+	MaxDialBackoff time.Duration `yaml:"max_dial_backoff"`
 }
 
 // ConsensusConfig holds PoA settings.
@@ -386,6 +392,7 @@ TxRateSustained:      10,       // per-IP sustained tx/sec after burst is spent
 TxRateBanThreshold:   100,      // sustained violations before a temporary ban
 TxRateBanDuration:    time.Hour,
 			MaxStaleBootnodeAge:  24 * time.Hour, // warn when a bootnode DNS hasn't resolved for this long
+			MaxDialBackoff:       5 * time.Minute, // cap per-bootnode retry interval so relay always recovers
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
