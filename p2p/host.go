@@ -146,6 +146,22 @@ type Config struct {
         // fix decommissioned hostnames before the peer count silently drops to
         // zero.  Default: 24h (applied in NewHost when zero).
         MaxStaleBootnodeAge time.Duration
+        // MaxDialBackoff is the maximum interval between consecutive dial
+        // attempts to an unreachable bootnode.  After each failed dial the
+        // wait grows exponentially from 5 s (first failure) and is capped at
+        // MaxDialBackoff so the relay always reconnects within a bounded
+        // window once the validator comes back online — without requiring
+        // operator intervention.  Default: 5m (applied in NewHost when zero).
+        MaxDialBackoff time.Duration
+        // HandshakeTimeout is the maximum time allowed for the TLS handshake to
+        // complete on an inbound connection.  A rogue peer that sends exactly
+        // enough bytes to keep the TLS state machine alive (e.g. a partial
+        // ClientHello followed by silence) holds one pending-handshake slot for
+        // the full duration; tightening this value (e.g. 2–3 s) limits how long
+        // a single slot can be occupied without completing authentication.
+        // 0 = default (10 s).  Production nodes may lower this to 3 s via
+        // config.DefaultConfig().
+        HandshakeTimeout time.Duration
 }
 
 // connIP extracts the host part from an "IP:port" address string.
@@ -329,6 +345,16 @@ type badBlockStrike struct {
         lastSeen time.Time
 }
 
+// bootnodeFailEntry tracks consecutive dial failures for one resolved bootnode
+// address.  Used by maintainLoop to apply per-bootnode exponential back-off
+// capped at MaxDialBackoff, independently of the PeerMgr back-off that applies
+// to non-bootnode peers.
+type bootnodeFailEntry struct {
+        failures    int
+        nextDial    time.Time // earliest allowed next dial; zero = dial immediately
+        firstFailAt time.Time // when the first failure was recorded (for stale-age WARN)
+}
+
 // whitelistExemptMaxEvents caps the in-memory ring buffer for whitelist
 // exemption events so memory cannot grow unboundedly on a busy node.
 const whitelistExemptMaxEvents = 100
@@ -482,6 +508,15 @@ type Host struct {
         // Capped at bootnodeWarnEventMaxEvents.
         bootnodeWarnEvents []BootnodeWarnEvent
 
+        // bootnodeMu guards bootnodeFailState.
+        bootnodeMu sync.Mutex
+        // bootnodeFailState maps resolved bootnode IP:port → per-address back-off
+        // tracking.  Populated by recordBootnodeFail when an outbound dial to a
+        // bootnode fails; cleared by clearBootnodeFail when the session reaches
+        // stableConnTime (healthy).  Consulted by maintainLoop to gate re-dial
+        // attempts so a persistently-down validator is not hammered every 10 s.
+        bootnodeFailState map[string]bootnodeFailEntry
+
         // tsMu guards tsStrikeCounts.  It is separate from badBlockMu so the
         // two independent counters can be updated without contention.
         tsMu sync.Mutex
@@ -615,6 +650,12 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.MaxStaleBootnodeAge == 0 {
                 cfg.MaxStaleBootnodeAge = 24 * time.Hour
         }
+        if cfg.MaxDialBackoff == 0 {
+                cfg.MaxDialBackoff = 5 * time.Minute
+        }
+        if cfg.HandshakeTimeout == 0 {
+                cfg.HandshakeTimeout = 10 * time.Second
+        }
         if cfg.TxRateBurst > 0 && cfg.TxRateBanDuration == 0 {
                 cfg.TxRateBanDuration = time.Hour
         }
@@ -668,6 +709,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
                 bootnodeLastResolvedAt: make(map[string]time.Time),
                 bootnodeSet:            make(map[string]struct{}),
                 maintainNow:            make(chan struct{}, 1),
+                bootnodeFailState:      make(map[string]bootnodeFailEntry),
         }
         h.txRate = newTxRateLimiter(cfg.TxRateBurst, cfg.TxRateSustained, cfg.TxRateBanThreshold)
         h.keepaliveIntervalNs.Store(int64(cfg.KeepaliveInterval))
@@ -689,6 +731,36 @@ func (h *Host) SetKeepaliveInterval(d time.Duration) error {
         }
         h.keepaliveIntervalNs.Store(int64(d))
         return nil
+}
+
+// recordBootnodeFail updates the per-bootnode exponential back-off state after
+// a failed dial attempt.  Called from the handleConn back-off defer when the
+// dialled address is a configured bootnode.  The back-off window grows
+// exponentially from 5 s (first failure) and is capped at MaxDialBackoff so
+// the relay always retries within a bounded interval.
+func (h *Host) recordBootnodeFail(addr string) {
+        h.bootnodeMu.Lock()
+        defer h.bootnodeMu.Unlock()
+        e := h.bootnodeFailState[addr]
+        if e.firstFailAt.IsZero() {
+                e.firstFailAt = time.Now()
+        }
+        e.failures++
+        d := backoffDuration(e.failures)
+        if d > h.cfg.MaxDialBackoff {
+                d = h.cfg.MaxDialBackoff
+        }
+        e.nextDial = time.Now().Add(d)
+        h.bootnodeFailState[addr] = e
+}
+
+// clearBootnodeFail resets the per-bootnode back-off state after a session
+// that lasted at least stableConnTime.  Called from the handleConn back-off
+// defer so the next reconnect starts from the minimum back-off interval.
+func (h *Host) clearBootnodeFail(addr string) {
+        h.bootnodeMu.Lock()
+        delete(h.bootnodeFailState, addr)
+        h.bootnodeMu.Unlock()
 }
 
 // rebuildBootnodeSet repopulates h.bootnodeSet from h.bootnodeLastResolved.
@@ -1778,9 +1850,56 @@ func (h *Host) maintainLoop() {
                         h.mu.RLock()
                         _, connected := h.peers[addr]
                         h.mu.RUnlock()
-                        if !connected {
-                                go h.dialPeer(addr)
+                        if connected {
+                                // Peer is up — reset any accumulated back-off so a
+                                // future restart reconnects quickly from the start.
+                                h.clearBootnodeFail(addr)
+                                continue
                         }
+
+                        // Apply per-bootnode exponential back-off capped at
+                        // MaxDialBackoff.  Unlike regular peers (which use PeerMgr's
+                        // CanDial), bootnodes always get retried — but we throttle
+                        // the attempt rate so a validator that is restarting slowly
+                        // is not hammered by a new TCP attempt every 10 s.
+                        h.bootnodeMu.Lock()
+                        e := h.bootnodeFailState[addr]
+                        inBackoff := !e.nextDial.IsZero() && tickNow.Before(e.nextDial)
+                        age := time.Duration(0)
+                        if !e.firstFailAt.IsZero() {
+                                age = tickNow.Sub(e.firstFailAt)
+                        }
+                        h.bootnodeMu.Unlock()
+
+                        // Emit a WARN (and an Admin Panel ring-buffer event) when
+                        // the bootnode has been continuously unreachable for longer
+                        // than MaxStaleBootnodeAge.  The warning fires on every
+                        // discovery tick while the condition persists so operators
+                        // notice it clearly without having to grep logs.
+                        if age > 0 && age > h.cfg.MaxStaleBootnodeAge {
+                                h.log.Warn("bootnode unreachable: no successful connection since first dial failure",
+                                        "bootnode", addr,
+                                        "age", age.Round(time.Second),
+                                        "max_stale_bootnode_age", h.cfg.MaxStaleBootnodeAge,
+                                )
+                                ev := BootnodeWarnEvent{
+                                        Bootnode: addr,
+                                        Err:      "unreachable: dial back-off active",
+                                        AgeSecs:  int64(age.Seconds()),
+                                        At:       tickNow,
+                                }
+                                h.bootnodeWarnEventMu.Lock()
+                                h.bootnodeWarnEvents = append(h.bootnodeWarnEvents, ev)
+                                if len(h.bootnodeWarnEvents) > bootnodeWarnEventMaxEvents {
+                                        h.bootnodeWarnEvents = h.bootnodeWarnEvents[len(h.bootnodeWarnEvents)-bootnodeWarnEventMaxEvents:]
+                                }
+                                h.bootnodeWarnEventMu.Unlock()
+                        }
+
+                        if inBackoff {
+                                continue // still within the back-off window; skip this tick
+                        }
+                        go h.dialPeer(addr)
                 }
         }
 }
@@ -1925,6 +2044,12 @@ func (h *Host) dialPeer(addr string) {
                 } else {
                         h.log.Warn("dial failed", "addr", addr, "err", err)
                         h.mgr.OnDialFail(addr)
+                        // Update per-bootnode back-off so maintainLoop throttles
+                        // re-dial attempts rather than hammering a restarting
+                        // validator every 10 s.
+                        if h.isBootnode(addr) {
+                                h.recordBootnodeFail(addr)
+                        }
                 }
                 return
         }
@@ -1942,6 +2067,9 @@ func (h *Host) dialPeer(addr string) {
                         } else {
                                 h.log.Warn("tls handshake failed", "addr", addr, "err", err)
                                 h.mgr.OnDialFail(addr)
+                                if h.isBootnode(addr) {
+                                        h.recordBootnodeFail(addr)
+                                }
                         }
                         return
                 }
@@ -2051,8 +2179,26 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
                 defer func() {
                         if connectedAt.IsZero() || time.Since(connectedAt) < stableConnTime {
                                 h.mgr.OnDialFail(addr)
+                                // Advance per-bootnode back-off ONLY when the connection
+                                // never reached the message loop (connectedAt is zero).
+                                // That covers TCP failures (port still closed while the
+                                // validator restarts) and P2P-handshake failures.
+                                //
+                                // A session that reached the message loop but then dropped
+                                // quickly (< stableConnTime) is NOT penalised with bootnode
+                                // back-off: the validator is running and its port is open,
+                                // so the relay should reconnect immediately on the next
+                                // tick without waiting MaxDialBackoff.
+                                if h.isBootnode(addr) && connectedAt.IsZero() {
+                                        h.recordBootnodeFail(addr)
+                                }
                         } else {
                                 h.mgr.OnDialSuccess(addr)
+                                // Reset back-off on a healthy session so the next restart
+                                // reconnects from the minimum interval.
+                                if h.isBootnode(addr) {
+                                        h.clearBootnodeFail(addr)
+                                }
                         }
                 }()
         }
@@ -2086,7 +2232,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         //      application handshake, and
         //   b) PeerFingerprint is available before any application data flows.
         if tlsConn, ok := conn.(*tls.Conn); ok {
-                tlsConn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+                tlsConn.SetDeadline(time.Now().Add(h.cfg.HandshakeTimeout)) //nolint:errcheck
                 if err := tlsConn.Handshake(); err != nil {
                         // releaseHS() via defer; no explicit call needed here.
                         h.log.Debug("tls handshake failed — plaintext or unauthorized peer rejected",
