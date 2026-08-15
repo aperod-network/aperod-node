@@ -439,6 +439,31 @@ print(f"[OK]   p2p.bootnodes updated: {nodes}")
 PY
     fi
     ok "Bootnode ${VALIDATOR_BOOTNODE} прописан в ${LOCAL_NODE_YAML}"
+
+    # ── Прописываем IP валидатора в peer_whitelist ────────────────────────
+    # Предотвращает накопление bad-block страйков (→ 24-ч бан) пока реле
+    # не догонит цепь и не начнёт принимать gossip-блоки валидатора.
+    info "Шаг 7.5/9: Прописываем ${VALIDATOR_IP} в p2p.peer_whitelist…"
+    python3 - "${LOCAL_NODE_YAML}" "${VALIDATOR_IP}" <<'PY'
+import sys, yaml, os
+cfg_path     = sys.argv[1]
+validator_ip = sys.argv[2]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+p2p = cfg.setdefault("p2p", {})
+wl  = list(p2p.get("peer_whitelist") or [])
+if validator_ip not in wl:
+    wl.append(validator_ip)
+    p2p["peer_whitelist"] = wl
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, cfg_path)
+    print(f"[OK]   p2p.peer_whitelist updated: {wl}")
+else:
+    print(f"[OK]   p2p.peer_whitelist already contains {validator_ip} — skipping")
+PY
+    ok "IP валидатора ${VALIDATOR_IP} добавлен в peer_whitelist"
   else
     warn "${LOCAL_NODE_YAML} не найден — bootnode не прописан."
     warn "Добавьте вручную в node.yaml:"
@@ -938,6 +963,33 @@ PY
 fi
 ENDSSH
 ok "Bootnode ${PRIMARY_BOOTNODE} прописан в ${SECONDARY_NODE_YAML}"
+
+# ── Шаг 5.5: Прописываем IP валидатора в peer_whitelist нового узла ──
+# Без этого шага реле получает bad-block strike при каждом gossip-блоке
+# (реле не может принять блок пока не синхронизировалось) и после 5 страйков
+# забанит валидатор на 24 ч — полностью разрывая P2P-синхронизацию.
+# Белый список (peer_whitelist) исключает валидатор из счётчика страйков.
+info "Шаг 5.5/7: Прописываем ${PRIMARY_IP} в p2p.peer_whitelist нового узла…"
+ssh "root@${TARGET_IP}" python3 - "${SECONDARY_NODE_YAML}" "${PRIMARY_IP}" <<'PY'
+import sys, yaml, os
+cfg_path     = sys.argv[1]
+validator_ip = sys.argv[2]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+p2p = cfg.setdefault("p2p", {})
+wl  = list(p2p.get("peer_whitelist") or [])
+if validator_ip not in wl:
+    wl.append(validator_ip)
+    p2p["peer_whitelist"] = wl
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, cfg_path)
+    print(f"[OK]   p2p.peer_whitelist updated: {wl}")
+else:
+    print(f"[OK]   p2p.peer_whitelist already contains {validator_ip} — skipping")
+PY
+ok "IP валидатора ${PRIMARY_IP} добавлен в peer_whitelist нового узла"
 
 # ── Шаг 6: Права и запуск ─────────────────────────────────
 info "Шаг 6/7: Устанавливаем права, drop-in конфиги и запускаем ноду…"
