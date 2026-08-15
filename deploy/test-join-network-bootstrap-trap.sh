@@ -399,6 +399,240 @@ else
 fi
 
 # =============================================================================
+# ── SUITE 4: SSH disconnects during remote-stop heredoc → trap still fires ────
+#
+#  The critical property under test:
+#    _BS_VALIDATOR_STOPPED is set to 1 BEFORE the `ssh … bash` heredoc call
+#    (join-network.sh step 3).  If the SSH connection drops mid-stop (ssh
+#    exits non-zero), the ERR/EXIT trap must still:
+#      a. Print the [TRAP] banner.
+#      b. Call `ssh root@VALIDATOR_IP systemctl start aperod-node`
+#         (validator restart — _BS_VALIDATOR_STOPPED=1).
+#      c. Call `systemctl start aperod-node` for the local node
+#         (_BS_LOCAL_STOPPED=1 and _BS_RSYNC_STARTED=0 → data untouched).
+# =============================================================================
+section "SSH disconnect during remote-stop heredoc — trap fires, restarts both nodes"
+
+S4_DIR="${TMPDIR_TEST}/s4"
+S4_DATA="${S4_DIR}/data"
+S4_BIN="${S4_DIR}/bin"
+S4_YAML="${S4_DIR}/node.yaml"
+S4_CONFIG="${S4_DIR}/node-config.sh"
+
+mkdir -p "${S4_DATA}/chain.db"
+touch "${S4_DATA}/chain.db/CURRENT"
+printf 'network: testnet\n' >"${S4_YAML}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${S4_CONFIG}"; chmod +x "${S4_CONFIG}"
+
+# Sentinels
+S4_LOCAL_RESTART="${S4_DIR}/local-start-called"
+S4_VAL_RESTART="${S4_DIR}/val-start-called"
+
+# systemctl stub:
+#   stop aperod-node  → 0  (step 2: local node stops → _BS_LOCAL_STOPPED=1)
+#   is-active         → 1  (not active → wait loop exits immediately)
+#   start aperod-node → 0  (trap restart); touch sentinel
+make_stub "${S4_BIN}" "systemctl" "
+case \"\$*\" in
+  *'stop aperod-node'*)
+    exit 0 ;;
+  *'is-active'*)
+    exit 1 ;;
+  *'start aperod-node'*)
+    touch '${S4_LOCAL_RESTART}'
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
+"
+
+# ssh stub:
+#   network/stats              → JSON (step 1 tip_height read)
+#   [ -d … ]                   → exit 0 (steps 1b dir checks)
+#   bash (heredoc remote-stop) → exit 1 (simulates SSH disconnect mid-stop)
+#   systemctl start            → touch sentinel + exit 0 (trap restart of validator)
+#   anything else              → exit 0
+make_stub "${S4_BIN}" "ssh" "
+shift   # drop root@IP
+CMD=\"\$*\"
+if echo \"\$CMD\" | grep -q 'network/stats'; then
+  echo '{\"tip_height\":3000,\"height\":3000,\"peer_count\":2}'
+  exit 0
+elif echo \"\$CMD\" | grep -q 'systemctl start'; then
+  touch '${S4_VAL_RESTART}'
+  echo 'started'
+  exit 0
+elif [[ \"\$CMD\" == 'bash' ]]; then
+  # Consume the heredoc stdin so the pipe doesn't block, then simulate
+  # an SSH connection drop by returning a non-zero exit code.
+  cat >/dev/null
+  exit 1
+else
+  cat >/dev/null
+  exit 0
+fi
+"
+
+# rsync stub: should never be reached (SSH fails at step 3 before rsync).
+make_stub "${S4_BIN}" "rsync" 'exit 0'
+make_stub "${S4_BIN}" "curl"  "echo '{\"height\":0}'; exit 0"
+make_stub "${S4_BIN}" "chown" 'exit 0'
+make_stub "${S4_BIN}" "sleep" 'exit 0'
+
+run_bootstrap "${S4_BIN}" "${S4_DATA}" "${S4_YAML}" "${S4_CONFIG}"
+
+# ── T13: script exits non-zero when SSH drops during remote-stop ──────────────
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "T13: script exited non-zero (${LAST_EXIT}) when SSH disconnected during remote-stop"
+else
+  fail "T13: expected non-zero exit after SSH disconnect but got 0. Output:\n${LAST_OUTPUT}"
+fi
+
+# ── T14: [TRAP] banner present in output ─────────────────────────────────────
+if echo "${LAST_OUTPUT}" | grep -q '\[TRAP\]'; then
+  pass "T14: [TRAP] banner printed in output after SSH disconnect"
+else
+  fail "T14: expected [TRAP] banner in output. Got:\n${LAST_OUTPUT}"
+fi
+
+# ── T15: systemctl start aperod-node called by trap (local node restart) ──────
+# _BS_LOCAL_STOPPED=1 and _BS_RSYNC_STARTED=0 → data is intact → safe to restart.
+if [[ -f "${S4_LOCAL_RESTART}" ]]; then
+  pass "T15: trap called systemctl start aperod-node to restart local node"
+else
+  fail "T15: trap did not call systemctl start aperod-node for local node. Output:\n${LAST_OUTPUT}"
+fi
+
+# ── T16: ssh validator restart called by trap ─────────────────────────────────
+# _BS_VALIDATOR_STOPPED=1 was set BEFORE the failing ssh bash call → trap must
+# attempt validator restart even though the stop heredoc itself failed.
+if [[ -f "${S4_VAL_RESTART}" ]]; then
+  pass "T16: trap called ssh systemctl start aperod-node to restart validator"
+else
+  fail "T16: trap did not call ssh restart for validator. Output:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
+# ── SUITE 5: `systemctl enable --now aperod-node` fails at step 8 ─────────────
+#
+#  Critical property:
+#    _BS_LOCAL_STOPPED is set to 0 and `trap - EXIT ERR` is called ONLY after
+#    `systemctl enable --now aperod-node` succeeds.  If the command fails the
+#    script exits immediately (set -euo pipefail) while the trap is still
+#    active and _BS_LOCAL_STOPPED is still 1.  The cleanup trap must therefore:
+#      a. Print the [TRAP] banner.
+#      b. Call `systemctl start aperod-node` to restart the local relay that
+#         was stopped in step 2.
+#    The validator is already back up from step 5, so no ssh restart is needed.
+# =============================================================================
+section "systemctl enable --now aperod-node fails at step 8 — trap fires, local node restarted"
+
+S5_DIR="${TMPDIR_TEST}/s5"
+S5_DATA="${S5_DIR}/data"
+S5_BIN="${S5_DIR}/bin"
+S5_YAML="${S5_DIR}/node.yaml"
+S5_CONFIG="${S5_DIR}/node-config.sh"
+
+mkdir -p "${S5_DATA}/chain.db"
+touch "${S5_DATA}/chain.db/CURRENT"
+# Provide a fake snapshot so SNAP_HEIGHT detection (after rsync) works.
+touch "${S5_DATA}/snapshot-v2-7000.json.gz"
+printf 'network: testnet\n' >"${S5_YAML}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${S5_CONFIG}"; chmod +x "${S5_CONFIG}"
+
+# Sentinels
+S5_LOCAL_RESTART="${S5_DIR}/local-start-called"
+S5_ENABLE_CALLED="${S5_DIR}/enable-called"
+
+# systemctl stub:
+#   stop aperod-node         → 0   (step 2: local stops → _BS_LOCAL_STOPPED=1)
+#   is-active                → 1   (not running → wait loop exits)
+#   enable --now aperod-node → 1   (step 8: unit file missing / error)
+#   start aperod-node        → 0   (trap restart); touch sentinel
+make_stub "${S5_BIN}" "systemctl" "
+case \"\$*\" in
+  *'stop aperod-node'*)
+    exit 0 ;;
+  *'is-active'*)
+    exit 1 ;;
+  *'enable --now aperod-node'*)
+    touch '${S5_ENABLE_CALLED}'
+    exit 1 ;;
+  *'start aperod-node'*)
+    touch '${S5_LOCAL_RESTART}'
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
+"
+
+# ssh stub: everything succeeds (validator starts OK at step 5; step 8 is local-only).
+make_stub "${S5_BIN}" "ssh" "
+shift
+CMD=\"\$*\"
+if echo \"\$CMD\" | grep -q 'network/stats'; then
+  echo '{\"tip_height\":8000,\"height\":8000,\"peer_count\":3}'
+  exit 0
+elif echo \"\$CMD\" | grep -q 'systemctl start'; then
+  echo 'started'
+  exit 0
+elif [[ \"\$CMD\" == 'bash' ]]; then
+  cat >/dev/null
+  echo 'stopped'
+  exit 0
+else
+  cat >/dev/null
+  exit 0
+fi
+"
+
+# rsync succeeds — the failure happens later at step 8.
+make_stub "${S5_BIN}" "rsync" 'exit 0'
+
+make_stub "${S5_BIN}" "curl"  "echo '{\"height\":0}'; exit 0"
+make_stub "${S5_BIN}" "chown" 'exit 0'
+make_stub "${S5_BIN}" "sleep" 'exit 0'
+
+run_bootstrap "${S5_BIN}" "${S5_DATA}" "${S5_YAML}" "${S5_CONFIG}"
+
+# ── T17: script exits non-zero when enable --now fails ───────────────────────
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "T17: script exited non-zero (${LAST_EXIT}) when systemctl enable --now aperod-node failed"
+else
+  fail "T17: expected non-zero exit after enable --now failure but got 0. Output:\n${LAST_OUTPUT}"
+fi
+
+# ── T18: enable --now was actually called ─────────────────────────────────────
+if [[ -f "${S5_ENABLE_CALLED}" ]]; then
+  pass "T18: systemctl enable --now aperod-node was called (failure step exercised)"
+else
+  fail "T18: systemctl enable --now was never called — test did not reach step 8. Output:\n${LAST_OUTPUT}"
+fi
+
+# ── T19: [TRAP] banner present in output ─────────────────────────────────────
+if echo "${LAST_OUTPUT}" | grep -q '\[TRAP\]'; then
+  pass "T19: [TRAP] banner printed after enable --now failure"
+else
+  fail "T19: expected [TRAP] banner in output. Got:\n${LAST_OUTPUT}"
+fi
+
+# ── T20: trap called systemctl start aperod-node to restart local node ────────
+# _BS_LOCAL_STOPPED=1 (set at step 2) and _BS_RSYNC_STARTED=0 (rsync completed
+# and sentinel was removed at step 4c) → chain.db is consistent → safe to restart.
+if [[ -f "${S5_LOCAL_RESTART}" ]]; then
+  pass "T20: trap called systemctl start aperod-node to restart local relay after enable --now failure"
+else
+  fail "T20: trap did not call systemctl start aperod-node. Output:\n${LAST_OUTPUT}"
+fi
+
+# ── T21: error output contains a helpful diagnostic message ──────────────────
+if echo "${LAST_OUTPUT}" | grep -qi 'enable --now\|unit\|install-node\|unit-файл\|завершился'; then
+  pass "T21: output contains a diagnostic hint about the enable --now failure"
+else
+  fail "T21: expected a diagnostic message about the enable --now failure. Got:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
 # ── Summary ───────────────────────────────────────────────────────────────────
 # =============================================================================
 echo
