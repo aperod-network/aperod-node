@@ -118,6 +118,15 @@ type Server struct {
         // Wired to p2p.Host.SetKeepaliveInterval by cmd/node.
         // Optional — POST /api/v1/network/p2p-config returns 503 when not wired.
         p2pKeepaliveSetFn func(time.Duration) error
+        // p2pKeepalivePersistFn writes the new keepalive interval back to
+        // node.yaml (atomic tmp+rename) so it survives a node restart.
+        // Wired to cmd/node persistKeepaliveInterval.  Optional — when not
+        // wired, POST updates only the live value and reports persisted:false.
+        p2pKeepalivePersistFn func(time.Duration) error
+        // p2pKeepaliveYAMLFn re-reads node.yaml and returns the persisted
+        // keepalive interval, so GET can report live vs persisted drift.
+        // Optional — when not wired the yaml fields are omitted from GET.
+        p2pKeepaliveYAMLFn func() (time.Duration, error)
 
         // p2pBadBlockBanThreshold is the configured rogue-fork ban threshold
         // (number of out-of-range blocks before a peer is banned).
@@ -571,6 +580,20 @@ func (s *Server) SetP2PKeepaliveGetFunc(f func() time.Duration) { s.p2pKeepalive
 // Ping interval.  Wired to p2p.Host.SetKeepaliveInterval by cmd/node.
 // Optional — POST /api/v1/network/p2p-config returns 503 when not wired.
 func (s *Server) SetP2PKeepaliveSetFunc(f func(time.Duration) error) { s.p2pKeepaliveSetFn = f }
+
+// SetP2PKeepalivePersistFunc wires a function that persists the keepalive
+// interval back to node.yaml (atomic tmp+rename) so it survives a restart.
+// Optional — when not wired, POST only updates the live value.
+func (s *Server) SetP2PKeepalivePersistFunc(f func(time.Duration) error) {
+        s.p2pKeepalivePersistFn = f
+}
+
+// SetP2PKeepaliveYAMLFunc wires a function that re-reads node.yaml and returns
+// the persisted keepalive interval so GET can report live vs persisted drift.
+// Optional — when not wired the yaml fields are omitted from the GET response.
+func (s *Server) SetP2PKeepaliveYAMLFunc(f func() (time.Duration, error)) {
+        s.p2pKeepaliveYAMLFn = f
+}
 
 // SetP2PBanConfig stores the static rogue-fork ban parameters read from
 // node.yaml so that GET /api/v1/network/p2p-config can include them in its
