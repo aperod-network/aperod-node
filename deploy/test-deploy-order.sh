@@ -88,6 +88,25 @@ else
 fi
 echo ""
 
+# ── join-network.sh push-mode trap (shell e2e) ───────────────────────────────
+# Verifies the _push_cleanup trap in push-mode (join-network.sh <TARGET_IP>):
+#  1. Interrupted between Step 1 (target stopped) and Step 2 (source not yet
+#     stopped) → trap restarts target, does NOT restart source.
+#  2. Rsync interrupted mid-transfer → trap restarts source, does NOT restart
+#     target (data may be partial; sentinel remains).
+#  3. SSH disconnect during target-stop → trap restarts target, NOT source.
+#  4. Successful run → trap cleared before exit, ssh target-restart not called.
+echo "--- JoinNetworkPushTrapTests"
+if bash "$SCRIPT_DIR/test-join-network-push-trap.sh"; then
+    echo "PASS: JoinNetworkPushTrapTests"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: JoinNetworkPushTrapTests (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
+
 # ── join-network.sh identity isolation (shell e2e) ───────────────────────────
 # Verifies that join-network.sh never copies the source node's p2p_identity.key
 # to the target (rsync --exclude) and deletes any pre-existing key via SSH rm -f
@@ -113,6 +132,22 @@ if bash "$SCRIPT_DIR/test-verify-dropin.sh"; then
 else
     EXIT=$?
     echo "FAIL: VerifyDropinTests (exit $EXIT)"
+    FAIL=$((FAIL + 1))
+fi
+echo ""
+
+# ── join-network.sh dropin gate integration (shell e2e) ───────────────────────
+# Stubs ssh, rsync, and systemctl so the full push-mode flow of join-network.sh
+# runs without real SSH targets.  Confirms that a verify-dropin.sh failure
+# (wrong/missing GOMEMLIMIT or absent drop-in files) causes join-network.sh to
+# abort with a non-zero exit code, and that passing values let the join succeed.
+echo "--- JoinNetworkDropinGateTests"
+if bash "$SCRIPT_DIR/test-join-network-dropin.sh"; then
+    echo "PASS: JoinNetworkDropinGateTests"
+    PASS=$((PASS + 1))
+else
+    EXIT=$?
+    echo "FAIL: JoinNetworkDropinGateTests (exit $EXIT)"
     FAIL=$((FAIL + 1))
 fi
 echo ""
