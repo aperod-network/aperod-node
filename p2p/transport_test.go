@@ -799,6 +799,73 @@ func TestTLS_ForgedCert_CannotInjectBlock(t *testing.T) {
 //     close the connection.
 //  5. Assert PeerCount drops to 0 within 1 s.
 
+// ─── T-14: HandshakeTimeout — pending slot freed after configurable deadline ───
+//
+// Verifies that when HandshakeTimeout is set to a short value (200 ms), a raw
+// TCP connection that never sends any TLS data (simulating a partial ClientHello
+// stall) causes the pending-handshake slot to be released within the timeout
+// window.  After the timeout fires the semaphore must be back at 0 so the next
+// legitimate connection is not blocked.
+//
+// Test sequence:
+//  1. Start a TLS host with MaxPendingHandshakes=1 and HandshakeTimeout=200 ms.
+//  2. Open one raw TCP connection (no TLS data) to consume the single slot.
+//  3. Poll PendingHandshakes — it must reach 0 within ~500 ms (well after the
+//     200 ms deadline fires and handleConn returns).
+//  4. Confirm a second raw TCP connection is accepted (slot was freed).
+
+func TestTLS_HandshakeTimeout_SlotFreedOnDeadline(t *testing.T) {
+	tlsCfg, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("T-14: gen host config: %v", err)
+	}
+
+	const hsTimeout = 200 * time.Millisecond
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             20,
+		NodeID:               "hs-timeout-node",
+		UserAgent:            "aperod/test",
+		TLSConfig:            tlsCfg,
+		MaxPendingHandshakes: 1,
+		HandshakeTimeout:     hsTimeout,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("T-14: host.Start: %v", err)
+	}
+	t.Cleanup(host.Stop)
+
+	// Open a raw TCP connection (no TLS ClientHello) — it will hold the single
+	// pending-handshake slot until HandshakeTimeout fires.
+	slow, err := net.DialTimeout("tcp", host.ListenAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("T-14: slow conn dial: %v", err)
+	}
+	defer slow.Close()
+
+	// Give acceptLoop time to accept the connection and start the goroutine
+	// (which will then block in tlsConn.Handshake until the deadline fires).
+	time.Sleep(50 * time.Millisecond)
+
+	// Poll until PendingHandshakes returns to 0, meaning the deadline fired and
+	// handleConn returned, releasing the slot.  Budget = 3× HandshakeTimeout.
+	deadline := time.Now().Add(3 * hsTimeout)
+	for time.Now().Before(deadline) {
+		if host.PendingHandshakes() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if host.PendingHandshakes() != 0 {
+		t.Errorf("T-14: PendingHandshakes = %d after 3× HandshakeTimeout — slot was not freed",
+			host.PendingHandshakes())
+	} else {
+		t.Logf("T-14 ✓ pending-handshake slot freed after %s deadline", hsTimeout)
+	}
+}
+
 func TestKeepalive_SilentPeerEvicted(t *testing.T) {
 	const (
 		ka      = 100 * time.Millisecond // keepalive interval
