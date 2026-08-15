@@ -18,13 +18,14 @@ set -euo pipefail
 CONFIG="/etc/aperod/node.yaml"
 API_URL=""
 
-for arg in "$@"; do
-  case "$arg" in
-    --config=*) CONFIG="${arg#--config=}" ;;
-    --config)   shift; CONFIG="${1:-}" ;;
-    --api-url=*) API_URL="${arg#--api-url=}" ;;
+while (($#)); do
+  case "$1" in
+    --config=*)  CONFIG="${1#--config=}" ;;
+    --config)    shift; CONFIG="${1:-}" ;;
+    --api-url=*) API_URL="${1#--api-url=}" ;;
     --api-url)   shift; API_URL="${1:-}" ;;
   esac
+  shift
 done
 
 if [[ ! -f "$CONFIG" ]]; then
@@ -33,32 +34,59 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 python3 - "$CONFIG" "$API_URL" <<'PYEOF'
-import sys, re, json, urllib.request, urllib.error
+import sys, re, os, json, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 config_path = sys.argv[1]
 api_url     = sys.argv[2] if len(sys.argv) > 2 else ""
 
-# ── Load config ───────────────────────────────────────────────────────────────
+# ── Load node.yaml ────────────────────────────────────────────────────────────
 with open(config_path) as f:
-    text = f.read()
+    node_text = f.read()
 
 def parse_int(s):
     return int(s.replace("_", ""))
 
-# initial_supply (APRO)
-m = re.search(r'^\s*initial_supply\s*:\s*([0-9_]+)', text, re.MULTILINE)
-if not m:
-    print("ERROR: initial_supply not found", file=sys.stderr); sys.exit(1)
-initial_supply_apro = parse_int(m.group(1))
-initial_supply_napr = initial_supply_apro * 100_000_000
+# ── Resolve genesis file ──────────────────────────────────────────────────────
+# node.yaml has:  genesis:\n  file: "config/genesis-testnet.yaml"
+# Path is relative to node.yaml's directory.
+m_gf = re.search(r'^\s*file\s*:\s*"?([^"#\n]+)"?', node_text, re.MULTILINE)
+if not m_gf:
+    print("ERROR: genesis.file not found in config — check node.yaml genesis: section", file=sys.stderr)
+    sys.exit(1)
+genesis_rel = m_gf.group(1).strip().strip('"')
+config_dir  = os.path.dirname(os.path.abspath(config_path))
+genesis_path = os.path.join(config_dir, genesis_rel)
+if not os.path.isfile(genesis_path):
+    # Try relative to cwd as fallback
+    genesis_path2 = os.path.join(os.getcwd(), genesis_rel)
+    if os.path.isfile(genesis_path2):
+        genesis_path = genesis_path2
+    else:
+        print(f"ERROR: genesis file not found: {genesis_path}", file=sys.stderr)
+        sys.exit(1)
 
-# genesis timestamp from config (0 = set at first start, unknown without API)
+with open(genesis_path) as f:
+    text = f.read()
+
+# ── Parse initial_supply from genesis file ────────────────────────────────────
+m_is = re.search(r'^\s*initial_supply\s*:\s*([0-9_]+)', text, re.MULTILINE)
+if m_is:
+    initial_supply_apro = parse_int(m_is.group(1))
+    initial_supply_napr = initial_supply_apro * 100_000_000
+else:
+    # Fallback: 10B sealed at genesis
+    initial_supply_apro = 10_000_000_000
+    initial_supply_napr = initial_supply_apro * 100_000_000
+
+# ── Parse genesis timestamp ───────────────────────────────────────────────────
 m_ts = re.search(r'^\s*timestamp\s*:\s*([0-9_]+)', text, re.MULTILINE)
 config_genesis_ts = parse_int(m_ts.group(1)) if m_ts else 0
 
-# ── Parse allocations ─────────────────────────────────────────────────────────
-# Very lightweight YAML parser for the known structure.
+# ── Parse allocations from genesis file ──────────────────────────────────────
+# Supports two vesting formats:
+#   flat:   type: immediate   cliff_seconds: N   vest_seconds: N
+#   nested: vesting:\n        type: immediate\n  cliff_seconds: N
 in_alloc = False
 alloc_lines = []
 for line in text.splitlines():
@@ -72,7 +100,8 @@ for line in text.splitlines():
 allocations = []
 cur = {}
 for line in alloc_lines:
-    if re.match(r'\s+-\s+address', line):
+    # New allocation entry starts at "  - address:" or "  - label:"
+    if re.match(r'\s+-\s+(address|label)\s*:', line):
         if cur:
             allocations.append(cur)
         cur = {"amount": 0, "label": "", "vesting_type": "immediate",
@@ -81,6 +110,7 @@ for line in alloc_lines:
     if m: cur["amount"] = parse_int(m.group(1))
     m = re.match(r'\s+label\s*:\s*"?([^"#\n]+)"?', line)
     if m: cur["label"] = m.group(1).strip().strip('"')
+    # type: may appear directly or nested under vesting:
     m = re.match(r'\s+type\s*:\s*(\w+)', line)
     if m: cur["vesting_type"] = m.group(1)
     m = re.match(r'\s+cliff_seconds\s*:\s*([0-9_]+)', line)
@@ -89,6 +119,10 @@ for line in alloc_lines:
     if m: cur["vest_seconds"] = parse_int(m.group(1))
 if cur:
     allocations.append(cur)
+
+if not allocations:
+    print(f"ERROR: no allocations found in genesis file: {genesis_path}", file=sys.stderr)
+    sys.exit(1)
 
 total_napr = sum(a["amount"] for a in allocations)
 
@@ -231,7 +265,7 @@ if minted_napr is not None and burned_napr is not None:
         print(f"  │  Circulating = unlocked + minted − burned            │")
         print(f"  │  = {fmt(total_unlocked_napr)} + {fmt(minted_napr)} − {fmt(burned_napr)} │")
         print(f"  │  = {BOLD}{GREEN}{fmt(circulating)} APRO{RESET}                        │")
-    print(f"  │  Remaining mintable cap : {fmt(initial_supply_napr - (total_napr + (minted_napr or 0)))} APRO  │")
+    print(f"  │  Remaining mintable cap : {fmt(initial_supply_napr - (minted_napr or 0))} APRO  │")
     print(f"  └──────────────────────────────────────────────────────┘")
 
 print()
