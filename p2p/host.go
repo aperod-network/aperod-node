@@ -2197,30 +2197,34 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
         // covering TCP dial errors, TLS failures, P2P handshake failures, and
         // session drops.  connectedAt is zero for pre-message-loop exits (treat
         // as failure) and non-zero once the message loop starts.
-        //   • connectedAt is zero           → handshake failed   → OnDialFail
-        //   • lasted < stableConnTime       → peer flapped       → OnDialFail
-        //   • lasted ≥ stableConnTime       → healthy session    → OnDialSuccess
+        //   • connectedAt is zero           → handshake failed       → OnDialFail + recordBootnodeFail
+        //   • lasted < stableConnTime       → peer flapped           → OnDialFail + clearBootnodeFail
+        //   • lasted ≥ stableConnTime       → healthy session        → OnDialSuccess + clearBootnodeFail
+        //
+        // Bootnode back-off is cleared whenever connectedAt is non-zero (i.e.
+        // the P2P handshake succeeded and the message loop ran), regardless of
+        // session length.  A brief drop proves the validator's port is open and
+        // its P2P stack is healthy; accumulated TCP-failure back-off from earlier
+        // retries would otherwise delay the reconnect by up to MaxDialBackoff
+        // even though the validator has already recovered.
         if outbound {
                 defer func() {
                         if connectedAt.IsZero() || time.Since(connectedAt) < stableConnTime {
                                 h.mgr.OnDialFail(addr)
-                                // Advance per-bootnode back-off ONLY when the connection
-                                // never reached the message loop (connectedAt is zero).
-                                // That covers TCP failures (port still closed while the
-                                // validator restarts) and P2P-handshake failures.
-                                //
-                                // A session that reached the message loop but then dropped
-                                // quickly (< stableConnTime) is NOT penalised with bootnode
-                                // back-off: the validator is running and its port is open,
-                                // so the relay should reconnect immediately on the next
-                                // tick without waiting MaxDialBackoff.
-                                if h.isBootnode(addr) && connectedAt.IsZero() {
-                                        h.recordBootnodeFail(addr)
+                                if h.isBootnode(addr) {
+                                        if connectedAt.IsZero() {
+                                                // TCP/TLS/P2P-handshake failure: advance back-off.
+                                                h.recordBootnodeFail(addr)
+                                        } else {
+                                                // Connection reached the message loop but dropped
+                                                // quickly (< stableConnTime).  The validator's port
+                                                // is open — clear any prior back-off so the relay
+                                                // reconnects immediately on the next maintain tick.
+                                                h.clearBootnodeFail(addr)
+                                        }
                                 }
                         } else {
                                 h.mgr.OnDialSuccess(addr)
-                                // Reset back-off on a healthy session so the next restart
-                                // reconnects from the minimum interval.
                                 if h.isBootnode(addr) {
                                         h.clearBootnodeFail(addr)
                                 }
