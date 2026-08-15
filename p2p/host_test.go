@@ -267,6 +267,110 @@ func TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive(t *testing.T) {
 	}
 }
 
+// TestHost_KeepalivePongDeadline_EvictsDeadPeer verifies that the keepalive
+// goroutine's pong-deadline check closes the connection of a peer that stops
+// replying to keepalive Pings — the guard against half-open TCP sessions
+// (e.g. after a silent peer crash) that would otherwise hold a peer slot
+// indefinitely.
+//
+// Setup: a raw TCP server completes the asymmetric handshake (one Pong) and
+// then keeps reading messages WITHOUT ever replying to another Ping.  With a
+// 100 ms KeepaliveInterval the pong deadline is 2×100 ms = 200 ms measured
+// from the handshake, so within a few keepalive ticks the initiating host
+// must log the eviction, close the connection, and drop PeerCount() to 0.
+func TestHost_KeepalivePongDeadline_EvictsDeadPeer(t *testing.T) {
+	// Remote-peer server: accept one connection, do the asymmetric
+	// handshake, then swallow every subsequent message silently.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Asymmetric handshake: outbound host sends MsgPing first.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("server: expected MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "dead-server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			return
+		}
+
+		// "Dead" phase: read (drain) every keepalive Ping but NEVER send a
+		// Pong back — simulating a peer whose Pong goroutine is blocked.
+		// Keeping the read loop alive means the TCP connection stays open
+		// from the host's perspective, so only the pong-deadline eviction
+		// (not a write/read error) can free the peer slot.
+		for {
+			conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+			if _, _, rdErr2 := p2p.ReadMsg(conn); rdErr2 != nil {
+				return // connection closed by the host — eviction fired
+			}
+		}
+	}()
+
+	// Short keepalive so the test completes quickly: deadline = 200 ms.
+	const keepalive = 100 * time.Millisecond
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          5,
+		NodeID:            "pong-deadline-test",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: keepalive,
+	}, &stubHandler{}, newTestLogger())
+	if sErr := host.Start(); sErr != nil {
+		t.Fatalf("host.Start: %v", sErr)
+	}
+	defer host.Stop()
+
+	// Dial the server; wait up to 2 s for the connection to be established.
+	host.DialPeer(ln.Addr().String())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if host.PeerCount() != 1 {
+		t.Fatalf("peer never connected")
+	}
+
+	// The pong deadline is 2×keepalive = 200 ms from the handshake pong.
+	// Allow a generous 3 s for the eviction to fire and the peer table to
+	// be cleaned up (handles slow CI schedulers without flaking).
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if host.PeerCount() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := host.PeerCount(); got != 0 {
+		t.Fatalf("dead peer was not evicted: PeerCount = %d, want 0 — pong-deadline eviction regressed", got)
+	}
+
+	// The server's read loop must have observed the connection close.
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Error("server never saw the connection close — host did not close the dead peer's conn")
+	}
+}
+
 func TestHost_BroadcastBlock_NoPeers(t *testing.T) {
 	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
 	priv, pub, _ := crypto.GenerateValidatorKey()
