@@ -106,6 +106,14 @@ func HostKeepaliveInterval(h *Host) time.Duration {
 	return h.cfg.KeepaliveInterval
 }
 
+// HostGetBlockStallTimeout returns the GetBlockStallTimeout stored in the
+// host's config after NewHost has applied any defaults.  Exported for unit
+// tests that verify the node.yaml → p2p.Config → Host wiring (e.g. a raised
+// 60s value must survive NewHost instead of falling back to the 15s default).
+func HostGetBlockStallTimeout(h *Host) time.Duration {
+	return h.cfg.GetBlockStallTimeout
+}
+
 // SetKeepaliveIntervalForTest sets the live keepalive interval atomically
 // without enforcing the [1s, 15s] production range constraint.  Use only in
 // unit tests that need ms-scale intervals to avoid slow wall-clock waits.
@@ -257,6 +265,66 @@ func HostBootnodeInBackoff(h *Host, addr string) bool {
 // Exported so tests can pre-load back-off state to exercise the throttle path.
 func HostRecordBootnodeFail(h *Host, addr string) {
 	h.recordBootnodeFail(addr)
+}
+
+// HostSetSendHook installs fn as the send function used by BroadcastBlock
+// (and its retry path) instead of Peer.Send.  Pass nil to restore the
+// default.  Exported for tests that inject transient send failures.
+func HostSetSendHook(h *Host, fn func(*Peer, MessageType, interface{}) (int, error)) {
+	if fn == nil {
+		h.sendHook.Store(nil)
+		return
+	}
+	h.sendHook.Store(&fn)
+}
+
+// NewTestPeer constructs a bare Peer around conn for transport-level tests
+// that must exercise the production sendN path (byte accounting, poisoning)
+// without a full host handshake.  Exported for testing only.
+func NewTestPeer(conn net.Conn, addr string) *Peer {
+	return &Peer{conn: conn, addr: addr}
+}
+
+// PeerPoisoned reports whether the peer's stream has been marked poisoned
+// by a partial write.  Exported for testing only.
+func (p *Peer) PeerPoisoned() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.poisoned
+}
+
+// PeerSendN exposes Peer.sendN for tests (byte-accounted send).
+func (p *Peer) PeerSendN(msgType MessageType, payload interface{}) (int, error) {
+	return p.sendN(msgType, payload)
+}
+
+// WriteMsgN exposes writeMsgN for transport-level partial-write tests.
+func WriteMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, error) {
+	return writeMsgN(conn, msgType, payload)
+}
+
+// PeerAddr returns the peer's address key as used in the host peer table.
+// Exported for testing only.
+func (p *Peer) PeerAddr() string {
+	return p.addr
+}
+
+// HostPeers returns a snapshot of currently registered peers.  Exported for
+// testing only.
+func HostPeers(h *Host) []*Peer {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*Peer, 0, len(h.peers))
+	for _, p := range h.peers {
+		out = append(out, p)
+	}
+	return out
+}
+
+// HostBroadcastRetryDelay returns the BroadcastRetryDelay stored in the
+// host's config after NewHost has applied any defaults.  Exported for tests.
+func HostBroadcastRetryDelay(h *Host) time.Duration {
+	return h.cfg.BroadcastRetryDelay
 }
 
 // HostMaxDialBackoff returns the MaxDialBackoff value stored in the host's
