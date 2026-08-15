@@ -220,6 +220,144 @@ func TestBootnodeDialBackoff_MinPeersBypassBlocked(t *testing.T) {
 	}
 }
 
+// TestBootnodeDialBackoff_ClearedAfterBriefConnect is the key regression test
+// for the accumulated-back-off-then-brief-connect scenario.
+//
+// Scenario:
+//  1. The bootnode is down; several consecutive TCP failures push it into the
+//     back-off state with nextDial ≈ MaxDialBackoff in the future.
+//  2. The validator recovers; the next dial attempt succeeds, the P2P
+//     handshake completes (connectedAt is set in handleConn), but the session
+//     is then dropped before stableConnTime elapses.
+//  3. Because connectedAt is non-zero, handleConn's deferred cleanup must call
+//     clearBootnodeFail, erasing the prior back-off state.
+//  4. The next maintainLoop tick must therefore re-dial immediately rather than
+//     waiting for the (already-expired or still-pending) back-off window.
+//
+// Without the fix, clearBootnodeFail was only called when the session lasted ≥
+// stableConnTime (60 s), leaving the prior TCP-failure back-off in place and
+// delaying the reconnect by up to MaxDialBackoff.
+func TestBootnodeDialBackoff_ClearedAfterBriefConnect(t *testing.T) {
+	const backoff = 200 * time.Millisecond
+	const bootnodeAddr = "127.0.0.1:19945"
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		Bootnodes:           []string{bootnodeAddr},
+		MaxPeers:            5,
+		NodeID:              "test-clear-after-brief",
+		UserAgent:           "aperod-test/0.1",
+		MaxDialBackoff:      backoff,
+		MaxStaleBootnodeAge: time.Hour,
+	}, &stubHandler{}, log)
+
+	p2p.HostSetBootnodeResolved(h, bootnodeAddr, []string{bootnodeAddr})
+
+	// useHandshake controls which code path the dial func takes.
+	// false = TCP fail (Phase 1: accumulate back-off)
+	// true  = net.Pipe + P2P handshake (Phase 2: brief connect then drop)
+	var useHandshake atomic.Bool
+	var dialCount atomic.Int64
+
+	// connectCh is signalled once the Phase-2 server goroutine has written
+	// MsgPong (connectedAt will be set in handleConn shortly after).
+	connectCh := make(chan struct{}, 1)
+
+	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != bootnodeAddr {
+			return stubDialFail(ctx, network, addr)
+		}
+		dialCount.Add(1)
+		if !useHandshake.Load() {
+			return stubDialFail(ctx, network, addr)
+		}
+		// Return a net.Pipe pair.  Our goroutine acts as the remote peer:
+		// read MsgPing, write MsgPong, then immediately close the connection
+		// so the session drops before stableConnTime (60 s).
+		server, client := net.Pipe()
+		go func() {
+			defer server.Close()
+			server.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+			mt, _, err := p2p.ReadMsg(server)
+			if err != nil || mt != p2p.MsgPing {
+				return
+			}
+			if err := p2p.WriteMsg(server, p2p.MsgPong, p2p.PingMsg{
+				NodeID:    "brief-server",
+				UserAgent: "test",
+				Timestamp: time.Now().Unix(),
+			}); err != nil {
+				return
+			}
+			// Signal that the P2P handshake is complete; server.Close() in the
+			// defer immediately drops the session (< stableConnTime).
+			select {
+			case connectCh <- struct{}{}:
+			default:
+			}
+		}()
+		return client, nil
+	})
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Host.Start: %v", err)
+	}
+	defer h.Stop()
+
+	// ── Phase 1: wait for at least one TCP failure to be recorded ─────────────
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("back-off not recorded within 2 s of startup")
+	}
+	t.Logf("Phase 1: bootnode in back-off after TCP failure (dials so far: %d)", dialCount.Load())
+
+	// ── Phase 2: switch to the handshake-completing dial; wait for back-off ───
+	useHandshake.Store(true)
+	time.Sleep(backoff + 100*time.Millisecond) // back-off window expires
+
+	if p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("bootnode still in back-off after window should have expired")
+	}
+
+	// Trigger a maintain tick so maintainLoop dials via the handshake path.
+	p2p.HostTriggerMaintain(h)
+
+	// Wait for the server goroutine to signal that MsgPong was sent.
+	select {
+	case <-connectCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("P2P handshake never completed within 3 s")
+	}
+	t.Logf("Phase 2: P2P handshake completed (brief connect); dials so far: %d", dialCount.Load())
+
+	// Allow handleConn's deferred cleanup to run.
+	time.Sleep(200 * time.Millisecond)
+
+	// ── Assertion: back-off must be cleared because connectedAt is non-zero ───
+	if p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Errorf("bootnode back-off NOT cleared after brief-connected session: " +
+			"clearBootnodeFail should be called when connectedAt is non-zero, " +
+			"regardless of session length")
+	}
+
+	// ── Assertion: the next maintain tick must re-dial immediately ─────────────
+	beforeCount := dialCount.Load()
+	p2p.HostTriggerMaintain(h)
+	time.Sleep(200 * time.Millisecond)
+	if dialCount.Load() <= beforeCount {
+		t.Errorf("bootnode not re-dialled after back-off cleared by brief connect "+
+			"(count before=%d, after=%d)", beforeCount, dialCount.Load())
+	}
+}
+
 // TestBootnodeDialBackoff_RetryAfterExpiry confirms that once the back-off
 // window expires, the next maintainLoop tick retries the dial.
 func TestBootnodeDialBackoff_RetryAfterExpiry(t *testing.T) {
