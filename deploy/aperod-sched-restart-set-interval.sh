@@ -62,6 +62,17 @@ if [[ -n "${ARG_INTERVAL}" ]]; then
     echo "${KEY_LINE}" >> "${ENV_FILE}"
   fi
   echo "[INFO] Wrote ${KEY_LINE} to ${ENV_FILE}"
+
+  # Record the Unix-ms timestamp of this interval change so the API can detect
+  # that the countdown base has shifted even before the next restart fires.
+  TS_MS=$(( $(date +%s) * 1000 ))
+  CHANGED_LINE="SCHED_RESTART_INTERVAL_CHANGED_AT=${TS_MS}"
+  if [[ -f "${ENV_FILE}" ]] && grep -qE '^\s*SCHED_RESTART_INTERVAL_CHANGED_AT\s*=' "${ENV_FILE}" 2>/dev/null; then
+    sed -i "s|^\s*SCHED_RESTART_INTERVAL_CHANGED_AT\s*=.*|${CHANGED_LINE}|" "${ENV_FILE}"
+  else
+    echo "${CHANGED_LINE}" >> "${ENV_FILE}"
+  fi
+  echo "[INFO] Wrote ${CHANGED_LINE} to ${ENV_FILE}"
 fi
 
 # ── Read interval from env file ───────────────────────────────────────────────
