@@ -10,9 +10,13 @@ package p2p_test
 // 3.5.6 Peer count limit:     MaxPeers=1 causes the second connection to be dropped.
 
 import (
+        "bytes"
         "crypto/tls"
         "encoding/json"
+        "log/slog"
         "net"
+        "strings"
+        "sync"
         "testing"
         "time"
 
@@ -600,6 +604,136 @@ func TestDuplicateP2PIdentity_Rejected(t *testing.T) {
                 t.Errorf("3.5.8: peer count = %d after identity-conflict rejection, want 0", host.PeerCount())
         }
 
+        // Task #1905: the guard must also record a DuplicateIdentityEvent in the
+        // ring buffer so the API server can surface it in the Admin Panel.
+        evts := host.GetDuplicateIdentityEvents(time.Time{})
+        if len(evts) == 0 {
+                t.Error("3.5.8: GetDuplicateIdentityEvents returned no events after identity-conflict rejection")
+        } else {
+                if evts[0].Fingerprint != sharedFP {
+                        t.Errorf("3.5.8: event fingerprint = %s, want %s", evts[0].Fingerprint, sharedFP)
+                }
+                if evts[0].Addr == "" {
+                        t.Error("3.5.8: event addr is empty")
+                }
+                if evts[0].At.IsZero() {
+                        t.Error("3.5.8: event timestamp is zero")
+                }
+                // A since-filter in the future must exclude the event.
+                if got := host.GetDuplicateIdentityEvents(time.Now().Add(time.Hour)); len(got) != 0 {
+                        t.Errorf("3.5.8: since-filter returned %d events, want 0", len(got))
+                }
+        }
+
         t.Logf("3.5.8 ✓ duplicate P2P identity rejected: readErr=%v peerCount=%d fp=%s…",
                 readErr, host.PeerCount(), sharedFP[:8])
+}
+
+// ─── 3.5.9 Duplicate P2P identity — outbound dial path ───────────────────────
+
+// syncLogBuffer is a concurrency-safe bytes.Buffer for capturing slog output
+// from the Host's background goroutines.
+type syncLogBuffer struct {
+        mu  sync.Mutex
+        buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+        b.mu.Lock()
+        defer b.mu.Unlock()
+        return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+        b.mu.Lock()
+        defer b.mu.Unlock()
+        return b.buf.String()
+}
+
+// TestDuplicateP2PIdentity_RejectedOutbound verifies that the identity-conflict
+// guard also fires on the OUTBOUND dial path: when the host dials a listener
+// that presents the host's own TLS fingerprint (the "two cloned nodes dial each
+// other" scenario), the connection must be closed after the TLS handshake
+// without registering the peer, and the identity-conflict ERROR must be logged.
+func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
+        // One shared TLS identity for both "nodes" — simulates two nodes cloned
+        // from the same data directory (copied p2p_identity.key).
+        sharedCfg, sharedFP, err := p2p.GenerateNodeTLSConfig()
+        if err != nil {
+                t.Fatalf("GenerateNodeTLSConfig: %v", err)
+        }
+
+        // Capture ERROR-level logs so the identity-conflict message can be asserted.
+        logBuf := &syncLogBuffer{}
+        logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
+
+        host := p2p.NewHost(p2p.Config{
+                ListenAddr:      "127.0.0.1:0",
+                MaxPeers:        5,
+                NodeID:          "outbound-host",
+                UserAgent:       "aperod/test",
+                TLSConfig:       sharedCfg,
+                SelfFingerprint: sharedFP,
+        }, &stubHandler{}, logger)
+        if err := host.Start(); err != nil {
+                t.Fatalf("host.Start: %v", err)
+        }
+        t.Cleanup(host.Stop)
+
+        // Remote "clone" node: a bare TLS listener presenting the SAME cert.
+        ln, err := tls.Listen("tcp", "127.0.0.1:0", sharedCfg)
+        if err != nil {
+                t.Fatalf("tls.Listen: %v", err)
+        }
+        t.Cleanup(func() { ln.Close() })
+
+        // remoteClosed is signalled when the host closes the connection (the
+        // listener side observes EOF / reset on its first read).
+        remoteClosed := make(chan error, 1)
+        go func() {
+                c, err := ln.Accept()
+                if err != nil {
+                        remoteClosed <- err
+                        return
+                }
+                defer c.Close()
+                // The server-side TLS handshake completes lazily on first Read.
+                // If the host's identity-conflict guard fires, it closes the conn
+                // right after the handshake, so this Read must fail — and it must
+                // NOT return a valid Aperod Ping frame first.
+                c.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+                buf := make([]byte, 1)
+                _, readErr := c.Read(buf)
+                remoteClosed <- readErr
+        }()
+
+        // Host acts as the outbound dialer toward the cloned listener.
+        host.DialPeer(ln.Addr().String())
+
+        // Wait for the remote side to observe the disconnect.
+        select {
+        case readErr := <-remoteClosed:
+                if readErr == nil {
+                        t.Error("3.5.9: host sent application data to a duplicate-identity peer — outbound guard did not fire before the Aperod handshake")
+                }
+        case <-time.After(4 * time.Second):
+                t.Fatal("3.5.9: timed out waiting for the host to close the duplicate-identity connection")
+        }
+
+        // Give the host a moment to finish any teardown bookkeeping.
+        time.Sleep(100 * time.Millisecond)
+
+        // The peer must never be registered.
+        if host.PeerCount() != 0 {
+                t.Errorf("3.5.9: peer count = %d after outbound identity-conflict rejection, want 0", host.PeerCount())
+        }
+
+        // The identity-conflict ERROR log must be present.
+        logs := logBuf.String()
+        if !strings.Contains(logs, "identity conflict") {
+                t.Errorf("3.5.9: identity-conflict ERROR log not found; captured logs:\n%s", logs)
+        }
+
+        t.Logf("3.5.9 ✓ outbound duplicate P2P identity rejected: peerCount=%d fp=%s…",
+                host.PeerCount(), sharedFP[:8])
 }
