@@ -142,3 +142,69 @@ func TestMemWatchdogSavesSnapshotBeforeKill(t *testing.T) {
 		t.Errorf("expected \"shutdown: snapshot saved\" log was not emitted\nlog:\n%s", logBuf.String())
 	}
 }
+
+// TestMemWatchdogFiresOnlyOnce verifies that the memory watchdog sends at most
+// one signal through memPressureCh even when RSS stays above the threshold
+// across multiple ticker ticks.
+//
+// A refactor that accidentally removes the `fired` flag guard would cause
+// memPressureCh to receive a second signal, triggering a double-shutdown that
+// could corrupt the snapshot or panic on a closed channel.
+func TestMemWatchdogFiresOnlyOnce(t *testing.T) {
+	// ticks is a buffered channel: we can pre-load two ticks without blocking.
+	ticks := make(chan time.Time, 2)
+
+	// threshold = 65 % of a 1 GiB fake limit (same formula as production).
+	const fakeLimit int64 = 1 << 30 // 1 GiB
+	threshold := uint64(fakeLimit) * 65 / 100
+
+	// rssAboveThreshold always reports RSS just above the threshold so that
+	// every tick should (naïvely) trigger the watchdog.
+	rssAboveThreshold := func() int64 { return int64(threshold) + 1 }
+
+	// memPressureCh is buffered (capacity 1) — same as production.
+	// After the watchdog fires once the channel is full; a non-guarded second
+	// send would silently drop into the default branch, so we use a larger
+	// buffer (capacity 2) to detect whether a second signal was attempted.
+	memPressureCh := make(chan struct{}, 2)
+
+	stop := make(chan struct{})
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	// Pre-load two above-threshold ticks so the goroutine processes both
+	// without any wall-clock wait.
+	ticks <- time.Now()
+	ticks <- time.Now()
+
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		runMemoryWatchdogLoop(ticks, stop, threshold, fakeLimit, rssAboveThreshold, memPressureCh, log)
+	}()
+
+	// Give the goroutine enough time to drain both ticks.
+	// A short sleep is fine here because we pre-loaded the channel and the
+	// goroutine does no I/O — it will finish both iterations in microseconds.
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop the watchdog.
+	close(stop)
+	select {
+	case <-watchdogDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for watchdog goroutine to exit")
+	}
+
+	// Assert: exactly one signal was sent, not two.
+	got := len(memPressureCh)
+	if got != 1 {
+		t.Errorf("memPressureCh has %d signal(s) after two above-threshold ticks, want exactly 1\nlog:\n%s",
+			got, logBuf.String())
+	}
+
+	// The watchdog must have logged the Warn exactly once.
+	if !logContainsMsg(&logBuf, "memory watchdog: RSS approaching GOMEMLIMIT — initiating proactive graceful restart") {
+		t.Errorf("expected watchdog Warn log was not emitted\nlog:\n%s", logBuf.String())
+	}
+}
