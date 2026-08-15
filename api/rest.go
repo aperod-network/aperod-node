@@ -2690,12 +2690,22 @@ func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := s.p2pKeepaliveGetFn()
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		resp := map[string]interface{}{
 			"keepalive_interval_secs":     int(d.Seconds()),
 			"bad_block_ban_threshold":     s.p2pBadBlockBanThreshold,
 			"bad_block_ban_duration_secs": s.p2pBadBlockBanDurationSecs,
 			"bad_block_height_lead":       s.p2pBadBlockHeightLead,
-		})
+		}
+		// Task #1910 — report the persisted node.yaml value alongside the
+		// live value so operators can see when they differ (i.e. a tuned
+		// interval that would NOT survive a restart).
+		if s.p2pKeepaliveYAMLFn != nil {
+			if yd, err := s.p2pKeepaliveYAMLFn(); err == nil {
+				resp["keepalive_interval_yaml_secs"] = int(yd.Seconds())
+				resp["keepalive_persisted"] = int(yd.Seconds()) == int(d.Seconds())
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 
 	case http.MethodPost:
 		if s.p2pKeepaliveSetFn == nil {
@@ -2712,10 +2722,25 @@ func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		// Task #1910 — persist the new interval to node.yaml (atomic
+		// tmp+rename) so it survives a node restart.  A persistence
+		// failure does NOT roll back the live update; it is reported to
+		// the caller via persisted:false + persist_error instead.
+		resp := map[string]interface{}{
 			"message":                 "keepalive_interval updated",
 			"keepalive_interval_secs": req.KeepaliveIntervalSecs,
-		})
+		}
+		if s.p2pKeepalivePersistFn != nil {
+			if err := s.p2pKeepalivePersistFn(d); err != nil {
+				resp["persisted"] = false
+				resp["persist_error"] = err.Error()
+			} else {
+				resp["persisted"] = true
+			}
+		} else {
+			resp["persisted"] = false
+		}
+		writeJSON(w, http.StatusOK, resp)
 
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
