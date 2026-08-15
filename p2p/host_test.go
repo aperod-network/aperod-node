@@ -46,7 +46,7 @@ func (s *stubHandler) OnVote(v p2p.VoteMsg) {
 	s.votes = append(s.votes, v)
 	s.mu.Unlock()
 }
-func (s *stubHandler) CurrentHeight() uint64                    { return 0 }
+func (s *stubHandler) CurrentHeight() uint64                   { return 0 }
 func (s *stubHandler) CurrentTailHashes(_ int) []crypto.Hash32 { return nil }
 func (s *stubHandler) GetBlock(_ crypto.Hash32) *core.Block    { return nil }
 
@@ -122,9 +122,9 @@ func TestHost_SetKeepaliveInterval_Validation(t *testing.T) {
 	}{
 		{0, true},
 		{500 * time.Millisecond, true},
-		{1 * time.Second, false},        // lower bound — valid
-		{7 * time.Second, false},        // midpoint — valid
-		{15 * time.Second, false},       // upper bound — valid
+		{1 * time.Second, false},  // lower bound — valid
+		{7 * time.Second, false},  // midpoint — valid
+		{15 * time.Second, false}, // upper bound — valid
 		{16 * time.Second, true},
 		{time.Hour, true},
 	}
@@ -368,6 +368,131 @@ func TestHost_KeepalivePongDeadline_EvictsDeadPeer(t *testing.T) {
 	case <-serverDone:
 	case <-time.After(2 * time.Second):
 		t.Error("server never saw the connection close — host did not close the dead peer's conn")
+	}
+}
+
+// TestHost_KeepaliveTickRate_MatchesConfiguredInterval verifies that the
+// keepalive goroutine actually ticks at the configured KeepaliveInterval and
+// sends MsgPing at that rate — not just that NewHost stores the value.  A
+// future change that hardcodes the ticker duration (e.g. time.NewTicker(10 *
+// time.Second) instead of the configured interval) would pass the storage
+// tests but silently break operators who tune keepalive_interval for
+// high-latency links; this test catches that regression.
+//
+// Setup: a raw TCP loopback server completes the asymmetric handshake and
+// then counts every incoming MsgPing over a measured window, replying with a
+// MsgPong to each so the pong-deadline eviction never fires.  With a 200 ms
+// interval and a 1.2 s window we expect ~6 keepalive pings; the assertion
+// accepts ±50 % (3..9) so slow CI schedulers do not flake, while a hardcoded
+// 10 s ticker (0 pings) or a runaway ticker (>9 pings) both fail clearly.
+func TestHost_KeepaliveTickRate_MatchesConfiguredInterval(t *testing.T) {
+	const (
+		interval    = 200 * time.Millisecond
+		measureWin  = 1200 * time.Millisecond
+		expectPings = 6 // measureWin / interval
+	)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// pingCount counts keepalive MsgPing frames received AFTER the
+	// handshake ping; windowStart is closed once the handshake completes
+	// so the measurement window is anchored at the moment the keepalive
+	// goroutine starts, not at test start.
+	var pingCount atomic.Int64
+	windowStart := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Asymmetric handshake: outbound host sends MsgPing first.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("server: expected handshake MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "tick-rate-server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			return
+		}
+		close(windowStart) // keepalive goroutine is now running on the host side
+
+		// Count keepalive pings; reply Pong to each so the host never
+		// evicts us via the pong-deadline check.
+		for {
+			conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+			mt2, _, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return // connection closed — test is finishing
+			}
+			if mt2 == p2p.MsgPing {
+				pingCount.Add(1)
+				_ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+					NodeID: "tick-rate-server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+				})
+			}
+		}
+	}()
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          5,
+		NodeID:            "tick-rate-test",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: interval,
+	}, &stubHandler{}, newTestLogger())
+	if sErr := host.Start(); sErr != nil {
+		t.Fatalf("host.Start: %v", sErr)
+	}
+	var stopOnce sync.Once
+	stopHost := func() { stopOnce.Do(host.Stop) }
+	defer stopHost()
+
+	// Sanity: the configured interval must have survived NewHost unchanged
+	// (guards against a default-application bug masking the tick-rate check).
+	if got := p2p.HostKeepaliveInterval(host); got != interval {
+		t.Fatalf("KeepaliveInterval after NewHost = %v, want %v", got, interval)
+	}
+
+	host.DialPeer(ln.Addr().String())
+
+	// Wait for the handshake to complete so the measurement window starts
+	// exactly when the keepalive goroutine does.
+	select {
+	case <-windowStart:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handshake never completed — no MsgPing received by server")
+	}
+
+	// Measured window: count keepalive pings that arrive within it.
+	time.Sleep(measureWin)
+	got := pingCount.Load()
+
+	// ±50 % tolerance: [expectPings/2, expectPings*3/2] = [3, 9].
+	lo, hi := int64(expectPings/2), int64(expectPings*3/2)
+	if got < lo || got > hi {
+		t.Errorf("keepalive ping rate mismatch: got %d pings in %v with interval %v, want %d±50%% ([%d, %d]) — "+
+			"the keepalive ticker is not running at the configured KeepaliveInterval",
+			got, measureWin, interval, expectPings, lo, hi)
+	}
+
+	// Tear down: closing the host closes the connection; the server's read
+	// loop must observe it and exit.
+	stopHost()
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Error("server never saw the connection close")
 	}
 }
 
@@ -1277,9 +1402,9 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 		NodeID:     "wl-invalid-host",
 		UserAgent:  "aperod/test",
 		PeerWhitelist: []string{
-			"127.0.0.1",   // valid bare IP  — must be kept
-			"10.0.0.0/8",  // valid CIDR     — must be kept
-			"not-an-ip",   // garbage        — must be skipped without crashing
+			"127.0.0.1",  // valid bare IP  — must be kept
+			"10.0.0.0/8", // valid CIDR     — must be kept
+			"not-an-ip",  // garbage        — must be skipped without crashing
 		},
 	}, &stubHandler{}, newTestLogger())
 
@@ -1866,8 +1991,9 @@ func TestHost_WhitelistSidecar_UnreadablePermissions(t *testing.T) {
 // TestHost_AddToWhitelist_UnwritableDir_RollsBack verifies the write-first
 // design of applyWhitelistLocked: when the sidecar directory loses write
 // permission after the node starts, AddToWhitelist must
-//   (a) return a non-nil error, and
-//   (b) leave the in-memory whitelist unchanged — no silent partial update.
+//
+//	(a) return a non-nil error, and
+//	(b) leave the in-memory whitelist unchanged — no silent partial update.
 //
 // Without the persist-before-swap ordering, the caller would receive an error
 // but the in-memory list would already contain the new entry; on the next
@@ -2252,7 +2378,7 @@ func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
 type gapSyncHandler struct {
 	mu     sync.Mutex
 	tip    uint64
-	chain  []*core.Block          // chain[i] is the accepted block at height i
+	chain  []*core.Block // chain[i] is the accepted block at height i
 	byHash map[crypto.Hash32]*core.Block
 }
 
@@ -2584,10 +2710,10 @@ func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
 // fail phase 2 while the static-chain gap test (which uses a frozen chain)
 // would continue to pass — this test catches that regression.
 func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
-	const initialGap = 500           // blocks pre-built before relay connects
+	const initialGap = 500 // blocks pre-built before relay connects
 	const productionInterval = 50 * time.Millisecond
-	const minLiveBlocks = 15         // live blocks that must exist before phase-2 check
-	const allowedLag = 5             // relay may trail the live tip by this many blocks
+	const minLiveBlocks = 15 // live blocks that must exist before phase-2 check
+	const allowedLag = 5     // relay may trail the live tip by this many blocks
 	const catchUpTimeout = 30 * time.Second
 	const liveTimeout = 15 * time.Second
 
@@ -2954,7 +3080,6 @@ func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
 			finalRelayTip, finalLiveTip, lag)
 	}
 }
-
 
 // TestSync_RelayStall_ReissuesGetHeaders verifies that when a relay node sends
 // MsgGetBlock requests that the peer never answers (block pruned, reorg, or
@@ -3357,11 +3482,11 @@ func TestSync_RelayStall_Recovers(t *testing.T) {
 // silently disable the protection: a deliberately rogue peer that keeps
 // sending blocks far above our tip
 //
-//   1. is NOT banned by the first 5 bad blocks minus one (threshold-1 = 4),
-//   2. IS banned once the 5-strike threshold is reached (ListBans has a
-//      matching bare-IP entry with the "rogue fork blocks" reason),
-//   3. is disconnected immediately (PeerCount drops to 0), and
-//   4. cannot reconnect from the same IP on a new source port.
+//  1. is NOT banned by the first 5 bad blocks minus one (threshold-1 = 4),
+//  2. IS banned once the 5-strike threshold is reached (ListBans has a
+//     matching bare-IP entry with the "rogue fork blocks" reason),
+//  3. is disconnected immediately (PeerCount drops to 0), and
+//  4. cannot reconnect from the same IP on a new source port.
 //
 // The task description asks for 6+ bad blocks; we send 6 to mirror a real
 // attacker that does not stop at the threshold.
@@ -3635,9 +3760,9 @@ func (h *heightTrackingHandler) OnBlock(b *core.Block) {
 		h.height = b.Header.Height
 	}
 }
-func (h *heightTrackingHandler) OnTransaction(_ *core.Transaction)    {}
-func (h *heightTrackingHandler) OnVote(_ p2p.VoteMsg)                 {}
-func (h *heightTrackingHandler) CurrentHeight() uint64                 {
+func (h *heightTrackingHandler) OnTransaction(_ *core.Transaction) {}
+func (h *heightTrackingHandler) OnVote(_ p2p.VoteMsg)              {}
+func (h *heightTrackingHandler) CurrentHeight() uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.height
@@ -3833,5 +3958,198 @@ func TestHost_WhitelistSidecar_UnreadableFailsClosed(t *testing.T) {
 	if err == nil {
 		h.Stop()
 		t.Fatal("Start() succeeded with an unreadable whitelist sidecar — expected a non-nil error (fail-closed)")
+	}
+}
+
+// TestHost_SetKeepaliveInterval_MidConnection_AdoptsNewRate verifies that the
+// keepalive goroutine actually adopts a new interval set via the production
+// SetKeepaliveInterval API mid-connection: after the change, subsequent
+// keepalive pings must arrive at the NEW rate (each inter-ping gap within
+// ±20% of the new interval).  A regression in the atomic load or the
+// ping.Reset call inside the keepalive goroutine would keep ticking at the
+// old rate and silently drop peers on high-latency links; this test catches
+// that before production.
+//
+// Timeline: the host connects with a 2 s initial interval; the test then
+// calls SetKeepaliveInterval(1 s) (valid production value, no test helper).
+// The goroutine observes the change on its next tick (~2 s, still at the old
+// cadence, by design — "reset on next tick"), resets the ticker, and from
+// then on every gap between consecutive pings must be ~1 s ±20%.
+func TestHost_SetKeepaliveInterval_MidConnection_AdoptsNewRate(t *testing.T) {
+	const (
+		initialInterval = 2 * time.Second
+		newInterval     = 1 * time.Second
+		wantPostPings   = 4 // transition ping + 3 gaps at the new rate
+	)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// pingTimes records the arrival time of every keepalive MsgPing received
+	// after the handshake ping.  Guarded by pingMu.
+	var (
+		pingMu    sync.Mutex
+		pingTimes []time.Time
+	)
+	handshakeDone := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Asymmetric handshake: outbound host sends MsgPing first.
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		mt, _, rdErr := p2p.ReadMsg(conn)
+		if rdErr != nil || mt != p2p.MsgPing {
+			t.Logf("server: expected handshake MsgPing, got %v err=%v", mt, rdErr)
+			return
+		}
+		if wErr := p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+			NodeID: "rate-change-server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+		}); wErr != nil {
+			return
+		}
+		close(handshakeDone)
+
+		// Record keepalive ping arrival times; reply Pong to each so the
+		// pong-deadline eviction never fires.
+		for {
+			conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+			mt2, _, rdErr2 := p2p.ReadMsg(conn)
+			if rdErr2 != nil {
+				return // connection closed — test is finishing
+			}
+			if mt2 == p2p.MsgPing {
+				pingMu.Lock()
+				pingTimes = append(pingTimes, time.Now())
+				pingMu.Unlock()
+				_ = p2p.WriteMsg(conn, p2p.MsgPong, p2p.PingMsg{
+					NodeID: "rate-change-server", Height: 0, UserAgent: "test", Timestamp: time.Now().UnixNano(),
+				})
+			}
+		}
+	}()
+
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:        "127.0.0.1:0",
+		MaxPeers:          5,
+		NodeID:            "rate-change-test",
+		UserAgent:         "aperod/test",
+		KeepaliveInterval: initialInterval,
+	}, &stubHandler{}, newTestLogger())
+	if sErr := host.Start(); sErr != nil {
+		t.Fatalf("host.Start: %v", sErr)
+	}
+	var stopOnce sync.Once
+	stopHost := func() { stopOnce.Do(host.Stop) }
+	defer stopHost()
+
+	host.DialPeer(ln.Addr().String())
+	select {
+	case <-handshakeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handshake never completed — no MsgPing received by server")
+	}
+
+	// Mid-connection interval change via the PRODUCTION API (not the test
+	// helper) so the atomic store → atomic load → ticker Reset chain is
+	// exercised end to end.
+	if kErr := host.SetKeepaliveInterval(newInterval); kErr != nil {
+		t.Fatalf("SetKeepaliveInterval(%v): %v", newInterval, kErr)
+	}
+	if got := host.GetKeepaliveInterval(); got != newInterval {
+		t.Fatalf("GetKeepaliveInterval after change = %v, want %v", got, newInterval)
+	}
+
+	// Wait for enough post-change pings.  The first ping arrives at the old
+	// 2 s cadence (change is applied ON that tick), then three more at 1 s
+	// each: worst case ~2s + 3×1s = 5 s; allow 15 s for slow CI.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		pingMu.Lock()
+		n := len(pingTimes)
+		pingMu.Unlock()
+		if n >= wantPostPings {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pingMu.Lock()
+	times := append([]time.Time(nil), pingTimes...)
+	pingMu.Unlock()
+	if len(times) < wantPostPings {
+		t.Fatalf("received only %d keepalive pings, want ≥%d — keepalive goroutine stalled after SetKeepaliveInterval", len(times), wantPostPings)
+	}
+
+	// Gaps AFTER the transition ping (times[0] fires at the old cadence)
+	// must each be within ±20%% of the new interval.
+	lo := time.Duration(float64(newInterval) * 0.8)
+	hi := time.Duration(float64(newInterval) * 1.2)
+	for i := 1; i < wantPostPings; i++ {
+		gap := times[i].Sub(times[i-1])
+		if gap < lo || gap > hi {
+			t.Errorf("post-change ping gap %d = %v, want %v ±20%% ([%v, %v]) — keepalive ticker did not adopt the new interval",
+				i, gap.Round(time.Millisecond), newInterval, lo, hi)
+		}
+	}
+
+	stopHost()
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Error("server never saw the connection close")
+	}
+}
+
+// TestHost_SetKeepaliveInterval_RejectedValueLeavesIntervalUnchanged verifies
+// that when SetKeepaliveInterval rejects an out-of-range value (outside
+// [1s, 15s]) with an error, the live interval is left exactly as it was —
+// a failed validation must never half-apply the new value, or the keepalive
+// goroutine would silently tick at an unintended rate.
+func TestHost_SetKeepaliveInterval_RejectedValueLeavesIntervalUnchanged(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+
+	// Establish a known-good baseline distinct from the 10 s default.
+	const baseline = 5 * time.Second
+	if err := h.SetKeepaliveInterval(baseline); err != nil {
+		t.Fatalf("SetKeepaliveInterval(%v): %v", baseline, err)
+	}
+
+	for _, bad := range []time.Duration{
+		0,
+		-1 * time.Second,
+		999 * time.Millisecond,
+		15*time.Second + time.Nanosecond,
+		16 * time.Second,
+		time.Hour,
+	} {
+		err := h.SetKeepaliveInterval(bad)
+		if err == nil {
+			t.Errorf("SetKeepaliveInterval(%v): want error, got nil", bad)
+		}
+		if got := h.GetKeepaliveInterval(); got != baseline {
+			t.Errorf("after rejected SetKeepaliveInterval(%v): interval = %v, want unchanged %v", bad, got, baseline)
+		}
+	}
+}
+
+// TestHost_GetPeerList verifies that GetPeerList returns the correct peer
+// snapshot including height and direction, and returns an empty slice when no
+// peers are connected.
+func TestHost_GetPeerList_EmptyWhenNoPeers(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	peers := h.GetPeerList()
+	if peers == nil {
+		t.Fatal("GetPeerList() = nil, want empty non-nil slice")
+	}
+	if len(peers) != 0 {
+		t.Errorf("GetPeerList() len = %d, want 0 (no connected peers)", len(peers))
 	}
 }
