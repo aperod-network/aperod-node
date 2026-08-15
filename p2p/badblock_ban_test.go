@@ -1975,6 +1975,274 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 	}
 }
 
+// ─── Test: TLS peers sharing an IP are all evicted on ban ────────────────────
+
+// TestBadBlockBan_TLSAllConnectionsEvicted verifies that all TLS-wrapped
+// connections from a banned IP are evicted immediately — not just the one that
+// triggered the threshold.
+//
+// This is the TLS counterpart of TestBadBlockBan_AllConnectionsEvicted.  The
+// original plain-TCP test cannot catch a regression where evictByIP performs a
+// type assertion on net.Conn (e.g. casting to *net.TCPConn) that silently skips
+// *tls.Conn values, leaving the second TLS connection open after the ban fires.
+//
+// Test sequence:
+//  1. Boot a Host with mutual-TLS enabled.
+//  2. Open two TLS connections from the same loopback IP (different source ports).
+//  3. Wait for PeerCount to reach 2.
+//  4. Send 10 out-of-range blocks on the first TLS connection → ban fires.
+//  5. Assert PeerCount drops to 0 (both connections evicted).
+//  6. Assert the second TLS connection is actually closed (Read returns EOF/reset,
+//     not a timeout).
+func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
+	const threshold = 10
+
+	// Generate independent TLS identities for host and peer.
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate host TLS config: %v", err)
+	}
+	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate peer TLS config: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-tls-evict-all",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+
+	// dialTLS opens a TLS connection, completes the Aperod Ping/Pong handshake,
+	// and returns the open *tls.Conn.
+	dialTLS := func(nodeID string) *tls.Conn {
+		t.Helper()
+		c, err := tls.DialWithDialer(
+			&net.Dialer{Timeout: 2 * time.Second},
+			"tcp", hostAddr, cfgPeer,
+		)
+		if err != nil {
+			t.Fatalf("TLS dial (%s): %v", nodeID, err)
+		}
+		c.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
+			NodeID:    nodeID,
+			Height:    0,
+			UserAgent: "test",
+			Timestamp: time.Now().Unix(),
+		}); err != nil {
+			c.Close()
+			t.Fatalf("write ping (%s): %v", nodeID, err)
+		}
+		msgType, _, err := p2p.ReadMsg(c)
+		if err != nil || msgType != p2p.MsgPong {
+			c.Close()
+			t.Fatalf("expected MsgPong (%s), got %v err=%v", nodeID, msgType, err)
+		}
+		c.SetDeadline(time.Time{}) //nolint:errcheck
+		return c
+	}
+
+	// Open two TLS connections from the same 127.0.0.1 address.
+	tlsConn1 := dialTLS("tls-rogue-1")
+	defer tlsConn1.Close()
+
+	tlsConn2 := dialTLS("tls-rogue-2")
+	defer tlsConn2.Close()
+
+	// Wait for both peers to register.
+	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 2 }) {
+		t.Fatalf("expected 2 TLS peers registered, got %d", h.PeerCount())
+	}
+	t.Logf("both TLS connections registered; PeerCount=2")
+
+	// Trigger the ban on the first TLS connection.
+	for i := 0; i < threshold; i++ {
+		sb := p2p.SerializedBlock{
+			Header: p2p.SerializedHeader{Height: 9000},
+		}
+		tlsConn1.SetWriteDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+		_ = p2p.WriteMsg(tlsConn1, p2p.MsgBlock, sb)          // conn may close on final write
+		tlsConn1.SetWriteDeadline(time.Time{})                 //nolint:errcheck
+	}
+
+	// Both TLS connections must be evicted because they share the same bare IP.
+	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("PeerCount = %d after ban; both TLS connections should have been evicted", h.PeerCount())
+	}
+
+	// Verify the second TLS connection is actually closed.  Use raw Read() with a
+	// short deadline so a blackholed (open) connection is caught as a timeout
+	// failure — exactly the regression this test exists to catch.
+	tlsConn2.SetDeadline(time.Now().Add(300 * time.Millisecond)) //nolint:errcheck
+	buf := make([]byte, 256)
+	var readErr error
+	for readErr == nil {
+		_, readErr = tlsConn2.Read(buf)
+	}
+	if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+		t.Errorf("second TLS connection still open after IP ban (read timed out instead of EOF/reset) — " +
+			"evictByIP may not be reaching tls.Conn-wrapped connections")
+	} else {
+		t.Logf("second TLS connection correctly closed: %v", readErr)
+	}
+
+	// Confirm ban entry exists for the loopback IP.
+	bans := h.ListBans()
+	if len(bans) == 0 {
+		t.Errorf("no ban entry found after %d TLS bad blocks", threshold)
+	}
+}
+
+// ─── Test: TLS-whitelisted validator is still exempt from wrong-fork bans ────
+
+// TestBadBlockBan_TLSWhitelistedPeerNotBanned is the regression test that
+// confirms the PeerWhitelist bad-block exemption still applies when the
+// connection is established over TLS mutual auth.
+//
+// The plain-TCP whitelist tests (TestBadBlockBan_WhitelistedPeerNotBanned)
+// exercise the fast path in checkBadBlock but do not cover the TLS code path.
+// A regression in the TLS branch — e.g. a short-circuit that bypasses the
+// whitelist check — could silently allow the ban counter to fire on a trusted
+// production validator that always connects over TLS.
+//
+// Test sequence:
+//  1. Boot a Host with a self-signed TLS config AND PeerWhitelist=["127.0.0.1"].
+//  2. The peer dials with its own independent TLS identity, completes the TLS
+//     handshake, then finishes the Aperod Ping/Pong handshake.
+//  3. The peer sends BadBlockBanThreshold+5 out-of-range blocks (well above the
+//     default threshold of 10) — any one of which would ban a non-whitelisted peer.
+//  4. Assertions: no ban entry created, PeerCount still 1, connection still live.
+func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
+	const threshold = 10
+
+	// ── Step 1: generate independent TLS identities for host and peer ────────
+
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate host TLS config: %v", err)
+	}
+	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate peer TLS config: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-tls-wl-not-banned",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  24 * time.Hour,
+		// Whitelist the loopback so the TLS peer (127.0.0.1) is a trusted validator.
+		PeerWhitelist: []string{"127.0.0.1"},
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+
+	// ── Step 2: TLS dial + Aperod Ping/Pong handshake ────────────────────────
+
+	tlsConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", hostAddr, cfgPeer,
+	)
+	if err != nil {
+		t.Fatalf("TLS dial: %v", err)
+	}
+	defer tlsConn.Close()
+
+	// Extract the bare IP as seen by the host (local side of our connection).
+	localAddr := tlsConn.LocalAddr().String()
+	peerIP, _, splitErr := net.SplitHostPort(localAddr)
+	if splitErr != nil {
+		peerIP = localAddr
+	}
+
+	tlsConn.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+	// Asymmetric handshake: dialer sends MsgPing first; host replies with MsgPong.
+	if err := p2p.WriteMsg(tlsConn, p2p.MsgPing, p2p.PingMsg{
+		NodeID:    "tls-whitelisted-validator",
+		Height:    0,
+		UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("write ping over TLS: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(tlsConn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("expected MsgPong over TLS, got %v err=%v", msgType, err)
+	}
+	tlsConn.SetDeadline(time.Time{}) // clear deadline
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("TLS peer did not register after Ping/Pong handshake")
+	}
+	t.Logf("step 2 ✓ TLS whitelisted peer %s registered after mutual-auth handshake", peerIP)
+
+	// ── Step 3: send threshold+5 out-of-range blocks — all must be no-ops ────
+	// ourTip = 0 (stubHandler); out-of-range is height > 0 + 1000.
+	// A non-whitelisted peer would be disconnected and banned at exactly
+	// BadBlockBanThreshold.  The whitelisted 127.0.0.1 must accumulate zero
+	// strikes and stay connected regardless of how many bad blocks it sends.
+
+	for i := 0; i < threshold+5; i++ {
+		sb := p2p.SerializedBlock{
+			Header: p2p.SerializedHeader{Height: 9999},
+		}
+		tlsConn.SetWriteDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+		if err := p2p.WriteMsg(tlsConn, p2p.MsgBlock, sb); err != nil {
+			t.Fatalf("write bad block %d over TLS: %v", i+1, err)
+		}
+		tlsConn.SetWriteDeadline(time.Time{}) //nolint:errcheck
+	}
+
+	// Give the host time to process all messages.
+	time.Sleep(200 * time.Millisecond)
+
+	// ── Step 4: assert no ban was created and the peer is still connected ─────
+
+	if bans := h.ListBans(); len(bans) != 0 {
+		t.Errorf("step 4 failed: TLS whitelisted peer %s was banned after %d out-of-range blocks; bans: %v",
+			peerIP, threshold+5, bans)
+	} else {
+		t.Logf("step 4 ✓ TLS whitelisted peer %s correctly NOT banned after %d out-of-range blocks",
+			peerIP, threshold+5)
+	}
+	if h.PeerCount() != 1 {
+		t.Errorf("step 4 failed: PeerCount = %d after out-of-range blocks from TLS whitelisted peer, want 1",
+			h.PeerCount())
+	}
+
+	// Confirm the connection is still live by writing one more message.
+	tlsConn.SetWriteDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+	writeErr := p2p.WriteMsg(tlsConn, p2p.MsgBlock, p2p.SerializedBlock{
+		Header: p2p.SerializedHeader{Height: 9999},
+	})
+	tlsConn.SetWriteDeadline(time.Time{}) //nolint:errcheck
+	if writeErr != nil {
+		t.Errorf("step 4 failed: TLS whitelisted peer connection was closed unexpectedly: %v", writeErr)
+	} else {
+		t.Logf("step 4 ✓ TLS whitelisted peer connection still live after %d bad blocks", threshold+5)
+	}
+}
+
 // ─── Test: slow-handshake flood cannot exhaust all peer slots ─────────────────
 
 // TestSlowHandshakeFlood verifies that MaxPendingHandshakes caps the number of
@@ -2142,6 +2410,228 @@ func TestSlowHandshakeFlood(t *testing.T) {
 			legitIP, h.PeerCount())
 	}
 	t.Logf("step 4 ✓ legitimate TLS peer %s registered successfully after the flood", legitIP)
+}
+
+// ─── Test: concurrent handshake flood cannot double-count slots ───────────────
+
+// TestConcurrentHandshakeFlood verifies that the pendingHandshakes atomic
+// counter remains correct when MaxPendingHandshakes + N TCP connections arrive
+// simultaneously.  The sequential TestSlowHandshakeFlood opens connections one
+// at a time; this test uses two-phase goroutine barriers to stress the
+// Add/compare sequence in acceptLoop for races that could allow more goroutines
+// than MaxPendingHandshakes through.
+//
+// The cap is proved behaviourally — not via sampling — by confirming that every
+// excess connection is immediately closed (EOF on Read) and that no slots are
+// leaked after the flood drains.
+//
+// Flow:
+//  1. Boot a TLS-enabled host with MaxPendingHandshakes = maxPending.
+//  2. Phase 1: launch exactly maxPending goroutines behind a barrier; all dial
+//     simultaneously and hold raw TCP connections (no TLS data sent) so that
+//     server-side handleConn blocks inside tls.Conn.Handshake().  Wait until
+//     PendingHandshakes() == maxPending (all slots occupied); treat timeout as
+//     a fatal test failure — without saturation the excess-rejection check is
+//     meaningless.
+//  3. Phase 2: launch extraFlood more goroutines behind a second barrier; all
+//     dial simultaneously.  Every connection that the host accepts must be
+//     closed immediately (EOF or reset on the first Read, not a timeout),
+//     proving the counter never exceeded the cap.
+//  4. Close the phase-1 flood connections.  PendingHandshakes() must drain to 0
+//     within the deadline — failure is fatal (slot leak detected).
+//  5. A legitimate TLS peer completes the full handshake and registers,
+//     confirming no permanent slot starvation after the attack.
+func TestConcurrentHandshakeFlood(t *testing.T) {
+	const (
+		maxPending = 5
+		extraFlood = 8 // connections beyond the cap sent simultaneously
+	)
+
+	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate host TLS config: %v", err)
+	}
+	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate peer TLS config: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             50,
+		NodeID:               "test-concurrent-flood",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		MaxPendingHandshakes: maxPending,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	hostAddr := h.ListenAddr()
+
+	// concurrentDial launches n goroutines that all dial hostAddr at the same
+	// instant.  Each goroutine signals readyCh when it is blocked at the start
+	// gate, then waits for startCh to be closed before dialling.  The caller
+	// must drain readyCh (n times) and then close startCh.
+	// Returns a slice of n net.Conn values; nil entries mean the dial failed.
+	concurrentDial := func(n int, mustSucceed bool) []net.Conn {
+		conns := make([]net.Conn, n)
+		readyCh := make(chan struct{}, n)
+		startCh := make(chan struct{})
+
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				readyCh <- struct{}{} // signal: I am at the gate
+				<-startCh             // wait for the simultaneous release
+				c, dialErr := net.DialTimeout("tcp", hostAddr, 3*time.Second)
+				if dialErr != nil {
+					if mustSucceed {
+						// Non-fatal from here; caller checks the slice.
+						t.Logf("concurrentDial[%d]: dial error: %v", idx, dialErr)
+					}
+					return
+				}
+				conns[idx] = c
+			}(i)
+		}
+
+		// Wait for every goroutine to reach the gate, then release all at once.
+		for i := 0; i < n; i++ {
+			<-readyCh
+		}
+		close(startCh)
+		wg.Wait()
+		return conns
+	}
+
+	// ── Phase 1: saturate all handshake slots concurrently ───────────────────
+	// All maxPending goroutines are unblocked simultaneously.  Each holds an
+	// open raw TCP connection without sending any TLS records; handleConn blocks
+	// inside tls.Conn.Handshake() keeping the slot occupied.
+	floodConns := concurrentDial(maxPending, true)
+
+	// Every phase-1 dial must have succeeded — OS backlog is far larger than
+	// maxPending (5), so any failure is a test environment problem.
+	for i, c := range floodConns {
+		if c == nil {
+			t.Fatalf("phase 1: flood conn %d failed to dial — "+
+				"cannot saturate slots; remaining test would prove nothing", i)
+		}
+	}
+
+	// Wait until all slots are occupied before testing excess connections.
+	// Without confirmed saturation, excess connections could succeed not because
+	// of a cap bypass but because free slots were still available.
+	if !waitFor(2*time.Second, func() bool {
+		return h.PendingHandshakes() == int64(maxPending)
+	}) {
+		t.Fatalf("phase 1: PendingHandshakes did not reach %d within 2 s (got %d); "+
+			"slots were not fully occupied — excess-rejection check cannot proceed",
+			maxPending, h.PendingHandshakes())
+	}
+	t.Logf("phase 1 ✓ all %d slots occupied (PendingHandshakes=%d)",
+		maxPending, h.PendingHandshakes())
+
+	// ── Phase 2: send excess connections simultaneously ───────────────────────
+	// All extraFlood goroutines are released from the same gate so they race
+	// through acceptLoop concurrently, maximising the chance of a double-count
+	// window in the atomic Add/compare.
+	//
+	// Each excess connection MUST have been accepted at the TCP level (dial must
+	// succeed — only 13 total connections, well within the OS backlog) and then
+	// immediately closed by acceptLoop at the application level (EOF on first
+	// Read, not a timeout).  OS-level dial failure is a test error because it
+	// cannot validate the handshake-slot guard.
+	excessConns := concurrentDial(extraFlood, false)
+
+	closedCount := 0
+	for i, c := range excessConns {
+		if c == nil {
+			// Dial failed at the OS level — this cannot be treated as guard
+			// coverage; the application-level cap check was never reached.
+			t.Errorf("phase 2: excess conn %d: dial failed at OS/listener level — "+
+				"cannot verify the application-layer MaxPendingHandshakes guard", i)
+			continue
+		}
+		c.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+		buf := make([]byte, 1)
+		n, readErr := c.Read(buf)
+		switch {
+		case n > 0 || readErr == nil:
+			t.Errorf("phase 2: excess conn %d was accepted by the host (n=%d err=%v); "+
+				"MaxPendingHandshakes cap appears to have been exceeded", i, n, readErr)
+		case func() bool { nerr, ok := readErr.(net.Error); return ok && nerr.Timeout() }():
+			t.Errorf("phase 2: excess conn %d left open (Read timed out — not closed by host); "+
+				"cap may have been bypassed via concurrent Add race", i)
+		default:
+			t.Logf("phase 2 ✓ excess conn %d immediately closed by host: %v", i, readErr)
+			closedCount++
+		}
+		c.Close()
+	}
+	t.Logf("phase 2 summary: %d/%d excess connections immediately closed by host",
+		closedCount, extraFlood)
+
+	// Counter must be within bounds right after the storm.
+	if cur := h.PendingHandshakes(); cur > int64(maxPending) {
+		t.Errorf("PendingHandshakes over cap after excess flood: %d > %d", cur, maxPending)
+	}
+
+	// ── Phase 3: release flood connections; assert full slot drain ────────────
+	// Fatal: a leaked slot means honest peers would be incorrectly rejected
+	// permanently — the guard becomes a ratchet that can only tighten.
+	for _, c := range floodConns {
+		if c != nil {
+			c.Close()
+		}
+	}
+	if !waitFor(2*time.Second, func() bool {
+		return h.PendingHandshakes() == 0
+	}) {
+		t.Fatalf("phase 3: PendingHandshakes did not drain to 0 within 2 s (got %d) — "+
+			"slot leak detected; releaseHS() may not fire on all exit paths",
+			h.PendingHandshakes())
+	}
+	t.Logf("phase 3 ✓ all slots released: PendingHandshakes=0")
+
+	// ── Phase 4: legitimate TLS peer must connect and register ───────────────
+	// Confirms: (a) no permanent slot starvation, (b) guard resets cleanly for
+	// honest peers after a concurrent attack.
+	tlsConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second},
+		"tcp", hostAddr, cfgPeer,
+	)
+	if err != nil {
+		t.Fatalf("phase 4: legitimate TLS peer could not connect after concurrent flood: %v", err)
+	}
+	defer tlsConn.Close()
+
+	tlsConn.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+	if err := p2p.WriteMsg(tlsConn, p2p.MsgPing, p2p.PingMsg{
+		NodeID:    "legit-peer-concurrent-flood",
+		Height:    0,
+		UserAgent: "test",
+		Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("phase 4: write ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(tlsConn)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("phase 4: expected MsgPong, got type=%v err=%v", msgType, err)
+	}
+	tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Errorf("phase 4: legitimate peer did not register after concurrent flood; PeerCount=%d",
+			h.PeerCount())
+	} else {
+		t.Logf("phase 4 ✓ legitimate TLS peer registered successfully after concurrent handshake flood")
+	}
 }
 
 // ─── Test: wrong-fork ban records a BanEvent for the API/Telegram alert chain ─
@@ -2608,6 +3098,51 @@ func runtime_gosched() {
 }
 
 // ─── Test: null-JSON whitelist sidecar blocks startup ────────────────────────
+
+// TestWhitelistSidecar_EmptySidecarAndNoCfgIsOpenNetwork confirms that an
+// empty-array sidecar ("[]") combined with an empty cfg.PeerWhitelist results
+// in a fully-open network: GetPeerWhitelist() must be empty and a peer from
+// 127.0.0.1 must be accepted.  This guards the path in loadWhitelistFromFile
+// where both sources are empty and the retention branch must NOT fire.
+func TestWhitelistSidecar_EmptySidecarAndNoCfgIsOpenNetwork(t *testing.T) {
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, "whitelist.json")
+	// Write an empty JSON array — valid but containing no entries.
+	if err := os.WriteFile(sidecarPath, []byte("[]"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "test-empty-whitelist",
+		UserAgent:     "aperod/test",
+		// PeerWhitelist is intentionally empty (open network in cfg).
+		WhitelistFile: sidecarPath,
+	}, &stubHandler{}, newTestLogger())
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	defer h.Stop()
+
+	// GetPeerWhitelist() must be empty — the retention branch must not fire
+	// when both the sidecar and cfg.PeerWhitelist are empty.
+	wl := h.GetPeerWhitelist()
+	if len(wl) != 0 {
+		t.Errorf("GetPeerWhitelist() = %v, want empty (open network)", wl)
+	}
+
+	// A peer from 127.0.0.1 must be accepted — no IP restriction should apply.
+	conn, _ := connectPeer(t, h.ListenAddr())
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Errorf("PeerCount = %d after handshake, want 1 (open network must accept the peer)", h.PeerCount())
+	} else {
+		t.Logf("open-network preserved: peer accepted, GetPeerWhitelist=%v", wl)
+	}
+}
 
 // TestWhitelistSidecar_NullJSONBlocksStartup writes a sidecar containing the
 // literal JSON value `null` and verifies that h.Start() returns a non-nil error.
