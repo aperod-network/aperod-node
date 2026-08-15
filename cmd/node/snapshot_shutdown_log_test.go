@@ -1063,3 +1063,238 @@ func TestSilentReplacement_StaleSnapshotAtOldHeightIgnored(t *testing.T) {
 
 	assertStartupReasonInBuf(t, &buf, "no_snapshot")
 }
+
+// ─── checkStartupSnapshotTiming ──────────────────────────────────────────────
+//
+// checkStartupSnapshotTiming is the proactive startup warning that compares the
+// persisted last_snap_save_ms against the effective systemd TimeoutStopSec and
+// emits a structured log entry when the ratio crosses 50 % (Warn) or 80 %
+// (Error).  The tests below verify:
+//
+//  1. The full DB round-trip path: StoreSnapshotSaveDuration → LoadSnapshotSaveDuration
+//     → checkStartupSnapshotTiming emits ratio_pct in the log.
+//  2. Error-level warning fires when savedSnapMs > 80 % of TimeoutStopSec.
+//  3. Warn-level warning fires when savedSnapMs > 50 % of TimeoutStopSec.
+//  4. No log is emitted when the ratio is below both thresholds.
+//  5. The function is a no-op when no TimeoutStopSec config file is found.
+
+// openTempDB creates a real LevelDB store in a temporary directory and
+// registers a Cleanup to close it.  It is used by the
+// checkStartupSnapshotTiming tests so they exercise the actual DB code path
+// rather than passing a synthetic int64 directly.
+func openTempDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("openTempDB: store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// TestCheckStartupSnapshotTiming_DBRoundtrip_ErrorThreshold is the primary
+// integration test for the proactive startup warning path.  It verifies the
+// full pipeline:
+//
+//  1. db.StoreSnapshotSaveDuration persists a synthetic save duration.
+//  2. db.LoadSnapshotSaveDuration retrieves it successfully (found=true).
+//  3. checkStartupSnapshotTiming emits an Error-level log entry with a
+//     ratio_pct field when the stored duration exceeds 80 % of the
+//     TimeoutStopSec read from an injectable drop-in directory.
+//
+// Thresholds used: TimeoutStopSec=100 s, savedSnapMs=90 000 ms (90 s) →
+// ratio = 90 % > 80 % → Error-level "SIGKILL risk" message.
+func TestCheckStartupSnapshotTiming_DBRoundtrip_ErrorThreshold(t *testing.T) {
+	db := openTempDB(t)
+
+	// 90 seconds expressed in milliseconds — 90 % of a 100 s timeout.
+	const saveMs = int64(90_000)
+	if err := db.StoreSnapshotSaveDuration(saveMs); err != nil {
+		t.Fatalf("StoreSnapshotSaveDuration(%d): %v", saveMs, err)
+	}
+
+	// Verify the round-trip: the value must be readable on the same DB handle.
+	got, found, err := db.LoadSnapshotSaveDuration()
+	if err != nil {
+		t.Fatalf("LoadSnapshotSaveDuration: %v", err)
+	}
+	if !found {
+		t.Fatal("LoadSnapshotSaveDuration: found=false immediately after store")
+	}
+	if got != saveMs {
+		t.Fatalf("LoadSnapshotSaveDuration = %d, want %d", got, saveMs)
+	}
+
+	// Write a synthetic drop-in with TimeoutStopSec=100 s so ratio = 90 %.
+	dropinDir, service := writeTimeoutConfInDir(t, 100)
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+	checkStartupSnapshotTiming(got, dropinDir, service, log)
+
+	const wantMsg = "startup: last snapshot save duration exceeds 80% of systemd stop timeout — SIGKILL risk on next shutdown"
+	if !logContainsMsg(&buf, wantMsg) {
+		t.Fatalf("expected Error-level log %q not found; full output:\n%s", wantMsg, buf.String())
+	}
+
+	// Log level must be ERROR.
+	level, hasLevel := logFieldValue(&buf, wantMsg, "level")
+	if !hasLevel {
+		t.Fatalf("level field missing from ratio warning record; full output:\n%s", buf.String())
+	}
+	if level != "ERROR" {
+		t.Errorf("expected log level ERROR for 90%% ratio, got %q", level)
+	}
+
+	// ratio_pct must be present.
+	pct, ok := logFieldValue(&buf, wantMsg, "ratio_pct")
+	if !ok || pct == "" {
+		t.Fatalf("ratio_pct field missing from Error-level warning; full output:\n%s", buf.String())
+	}
+}
+
+// TestCheckStartupSnapshotTiming_DBRoundtrip_WarnThreshold verifies that the
+// Warn-level message fires (not Error) when the stored duration is between
+// 50 % and 80 % of TimeoutStopSec.
+//
+// Thresholds: TimeoutStopSec=200 s, savedSnapMs=120 000 ms (120 s) →
+// ratio = 60 % → Warn, not Error.
+func TestCheckStartupSnapshotTiming_DBRoundtrip_WarnThreshold(t *testing.T) {
+	db := openTempDB(t)
+
+	const saveMs = int64(120_000) // 120 s = 60 % of 200 s
+	if err := db.StoreSnapshotSaveDuration(saveMs); err != nil {
+		t.Fatalf("StoreSnapshotSaveDuration(%d): %v", saveMs, err)
+	}
+	got, found, err := db.LoadSnapshotSaveDuration()
+	if err != nil || !found {
+		t.Fatalf("LoadSnapshotSaveDuration: err=%v found=%v", err, found)
+	}
+
+	dropinDir, service := writeTimeoutConfInDir(t, 200)
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+	checkStartupSnapshotTiming(got, dropinDir, service, log)
+
+	const wantWarn = "startup: last snapshot save duration exceeds 50% of systemd stop timeout — consider increasing TimeoutStopSec"
+	if !logContainsMsg(&buf, wantWarn) {
+		t.Fatalf("expected Warn-level log %q not found; full output:\n%s", wantWarn, buf.String())
+	}
+
+	// Must NOT escalate to Error.
+	const errMsg = "SIGKILL risk"
+	if logContainsMsg(&buf, errMsg) {
+		t.Errorf("unexpected Error-level message at 60%% ratio; full output:\n%s", buf.String())
+	}
+
+	// ratio_pct must be present.
+	pct, ok := logFieldValue(&buf, wantWarn, "ratio_pct")
+	if !ok || pct == "" {
+		t.Fatalf("ratio_pct field missing from Warn-level warning; full output:\n%s", buf.String())
+	}
+}
+
+// TestCheckStartupSnapshotTiming_BelowThreshold verifies that no log entry is
+// emitted when the stored duration is below the 50 % warn threshold.
+//
+// Thresholds: TimeoutStopSec=300 s, savedSnapMs=30 000 ms (30 s) →
+// ratio = 10 % → no log expected.
+func TestCheckStartupSnapshotTiming_BelowThreshold(t *testing.T) {
+	db := openTempDB(t)
+
+	const saveMs = int64(30_000) // 30 s = 10 % of 300 s
+	if err := db.StoreSnapshotSaveDuration(saveMs); err != nil {
+		t.Fatalf("StoreSnapshotSaveDuration(%d): %v", saveMs, err)
+	}
+	got, found, err := db.LoadSnapshotSaveDuration()
+	if err != nil || !found {
+		t.Fatalf("LoadSnapshotSaveDuration: err=%v found=%v", err, found)
+	}
+
+	dropinDir, service := writeTimeoutConfInDir(t, 300)
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+	checkStartupSnapshotTiming(got, dropinDir, service, log)
+
+	if buf.Len() != 0 {
+		t.Errorf("expected no log at 10%% ratio, got:\n%s", buf.String())
+	}
+}
+
+// TestCheckStartupSnapshotTiming_NoTimeoutConfig verifies that
+// checkStartupSnapshotTiming is a no-op when no drop-in directory or service
+// file contains a TimeoutStopSec line (non-systemd host, or default config).
+// Even a very long save duration must produce no log output.
+func TestCheckStartupSnapshotTiming_NoTimeoutConfig(t *testing.T) {
+	dropinDir := t.TempDir() // empty — no .conf files
+	service := filepath.Join(t.TempDir(), "aperod-node.service") // absent
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+	// 9999 s would be 100× any reasonable timeout — but without a config
+	// the function must be silent.
+	checkStartupSnapshotTiming(9_999_000, dropinDir, service, log)
+
+	if buf.Len() != 0 {
+		t.Errorf("expected no log when no TimeoutStopSec config exists, got:\n%s", buf.String())
+	}
+}
+
+// TestCheckStartupSnapshotTiming_DBRoundtrip_PersistAcrossReopen verifies that
+// the stored snapshot save duration survives a DB close/reopen — the scenario
+// that occurs between two node restarts.  This ensures the proactive warning
+// path (which reads from the previous run's DB) actually sees the persisted
+// value and is not silently reading zero.
+func TestCheckStartupSnapshotTiming_DBRoundtrip_PersistAcrossReopen(t *testing.T) {
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, "chain.db")
+
+	// First "run": store the save duration.
+	const saveMs = int64(85_000) // 85 s
+	db1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open (first): %v", err)
+	}
+	if err := db1.StoreSnapshotSaveDuration(saveMs); err != nil {
+		db1.Close()
+		t.Fatalf("StoreSnapshotSaveDuration: %v", err)
+	}
+	db1.Close()
+
+	// Second "run": reopen and load; must find the stored value.
+	db2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open (second): %v", err)
+	}
+	defer db2.Close()
+
+	got, found, err := db2.LoadSnapshotSaveDuration()
+	if err != nil {
+		t.Fatalf("LoadSnapshotSaveDuration after reopen: %v", err)
+	}
+	if !found {
+		t.Fatal("LoadSnapshotSaveDuration: found=false after close+reopen — value did not survive restart")
+	}
+	if got != saveMs {
+		t.Fatalf("LoadSnapshotSaveDuration after reopen = %d, want %d", got, saveMs)
+	}
+
+	// With TimeoutStopSec=100 s the ratio is 85 % → Error-level warning must fire.
+	dropinDir, service := writeTimeoutConfInDir(t, 100)
+
+	var buf bytes.Buffer
+	log := newCaptureLogger(&buf)
+	checkStartupSnapshotTiming(got, dropinDir, service, log)
+
+	const wantMsg = "startup: last snapshot save duration exceeds 80% of systemd stop timeout — SIGKILL risk on next shutdown"
+	if !logContainsMsg(&buf, wantMsg) {
+		t.Fatalf("expected Error log %q after DB reopen, got:\n%s", wantMsg, buf.String())
+	}
+
+	pct, ok := logFieldValue(&buf, wantMsg, "ratio_pct")
+	if !ok || pct == "" {
+		t.Fatalf("ratio_pct missing after DB reopen; full output:\n%s", buf.String())
+	}
+}
