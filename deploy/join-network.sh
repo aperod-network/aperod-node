@@ -237,7 +237,13 @@ ${BOLD}╔═══════════════════════�
   # after the remote stop fires (but before the heredoc returns) still causes
   # the trap to attempt a restart, not silently leave the validator down.
   _BS_VALIDATOR_STOPPED=1
-  ssh "root@${VALIDATOR_IP}" bash <<'REMOTE_STOP'
+  # The heredoc below is single-quoted (no local expansion), so the locally
+  # resolved VALIDATOR_DATA_DIR must be forwarded explicitly: a printf prologue
+  # (with %q quoting) is prepended to the stdin stream so the remote shell sees
+  # the exact directory that rsync will copy — not a hardcoded default.
+  {
+    printf 'VALIDATOR_DATA_DIR=%q\n' "${VALIDATOR_DATA_DIR}"
+    cat <<'REMOTE_STOP'
     if ! systemctl stop aperod-node 2>/dev/null; then
       echo "[ERR] Не удалось остановить aperod-node на валидаторе" >&2
       exit 1
@@ -250,8 +256,47 @@ ${BOLD}╔═══════════════════════�
       echo "[ERR] aperod-node на валидаторе не остановился за 15 с" >&2
       exit 1
     fi
+    # systemd is down, but chain.db may still be held open by a non-systemd
+    # process (manually launched node, stuck Go test).  Rsync of an open
+    # LevelDB produces a corrupt copy — check fuser/lsof before proceeding.
+    # VALIDATOR_DATA_DIR is injected by the printf prologue above and matches
+    # the exact directory the subsequent rsync will copy.
+    _CHAIN_DB_DIR="${VALIDATOR_DATA_DIR}/chain.db"
+    _DB_BUSY=0
+    if [ -d "${_CHAIN_DB_DIR}" ]; then
+      # FAIL CLOSED: without a trustworthy inspection result we must not rsync.
+      if command -v fuser >/dev/null 2>&1; then
+        _RC=0; fuser -s "${_CHAIN_DB_DIR}"/* 2>/dev/null || _RC=$?
+        case "${_RC}" in
+          0) _DB_BUSY=1 ;;   # at least one process holds a file open
+          1) : ;;            # documented "no process found" — DB free
+          *)
+            echo "[ERR] fuser на валидаторе завершился с неожиданным кодом ${_RC} — результату нельзя доверять, rsync прерван (fail closed)" >&2
+            exit 1 ;;
+        esac
+      elif command -v lsof >/dev/null 2>&1; then
+        _RC=0; lsof +D "${_CHAIN_DB_DIR}" >/dev/null 2>&1 || _RC=$?
+        case "${_RC}" in
+          0) _DB_BUSY=1 ;;   # at least one process holds a file open
+          1) : ;;            # documented "no open files found" — DB free
+          *)
+            echo "[ERR] lsof на валидаторе завершился с неожиданным кодом ${_RC} — результату нельзя доверять, rsync прерван (fail closed)" >&2
+            exit 1 ;;
+        esac
+      else
+        echo "[ERR] Ни fuser, ни lsof не найдены на валидаторе — невозможно проверить, что LevelDB не открыт другим процессом" >&2
+        echo "[ERR] rsync без этой проверки может создать повреждённую копию — прерываем ДО rsync (fail closed)" >&2
+        echo "[ERR] Установите на валидаторе: apt-get install -y psmisc   # fuser (или lsof)" >&2
+        exit 1
+      fi
+    fi
+    if [ "${_DB_BUSY}" -eq 1 ]; then
+      echo "[ERR] chain.db (${_CHAIN_DB_DIR}) на валидаторе всё ещё открыт другим процессом — rsync прерван" >&2
+      exit 1
+    fi
     echo "stopped"
 REMOTE_STOP
+  } | ssh "root@${VALIDATOR_IP}" bash
   ok "aperod-node на валидаторе остановлен"
 
   # ── Шаг 3.5: Записываем sentinel непосредственно перед rsync ──
@@ -723,6 +768,55 @@ if systemctl is-active --quiet aperod-node; then
 fi
 _SOURCE_STOPPED=1
 ok "aperod-node на источнике остановлен"
+
+# ── Шаг 2a: Проверяем что chain.db не открыт ДРУГИМ процессом ──
+# systemctl is-active only covers the systemd-managed service.  A manually
+# launched aperod-node, a stuck Go test, or any other process may still hold
+# the LevelDB open — rsync of an open LevelDB produces a corrupt copy exactly
+# like copying a running service would.  fuser/lsof catches those cases.
+info "Шаг 2a/7: Проверяем что LevelDB (${PRIMARY_DATA_DIR}/chain.db) не открыт другим процессом…"
+_CHAIN_DB_DIR="${PRIMARY_DATA_DIR}/chain.db"
+_DB_BUSY=0
+if [[ -d "${_CHAIN_DB_DIR}" ]]; then
+  # FAIL CLOSED: without an inspection tool we cannot prove the DB is free,
+  # so we must not rsync.  The trap restarts the source (_SOURCE_STOPPED=1).
+  if command -v fuser >/dev/null 2>&1; then
+    _RC=0; fuser -s "${_CHAIN_DB_DIR}"/* 2>/dev/null || _RC=$?
+    case "${_RC}" in
+      0) _DB_BUSY=1 ;;   # at least one process holds a file open
+      1) : ;;            # documented "no process found" result — DB free
+      *) die "fuser завершился с неожиданным кодом ${_RC} — результат проверки нельзя доверять.
+  rsync живого LevelDB может повредить копию — прерываем ДО rsync (fail closed).
+  Проверьте вручную: fuser -v ${_CHAIN_DB_DIR}/*  и повторите: bash join-network.sh ${TARGET_IP}" ;;
+    esac
+  elif command -v lsof >/dev/null 2>&1; then
+    _RC=0; lsof +D "${_CHAIN_DB_DIR}" >/dev/null 2>&1 || _RC=$?
+    case "${_RC}" in
+      0) _DB_BUSY=1 ;;   # at least one process holds a file open
+      1) : ;;            # documented "no open files found" result — DB free
+      *) die "lsof завершился с неожиданным кодом ${_RC} — результат проверки нельзя доверять.
+  rsync живого LevelDB может повредить копию — прерываем ДО rsync (fail closed).
+  Проверьте вручную: lsof +D ${_CHAIN_DB_DIR}  и повторите: bash join-network.sh ${TARGET_IP}" ;;
+    esac
+  else
+    die "Ни fuser, ни lsof не найдены — невозможно проверить, что LevelDB не открыт другим процессом.
+  rsync без этой проверки может создать повреждённую копию — прерываем ДО rsync (fail closed).
+  Установите инструмент и повторите:
+    apt-get install -y psmisc   # fuser
+    # или: apt-get install -y lsof
+  Затем: bash join-network.sh ${TARGET_IP}"
+  fi
+fi
+if [[ ${_DB_BUSY} -eq 1 ]]; then
+  # The EXIT/ERR trap will restart the source service (_SOURCE_STOPPED=1);
+  # the foreign process holding the DB must be dealt with by the operator.
+  die "chain.db всё ещё открыт другим процессом (не systemd-сервисом).
+  rsync живого LevelDB приведёт к повреждению копии — прерываем ДО rsync.
+  Найдите и остановите процесс:
+    fuser -v ${_CHAIN_DB_DIR}/*    # или: lsof +D ${_CHAIN_DB_DIR}
+  Затем повторите: bash join-network.sh ${TARGET_IP}"
+fi
+ok "chain.db не открыт ни одним процессом — rsync безопасен"
 
 # ── Шаг 2b: Записываем sentinel на целевом сервере ────────
 # The sentinel .rsync-in-progress tells aperod-node to refuse startup until
