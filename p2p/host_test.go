@@ -4153,3 +4153,38 @@ func TestHost_GetPeerList_EmptyWhenNoPeers(t *testing.T) {
 		t.Errorf("GetPeerList() len = %d, want 0 (no connected peers)", len(peers))
 	}
 }
+
+// TestHost_WhitelistPeer_NoBanAfterBadBlocks verifies that a peer whose IP is
+// in the p2p.peer_whitelist never accumulates bad-block strikes, even after
+// receiving multiple out-of-range blocks.  This is the property that prevents
+// the relay-node ban cycle: a relay that is catching up sends gossip blocks
+// that the validator cannot yet accept, but those blocks should NOT count
+// against the relay's strike counter.
+func TestHost_WhitelistPeer_NoBanAfterBadBlocks(t *testing.T) {
+	// Arrange: build a host with a 5-strike ban threshold and a whitelisted IP.
+	const banThreshold = 5
+	cfg := p2p.Config{
+		MaxPeers:             10,
+		BadBlockBanThreshold: banThreshold,
+		PeerWhitelist:        []string{"10.0.0.42"},
+	}
+	h := p2p.NewHost(cfg, &stubHandler{}, newTestLogger())
+
+	// Record the initial ban count.
+	initialBans := len(h.ListBans())
+
+	// Act: simulate banThreshold+2 bad-block strikes from the whitelisted IP.
+	// Without the whitelist, 5 strikes would trigger a 24-hour ban.
+	for i := 0; i < banThreshold+2; i++ {
+		h.RecordBadBlockStrike("10.0.0.42:30303")
+	}
+
+	// Assert: no new bans were applied — whitelisted IP is exempt.
+	bans := h.ListBans()
+	if len(bans) != initialBans {
+		t.Errorf("whitelisted peer got banned: want %d bans, got %d bans", initialBans, len(bans))
+		for _, b := range bans {
+			t.Logf("  ban: %+v", b)
+		}
+	}
+}
