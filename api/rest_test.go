@@ -3,302 +3,303 @@ package api_test
 // Tests for Phase 2 REST endpoints and new JSON-RPC methods (apr_getTransaction, apr_estimateFee).
 
 import (
-        "bytes"
-        "encoding/hex"
-        "encoding/json"
-        "log/slog"
-        "net/http"
-        "net/http/httptest"
-        "os"
-        "testing"
-        "time"
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
 
-        "github.com/aperod/aperod/api"
-        "github.com/aperod/aperod/core"
-        "github.com/aperod/aperod/crypto"
-        "github.com/aperod/aperod/store"
+	"github.com/aperod/aperod/api"
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
 )
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 func testLogger() *slog.Logger {
-        return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
 // buildChainServer creates a server backed by a chain with genesis + n blocks.
 func buildChainServer(t *testing.T, extraBlocks int) (*api.Server, *core.Chain) {
-        t.Helper()
-        priv, pub, _ := crypto.GenerateValidatorKey()
+	t.Helper()
+	priv, pub, _ := crypto.GenerateValidatorKey()
 
-        makeBlock := func(height uint64, prevHash crypto.Hash32) *core.Block {
-                cb := core.CoinbaseTx(crypto.Point32(pub), 1_000_000)
-                txs := []core.Transaction{cb}
-                hdr := core.BlockHeader{
-                        Height:       height,
-                        PrevHash:     prevHash,
-                        Timestamp:    time.Now().UnixNano(),
-                        ValidatorPub: pub,
-                        MerkleRoot:   core.MerkleRoot(txs),
-                }
-                _ = hdr.Sign(priv)
-                return &core.Block{Header: hdr, Txs: txs}
-        }
+	makeBlock := func(height uint64, prevHash crypto.Hash32) *core.Block {
+		cb := core.CoinbaseTx(crypto.Point32(pub), 1_000_000)
+		txs := []core.Transaction{cb}
+		hdr := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prevHash,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(txs),
+		}
+		_ = hdr.Sign(priv)
+		return &core.Block{Header: hdr, Txs: txs}
+	}
 
-        var prev crypto.Hash32
-        genesis := makeBlock(0, prev)
-        chain := core.NewChain()
-        _ = chain.SetGenesis(genesis)
+	var prev crypto.Hash32
+	genesis := makeBlock(0, prev)
+	chain := core.NewChain()
+	_ = chain.SetGenesis(genesis)
 
-        for i := 1; i <= extraBlocks; i++ {
-                parent := chain.GetByHeight(uint64(i - 1))
-                prev = parent.Hash()
-                _ = chain.AddBlock(makeBlock(uint64(i), prev))
-        }
+	for i := 1; i <= extraBlocks; i++ {
+		parent := chain.GetByHeight(uint64(i - 1))
+		prev = parent.Hash()
+		_ = chain.AddBlock(makeBlock(uint64(i), prev))
+	}
 
-        mp := core.NewMempool(core.DefaultMempoolConfig())
-        utxos := core.NewUTXOSet()
-        srv := api.NewServer(":0", chain, mp, utxos, testLogger())
-        return srv, chain
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	utxos := core.NewUTXOSet()
+	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	return srv, chain
 }
 
 func restGet(t *testing.T, srv *api.Server, path string) (int, map[string]interface{}) {
-        t.Helper()
-        req := httptest.NewRequest(http.MethodGet, path, nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        var resp map[string]interface{}
-        _ = json.NewDecoder(rr.Body).Decode(&resp)
-        return rr.Code, resp
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	var resp map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return rr.Code, resp
 }
 
 // restGetHeader sends a GET request with a single extra header.
 func restGetHeader(t *testing.T, srv *api.Server, path, header, value string) (int, map[string]interface{}) {
-        t.Helper()
-        req := httptest.NewRequest(http.MethodGet, path, nil)
-        req.Header.Set(header, value)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        var resp map[string]interface{}
-        _ = json.NewDecoder(rr.Body).Decode(&resp)
-        return rr.Code, resp
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set(header, value)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	var resp map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return rr.Code, resp
 }
 
 // ─── /api/v1/blocks ───────────────────────────────────────────────────────────
 
 func TestREST_Blocks_WithGenesis(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, resp := restGet(t, srv, "/api/v1/blocks")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["total"] == nil {
-                t.Error("expected total in response")
-        }
-        blocks, _ := resp["blocks"].([]interface{})
-        if len(blocks) == 0 {
-                t.Error("expected at least genesis block")
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, resp := restGet(t, srv, "/api/v1/blocks")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["total"] == nil {
+		t.Error("expected total in response")
+	}
+	blocks, _ := resp["blocks"].([]interface{})
+	if len(blocks) == 0 {
+		t.Error("expected at least genesis block")
+	}
 }
 
 func TestREST_Blocks_Pagination(t *testing.T) {
-        srv, _ := buildChainServer(t, 5)
-        code, resp := restGet(t, srv, "/api/v1/blocks?limit=3&offset=0")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        blocks, ok := resp["blocks"].([]interface{})
-        if !ok {
-                t.Fatalf("blocks not an array: %T", resp["blocks"])
-        }
-        if len(blocks) != 3 {
-                t.Errorf("got %d blocks, want 3", len(blocks))
-        }
+	srv, _ := buildChainServer(t, 5)
+	code, resp := restGet(t, srv, "/api/v1/blocks?limit=3&offset=0")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	blocks, ok := resp["blocks"].([]interface{})
+	if !ok {
+		t.Fatalf("blocks not an array: %T", resp["blocks"])
+	}
+	if len(blocks) != 3 {
+		t.Errorf("got %d blocks, want 3", len(blocks))
+	}
 }
 
 func TestREST_Blocks_OffsetPastEnd(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, resp := restGet(t, srv, "/api/v1/blocks?offset=99999")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        blocks := resp["blocks"].([]interface{})
-        if len(blocks) != 0 {
-                t.Errorf("expected empty blocks slice, got %d", len(blocks))
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, resp := restGet(t, srv, "/api/v1/blocks?offset=99999")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	blocks := resp["blocks"].([]interface{})
+	if len(blocks) != 0 {
+		t.Errorf("expected empty blocks slice, got %d", len(blocks))
+	}
 }
 
 func TestREST_Blocks_MethodNotAllowed(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks", nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusMethodNotAllowed {
-                t.Errorf("status = %d, want 405", rr.Code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rr.Code)
+	}
 }
 
 // ─── /api/v1/blocks/{id} ─────────────────────────────────────────────────────
 
 func TestREST_BlockByHeight(t *testing.T) {
-        srv, _ := buildChainServer(t, 3)
-        code, resp := restGet(t, srv, "/api/v1/blocks/0")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200 for block 0", code)
-        }
-        if resp["height"] != float64(0) {
-                t.Errorf("height = %v, want 0", resp["height"])
-        }
+	srv, _ := buildChainServer(t, 3)
+	code, resp := restGet(t, srv, "/api/v1/blocks/0")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200 for block 0", code)
+	}
+	if resp["height"] != float64(0) {
+		t.Errorf("height = %v, want 0", resp["height"])
+	}
 }
 
 func TestREST_BlockByHash(t *testing.T) {
-        srv, chain := buildChainServer(t, 1)
-        genesis := chain.GetByHeight(0)
-        gh := genesis.Hash()
-        hashHex := hex.EncodeToString(gh[:])
-        code, resp := restGet(t, srv, "/api/v1/blocks/"+hashHex)
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["height"] != float64(0) {
-                t.Errorf("height = %v, want 0", resp["height"])
-        }
+	srv, chain := buildChainServer(t, 1)
+	genesis := chain.GetByHeight(0)
+	gh := genesis.Hash()
+	hashHex := hex.EncodeToString(gh[:])
+	code, resp := restGet(t, srv, "/api/v1/blocks/"+hashHex)
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["height"] != float64(0) {
+		t.Errorf("height = %v, want 0", resp["height"])
+	}
 }
 
 func TestREST_BlockByID_NotFoundHeight(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, _ := restGet(t, srv, "/api/v1/blocks/9999")
-        if code != http.StatusNotFound {
-                t.Errorf("status = %d, want 404", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, _ := restGet(t, srv, "/api/v1/blocks/9999")
+	if code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
 }
 
 func TestREST_BlockByID_InvalidID(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, _ := restGet(t, srv, "/api/v1/blocks/notahash")
-        if code != http.StatusBadRequest {
-                t.Errorf("status = %d, want 400", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, _ := restGet(t, srv, "/api/v1/blocks/notahash")
+	if code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", code)
+	}
 }
 
 func TestREST_BlockByID_NotFoundHash(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        // All-0xFF hash is unlikely to match any real block
-        notFound := make([]byte, 32)
-        for i := range notFound {
-                notFound[i] = 0xFF
-        }
-        code, _ := restGet(t, srv, "/api/v1/blocks/"+hex.EncodeToString(notFound))
-        if code != http.StatusNotFound {
-                t.Errorf("status = %d, want 404", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	// All-0xFF hash is unlikely to match any real block
+	notFound := make([]byte, 32)
+	for i := range notFound {
+		notFound[i] = 0xFF
+	}
+	code, _ := restGet(t, srv, "/api/v1/blocks/"+hex.EncodeToString(notFound))
+	if code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
 }
 
 func TestREST_BlockByID_MethodNotAllowed(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/0", nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusMethodNotAllowed {
-                t.Errorf("status = %d, want 405", rr.Code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks/0", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rr.Code)
+	}
 }
 
 // ─── /api/v1/transactions/{hash} ─────────────────────────────────────────────
 
 func TestREST_Transaction_Confirmed(t *testing.T) {
-        srv, chain := buildChainServer(t, 0)
-        genesis := chain.GetByHeight(0)
-        txHash := genesis.Txs[0].Hash()
-        txHashArr := txHash
-        code, resp := restGet(t, srv, "/api/v1/transactions/"+hex.EncodeToString(txHashArr[:]))
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["is_coinbase"] != true {
-                t.Errorf("is_coinbase = %v, want true", resp["is_coinbase"])
-        }
+	srv, chain := buildChainServer(t, 0)
+	genesis := chain.GetByHeight(0)
+	txHash := genesis.Txs[0].Hash()
+	txHashArr := txHash
+	code, resp := restGet(t, srv, "/api/v1/transactions/"+hex.EncodeToString(txHashArr[:]))
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["is_coinbase"] != true {
+		t.Errorf("is_coinbase = %v, want true", resp["is_coinbase"])
+	}
 }
 
 func TestREST_Transaction_NotFound(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, _ := restGet(t, srv, "/api/v1/transactions/"+hex.EncodeToString(make([]byte, 32)))
-        if code != http.StatusNotFound {
-                t.Errorf("status = %d, want 404", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, _ := restGet(t, srv, "/api/v1/transactions/"+hex.EncodeToString(make([]byte, 32)))
+	if code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
 }
 
 func TestREST_Transaction_InvalidHash(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, _ := restGet(t, srv, "/api/v1/transactions/notahash")
-        if code != http.StatusBadRequest {
-                t.Errorf("status = %d, want 400", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, _ := restGet(t, srv, "/api/v1/transactions/notahash")
+	if code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", code)
+	}
 }
 
 func TestREST_Transaction_MethodNotAllowed(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        req := httptest.NewRequest(http.MethodPost, "/api/v1/transactions/"+hex.EncodeToString(make([]byte, 32)), nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusMethodNotAllowed {
-                t.Errorf("status = %d, want 405", rr.Code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/transactions/"+hex.EncodeToString(make([]byte, 32)), nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rr.Code)
+	}
 }
 
 // ─── /api/v1/address/{addr}/transactions ─────────────────────────────────────
 
 func TestREST_AddressTxs_ValidAddress(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        wk, _ := crypto.GenerateWalletKeys()
-        addr := crypto.AddressFromKeys(crypto.MainnetByte, wk)
-        code, resp := restGet(t, srv, "/api/v1/address/"+addr.String()+"/transactions")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["transactions"] == nil {
-                t.Error("expected transactions field")
-        }
+	srv, _ := buildChainServer(t, 0)
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.AddressFromKeys(crypto.MainnetByte, wk)
+	code, resp := restGet(t, srv, "/api/v1/address/"+addr.String()+"/transactions")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["transactions"] == nil {
+		t.Error("expected transactions field")
+	}
 }
 
 func TestREST_AddressTxs_InvalidAddress(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, _ := restGet(t, srv, "/api/v1/address/garbage-addr/transactions")
-        if code != http.StatusBadRequest {
-                t.Errorf("status = %d, want 400", code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, _ := restGet(t, srv, "/api/v1/address/garbage-addr/transactions")
+	if code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", code)
+	}
 }
 
 func TestREST_AddressTxs_CoinbaseMatch(t *testing.T) {
-        // Build chain where coinbase output.OneTimePub == spendPub of query address
-        priv, pub, _ := crypto.GenerateValidatorKey()
-        spendPt := crypto.Point32(pub)
-        cb := core.CoinbaseTx(spendPt, 1_000_000)
-        txs := []core.Transaction{cb}
-        hdr := core.BlockHeader{
-                Height:       0,
-                Timestamp:    time.Now().UnixNano(),
-                ValidatorPub: pub,
-                MerkleRoot:   core.MerkleRoot(txs),
-        }
-        _ = hdr.Sign(priv)
-        genesis := &core.Block{Header: hdr, Txs: txs}
-        chain := core.NewChain()
-        _ = chain.SetGenesis(genesis)
+	// Build chain where coinbase output.OneTimePub == spendPub of query address
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	spendPt := crypto.Point32(pub)
+	cb := core.CoinbaseTx(spendPt, 1_000_000)
+	txs := []core.Transaction{cb}
+	hdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(txs),
+	}
+	_ = hdr.Sign(priv)
+	genesis := &core.Block{Header: hdr, Txs: txs}
+	chain := core.NewChain()
+	_ = chain.SetGenesis(genesis)
 
-        mp := core.NewMempool(core.DefaultMempoolConfig())
-        utxos := core.NewUTXOSet()
-        srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	utxos := core.NewUTXOSet()
+	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
 
-        // Encode spendPt as an address (use same point for spend+view)
-        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPt, spendPt)
-        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        txList, _ := resp["transactions"].([]interface{})
-        if len(txList) == 0 {
-                t.Error("expected at least 1 coinbase output matching the address")
-        }
+	// Encode spendPt as an address (use same point for spend+view)
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPt, spendPt)
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	txList, _ := resp["transactions"].([]interface{})
+	if len(txList) == 0 {
+		t.Error("expected at least 1 coinbase output matching the address")
+	}
 }
 
 // TestREST_AddressTxs_IsCoinbaseFlagged confirms that the address-transactions
@@ -306,425 +307,498 @@ func TestREST_AddressTxs_CoinbaseMatch(t *testing.T) {
 // the regression guard for the "+0 APRO" wallet-history bug: the wallet filters
 // on this field so it must be present and accurate.
 func TestREST_AddressTxs_IsCoinbaseFlagged(t *testing.T) {
-        // Build a genesis block whose coinbase output.OneTimePub equals spendPt so
-        // the scanner matches it and returns it in the address-transactions list.
-        priv, pub, _ := crypto.GenerateValidatorKey()
-        spendPt := crypto.Point32(pub)
-        cb := core.CoinbaseTx(spendPt, 1_000_000)
-        txs := []core.Transaction{cb}
-        hdr := core.BlockHeader{
-                Height:       0,
-                Timestamp:    time.Now().UnixNano(),
-                ValidatorPub: pub,
-                MerkleRoot:   core.MerkleRoot(txs),
-        }
-        _ = hdr.Sign(priv)
-        genesis := &core.Block{Header: hdr, Txs: txs}
-        chain := core.NewChain()
-        _ = chain.SetGenesis(genesis)
+	// Build a genesis block whose coinbase output.OneTimePub equals spendPt so
+	// the scanner matches it and returns it in the address-transactions list.
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	spendPt := crypto.Point32(pub)
+	cb := core.CoinbaseTx(spendPt, 1_000_000)
+	txs := []core.Transaction{cb}
+	hdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(txs),
+	}
+	_ = hdr.Sign(priv)
+	genesis := &core.Block{Header: hdr, Txs: txs}
+	chain := core.NewChain()
+	_ = chain.SetGenesis(genesis)
 
-        mp := core.NewMempool(core.DefaultMempoolConfig())
-        utxos := core.NewUTXOSet()
-        srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	utxos := core.NewUTXOSet()
+	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
 
-        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPt, spendPt)
-        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        txList, _ := resp["transactions"].([]interface{})
-        if len(txList) == 0 {
-                t.Fatal("expected at least 1 matching transaction for the coinbase output")
-        }
-        first, ok := txList[0].(map[string]interface{})
-        if !ok {
-                t.Fatalf("transaction entry is not an object: %T", txList[0])
-        }
-        if first["is_coinbase"] != true {
-                t.Errorf("is_coinbase = %v, want true — coinbase block-reward outputs must be flagged so the wallet filter can exclude them", first["is_coinbase"])
-        }
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPt, spendPt)
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	txList, _ := resp["transactions"].([]interface{})
+	if len(txList) == 0 {
+		t.Fatal("expected at least 1 matching transaction for the coinbase output")
+	}
+	first, ok := txList[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("transaction entry is not an object: %T", txList[0])
+	}
+	if first["is_coinbase"] != true {
+		t.Errorf("is_coinbase = %v, want true — coinbase block-reward outputs must be flagged so the wallet filter can exclude them", first["is_coinbase"])
+	}
 }
 
 func TestREST_AddressTxs_MethodNotAllowed(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        wk, _ := crypto.GenerateWalletKeys()
-        addr := crypto.AddressFromKeys(crypto.MainnetByte, wk)
-        req := httptest.NewRequest(http.MethodPost, "/api/v1/address/"+addr.String()+"/transactions", nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusMethodNotAllowed {
-                t.Errorf("status = %d, want 405", rr.Code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.AddressFromKeys(crypto.MainnetByte, wk)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/address/"+addr.String()+"/transactions", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rr.Code)
+	}
 }
 
 // ─── /api/v1/network/stats ────────────────────────────────────────────────────
 
 func TestREST_NetworkStats_Genesis(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        code, resp := restGet(t, srv, "/api/v1/network/stats")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["height"] == nil {
-                t.Error("expected height in stats")
-        }
+	srv, _ := buildChainServer(t, 0)
+	code, resp := restGet(t, srv, "/api/v1/network/stats")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["height"] == nil {
+		t.Error("expected height in stats")
+	}
 }
 
 func TestREST_NetworkStats_MultiBlock(t *testing.T) {
-        srv, _ := buildChainServer(t, 5)
-        code, resp := restGet(t, srv, "/api/v1/network/stats")
-        if code != http.StatusOK {
-                t.Errorf("status = %d, want 200", code)
-        }
-        if resp["height"] != float64(5) {
-                t.Errorf("height = %v, want 5", resp["height"])
-        }
-        if resp["total_txs"] == nil {
-                t.Error("expected total_txs")
-        }
+	srv, _ := buildChainServer(t, 5)
+	code, resp := restGet(t, srv, "/api/v1/network/stats")
+	if code != http.StatusOK {
+		t.Errorf("status = %d, want 200", code)
+	}
+	if resp["height"] != float64(5) {
+		t.Errorf("height = %v, want 5", resp["height"])
+	}
+	if resp["total_txs"] == nil {
+		t.Error("expected total_txs")
+	}
+}
+
+// reconnect_backoff_active must appear in the stats payload so the API-server
+// peer-count monitor can flag a relay that is silently waiting out a dial
+// back-off window with 0 peers.
+func TestREST_NetworkStats_ReconnectBackoffFlag(t *testing.T) {
+	srv, _ := buildChainServer(t, 0)
+
+	// Not wired → defaults to false, but the key must be present.
+	code, resp := restGet(t, srv, "/api/v1/network/stats")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if v, ok := resp["reconnect_backoff_active"]; !ok {
+		t.Error("expected reconnect_backoff_active key in stats")
+	} else if v != false {
+		t.Errorf("reconnect_backoff_active = %v, want false when not wired", v)
+	}
+
+	// Wired → reflects the live flag.
+	srv.SetReconnectBackoffFlag(func() bool { return true })
+	code, resp = restGet(t, srv, "/api/v1/network/stats")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp["reconnect_backoff_active"] != true {
+		t.Errorf("reconnect_backoff_active = %v, want true when wired flag returns true", resp["reconnect_backoff_active"])
+	}
 }
 
 func TestREST_NetworkStats_MethodNotAllowed(t *testing.T) {
-        srv, _ := buildChainServer(t, 0)
-        req := httptest.NewRequest(http.MethodPost, "/api/v1/network/stats", nil)
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusMethodNotAllowed {
-                t.Errorf("status = %d, want 405", rr.Code)
-        }
+	srv, _ := buildChainServer(t, 0)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/network/stats", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rr.Code)
+	}
 }
 
 // ─── apr_getTransaction RPC ───────────────────────────────────────────────────
 
 func TestRPC_GetTransaction_Confirmed(t *testing.T) {
-        srv, chain := buildChainServer(t, 0)
-        genesis := chain.GetByHeight(0)
-        txHash := genesis.Txs[0].Hash()
-        hashHex := hex.EncodeToString(txHash[:])
+	srv, chain := buildChainServer(t, 0)
+	genesis := chain.GetByHeight(0)
+	txHash := genesis.Txs[0].Hash()
+	hashHex := hex.EncodeToString(txHash[:])
 
-        resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{"hash": hashHex})
-        if resp["error"] != nil {
-                t.Fatalf("apr_getTransaction error: %v", resp["error"])
-        }
-        result := resp["result"].(map[string]interface{})
-        if result["is_coinbase"] != true {
-                t.Errorf("is_coinbase = %v, want true", result["is_coinbase"])
-        }
-        if result["block_height"] != float64(0) {
-                t.Errorf("block_height = %v, want 0", result["block_height"])
-        }
+	resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{"hash": hashHex})
+	if resp["error"] != nil {
+		t.Fatalf("apr_getTransaction error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	if result["is_coinbase"] != true {
+		t.Errorf("is_coinbase = %v, want true", result["is_coinbase"])
+	}
+	if result["block_height"] != float64(0) {
+		t.Errorf("block_height = %v, want 0", result["block_height"])
+	}
 }
 
 func TestRPC_GetTransaction_NotFound(t *testing.T) {
-        srv, _ := newTestServer(t)
-        resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{
-                "hash": hex.EncodeToString(make([]byte, 32)),
-        })
-        if resp["error"] == nil {
-                t.Error("expected error for unknown tx")
-        }
+	srv, _ := newTestServer(t)
+	resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{
+		"hash": hex.EncodeToString(make([]byte, 32)),
+	})
+	if resp["error"] == nil {
+		t.Error("expected error for unknown tx")
+	}
 }
 
 func TestRPC_GetTransaction_InvalidHash(t *testing.T) {
-        srv, _ := newTestServer(t)
-        resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{"hash": "tooshort"})
-        if resp["error"] == nil {
-                t.Error("expected error for bad hash")
-        }
+	srv, _ := newTestServer(t)
+	resp := rpcCall(t, srv, "apr_getTransaction", map[string]string{"hash": "tooshort"})
+	if resp["error"] == nil {
+		t.Error("expected error for bad hash")
+	}
 }
 
 // ─── apr_estimateFee RPC ──────────────────────────────────────────────────────
 
 func TestRPC_EstimateFee_Default(t *testing.T) {
-        srv, _ := newTestServer(t)
-        resp := rpcCall(t, srv, "apr_estimateFee", nil)
-        if resp["error"] != nil {
-                t.Fatalf("apr_estimateFee error: %v", resp["error"])
-        }
-        result := resp["result"].(map[string]interface{})
-        if result["fee"] == nil {
-                t.Error("expected fee in response")
-        }
-        if result["unit"] != "nAPRO" {
-                t.Errorf("unit = %v, want nAPRO", result["unit"])
-        }
+	srv, _ := newTestServer(t)
+	resp := rpcCall(t, srv, "apr_estimateFee", nil)
+	if resp["error"] != nil {
+		t.Fatalf("apr_estimateFee error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	if result["fee"] == nil {
+		t.Error("expected fee in response")
+	}
+	if result["unit"] != "nAPRO" {
+		t.Errorf("unit = %v, want nAPRO", result["unit"])
+	}
 }
 
 func TestRPC_EstimateFee_WithSize(t *testing.T) {
-        srv, _ := newTestServer(t)
+	srv, _ := newTestServer(t)
 	// size_bytes drives the estimate: fee = size_bytes x InitialBaseFeePerByte
-        resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1000})
-        if resp["error"] != nil {
-                t.Fatalf("apr_estimateFee error: %v", resp["error"])
-        }
-        result := resp["result"].(map[string]interface{})
-        fee := result["fee"].(float64)
+	resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1000})
+	if resp["error"] != nil {
+		t.Fatalf("apr_estimateFee error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	fee := result["fee"].(float64)
 	if fee != float64(1000*core.InitialBaseFeePerByte) {
 		t.Errorf("fee = %v, want %v (size_based_eip1559)", fee, float64(1000*core.InitialBaseFeePerByte))
-        }
+	}
 }
 
 func TestRPC_EstimateFee_SmallTx_MinFee(t *testing.T) {
-        srv, _ := newTestServer(t)
-        resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1})
-        result := resp["result"].(map[string]interface{})
-        fee := result["fee"].(float64)
+	srv, _ := newTestServer(t)
+	resp := rpcCall(t, srv, "apr_estimateFee", map[string]interface{}{"size_bytes": 1})
+	result := resp["result"].(map[string]interface{})
+	fee := result["fee"].(float64)
 	if fee < float64(core.MinBaseFeePerByte) {
 		t.Errorf("fee = %v, should be >= %d (MinBaseFeePerByte)", fee, core.MinBaseFeePerByte)
-        }
+	}
 }
 
 // ─── WebSocket hub ────────────────────────────────────────────────────────────
 
 func TestHub_ClientCount_Initial(t *testing.T) {
-        srv, _ := newTestServer(t)
-        if srv.Hub().ClientCount() != 0 {
-                t.Errorf("ClientCount = %d, want 0", srv.Hub().ClientCount())
-        }
+	srv, _ := newTestServer(t)
+	if srv.Hub().ClientCount() != 0 {
+		t.Errorf("ClientCount = %d, want 0", srv.Hub().ClientCount())
+	}
 }
 
 func TestHub_BroadcastBlock_NoPeers(t *testing.T) {
-        srv, _ := newTestServer(t)
-        priv, pub, _ := crypto.GenerateValidatorKey()
-        hdr := core.BlockHeader{Height: 0, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
-        _ = hdr.Sign(priv)
-        b := &core.Block{Header: hdr}
-        srv.Hub().BroadcastBlock(b) // must not panic
+	srv, _ := newTestServer(t)
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{Height: 0, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
+	_ = hdr.Sign(priv)
+	b := &core.Block{Header: hdr}
+	srv.Hub().BroadcastBlock(b) // must not panic
 }
 
 func TestHub_BroadcastTx_NoPeers(t *testing.T) {
-        srv, _ := newTestServer(t)
-        tx := &core.Transaction{Version: core.TxVersionBase}
-        srv.Hub().BroadcastTx(tx) // must not panic
+	srv, _ := newTestServer(t)
+	tx := &core.Transaction{Version: core.TxVersionBase}
+	srv.Hub().BroadcastTx(tx) // must not panic
 }
 
 func TestHub_BroadcastConfirmed_NoPeers(t *testing.T) {
-        srv, _ := newTestServer(t)
-        tx := &core.Transaction{Version: core.TxVersionBase}
-        srv.Hub().BroadcastConfirmed(tx, 5) // must not panic
+	srv, _ := newTestServer(t)
+	tx := &core.Transaction{Version: core.TxVersionBase}
+	srv.Hub().BroadcastConfirmed(tx, 5) // must not panic
 }
 
 // ─── /api/v1/admin/mint ────────────────────────────────────────────────────
 
 func restPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int, map[string]interface{}) {
-        t.Helper()
-        req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
-        req.Host = "127.0.0.1" // localOnly guard: simulate loopback caller
-        req.Header.Set("Content-Type", "application/json")
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        var resp map[string]interface{}
-        _ = json.NewDecoder(rr.Body).Decode(&resp)
-        return rr.Code, resp
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Host = "127.0.0.1" // localOnly guard: simulate loopback caller
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	var resp map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return rr.Code, resp
 }
 
 func restLocalPostJSON(t *testing.T, srv *api.Server, path string, body []byte) (int, map[string]interface{}) {
-        t.Helper()
-        req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
-        req.Host = "127.0.0.1"
-        req.Header.Set("Content-Type", "application/json")
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        var resp map[string]interface{}
-        _ = json.NewDecoder(rr.Body).Decode(&resp)
-        return rr.Code, resp
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Host = "127.0.0.1"
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	var resp map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return rr.Code, resp
 }
 func TestREST_AdminMint_FractionalAmount(t *testing.T) {
-        srv, _ := newTestServer(t)
-        // Stub the engine mint scheduler (in production it is wired to
-        // consensus.Engine.ScheduleAdminMint by cmd/node).
-        srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
-                return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 42, nil
-        })
-        wk, _ := crypto.GenerateWalletKeys()
-        addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+	srv, _ := newTestServer(t)
+	// Stub the engine mint scheduler (in production it is wired to
+	// consensus.Engine.ScheduleAdminMint by cmd/node).
+	srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+		return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 42, nil
+	})
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-        body := []byte(`{"address":"` + string(addr) + `","amount_apr":5909.5}`)
-        code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
-        if code != http.StatusCreated {
-                t.Fatalf("expected 201, got %d: %v", code, resp)
-        }
-        amt, ok := resp["amount_apr"].(float64)
-        if !ok || amt != 5909.5 {
-                t.Fatalf("expected amount_apr=5909.5, got %v", resp["amount_apr"])
-        }
-        if resp["tx_hash"] == "" {
-                t.Fatal("expected non-empty tx_hash")
-        }
+	body := []byte(`{"address":"` + string(addr) + `","amount_apr":5909.5}`)
+	code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
+	if code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %v", code, resp)
+	}
+	amt, ok := resp["amount_apr"].(float64)
+	if !ok || amt != 5909.5 {
+		t.Fatalf("expected amount_apr=5909.5, got %v", resp["amount_apr"])
+	}
+	// Task #1902 — the response must carry the authoritative scheduled nAPRO
+	// amount (not just a float echo of the request) so the API server can
+	// persist and verify the exact on-chain value.
+	// Serialized as a decimal string so JS callers can parse losslessly with BigInt.
+	napr, ok := resp["amount_napr"].(string)
+	if !ok || napr != "590950000000" {
+		t.Fatalf("expected amount_napr=\"590950000000\", got %v", resp["amount_napr"])
+	}
+	if resp["tx_hash"] == "" {
+		t.Fatal("expected non-empty tx_hash")
+	}
+}
+
+// TestREST_AdminMint_ReturnsV2BlindForScheduledHeight verifies Task #1900:
+// when the mint scheduler commits the mint at a real height (> 0), the
+// response blind must be DeterministicMintBlindV2(spendPub, amount, height) —
+// matching the commitment BuildMintTx created — NOT the legacy V1 blind.
+func TestREST_AdminMint_ReturnsV2BlindForScheduledHeight(t *testing.T) {
+	srv, _ := newTestServer(t)
+	const mintHeight = uint64(777)
+	srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+		return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", mintHeight, nil
+	})
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+	body := []byte(`{"address":"` + string(addr) + `","amount_apr":500}`)
+	code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
+	if code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %v", code, resp)
+	}
+	if h, _ := resp["height"].(float64); uint64(h) != mintHeight {
+		t.Fatalf("expected height=%d in response, got %v", mintHeight, resp["height"])
+	}
+	const amountNAPR = uint64(500 * 100_000_000)
+	wantV2, err := crypto.DeterministicMintBlindV2(wk.Spend.Public, amountNAPR, mintHeight)
+	if err != nil {
+		t.Fatalf("DeterministicMintBlindV2: %v", err)
+	}
+	wantHex := fmt.Sprintf("%x", wantV2[:])
+	gotHex, _ := resp["blind_hex"].(string)
+	if gotHex != wantHex {
+		t.Fatalf("blind_hex mismatch: got %s want V2 %s", gotHex, wantHex)
+	}
+	v1, _ := crypto.DeterministicMintBlind(wk.Spend.Public, amountNAPR)
+	if gotHex == fmt.Sprintf("%x", v1[:]) {
+		t.Fatal("blind_hex equals legacy V1 blind — commitment mismatch for scheduled mints")
+	}
 }
 
 func TestREST_AdminMint_ZeroAmount(t *testing.T) {
-        srv, _ := newTestServer(t)
-        wk, _ := crypto.GenerateWalletKeys()
-        addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+	srv, _ := newTestServer(t)
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-        body := []byte(`{"address":"` + string(addr) + `","amount_apr":0}`)
-        code, _ := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
-        if code != http.StatusBadRequest {
-                t.Fatalf("expected 400 for zero amount, got %d", code)
-        }
+	body := []byte(`{"address":"` + string(addr) + `","amount_apr":0}`)
+	code, _ := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for zero amount, got %d", code)
+	}
 }
 
 func TestREST_NetworkBanByAddr_LocalOnly(t *testing.T) {
-        srv, _ := newTestServer(t)
-        srv.SetBanLiftFunc(func(string) bool { return true }) // always succeeds
+	srv, _ := newTestServer(t)
+	srv.SetBanLiftFunc(func(string) bool { return true }) // always succeeds
 
-        // Request with a non-loopback Host must be rejected.
-        req := httptest.NewRequest(http.MethodDelete, "/api/v1/network/bans/192.0.2.1", nil)
-        req.Host = "attacker.example.com"
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        if rr.Code != http.StatusForbidden {
-                t.Fatalf("expected 403 for non-loopback Host, got %d", rr.Code)
-        }
+	// Request with a non-loopback Host must be rejected.
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/network/bans/192.0.2.1", nil)
+	req.Host = "attacker.example.com"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback Host, got %d", rr.Code)
+	}
 }
 func buildUTXOServer(t *testing.T) (*api.Server, *core.UTXOSet) {
-        t.Helper()
-        priv, pub, _ := crypto.GenerateValidatorKey()
-        hdr := core.BlockHeader{
-                Height:       0,
-                Timestamp:    time.Now().UnixNano(),
-                ValidatorPub: pub,
-                MerkleRoot:   core.MerkleRoot(nil),
-        }
-        _ = hdr.Sign(priv)
-        genesis := &core.Block{Header: hdr}
+	t.Helper()
+	priv, pub, _ := crypto.GenerateValidatorKey()
+	hdr := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	_ = hdr.Sign(priv)
+	genesis := &core.Block{Header: hdr}
 
-        chain := core.NewChain()
-        _ = chain.SetGenesis(genesis)
+	chain := core.NewChain()
+	_ = chain.SetGenesis(genesis)
 
-        mp := core.NewMempool(core.DefaultMempoolConfig())
-        utxos := core.NewUTXOSet()
-        log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-        srv := api.NewServer(":0", chain, mp, utxos, log)
-        return srv, utxos
+	mp := core.NewMempool(core.DefaultMempoolConfig())
+	utxos := core.NewUTXOSet()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := api.NewServer(":0", chain, mp, utxos, log)
+	return srv, utxos
 }
 
 // TestREST_AddressUTXOs_TransparentMatch verifies that a UTXO whose OneTimePub
 // equals the address spend public key appears in the listing.
 func TestREST_AddressUTXOs_TransparentMatch(t *testing.T) {
-        srv, utxos := buildUTXOServer(t)
+	srv, utxos := buildUTXOServer(t)
 
-        wk, err := crypto.GenerateWalletKeys()
-        if err != nil {
-                t.Fatalf("GenerateWalletKeys: %v", err)
-        }
-        spendPub := wk.Spend.Public
-        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	spendPub := wk.Spend.Public
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
 
-        var txHash crypto.Hash32
-        txHash[0] = 0xAB
-        utxos.Add(&core.UTXO{
-                TxHash:      txHash,
-                OutputIndex: 0,
-                OneTimePub:  spendPub,
-                BlockHeight: 0,
-        })
+	var txHash crypto.Hash32
+	txHash[0] = 0xAB
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		OneTimePub:  spendPub,
+		BlockHeight: 0,
+	})
 
-        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
-        if code != http.StatusOK {
-                t.Fatalf("status = %d, want 200", code)
-        }
-        list, _ := resp["utxos"].([]interface{})
-        if len(list) != 1 {
-                t.Fatalf("utxos count = %d, want 1", len(list))
-        }
-        entry := list[0].(map[string]interface{})
-        if entry["tx_hash"] != hex.EncodeToString(txHash[:]) {
-                t.Errorf("tx_hash = %v, want %s", entry["tx_hash"], hex.EncodeToString(txHash[:]))
-        }
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("utxos count = %d, want 1", len(list))
+	}
+	entry := list[0].(map[string]interface{})
+	if entry["tx_hash"] != hex.EncodeToString(txHash[:]) {
+		t.Errorf("tx_hash = %v, want %s", entry["tx_hash"], hex.EncodeToString(txHash[:]))
+	}
 }
 
 // TestREST_AddressUTXOs_SpentRemoved verifies that once a UTXO is removed from
 // the set (simulating a spend), it no longer appears in the address listing.
 func TestREST_AddressUTXOs_SpentRemoved(t *testing.T) {
-        srv, utxos := buildUTXOServer(t)
+	srv, utxos := buildUTXOServer(t)
 
-        wk, err := crypto.GenerateWalletKeys()
-        if err != nil {
-                t.Fatalf("GenerateWalletKeys: %v", err)
-        }
-        spendPub := wk.Spend.Public
-        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	spendPub := wk.Spend.Public
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
 
-        var txHash crypto.Hash32
-        txHash[0] = 0xCD
-        utxos.Add(&core.UTXO{
-                TxHash:      txHash,
-                OutputIndex: 0,
-                OneTimePub:  spendPub,
-                BlockHeight: 0,
-        })
+	var txHash crypto.Hash32
+	txHash[0] = 0xCD
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		OneTimePub:  spendPub,
+		BlockHeight: 0,
+	})
 
-        // Confirm it appears before spending
-        _, before := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
-        beforeList, _ := before["utxos"].([]interface{})
-        if len(beforeList) != 1 {
-                t.Fatalf("pre-spend utxos = %d, want 1", len(beforeList))
-        }
+	// Confirm it appears before spending
+	_, before := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	beforeList, _ := before["utxos"].([]interface{})
+	if len(beforeList) != 1 {
+		t.Fatalf("pre-spend utxos = %d, want 1", len(beforeList))
+	}
 
-        // Spend the UTXO (remove from set) and flush the response cache so the
-        // next request sees the updated UTXO set rather than the cached entry.
-        utxos.Remove(txHash, 0)
-        srv.FlushUTXOCache()
+	// Spend the UTXO (remove from set) and flush the response cache so the
+	// next request sees the updated UTXO set rather than the cached entry.
+	utxos.Remove(txHash, 0)
+	srv.FlushUTXOCache()
 
-        // Confirm it is gone
-        code, after := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
-        if code != http.StatusOK {
-                t.Fatalf("status = %d, want 200", code)
-        }
-        afterList, _ := after["utxos"].([]interface{})
-        if len(afterList) != 0 {
-                t.Errorf("post-spend utxos = %d, want 0 (spent UTXO must not appear)", len(afterList))
-        }
+	// Confirm it is gone
+	code, after := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	afterList, _ := after["utxos"].([]interface{})
+	if len(afterList) != 0 {
+		t.Errorf("post-spend utxos = %d, want 0 (spent UTXO must not appear)", len(afterList))
+	}
 }
 
 // TestREST_AddressUTXOs_MintHeightMatch verifies that a coinbase/mint UTXO
 // whose OneTimePub was derived as spend_pub + height*G is matched correctly,
 // and that the returned block_height reflects the height used during derivation.
 func TestREST_AddressUTXOs_MintHeightMatch(t *testing.T) {
-        srv, utxos := buildUTXOServer(t)
+	srv, utxos := buildUTXOServer(t)
 
-        wk, err := crypto.GenerateWalletKeys()
-        if err != nil {
-                t.Fatalf("GenerateWalletKeys: %v", err)
-        }
-        spendPub := wk.Spend.Public
-        addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	spendPub := wk.Spend.Public
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, wk.View.Public)
 
-        const mintHeight = uint64(42)
+	const mintHeight = uint64(42)
 
-        // Compute mint pub: spend_pub + mintHeight * G  (matches the handler logic)
-        heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(mintHeight))
-        if err != nil {
-                t.Fatalf("ScalarMulBase: %v", err)
-        }
-        mintPub, err := crypto.AddPoints(spendPub, heightPub)
-        if err != nil {
-                t.Fatalf("AddPoints: %v", err)
-        }
+	// Compute mint pub: spend_pub + mintHeight * G  (matches the handler logic)
+	heightPub, err := crypto.ScalarMulBase(crypto.ScalarFromUint64(mintHeight))
+	if err != nil {
+		t.Fatalf("ScalarMulBase: %v", err)
+	}
+	mintPub, err := crypto.AddPoints(spendPub, heightPub)
+	if err != nil {
+		t.Fatalf("AddPoints: %v", err)
+	}
 
-        var txHash crypto.Hash32
-        txHash[0] = 0xEF
-        utxos.Add(&core.UTXO{
-                TxHash:      txHash,
-                OutputIndex: 0,
-                OneTimePub:  mintPub,
-                BlockHeight: mintHeight,
-        })
+	var txHash crypto.Hash32
+	txHash[0] = 0xEF
+	utxos.Add(&core.UTXO{
+		TxHash:      txHash,
+		OutputIndex: 0,
+		OneTimePub:  mintPub,
+		BlockHeight: mintHeight,
+	})
 
-        code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
-        if code != http.StatusOK {
-                t.Fatalf("status = %d, want 200", code)
-        }
-        list, _ := resp["utxos"].([]interface{})
-        if len(list) != 1 {
-                t.Fatalf("utxos count = %d, want 1 (mint UTXO must match via height-offset pub)", len(list))
-        }
-        entry := list[0].(map[string]interface{})
-        if entry["block_height"] != float64(mintHeight) {
-                t.Errorf("block_height = %v, want %d", entry["block_height"], mintHeight)
-        }
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	list, _ := resp["utxos"].([]interface{})
+	if len(list) != 1 {
+		t.Fatalf("utxos count = %d, want 1 (mint UTXO must match via height-offset pub)", len(list))
+	}
+	entry := list[0].(map[string]interface{})
+	if entry["block_height"] != float64(mintHeight) {
+		t.Errorf("block_height = %v, want %d", entry["block_height"], mintHeight)
+	}
 }
 
 // TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey confirms that a
@@ -1156,43 +1230,43 @@ func TestREST_AddressScan_PostViewKey(t *testing.T) {
 }
 
 func TestWS_Endpoint_Registered(t *testing.T) {
-        // golang.org/x/net/websocket requires http.Hijacker; use a real test server.
-        srv, _ := newTestServer(t)
-        ts := httptest.NewServer(srv)
-        defer ts.Close()
+	// golang.org/x/net/websocket requires http.Hijacker; use a real test server.
+	srv, _ := newTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
 
-        // Plain GET without WS upgrade headers — server may return any non-404 status.
-        resp, err := http.Get(ts.URL + "/ws")
-        if err != nil {
-                t.Fatalf("GET /ws: %v", err)
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode == http.StatusNotFound {
-                t.Error("/ws route not registered (got 404)")
-        }
+	// Plain GET without WS upgrade headers — server may return any non-404 status.
+	resp, err := http.Get(ts.URL + "/ws")
+	if err != nil {
+		t.Fatalf("GET /ws: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.Error("/ws route not registered (got 404)")
+	}
 }
 
 func restLocalDelete(t *testing.T, srv *api.Server, path string) (int, map[string]interface{}) {
-        t.Helper()
-        req := httptest.NewRequest(http.MethodDelete, path, nil)
-        req.Host = "127.0.0.1"
-        rr := httptest.NewRecorder()
-        srv.ServeHTTP(rr, req)
-        var resp map[string]interface{}
-        _ = json.NewDecoder(rr.Body).Decode(&resp)
-        return rr.Code, resp
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Host = "127.0.0.1"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	var resp map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return rr.Code, resp
 }
 
 func TestREST_NetworkBanByAddr_LoopbackHost(t *testing.T) {
-        srv, _ := newTestServer(t)
-        srv.SetBanLiftFunc(func(string) bool { return false }) // no active ban
+	srv, _ := newTestServer(t)
+	srv.SetBanLiftFunc(func(string) bool { return false }) // no active ban
 
-        code, _ := restLocalDelete(t, srv, "/api/v1/network/bans/192.0.2.1")
-        // 404 = "no active ban for this address" which is the correct non-error
-        // response when the guard has passed and the ban simply isn't found.
-        if code != http.StatusNotFound {
-                t.Fatalf("expected 404 (no active ban), got %d", code)
-        }
+	code, _ := restLocalDelete(t, srv, "/api/v1/network/bans/192.0.2.1")
+	// 404 = "no active ban for this address" which is the correct non-error
+	// response when the guard has passed and the ban simply isn't found.
+	if code != http.StatusNotFound {
+		t.Fatalf("expected 404 (no active ban), got %d", code)
+	}
 }
 
 // TestREST_UTXO_InMemorySpentCheck confirms that /api/v1/utxo/{hash}/{idx} returns
