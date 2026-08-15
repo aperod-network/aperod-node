@@ -261,14 +261,19 @@ write_node_yaml "${I0_YAML}"
 
 # systemctl stub: stop exits 0 (command accepted) but is-active ALWAYS exits 0
 # (service is still running) → the wait loop never exits early → timeout fires.
+# The stub is also a SPY: every invocation is appended to I0_SYSCTL_LOG so the
+# test can assert that "start aperod-node" fired on the source after the abort
+# (the recovery restart + EXIT-trap safety net in join-network.sh).
 I0_BIN="${TMPDIR_TEST}/i0-bin"
-make_stub "${I0_BIN}" "systemctl" '
-case "$*" in
-  *"stop aperod-node"*)          exit 0 ;;   # pretend stop command succeeded …
-  *"is-active"*)                 exit 0 ;;   # … but service is STILL active
+I0_SYSCTL_LOG="${TMPDIR_TEST}/i0-systemctl.log"
+make_stub "${I0_BIN}" "systemctl" "
+echo \"\$*\" >> '${I0_SYSCTL_LOG}'
+case \"\$*\" in
+  *\"stop aperod-node\"*)          exit 0 ;;   # pretend stop command succeeded …
+  *\"is-active\"*)                 exit 0 ;;   # … but service is STILL active
   *) exit 0 ;;
 esac
-'
+"
 
 # sleep stub: no-op so the 15-iteration wait loop finishes instantly.
 make_stub "${I0_BIN}" "sleep" 'exit 0'
@@ -314,6 +319,24 @@ if [[ -f "${I0_SRC}/p2p_identity.key" ]]; then
   fi
 else
   fail "I0c: source p2p_identity.key is missing after abort — script damaged the source"
+fi
+
+# I0d: the source node must be restarted after the timeout abort.
+# join-network.sh has two defences: the inline recovery `systemctl start` right
+# before the timeout `die`, and the unconditional EXIT-trap safety net.  Either
+# way, the spy stub must have recorded at least one "start aperod-node" call
+# AFTER the stop/is-active sequence — otherwise the source is left down.
+if grep -q 'start aperod-node' "${I0_SYSCTL_LOG}" 2>/dev/null; then
+  # Ensure the start happened after the stop (recovery, not a stray pre-start).
+  I0_STOP_LINE=$(grep -n 'stop aperod-node' "${I0_SYSCTL_LOG}" | head -1 | cut -d: -f1)
+  I0_START_LINE=$(grep -n 'start aperod-node' "${I0_SYSCTL_LOG}" | grep -v 'stop' | tail -1 | cut -d: -f1)
+  if [[ -n "${I0_STOP_LINE}" && -n "${I0_START_LINE}" && ${I0_START_LINE} -gt ${I0_STOP_LINE} ]]; then
+    pass "I0d: source aperod-node restarted after timeout abort (start recorded after stop)"
+  else
+    fail "I0d: 'start aperod-node' recorded but not after the stop (stop line=${I0_STOP_LINE:-none}, start line=${I0_START_LINE:-none})"
+  fi
+else
+  fail "I0d: 'start aperod-node' never invoked on source after timeout abort — source node left stopped. systemctl log: $(cat "${I0_SYSCTL_LOG}" 2>/dev/null || echo '(empty)')"
 fi
 
 # =============================================================================
