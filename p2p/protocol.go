@@ -4,30 +4,30 @@
 package p2p
 
 import (
-        "encoding/binary"
-        "encoding/json"
-        "fmt"
-        "io"
-        "net"
-        "time"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"time"
 
-        "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/crypto"
 )
 
 // MessageType identifies the purpose of a network message.
 type MessageType uint8
 
 const (
-        MsgPing        MessageType = 0x01
-        MsgPong        MessageType = 0x02
-        MsgGetHeaders  MessageType = 0x10
-        MsgHeaders     MessageType = 0x11
-        MsgGetBlock    MessageType = 0x12
-        MsgBlock       MessageType = 0x13
-        MsgTx          MessageType = 0x20
-        MsgVote        MessageType = 0x30
-        MsgGetPeers    MessageType = 0x40
-        MsgPeers       MessageType = 0x41
+	MsgPing       MessageType = 0x01
+	MsgPong       MessageType = 0x02
+	MsgGetHeaders MessageType = 0x10
+	MsgHeaders    MessageType = 0x11
+	MsgGetBlock   MessageType = 0x12
+	MsgBlock      MessageType = 0x13
+	MsgTx         MessageType = 0x20
+	MsgVote       MessageType = 0x30
+	MsgGetPeers   MessageType = 0x40
+	MsgPeers      MessageType = 0x41
 )
 
 // MaxMessageSize is the maximum allowed message size (10 MB).
@@ -50,61 +50,61 @@ const WriteTimeout = 10 * time.Second
 
 // Envelope wraps every network message with a type tag and length-prefixed body.
 type Envelope struct {
-        Type    MessageType `json:"t"`
-        Payload []byte      `json:"p"`
+	Type    MessageType `json:"t"`
+	Payload []byte      `json:"p"`
 }
 
 // ─── Message payloads ─────────────────────────────────────────────────────────
 
 // PingMsg is sent on connect and periodically to maintain the connection.
 type PingMsg struct {
-        NodeID    string `json:"node_id"`
-        Height    uint64 `json:"height"`
-        UserAgent string `json:"ua"`
-        Timestamp int64  `json:"ts"`
+	NodeID    string `json:"node_id"`
+	Height    uint64 `json:"height"`
+	UserAgent string `json:"ua"`
+	Timestamp int64  `json:"ts"`
 }
 
 // PeersMsg is the response to MsgGetPeers.
 type PeersMsg struct {
-        Addrs []string `json:"addrs"` // "host:port" list
+	Addrs []string `json:"addrs"` // "host:port" list
 }
 
 // GetHeadersMsg requests headers starting after KnownHashes (up to Limit).
 type GetHeadersMsg struct {
-        KnownHashes []crypto.Hash32 `json:"known"` // tail of local chain
-        Limit       int             `json:"limit"`
+	KnownHashes []crypto.Hash32 `json:"known"` // tail of local chain
+	Limit       int             `json:"limit"`
 }
 
 // HeadersMsg contains a slice of serialized block headers.
 type HeadersMsg struct {
-        Headers []SerializedHeader `json:"headers"`
+	Headers []SerializedHeader `json:"headers"`
 }
 
 // SerializedHeader is a JSON-friendly block header.
 type SerializedHeader struct {
-        Height       uint64   `json:"height"`
-        Hash         [32]byte `json:"hash"`
-        PrevHash     [32]byte `json:"prev_hash"`
-        MerkleRoot   [32]byte `json:"merkle_root"`
-        Timestamp    int64    `json:"timestamp"`
-        Round        uint32   `json:"round"`
-        ValidatorPub []byte   `json:"validator_pub"`
-        Signature    []byte   `json:"sig"`
-        OraclePrice  uint64   `json:"oracle_price"`
-        BaseFee      uint64   `json:"base_fee"`
+	Height       uint64   `json:"height"`
+	Hash         [32]byte `json:"hash"`
+	PrevHash     [32]byte `json:"prev_hash"`
+	MerkleRoot   [32]byte `json:"merkle_root"`
+	Timestamp    int64    `json:"timestamp"`
+	Round        uint32   `json:"round"`
+	ValidatorPub []byte   `json:"validator_pub"`
+	Signature    []byte   `json:"sig"`
+	OraclePrice  uint64   `json:"oracle_price"`
+	BaseFee      uint64   `json:"base_fee"`
 }
 
 // GetBlockMsg requests a specific block by hash.
 type GetBlockMsg struct {
-        Hash crypto.Hash32 `json:"hash"`
+	Hash crypto.Hash32 `json:"hash"`
 }
 
 // VoteMsg carries a consensus finalization vote.
 type VoteMsg struct {
-        BlockHash    crypto.Hash32 `json:"block_hash"`
-        Height       uint64        `json:"height"`
-        ValidatorPub []byte        `json:"validator_pub"`
-        Signature    []byte        `json:"sig"`
+	BlockHash    crypto.Hash32 `json:"block_hash"`
+	Height       uint64        `json:"height"`
+	ValidatorPub []byte        `json:"validator_pub"`
+	Signature    []byte        `json:"sig"`
 }
 
 // ─── Framing ──────────────────────────────────────────────────────────────────
@@ -112,64 +112,77 @@ type VoteMsg struct {
 // WriteMsg encodes and sends a message over conn.
 // Format: [4-byte big-endian length][msgType byte][JSON body]
 func WriteMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
-        return writeMsg(conn, msgType, payload)
+	return writeMsg(conn, msgType, payload)
 }
 
 // ReadMsg reads the next message from conn (exported alias for tests).
 func ReadMsg(conn net.Conn) (MessageType, []byte, error) {
-        return readMsg(conn)
+	return readMsg(conn)
 }
 
 func writeMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
-        conn.SetWriteDeadline(time.Now().Add(WriteTimeout)) //nolint:errcheck
-        data, err := json.Marshal(payload)
-        if err != nil {
-                return fmt.Errorf("marshal: %w", err)
-        }
+	_, err := writeMsgN(conn, msgType, payload)
+	return err
+}
 
-        // [1 byte type][payload]
-        body := append([]byte{byte(msgType)}, data...)
+// writeMsgN is writeMsg with byte accounting: it returns the number of bytes
+// actually written to conn alongside the error.  Callers that may want to
+// retry a failed send MUST inspect n — a retry on the same stream is only
+// safe when n == 0 (nothing reached the wire, framing intact).  Any partial
+// write (0 < n < frame size) leaves an unfinished frame on the stream; a
+// subsequent send would inject a new length prefix into the middle of the
+// old frame and permanently desynchronize the receiver's parser, so the
+// only safe recovery is closing the connection.
+//
+// The 4-byte length prefix and the body are written with a single
+// conn.Write call so a successful write is always a complete frame.
+func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, error) {
+	conn.SetWriteDeadline(time.Now().Add(WriteTimeout)) //nolint:errcheck
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal: %w", err)
+	}
 
-        if len(body) > MaxMessageSize {
-                return fmt.Errorf("message too large: %d bytes", len(body))
-        }
+	// [1 byte type][payload]
+	body := append([]byte{byte(msgType)}, data...)
 
-        // 4-byte length prefix
-        header := make([]byte, 4)
-        binary.BigEndian.PutUint32(header, uint32(len(body)))
+	if len(body) > MaxMessageSize {
+		return 0, fmt.Errorf("message too large: %d bytes", len(body))
+	}
 
-        if _, err := conn.Write(header); err != nil {
-                return err
-        }
-        _, err = conn.Write(body)
-        return err
+	// [4-byte length prefix][body] in one buffer → one Write call.
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
+	copy(frame[4:], body)
+
+	return conn.Write(frame)
 }
 
 // readMsg reads the next message from conn.
 func readMsg(conn net.Conn) (MessageType, []byte, error) {
-        conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 
-        var lenBuf [4]byte
-        if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-                return 0, nil, fmt.Errorf("read length: %w", err)
-        }
-        length := binary.BigEndian.Uint32(lenBuf[:])
-        if length == 0 || length > MaxMessageSize {
-                return 0, nil, fmt.Errorf("invalid message length: %d", length)
-        }
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return 0, nil, fmt.Errorf("read length: %w", err)
+	}
+	length := binary.BigEndian.Uint32(lenBuf[:])
+	if length == 0 || length > MaxMessageSize {
+		return 0, nil, fmt.Errorf("invalid message length: %d", length)
+	}
 
-        body := make([]byte, length)
-        if _, err := io.ReadFull(conn, body); err != nil {
-                return 0, nil, fmt.Errorf("read body: %w", err)
-        }
+	body := make([]byte, length)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return 0, nil, fmt.Errorf("read body: %w", err)
+	}
 
-        msgType := MessageType(body[0])
-        return msgType, body[1:], nil
+	msgType := MessageType(body[0])
+	return msgType, body[1:], nil
 }
 
 // unmarshal decodes a JSON payload into v.
 func unmarshal(data []byte, v interface{}) error {
-        return json.Unmarshal(data, v)
+	return json.Unmarshal(data, v)
 }
 
 // Unmarshal is an exported alias for unmarshal used in tests.
