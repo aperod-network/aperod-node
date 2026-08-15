@@ -129,6 +129,16 @@ ${BOLD}╔═══════════════════════�
   _BS_LOCAL_STOPPED=0
   _BS_VALIDATOR_STOPPED=0
 
+  # _BS_RSYNC_STARTED tracks whether rsync has begun writing to LOCAL_DATA_DIR.
+  # Set to 1 immediately before the first rsync command; reset to 0 after the
+  # sentinel is removed (meaning the transfer completed and data is consistent).
+  # The cleanup trap uses this to decide whether it is safe to restart the local
+  # relay:
+  #   0 → rsync never ran (or finished OK and sentinel was removed) → safe to restart
+  #   1 → rsync started but did not complete → data may be partially overwritten
+  #         → do NOT restart; leave sentinel; require operator action
+  _BS_RSYNC_STARTED=0
+
   # ── Защитный trap (установлен ДО остановки любого сервиса) ─
   # Перезапускает каждый остановленный сервис независимо от того,
   # на каком шаге произошёл сбой. Снимается только после того,
@@ -137,6 +147,8 @@ ${BOLD}╔═══════════════════════�
     local _exit=$?
     if [[ ${_exit} -ne 0 ]]; then
       warn "[TRAP] Bootstrap завершился с кодом ${_exit} — восстанавливаем ноды…"
+      # The source (validator) was stopped for rsync — always restart it
+      # so the network keeps producing blocks, regardless of what failed.
       if [[ ${_BS_VALIDATOR_STOPPED} -eq 1 ]]; then
         warn "[TRAP] Перезапускаем aperod-node на валидаторе (${VALIDATOR_IP})…"
         if ssh "root@${VALIDATOR_IP}" "systemctl start aperod-node 2>/dev/null && echo started" 2>/dev/null; then
@@ -147,6 +159,20 @@ ${BOLD}╔═══════════════════════�
         fi
       fi
       if [[ ${_BS_LOCAL_STOPPED} -eq 1 ]]; then
+        # Always attempt to restart the local node — the .rsync-in-progress
+        # sentinel (written before rsync runs) prevents aperod-node from loading
+        # a partially-written chain.db, so it is safe to call systemctl start
+        # regardless of whether rsync touched any data.
+        if [[ ${_BS_RSYNC_STARTED} -eq 1 ]]; then
+          warn "[TRAP] rsync был прерван — chain.db может быть в частичном состоянии."
+          warn "       Файл-sentinel .rsync-in-progress оставлен в ${LOCAL_DATA_DIR}."
+          warn "       Нода не запустится, пока sentinel не будет удалён вручную."
+          warn "       Для восстановления:"
+          warn "         1. Повторите bootstrap: bash join-network.sh --bootstrap-from=${VALIDATOR_IP}"
+          warn "         2. ИЛИ восстановите chain.db из бэкапа, затем:"
+          warn "              rm ${LOCAL_DATA_DIR}/.rsync-in-progress"
+          warn "              systemctl start aperod-node"
+        fi
         warn "[TRAP] Перезапускаем local aperod-node…"
         if systemctl start aperod-node 2>/dev/null; then
           ok "[TRAP] Local aperod-node запущен."
@@ -228,6 +254,23 @@ ${BOLD}╔═══════════════════════�
 REMOTE_STOP
   ok "aperod-node на валидаторе остановлен"
 
+  # ── Шаг 3.5: Записываем sentinel непосредственно перед rsync ──
+  # Written here — after both nodes are stopped and immediately before any
+  # data is transferred — so the flag accurately reflects "rsync has begun".
+  # aperod-node refuses to start when this file is present, protecting against
+  # watchdog or stale systemd timer restarts during the transfer.
+  # Removed explicitly in step 4c after both rsync operations succeed.
+  # NOT removed by the cleanup trap on failure: if rsync started but failed,
+  # the data dir may be partially overwritten and the relay must stay blocked
+  # until the operator re-runs bootstrap or restores from a known-good backup.
+  _BS_SENTINEL="${LOCAL_DATA_DIR}/.rsync-in-progress"
+  mkdir -p "${LOCAL_DATA_DIR}"
+  touch "${_BS_SENTINEL}"
+  # Set the rsync-started flag AFTER writing the sentinel.
+  # From this point any failure leaves data in an unknown partial state.
+  _BS_RSYNC_STARTED=1
+  info "Шаг 3.5/9: Sentinel .rsync-in-progress записан — rsync начинается"
+
   # ── Шаг 4: Rsync chain.db и снимков с валидатора ──────────
   info "Шаг 4/9: Rsync chain.db с валидатора (--delete)…"
   info "  Это может занять несколько минут (~1-2 ГБ)"
@@ -249,6 +292,15 @@ REMOTE_STOP
     "root@${VALIDATOR_IP}:${VALIDATOR_DATA_DIR}/" \
     "${LOCAL_DATA_DIR}/"
   ok "Снимки синхронизированы"
+
+  # ── Шаг 4c/9: Снимаем sentinel ────────────────────────────
+  # Both chain.db and snapshots were transferred successfully — the node may
+  # now start safely.  Remove the sentinel that blocked premature starts.
+  rm -f "${_BS_SENTINEL}" 2>/dev/null || true
+  # Reset the rsync-started flag: data is now consistent; if any later step
+  # fails, the cleanup trap may safely restart the local relay.
+  _BS_RSYNC_STARTED=0
+  info "Шаг 4c/9: Sentinel .rsync-in-progress удалён (rsync завершён успешно)"
 
   # Determine the snapshot height from the copied file name.
   SNAP_HEIGHT=$(ls "${LOCAL_DATA_DIR}"/snapshot-v2-*.json.gz 2>/dev/null \
@@ -412,7 +464,20 @@ PY
   if [[ -x /opt/aperod/blockchain/deploy/ensure-dropin.sh ]]; then
     bash /opt/aperod/blockchain/deploy/ensure-dropin.sh
   fi
-  systemctl enable --now aperod-node
+  # IMPORTANT: _BS_LOCAL_STOPPED and the cleanup trap are intentionally NOT
+  # cleared before this command.  If `systemctl enable --now aperod-node` fails
+  # (e.g. unit file not installed), the ERR/EXIT trap will still fire with
+  # _BS_LOCAL_STOPPED=1 and attempt to restart the local node via
+  # `systemctl start aperod-node`.  Clearing those flags first would silence
+  # the trap and leave the relay stopped with no recovery.
+  if ! systemctl enable --now aperod-node; then
+    die "Шаг 8: systemctl enable --now aperod-node завершился с ошибкой.
+  Возможные причины:
+    • unit-файл aperod-node.service не установлен (запустите install-node.sh)
+    • Ошибка прав доступа (запустите скрипт от root / sudo)
+  Trap попытается перезапустить local aperod-node — проверьте состояние:
+    systemctl status aperod-node"
+  fi
   _BS_LOCAL_STOPPED=0
   # Both services are now up (or we've warned about the validator).
   # Снимаем trap: неожиданный выход после этой точки не требует восстановления нод.
@@ -529,6 +594,15 @@ echo
 _TARGET_STOPPED=0
 _SOURCE_STOPPED=0
 
+# _PUSH_RSYNC_STARTED tracks whether rsync has begun writing to the target.
+# Set to 1 immediately before the rsync command (after the sentinel is written);
+# reset to 0 after the sentinel is removed (transfer complete, data consistent).
+# The cleanup trap uses this flag to decide whether the target may be restarted:
+#   0 → rsync never ran, OR finished OK and sentinel removed → safe to restart
+#   1 → rsync started but did not complete → partial data; DO NOT restart;
+#         leave sentinel; operator must re-run join-network.sh or restore backup
+_PUSH_RSYNC_STARTED=0
+
 # ── Защитный trap: гарантирует запуск ОБОИХ узлов при любом сбое ──────────
 # Installed BEFORE Step 1 so it fires even if the script is interrupted
 # immediately after the target node is stopped.
@@ -537,15 +611,8 @@ _push_cleanup() {
   local _exit=$?
   if [[ ${_exit} -ne 0 ]]; then
     warn "[TRAP] Скрипт завершился с кодом ${_exit} — восстанавливаем ноды…"
-    if [[ ${_TARGET_STOPPED} -eq 1 ]]; then
-      warn "[TRAP] Перезапускаем aperod-node на ЦЕЛЕВОМ сервере (${TARGET_IP})…"
-      if ssh "root@${TARGET_IP}" "systemctl start aperod-node 2>/dev/null && echo started" 2>/dev/null; then
-        ok "[TRAP] aperod-node на целевом сервере (${TARGET_IP}) запущен."
-      else
-        warn "[TRAP] Не удалось запустить aperod-node на целевом сервере — запустите вручную:"
-        warn "       ssh root@${TARGET_IP} systemctl start aperod-node"
-      fi
-    fi
+    # The source (this server) was stopped for rsync — always restart it so
+    # the network keeps producing blocks regardless of what failed.
     if [[ ${_SOURCE_STOPPED} -eq 1 ]]; then
       warn "[TRAP] Перезапускаем aperod-node на ИСТОЧНИКЕ (этот сервер)…"
       if systemctl start aperod-node 2>/dev/null; then
@@ -553,6 +620,71 @@ _push_cleanup() {
       else
         warn "[TRAP] Не удалось запустить aperod-node через trap — запустите вручную:"
         warn "       systemctl start aperod-node"
+      fi
+    fi
+    if [[ ${_TARGET_STOPPED} -eq 1 ]]; then
+      if [[ ${_PUSH_RSYNC_STARTED} -eq 0 ]]; then
+        # rsync never ran (failure before step 3) OR completed OK and the
+        # sentinel was already removed (failure in a later config step).
+        # Target chain.db is untouched or consistent — safe to restart.
+        warn "[TRAP] Перезапускаем aperod-node на ЦЕЛЕВОМ сервере (${TARGET_IP})…"
+        if ssh "root@${TARGET_IP}" "systemctl start aperod-node 2>/dev/null && echo started" 2>/dev/null; then
+          ok "[TRAP] aperod-node на целевом сервере (${TARGET_IP}) запущен."
+        else
+          warn "[TRAP] Не удалось запустить aperod-node на целевом сервере по SSH."
+          echo -e "${RED}${BOLD}"
+          echo    "  ╔══════════════════════════════════════════════════════════════╗"
+          echo    "  ║  ⚠  ТРЕБУЕТСЯ РУЧНОЕ ВОССТАНОВЛЕНИЕ ЦЕЛЕВОЙ НОДЫ           ║"
+          echo    "  ║                                                              ║"
+          echo    "  ║  SSH-соединение с ${TARGET_IP} потеряно.                    "
+          echo    "  ║  Когда сеть восстановится, выполните на ЭТОМ сервере:       ║"
+          echo    "  ║                                                              ║"
+          printf  "  ║    ssh root@%s systemctl start aperod-node\n" "${TARGET_IP}"
+          echo    "  ║                                                              ║"
+          echo    "  ║  Или запустите готовый скрипт:                              ║"
+          echo    "  ║    bash /tmp/aperod-join-recovery.sh                        ║"
+          echo    "  ╚══════════════════════════════════════════════════════════════╝"
+          echo -e "${NC}"
+          # Write a ready-to-run recovery script so the operator can paste one
+          # command once connectivity is restored — no need to remember the exact
+          # syntax under pressure.
+          local _recovery_script="/tmp/aperod-join-recovery.sh"
+          cat >"${_recovery_script}" <<RECOVERY_SH
+#!/usr/bin/env bash
+# Aperod join-network.sh — recovery script
+# Generated automatically because the SSH restart of the target node failed.
+# Run this script from the SOURCE server once network connectivity to the
+# target (${TARGET_IP}) is restored.
+set -euo pipefail
+TARGET_IP="${TARGET_IP}"
+echo "Attempting to start aperod-node on \${TARGET_IP}..."
+if ssh "root@\${TARGET_IP}" "systemctl start aperod-node 2>/dev/null && echo started"; then
+  echo "[OK] aperod-node started on \${TARGET_IP}."
+  echo "     Verify: ssh root@\${TARGET_IP} systemctl status aperod-node"
+else
+  echo "[ERR] Still cannot reach \${TARGET_IP} via SSH."
+  echo "      Connect to the target server directly and run:"
+  echo "        systemctl start aperod-node"
+  exit 1
+fi
+RECOVERY_SH
+          chmod +x "${_recovery_script}"
+          warn "[TRAP] Скрипт восстановления записан: ${_recovery_script}"
+          warn "       Запустите его как только SSH-доступ к ${TARGET_IP} будет восстановлен:"
+          warn "       bash ${_recovery_script}"
+        fi
+      else
+        # rsync started but did not complete — data may be partially written.
+        # Do NOT restart the target; leave the sentinel so aperod-node cannot
+        # start accidentally (e.g. via watchdog or stale systemd timer).
+        warn "[TRAP] Целевая нода (${TARGET_IP}) НЕ запускается автоматически."
+        warn "       rsync был прерван — chain.db может быть в частичном состоянии."
+        warn "       Файл-sentinel .rsync-in-progress оставлен на ${TARGET_IP}:${SECONDARY_DATA_DIR}."
+        warn "       Для восстановления:"
+        warn "         1. Повторите: bash join-network.sh ${TARGET_IP}"
+        warn "         2. ИЛИ восстановите chain.db из бэкапа, затем:"
+        warn "              ssh root@${TARGET_IP} \"rm ${SECONDARY_DATA_DIR}/.rsync-in-progress\""
+        warn "              ssh root@${TARGET_IP} systemctl start aperod-node"
       fi
     fi
   fi
@@ -592,14 +724,43 @@ fi
 _SOURCE_STOPPED=1
 ok "aperod-node на источнике остановлен"
 
+# ── Шаг 2b: Записываем sentinel на целевом сервере ────────
+# The sentinel .rsync-in-progress tells aperod-node to refuse startup until
+# it is removed.  This prevents a watchdog or stale systemd timer from
+# starting the node against a half-written LevelDB while rsync is in flight.
+# The sentinel is removed after a successful rsync (step 3b) and also by the
+# cleanup trap on any error path.
+info "Шаг 2b/7: Записываем sentinel .rsync-in-progress на ${TARGET_IP}:${SECONDARY_DATA_DIR}…"
+ssh "root@${TARGET_IP}" "mkdir -p '${SECONDARY_DATA_DIR}' && touch '${SECONDARY_DATA_DIR}/.rsync-in-progress' && echo 'sentinel written'"
+ok "Sentinel записан (нода заблокирована от преждевременного старта)"
+
 # ── Шаг 3: Rsync данных с --delete ────────────────────────
 info "Шаг 3/7: Синхронизируем цепь (rsync --delete)…"
 info "  Это может занять несколько минут (~1-2 ГБ)"
+# Set _PUSH_RSYNC_STARTED=1 immediately before rsync begins.
+# From this point any failure means target data may be partially overwritten.
+# The cleanup trap will leave the sentinel in place and NOT restart the target.
+_PUSH_RSYNC_STARTED=1
+# IMPORTANT: .rsync-in-progress must be excluded from --delete.
+# The source does not have this file, so without the exclusion rsync's
+# deletion pass would remove the sentinel from the target BEFORE the data
+# transfer completes — defeating its purpose.
 rsync -az --delete --progress --ignore-errors \
   --exclude='p2p_identity.key' \
+  --exclude='.rsync-in-progress' \
   "${PRIMARY_DATA_DIR}/" \
   "root@${TARGET_IP}:${SECONDARY_DATA_DIR}/"
 ok "Rsync завершён"
+
+# ── Шаг 3b: Удаляем sentinel после успешного rsync ────────
+# rsync completed without error — the data dir is now consistent.
+# Remove the sentinel so the node can start normally, and reset the
+# rsync-started flag so any subsequent failure allows the trap to restart
+# the target (data is known-good from this point forward).
+info "Шаг 3b/7: Rsync завершён успешно — удаляем sentinel .rsync-in-progress…"
+ssh "root@${TARGET_IP}" "rm -f '${SECONDARY_DATA_DIR}/.rsync-in-progress' && echo 'sentinel removed'"
+_PUSH_RSYNC_STARTED=0
+ok "Sentinel удалён (нода готова к запуску)"
 
 # ── Перезапускаем ноду на ИСТОЧНИКЕ ───────────────────────
 info "Перезапускаем aperod-node на источнике…"
