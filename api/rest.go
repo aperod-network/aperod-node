@@ -47,6 +47,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.restAdminPartialUnstake))
         s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.restAdminFullUnstake))
         s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.restAdminStakeDeposit))
+        s.mux.HandleFunc("/api/v1/admin/utxo-audit", s.localOnly(s.restAdminUTXOAudit))
         s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
         s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
         s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.restNetworkBans))
@@ -57,7 +58,9 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
         s.mux.HandleFunc("/api/v1/network/stall-events", s.localOnly(s.restNetworkStallEvents))
         s.mux.HandleFunc("/api/v1/network/bootnode-warn-events", s.localOnly(s.restNetworkBootnodeWarnEvents))
+        s.mux.HandleFunc("/api/v1/network/duplicate-identity-events", s.localOnly(s.restNetworkDuplicateIdentityEvents))
         s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.restNetworkP2PConfig))
+        s.mux.HandleFunc("/api/v1/network/peers", s.localOnly(s.restNetworkPeers))
         s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
         s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
         s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
@@ -1210,6 +1213,34 @@ func (s *Server) restNetworkBanEvents(w http.ResponseWriter, r *http.Request) {
 //
 // Returns block-fetch stall events recorded by the P2P layer: each entry is a
 // peer that failed to serve a requested block within GetBlockStallTimeout.
+// ─── GET /api/v1/network/peers ────────────────────────────────────────────────
+//
+// Returns a snapshot of all currently connected P2P peers with their
+// last-reported chain heights and connection direction.  Heights are updated
+// on every keepalive Pong reply; a height of 0 means the peer has not yet
+// replied to a Ping since connecting.
+//
+// Useful for monitoring relay-node lag: compare each peer's height against
+// the validator's own tip_height to detect sync stalls before they escalate
+// to a ban.
+//
+// Response: [ { "addr": "ip:port", "height": N, "direction": "in"|"out" }, … ]
+func (s *Server) restNetworkPeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	if s.peerListFn == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+		return
+	}
+	peers := s.peerListFn()
+	if peers == nil {
+		peers = []PeerListEntry{}
+	}
+	writeJSON(w, http.StatusOK, peers)
+}
+
 // Accepts an optional `since` query parameter (Unix milliseconds) to fetch
 // only events recorded after that time.
 //
@@ -1273,6 +1304,42 @@ func (s *Server) restNetworkBootnodeWarnEvents(w http.ResponseWriter, r *http.Re
         events := s.bootnodeWarnEventFn(since)
         if events == nil {
                 events = []BootnodeWarnEntry{}
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
+}
+
+// ─── GET /api/v1/network/duplicate-identity-events ───────────────────────────
+//
+// Returns duplicate-identity fingerprint conflict events recorded by the P2P
+// layer: each entry is a peer that presented the same TLS SPKI fingerprint as
+// this node's own identity key and was rejected by the identity-conflict guard.
+// Accepts an optional `since` query parameter (Unix milliseconds) to fetch only
+// events recorded after that time.
+//
+// Response: { "events": [ { addr, fingerprint, at } ] }
+func (s *Server) restNetworkDuplicateIdentityEvents(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        if s.duplicateIdentityEventFn == nil {
+                writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+                return
+        }
+
+        var since time.Time
+        if raw := r.URL.Query().Get("since"); raw != "" {
+                ms, err := strconv.ParseInt(raw, 10, 64)
+                if err != nil {
+                        writeJSONError(w, http.StatusBadRequest, "since must be a Unix-ms integer")
+                        return
+                }
+                since = time.UnixMilli(ms)
+        }
+
+        events := s.duplicateIdentityEventFn(since)
+        if events == nil {
+                events = []DuplicateIdentityEntry{}
         }
         writeJSON(w, http.StatusOK, map[string]interface{}{"events": events})
 }
@@ -1380,6 +1447,7 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                         "timestamp_rejected_count":   s.TimestampRejectedCount(),
                         "peer_count":                 s.livePeerCount(),
                         "pending_handshakes":          s.livePendingHandshakes(),
+                        "reconnect_backoff_active":    s.liveReconnectBackoff(),
                 })
                 return
         }
@@ -1396,6 +1464,7 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 "timestamp_rejected_count":   s.TimestampRejectedCount(),
                 "peer_count":                 s.livePeerCount(),
                 "pending_handshakes":          s.livePendingHandshakes(),
+                "reconnect_backoff_active":    s.liveReconnectBackoff(),
         })
 }
 
@@ -1414,6 +1483,15 @@ func (s *Server) livePendingHandshakes() int64 {
                 return 0
         }
         return s.pendingHandshakeCounter()
+}
+
+// liveReconnectBackoff reports whether the P2P host is currently holding off
+// bootnode redials due to exponential back-off, or false if not wired.
+func (s *Server) liveReconnectBackoff() bool {
+        if s.reconnectBackoffFlag == nil {
+                return false
+        }
+        return s.reconnectBackoffFlag()
 }
 
 // ─── GET /api/v1/validators ──────────────────────────────────────────────────
@@ -2210,9 +2288,15 @@ type mintRequest struct {
 type mintResponse struct {
         TxHash    string  `json:"tx_hash"`
         AmountAPR float64 `json:"amount_apr"`
-        Address   string  `json:"address"`
-        BlindHex  string  `json:"blind_hex"` // hex-encoded blind factor used for the commitment
-        Height    uint64  `json:"height"`    // block height the mint was committed at
+        // AmountNAPR is the authoritative minted amount in nAPRO — the exact
+        // integer value passed to the mint scheduler and committed on-chain.
+        // Serialized as a decimal STRING so JavaScript callers can parse it
+        // losslessly with BigInt (a JSON number would be rounded above 2^53).
+        // Callers must persist/verify against this value, not the float echo.
+        AmountNAPR string `json:"amount_napr"`
+        Address    string `json:"address"`
+        BlindHex   string `json:"blind_hex"` // hex-encoded blind factor used for the commitment
+        Height     uint64 `json:"height"`    // block height the mint was committed at
 }
 
 // adminMintWaitTimeout bounds how long restAdminMint waits for the scheduled
@@ -2312,7 +2396,17 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 writeJSONError(w, http.StatusInternalServerError, "decode address for blind: "+err.Error())
                 return
         }
-        mintBlind, err := crypto.DeterministicMintBlind(spendPub, amountNAPR)
+        // Scheduled mints are built at the block's real height (mintHeight > 0),
+        // where BuildMintTx derives the commitment blind with
+        // DeterministicMintBlindV2 (includes height). Returning the legacy V1
+        // blind here would give the caller a blind that does NOT match the
+        // on-chain commitment, making the UTXO unspendable from stored data.
+        var mintBlind crypto.BlindFactor
+        if mintHeight > 0 {
+                mintBlind, err = crypto.DeterministicMintBlindV2(spendPub, amountNAPR, mintHeight)
+        } else {
+                mintBlind, err = crypto.DeterministicMintBlind(spendPub, amountNAPR)
+        }
         if err != nil {
                 writeJSONError(w, http.StatusInternalServerError, "compute mint blind: "+err.Error())
                 return
@@ -2324,11 +2418,12 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 "tx_hash", txHashHex, "height", mintHeight)
 
         writeJSON(w, http.StatusCreated, mintResponse{
-                TxHash:    txHashHex,
-                AmountAPR: req.AmountAPR,
-                Address:   req.Address,
-                BlindHex:  blindHex,
-                Height:    mintHeight,
+                TxHash:     txHashHex,
+                AmountAPR:  req.AmountAPR,
+                AmountNAPR: strconv.FormatUint(amountNAPR, 10),
+                Address:    req.Address,
+                BlindHex:   blindHex,
+                Height:     mintHeight,
         })
 }
 
@@ -2625,4 +2720,76 @@ func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// ─── GET /api/v1/admin/utxo-audit ────────────────────────────────────────────
+
+// UTXOAuditMismatch describes one u/ store entry whose fields diverge from the
+// authoritative output data in the raw block store.
+type UTXOAuditMismatch struct {
+	TxHash      string `json:"tx_hash"`
+	OutputIndex uint32 `json:"output_index"`
+	Height      uint64 `json:"height"`
+	StoreCommit string `json:"store_commit"`
+	BlockCommit string `json:"block_commit"`
+}
+
+// UTXOAuditResult holds the outcome of one background UTXO-store audit cycle.
+// Produced by the audit goroutine in cmd/node/main.go and pushed here via
+// SetUTXOAuditResult so /api/v1/admin/utxo-audit can expose it to the
+// Node.js api-server monitor (which fires the Telegram alert on mismatches>0).
+type UTXOAuditResult struct {
+	CompletedAt          time.Time           `json:"completed_at"`
+	DurationMs           int64               `json:"duration_ms"`
+	TipHeight            uint64              `json:"tip_height"`
+	SampledChecked       int                 `json:"sampled_checked"`        // random unspent u/ entries verified this cycle
+	RecentBlocksChecked  uint64              `json:"recent_blocks_checked"`  // recent blocks fully verified this cycle
+	RecentOutputsChecked int                 `json:"recent_outputs_checked"` // outputs verified inside those recent blocks
+	Mismatches           int                 `json:"mismatches"`             // total divergent entries found (sampled + recent)
+	Skipped              int                 `json:"skipped"`                // entries that could not be verified (pruned/unreadable blocks)
+	Error                string              `json:"error,omitempty"`        // first non-fatal error encountered, if any
+	MismatchDetails      []UTXOAuditMismatch `json:"mismatch_details,omitempty"`
+}
+
+// SetUTXOAuditResult stores the latest background audit outcome.
+// Called by the audit goroutine in cmd/node after every cycle.
+func (s *Server) SetUTXOAuditResult(res *UTXOAuditResult) {
+	s.utxoAuditMu.Lock()
+	s.utxoAudit = res
+	s.utxoAuditMu.Unlock()
+}
+
+// UTXOAuditResultSnapshot returns the latest stored audit result (nil when no
+// cycle has completed yet).
+func (s *Server) UTXOAuditResultSnapshot() *UTXOAuditResult {
+	s.utxoAuditMu.Lock()
+	defer s.utxoAuditMu.Unlock()
+	return s.utxoAudit
+}
+
+// restAdminUTXOAudit returns the outcome of the most recent background
+// UTXO-store integrity audit.  Local-only (wrapped in localOnly()): consumed by
+// the Node.js api-server monitor which alerts admins in Telegram when
+// mismatches>0 — catching store/blockchain divergence before a withdrawal
+// fails with the wrong commitment.
+func (s *Server) restAdminUTXOAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
+		writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
+		return
+	}
+	res := s.UTXOAuditResultSnapshot()
+	if res == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "pending",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ok",
+		"audit":  res,
+	})
 }
