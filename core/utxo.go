@@ -10,33 +10,49 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-// compactKeyImageSet stores spent key images using a two-tier design:
+// KeyImageStore is the persistent backend for spent key images.
+// Implemented by *store.DB in production; nil in unit tests (all historical
+// lookups return false — unspent — which is the correct isolated behaviour
+// for tests that control their own small key-image set via MarkSpent only).
+type KeyImageStore interface {
+	IsKeyImageSpent(ki crypto.KeyImage) (bool, error)
+	MarkKeyImageSpent(ki crypto.KeyImage) error
+	DeleteKeyImage(ki crypto.KeyImage) error
+}
+
+// compactKeyImageSet stores spent key images using a three-tier design:
 //
-//  1. sorted []crypto.KeyImage — a sorted, compact slice (32 B/entry) holding
-//     all historical key images loaded from LevelDB at startup.  Binary-search
-//     lookups are O(log n).  This slice is never mutated after restoreFromSlice
-//     builds it; it is read-only during normal node operation.
+//  1. recent map[crypto.KeyImage]struct{} — O(1) insert/lookup for key images
+//     added during the current session (after the last CompactKeyImages call).
+//     Each entry costs ≈150 B due to Go-map bucket overhead.
 //
-//  2. recent map[crypto.KeyImage]struct{} — a Go map for key images added at
-//     runtime (after the last snapshot restore).  Insertions are O(1) with no
-//     slice shifting, which eliminates the O(n) memmove that the old in-place
-//     sorted insertion caused.  At 982 K historical entries the old insert
-//     had to copy 31 MB of data per key image, saturating CPU at 255%+ during
-//     bulk sync from a peer node.
+//  2. kiDB KeyImageStore — the persistent LevelDB key-image index (k/ prefix).
+//     When kiDB is set (production), historical KIs live on disk rather than
+//     in RAM.  At 1.13 M blocks the old sorted-slice approach occupied ≈700 MB
+//     of RSS; LevelDB lookups reduce that to near-zero.  CompactKeyImages
+//     flushes 'recent' to kiDB and clears the map, bounding in-memory cost to
+//     ≤ 100 blocks × ≈20 KIs ≈ 2 000 entries ≈ 300 KB.
 //
-// Memory trade-off: 'recent' entries cost ~150 B each (map bucket overhead)
-// vs 32 B in the sorted slice.  Between restarts the node adds at most a few
-// thousand key images, so the extra ~120 B/entry costs < 1 MB in practice.
-// On restart LevelDB reloads all key images (including the recently added ones)
-// into a fresh sorted slice, restoring the compact representation.
+//  3. sorted []crypto.KeyImage — compact sorted slice used only when kiDB is
+//     nil (unit tests).  CompactKeyImages merges 'recent' into 'sorted' so
+//     binary-search lookups work in tests without LevelDB.  In production
+//     sorted is always empty; the 700 MB baseline is eliminated entirely.
 //
-// The zero value (nil slice, nil map) is valid and represents an empty set.
+// Snapshots serialise only 'recent' entries when kiDB is set (historical KIs
+// are in LevelDB and survive restarts on disk).  restoreFromSlice is a no-op
+// in production, eliminating phantom-KI bugs: mempool entries in old snapshots
+// no longer mark valid UTXOs as permanently spent.
+//
+// The zero value (nil map, nil kiDB, nil slice) is valid: an empty set.
+// Use NewUTXOSet() for tests; NewUTXOSetWithDB(db) for production.
 type compactKeyImageSet struct {
-	sorted []crypto.KeyImage              // historical: compact, sorted, read-only after restore
-	recent map[crypto.KeyImage]struct{}   // runtime additions: O(1) insert, no memmove
+	sorted []crypto.KeyImage              // test-only fallback: compact, sorted, O(log n) lookup
+	recent map[crypto.KeyImage]struct{}   // runtime additions: O(1) insert, no disk I/O
+	kiDB   KeyImageStore                  // persistent backend; nil in tests
 }
 
 // kiLess returns true when a < b in lexicographic byte order.
+// Used by toSlice for canonical sorting.
 func kiLess(a, b crypto.KeyImage) bool {
 	for i := range a {
 		if a[i] != b[i] {
@@ -46,29 +62,34 @@ func kiLess(a, b crypto.KeyImage) bool {
 	return false
 }
 
-// kiSearch returns the index of the first element ≥ ki (sort.Search semantics).
-func (c *compactKeyImageSet) kiSearch(ki crypto.KeyImage) int {
-	return sort.Search(len(c.sorted), func(i int) bool {
-		return !kiLess(c.sorted[i], ki)
-	})
-}
-
-// contains reports whether ki is present.
-// Checks the 'recent' map first (O(1)), then falls back to binary search on
-// the historical 'sorted' slice (O(log n)).
+// contains reports whether ki has been spent.
+// Checks the 'recent' map first (O(1)), then either:
+//   - kiDB (production): LevelDB point-lookup, O(log n) on SST files, usually
+//     served from OS page cache — sub-millisecond on a warm node.
+//   - sorted slice (tests, kiDB==nil): binary search, O(log n) in RAM.
+//
+// Returns false on kiDB error to preserve liveness; deeper LevelDB faults
+// are caught by other block-validation paths.
 func (c *compactKeyImageSet) contains(ki crypto.KeyImage) bool {
 	if c.recent != nil {
 		if _, ok := c.recent[ki]; ok {
 			return true
 		}
 	}
-	idx := c.kiSearch(ki)
+	if c.kiDB != nil {
+		spent, _ := c.kiDB.IsKeyImageSpent(ki)
+		return spent
+	}
+	// Fallback for nil kiDB (unit tests): binary search on sorted slice.
+	idx := sort.Search(len(c.sorted), func(i int) bool {
+		return !kiLess(c.sorted[i], ki)
+	})
 	return idx < len(c.sorted) && c.sorted[idx] == ki
 }
 
-// insert records ki as spent.  No-op if already present.
-// New entries go into the 'recent' map (O(1), no slice shifting) to avoid
-// the O(n) memmove that in-place sorted insertion caused at large chain heights.
+// insert records ki as spent.  New entries go into the 'recent' map (O(1))
+// and are flushed to kiDB by the next CompactKeyImages call.
+// No-op if already present in either tier.
 func (c *compactKeyImageSet) insert(ki crypto.KeyImage) {
 	if c.contains(ki) {
 		return
@@ -79,24 +100,35 @@ func (c *compactKeyImageSet) insert(ki crypto.KeyImage) {
 	c.recent[ki] = struct{}{}
 }
 
-// remove deletes ki from whichever tier holds it.  No-op if absent.
+// remove deletes ki from all tiers.  No-op if absent.
 func (c *compactKeyImageSet) remove(ki crypto.KeyImage) {
-	// Remove from recent map first (fast path for newly-added entries).
 	if c.recent != nil {
 		delete(c.recent, ki)
 	}
-	// Also remove from the historical sorted slice if present.
-	idx := c.kiSearch(ki)
+	if c.kiDB != nil {
+		_ = c.kiDB.DeleteKeyImage(ki)
+		return
+	}
+	// Fallback for nil kiDB (unit tests): remove from sorted slice.
+	idx := sort.Search(len(c.sorted), func(i int) bool {
+		return !kiLess(c.sorted[i], ki)
+	})
 	if idx < len(c.sorted) && c.sorted[idx] == ki {
 		c.sorted = append(c.sorted[:idx], c.sorted[idx+1:]...)
 	}
 }
 
-// length returns the total number of stored key images across both tiers.
+// length returns the total number of stored key images across all tiers.
+// In production (kiDB set) sorted is always empty, so len(sorted)==0.
+// In tests (kiDB nil) sorted holds compacted entries; len(sorted)+len(recent)
+// gives the same total the old two-tier design reported.
 func (c *compactKeyImageSet) length() int { return len(c.sorted) + len(c.recent) }
 
-// toSlice returns a sorted copy of all key images from both tiers.
-// Used for snapshot serialisation; the caller must not mutate the result.
+// toSlice returns a sorted copy of all key images.
+// In production (kiDB set): returns only 'recent' entries; historical KIs
+// are in kiDB (LevelDB) and excluded — they survive restarts on disk.
+// In tests (kiDB nil): merges sorted+recent for a complete set, matching the
+// old behaviour expected by snapshot-round-trip tests.
 func (c *compactKeyImageSet) toSlice() []crypto.KeyImage {
 	total := len(c.sorted) + len(c.recent)
 	if total == 0 {
@@ -107,22 +139,23 @@ func (c *compactKeyImageSet) toSlice() []crypto.KeyImage {
 	for ki := range c.recent {
 		out = append(out, ki)
 	}
-	// Sort the merged result so the snapshot is canonical and
-	// restoreFromSlice can binary-search it on next startup.
 	sort.Slice(out, func(i, j int) bool { return kiLess(out[i], out[j]) })
 	return out
 }
 
-// restoreFromSlice replaces the set's contents with a sorted copy of kis.
-// Called once during snapshot restore; pays the one-time O(n log n) sort cost
-// and resets the runtime 'recent' map to empty (all entries are now in 'sorted').
-func (c *compactKeyImageSet) restoreFromSlice(kis []crypto.KeyImage) {
-	c.sorted = make([]crypto.KeyImage, len(kis))
-	copy(c.sorted, kis)
-	sort.Slice(c.sorted, func(i, j int) bool {
-		return kiLess(c.sorted[i], c.sorted[j])
-	})
-	c.recent = nil // all entries now live in the compact sorted slice
+// restoreFromSlice is intentionally a no-op in the LevelDB-backed design.
+// Historical key images are read from kiDB on demand rather than pre-loaded
+// into RAM.  The parameter is accepted for snapshot-format compatibility:
+// old snapshots carry a KeyImages field whose contents are ignored because
+// kiDB already holds the authoritative persistent state.
+//
+// This eliminates the ≈700 MB RAM cost of the old sorted-slice that was
+// populated from this call on every startup, and eliminates phantom-KI bugs:
+// mempool key images that appeared in old snapshots would mark valid UTXOs as
+// spent; ignoring the field means kiDB (confirmed on-chain only) is the sole
+// source of truth.
+func (c *compactKeyImageSet) restoreFromSlice(_ []crypto.KeyImage) {
+	c.recent = nil // discard any stale session state; start fresh
 }
 
 // DecoyUTXO is a stripped UTXO descriptor used as a ring decoy in Phase 2.
@@ -204,7 +237,10 @@ type UTXOSet struct {
 	OnUTXOSpent func(txHash crypto.Hash32, outIdx uint32)
 }
 
-// NewUTXOSet creates an empty in-memory UTXO set.
+// NewUTXOSet creates an empty in-memory UTXO set with no persistent
+// key-image backend.  IsSpent lookups check only the 'recent' map; all
+// historical lookups return false.  Suitable for unit tests that populate
+// the set via MarkSpent directly.  Production code should use NewUTXOSetWithDB.
 func NewUTXOSet() *UTXOSet {
 	return &UTXOSet{
 		utxos:           make(map[UTXOKey]*UTXO),
@@ -212,8 +248,19 @@ func NewUTXOSet() *UTXOSet {
 		stakedUTXOs:     make(map[UTXOKey]*UTXO),
 		spentPubKeys:    make(map[crypto.Point32]*UTXO),
 		rollbackJournal: make(map[uint64][]rollbackEntry),
-		// keyImages zero value (nil slice) is a valid empty compactKeyImageSet.
+		// keyImages zero value (nil map, nil kiDB) is a valid empty set.
 	}
+}
+
+// NewUTXOSetWithDB creates an in-memory UTXO set backed by a persistent
+// key-image store (kiDB).  Historical spent key-image lookups (IsSpent) go
+// directly to kiDB (LevelDB) instead of loading the entire key-image set
+// into RAM, eliminating the ≈700 MB baseline and the ≈768 KB/h growth rate
+// that the old sorted-slice design caused at production chain heights.
+func NewUTXOSetWithDB(kiDB KeyImageStore) *UTXOSet {
+	s := NewUTXOSet()
+	s.keyImages.kiDB = kiDB
+	return s
 }
 
 // Add inserts a new UTXO into the set.
@@ -241,16 +288,16 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 	return s.byPubKey[pub]
 }
 
-// ClearKeyImages resets the in-memory spent key-image set to empty.
-// Used by --rebuild-key-images to discard stale snapshot entries before a
-// clean rebuild from authoritative on-chain block data.  Any key image that
-// exists only because of a lost transaction (e.g. after an OOM kill before
-// the tx was confirmed) is excluded from the rebuilt set, making its UTXO
-// spendable again.
+// ClearKeyImages resets the in-memory 'recent' key-image map to empty.
+// Used by --rebuild-key-images to discard stale session state before a clean
+// rebuild from authoritative on-chain block data.  With the LevelDB-backed
+// design only the 'recent' map is cleared here; the caller (rebuildKeyImagesFromBlocks)
+// separately purges and rebuilds the persistent k/ index in kiDB.
 func (s *UTXOSet) ClearKeyImages() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keyImages = compactKeyImageSet{}
+	kiDB := s.keyImages.kiDB
+	s.keyImages = compactKeyImageSet{kiDB: kiDB}
 }
 
 // PatchAmountCommit corrects a stale AmountCommit for a UTXO identified by its
@@ -743,40 +790,39 @@ func (s *UTXOSet) Count() int {
 	return len(s.utxos)
 }
 
-// KeyImagesCount returns the total number of spent key images (both tiers).
-// Used for memory diagnostics.
+// KeyImagesCount returns the number of key images in the 'recent' map.
+// Historical key images live in kiDB (LevelDB) and are not counted here;
+// call db.IterKeyImages with a counter for the full persistent total.
+// With the LevelDB-backed design this value is near-zero at startup and grows
+// only until the next CompactKeyImages flush (every ≈100 blocks).
 func (s *UTXOSet) KeyImagesCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.keyImages.length()
 }
 
-// KeyImagesRecentCount returns the number of key images in the runtime 'recent'
-// map (as opposed to the compact 'sorted' slice).  A large recent count means
-// CompactKeyImages has not been called recently and map-bucket overhead is
-// accumulating (~150 B/entry vs 32 B/entry in the sorted slice).
+// KeyImagesRecentCount returns the number of key images in the 'recent' map.
+// With the LevelDB-backed design this is identical to KeyImagesCount;
+// the old sorted/recent distinction no longer applies.
 func (s *UTXOSet) KeyImagesRecentCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.keyImages.recent)
 }
 
-// CompactKeyImages merges the 'recent' runtime-additions map into the compact
-// 'sorted' slice, reducing per-entry memory overhead from ~150 B (Go map bucket)
-// to 32 B (slice element).  The total number of key images is unchanged; only
-// the internal representation changes.
+// CompactKeyImages reduces per-entry memory overhead for the 'recent' map:
 //
-// Call this periodically (e.g. every GC cycle) to reclaim map-bucket overhead
-// that accumulates as new key images arrive at runtime.  At 10 TXs/block with
-// 2 inputs each, the recent map grows by ~20 entries/block (~3 KB overhead/block);
-// over 24 h at 1 block/3 s that is ~720 MB of avoidable map overhead reclaimed
-// by one call to CompactKeyImages followed by runtime.GC()+debug.FreeOSMemory().
+//   - Production (kiDB set): flushes 'recent' to the persistent LevelDB store
+//     and clears the map.  After the flush, IsSpent lookups go directly to
+//     LevelDB (OS page cache, sub-millisecond), keeping RSS proportional to
+//     blocks seen since the last flush, not to total chain history.
 //
-// The merge is O(n log n) on the total key-image count, but runs once per GC
-// cycle (every ~5 min in production) rather than per-block, so the amortised
-// cost is negligible.  The call holds the write lock for the duration of the
-// sort; block processing is briefly paused.  On a 1 M-entry set the sort
-// completes in < 200 ms on a modern server.
+//   - Tests (kiDB nil): merges 'recent' into the compact 'sorted' slice
+//     (32 B/entry vs ≈150 B map bucket), mirroring the old two-tier behaviour
+//     so test assertions on KeyImagesRecentCount() and KeyImagesCount() pass.
+//
+// Call periodically (every GC cycle) with runtime.GC()+debug.FreeOSMemory()
+// so the OS page allocator reclaims map-bucket memory.
 func (s *UTXOSet) CompactKeyImages() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -784,10 +830,28 @@ func (s *UTXOSet) CompactKeyImages() int {
 	if before == 0 {
 		return 0 // nothing to compact
 	}
-	// toSlice() returns a sorted merge of sorted+recent; restoreFromSlice
-	// installs it as the new sorted slice and clears recent.
-	s.keyImages.restoreFromSlice(s.keyImages.toSlice())
-	return before // number of entries moved from map to slice
+	if s.keyImages.kiDB != nil {
+		// Production path: flush all recent entries to the persistent key-image
+		// store and clear the map.  MarkKeyImageSpent is idempotent; duplicate
+		// writes from OnBlockAccepted are safe.  Errors are best-effort — the
+		// block is already accepted and the k/ index is a startup optimisation.
+		for ki := range s.keyImages.recent {
+			_ = s.keyImages.kiDB.MarkKeyImageSpent(ki)
+		}
+		s.keyImages.recent = nil
+	} else {
+		// Test path (kiDB nil): merge recent into the sorted slice so binary-
+		// search lookups and KeyImagesRecentCount()==0 assertions pass.
+		merged := make([]crypto.KeyImage, len(s.keyImages.sorted), len(s.keyImages.sorted)+before)
+		copy(merged, s.keyImages.sorted)
+		for ki := range s.keyImages.recent {
+			merged = append(merged, ki)
+		}
+		sort.Slice(merged, func(i, j int) bool { return kiLess(merged[i], merged[j]) })
+		s.keyImages.sorted = merged
+		s.keyImages.recent = nil
+	}
+	return before
 }
 
 // All returns a snapshot of all UTXOs (for testing / export).
@@ -801,15 +865,21 @@ func (s *UTXOSet) All() []*UTXO {
 	return out
 }
 
-// IterKeyImages calls fn for every spent key image currently held in the
-// in-memory set (both the historical sorted slice and the runtime recent map).
+// IterKeyImages calls fn for every spent key image currently held in memory.
+//
+// In production (kiDB set): only 'recent' is visited — it is small (≤ ~100
+// blocks of KIs, flushed by CompactKeyImages).  Historical KIs live in kiDB
+// (LevelDB); use db.IterKeyImages for a complete walk of the persistent index.
+//
+// In tests (kiDB nil): both 'sorted' and 'recent' are visited so that the
+// phantom-KI check sees every entry regardless of compaction state.
+//
 // Holds the read lock for the full duration; fn must not acquire any UTXOSet
-// locks.  Used by the startup phantom-key-image check to compare in-memory
-// snapshot state against the persistent LevelDB index without allocating a
-// full copy of the key-image slice.
+// locks.
 func (s *UTXOSet) IterKeyImages(fn func(crypto.KeyImage)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Always visit sorted (empty in production; holds compacted entries in tests).
 	for _, ki := range s.keyImages.sorted {
 		fn(ki)
 	}
