@@ -198,6 +198,125 @@ func TestChain_MemoryCapTipIntact(t *testing.T) {
 	}
 }
 
+// TestChain_SmallWindow10 is the canonical acceptance test for Task 1816.
+// It constructs a Chain with a window of exactly 10 blocks, adds 15 blocks,
+// and confirms:
+//   - the oldest 5 blocks (heights 0-4) are no longer in memory, and
+//   - the newest 10 blocks (heights 6-15) remain accessible.
+//
+// Using height-0 genesis plus heights 1-15 gives 16 total entries; after
+// processing height 15, only heights 6-15 should survive.
+func TestChain_SmallWindow10(t *testing.T) {
+	const window = 10
+	const extra = 5
+	const total = window + extra // 15 non-genesis blocks
+
+	c := core.NewChain(window)
+	genesis := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(genesis); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+
+	hashes := make([]crypto.Hash32, total+1)
+	hashes[0] = genesis.Hash()
+	prev := genesis
+	for h := uint64(1); h <= uint64(total); h++ {
+		b := makeMinimalBlock(h, prev.Hash())
+		if err := c.AddBlock(b); err != nil {
+			t.Fatalf("AddBlock(height=%d): %v", h, err)
+		}
+		hashes[h] = b.Hash()
+		prev = b
+	}
+
+	// Tip must be at height `total`.
+	if got := c.Height(); got != uint64(total) {
+		t.Errorf("Height = %d, want %d", got, total)
+	}
+
+	// In-memory count must equal exactly the window size.
+	if got := c.InMemoryBlockCount(); got != window {
+		t.Errorf("InMemoryBlockCount = %d, want %d (window)", got, window)
+	}
+
+	// The oldest `extra` blocks (heights 0 .. total-window == 0..5) must be evicted.
+	evictedUpTo := uint64(total - window) // = 5 (inclusive)
+	for h := uint64(0); h <= evictedUpTo; h++ {
+		if c.GetByHeight(h) != nil {
+			t.Errorf("height %d: expected evicted, but still in memory", h)
+		}
+		if c.GetByHash(hashes[h]) != nil {
+			t.Errorf("height %d hash: expected evicted, but still in memory", h)
+		}
+	}
+
+	// The newest `window` blocks (heights evictedUpTo+1 .. total) must remain.
+	for h := evictedUpTo + 1; h <= uint64(total); h++ {
+		if c.GetByHeight(h) == nil {
+			t.Errorf("height %d: expected in sliding window, but GetByHeight returned nil", h)
+		}
+		if c.GetByHash(hashes[h]) == nil {
+			t.Errorf("height %d hash: expected in sliding window, but GetByHash returned nil", h)
+		}
+	}
+}
+
+// TestChain_FastForwardWithIndexMemoryCap confirms that FastForwardWithIndex
+// (the startup index-restore path) applies the same sliding-window eviction as
+// AddBlock and FastForward.  Blocks outside the window must not appear in the
+// tx index or the height map after the call.
+func TestChain_FastForwardWithIndexMemoryCap(t *testing.T) {
+	const window = 10
+	const total = window + 5 // 15 non-genesis blocks
+
+	c := core.NewChain(window)
+	genesis := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(genesis); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+
+	// Build blocks to bulk-load.
+	blocks := make([]*core.Block, 0, total)
+	prev := genesis
+	for h := uint64(1); h <= uint64(total); h++ {
+		b := makeMinimalBlock(h, prev.Hash())
+		blocks = append(blocks, b)
+		prev = b
+	}
+
+	// Build a minimal tx-index: one dummy entry per block, all pointing to
+	// TxIdx=0.  Entries whose block is evicted during FastForwardWithIndex
+	// must be silently skipped (not crash, not leak into the index).
+	txEntries := make(map[crypto.Hash32]core.TxIndexEntry, total)
+	for _, b := range blocks {
+		// Use the block hash as a fake tx hash — that is unique per block.
+		txEntries[b.Hash()] = core.TxIndexEntry{Height: b.Header.Height, TxIdx: 0}
+	}
+
+	c.FastForwardWithIndex(blocks, txEntries)
+
+	// Tip must be at height `total`.
+	if got := c.Height(); got != uint64(total) {
+		t.Errorf("Height after FastForwardWithIndex = %d, want %d", got, total)
+	}
+
+	// In-memory count must equal exactly the configured window.
+	if got := c.InMemoryBlockCount(); got != window {
+		t.Errorf("InMemoryBlockCount = %d, want %d (window)", got, window)
+	}
+
+	evictedUpTo := uint64(total - window) // heights 0..5 evicted
+	for h := uint64(1); h <= evictedUpTo; h++ {
+		if c.GetByHeight(h) != nil {
+			t.Errorf("height %d: expected evicted after FastForwardWithIndex, still accessible", h)
+		}
+	}
+	// Tip block must still be accessible.
+	if c.GetByHeight(uint64(total)) == nil {
+		t.Errorf("tip at height %d missing after FastForwardWithIndex", total)
+	}
+}
+
 // TestChain_ReorgAfterCacheEviction verifies that Reorg succeeds when the
 // fork-point block has already been evicted from the in-memory sliding-window
 // cache.  This exercises the code path that would fall back to the on-disk
