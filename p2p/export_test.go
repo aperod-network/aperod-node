@@ -215,6 +215,18 @@ const HostMaxClockSkewNs = hostMaxClockSkewNs
 // constant.
 const BadBlockStrikeTTL = badBlockStrikeTTL
 
+// HostSetBootnodeLastResolvedAt overwrites the last-successful-resolution
+// timestamp for raw in bootnodeLastResolvedAt without changing any other
+// bootnode state.  Use in tests to simulate a stale bootnode without waiting
+// for a real DNS failure — set t to time.Now().Add(-age) before triggering a
+// maintainLoop tick to make the stale-age check fire.  raw must already be
+// present in cfg.Bootnodes for the stale check to sample it.
+func HostSetBootnodeLastResolvedAt(h *Host, raw string, t time.Time) {
+	h.mu.Lock()
+	h.bootnodeLastResolvedAt[raw] = t
+	h.mu.Unlock()
+}
+
 // SetBadBlockLastSeen overwrites the lastSeen timestamp for ip in the
 // bad-block strike map without changing its strike count.  This lets unit
 // tests simulate elapsed time (e.g. time.Now().Add(-2*BadBlockStrikeTTL))
@@ -227,4 +239,29 @@ func (h *Host) SetBadBlockLastSeen(ip string, t time.Time) {
 		s.lastSeen = t
 		h.badBlockCounts[ip] = s
 	}
+}
+
+// HostBootnodeInBackoff reports whether addr is currently inside its
+// per-bootnode exponential back-off window — i.e. whether maintainLoop would
+// skip this address on the next tick.  Returns false when addr has no recorded
+// failures (nextDial is zero).  Exported for testing only.
+func HostBootnodeInBackoff(h *Host, addr string) bool {
+	h.bootnodeMu.Lock()
+	defer h.bootnodeMu.Unlock()
+	e := h.bootnodeFailState[addr]
+	return !e.nextDial.IsZero() && time.Now().Before(e.nextDial)
+}
+
+// HostRecordBootnodeFail directly injects one dial failure for addr into the
+// per-bootnode back-off state without going through the network layer.
+// Exported so tests can pre-load back-off state to exercise the throttle path.
+func HostRecordBootnodeFail(h *Host, addr string) {
+	h.recordBootnodeFail(addr)
+}
+
+// HostMaxDialBackoff returns the MaxDialBackoff value stored in the host's
+// config after NewHost has applied any defaults.  Exported for tests that
+// verify the default-application path without starting a real listener.
+func HostMaxDialBackoff(h *Host) time.Duration {
+	return h.cfg.MaxDialBackoff
 }
