@@ -650,7 +650,10 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
         if cfg.MaxStaleBootnodeAge == 0 {
                 cfg.MaxStaleBootnodeAge = 24 * time.Hour
         }
-        if cfg.MaxDialBackoff == 0 {
+        if cfg.MaxDialBackoff <= 0 {
+                // 0 means "apply default"; negative is an invalid value that
+                // would silently disable throttling (recordBootnodeFail caps d
+                // at a negative MaxDialBackoff, producing a past nextDial).
                 cfg.MaxDialBackoff = 5 * time.Minute
         }
         if cfg.HandshakeTimeout == 0 {
@@ -752,6 +755,18 @@ func (h *Host) recordBootnodeFail(addr string) {
         }
         e.nextDial = time.Now().Add(d)
         h.bootnodeFailState[addr] = e
+}
+
+// inBootnodeBackoff reports whether addr is currently inside its per-bootnode
+// exponential back-off window.  Returns false when addr has no recorded
+// failures (nextDial is zero).  Called from maintainLoop before launching a
+// dial goroutine so that BOTH the dedicated bootnode loop and the MinPeers
+// known-peer loop respect the same throttle.
+func (h *Host) inBootnodeBackoff(addr string) bool {
+        h.bootnodeMu.Lock()
+        e := h.bootnodeFailState[addr]
+        h.bootnodeMu.Unlock()
+        return !e.nextDial.IsZero() && time.Now().Before(e.nextDial)
 }
 
 // clearBootnodeFail resets the per-bootnode back-off state after a session
@@ -1733,6 +1748,16 @@ func (h *Host) maintainLoop() {
                         // a concurrent ban write completes.
                         for _, addr := range known {
                                 if h.mgr.IsBanned(addr) {
+                                        continue
+                                }
+                                // If this address belongs to a configured bootnode that is
+                                // currently in its dial-back-off window, skip it here.  The
+                                // dedicated bootnode loop below is the single authoritative
+                                // place for bootnode re-dials; allowing the MinPeers path to
+                                // bypass bootnodeFailState would undermine MaxDialBackoff: a
+                                // down validator that is in peerList would be retried every
+                                // 10 s regardless of the configured back-off cap.
+                                if h.isBootnode(addr) && h.inBootnodeBackoff(addr) {
                                         continue
                                 }
                                 h.mu.RLock()
