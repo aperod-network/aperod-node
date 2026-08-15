@@ -104,6 +104,43 @@ PRIMARY_HOST="${PRIMARY%%:*}"
 PRIMARY_PORT="${PRIMARY##*:}"
 [[ "${PRIMARY_PORT}" =~ ^[0-9]+$ ]] || PRIMARY_PORT="8545"
 
+# ── Ранняя проверка: --no-chaindb несовместим с safe-mode guard ───────────────
+# install-node.sh sets consensus.non_validator: true when no --primary-ip is
+# given to prevent the node from mining an incompatible genesis block.
+# cmd/node/main.go aborts startup immediately with
+#   "non_validator mode requires an existing chain"
+# when there is no chain.db — peer-sync cannot help: the node never reaches P2P
+# code.  If we continued with --no-chaindb we would stop the service, DELETE the
+# existing chain.db, configure the bootnode, and then leave the operator with a
+# node that cannot start (guard still set) or one that creates its own
+# incompatible genesis (guard removed).  Fail before touching anything.
+if [[ "${NO_CHAINDB}" == "true" && -f "${NODE_YAML}" ]]; then
+  NV_FLAG=$(python3 - "${NODE_YAML}" <<'PY' 2>/dev/null || echo "false"
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f) or {}
+print(str((cfg.get('consensus') or {}).get('non_validator', False)).lower())
+PY
+)
+  if [[ "${NV_FLAG}" == "true" ]]; then
+    echo
+    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗"
+    echo -e "║  ✗  --no-chaindb несовместим с ограничением non_validator         ║"
+    echo -e "╠══════════════════════════════════════════════════════════════════╣"
+    echo -e "║  Этот сервер установлен без --primary-ip и имеет                 ║"
+    echo -e "║  consensus.non_validator: true в node.yaml.                      ║"
+    echo -e "║  Нода не запустится без корректного chain.db:                    ║"
+    echo -e "║    «non_validator mode requires an existing chain»               ║"
+    echo -e "║                                                                  ║"
+    echo -e "║  Решение: запустите без --no-chaindb, чтобы скачать chain.db:   ║"
+    echo -e "║                                                                  ║"
+    echo -e "║    sudo bash aperod-join.sh ${PRIMARY}$(printf '%*s' $((42 - ${#PRIMARY})) '')║"
+    echo -e "╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    die "--no-chaindb нельзя использовать пока consensus.non_validator: true. Загрузите chain.db (запустите без --no-chaindb)."
+  fi
+fi
+
 # ── Автоопределение GOMEMLIMIT ────────────────────────────
 TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 TOTAL_RAM_BYTES=$(( TOTAL_RAM_KB * 1024 ))
@@ -356,6 +393,69 @@ print(f"[OK]   p2p.bootnodes updated: {nodes}")
 PY
   fi
   ok "Bootnode ${BOOTNODE_ADDR} прописан в ${NODE_YAML}"
+
+  # ── Прописываем IP основного узла в peer_whitelist ───────────────────────
+  # Предотвращает накопление bad-block страйков (→ 24-ч бан) пока новый узел
+  # догоняет цепь и не может принять gossip-блоки основного узла.
+  # peer_whitelist исключает PRIMARY_HOST из счётчика страйков.
+  info "Шаг 7.5/8: Прописываем ${PRIMARY_HOST} в p2p.peer_whitelist…"
+  python3 - "${NODE_YAML}" "${PRIMARY_HOST}" <<'PY'
+import sys, yaml, os
+cfg_path     = sys.argv[1]
+primary_ip   = sys.argv[2]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+p2p = cfg.setdefault("p2p", {})
+wl  = list(p2p.get("peer_whitelist") or [])
+if primary_ip not in wl:
+    wl.append(primary_ip)
+    p2p["peer_whitelist"] = wl
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, cfg_path)
+    print(f"[OK]   p2p.peer_whitelist updated: {wl}")
+else:
+    print(f"[OK]   p2p.peer_whitelist already contains {primary_ip} — skipping")
+PY
+  ok "IP основного узла ${PRIMARY_HOST} добавлен в peer_whitelist"
+
+  # ── Remove non_validator safe-mode guard set by install-node.sh ─────────────
+  # install-node.sh writes consensus.non_validator: true when no --primary-ip is
+  # given so the node cannot produce blocks (and cannot mine an incompatible
+  # genesis) if the operator ignores the bootnode warning and manually starts the
+  # service.  Now that we have the correct chain.db and a bootnode configured,
+  # the operator's consensus settings should take effect — remove the override.
+  #
+  # The --no-chaindb + consensus.non_validator: true combination is rejected
+  # above (early argument check before any destructive step) because the node
+  # aborts on startup without chain.db when non_validator is true.  At this
+  # point we are guaranteed to have either a downloaded chain.db or no guard to
+  # remove.
+  info "Снимаем ограничение consensus.non_validator (chain.db на месте, режим реле больше не нужен)…"
+  if [[ -x "${NODE_CONFIG_SH}" ]]; then
+    APEROD_CONFIG="${NODE_YAML}" bash "${NODE_CONFIG_SH}" unset-field consensus.non_validator \
+      || warn "Не удалось снять consensus.non_validator — проверьте ${NODE_YAML} вручную"
+  else
+    # Fallback: inline Python — mirrors node-config.sh unset-field with dotted path.
+    # Only removes consensus.non_validator; leaves the rest of the consensus block intact.
+    python3 - "${NODE_YAML}" <<'PY'
+import sys, yaml, os
+cfg_path = sys.argv[1]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+consensus = cfg.get('consensus')
+if isinstance(consensus, dict) and 'non_validator' in consensus:
+    del consensus['non_validator']
+    tmp = cfg_path + '.tmp'
+    with open(tmp, 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, cfg_path)
+    print('[OK]   consensus.non_validator removed from', cfg_path)
+else:
+    print('[OK]   consensus.non_validator was not set — nothing to do')
+PY
+  fi
 fi
 echo
 
