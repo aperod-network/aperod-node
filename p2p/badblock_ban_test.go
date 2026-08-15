@@ -1272,9 +1272,9 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 //   - fresh_node_our_tip_zero      : our node just started (tip=0); ban still fires
 func TestBadBlockBan_RoguePeerStillBanned(t *testing.T) {
 	const (
-		threshold  = 5
-		lead       = 1000
-		banDur     = 24 * time.Hour
+		threshold = 5
+		lead      = 1000
+		banDur    = 24 * time.Hour
 	)
 
 	// connectAndSendBadBlocks dials host, announces peerHeight in the Ping,
@@ -1734,10 +1734,10 @@ func TestWhitelist_EmptySidecarRetainsNodeYamlEntries(t *testing.T) {
 	}
 
 	h := p2p.NewHost(p2p.Config{
-		ListenAddr:    "127.0.0.1:0",
-		MaxPeers:      10,
-		NodeID:        "test-empty-sidecar-retain",
-		UserAgent:     "aperod/test",
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "test-empty-sidecar-retain",
+		UserAgent:  "aperod/test",
 		// node.yaml validator entry that must be retained despite the empty sidecar.
 		PeerWhitelist: []string{"127.0.0.1"},
 		WhitelistFile: sidecar,
@@ -1896,8 +1896,8 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 		Header: p2p.SerializedHeader{Height: 5000},
 	}
 	tlsConn.SetWriteDeadline(time.Now().Add(time.Second)) //nolint:errcheck
-	_ = p2p.WriteMsg(tlsConn, p2p.MsgBlock, sb) // connection may close during/after this write
-	tlsConn.SetWriteDeadline(time.Time{})        //nolint:errcheck
+	_ = p2p.WriteMsg(tlsConn, p2p.MsgBlock, sb)           // connection may close during/after this write
+	tlsConn.SetWriteDeadline(time.Time{})                 //nolint:errcheck
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
 		t.Errorf("step 4 failed: TLS peer was NOT disconnected after %d out-of-range blocks", threshold)
@@ -2073,7 +2073,7 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 			Header: p2p.SerializedHeader{Height: 9000},
 		}
 		tlsConn1.SetWriteDeadline(time.Now().Add(time.Second)) //nolint:errcheck
-		_ = p2p.WriteMsg(tlsConn1, p2p.MsgBlock, sb)          // conn may close on final write
+		_ = p2p.WriteMsg(tlsConn1, p2p.MsgBlock, sb)           // conn may close on final write
 		tlsConn1.SetWriteDeadline(time.Time{})                 //nolint:errcheck
 	}
 
@@ -3002,9 +3002,9 @@ func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
 	p2p.HostBanPeer(h, "10.255.0.0", "seed ban", time.Hour)
 
 	const (
-		writerCount    = 8
+		writerCount     = 8
 		writesPerWorker = 25
-		testDuration   = 300 * time.Millisecond
+		testDuration    = 300 * time.Millisecond
 	)
 
 	var (
@@ -3113,10 +3113,10 @@ func TestWhitelistSidecar_EmptySidecarAndNoCfgIsOpenNetwork(t *testing.T) {
 	}
 
 	h := p2p.NewHost(p2p.Config{
-		ListenAddr:    "127.0.0.1:0",
-		MaxPeers:      10,
-		NodeID:        "test-empty-whitelist",
-		UserAgent:     "aperod/test",
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "test-empty-whitelist",
+		UserAgent:  "aperod/test",
 		// PeerWhitelist is intentionally empty (open network in cfg).
 		WhitelistFile: sidecarPath,
 	}, &stubHandler{}, newTestLogger())
@@ -3170,4 +3170,108 @@ func TestWhitelistSidecar_NullJSONBlocksStartup(t *testing.T) {
 		t.Fatal("Start() returned nil; expected a non-nil error for a null-JSON whitelist sidecar")
 	}
 	t.Logf("Start() correctly rejected null sidecar: %v", err)
+}
+
+// ─── Test: rogue peer crossing the threshold → BanEvent + HostCanDial=false ──
+
+// TestBadBlockBan_RoguePeerBanEventAndDialBlocked is the end-to-end regression
+// test for the auto-ban pipeline required by the "deliberately rogue peer"
+// scenario:
+//
+//  1. A rogue peer connects and sends MsgBlock messages whose height exceeds
+//     CurrentHeight + BadBlockHeightLead, driving the strike counter through
+//     the real dispatch path up to BadBlockBanThreshold.
+//  2. Below the threshold: no ban, no BanEvent, and HostCanDial still allows
+//     dialling the rogue IP (proves no premature ban).
+//  3. At the threshold: a BanEvent is recorded via GetBanEvents AND
+//     HostCanDial returns false for that IP — both for the bare IP and for
+//     the IP:port form (PeerMgr.IsBanned falls back to the bare-IP key).
+//
+// The HostCanDial assertion is the piece no other test covers: it proves the
+// wrong-fork ban actually feeds the outbound dial gate, so maintainLoop /
+// discovery can never re-dial a peer that was just auto-banned for flooding
+// out-of-range blocks.
+func TestBadBlockBan_RoguePeerBanEventAndDialBlocked(t *testing.T) {
+	const (
+		threshold = 4
+		banDur    = 2 * time.Hour
+	)
+
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-rogue-ban-dial",
+		UserAgent:            "aperod/test",
+		BadBlockBanThreshold: threshold,
+		BadBlockHeightLead:   1000,
+		BadBlockBanDuration:  banDur,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	conn, peerIP := connectPeer(t, h.ListenAddr())
+	defer conn.Close()
+
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
+		t.Fatal("rogue peer did not register after handshake")
+	}
+
+	before := time.Now()
+
+	// Step 1: drive threshold-1 out-of-range blocks — one strike short of the ban.
+	// ourTip = 0 (stubHandler), lead = 1000 → height 7777 is far out of range.
+	for i := 0; i < threshold-1; i++ {
+		sendBlockAtHeight(t, conn, 7777)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Step 2: below the threshold nothing may fire.
+	if len(h.ListBans()) != 0 {
+		t.Fatalf("premature ban after %d strikes (threshold=%d)", threshold-1, threshold)
+	}
+	if got := h.GetBanEvents(before); len(got) != 0 {
+		t.Fatalf("premature BanEvent after %d strikes: %+v", threshold-1, got)
+	}
+	if !p2p.HostCanDial(h, peerIP) {
+		t.Fatalf("HostCanDial(%s) = false before the threshold was crossed", peerIP)
+	}
+	t.Logf("after %d strikes: no ban, no BanEvent, dial still allowed ✓", threshold-1)
+
+	// Step 3: the final strike crosses the threshold → ban fires.
+	sendBlockAtHeight(t, conn, 7777)
+	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Fatalf("rogue peer was NOT disconnected after %d out-of-range blocks", threshold)
+	}
+
+	// A BanEvent must be recorded for the rogue IP.
+	events := h.GetBanEvents(before)
+	var ev *p2p.BanEvent
+	for i := range events {
+		if events[i].IP == peerIP {
+			ev = &events[i]
+			break
+		}
+	}
+	if ev == nil {
+		t.Fatalf("no BanEvent recorded for rogue IP %q; events: %+v", peerIP, events)
+	}
+	if ev.Violations != threshold {
+		t.Errorf("BanEvent.Violations = %d, want %d", ev.Violations, threshold)
+	}
+	if ev.BanDurationSecs < int64(banDur.Seconds())-5 {
+		t.Errorf("BanEvent.BanDurationSecs = %d, want ~%d", ev.BanDurationSecs, int64(banDur.Seconds()))
+	}
+	t.Logf("BanEvent recorded: ip=%s violations=%d reason=%q ✓", ev.IP, ev.Violations, ev.Reason)
+
+	// HostCanDial must now refuse the rogue IP — bare form and IP:port form.
+	if p2p.HostCanDial(h, peerIP) {
+		t.Errorf("HostCanDial(%s) = true after auto-ban; outbound dial gate is broken", peerIP)
+	}
+	withPort := net.JoinHostPort(peerIP, "30303")
+	if p2p.HostCanDial(h, withPort) {
+		t.Errorf("HostCanDial(%s) = true after auto-ban; bare-IP fallback in IsBanned is broken", withPort)
+	}
+	t.Logf("HostCanDial correctly refuses %s and %s after the auto-ban ✓", peerIP, withPort)
 }
