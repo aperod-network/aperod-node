@@ -869,7 +869,11 @@ func run() error {
         // Create the UTXO set here (before chain loading) so the resume path
         // can populate it from stored blocks, ensuring historical spent key
         // images are known to TxVerifier before the first peer block arrives.
-        utxos := core.NewUTXOSet()
+        // NewUTXOSetWithDB wires the LevelDB key-image backend so that
+        // IsSpent lookups for historical KIs go to disk rather than a
+        // 700 MB in-memory sorted slice, eliminating the main RSS baseline
+        // and the ≈768 KB/h growth that accumulated between restarts.
+        utxos := core.NewUTXOSetWithDB(db)
         // Wire the spent-UTXO index callback so ApplyBlock (called during the
         // startup scan and live block acceptance) keeps the su/ index current.
         // Non-fatal on DB error — the index is a startup-performance optimisation.
@@ -1870,7 +1874,10 @@ func run() error {
                 log.Info("loading spent key-image set from database index",
                         "tip_height", tipHeight)
                 kiIterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
-                        utxos.MarkSpent(ki)
+                        // With the LevelDB-backed UTXOSet, historical key images are
+                        // not pre-loaded into RAM — IsSpent queries kiDB on demand.
+                        // We iterate only to validate index health and get the count
+                        // for keyImageIndexTrusted; no MarkSpent call is needed.
                         kiCount++
                         return nil
                 })
@@ -1950,7 +1957,7 @@ func run() error {
                                 }
                                 if !utxoFromIndex {
                                         // Partial load failed — clear and fall back to block scan.
-                                        utxos = core.NewUTXOSet()
+                                        utxos = core.NewUTXOSetWithDB(db)
                                         utxos.OnUTXOSpent = func(txHash crypto.Hash32, outIdx uint32) {
                                                 if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
                                                         log.Warn("failed to persist spent UTXO", "err", spentErr)
@@ -2187,12 +2194,12 @@ func run() error {
                         // pages to the OS so RSS does not grow unboundedly between
                         // snapshot saves.
                         //
-                        // CompactKeyImages merges the runtime 'recent' map (≈150 B/entry
-                        // Go-map overhead) into the compact 'sorted' slice (32 B/entry).
-                        // On a chain with 10 TXs/block × 2 inputs the recent map grows
-                        // ~20 entries/block; without compaction that is ~118 B × 20 × 100
-                        // = 236 KB of avoidable overhead per GC cycle — which compounds
-                        // to ~1.7 GB/day on a busy chain.
+                        // CompactKeyImages flushes the 'recent' map (≈150 B/entry
+                        // Go-map overhead) to the persistent LevelDB key-image index
+                        // and clears the map.  After the flush, IsSpent lookups for
+                        // those KIs go directly to LevelDB (OS page cache, sub-ms)
+                        // rather than the Go map, keeping RSS proportional to blocks
+                        // seen since the last flush rather than to total chain history.
                         //
                         // 100 blocks ≈ 5 min at 1 block/3 s.  The previous value (500)
                         // fired every ~25 min, allowing up to 540 MB of RSS growth between
@@ -2597,6 +2604,7 @@ func run() error {
                                 TxRateBanDuration:    cfg.P2P.TxRateBanDuration,
                                 MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
                                 GetBlockStallTimeout: cfg.P2P.GetBlockStallTimeout,
+                                MaxDialBackoff:       cfg.P2P.MaxDialBackoff,
                         }, handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
@@ -3059,7 +3067,13 @@ func countPhantomKeyImages(db *store.DB, utxos *core.UTXOSet) (phantom, checked 
 func checkPhantomKeyImages(db *store.DB, utxos *core.UTXOSet, srv *api.Server, log *slog.Logger) {
         go func() {
                 if utxos.KeyImagesCount() == 0 {
-                        log.Info("startup: phantom-ki-check skipped — no key images in snapshot")
+                        // With the LevelDB-backed UTXOSet, key images are not
+                        // pre-loaded into RAM at startup — only the small 'recent'
+                        // map is in memory.  Phantom KIs (mempool entries saved into
+                        // old snapshots that falsely blocked UTXOs) cannot occur
+                        // because restoreFromSlice is a no-op and kiDB holds only
+                        // confirmed on-chain key images.
+                        log.Info("startup: phantom-ki-check skipped — key images are LevelDB-backed (no RAM pre-load)")
                         return
                 }
                 phantom, checked := countPhantomKeyImages(db, utxos)
@@ -4277,11 +4291,21 @@ func backfillTxIdxRange(fromH, toH uint64, db *store.DB, log *slog.Logger) {
         lastGood := fromH
         for h := fromH + 1; h <= toH; h++ {
                 raw, fetchErr := db.GetRawBlockByHeight(h)
-                if fetchErr != nil || raw == nil {
-                        log.Warn("tx index background backfill: block fetch failed — halting; will retry next restart",
+                if fetchErr != nil {
+                        // Real LevelDB read error — halt and retry the whole range next restart.
+                        log.Warn("tx index background backfill: block fetch error — halting; will retry next restart",
                                 "height", h, "err", fetchErr)
                         _ = db.StoreTxIdxCompleteHeight(lastGood)
                         return
+                }
+                if raw == nil {
+                        // Height entry exists but raw-block data is absent (e.g. post-repair
+                        // gap or pruned block).  Nothing to index; skip and continue so all
+                        // subsequent blocks are not permanently blocked by this gap.
+                        log.Warn("tx index background backfill: block data missing — skipping height",
+                                "height", h)
+                        lastGood = h // mark as processed so we don't retry this gap forever
+                        continue
                 }
                 var b core.Block
                 if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
