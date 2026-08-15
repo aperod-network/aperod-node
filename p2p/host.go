@@ -1544,6 +1544,15 @@ func (h *Host) LiftBan(addr string) bool {
         return h.mgr.LiftBan(addr)
 }
 
+// PongGetHeadersTotal returns how many times the MsgPong dispatch handler has
+// passed the cooldown gate and called requestHeaders because a keepalive Pong
+// revealed the peer to be ahead of the local chain.  Exposed so tests can
+// verify the Pong-triggered sync re-trigger actually fired (not merely that
+// the chain advanced by some other path).
+func (h *Host) PongGetHeadersTotal() int64 {
+        return h.pongGetHeadersTotal.Load()
+}
+
 // PeerHeight returns the last-reported chain height for the peer at addr and
 // whether the peer is currently connected.  The height is updated by the
 // MsgPong dispatch handler on every keepalive reply, so callers can use this
