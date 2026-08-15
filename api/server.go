@@ -47,8 +47,15 @@ type Server struct {
         apiKey      string   // optional; empty = dev mode (no auth)
         corsOrigins []string // empty = allow all ("*")
         rateLimiter *RateLimiter
+
+        // utxoAudit holds the latest background UTXO-store audit result,
+        // pushed by cmd/node via SetUTXOAuditResult and served on
+        // /api/v1/admin/utxo-audit.  Guarded by utxoAuditMu.
+        utxoAuditMu sync.Mutex
+        utxoAudit   *UTXOAuditResult
         peerCounter            func() int   // optional; wired to p2p.Host.PeerCount by cmd/node
         pendingHandshakeCounter func() int64 // optional; wired to p2p.Host.PendingHandshakes by cmd/node
+        reconnectBackoffFlag    func() bool  // optional; wired to p2p.Host.ReconnectBackoffActive by cmd/node
         // tsRejectedCounter returns the count of blocks rejected by the timejacking guard.
         // Wired from consensus.Engine.TimestampRejectedCount in cmd/node after engine start.
         tsRejectedCounter func() int64
@@ -72,6 +79,11 @@ type Server struct {
         // Wired to p2p.Host.GetWhitelistExemptions by cmd/node.
         whitelistExemptFn func(since time.Time) []WhitelistExemptionEntry
 
+        // peerListFn returns a snapshot of all currently connected peers with
+        // their heights and direction.  Wired to p2p.Host.GetPeerList by cmd/node.
+        // Optional — GET /api/v1/network/peers returns 503 when not wired.
+        peerListFn func() []PeerListEntry
+
         // stallEventFn returns block-fetch stall events since a given time.
         // Wired to p2p.Host.GetStallEvents by cmd/node.
         stallEventFn func(since time.Time) []StallEventEntry
@@ -79,6 +91,11 @@ type Server struct {
         // bootnodeWarnEventFn returns malformed/stale bootnode warning events since
         // a given time.  Wired to p2p.Host.GetBootnodeWarnEvents by cmd/node.
         bootnodeWarnEventFn func(since time.Time) []BootnodeWarnEntry
+
+        // duplicateIdentityEventFn returns duplicate-identity fingerprint conflict
+        // events since a given time.
+        // Wired to p2p.Host.GetDuplicateIdentityEvents by cmd/node.
+        duplicateIdentityEventFn func(since time.Time) []DuplicateIdentityEntry
 
         // peerWhitelist holds the parsed peer_whitelist entries from node.yaml.
         // Stored so /api/v1/status can report them to operators.
@@ -427,6 +444,13 @@ func (s *Server) SetPeerCounter(f func() int) { s.peerCounter = f }
 // can report it (Task #504).
 func (s *Server) SetPendingHandshakeCounter(f func() int64) { s.pendingHandshakeCounter = f }
 
+// SetReconnectBackoffFlag wires a function reporting whether at least one
+// bootnode is currently inside its dial back-off window so
+// /api/v1/network/stats can expose reconnect_backoff_active (Task: relay
+// silently stuck with 0 peers after back-off cap). Optional — reports false
+// when unset.
+func (s *Server) SetReconnectBackoffFlag(f func() bool) { s.reconnectBackoffFlag = f }
+
 // StallEventEntry is one block-fetch stall event returned by the REST API.
 // Mirrors p2p.StallEvent; defined here to avoid an import cycle.
 type StallEventEntry struct {
@@ -456,6 +480,15 @@ type BootnodeWarnEntry struct {
         At       time.Time `json:"at"`
 }
 
+// DuplicateIdentityEntry is one duplicate-identity fingerprint conflict event
+// returned by the REST API.
+// Mirrors p2p.DuplicateIdentityEvent; defined here to avoid an import cycle.
+type DuplicateIdentityEntry struct {
+        Addr        string    `json:"addr"`
+        Fingerprint string    `json:"fingerprint"`
+        At          time.Time `json:"at"`
+}
+
 // WhitelistExemptionEntry is one whitelist-exemption event returned by the REST API.
 // Mirrors p2p.WhitelistExemptionEvent; defined here to avoid an import cycle.
 type WhitelistExemptionEntry struct {
@@ -464,6 +497,14 @@ type WhitelistExemptionEntry struct {
         BlockHeight uint64    `json:"block_height"`
         OurTip      uint64    `json:"our_tip"`
         At          time.Time `json:"at"`
+}
+
+// PeerListEntry is one connected peer snapshot returned by the REST API.
+// Mirrors p2p.PeerListEntry; defined here to avoid an import cycle.
+type PeerListEntry struct {
+        Addr      string `json:"addr"`
+        Height    uint64 `json:"height"`
+        Direction string `json:"direction"` // "in" or "out"
 }
 
 // BanEntry is a snapshot of one active P2P ban entry, returned by the REST API.
@@ -571,6 +612,14 @@ func (s *Server) SetStaleBootnodeFn(f func() []StaleBootnodeEntry) {
         s.staleBootnodeFn = f
 }
 
+// SetDuplicateIdentityEventFunc wires a function that returns duplicate-identity
+// fingerprint conflict events recorded since a given time.
+// Wired to p2p.Host.GetDuplicateIdentityEvents by cmd/node.
+// Optional — GET /api/v1/network/duplicate-identity-events returns 503 when not wired.
+func (s *Server) SetDuplicateIdentityEventFunc(f func(since time.Time) []DuplicateIdentityEntry) {
+        s.duplicateIdentityEventFn = f
+}
+
 // SetBanEventFunc wires a function that returns peer-ban events recorded since a
 // given time.  Wired to p2p.Host.GetBanEvents by cmd/node.
 // Optional — GET /api/v1/network/ban-events returns 503 when not wired.
@@ -583,6 +632,14 @@ func (s *Server) SetBanEventFunc(f func(since time.Time) []BanEventEntry) {
 // Optional — GET /api/v1/network/whitelist-exemptions returns 503 when not wired.
 func (s *Server) SetWhitelistExemptFunc(f func(since time.Time) []WhitelistExemptionEntry) {
         s.whitelistExemptFn = f
+}
+
+// SetPeerListFunc wires a function that returns all currently connected peers
+// with their last-reported heights and direction.
+// Wired to p2p.Host.GetPeerList by cmd/node.
+// Optional — GET /api/v1/network/peers returns 503 when not wired.
+func (s *Server) SetPeerListFunc(f func() []PeerListEntry) {
+        s.peerListFn = f
 }
 
 // SetNodeIdentity stores the P2P TLS fingerprint, listen address, and node ID
