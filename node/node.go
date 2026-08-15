@@ -61,7 +61,7 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 
         // ── Chain state ───────────────────────────────────────────────────────────
         chain := core.NewChain()
-        utxos := core.NewUTXOSet()
+        utxos := core.NewUTXOSetWithDB(db)
         mempool := core.NewMempool(core.DefaultMempoolConfig())
 
         // ── Genesis ───────────────────────────────────────────────────────────────
