@@ -3,10 +3,12 @@ package main
 
 import (
         "bufio"
+        "crypto/tls"
         "encoding/json"
         "fmt"
         "log/slog"
         "math"
+        "math/rand/v2"
         "net/http"
         _ "net/http/pprof" // registers /debug/pprof/* handlers on http.DefaultServeMux
         "os"
@@ -47,6 +49,66 @@ func parseP2PAddr(addr string) string {
                 return m[1] + ":" + m[2]
         }
         return addr
+}
+
+// buildP2PConfig is the single production mapping from the loaded node.yaml
+// configuration (config.Config) to the p2p host configuration (p2p.Config).
+// It is factored out of run() so unit tests can invoke the REAL mapping —
+// e.g. verifying that a raised p2p.get_block_stall_timeout (60s for slow
+// links) actually reaches the p2p host instead of silently falling back to
+// the built-in 15s default after a refactor.
+func buildP2PConfig(
+        cfg *config.Config,
+        tcpAddr string,
+        bootnodes []string,
+        nodeID string,
+        tlsCfg *tls.Config,
+        nodeFingerprint string,
+) p2p.Config {
+        // Default the ban-file path to <data_dir>/p2p_bans.json when
+        // the operator has not set p2p.ban_file in node.yaml.
+        // An explicit "-" disables persistence (useful for unit tests).
+        banFilePath := cfg.P2P.BanFile
+        if banFilePath == "" {
+                banFilePath = filepath.Join(cfg.DataDir, "p2p_bans.json")
+        }
+        // Default the whitelist-file path to <data_dir>/p2p_whitelist.json.
+        // An explicit "-" disables persistence.
+        whitelistFilePath := cfg.P2P.WhitelistFile
+        if whitelistFilePath == "" {
+                whitelistFilePath = filepath.Join(cfg.DataDir, "p2p_whitelist.json")
+        }
+        return p2p.Config{
+                ListenAddr:           tcpAddr,
+                Bootnodes:            bootnodes,
+                MaxPeers:             cfg.P2P.MaxPeers,
+                MinPeers:             cfg.P2P.MinPeers,
+                MaxPeersPerIP:        cfg.P2P.MaxPeersPerIP,
+                MinOutbound:          cfg.P2P.MinOutbound,
+                NodeID:               nodeID,
+                UserAgent:            "aperod-node/1.0",
+                TLSConfig:            tlsCfg,
+                SelfFingerprint:      nodeFingerprint,
+                AllowedPeers:         cfg.P2P.AllowedPeers,
+                PeerWhitelist:        cfg.P2P.PeerWhitelist,
+                MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
+                BadBlockHeightLead:    cfg.P2P.BadBlockHeightLead,
+                BadBlockBanThreshold:  cfg.P2P.BadBlockBanThreshold,
+                BadBlockBanDuration:   cfg.P2P.BadBlockBanDuration,
+                TimestampBanThreshold: cfg.P2P.TimestampBanThreshold,
+                TimestampBanDuration:  cfg.P2P.TimestampBanDuration,
+                BanFile:               banFilePath,
+                WhitelistFile:        whitelistFilePath,
+                KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
+                MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
+                TxRateBurst:          cfg.P2P.TxRateBurst,
+                TxRateSustained:      cfg.P2P.TxRateSustained,
+                TxRateBanThreshold:   cfg.P2P.TxRateBanThreshold,
+                TxRateBanDuration:    cfg.P2P.TxRateBanDuration,
+                MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
+                GetBlockStallTimeout: cfg.P2P.GetBlockStallTimeout,
+                MaxDialBackoff:       cfg.P2P.MaxDialBackoff,
+        }
 }
 
 // nodeHandler implements p2p.Handler using the consensus engine and in-memory chain.
@@ -2495,6 +2557,10 @@ func run() error {
                         apiSrv.SetUTXOReady()
                         log.Info("UTXO rebuild window closed — live UTXO queries enabled")
                 }()
+                // Background UTXO-store integrity audit: sampled u/ entries +
+                // recent blocks vs. raw block data, exposed on
+                // /api/v1/admin/utxo-audit for the api-server Telegram monitor.
+                startUTXOAuditLoop(db, apiSrv, log)
         }
 
         // ── 9. Start P2P networking ───────────────────────────────────────────────
@@ -2562,50 +2628,9 @@ func run() error {
                                 db:     db,
                                 log:    log,
                         }
-                        // Default the ban-file path to <data_dir>/p2p_bans.json when
-                        // the operator has not set p2p.ban_file in node.yaml.
-                        // An explicit "-" disables persistence (useful for unit tests).
-                        banFilePath := cfg.P2P.BanFile
-                        if banFilePath == "" {
-                                banFilePath = filepath.Join(cfg.DataDir, "p2p_bans.json")
-                        }
-                        // Default the whitelist-file path to <data_dir>/p2p_whitelist.json.
-                        // An explicit "-" disables persistence.
-                        whitelistFilePath := cfg.P2P.WhitelistFile
-                        if whitelistFilePath == "" {
-                                whitelistFilePath = filepath.Join(cfg.DataDir, "p2p_whitelist.json")
-                        }
-                        host = p2p.NewHost(p2p.Config{
-                                ListenAddr:           tcpAddr,
-                                Bootnodes:            bootnodes,
-                                MaxPeers:             cfg.P2P.MaxPeers,
-                                MinPeers:             cfg.P2P.MinPeers,
-                                MaxPeersPerIP:        cfg.P2P.MaxPeersPerIP,
-                                MinOutbound:          cfg.P2P.MinOutbound,
-                                NodeID:               myKey.Public().ID(),
-                                UserAgent:            "aperod-node/1.0",
-                                TLSConfig:            tlsCfg,
-                                SelfFingerprint:      nodeFingerprint,
-                                AllowedPeers:         cfg.P2P.AllowedPeers,
-                                PeerWhitelist:        cfg.P2P.PeerWhitelist,
-                                MaxPendingHandshakes: cfg.P2P.MaxPendingHandshakes,
-                                BadBlockHeightLead:    cfg.P2P.BadBlockHeightLead,
-                                BadBlockBanThreshold:  cfg.P2P.BadBlockBanThreshold,
-                                BadBlockBanDuration:   cfg.P2P.BadBlockBanDuration,
-                                TimestampBanThreshold: cfg.P2P.TimestampBanThreshold,
-                                TimestampBanDuration:  cfg.P2P.TimestampBanDuration,
-                                BanFile:               banFilePath,
-                                WhitelistFile:        whitelistFilePath,
-                                KeepaliveInterval:    cfg.P2P.KeepaliveInterval,
-                                MaxBlockIngestPerSec: cfg.P2P.MaxBlockIngestPerSec,
-                                TxRateBurst:          cfg.P2P.TxRateBurst,
-                                TxRateSustained:      cfg.P2P.TxRateSustained,
-                                TxRateBanThreshold:   cfg.P2P.TxRateBanThreshold,
-                                TxRateBanDuration:    cfg.P2P.TxRateBanDuration,
-                                MaxStaleBootnodeAge:  cfg.P2P.MaxStaleBootnodeAge,
-                                GetBlockStallTimeout: cfg.P2P.GetBlockStallTimeout,
-                                MaxDialBackoff:       cfg.P2P.MaxDialBackoff,
-                        }, handler, log)
+                        host = p2p.NewHost(
+                                buildP2PConfig(cfg, tcpAddr, bootnodes, myKey.Public().ID(), tlsCfg, nodeFingerprint),
+                                handler, log)
                         if len(cfg.P2P.PeerWhitelist) > 0 {
                                 log.Info("peer IP whitelist active — only listed IPs may connect inbound",
                                         "entries", len(cfg.P2P.PeerWhitelist))
@@ -2661,6 +2686,10 @@ func run() error {
                                 if apiSrv != nil {
                                         apiSrv.SetPeerCounter(host.PeerCount)
                                 apiSrv.SetPendingHandshakeCounter(host.PendingHandshakes)
+                                // Expose reconnect_backoff_active so monitoring can
+                                // distinguish "relay stuck in dial back-off with 0 peers"
+                                // from a healthy just-started node.
+                                apiSrv.SetReconnectBackoffFlag(host.ReconnectBackoffActive)
                                 apiSrv.SetBanListFunc(func() []api.BanEntry {
                                         bans := host.ListBans()
                                         out := make([]api.BanEntry, len(bans))
@@ -2676,6 +2705,16 @@ func run() error {
                                 apiSrv.SetWhitelistGetFunc(host.GetPeerWhitelist)
                                 apiSrv.SetWhitelistAddFunc(host.AddToWhitelist)
                                 apiSrv.SetWhitelistRemoveFunc(host.RemoveFromWhitelist)
+                                // Wire peer-list snapshot for /api/v1/network/peers so
+                                // external monitoring can detect relay-node lag.
+                                apiSrv.SetPeerListFunc(func() []api.PeerListEntry {
+                                        peers := host.GetPeerList()
+                                        out := make([]api.PeerListEntry, len(peers))
+                                        for i, p := range peers {
+                                                out[i] = api.PeerListEntry{Addr: p.Addr, Height: p.Height, Direction: p.Direction}
+                                        }
+                                        return out
+                                })
                                 // Wire live keepalive-interval tuning so the Admin Panel
                                 // can adjust it without a node restart.
                                 apiSrv.SetP2PKeepaliveGetFunc(host.GetKeepaliveInterval)
@@ -2727,6 +2766,19 @@ func run() error {
                                                 out[i] = api.StallEventEntry{
                                                         PeerAddr:    e.PeerAddr,
                                                         StalledCount: e.StalledCount,
+                                                        At:          e.At,
+                                                }
+                                        }
+                                        return out
+                                })
+                                // Wire duplicate-identity conflict events for the Admin Panel notification log.
+                                apiSrv.SetDuplicateIdentityEventFunc(func(since time.Time) []api.DuplicateIdentityEntry {
+                                        evts := host.GetDuplicateIdentityEvents(since)
+                                        out := make([]api.DuplicateIdentityEntry, len(evts))
+                                        for i, e := range evts {
+                                                out[i] = api.DuplicateIdentityEntry{
+                                                        Addr:        e.Addr,
+                                                        Fingerprint: e.Fingerprint,
                                                         At:          e.At,
                                                 }
                                         }
@@ -4526,4 +4578,271 @@ func validateAmountCommitsFromBlocks(
                 }
         }
         return
+}
+
+// ─── Background UTXO-store integrity audit ───────────────────────────────────
+//
+// Production incident: u/ (UTXO store) LevelDB entries carried AmountCommit
+// values that diverged from the raw on-chain blocks, which was only discovered
+// when a user could not withdraw ~148M APRO (ring construction used the wrong
+// commitment).  verifyUTXOStoreEntries() catches this class of corruption, but
+// only runs under --repair-db.  The background audit below detects the same
+// divergence continuously, without a full-chain scan, so the api-server can
+// alert admins in Telegram BEFORE any withdrawal is blocked.
+//
+// Each cycle performs two checks:
+//  1. Sampled check — up to utxoAuditSampleN random UNSPENT u/ entries are
+//     verified against the raw block they claim to originate from (reservoir
+//     sampling over the u/ keyspace keeps memory bounded).
+//  2. Recent-blocks check — the most recent utxoAuditRecentK blocks are fully
+//     verified (every output vs. its u/ entry), because fresh entries are the
+//     most likely to be touched by a bad restore or external writer.
+//
+// The audit NEVER writes to the store — it only reports.  Repair remains an
+// explicit operator action (--repair-db) so an audit bug can never corrupt
+// healthy entries.
+
+const (
+        // utxoAuditInterval is the pause between audit cycles.
+        utxoAuditInterval = 10 * time.Minute
+        // utxoAuditInitialDelay defers the first cycle so startup I/O settles.
+        utxoAuditInitialDelay = 2 * time.Minute
+        // utxoAuditSampleN is how many random unspent u/ entries are verified per cycle.
+        utxoAuditSampleN = 200
+        // utxoAuditRecentK is how many recent blocks are fully verified per cycle.
+        utxoAuditRecentK = uint64(50)
+        // utxoAuditMaxDetails caps the mismatch detail entries included in the result.
+        utxoAuditMaxDetails = 20
+)
+
+// utxoAuditKey identifies one u/ store entry (tx hash + output index).
+type utxoAuditKey struct {
+        txHash crypto.Hash32
+        outIdx uint32
+}
+
+// sampleUTXOKeys reservoir-samples up to n keys uniformly from the whole u/
+// keyspace in a single iterator pass with O(n) memory.  Spent-ness is NOT
+// checked here (that would add a point lookup per key over millions of keys);
+// callers filter spent entries afterwards on the small sample only.
+func sampleUTXOKeys(blockStore *store.DB, n int, rng *rand.Rand) ([]utxoAuditKey, error) {
+        sample := make([]utxoAuditKey, 0, n)
+        seen := 0
+        err := blockStore.IterAllUTXOKeys(func(txHash crypto.Hash32, outIdx uint32) {
+                seen++
+                if len(sample) < n {
+                        sample = append(sample, utxoAuditKey{txHash, outIdx})
+                        return
+                }
+                if j := rng.IntN(seen); j < n {
+                        sample[j] = utxoAuditKey{txHash, outIdx}
+                }
+        })
+        return sample, err
+}
+
+// auditCompareOutput returns true when the stored entry matches the on-chain
+// output.  BlockHeight is deliberately not compared — identical deterministic
+// mint txs share one hash across heights (see verifyUTXOStoreEntries).
+func auditCompareOutput(existing *store.StoredUTXO, out *core.Output) bool {
+        return existing.AmountCommit == out.AmountCommit &&
+                existing.OneTimePub == out.OneTimePub &&
+                existing.TxPubKey == out.TxPubKey &&
+                existing.EncAmount == out.EncAmount
+}
+
+// auditUTXOStore runs one audit cycle: sampled random unspent u/ entries plus
+// a full verification of the most recent recentK blocks.  Read-only.
+func auditUTXOStore(
+        blockStore *store.DB,
+        tipHeight uint64,
+        sampleN int,
+        recentK uint64,
+        rng *rand.Rand,
+        log *slog.Logger,
+) api.UTXOAuditResult {
+        start := time.Now()
+        res := api.UTXOAuditResult{TipHeight: tipHeight}
+        var firstErr error
+        recordMismatch := func(txHash crypto.Hash32, outIdx uint32, height uint64, storeCommit, blockCommit [32]byte) {
+                res.Mismatches++
+                if len(res.MismatchDetails) < utxoAuditMaxDetails {
+                        res.MismatchDetails = append(res.MismatchDetails, api.UTXOAuditMismatch{
+                                TxHash:      fmt.Sprintf("%x", txHash[:]),
+                                OutputIndex: outIdx,
+                                Height:      height,
+                                StoreCommit: fmt.Sprintf("%x", storeCommit[:]),
+                                BlockCommit: fmt.Sprintf("%x", blockCommit[:]),
+                        })
+                }
+                log.Warn("utxo-audit: store entry diverges from raw block",
+                        "tx_hash", fmt.Sprintf("%x", txHash[:]),
+                        "out_idx", outIdx,
+                        "height", height,
+                        "store_commit", fmt.Sprintf("%x", storeCommit[:]),
+                        "block_commit", fmt.Sprintf("%x", blockCommit[:]),
+                        "hint", "run --repair-db at the next maintenance window BEFORE any withdrawal from affected addresses")
+        }
+
+        // ── 1. Sampled check of random unspent u/ entries ─────────────────────────
+        // Cache raw blocks decoded during this cycle so several sampled entries
+        // from the same block cost one read+unmarshal.
+        blockCache := make(map[uint64]*core.Block)
+        loadBlock := func(h uint64) *core.Block {
+                if b, ok := blockCache[h]; ok {
+                        return b // may be nil (negative cache for pruned/unreadable)
+                }
+                raw, err := blockStore.GetRawBlockByHeight(h)
+                if err != nil || raw == nil {
+                        if err != nil && firstErr == nil {
+                                firstErr = fmt.Errorf("height %d: %w", h, err)
+                        }
+                        blockCache[h] = nil
+                        return nil
+                }
+                var b core.Block
+                if err := json.Unmarshal(raw, &b); err != nil {
+                        if firstErr == nil {
+                                firstErr = fmt.Errorf("unmarshal height %d: %w", h, err)
+                        }
+                        blockCache[h] = nil
+                        return nil
+                }
+                blockCache[h] = &b
+                return &b
+        }
+
+        // Oversample so the cycle still verifies ~sampleN entries after spent
+        // entries are filtered out of the raw sample.
+        keys, iterErr := sampleUTXOKeys(blockStore, sampleN*4, rng)
+        if iterErr != nil && firstErr == nil {
+                firstErr = iterErr
+        }
+        for _, k := range keys {
+                if res.SampledChecked >= sampleN {
+                        break
+                }
+                if blockStore.IsUTXOSpent(k.txHash, k.outIdx) {
+                        continue // spent — commitment no longer used for ring construction
+                }
+                existing, getErr := blockStore.GetUTXO(k.txHash, k.outIdx)
+                if getErr != nil || existing == nil {
+                        if getErr != nil && firstErr == nil {
+                                firstErr = getErr
+                        }
+                        continue
+                }
+                b := loadBlock(existing.BlockHeight)
+                if b == nil {
+                        res.Skipped++ // pruned or unreadable block — cannot verify
+                        continue
+                }
+                found := false
+                for _, tx := range b.Txs {
+                        if tx.Hash() != k.txHash {
+                                continue
+                        }
+                        found = true
+                        if int(k.outIdx) >= len(tx.Outputs) {
+                                // Entry references an output index the on-chain tx
+                                // does not have — definite divergence.
+                                recordMismatch(k.txHash, k.outIdx, existing.BlockHeight,
+                                        existing.AmountCommit, [32]byte{})
+                                break
+                        }
+                        out := tx.Outputs[k.outIdx]
+                        if !auditCompareOutput(existing, &out) {
+                                recordMismatch(k.txHash, k.outIdx, existing.BlockHeight,
+                                        existing.AmountCommit, out.AmountCommit)
+                        }
+                        break
+                }
+                if !found {
+                        // Tx hash absent at the stored height.  Deterministic mint
+                        // txs can legitimately record a different inclusion height,
+                        // so this is counted as unverifiable rather than corruption
+                        // (the recent-blocks pass below catches real divergence for
+                        // fresh entries, and --repair-db verifies the full chain).
+                        res.Skipped++
+                        continue
+                }
+                res.SampledChecked++
+        }
+
+        // ── 2. Full verification of the most recent recentK blocks ───────────────
+        startH := uint64(0)
+        if tipHeight+1 > recentK {
+                startH = tipHeight + 1 - recentK
+        }
+        for h := startH; h <= tipHeight; h++ {
+                b := loadBlock(h)
+                if b == nil {
+                        res.Skipped++
+                        continue
+                }
+                res.RecentBlocksChecked++
+                for _, tx := range b.Txs {
+                        txHash := tx.Hash()
+                        for outIdx := range tx.Outputs {
+                                existing, _ := blockStore.GetUTXO(txHash, uint32(outIdx))
+                                if existing == nil {
+                                        continue // absent entries are the gap-monitor's domain
+                                }
+                                res.RecentOutputsChecked++
+                                out := tx.Outputs[outIdx]
+                                if !auditCompareOutput(existing, &out) {
+                                        recordMismatch(txHash, uint32(outIdx), h,
+                                                existing.AmountCommit, out.AmountCommit)
+                                }
+                        }
+                }
+        }
+
+        if firstErr != nil {
+                res.Error = firstErr.Error()
+        }
+        res.CompletedAt = time.Now()
+        res.DurationMs = time.Since(start).Milliseconds()
+        return res
+}
+
+// startUTXOAuditLoop launches the periodic background audit goroutine.
+// Results are pushed to the API server for /api/v1/admin/utxo-audit; the
+// Node.js api-server polls that endpoint and fires the Telegram admin alert
+// when mismatches>0.  apiSrv must be non-nil.
+func startUTXOAuditLoop(blockStore *store.DB, apiSrv *api.Server, log *slog.Logger) {
+        go func() {
+                rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(os.Getpid())))
+                time.Sleep(utxoAuditInitialDelay)
+                for {
+                        _, tip, err := blockStore.GetTip()
+                        if err != nil {
+                                log.Warn("utxo-audit: get tip failed — skipping cycle", "err", err)
+                        } else {
+                                res := auditUTXOStore(blockStore, tip, utxoAuditSampleN, utxoAuditRecentK, rng, log)
+                                apiSrv.SetUTXOAuditResult(&res)
+                                if res.Mismatches > 0 {
+                                        log.Warn("utxo-audit: cycle found store/blockchain divergence",
+                                                "mismatches", res.Mismatches,
+                                                "sampled_checked", res.SampledChecked,
+                                                "recent_blocks_checked", res.RecentBlocksChecked,
+                                                "skipped", res.Skipped,
+                                                "duration_ms", res.DurationMs)
+                                } else {
+                                        log.Info("utxo-audit: cycle clean",
+                                                "sampled_checked", res.SampledChecked,
+                                                "recent_blocks_checked", res.RecentBlocksChecked,
+                                                "recent_outputs_checked", res.RecentOutputsChecked,
+                                                "skipped", res.Skipped,
+                                                "duration_ms", res.DurationMs)
+                                }
+                        }
+                        time.Sleep(utxoAuditInterval)
+                }
+        }()
+        log.Info("utxo-audit: background integrity audit scheduled",
+                "interval", utxoAuditInterval.String(),
+                "initial_delay", utxoAuditInitialDelay.String(),
+                "sample_n", utxoAuditSampleN,
+                "recent_blocks", utxoAuditRecentK)
 }
