@@ -1502,6 +1502,171 @@ func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
 	}
 }
 
+// ─── Stale-bootnode WARN tests ───────────────────────────────────────────────
+
+// syncWriter is a thread-safe io.Writer backed by a bytes.Buffer.
+// Used in tests to capture slog output from goroutines other than the test
+// goroutine without triggering data-race detections.
+type syncWriter struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// TestHost_StaleBootnodeWarn_FiresOncePerTick verifies that maintainLoop emits
+// exactly one WARN log entry per tick when a bootnode's last successful DNS
+// resolution is older than MaxStaleBootnodeAge, and produces no stale WARN
+// when the age is below the threshold.
+//
+// The test uses a hostname in the reserved .invalid TLD so DNS resolution
+// fails immediately on every maintainLoop tick, keeping bootnodeLastResolvedAt
+// pinned at the backdated timestamp rather than being reset by a successful
+// resolution.
+//
+// Two phases are exercised:
+//  1. Fresh: seed age = 0 → no stale WARN event in GetBootnodeWarnEvents.
+//  2. Stale: seed age = 2 × MaxStaleBootnodeAge → exactly one stale WARN event
+//     per tick; the log line contains the bootnode address and an "age=" field.
+func TestHost_StaleBootnodeWarn_FiresOncePerTick(t *testing.T) {
+	const rawBootnode = "stale-bootnode.invalid:9000"
+	const maxStale = 100 * time.Millisecond
+
+	logOut := &syncWriter{}
+	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// ── Phase 1: fresh — no stale WARN should fire ────────────────────────────
+	//
+	// Pre-seed bootnodeLastResolvedAt to "now" so the age is well below
+	// MaxStaleBootnodeAge.  Start() only seeds the entry when it is absent, so
+	// this value survives the Start() call unchanged.
+	freshSeed := time.Now()
+
+	hostFresh := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            5,
+		NodeID:              "stale-bootnode-fresh-test",
+		UserAgent:           "aperod/test",
+		Bootnodes:           []string{rawBootnode},
+		MaxStaleBootnodeAge: maxStale,
+	}, &stubHandler{}, logger)
+
+	// Pre-seed with a fresh timestamp before Start() to prevent the grace-period
+	// seed from overriding a backdated value in the stale-phase host below.
+	p2p.HostSetBootnodeLastResolvedAt(hostFresh, rawBootnode, freshSeed)
+
+	if err := hostFresh.Start(); err != nil {
+		t.Fatalf("fresh host Start: %v", err)
+	}
+	defer hostFresh.Stop()
+
+	before1 := time.Now()
+	p2p.HostTriggerMaintain(hostFresh)
+	// Wait for the tick to complete (DNS for .invalid fails fast, then stale
+	// check runs; 300 ms is generous headroom).
+	time.Sleep(300 * time.Millisecond)
+
+	evFresh := hostFresh.GetBootnodeWarnEvents(before1)
+	var staleFresh []p2p.BootnodeWarnEvent
+	for _, e := range evFresh {
+		if e.Err == "" && e.Bootnode == rawBootnode {
+			staleFresh = append(staleFresh, e)
+		}
+	}
+	if len(staleFresh) != 0 {
+		t.Errorf("Phase 1 (fresh): expected 0 stale WARN events, got %d", len(staleFresh))
+	}
+	logFresh := logOut.String()
+	if strings.Contains(logFresh, "bootnode stale") {
+		t.Errorf("Phase 1 (fresh): unexpected 'bootnode stale' in log:\n%s", logFresh)
+	}
+
+	// ── Phase 2: stale — WARN should fire exactly once per tick ──────────────
+	//
+	// A separate host so the log buffer captures only Phase-2 output.
+	logOut2 := &syncWriter{}
+	logger2 := slog.New(slog.NewTextHandler(logOut2, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	hostStale := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		MaxPeers:            5,
+		NodeID:              "stale-bootnode-stale-test",
+		UserAgent:           "aperod/test",
+		Bootnodes:           []string{rawBootnode},
+		MaxStaleBootnodeAge: maxStale,
+	}, &stubHandler{}, logger2)
+
+	// Pre-seed with a timestamp far older than MaxStaleBootnodeAge.
+	staleSeed := time.Now().Add(-10 * maxStale)
+	p2p.HostSetBootnodeLastResolvedAt(hostStale, rawBootnode, staleSeed)
+
+	if err := hostStale.Start(); err != nil {
+		t.Fatalf("stale host Start: %v", err)
+	}
+	defer hostStale.Stop()
+
+	// ── Tick 1 ────────────────────────────────────────────────────────────────
+	before2 := time.Now()
+	p2p.HostTriggerMaintain(hostStale)
+	time.Sleep(300 * time.Millisecond)
+
+	evStale1 := hostStale.GetBootnodeWarnEvents(before2)
+	var warnStale1 []p2p.BootnodeWarnEvent
+	for _, e := range evStale1 {
+		if e.Err == "" && e.Bootnode == rawBootnode {
+			warnStale1 = append(warnStale1, e)
+		}
+	}
+	if len(warnStale1) != 1 {
+		t.Errorf("Phase 2 tick 1: expected exactly 1 stale WARN event, got %d", len(warnStale1))
+	} else {
+		ev := warnStale1[0]
+		if ev.AgeSecs <= 0 {
+			t.Errorf("Phase 2 tick 1: expected AgeSecs > 0, got %d", ev.AgeSecs)
+		}
+		if ev.Bootnode != rawBootnode {
+			t.Errorf("Phase 2 tick 1: Bootnode = %q, want %q", ev.Bootnode, rawBootnode)
+		}
+	}
+	// Verify the WARN log line contains the bootnode address and age field.
+	log2 := logOut2.String()
+	if !strings.Contains(log2, "bootnode stale") {
+		t.Errorf("Phase 2 tick 1: expected 'bootnode stale' in log, got:\n%s", log2)
+	}
+	if !strings.Contains(log2, rawBootnode) {
+		t.Errorf("Phase 2 tick 1: expected bootnode address in log, got:\n%s", log2)
+	}
+	if !strings.Contains(log2, "age=") {
+		t.Errorf("Phase 2 tick 1: expected 'age=' field in log, got:\n%s", log2)
+	}
+
+	// ── Tick 2: confirm the WARN fires again (once per tick, not just once ever) ─
+	before3 := time.Now()
+	p2p.HostTriggerMaintain(hostStale)
+	time.Sleep(300 * time.Millisecond)
+
+	evStale2 := hostStale.GetBootnodeWarnEvents(before3)
+	var warnStale2 []p2p.BootnodeWarnEvent
+	for _, e := range evStale2 {
+		if e.Err == "" && e.Bootnode == rawBootnode {
+			warnStale2 = append(warnStale2, e)
+		}
+	}
+	if len(warnStale2) != 1 {
+		t.Errorf("Phase 2 tick 2: expected exactly 1 stale WARN event per tick, got %d", len(warnStale2))
+	}
+}
+
 // ─── Whitelist sidecar tamper tests ──────────────────────────────────────────
 
 // TestHost_WhitelistSidecar_NullJSON verifies that a sidecar file containing
@@ -1893,6 +2058,9 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 	t.Logf("after hiccup: PeerCount=%d", host.PeerCount())
 
 	// ── Phase 3: fire one maintain tick; both bootnodes must be re-dialled ────
+	// Back-off does NOT apply here: a connection that reached the message loop
+	// but then dropped (< stableConnTime) is not penalised with bootnode back-off
+	// so the relay reconnects immediately on the next tick.
 	p2p.HostTriggerMaintain(host)
 
 	deadline = time.Now().Add(3 * time.Second)
@@ -3441,13 +3609,18 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 	rogueLn.Close() // from this point on: connection refused
 
 	// ── Host under test ───────────────────────────────────────────────────────
+	// MaxDialBackoff is set to 100 ms so the per-bootnode back-off window
+	// expires well within each 150 ms inter-tick sleep, allowing the rogue
+	// bootnode to be retried on every tick.  The 5 s default would cause
+	// maintainLoop to skip rogue re-dials within the test's 450 ms window.
 	host := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		MinPeers:   1,
-		NodeID:     "rogue-bootnode-test",
-		UserAgent:  "aperod-test",
-		Bootnodes:  []string{validAddr, rogueAddr},
+		ListenAddr:     "127.0.0.1:0",
+		MaxPeers:       10,
+		MinPeers:       1,
+		NodeID:         "rogue-bootnode-test",
+		UserAgent:      "aperod-test",
+		Bootnodes:      []string{validAddr, rogueAddr},
+		MaxDialBackoff: 100 * time.Millisecond,
 	}, &stubHandler{}, newTestLogger())
 
 	// Wrap the default dial function to count attempts to the rogue address.
@@ -3479,10 +3652,13 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 	t.Logf("valid bootnode connected: PeerCount=%d", host.PeerCount())
 
 	// ── Phase 2: fire several maintain ticks and let dial goroutines settle ───
+	// Each inter-tick sleep (150 ms) exceeds MaxDialBackoff (100 ms), so the
+	// back-off window expires before the next tick fires and the rogue bootnode
+	// is retried on every tick.
 	const ticks = 3
 	for i := 0; i < ticks; i++ {
 		p2p.HostTriggerMaintain(host)
-		time.Sleep(150 * time.Millisecond) // allow dialPeer goroutines to run
+		time.Sleep(150 * time.Millisecond) // back-off expires (100 ms) + dial goroutine runs
 	}
 
 	// ── Assertions ────────────────────────────────────────────────────────────
@@ -3496,12 +3672,12 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 	}
 
 	// 2. The rogue address must have been attempted at least (ticks) times
-	//    (Start fires the first dial; each HostTriggerMaintain fires another
-	//    because bootnodes skip exponential back-off).
+	//    total.  Start() fires the first dial; each subsequent HostTriggerMaintain
+	//    fires another once the MaxDialBackoff window (100 ms) has expired.
 	rogueAttempts := rogueDials.Load()
 	if rogueAttempts < int32(ticks) {
 		t.Errorf("rogue bootnode attempted %d times, want ≥%d — "+
-			"maintainLoop must keep retrying refused bootnodes with back-off skipped",
+			"maintainLoop must keep retrying refused bootnodes once their back-off expires",
 			rogueAttempts, ticks)
 	} else {
 		t.Logf("✓ rogue bootnode retried %d times across %d ticks (ECONNREFUSED, no panic)",
