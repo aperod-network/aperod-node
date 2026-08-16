@@ -156,6 +156,71 @@ func TestHost_GetKeepaliveInterval_ReturnsUpdated(t *testing.T) {
 	}
 }
 
+// TestHost_SetBanConfig_Validation verifies that SetBanConfig rejects
+// out-of-range values and accepts boundary and midpoint values (Task #1922).
+func TestHost_SetBanConfig_Validation(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+
+	cases := []struct {
+		threshold  int
+		duration   time.Duration
+		heightLead uint64
+		wantErr    bool
+	}{
+		{0, time.Hour, 1000, true},                     // threshold below lower bound
+		{1001, time.Hour, 1000, true},                  // threshold above upper bound
+		{10, 30 * time.Second, 1000, true},             // duration below 1m
+		{10, 31 * 24 * time.Hour, 1000, true},          // duration above 30d
+		{10, time.Hour, 0, true},                       // heightLead below lower bound
+		{10, time.Hour, 1_000_001, true},               // heightLead above upper bound
+		{1, time.Minute, 1, false},                     // all lower bounds — valid
+		{10, 24 * time.Hour, 1000, false},              // defaults — valid
+		{1000, 30 * 24 * time.Hour, 1_000_000, false},  // all upper bounds — valid
+	}
+	for _, tc := range cases {
+		err := h.SetBanConfig(tc.threshold, tc.duration, tc.heightLead)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("SetBanConfig(%d, %v, %d): err=%v, wantErr=%v",
+				tc.threshold, tc.duration, tc.heightLead, err, tc.wantErr)
+		}
+	}
+}
+
+// TestHost_GetBanConfig_ReturnsUpdated verifies that GetBanConfig returns the
+// values most recently stored by SetBanConfig, and that a rejected update
+// leaves the previous values intact.
+func TestHost_GetBanConfig_ReturnsUpdated(t *testing.T) {
+	h := p2p.NewHost(p2p.Config{
+		MaxPeers:             10,
+		BadBlockBanThreshold: 7,
+		BadBlockBanDuration:  2 * time.Hour,
+		BadBlockHeightLead:   500,
+	}, &stubHandler{}, newTestLogger())
+
+	// Initial values come from the Config.
+	th, dur, lead := h.GetBanConfig()
+	if th != 7 || dur != 2*time.Hour || lead != 500 {
+		t.Fatalf("GetBanConfig initial = (%d, %v, %d), want (7, 2h, 500)", th, dur, lead)
+	}
+
+	if err := h.SetBanConfig(3, time.Hour, 200); err != nil {
+		t.Fatalf("SetBanConfig: %v", err)
+	}
+	th, dur, lead = h.GetBanConfig()
+	if th != 3 || dur != time.Hour || lead != 200 {
+		t.Errorf("GetBanConfig = (%d, %v, %d), want (3, 1h, 200)", th, dur, lead)
+	}
+
+	// A rejected update must not change any of the three live values.
+	if err := h.SetBanConfig(0, time.Hour, 200); err == nil {
+		t.Fatal("SetBanConfig(0, ...) should have failed")
+	}
+	th, dur, lead = h.GetBanConfig()
+	if th != 3 || dur != time.Hour || lead != 200 {
+		t.Errorf("GetBanConfig after rejected update = (%d, %v, %d), want (3, 1h, 200)", th, dur, lead)
+	}
+}
+
 // TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive verifies that decreasing
 // the live keepalive interval does NOT evict a healthy connected peer whose last
 // Pong arrived more than 2×newInterval ago but within 2×oldInterval (the
