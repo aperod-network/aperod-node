@@ -139,6 +139,14 @@ type Server struct {
         // block height must be before it counts as an out-of-range strike.
         // Set via SetP2PBanConfig after the P2P host is started.
         p2pBadBlockHeightLead uint64
+        // p2pBanGetFn returns the current LIVE wrong-fork ban parameters.
+        // Wired to p2p.Host.GetBanConfig by cmd/node.  Optional — when not
+        // wired, GET falls back to the static SetP2PBanConfig values.
+        p2pBanGetFn func() (int, time.Duration, uint64)
+        // p2pBanSetFn updates the live wrong-fork ban parameters without a
+        // restart.  Wired to p2p.Host.SetBanConfig by cmd/node.  Optional —
+        // POST returns 503 for ban fields when not wired.
+        p2pBanSetFn func(int, time.Duration, uint64) error
 
         // P2P identity fields — set via SetNodeIdentity after TLS key is loaded.
         tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
@@ -603,6 +611,22 @@ func (s *Server) SetP2PBanConfig(threshold int, durationSecs int64, heightLead u
         s.p2pBadBlockBanThreshold = threshold
         s.p2pBadBlockBanDurationSecs = durationSecs
         s.p2pBadBlockHeightLead = heightLead
+}
+
+// SetP2PBanConfigGetFunc wires a function returning the current LIVE
+// wrong-fork ban parameters (threshold, duration, height lead).  Wired to
+// p2p.Host.GetBanConfig by cmd/node.  When wired, GET /api/v1/network/
+// p2p-config reports these live values instead of the static node.yaml ones.
+func (s *Server) SetP2PBanConfigGetFunc(f func() (int, time.Duration, uint64)) {
+        s.p2pBanGetFn = f
+}
+
+// SetP2PBanConfigSetFunc wires a function that updates the live wrong-fork
+// ban parameters.  Wired to p2p.Host.SetBanConfig by cmd/node.
+// Optional — POST /api/v1/network/p2p-config returns 503 for ban fields
+// when not wired.
+func (s *Server) SetP2PBanConfigSetFunc(f func(int, time.Duration, uint64) error) {
+        s.p2pBanSetFn = f
 }
 
 // SetStallEventFunc wires a function that returns block-fetch stall events
