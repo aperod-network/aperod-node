@@ -605,6 +605,15 @@ type Host struct {
 	// any lock or restart.  Initialised from cfg.KeepaliveInterval in NewHost.
 	keepaliveIntervalNs atomic.Int64
 
+	// Live wrong-fork ban tuning (Task #1922).  Initialised from
+	// cfg.BadBlockBanThreshold / BadBlockBanDuration / BadBlockHeightLead in
+	// NewHost and updated atomically by SetBanConfig so operators can tighten
+	// the rogue-peer ban sensitivity from the Admin Panel without a restart.
+	// All readers (handleIncomingBlock) load these instead of h.cfg fields.
+	badBlockBanThresholdV atomic.Int64
+	badBlockBanDurationNs atomic.Int64
+	badBlockHeightLeadV   atomic.Uint64
+
 	// bootnodeLastResolved maps each raw bootnode string (as it appears in
 	// cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
 	// Updated on every successful DNS resolution in Start() and maintainLoop.
@@ -793,7 +802,41 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 	}
 	h.txRate = newTxRateLimiter(cfg.TxRateBurst, cfg.TxRateSustained, cfg.TxRateBanThreshold)
 	h.keepaliveIntervalNs.Store(int64(cfg.KeepaliveInterval))
+	h.badBlockBanThresholdV.Store(int64(cfg.BadBlockBanThreshold))
+	h.badBlockBanDurationNs.Store(int64(cfg.BadBlockBanDuration))
+	h.badBlockHeightLeadV.Store(cfg.BadBlockHeightLead)
 	return h
+}
+
+// GetBanConfig returns the current live wrong-fork ban parameters
+// (threshold strikes, ban duration, height lead).  Thread-safe; may be
+// called concurrently with SetBanConfig and handleIncomingBlock.
+func (h *Host) GetBanConfig() (threshold int, duration time.Duration, heightLead uint64) {
+	return int(h.badBlockBanThresholdV.Load()),
+		time.Duration(h.badBlockBanDurationNs.Load()),
+		h.badBlockHeightLeadV.Load()
+}
+
+// SetBanConfig atomically updates the live wrong-fork ban parameters without
+// restarting the node.  Existing peer goroutines pick up the new values on
+// the next incoming block.  Validation:
+//   - threshold must be in [1, 1000]
+//   - duration must be in [1m, 30d]
+//   - heightLead must be in [1, 1_000_000]
+func (h *Host) SetBanConfig(threshold int, duration time.Duration, heightLead uint64) error {
+	if threshold < 1 || threshold > 1000 {
+		return fmt.Errorf("bad_block_ban_threshold must be in [1, 1000], got %d", threshold)
+	}
+	if duration < time.Minute || duration > 30*24*time.Hour {
+		return fmt.Errorf("bad_block_ban_duration must be in [1m, 720h], got %s", duration)
+	}
+	if heightLead < 1 || heightLead > 1_000_000 {
+		return fmt.Errorf("bad_block_height_lead must be in [1, 1000000], got %d", heightLead)
+	}
+	h.badBlockBanThresholdV.Store(int64(threshold))
+	h.badBlockBanDurationNs.Store(int64(duration))
+	h.badBlockHeightLeadV.Store(heightLead)
+	return nil
 }
 
 // GetKeepaliveInterval returns the current live keepalive Ping interval.
@@ -3090,8 +3133,8 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 			// Rogue peers that fabricate future-height blocks announce a
 			// peer.height at or below our tip (they pretend to be at the same
 			// height), so the second condition catches them.
-			if block.Header.Height > ourTip+h.cfg.BadBlockHeightLead &&
-				peer.height <= ourTip+h.cfg.BadBlockHeightLead {
+			if liveHeightLead := h.badBlockHeightLeadV.Load(); block.Header.Height > ourTip+liveHeightLead &&
+				peer.height <= ourTip+liveHeightLead {
 				// Whitelisted peers are trusted validators; skip the
 				// strike counter entirely so a temporarily-ahead validator
 				// is never auto-banned for being on a longer fork.
@@ -3148,11 +3191,11 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					"block_height", block.Header.Height,
 					"our_tip", ourTip,
 					"count", count)
-				if count >= h.cfg.BadBlockBanThreshold {
+				if count >= int(h.badBlockBanThresholdV.Load()) {
 					// Ban by bare IP so reconnects on new source ports are
 					// also rejected.  IsBanned checks both IP:port and bare
 					// IP, so this blocks all future connections from the host.
-					banDuration := h.cfg.BadBlockBanDuration
+					banDuration := time.Duration(h.badBlockBanDurationNs.Load())
 					// Commit the ban and cancel any in-flight dials to this
 					// IP under dialGateMu so that no new TCP connection can
 					// be initiated after the ban is written.
