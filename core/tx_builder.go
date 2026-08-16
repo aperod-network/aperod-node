@@ -550,6 +550,67 @@ func (b *TxBuilder) MaxSpendable() MaxSpendableResult {
         return res
 }
 
+// FeeEstimateResult is the outcome of EstimateFeeForAmount — a dry run of
+// Build's coin selection for a specific payment amount.
+type FeeEstimateResult struct {
+	// Fee is the exact fee (nAPRO) Build will charge for this amount.
+	Fee uint64
+	// InputCount is the number of inputs Build will select.
+	InputCount int
+	// TxSizeBytes is the estimated serialized size used for the fee.
+	TxSizeBytes int
+	// Sufficient reports whether the selected inputs cover amount+Fee —
+	// i.e. whether Build(amount, …) would succeed on this UTXO set.
+	Sufficient bool
+	// SpendableTotal is the sum of deduplicated UTXO amounts.
+	SpendableTotal uint64
+	// UTXOCount is the number of UTXOs remaining after OneTimePub dedup.
+	UTXOCount int
+}
+
+// EstimateFeeForAmount replays Build's exact selection for a given payment
+// amount without constructing a transaction: sort largest-first, dedup by
+// OneTimePub, greedy-select against the rough 1-input fee, then recompute the
+// fee from the actual selected input count.  It must stay in lockstep with
+// Build — any change to selection, dedup, or fee rules there must be mirrored
+// here, or wallets will show a different fee than the node charges.
+func (b *TxBuilder) EstimateFeeForAmount(amount uint64) FeeEstimateResult {
+	// Sort + dedup exactly like Build.
+	available := make([]OwnedUTXO, len(b.ownedUTXOs))
+	copy(available, b.ownedUTXOs)
+	sort.Slice(available, func(i, j int) bool {
+		return available[i].Amount > available[j].Amount
+	})
+	{
+		seen := make(map[crypto.Point32]struct{}, len(available))
+		uniq := available[:0]
+		for _, u := range available {
+			if _, dup := seen[u.OneTimePub]; dup {
+				continue
+			}
+			seen[u.OneTimePub] = struct{}{}
+			uniq = append(uniq, u)
+		}
+		available = uniq
+	}
+
+	res := FeeEstimateResult{UTXOCount: len(available)}
+	for _, u := range available {
+		res.SpendableTotal += u.Amount
+	}
+
+	selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte)
+	if selCount < 1 {
+		selCount = 1 // a tx always has ≥1 input
+	}
+	fee := txEstimateFee(selCount, 2, b.feePerByte)
+	res.Fee = fee
+	res.InputCount = selCount
+	res.TxSizeBytes = txOverheadBytes + selCount*txBytesPerInput + 2*txBytesPerOutput
+	res.Sufficient = selTotal >= amount+fee
+	return res
+}
+
 // simulateGreedySelection replays the greedy input-selection loop from Build
 // for a given payment amount and returns the number of inputs it would pick
 // and their total.  available must already be sorted largest-first and
