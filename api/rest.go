@@ -2678,8 +2678,14 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 // without restarting the node.  Valid range: [1, 15] seconds.
 
 // p2pConfigRequest is the JSON body for POST /api/v1/network/p2p-config.
+// All fields are optional pointers so operators can update the keepalive
+// interval and the wrong-fork ban parameters independently (Task #1922).
+// The three ban fields must be supplied together when any is present.
 type p2pConfigRequest struct {
-	KeepaliveIntervalSecs int `json:"keepalive_interval_secs"`
+	KeepaliveIntervalSecs   *int    `json:"keepalive_interval_secs"`
+	BadBlockBanThreshold    *int    `json:"bad_block_ban_threshold"`
+	BadBlockBanDurationSecs *int64  `json:"bad_block_ban_duration_secs"`
+	BadBlockHeightLead      *uint64 `json:"bad_block_height_lead"`
 }
 
 func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
@@ -2690,11 +2696,22 @@ func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := s.p2pKeepaliveGetFn()
+		// Prefer LIVE ban values (Task #1922) over the static node.yaml
+		// snapshot when the getter is wired.
+		banThreshold := s.p2pBadBlockBanThreshold
+		banDurationSecs := s.p2pBadBlockBanDurationSecs
+		banHeightLead := s.p2pBadBlockHeightLead
+		if s.p2pBanGetFn != nil {
+			th, dur, lead := s.p2pBanGetFn()
+			banThreshold = th
+			banDurationSecs = int64(dur.Seconds())
+			banHeightLead = lead
+		}
 		resp := map[string]interface{}{
 			"keepalive_interval_secs":     int(d.Seconds()),
-			"bad_block_ban_threshold":     s.p2pBadBlockBanThreshold,
-			"bad_block_ban_duration_secs": s.p2pBadBlockBanDurationSecs,
-			"bad_block_height_lead":       s.p2pBadBlockHeightLead,
+			"bad_block_ban_threshold":     banThreshold,
+			"bad_block_ban_duration_secs": banDurationSecs,
+			"bad_block_height_lead":       banHeightLead,
 		}
 		// Task #1910 — report the persisted node.yaml value alongside the
 		// live value so operators can see when they differ (i.e. a tuned
@@ -2708,37 +2725,74 @@ func (s *Server) restNetworkP2PConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 
 	case http.MethodPost:
-		if s.p2pKeepaliveSetFn == nil {
-			writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
-			return
-		}
 		var req p2pConfigRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
-		d := time.Duration(req.KeepaliveIntervalSecs) * time.Second
-		if err := s.p2pKeepaliveSetFn(d); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+		anyBan := req.BadBlockBanThreshold != nil || req.BadBlockBanDurationSecs != nil || req.BadBlockHeightLead != nil
+		if req.KeepaliveIntervalSecs == nil && !anyBan {
+			writeJSONError(w, http.StatusBadRequest, "no fields to update: provide keepalive_interval_secs and/or the three bad_block_* fields")
 			return
 		}
-		// Task #1910 — persist the new interval to node.yaml (atomic
-		// tmp+rename) so it survives a node restart.  A persistence
-		// failure does NOT roll back the live update; it is reported to
-		// the caller via persisted:false + persist_error instead.
-		resp := map[string]interface{}{
-			"message":                 "keepalive_interval updated",
-			"keepalive_interval_secs": req.KeepaliveIntervalSecs,
+		// Validate ban-field completeness BEFORE applying anything so the
+		// update is all-or-nothing.
+		if anyBan && (req.BadBlockBanThreshold == nil || req.BadBlockBanDurationSecs == nil || req.BadBlockHeightLead == nil) {
+			writeJSONError(w, http.StatusBadRequest, "bad_block_ban_threshold, bad_block_ban_duration_secs and bad_block_height_lead must be provided together")
+			return
 		}
-		if s.p2pKeepalivePersistFn != nil {
-			if err := s.p2pKeepalivePersistFn(d); err != nil {
-				resp["persisted"] = false
-				resp["persist_error"] = err.Error()
-			} else {
-				resp["persisted"] = true
+		if req.KeepaliveIntervalSecs != nil && s.p2pKeepaliveSetFn == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+			return
+		}
+		if anyBan && s.p2pBanSetFn == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P layer not running")
+			return
+		}
+		resp := map[string]interface{}{}
+		if req.KeepaliveIntervalSecs != nil {
+			d := time.Duration(*req.KeepaliveIntervalSecs) * time.Second
+			if err := s.p2pKeepaliveSetFn(d); err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
 			}
-		} else {
-			resp["persisted"] = false
+			// Task #1910 — persist the new interval to node.yaml (atomic
+			// tmp+rename) so it survives a node restart.  A persistence
+			// failure does NOT roll back the live update; it is reported to
+			// the caller via persisted:false + persist_error instead.
+			resp["message"] = "keepalive_interval updated"
+			resp["keepalive_interval_secs"] = *req.KeepaliveIntervalSecs
+			if s.p2pKeepalivePersistFn != nil {
+				if err := s.p2pKeepalivePersistFn(d); err != nil {
+					resp["persisted"] = false
+					resp["persist_error"] = err.Error()
+				} else {
+					resp["persisted"] = true
+				}
+			} else {
+				resp["persisted"] = false
+			}
+		}
+		// Task #1922 — live wrong-fork ban tuning.  Validation of the
+		// individual value ranges happens inside p2p.Host.SetBanConfig.
+		if anyBan {
+			if *req.BadBlockBanDurationSecs <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "bad_block_ban_duration_secs must be positive")
+				return
+			}
+			dur := time.Duration(*req.BadBlockBanDurationSecs) * time.Second
+			if err := s.p2pBanSetFn(*req.BadBlockBanThreshold, dur, *req.BadBlockHeightLead); err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if _, ok := resp["message"]; ok {
+				resp["message"] = "keepalive_interval and ban config updated"
+			} else {
+				resp["message"] = "ban config updated"
+			}
+			resp["bad_block_ban_threshold"] = *req.BadBlockBanThreshold
+			resp["bad_block_ban_duration_secs"] = *req.BadBlockBanDurationSecs
+			resp["bad_block_height_lead"] = *req.BadBlockHeightLead
 		}
 		writeJSON(w, http.StatusOK, resp)
 
