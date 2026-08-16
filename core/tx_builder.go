@@ -463,6 +463,117 @@ func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMembe
         return ring, realIdx, fallbackCount, nil
 }
 
+// MaxSpendableResult describes the maximum amount that a single Build call
+// can actually send, computed with the exact same coin-selection rules that
+// Build uses (dedup by OneTimePub, largest-first greedy, ≤8 inputs,
+// fee = size × feePerByte with 2 outputs).
+type MaxSpendableResult struct {
+        // MaxAmount is the largest payment amount (nAPRO) for which
+        // Build(MaxAmount, …) succeeds on the current UTXO set.  Zero when
+        // nothing is spendable (no UTXOs, or every candidate is dust below fee).
+        MaxAmount uint64
+        // Fee is the exact fee that Build will charge for MaxAmount.
+        Fee uint64
+        // InputCount is the number of inputs Build will select for MaxAmount.
+        InputCount int
+        // SpendableTotal is the sum of all deduplicated UTXO amounts — the
+        // theoretical ceiling before fee and the 8-input cap are applied.
+        SpendableTotal uint64
+        // UTXOCount is the number of UTXOs remaining after OneTimePub dedup.
+        UTXOCount int
+}
+
+// MaxSpendable computes the maximum sendable amount by replaying Build's
+// exact selection algorithm.  It must stay in lockstep with Build: any change
+// to selection, dedup, or fee rules there must be mirrored here, otherwise
+// "send max" transactions fail with insufficient-funds on the first try.
+func (b *TxBuilder) MaxSpendable() MaxSpendableResult {
+        // Sort + dedup exactly like Build.
+        available := make([]OwnedUTXO, len(b.ownedUTXOs))
+        copy(available, b.ownedUTXOs)
+        sort.Slice(available, func(i, j int) bool {
+                return available[i].Amount > available[j].Amount
+        })
+        {
+                seen := make(map[crypto.Point32]struct{}, len(available))
+                uniq := available[:0]
+                for _, u := range available {
+                        if _, dup := seen[u.OneTimePub]; dup {
+                                continue
+                        }
+                        seen[u.OneTimePub] = struct{}{}
+                        uniq = append(uniq, u)
+                }
+                available = uniq
+        }
+
+        res := MaxSpendableResult{UTXOCount: len(available)}
+        for _, u := range available {
+                res.SpendableTotal += u.Amount
+        }
+        if len(available) == 0 {
+                return res
+        }
+
+        const maxInputs = 8
+        limit := len(available)
+        if limit > maxInputs {
+                limit = maxInputs
+        }
+
+        // Candidate amounts: take the k largest inputs and send everything
+        // minus the exact fee for k inputs / 2 outputs.  For each candidate,
+        // simulate Build's greedy selection to confirm it would succeed —
+        // Build stops adding inputs once the rough 1-input fee estimate is
+        // covered, so a candidate can select fewer inputs than k and fail the
+        // final fee check.  Keep the largest candidate that passes.
+        var prefix uint64
+        prefixSums := make([]uint64, limit+1)
+        for k := 1; k <= limit; k++ {
+                prefix += available[k-1].Amount
+                prefixSums[k] = prefix
+        }
+        for k := 1; k <= limit; k++ {
+                fee := txEstimateFee(k, 2, b.feePerByte)
+                if prefixSums[k] <= fee {
+                        continue
+                }
+                amount := prefixSums[k] - fee
+                selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte)
+                finalFee := txEstimateFee(selCount, 2, b.feePerByte)
+                if selTotal >= amount+finalFee && amount > res.MaxAmount {
+                        res.MaxAmount = amount
+                        res.Fee = finalFee
+                        res.InputCount = selCount
+                }
+        }
+        return res
+}
+
+// simulateGreedySelection replays the greedy input-selection loop from Build
+// for a given payment amount and returns the number of inputs it would pick
+// and their total.  available must already be sorted largest-first and
+// deduplicated by OneTimePub.
+func simulateGreedySelection(available []OwnedUTXO, amount, feePerByte uint64) (int, uint64) {
+        const maxInputs = 8
+        needed := amount + txEstimateFee(1, 2, feePerByte)
+        var (
+                count   int
+                totalIn uint64
+        )
+        for _, u := range available {
+                if totalIn >= needed {
+                        break
+                }
+                count++
+                totalIn += u.Amount
+                if count >= maxInputs {
+                        break
+                }
+        }
+        return count, totalIn
+}
+
 // Estimated serialized byte sizes used for fee calculation.
 // These mirror the formula in Transaction.Size() (transaction.go).
 const (
