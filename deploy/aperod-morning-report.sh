@@ -45,9 +45,13 @@ JCTL_TIMEOUT="${JCTL_TIMEOUT:-20}"   # секунд на каждый запро
 # ── Telegram credentials ─────────────────────────────────────
 for _ENV_FILE in /etc/aperod/api.env /etc/aperod/backup-secrets.env; do
   [ -f "$_ENV_FILE" ] || continue
-  while IFS='=' read -r _K _V; do
-    [[ "$_K" =~ ^# ]] && continue
-    [[ -z "$_K" ]] && continue
+  while IFS= read -r _line; do
+    [[ "$_line" =~ ^# ]] && continue
+    [[ -z "$_line" ]] && continue
+    _K="${_line%%=*}"
+    _V="${_line#*=}"
+    # Убираем кавычки: одинарные и двойные
+    _V="${_V#\"}"; _V="${_V%\"}"; _V="${_V#\'}"; _V="${_V%\'}"
     case "$_K" in
       TELEGRAM_BOT_TOKEN)     export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${_V}}" ;;
       ADMIN_TELEGRAM_CHAT_ID) export ADMIN_TELEGRAM_CHAT_ID="${ADMIN_TELEGRAM_CHAT_ID:-${_V}}" ;;
@@ -238,14 +242,18 @@ _API_STATUS=$(systemctl is-active aperod-api   2>/dev/null || echo "unknown")
 _node_json=$(_curl "$NODE_API/api/v1/status")
 _CUR_HEIGHT=$(echo "$_node_json" | grep -oP '"tip_height":\s*\K[0-9]+' \
              || echo "$_node_json" | grep -oP '"height":\s*\K[0-9]+' || echo "?")
-_CUR_PEERS=$(echo  "$_node_json" | grep -oP '"peers":\s*\K[0-9]+' \
-            || echo "$_node_json" | grep -oP '"peer_count":\s*\K[0-9]+' || echo "?")
-_SYNCING=$(echo    "$_node_json" | grep -oP '"syncing":\s*\K(true|false)' || echo "")
+# Peer count: /api/v1/network/peers returns a JSON array — count elements
+_peers_json=$(_curl "$NODE_API/api/v1/network/peers")
+_CUR_PEERS=$(echo "$_peers_json" | grep -oP '"addr"' | wc -l | tr -d ' ')
+[[ -z "$_CUR_PEERS" || "$_CUR_PEERS" == "0" ]] && \
+  _CUR_PEERS=$(echo "$_peers_json" | grep -c '"addr"' || echo "?")
+_SYNCING=$(echo "$_node_json" | grep -oP '"syncing":\s*\K(true|false)' || echo "")
 [[ "$_SYNCING" == "false" ]] && _CUR_SYNC="синхронизирован" \
-  || [[ "$_SYNCING" == "true" ]] && _CUR_SYNC="синхронизируется" || _CUR_SYNC="?"
+  || { [[ "$_SYNCING" == "true" ]] && _CUR_SYNC="синхронизируется" || _CUR_SYNC="?"; }
 
-_api_health=$(_curl "$API_BASE/api/health")
-_CB=$(echo "$_api_health" | grep -oP '"circuit_breaker":\s*"\K[^"]+' || echo "?")
+# Circuit breaker: /api/v1/node-status returns cb_state: "closed"|"open"|"half-open"
+_node_status_json=$(_curl "$API_BASE/api/v1/node-status")
+_CB=$(echo "$_node_status_json" | grep -oP '"cb_state":\s*"\K[^"]+' || echo "?")
 
 _DISK=$(df -h /opt/aperod 2>/dev/null | awk 'NR==2{print $5 " (" $4 " своб.)"}' || echo "?")
 _RAM=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%d МБ своб. / %d МБ всего", $7, $2}' || echo "?")
