@@ -2736,6 +2736,11 @@ func run() error {
                                         int64(cfg.P2P.BadBlockBanDuration.Seconds()),
                                         cfg.P2P.BadBlockHeightLead,
                                 )
+                                // Task #1922 — wire LIVE wrong-fork ban tuning so operators
+                                // can tighten the threshold from the Admin Panel without a
+                                // node restart.
+                                apiSrv.SetP2PBanConfigGetFunc(host.GetBanConfig)
+                                apiSrv.SetP2PBanConfigSetFunc(host.SetBanConfig)
                                 // Wire whitelist-exemption event log for the Admin Panel.
                                 apiSrv.SetWhitelistExemptFunc(func(since time.Time) []api.WhitelistExemptionEntry {
                                         evts := host.GetWhitelistExemptions(since)
