@@ -917,6 +917,8 @@ func (s *Server) dispatch(ctx context.Context, method string, params json.RawMes
                 return s.aprWalletSend(ctx, params)
         case "apr_walletMaxSpendable":
                 return s.aprWalletMaxSpendable(params)
+        case "apr_walletEstimateFee":
+                return s.aprWalletEstimateFee(params)
         case "apr_walletBatchSend":
                 return s.aprWalletBatchSend(params)
         case "apr_scanUTXOs":
