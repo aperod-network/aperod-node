@@ -114,412 +114,11 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
         // ── 3. Build OwnedUTXO slice from caller-provided list ────────────────────
         ownedUTXOs := make([]core.OwnedUTXO, 0, len(p.UTXOs))
         for _, u := range p.UTXOs {
-                txHash, err := hash32FromHex(u.TxHash)
-                if err != nil {
-                        return nil, fmt.Errorf("utxo tx_hash %q: %w", u.TxHash, err)
+                owned, resErr := s.resolveOwnedUTXO(u, viewPriv, spendPub)
+                if resErr != nil {
+                        return nil, resErr
                 }
-
-                tx, loc, txOk := s.chain.GetTransaction(txHash)
-                if !txOk {
-                        // Fallback 1: check mempool (tx submitted but not yet in a block)
-                        mempoolTx, inMempool := s.mempool.Get(txHash)
-                        if inMempool {
-                                tx = mempoolTx
-                                loc.Block = &core.Block{} // block not yet assigned; height 0
-                                txOk = true
-                        }
-                }
-                if !txOk {
-                        // Fallback 2: tx-hash index disk lookup (PutTxIdx entries).
-                        // Only covers blocks accepted after PutTxIdx was introduced —
-                        // older blocks fall through to Fallback 3 below.
-                        diskTx, diskLoc, diskFound, diskErr := s.getTransactionFromDisk(txHash)
-                        if diskErr != nil {
-                                s.log.Warn("disk tx-index fallback error",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "err", diskErr)
-                        }
-                        if diskFound {
-                                tx, loc, txOk = diskTx, diskLoc, true
-                        }
-                }
-
-                // Resolve the output — either from the full tx or from the UTXO store.
-                var out core.Output
-                if txOk {
-                        if int(u.OutIdx) >= len(tx.Outputs) {
-                                return nil, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
-                                        u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
-                        }
-                        out = tx.Outputs[u.OutIdx]
-                } else if s.blockStore != nil {
-                        // Fallback 3: UTXO store — written at block-acceptance time for
-                        // every output in every block since the node was first started.
-                        // This is the only reliable fallback for admin-minted UTXOs in
-                        // blocks predating PutTxIdx (the tx-hash index introduced later).
-                        s.log.Info("WALLET_SEND_TRACE: trying blockStore.GetUTXO",
-                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                        su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
-                        if suErr != nil {
-                                s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO error",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", suErr)
-                                return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
-                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
-                        }
-                        if su != nil {
-                                s.log.Info("WALLET_SEND_TRACE: blockStore.GetUTXO found UTXO",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
-                                        "height", su.BlockHeight,
-                                        "commit", fmt.Sprintf("%x", su.AmountCommit[:8]))
-                                // Synthesise core.Output from the stored UTXO fields.
-                                // Only OneTimePub, TxPubKey, and AmountCommit are needed for
-                                // RingCT input construction; EncAmount is not used downstream.
-                                out = core.Output{
-                                        OneTimePub:   su.OneTimePub,
-                                        TxPubKey:     su.TxPubKey,
-                                        AmountCommit: su.AmountCommit,
-                                }
-                                loc = core.TxLocation{
-                                        Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
-                                        TxIndex: 0,
-                                }
-                        } else if func() bool {
-                                s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO returned nil",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                                return false
-                        }() {
-                                // unreachable — the closure always returns false
-                        } else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
-                                // Fallback 4: in-memory UTXOSet told us the block height; now
-                                // read the block from disk to get the authoritative AmountCommit.
-                                // The snapshot AmountCommit may be stale/corrupt after an OOM
-                                // kill, but the raw block bytes on disk are the ground truth.
-                                // The t/ tx-hash index is also missing (same OOM), so we scan
-                                // the block's transactions directly.
-                                s.log.Info("in-memory UTXO fallback: LevelDB u/+t/ absent; reading block from disk",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
-                                        "height", memUTXO.BlockHeight)
-                                diskResolved := false
-                                if s.blockStore != nil {
-                                        raw, rawErr := s.blockStore.GetRawBlockByHeight(memUTXO.BlockHeight)
-                                        if rawErr == nil && raw != nil {
-                                                var blk core.Block
-                                                if jsonErr := json.Unmarshal(raw, &blk); jsonErr == nil {
-                                                        for ti, bTx := range blk.Txs {
-                                                                if bTx.Hash() == txHash {
-                                                                        if int(u.OutIdx) < len(bTx.Outputs) {
-                                                                                out = bTx.Outputs[u.OutIdx]
-                                                                                loc = core.TxLocation{
-                                                                                        Block:   &blk,
-                                                                                        TxIndex: ti,
-                                                                                }
-                                                                                diskResolved = true
-                                                                                // Heal the stale byPubKey entry so VerifyTx
-                                                                                // C-0 check finds the correct AmountCommit.
-                                                                                s.utxos.PatchAmountCommit(
-                                                                                        out.OneTimePub,
-                                                                                        out.AmountCommit,
-                                                                                )
-                                                                                // Heal the missing u/ LevelDB entry so that
-                                                                                // a subsequent node restart finds this UTXO
-                                                                                // in LevelDB without needing Fallback 4 again.
-                                                                                healEntry := &store.StoredUTXO{
-                                                                                        TxHash:       txHash,
-                                                                                        OutputIndex:  u.OutIdx,
-                                                                                        OneTimePub:   out.OneTimePub,
-                                                                                        TxPubKey:     out.TxPubKey,
-                                                                                        AmountCommit: out.AmountCommit,
-                                                                                        EncAmount:    out.EncAmount,
-                                                                                        BlockHeight:  blk.Header.Height,
-                                                                                }
-                                                                                if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, healEntry); putErr != nil {
-                                                                                        s.log.Warn("fallback4: failed to heal u/ entry in LevelDB",
-                                                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
-                                                                                } else {
-                                                                                        s.log.Info("fallback4: healed missing u/ entry in LevelDB",
-                                                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", blk.Header.Height)
-                                                                                }
-                                                                        }
-                                                                        break
-                                                                }
-                                                        }
-                                                }
-                                        }
-                                        if rawErr != nil {
-                                                s.log.Warn("fallback4: block read error",
-                                                        "height", memUTXO.BlockHeight, "err", rawErr)
-                                        }
-                                }
-                                if !diskResolved {
-                                        // Block scan failed; use snapshot fields as last resort.
-                                        // AmountCommit may be stale but ring-verify will catch it.
-                                        s.log.Warn("fallback4: block scan failed; using snapshot AmountCommit",
-                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                                        out = core.Output{
-                                                OneTimePub:   memUTXO.OneTimePub,
-                                                TxPubKey:     memUTXO.TxPubKey,
-                                                AmountCommit: memUTXO.AmountCommit,
-                                        }
-                                        loc = core.TxLocation{
-                                                Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
-                                                TxIndex: 0,
-                                        }
-                                        // Best-effort heal: write snapshot fields back to LevelDB so
-                                        // subsequent restarts find this UTXO in u/ without Fallback 4.
-                                        // AmountCommit may be stale (OOM snapshot); ring-verify will
-                                        // catch it — the operator can re-mint to get a clean entry.
-                                        if s.blockStore != nil {
-                                                snapHeal := &store.StoredUTXO{
-                                                        TxHash:       txHash,
-                                                        OutputIndex:  u.OutIdx,
-                                                        OneTimePub:   memUTXO.OneTimePub,
-                                                        TxPubKey:     memUTXO.TxPubKey,
-                                                        AmountCommit: memUTXO.AmountCommit,
-                                                        EncAmount:    memUTXO.EncAmount,
-                                                        BlockHeight:  memUTXO.BlockHeight,
-                                                }
-                                                if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, snapHeal); putErr != nil {
-                                                        s.log.Warn("fallback4: failed to heal u/ entry (snapshot)",
-                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
-                                                } else {
-                                                        s.log.Info("fallback4: healed missing u/ entry from snapshot",
-                                                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", memUTXO.BlockHeight)
-                                                }
-                                        }
-                                }
-                        } else {
-                                // Both LevelDB u/ entry and in-memory UTXOSet have no record of
-                                // this tx.  This happens when the node was restarted after an OOM
-                                // kill and the UTXO store (u/ prefix) was not yet rebuilt.
-                                // Run `aperod-node --repair-db` to restore missing u/ entries.
-                                s.log.Warn("WALLET_SEND: tx not found in u/ store or in-memory UTXO set — run --repair-db",
-                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                                return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
-                                        u.TxHash[:min(16, len(u.TxHash))])
-                        }
-                } else {
-                        s.log.Warn("WALLET_SEND: blockStore is nil — cannot look up tx",
-                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                        return nil, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
-                                u.TxHash[:min(16, len(u.TxHash))])
-                }
-
-                // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
-                // either the legacy literal spend_pub (all mints minted before the
-                // per-height uniqueness fix — regardless of their actual block height,
-                // since the old BuildMintTx never used height) or the new
-                // spend_pub + height*G for the height this output was actually mined at
-                // (see core.BuildMintTx). The legacy check MUST be tried first and
-                // independently of height — old on-chain mints must remain spendable
-                // forever, or wallet balance scanning breaks for every legacy reward.
-                var zeroPub crypto.Point32
-                var mintHeightScalar crypto.Scalar32
-                var mintBlockHeight uint64
-                isMintOut := false
-                if out.TxPubKey == zeroPub {
-                        if out.OneTimePub == spendPub {
-                                isMintOut = true
-                                mintHeightScalar = crypto.ScalarFromUint64(0)
-                                mintBlockHeight = 0
-                        } else {
-                                h := loc.Block.Header.Height
-                                heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
-                                if hErr == nil {
-                                        expectedMintPub, aErr := crypto.AddPoints(spendPub, heightPub)
-                                        if aErr == nil && out.OneTimePub == expectedMintPub {
-                                                isMintOut = true
-                                                mintHeightScalar = crypto.ScalarFromUint64(h)
-                                                mintBlockHeight = h
-                                        }
-                                }
-                        }
-                }
-
-                var blind crypto.BlindFactor
-                var hsScalar crypto.Scalar32
-                if isMintOut {
-                        hsScalar = mintHeightScalar
-                        if u.BlindHex == "" {
-                                if mintBlockHeight > 0 {
-                                        // Block-reward mint (height > 0): try V2 blind first (DeterministicMintBlindV2
-                                        // includes height in the derivation — required for UTXOs created after the
-                                        // F-049 fix).  Fall back to V1 for UTXOs minted before the migration.
-                                        blindV2, errV2 := crypto.DeterministicMintBlindV2(spendPub, u.AmountNAPR, mintBlockHeight)
-                                        if errV2 != nil {
-                                                return nil, fmt.Errorf("deterministic mint blind v2 for %s[%d]: %w",
-                                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV2)
-                                        }
-                                        cV2, cErrV2 := crypto.Commit(u.AmountNAPR, blindV2)
-                                        if cErrV2 == nil && cV2 == out.AmountCommit {
-                                                blind = blindV2
-                                                s.log.Info("DIAG: mint blind V2 OK",
-                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                        "amount_napr", u.AmountNAPR,
-                                                        "height", mintBlockHeight,
-                                                )
-                                        } else {
-                                                // V2 mismatch: this UTXO was created before the F-049 blind migration.
-                                                // Fall back to V1 for backward compatibility.
-                                                blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
-                                                if errV1 != nil {
-                                                        return nil, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
-                                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
-                                                }
-                                                blind = blindV1
-                                                cV1, _ := crypto.Commit(u.AmountNAPR, blindV1)
-                                                if cV1 != out.AmountCommit {
-                                                        s.log.Error("DIAG: MINT BLIND MISMATCH — neither V1 nor V2 blind matches on-chain commit",
-                                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                                "out_idx", u.OutIdx,
-                                                                "amount_napr", u.AmountNAPR,
-                                                                "height", mintBlockHeight,
-                                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
-                                                        )
-                                                } else {
-                                                        s.log.Info("DIAG: mint blind V1 fallback OK (pre-migration UTXO)",
-                                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                                "amount_napr", u.AmountNAPR,
-                                                                "height", mintBlockHeight,
-                                                        )
-                                                }
-                                        }
-                                } else {
-                                        // Legacy/admin mint (height == 0): always use V1.
-                                        blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
-                                        if err != nil {
-                                                return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
-                                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                                        }
-                                        // Diagnostic: verify recomputed commitment matches on-chain commitment.
-                                        recomputedCommit, commitErr := crypto.Commit(u.AmountNAPR, blind)
-                                        if commitErr != nil {
-                                                s.log.Error("DIAG: Commit recompute failed",
-                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                        "err", commitErr)
-                                        } else if recomputedCommit != out.AmountCommit {
-                                                s.log.Error("DIAG: MINT BLIND MISMATCH — recomputed commit != on-chain commit",
-                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                        "out_idx", u.OutIdx,
-                                                        "amount_napr", u.AmountNAPR,
-                                                        "spend_pub_hex", fmt.Sprintf("%x", spendPub[:]),
-                                                        "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
-                                                        "recomputed_commit", fmt.Sprintf("%x", recomputedCommit[:]),
-                                                )
-                                        } else {
-                                                s.log.Info("DIAG: mint blind OK",
-                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                        "amount_napr", u.AmountNAPR,
-                                                        "commit_prefix", fmt.Sprintf("%x", out.AmountCommit[:8]),
-                                                )
-                                        }
-                                }
-                        } else {
-                                blind, err = blindFactorFromHex(u.BlindHex)
-                                if err != nil {
-                                        return nil, fmt.Errorf("blind_hex for %s[%d]: %w",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                                }
-                        }
-                } else {
-                        // Stealth output: compute hs FIRST (needed for both signing and blind derivation).
-                        hs, scanErr := crypto.ScanForOutput(viewPriv, spendPub, out.TxPubKey, out.OneTimePub)
-                        if scanErr != nil || hs == nil {
-                                return nil, fmt.Errorf("output %s[%d] does not belong to wallet (view scan failed)",
-                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
-                        }
-                        hsScalar = *hs
-
-                        if u.BlindHex == "" {
-                                // Derive deterministic blind from ECDH shared secret.
-                                // Requires UTXO built after the deterministic blind migration (v2+).
-                                blind, err = crypto.DeterministicPaymentBlind(hsScalar, u.AmountNAPR)
-                                if err != nil {
-                                        return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                                }
-                                // Verify the commitment to catch pre-migration UTXOs (random blind).
-                                recomputed, cErr := crypto.Commit(u.AmountNAPR, blind)
-                                if cErr != nil {
-                                        return nil, fmt.Errorf(
-                                                "commitment mismatch for tx %s[%d]: amount_napr=%d — deterministic blind computation failed: %w",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, u.AmountNAPR, cErr)
-                                } else if recomputed != out.AmountCommit {
-                                        s.log.Error("DIAG: pre-flight stealth commitment mismatch",
-                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                                "out_idx", u.OutIdx,
-                                                "amount_napr", u.AmountNAPR,
-                                                "recomputed_commit", fmt.Sprintf("%x", recomputed[:8]),
-                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
-                                        )
-                                        return nil, fmt.Errorf(
-                                                "commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — "+
-                                                        "UTXO predates deterministic blind migration, admin re-mint required",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
-                                                u.AmountNAPR,
-                                                recomputed[:8],
-                                                out.AmountCommit[:8])
-                                }
-                        } else {
-                                blind, err = blindFactorFromHex(u.BlindHex)
-                                if err != nil {
-                                        return nil, fmt.Errorf("blind_hex for %s[%d]: %w",
-                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
-                                }
-                        }
-                }
-                // ── Heal stale byPubKey entry ─────────────────────────────────────────
-                // byPubKey is loaded from the snapshot at startup.  After an OOM kill
-                // the snapshot may hold a corrupt AmountCommit for this UTXO while the
-                // LevelDB u/ store or the raw block on disk has the correct value.
-                // We patch byPubKey here — after out.AmountCommit is resolved from the
-                // best available source (Fallback 1-4) — so that VerifyTx C-0 check
-                // sees the same AmountCommit that the transaction was built with.
-                // This is a no-op when byPubKey already holds the correct value.
-                s.utxos.PatchAmountCommit(out.OneTimePub, out.AmountCommit)
-
-                // ── Pre-flight commitment check ───────────────────────────────────────
-                // Verify that (amount_napr, blind) reproduces the on-chain AmountCommit
-                // before passing the UTXO to TxBuilder.  If the stored blind_hex or
-                // amount_napr in the DB is wrong the ring builder will silently produce a
-                // bad ring and the validator rejects the tx with "no ring member found
-                // matching claimed commitment (C-0)".  Catching it here gives a clear
-                // error that the TypeScript layer can map to "re-mint required" or UTXO
-                // skip logic, rather than a cryptic ring-verification failure.
-                if preCommit, preErr := crypto.Commit(u.AmountNAPR, blind); preErr != nil {
-                        return nil, fmt.Errorf("commit recompute for %s[%d]: %w",
-                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, preErr)
-                } else if preCommit != out.AmountCommit {
-                        s.log.Error("DIAG: pre-flight commitment mismatch",
-                                "tx", u.TxHash[:min(16, len(u.TxHash))],
-                                "out_idx", u.OutIdx,
-                                "amount_napr", u.AmountNAPR,
-                                "recomputed_commit", fmt.Sprintf("%x", preCommit[:8]),
-                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
-                        )
-                        return nil, fmt.Errorf("commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — stored blind/amount does not reproduce on-chain commitment — re-mint required",
-                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
-                                u.AmountNAPR,
-                                preCommit[:8],
-                                out.AmountCommit[:8])
-                }
-
-                // hsScalar is set above for stealth outputs (ECDH shared secret) and for
-                // mint outputs (the block height scalar); zero only for legacy/admin mints
-                // where mint_pub == spend_pub directly (height=0).
-
-                ownedUTXOs = append(ownedUTXOs, core.OwnedUTXO{
-                        UTXO: core.UTXO{
-                                TxHash:       txHash,
-                                OutputIndex:  u.OutIdx,
-                                OneTimePub:   out.OneTimePub,
-                                TxPubKey:     out.TxPubKey,
-                                AmountCommit: out.AmountCommit,
-                                EncAmount:    out.EncAmount,
-                                BlockHeight:  loc.Block.Header.Height,
-                        },
-                        HsScalar: hsScalar,
-                        Amount:   u.AmountNAPR,
-                        Blind:    blind,
-                })
+                ownedUTXOs = append(ownedUTXOs, owned)
         }
 
         // ── 4. Determine change address ───────────────────────────────────────────
@@ -546,6 +145,16 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
         result, err := builder.Build(p.AmountNAPR, crypto.Address(p.ToAddress), changeAddr)
         if err != nil {
                 return nil, fmt.Errorf("build: %w", err)
+        }
+        // Re-patch byPubKey with the commitments of the inputs that were
+        // ACTUALLY selected.  When several candidate UTXOs share one
+        // OneTimePub (height-0 mints to the same address), the per-UTXO heal
+        // above leaves byPubKey holding whichever duplicate was resolved
+        // last — if that is not the one the builder selected (it keeps the
+        // largest), the C-0 check would reject the ring even though the
+        // spend is perfectly valid.
+        for _, su := range result.SelectedUTXOs {
+                s.utxos.PatchAmountCommit(su.OneTimePub, su.AmountCommit)
         }
         if result.FallbackDecoyCount > 0 {
                 s.log.Warn("privacy degraded: ring contains Phase 1 fallback decoys",
@@ -627,6 +236,421 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
                 DecoyCount:         result.RealDecoyCount,
                 FallbackDecoyCount: result.FallbackDecoyCount,
                 SpentKeyImages:     spentKIs,
+        }, nil
+}
+
+// resolveOwnedUTXO resolves one caller-provided UTXO reference into a fully
+// populated core.OwnedUTXO: it locates the output on chain (with the same
+// mempool / tx-index / UTXO-store / in-memory fallbacks as apr_walletSend),
+// derives or validates the Pedersen blind, and runs the pre-flight commitment
+// check.  Shared by apr_walletSend (fail on error) and apr_walletMaxSpendable
+// (skip on error).
+func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, spendPub crypto.Point32) (core.OwnedUTXO, error) {
+        txHash, err := hash32FromHex(u.TxHash)
+        if err != nil {
+                return core.OwnedUTXO{}, fmt.Errorf("utxo tx_hash %q: %w", u.TxHash, err)
+        }
+
+        tx, loc, txOk := s.chain.GetTransaction(txHash)
+        if !txOk {
+                // Fallback 1: check mempool (tx submitted but not yet in a block)
+                mempoolTx, inMempool := s.mempool.Get(txHash)
+                if inMempool {
+                        tx = mempoolTx
+                        loc.Block = &core.Block{} // block not yet assigned; height 0
+                        txOk = true
+                }
+        }
+        if !txOk {
+                // Fallback 2: tx-hash index disk lookup (PutTxIdx entries).
+                // Only covers blocks accepted after PutTxIdx was introduced —
+                // older blocks fall through to Fallback 3 below.
+                diskTx, diskLoc, diskFound, diskErr := s.getTransactionFromDisk(txHash)
+                if diskErr != nil {
+                        s.log.Warn("disk tx-index fallback error",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "err", diskErr)
+                }
+                if diskFound {
+                        tx, loc, txOk = diskTx, diskLoc, true
+                }
+        }
+
+        // Resolve the output — either from the full tx or from the UTXO store.
+        var out core.Output
+        if txOk {
+                if int(u.OutIdx) >= len(tx.Outputs) {
+                        return core.OwnedUTXO{}, fmt.Errorf("out_idx %d out of range for tx %s (%d outputs)",
+                                u.OutIdx, u.TxHash[:min(16, len(u.TxHash))], len(tx.Outputs))
+                }
+                out = tx.Outputs[u.OutIdx]
+        } else if s.blockStore != nil {
+                // Fallback 3: UTXO store — written at block-acceptance time for
+                // every output in every block since the node was first started.
+                // This is the only reliable fallback for admin-minted UTXOs in
+                // blocks predating PutTxIdx (the tx-hash index introduced later).
+                s.log.Info("WALLET_SEND_TRACE: trying blockStore.GetUTXO",
+                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
+                if suErr != nil {
+                        s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO error",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", suErr)
+                        return core.OwnedUTXO{}, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
+                }
+                if su != nil {
+                        s.log.Info("WALLET_SEND_TRACE: blockStore.GetUTXO found UTXO",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
+                                "height", su.BlockHeight,
+                                "commit", fmt.Sprintf("%x", su.AmountCommit[:8]))
+                        // Synthesise core.Output from the stored UTXO fields.
+                        // Only OneTimePub, TxPubKey, and AmountCommit are needed for
+                        // RingCT input construction; EncAmount is not used downstream.
+                        out = core.Output{
+                                OneTimePub:   su.OneTimePub,
+                                TxPubKey:     su.TxPubKey,
+                                AmountCommit: su.AmountCommit,
+                        }
+                        loc = core.TxLocation{
+                                Block:   &core.Block{Header: core.BlockHeader{Height: su.BlockHeight}},
+                                TxIndex: 0,
+                        }
+                } else if func() bool {
+                        s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO returned nil",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                        return false
+                }() {
+                        // unreachable — the closure always returns false
+                } else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
+                        // Fallback 4: in-memory UTXOSet told us the block height; now
+                        // read the block from disk to get the authoritative AmountCommit.
+                        // The snapshot AmountCommit may be stale/corrupt after an OOM
+                        // kill, but the raw block bytes on disk are the ground truth.
+                        // The t/ tx-hash index is also missing (same OOM), so we scan
+                        // the block's transactions directly.
+                        s.log.Info("in-memory UTXO fallback: LevelDB u/+t/ absent; reading block from disk",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
+                                "height", memUTXO.BlockHeight)
+                        diskResolved := false
+                        if s.blockStore != nil {
+                                raw, rawErr := s.blockStore.GetRawBlockByHeight(memUTXO.BlockHeight)
+                                if rawErr == nil && raw != nil {
+                                        var blk core.Block
+                                        if jsonErr := json.Unmarshal(raw, &blk); jsonErr == nil {
+                                                for ti, bTx := range blk.Txs {
+                                                        if bTx.Hash() == txHash {
+                                                                if int(u.OutIdx) < len(bTx.Outputs) {
+                                                                        out = bTx.Outputs[u.OutIdx]
+                                                                        loc = core.TxLocation{
+                                                                                Block:   &blk,
+                                                                                TxIndex: ti,
+                                                                        }
+                                                                        diskResolved = true
+                                                                        // Heal the stale byPubKey entry so VerifyTx
+                                                                        // C-0 check finds the correct AmountCommit.
+                                                                        s.utxos.PatchAmountCommit(
+                                                                                out.OneTimePub,
+                                                                                out.AmountCommit,
+                                                                        )
+                                                                        // Heal the missing u/ LevelDB entry so that
+                                                                        // a subsequent node restart finds this UTXO
+                                                                        // in LevelDB without needing Fallback 4 again.
+                                                                        healEntry := &store.StoredUTXO{
+                                                                                TxHash:       txHash,
+                                                                                OutputIndex:  u.OutIdx,
+                                                                                OneTimePub:   out.OneTimePub,
+                                                                                TxPubKey:     out.TxPubKey,
+                                                                                AmountCommit: out.AmountCommit,
+                                                                                EncAmount:    out.EncAmount,
+                                                                                BlockHeight:  blk.Header.Height,
+                                                                        }
+                                                                        if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, healEntry); putErr != nil {
+                                                                                s.log.Warn("fallback4: failed to heal u/ entry in LevelDB",
+                                                                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
+                                                                        } else {
+                                                                                s.log.Info("fallback4: healed missing u/ entry in LevelDB",
+                                                                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", blk.Header.Height)
+                                                                        }
+                                                                }
+                                                                break
+                                                        }
+                                                }
+                                        }
+                                }
+                                if rawErr != nil {
+                                        s.log.Warn("fallback4: block read error",
+                                                "height", memUTXO.BlockHeight, "err", rawErr)
+                                }
+                        }
+                        if !diskResolved {
+                                // Block scan failed; use snapshot fields as last resort.
+                                // AmountCommit may be stale but ring-verify will catch it.
+                                s.log.Warn("fallback4: block scan failed; using snapshot AmountCommit",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                                out = core.Output{
+                                        OneTimePub:   memUTXO.OneTimePub,
+                                        TxPubKey:     memUTXO.TxPubKey,
+                                        AmountCommit: memUTXO.AmountCommit,
+                                }
+                                loc = core.TxLocation{
+                                        Block:   &core.Block{Header: core.BlockHeader{Height: memUTXO.BlockHeight}},
+                                        TxIndex: 0,
+                                }
+                                // Best-effort heal: write snapshot fields back to LevelDB so
+                                // subsequent restarts find this UTXO in u/ without Fallback 4.
+                                // AmountCommit may be stale (OOM snapshot); ring-verify will
+                                // catch it — the operator can re-mint to get a clean entry.
+                                if s.blockStore != nil {
+                                        snapHeal := &store.StoredUTXO{
+                                                TxHash:       txHash,
+                                                OutputIndex:  u.OutIdx,
+                                                OneTimePub:   memUTXO.OneTimePub,
+                                                TxPubKey:     memUTXO.TxPubKey,
+                                                AmountCommit: memUTXO.AmountCommit,
+                                                EncAmount:    memUTXO.EncAmount,
+                                                BlockHeight:  memUTXO.BlockHeight,
+                                        }
+                                        if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, snapHeal); putErr != nil {
+                                                s.log.Warn("fallback4: failed to heal u/ entry (snapshot)",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", putErr)
+                                        } else {
+                                                s.log.Info("fallback4: healed missing u/ entry from snapshot",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "height", memUTXO.BlockHeight)
+                                        }
+                                }
+                        }
+                } else {
+                        // Both LevelDB u/ entry and in-memory UTXOSet have no record of
+                        // this tx.  This happens when the node was restarted after an OOM
+                        // kill and the UTXO store (u/ prefix) was not yet rebuilt.
+                        // Run `aperod-node --repair-db` to restore missing u/ entries.
+                        s.log.Warn("WALLET_SEND: tx not found in u/ store or in-memory UTXO set — run --repair-db",
+                                "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                        return core.OwnedUTXO{}, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
+                                u.TxHash[:min(16, len(u.TxHash))])
+                }
+        } else {
+                s.log.Warn("WALLET_SEND: blockStore is nil — cannot look up tx",
+                        "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
+                return core.OwnedUTXO{}, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
+                        u.TxHash[:min(16, len(u.TxHash))])
+        }
+
+        // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
+        // either the legacy literal spend_pub (all mints minted before the
+        // per-height uniqueness fix — regardless of their actual block height,
+        // since the old BuildMintTx never used height) or the new
+        // spend_pub + height*G for the height this output was actually mined at
+        // (see core.BuildMintTx). The legacy check MUST be tried first and
+        // independently of height — old on-chain mints must remain spendable
+        // forever, or wallet balance scanning breaks for every legacy reward.
+        var zeroPub crypto.Point32
+        var mintHeightScalar crypto.Scalar32
+        var mintBlockHeight uint64
+        isMintOut := false
+        if out.TxPubKey == zeroPub {
+                if out.OneTimePub == spendPub {
+                        isMintOut = true
+                        mintHeightScalar = crypto.ScalarFromUint64(0)
+                        mintBlockHeight = 0
+                } else {
+                        h := loc.Block.Header.Height
+                        heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h))
+                        if hErr == nil {
+                                expectedMintPub, aErr := crypto.AddPoints(spendPub, heightPub)
+                                if aErr == nil && out.OneTimePub == expectedMintPub {
+                                        isMintOut = true
+                                        mintHeightScalar = crypto.ScalarFromUint64(h)
+                                        mintBlockHeight = h
+                                }
+                        }
+                }
+        }
+
+        var blind crypto.BlindFactor
+        var hsScalar crypto.Scalar32
+        if isMintOut {
+                hsScalar = mintHeightScalar
+                if u.BlindHex == "" {
+                        if mintBlockHeight > 0 {
+                                // Block-reward mint (height > 0): try V2 blind first (DeterministicMintBlindV2
+                                // includes height in the derivation — required for UTXOs created after the
+                                // F-049 fix).  Fall back to V1 for UTXOs minted before the migration.
+                                blindV2, errV2 := crypto.DeterministicMintBlindV2(spendPub, u.AmountNAPR, mintBlockHeight)
+                                if errV2 != nil {
+                                        return core.OwnedUTXO{}, fmt.Errorf("deterministic mint blind v2 for %s[%d]: %w",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV2)
+                                }
+                                cV2, cErrV2 := crypto.Commit(u.AmountNAPR, blindV2)
+                                if cErrV2 == nil && cV2 == out.AmountCommit {
+                                        blind = blindV2
+                                        s.log.Info("DIAG: mint blind V2 OK",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "amount_napr", u.AmountNAPR,
+                                                "height", mintBlockHeight,
+                                        )
+                                } else {
+                                        // V2 mismatch: this UTXO was created before the F-049 blind migration.
+                                        // Fall back to V1 for backward compatibility.
+                                        blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+                                        if errV1 != nil {
+                                                return core.OwnedUTXO{}, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
+                                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
+                                        }
+                                        blind = blindV1
+                                        cV1, _ := crypto.Commit(u.AmountNAPR, blindV1)
+                                        if cV1 != out.AmountCommit {
+                                                s.log.Error("DIAG: MINT BLIND MISMATCH — neither V1 nor V2 blind matches on-chain commit",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "out_idx", u.OutIdx,
+                                                        "amount_napr", u.AmountNAPR,
+                                                        "height", mintBlockHeight,
+                                                        "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
+                                                )
+                                        } else {
+                                                s.log.Info("DIAG: mint blind V1 fallback OK (pre-migration UTXO)",
+                                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                        "amount_napr", u.AmountNAPR,
+                                                        "height", mintBlockHeight,
+                                                )
+                                        }
+                                }
+                        } else {
+                                // Legacy/admin mint (height == 0): always use V1.
+                                blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+                                if err != nil {
+                                        return core.OwnedUTXO{}, fmt.Errorf("deterministic blind for %s[%d]: %w",
+                                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                                }
+                                // Diagnostic: verify recomputed commitment matches on-chain commitment.
+                                recomputedCommit, commitErr := crypto.Commit(u.AmountNAPR, blind)
+                                if commitErr != nil {
+                                        s.log.Error("DIAG: Commit recompute failed",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "err", commitErr)
+                                } else if recomputedCommit != out.AmountCommit {
+                                        s.log.Error("DIAG: MINT BLIND MISMATCH — recomputed commit != on-chain commit",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "out_idx", u.OutIdx,
+                                                "amount_napr", u.AmountNAPR,
+                                                "spend_pub_hex", fmt.Sprintf("%x", spendPub[:]),
+                                                "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:]),
+                                                "recomputed_commit", fmt.Sprintf("%x", recomputedCommit[:]),
+                                        )
+                                } else {
+                                        s.log.Info("DIAG: mint blind OK",
+                                                "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                                "amount_napr", u.AmountNAPR,
+                                                "commit_prefix", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                                        )
+                                }
+                        }
+                } else {
+                        blind, err = blindFactorFromHex(u.BlindHex)
+                        if err != nil {
+                                return core.OwnedUTXO{}, fmt.Errorf("blind_hex for %s[%d]: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                        }
+                }
+        } else {
+                // Stealth output: compute hs FIRST (needed for both signing and blind derivation).
+                hs, scanErr := crypto.ScanForOutput(viewPriv, spendPub, out.TxPubKey, out.OneTimePub)
+                if scanErr != nil || hs == nil {
+                        return core.OwnedUTXO{}, fmt.Errorf("output %s[%d] does not belong to wallet (view scan failed)",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+                }
+                hsScalar = *hs
+
+                if u.BlindHex == "" {
+                        // Derive deterministic blind from ECDH shared secret.
+                        // Requires UTXO built after the deterministic blind migration (v2+).
+                        blind, err = crypto.DeterministicPaymentBlind(hsScalar, u.AmountNAPR)
+                        if err != nil {
+                                return core.OwnedUTXO{}, fmt.Errorf("deterministic blind for %s[%d]: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                        }
+                        // Verify the commitment to catch pre-migration UTXOs (random blind).
+                        recomputed, cErr := crypto.Commit(u.AmountNAPR, blind)
+                        if cErr != nil {
+                                return core.OwnedUTXO{}, fmt.Errorf(
+                                        "commitment mismatch for tx %s[%d]: amount_napr=%d — deterministic blind computation failed: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, u.AmountNAPR, cErr)
+                        } else if recomputed != out.AmountCommit {
+                                s.log.Error("DIAG: pre-flight stealth commitment mismatch",
+                                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                                        "out_idx", u.OutIdx,
+                                        "amount_napr", u.AmountNAPR,
+                                        "recomputed_commit", fmt.Sprintf("%x", recomputed[:8]),
+                                        "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                                )
+                                return core.OwnedUTXO{}, fmt.Errorf(
+                                        "commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — "+
+                                                "UTXO predates deterministic blind migration, admin re-mint required",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
+                                        u.AmountNAPR,
+                                        recomputed[:8],
+                                        out.AmountCommit[:8])
+                        }
+                } else {
+                        blind, err = blindFactorFromHex(u.BlindHex)
+                        if err != nil {
+                                return core.OwnedUTXO{}, fmt.Errorf("blind_hex for %s[%d]: %w",
+                                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
+                        }
+                }
+        }
+        // ── Heal stale byPubKey entry ─────────────────────────────────────────
+        // byPubKey is loaded from the snapshot at startup.  After an OOM kill
+        // the snapshot may hold a corrupt AmountCommit for this UTXO while the
+        // LevelDB u/ store or the raw block on disk has the correct value.
+        // We patch byPubKey here — after out.AmountCommit is resolved from the
+        // best available source (Fallback 1-4) — so that VerifyTx C-0 check
+        // sees the same AmountCommit that the transaction was built with.
+        // This is a no-op when byPubKey already holds the correct value.
+        s.utxos.PatchAmountCommit(out.OneTimePub, out.AmountCommit)
+
+        // ── Pre-flight commitment check ───────────────────────────────────────
+        // Verify that (amount_napr, blind) reproduces the on-chain AmountCommit
+        // before passing the UTXO to TxBuilder.  If the stored blind_hex or
+        // amount_napr in the DB is wrong the ring builder will silently produce a
+        // bad ring and the validator rejects the tx with "no ring member found
+        // matching claimed commitment (C-0)".  Catching it here gives a clear
+        // error that the TypeScript layer can map to "re-mint required" or UTXO
+        // skip logic, rather than a cryptic ring-verification failure.
+        if preCommit, preErr := crypto.Commit(u.AmountNAPR, blind); preErr != nil {
+                return core.OwnedUTXO{}, fmt.Errorf("commit recompute for %s[%d]: %w",
+                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, preErr)
+        } else if preCommit != out.AmountCommit {
+                s.log.Error("DIAG: pre-flight commitment mismatch",
+                        "tx", u.TxHash[:min(16, len(u.TxHash))],
+                        "out_idx", u.OutIdx,
+                        "amount_napr", u.AmountNAPR,
+                        "recomputed_commit", fmt.Sprintf("%x", preCommit[:8]),
+                        "on_chain_commit", fmt.Sprintf("%x", out.AmountCommit[:8]),
+                )
+                return core.OwnedUTXO{}, fmt.Errorf("commitment mismatch for tx %s[%d]: amount_napr=%d recomputed=%x on_chain=%x — stored blind/amount does not reproduce on-chain commitment — re-mint required",
+                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx,
+                        u.AmountNAPR,
+                        preCommit[:8],
+                        out.AmountCommit[:8])
+        }
+
+        // hsScalar is set above for stealth outputs (ECDH shared secret) and for
+        // mint outputs (the block height scalar); zero only for legacy/admin mints
+        // where mint_pub == spend_pub directly (height=0).
+
+        return core.OwnedUTXO{
+                UTXO: core.UTXO{
+                        TxHash:       txHash,
+                        OutputIndex:  u.OutIdx,
+                        OneTimePub:   out.OneTimePub,
+                        TxPubKey:     out.TxPubKey,
+                        AmountCommit: out.AmountCommit,
+                        EncAmount:    out.EncAmount,
+                        BlockHeight:  loc.Block.Header.Height,
+                },
+                HsScalar: hsScalar,
+                Amount:   u.AmountNAPR,
+                Blind:    blind,
         }, nil
 }
 
