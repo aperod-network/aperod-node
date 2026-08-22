@@ -17,6 +17,10 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 
 </div>
 
+<p align="center">
+  <img src="https://github.com/aperod-network/aperod-node/blob/main/.github/images/og.png?raw=true" alt="APEROD Preview" width="100%">
+</p>
+
 ---
 
 ## Table of Contents
