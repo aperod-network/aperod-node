@@ -10,7 +10,7 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
-[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://aperod.com/explorer/)
+[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://explorer.aperod.com/)
 [![Telegram](https://img.shields.io/badge/Wallet-@aperod__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/aperod_bot)
 
 **[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com/) &nbsp;·&nbsp; [💬 Telegram Wallet](https://t.me/aperod_bot)**
