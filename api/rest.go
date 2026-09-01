@@ -2696,6 +2696,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	snapDurMs        := s.lastSnapshotSaveDurMs
 	snapTimeout      := s.lastSnapshotTimeoutSec
 	snapFromPrevious := s.snapshotTimingFromPrevious
+        startupSnapReason := s.startupSnapshotReason
+        startupSnapTip    := s.startupSnapshotTipHeight
+        startupSnapErr    := s.startupSnapshotErrStr
 	s.snapshotMu.Unlock()
 	resp["last_snapshot_height"] = snapH
 	if !snapAt.IsZero() {
@@ -2704,6 +2707,17 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if snapErr != "" {
 		resp["last_snapshot_error"] = snapErr
 	}
+        if startupSnapReason != "" {
+                resp["startup_reason"] = startupSnapReason
+                resp["startup_tip_height"] = startupSnapTip
+                resp["snapshot_startup_reason"] = startupSnapReason
+                resp["snapshot_startup_tip_height"] = startupSnapTip
+                if startupSnapErr != "" {
+                        resp["startup_error"] = startupSnapErr
+                        resp["snapshot_startup_error"] = startupSnapErr
+                }
+        }
+        resp["startup_id"] = s.startupID
 	// Expose snapshot timing so the Admin Panel can display the timeout-ratio
 	// risk indicator without requiring log access.
 	if snapDurMs > 0 {

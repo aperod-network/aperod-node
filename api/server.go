@@ -252,6 +252,13 @@ type Server struct {
         // Cleared to false as soon as SetSnapshotTimings is called during the
         // current session (i.e. after the first in-process snapshot save).
         snapshotTimingFromPrevious bool
+        // startupSnapshotReason records the outcome of the snapshot load attempted
+        // during this process's startup. The associated tip and error are kept
+        // separately from the periodic/shutdown snapshot-save status above.
+        startupSnapshotReason    string
+        startupSnapshotTipHeight uint64
+        startupSnapshotErrStr    string
+        startupID                 string
 
         // utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
         // responses. The mint-UTXO monitor calls this endpoint every 5 minutes
@@ -296,6 +303,7 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
                 rateLimiter: NewRateLimiter(),
                 syncing:        1, // syncing until SetReady() is called
                 utxoRebuilding: 1, // set until SetUTXOReady() is called ~90 s after startup
+                startupID:       strconv.FormatInt(time.Now().UnixNano(), 10),
         }
         s.registerRoutes()
         return s
@@ -374,6 +382,26 @@ func (s *Server) SetSnapshotFailed(err error) {
         }
         s.snapshotMu.Lock()
         s.lastSnapshotErrStr = err.Error()
+        s.snapshotMu.Unlock()
+}
+
+const (
+        StartupSnapshotLoaded  = "snapshot_loaded"
+        StartupNoSnapshot      = "no_snapshot"
+        StartupCorruptSnapshot = "corrupt_snapshot"
+)
+
+// SetStartupSnapshotOutcome records the result of the snapshot load attempted
+// during node startup. err is exposed only when supplied (normally for a
+// corrupt or unreadable snapshot); a later call replaces the complete outcome.
+func (s *Server) SetStartupSnapshotOutcome(reason string, tipHeight uint64, err error) {
+        s.snapshotMu.Lock()
+        s.startupSnapshotReason = reason
+        s.startupSnapshotTipHeight = tipHeight
+        s.startupSnapshotErrStr = ""
+        if err != nil {
+                s.startupSnapshotErrStr = err.Error()
+        }
         s.snapshotMu.Unlock()
 }
 

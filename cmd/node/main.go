@@ -1340,6 +1340,9 @@ func run() error {
                                 cfg.Genesis.File,
                         )
                 }
+                if apiSrv != nil {
+                        apiSrv.SetStartupSnapshotOutcome(api.StartupNoSnapshot, 0, nil)
+                }
                 log.Info("initializing genesis block", "chain_id", genesisConfig.ChainID)
                 genesis, err := core.CreateGenesisBlock(genesisConfig, myKey.PrivKey())
                 if err != nil {
@@ -1713,6 +1716,9 @@ func run() error {
                 {
                         tipHashHex := fmt.Sprintf("%x", tipHash[:])
                         if snap, snapIsRelaxed, serr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
+                                if apiSrv != nil {
+                                        apiSrv.SetStartupSnapshotOutcome(api.StartupSnapshotLoaded, tipHeight, nil)
+                                }
                                 // ── UTXO count divergence check ──────────────────────────────────
                                 // See checkSnapshotUTXOCount in snapshot_utxo_check.go for the
                                 // full logic.  isRelaxed widens the tolerance to 100 % when the
@@ -1998,6 +2004,14 @@ func run() error {
                                 if !utxoCountOK && len(snap.UTXOs.KeyImages) > 0 {
                                         rescueSnap = snap
                                 }
+                        } else if apiSrv != nil {
+                                reason := api.StartupCorruptSnapshot
+                                outcomeErr := serr
+                                if os.IsNotExist(serr) {
+                                        reason = api.StartupNoSnapshot
+                                        outcomeErr = nil
+                                }
+                                apiSrv.SetStartupSnapshotOutcome(reason, tipHeight, outcomeErr)
                         }
                 }
 
