@@ -23,7 +23,7 @@ func buildBurnForTest(t *testing.T) (*core.BuildResult, uint64) {
 	}
 	owned[0].Blind = blind
 	change := crypto.AddressFromKeys(crypto.MainnetByte, keys)
-	result, err := core.NewTxBuilder(keys.Spend.Private, keys.View.Private, keys.Spend.Public, owned, 1).
+	result, err := core.NewTxBuilder(keys.Spend.Private, keys.View.Private, keys.Spend.Public, owned, core.InitialBaseFeePerByte).
 		Build(amount, crypto.MainnetBurnAddress(), change)
 	if err != nil {
 		t.Fatalf("build burn: %v", err)
