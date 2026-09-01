@@ -35,7 +35,10 @@ DB_NAME="${APEROD_DB_NAME:-barboskin}"
 DB_USER="${APEROD_DB_USER:-postgres}"
 ENCRYPTION_PASSWORD="${APEROD_BACKUP_PASSWORD:?Задайте APEROD_BACKUP_PASSWORD в /etc/environment}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-BACKUP_NAME="aperod_backup_${TIMESTAMP}"
+# Keep exactly one current backup object in remote storage.  A stable name makes
+# each successful upload replace the previous backup instead of accumulating
+# timestamped archives indefinitely.
+BACKUP_NAME="aperod_backup"
 TEXTFILE_DIR="${APEROD_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 TEXTFILE="${TEXTFILE_DIR}/aperod_backup.prom"
 START_TS=$(date +%s)
@@ -144,7 +147,6 @@ S3_ACCESS=$(_py "s.get('accessKeyId','')")
 S3_SECRET=$(_py "s.get('secretAccessKey','')")
 S3_BUCKET=$(_py "s.get('bucket','aperod-vault')")
 S3_REGION=$(_py "s.get('region','us-west-004')")
-S3_RETENTION_DAYS=$(_py "s.get('retentionDays',14)")
 
 if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_ACCESS" ] || [ -z "$S3_SECRET" ]; then
   echo "ОШИБКА: S3 endpoint/accessKeyId/secretAccessKey пустые в ${SETTINGS_FILE}."
@@ -153,7 +155,7 @@ if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_ACCESS" ] || [ -z "$S3_SECRET" ]; then
 fi
 
 echo "  Провайдер endpoint: ${S3_ENDPOINT}"
-echo "  Bucket: ${S3_BUCKET}  Region: ${S3_REGION}  Retention: ${S3_RETENTION_DAYS} дней"
+echo "  Bucket: ${S3_BUCKET}  Region: ${S3_REGION}"
 
 # ── Configure rclone via env vars (no rclone.conf needed!) ────────────────────
 # rclone reads RCLONE_CONFIG_<REMOTE>_<KEY> from environment
@@ -166,7 +168,6 @@ export RCLONE_CONFIG_S3BACKUP_REGION="$S3_REGION"
 export RCLONE_CONFIG_S3BACKUP_ACL="private"
 
 RCLONE_REMOTE="s3backup:${S3_BUCKET}"
-PRUNE_AGE="${S3_RETENTION_DAYS}d"
 
 # ── Clean up stale backup-tmp dirs from previous crashed runs ──────────────────
 # If the server was hard-killed (OOM, power loss), the EXIT trap never ran and
@@ -395,6 +396,7 @@ echo "  Дамп БД: $(du -sh "${BACKUP_DIR}/explorer_db.dump" | cut -f1)"
 # an SST file mid-archive (safe: the DB remains consistent).
 echo "=== [2/4] Архивирование + шифрование AES-256 (потоковый режим) ==="
 TAR_ARGS=( --ignore-failed-read --warning=no-file-removed -czf -
+           --warning=no-file-changed
            -C "$BACKUP_DIR" explorer_db.dump )
 if [ -d "$NODE_DATA_DIR" ]; then
   echo "  Включаем данные ноды (${NODE_DATA_DIR}) в поток архива..."
@@ -412,12 +414,19 @@ echo "  Зашифровано: $(du -sh "${BACKUP_DIR}/${BACKUP_NAME}.tar.gpg" 
 
 # ── 4. Upload to S3 via rclone ─────────────────────────────────────────────────
 echo "=== [3/4] Загрузка в ${RCLONE_REMOTE} ==="
-rclone copy "${BACKUP_DIR}/${BACKUP_NAME}.tar.gpg" "$RCLONE_REMOTE" --s3-no-check-bucket
+rclone copyto \
+  "${BACKUP_DIR}/${BACKUP_NAME}.tar.gpg" \
+  "${RCLONE_REMOTE}/${BACKUP_NAME}.tar.gpg" \
+  --s3-no-check-bucket
 echo "  Загружено: ${BACKUP_NAME}.tar.gpg"
 
-# Prune old backups
-echo "  Удаляем резервные копии старше ${S3_RETENTION_DAYS} дней..."
-rclone delete --min-age "$PRUNE_AGE" "$RCLONE_REMOTE" 2>/dev/null || true
+# Remove legacy timestamped backups only after the new fixed-name object has
+# uploaded successfully.  This preserves the previous good backup if upload
+# fails while ensuring the bucket contains one visible current backup.
+echo "  Удаляем старые timestamped-копии..."
+rclone delete "$RCLONE_REMOTE" \
+  --include 'aperod_backup_*.tar.gpg' \
+  --s3-no-check-bucket
 
 # ── 5. Cleanup ─────────────────────────────────────────────────────────────────
 echo "=== [4/4] Очистка временных файлов ==="
