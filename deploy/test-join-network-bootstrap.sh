@@ -39,6 +39,12 @@
 #  Validator stats returns an empty response. Bootstrap must continue with
 #  VALIDATOR_TIP=unknown and still complete all stop, rsync, and start steps.
 #
+#  Malformed validator API at step 1 (MV1-MV8)
+#  ───────────────────────────────────────────
+#  Validator stats returns malformed or truncated JSON. Bootstrap must treat
+#  both responses as unavailable, continue the full sequence, and report
+#  VALIDATOR_TIP=unknown.
+#
 #  Failure: API timeout (AT1-AT2)
 #  ───────────────────────────────
 #  API never returns height > 0; script must exit non-zero.
@@ -78,6 +84,8 @@ if ! command -v python3 &>/dev/null; then
   echo -e "${YELLOW}[SKIP]${NC}  python3 not found in PATH — skipping." >&2
   exit 0
 fi
+
+REAL_RSYNC=$(command -v rsync 2>/dev/null || true)
 
 VALIDATOR_IP="192.0.2.2"   # TEST-NET-1 — never routes
 
@@ -249,11 +257,45 @@ else
   fail "B2: expected --delete in rsync log. rsync calls:\n$(cat "${HP_RSYNC_LOG}" 2>/dev/null || echo '(empty)')"
 fi
 
-# ── B3: snapshot include pattern used ────────────────────────────────────────
-if grep -q 'snapshot-v2-\*' "${HP_RSYNC_LOG}" 2>/dev/null; then
-  pass "B3: snapshot rsync used snapshot-v2-* include pattern"
+# ── B3: snapshot rsync uses the exact include/exclude filter set ─────────────
+SNAPSHOT_RSYNC_CALL=$(grep -- '--exclude=\*' "${HP_RSYNC_LOG}" 2>/dev/null | tail -1 || true)
+EXPECTED_SNAPSHOT_FILTERS="--include=snapshot-v2-*.json.gz --include=snapshot-v2-*-prev.json.gz --exclude=*"
+ACTUAL_SNAPSHOT_FILTERS=$(printf '%s\n' "${SNAPSHOT_RSYNC_CALL}" \
+  | grep -oE -- '--(include|exclude)=[^ ]+' \
+  | paste -sd' ' -)
+if [[ "${ACTUAL_SNAPSHOT_FILTERS}" == "${EXPECTED_SNAPSHOT_FILTERS}" ]]; then
+  pass "B3: snapshot rsync used the exact v2 include/include/exclude filters"
 else
-  fail "B3: expected snapshot-v2-* in rsync log. rsync calls:\n$(cat "${HP_RSYNC_LOG}" 2>/dev/null || echo '(empty)')"
+  fail "B3: expected filters '${EXPECTED_SNAPSHOT_FILTERS}', got '${ACTUAL_SNAPSHOT_FILTERS}'. rsync calls:\n$(cat "${HP_RSYNC_LOG}" 2>/dev/null || echo '(empty)')"
+fi
+
+# ── B3b: real rsync includes only v2 snapshots ───────────────────────────────
+# Exercise rsync's own filter semantics rather than duplicating them in shell.
+B3B_SRC="${HP_DIR}/snapshot-filter-src"
+B3B_DST="${HP_DIR}/snapshot-filter-dst"
+mkdir -p "${B3B_SRC}" "${B3B_DST}"
+touch "${B3B_SRC}/snapshot-v1-100.json.gz" \
+      "${B3B_SRC}/snapshot-v2-200.json.gz" \
+      "${B3B_SRC}/snapshot-v2-200-prev.json.gz" \
+      "${B3B_SRC}/snapshot-v3-300.json.gz"
+if [[ -z "${REAL_RSYNC}" ]]; then
+  echo -e "${YELLOW}  SKIP${NC}  B3b: real rsync not available — filter semantics check skipped"
+else
+  B3B_OUTPUT=$("${REAL_RSYNC}" -ani \
+    --include='snapshot-v2-*.json.gz' \
+    --include='snapshot-v2-*-prev.json.gz' \
+    --exclude='*' \
+    "${B3B_SRC}/" "${B3B_DST}/" 2>&1)
+  B3B_EXIT=$?
+  if [[ ${B3B_EXIT} -eq 0 ]] \
+      && echo "${B3B_OUTPUT}" | grep -q 'snapshot-v2-200.json.gz' \
+      && echo "${B3B_OUTPUT}" | grep -q 'snapshot-v2-200-prev.json.gz' \
+      && ! echo "${B3B_OUTPUT}" | grep -q 'snapshot-v1-' \
+      && ! echo "${B3B_OUTPUT}" | grep -q 'snapshot-v3-'; then
+    pass "B3b: real rsync dry-run includes v2 snapshots and excludes v1/v3"
+  else
+    fail "B3b: real rsync snapshot filters selected unexpected files. Output:\n${B3B_OUTPUT}"
+  fi
 fi
 
 # ── B4: p2p_bans.json removed ────────────────────────────────────────────────
@@ -1096,6 +1138,111 @@ if [[ -f "${SV_LOCAL_STARTED}" ]]; then
 else
   fail "SV5: local validator was not started. Output:\n${LAST_OUTPUT}"
 fi
+
+# =============================================================================
+# ── MALFORMED VALIDATOR API AT STEP 1 ─────────────────────────────────────────
+# Invalid JSON must be treated exactly like an unavailable validator API.
+# =============================================================================
+run_invalid_validator_case() {
+  local case_id="$1"
+  local case_title="$2"
+  local stats_payload="$3"
+  local case_dir="${TMPDIR_TEST}/${case_id}"
+  local case_data="${case_dir}/data"
+  local case_bin="${case_dir}/bin"
+  local case_yaml="${case_dir}/node.yaml"
+  local case_config="${case_dir}/node-config.sh"
+  local stats_file="${case_dir}/validator-stats"
+  local rsync_called="${case_dir}/rsync-called"
+  local validator_stopped="${case_dir}/validator-stopped"
+  local validator_started="${case_dir}/validator-started"
+  local local_started="${case_dir}/local-started"
+
+  section "${case_title}"
+  mkdir -p "${case_data}/chain.db"
+  touch "${case_data}/chain.db/CURRENT"
+  touch "${case_data}/snapshot-v2-700.json.gz"
+  printf 'network: testnet\n' >"${case_yaml}"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"${case_config}"
+  chmod +x "${case_config}"
+  printf '%s\n' "${stats_payload}" >"${stats_file}"
+
+  make_stub "${case_bin}" "rsync" "touch '${rsync_called}'; exit 0"
+  make_stub "${case_bin}" "chown" 'exit 0'
+  make_stub "${case_bin}" "sleep" 'exit 0'
+  make_stub "${case_bin}" "aperod-node" "
+if echo \"\$*\" | grep -q -- '--check-store'; then
+  echo 'check-store OK: tip_height=700 missing=0 (threshold=5000)'
+fi
+exit 0
+"
+  make_stub "${case_bin}" "systemctl" "
+case \"\$*\" in
+  *'stop aperod-node'*)  exit 0 ;;
+  *'is-active'*)         exit 1 ;;
+  *'enable --now'*|*'start aperod-node'*)
+    touch '${local_started}'
+    exit 0 ;;
+  *)                     exit 0 ;;
+esac
+"
+  make_stub "${case_bin}" "ssh" "
+shift
+CMD=\"\$*\"
+if echo \"\$CMD\" | grep -q 'network/stats'; then
+  cat '${stats_file}'
+elif echo \"\$CMD\" | grep -q 'systemctl start'; then
+  touch '${validator_started}'
+  echo 'started'
+elif [[ \"\$CMD\" == 'bash' ]]; then
+  cat >/dev/null
+  touch '${validator_stopped}'
+  echo 'stopped'
+else
+  cat >/dev/null
+  echo 'ok'
+fi
+exit 0
+"
+  make_stub "${case_bin}" "curl" "
+echo '{\"height\":700,\"peer_count\":1,\"syncing\":false}'
+exit 0
+"
+
+  run_bootstrap "${case_bin}" "${case_data}" "${case_yaml}" "${case_config}"
+
+  if [[ ${LAST_EXIT} -eq 0 ]]; then
+    pass "${case_id}1: ${case_title} exits 0"
+  else
+    fail "${case_id}1: expected exit 0 but got ${LAST_EXIT}. Output:\n${LAST_OUTPUT}"
+  fi
+
+  if echo "${LAST_OUTPUT}" | grep -q 'Validator tip_height: unknown'; then
+    pass "${case_id}2: completion banner reports validator tip_height as unknown"
+  else
+    fail "${case_id}2: expected unknown validator tip. Output:\n${LAST_OUTPUT}"
+  fi
+
+  if [[ -f "${rsync_called}" ]]; then
+    pass "${case_id}3: rsync still executed after invalid validator stats"
+  else
+    fail "${case_id}3: rsync did not execute. Output:\n${LAST_OUTPUT}"
+  fi
+
+  if [[ -f "${validator_stopped}" ]] && [[ -f "${validator_started}" ]] && [[ -f "${local_started}" ]]; then
+    pass "${case_id}4: validator stop/restart and local start all executed"
+  else
+    fail "${case_id}4: bootstrap sequence was incomplete. Output:\n${LAST_OUTPUT}"
+  fi
+}
+
+run_invalid_validator_case "MV" \
+  "Malformed validator API at step 1 — invalid JSON continues with unknown tip" \
+  '{"tip_height":700'
+
+run_invalid_validator_case "TV" \
+  "Truncated validator API at step 1 — incomplete JSON continues with unknown tip" \
+  '{"tip_height":'
 
 # =============================================================================
 # ── FAILURE: API timeout ──────────────────────────────────────────────────────
