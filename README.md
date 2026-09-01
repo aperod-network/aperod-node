@@ -467,6 +467,6 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) fo
   <sub>
     <a href="https://aperod.com">aperod.com</a> &nbsp;·&nbsp;
     <a href="https://t.me/aperod_bot">Telegram Wallet</a> &nbsp;·&nbsp;
-    <a href="https://aperod.com/explorer/">Block Explorer</a>
+    <a href="https://explorer.aperod.com/">Block Explorer</a>
   </sub>
 </div>
