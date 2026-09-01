@@ -339,6 +339,9 @@ type ConsensusConfig struct {
 	// is exhausted.  Unlike pool rewards, tail rewards ARE minted (create new
 	// supply).  0 uses the default: 100_000_000 nAPRO = 1 APRO/block.
 	TailRewardNAPR uint64 `yaml:"tail_reward_napro"`
+	// RingCTV4ActivationHeight is the first block height allowed to contain
+	// commitment-binding v4 transfers. Zero activates v4 immediately.
+	RingCTV4ActivationHeight uint64 `yaml:"ringct_v4_activation_height"`
 }
 
 // APIConfig holds RPC/REST settings.

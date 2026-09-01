@@ -198,6 +198,9 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         //     pay_blind = Σr_in - r_fee
         inBlinds := make([]crypto.BlindFactor, len(selected))
         for i, u := range selected {
+		if err := validateOwnedUTXOOpening(u); err != nil {
+			return nil, fmt.Errorf("input opening [%d]: %w", i, err)
+		}
                 inBlinds[i] = u.Blind
         }
 
@@ -305,6 +308,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                         KeyImage:     ki,
                         Ring:         ring,
                         AmountCommit: u.AmountCommit,
+			RealIndex:    uint8(realIdx),
                 }
         }
 
@@ -322,7 +326,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 
         // ── Assemble unsigned transaction ─────────────────────────────────────────
         tx := Transaction{
-                Version:     TxVersionBase,
+		Version:     TxVersionCommitmentBinding,
                 Inputs:      inputs,
                 Outputs:     outputs,
                 Fee:         estimatedFee,
@@ -335,7 +339,14 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         txHash := tx.Hash()
         for i := range inputs {
                 msg := ringSignMessage(txHash, uint32(i))
-                sig, err := crypto.MLSAGSign(msg, inputs[i].Ring, inputRealIdxs[i], inputPrivKeys[i])
+		sig, err := crypto.MLSAGSignV4(
+			msg,
+			inputs[i].Ring,
+			inputRealIdxs[i],
+			inputPrivKeys[i],
+			selected[i].Blind,
+			selected[i].Amount,
+		)
                 if err != nil {
                         return nil, fmt.Errorf("mlsag sign [%d]: %w", i, err)
                 }
@@ -357,6 +368,17 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 FallbackDecoyCount: totalFallbackDecoys,
                 SelectedUTXOs:      selected,
         }, nil
+}
+
+func validateOwnedUTXOOpening(utxo OwnedUTXO) error {
+	commitment, err := crypto.Commit(utxo.Amount, utxo.Blind)
+	if err != nil {
+		return fmt.Errorf("invalid amount or blind: %w", err)
+	}
+	if commitment != utxo.AmountCommit {
+		return fmt.Errorf("amount/blind do not open the selected UTXO commitment")
+	}
+	return nil
 }
 
 // txBuildOutputWithBlind creates an Output using a specified blind factor.
@@ -640,11 +662,13 @@ func simulateGreedySelection(available []OwnedUTXO, amount, feePerByte uint64) (
 const (
         // txOverheadBytes: version(1) + fee(8) + feeCommit(32).
         txOverheadBytes = 41
-        // txBytesPerInput: input body: keyImage(32) + ring(16×32) + amountCommit(32) = 576
-        //                  MLSAG sig:  c0(32) + ss(16×32) + keyImage(32)          = 576
-        //                  Total per input: 576 + 576 = 1152.
+		// txBytesPerInput: input body: keyImage(32) + ring(16×32) + amountCommit(32) = 576
+		//                  disclosed real index: 1
+		//                  v4 MLSAG: c0(32) + keyImage(32) + 3 response vectors
+		//                  (3×16×32) + direct link R/S(64) = 1664.
+		//                  Total per input: 576 + 1 + 1664 = 2241.
         // Must stay in sync with Transaction.Size() in transaction.go.
-        txBytesPerInput = 1152
+		txBytesPerInput = 2241
         // txBytesPerOutput: oneTimePub(32) + txPubKey(32) + amountCommit(32)
         //                   + encAmount(8) + rangeProof(675).
         txBytesPerOutput = 779

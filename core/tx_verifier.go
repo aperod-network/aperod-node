@@ -218,6 +218,19 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // first so that locked-genesis errors surface before C-0 fires.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
+			if tx.Version == TxVersionCommitmentBinding {
+				realMember := inp.Ring[int(inp.RealIndex)]
+				utxo := v.utxos.GetByPubKey(realMember)
+				if utxo == nil {
+					return fmt.Errorf("tx %x: input %d proven real member %x is not an active UTXO",
+						txHashPrefix[:8], i, realMember[:8])
+				}
+				if utxo.AmountCommit != inp.AmountCommit {
+					return fmt.Errorf("tx %x: input %d proven real member commitment does not match claimed commitment",
+						txHashPrefix[:8], i)
+				}
+				continue
+			}
                         presentCount := 0
                         matchCount := 0
                         for _, member := range inp.Ring {
@@ -273,7 +286,13 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
                 }
                 // The signed message is H(txHash || inputIndex)
                 msg := ringSignMessage(txHash, uint32(i))
-                ok, err := crypto.MLSAGVerify(msg, inp.Ring, sig)
+		var ok bool
+		var err error
+		if tx.Version == TxVersionCommitmentBinding {
+			ok, err = crypto.MLSAGVerifyV4(msg, inp.Ring, inp.AmountCommit, int(inp.RealIndex), sig)
+		} else {
+			ok, err = crypto.MLSAGVerify(msg, inp.Ring, sig)
+		}
                 if err != nil {
                         return fmt.Errorf("tx %x: ring sig error at input %d: %w", txHashPrefix[:8], i, err)
                 }

@@ -129,6 +129,9 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	// Collect input blinds for BlindSum.
 	inBlinds := make([]crypto.BlindFactor, len(selected))
 	for i, u := range selected {
+		if err := validateOwnedUTXOOpening(u); err != nil {
+			return nil, fmt.Errorf("input opening[%d]: %w", i, err)
+		}
 		inBlinds[i] = u.Blind
 	}
 
@@ -254,6 +257,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			KeyImage:     ki,
 			Ring:         ring,
 			AmountCommit: u.AmountCommit,
+			RealIndex:    uint8(realIdx),
 		}
 	}
 
@@ -271,7 +275,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 
 	// ── Assemble and MLSAG-sign ───────────────────────────────────────────────
 	tx := Transaction{
-		Version:     TxVersionBase,
+		Version:     TxVersionCommitmentBinding,
 		Inputs:      inputs,
 		Outputs:     outputs,
 		Fee:         estimatedFee,
@@ -282,7 +286,14 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	txHashVal := tx.Hash()
 	for i := range inputs {
 		msg := ringSignMessage(txHashVal, uint32(i))
-		sig, err := crypto.MLSAGSign(msg, inputs[i].Ring, inputRealIdxs[i], inputPrivKeys[i])
+		sig, err := crypto.MLSAGSignV4(
+			msg,
+			inputs[i].Ring,
+			inputRealIdxs[i],
+			inputPrivKeys[i],
+			selected[i].Blind,
+			selected[i].Amount,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("mlsag sign[%d]: %w", i, err)
 		}

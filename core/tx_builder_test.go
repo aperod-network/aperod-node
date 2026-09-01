@@ -16,7 +16,7 @@ import (
 
 // makeGenesisWithCoinbase creates a minimal single-block chain where Alice
 // owns one coinbase output worth `supply` base units.
-func makeGenesisWithCoinbase(t *testing.T, aliceKeys *crypto.WalletKeyPair, supply uint64) (*core.Chain, *core.Block) {
+func makeGenesisWithCoinbase(t *testing.T, aliceKeys *crypto.WalletKeyPair, supply uint64) (*core.Chain, *core.Block, crypto.BlindFactor) {
         t.Helper()
 
         validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
@@ -79,7 +79,7 @@ func makeGenesisWithCoinbase(t *testing.T, aliceKeys *crypto.WalletKeyPair, supp
         if err := chain.SetGenesis(genesis); err != nil {
                 t.Fatal(err)
         }
-        return chain, genesis
+        return chain, genesis, blind
 }
 
 // TestTxBuilder_AliceToBob exercises the full RingCT transaction lifecycle.
@@ -101,7 +101,7 @@ func TestTxBuilder_AliceToBob(t *testing.T) {
         bobAddr := crypto.AddressFromKeys(net, bobKeys)
 
         // Create a chain with Alice's coinbase UTXO
-        chain, _ := makeGenesisWithCoinbase(t, aliceKeys, supply)
+        chain, _, inputBlind := makeGenesisWithCoinbase(t, aliceKeys, supply)
 
         // Alice scans her chain for owned outputs
         scanner := core.NewWalletScanner(
@@ -114,6 +114,7 @@ func TestTxBuilder_AliceToBob(t *testing.T) {
         if len(ownedByAlice) == 0 {
                 t.Fatal("Alice found no outputs in her coinbase block")
         }
+        ownedByAlice[0].Blind = inputBlind
         t.Logf("Alice owns %d UTXOs, total balance: %d base units",
                 len(ownedByAlice), core.Balance(ownedByAlice))
 
@@ -222,7 +223,7 @@ func TestTxBuilder_InsufficientFunds(t *testing.T) {
         bobAddr := crypto.AddressFromKeys(net, bobKeys)
         aliceAddr := crypto.AddressFromKeys(net, aliceKeys)
 
-        chain, _ := makeGenesisWithCoinbase(t, aliceKeys, 1000)
+        chain, _, _ := makeGenesisWithCoinbase(t, aliceKeys, 1000)
         scanner := core.NewWalletScanner(
                 aliceKeys.View.Private, aliceKeys.Spend.Public, aliceKeys.View.Public, net,
         )
@@ -254,7 +255,7 @@ func TestFeeEstimateMatchesTransactionSize(t *testing.T) {
 	// is fine because Transaction.Size() never dereferences field contents.
 	ring := make([]crypto.RingMember, crypto.RingSize)
 	tx := core.Transaction{
-		Version: core.TxVersionBase,
+Version: core.TxVersionCommitmentBinding,
 		Inputs: []core.RingInput{
 			{Ring: ring},
 		},
@@ -262,7 +263,10 @@ func TestFeeEstimateMatchesTransactionSize(t *testing.T) {
 			{}, // payment output
 			{}, // change output
 		},
-		Signatures:  []*crypto.MLSAGSignature{{}},
+Signatures: []*crypto.MLSAGSignature{{
+BlindSS: make([][32]byte, crypto.RingSize),
+ValueSS: make([][32]byte, crypto.RingSize),
+}},
 		RangeProofs: []*crypto.RangeProof{{}, {}},
 	}
 
@@ -326,7 +330,7 @@ func TestTxBuilder_FallbackDecoyCount_SparseUTXOSet(t *testing.T) {
         bobAddr := crypto.AddressFromKeys(net, bobKeys)
 
         // Create a single-block chain with Alice's coinbase UTXO.
-        chain, _ := makeGenesisWithCoinbase(t, aliceKeys, supply)
+        chain, _, inputBlind := makeGenesisWithCoinbase(t, aliceKeys, supply)
         scanner := core.NewWalletScanner(
                 aliceKeys.View.Private, aliceKeys.Spend.Public, aliceKeys.View.Public, net,
         )
@@ -334,6 +338,7 @@ func TestTxBuilder_FallbackDecoyCount_SparseUTXOSet(t *testing.T) {
         if len(ownedByAlice) == 0 {
                 t.Fatal("Alice found no UTXOs")
         }
+        ownedByAlice[0].Blind = inputBlind
 
         // Build a UTXOSet with only 3 spent decoys — far fewer than RingSize-1 = 15.
         const nSpentDecoys = 3

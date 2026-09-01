@@ -426,6 +426,10 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	seen := make(map[crypto.KeyImage]int) // ki → first tx index (for error reporting)
 	for txIdx, tx := range block.Txs {
 		for _, inp := range tx.Inputs {
+			if tx.Version == TxVersionCommitmentBinding && int(inp.RealIndex) >= len(inp.Ring) {
+				return fmt.Errorf("block %d tx[%d]: v4 real index %d out of range",
+					block.Header.Height, txIdx, inp.RealIndex)
+			}
 			canonical, cerr := crypto.CanonicalKeyImage(inp.KeyImage)
 			if cerr != nil {
 				return fmt.Errorf("block %d tx[%d]: invalid key image: %w",
@@ -490,7 +494,7 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 			} else {
 				s.keyImages.insert(inp.KeyImage) // fallback: store raw (already validated)
 			}
-			for _, member := range inp.Ring {
+			for _, member := range stateTransitionRingMembers(tx, inp) {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
@@ -606,7 +610,7 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 			}
 			// Safety-net fallback: if the journal was pruned (reorg deeper than
 			// maxRollbackDepth) try spentPubKeys as a last resort.
-			for _, member := range inp.Ring {
+			for _, member := range stateTransitionRingMembers(tx, inp) {
 				if _, alreadyRestored := journalRestored[member]; alreadyRestored {
 					break
 				}
@@ -772,7 +776,7 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 	defer s.mu.Unlock()
 	for _, tx := range block.Txs {
 		for _, inp := range tx.Inputs {
-			for _, member := range inp.Ring {
+			for _, member := range stateTransitionRingMembers(tx, inp) {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
 						delete(s.byPubKey, member)
@@ -789,6 +793,17 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 			}
 		}
 	}
+}
+
+func stateTransitionRingMembers(tx Transaction, inp RingInput) []crypto.RingMember {
+	if tx.Version != TxVersionCommitmentBinding {
+		return inp.Ring
+	}
+	idx := int(inp.RealIndex)
+	if idx < 0 || idx >= len(inp.Ring) {
+		return nil
+	}
+	return inp.Ring[idx : idx+1]
 }
 
 // SpentDecoyCount returns the number of spent UTXOs in the decoy pool.

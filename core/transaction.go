@@ -14,6 +14,9 @@ const (
         TxVersionBase      TxVersion = 1 // Standard RingCT transaction
         TxVersionGameAsset TxVersion = 2 // Transaction with game asset data in Extra
         TxVersionStake     TxVersion = 3 // Validator stake deposit / withdrawal
+	// TxVersionCommitmentBinding adds a linked Pedersen-opening proof to every
+	// MLSAG signature. Legacy versions remain valid for historical replay.
+	TxVersionCommitmentBinding TxVersion = 4
 )
 
 // Transaction is the core unit of value transfer in Aperod.
@@ -48,6 +51,10 @@ type RingInput struct {
         Ring []crypto.RingMember // len = crypto.RingSize
         // AmountCommit is the Pedersen commitment of the UTXO being spent (from the original Output).
         AmountCommit crypto.Commitment
+	// RealIndex is disclosed by v4 transactions so the state transition can
+	// remove the exact UTXO proven by the direct ownership link. It is ignored
+	// for legacy versions.
+	RealIndex uint8
 }
 
 // Output is a newly created UTXO.
@@ -81,6 +88,9 @@ func (tx *Transaction) Hash() crypto.Hash32 {
                 for _, rm := range inp.Ring {
                         parts = append(parts, rm[:])
                 }
+		if tx.Version == TxVersionCommitmentBinding {
+			parts = append(parts, []byte{inp.RealIndex})
+		}
         }
         for _, out := range tx.Outputs {
                 parts = append(parts, out.OneTimePub[:])
@@ -109,6 +119,11 @@ func (tx *Transaction) Validate() error {
         if tx.Version == 0 {
                 return fmt.Errorf("tx version 0 is invalid")
         }
+	switch tx.Version {
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding:
+	default:
+		return fmt.Errorf("unsupported tx version %d", tx.Version)
+	}
 
         // Stake transactions carry payload in Extra.  Validate the Extra field,
         // then fall through to enforce RangeProof count for any outputs (C-2 fix:
@@ -165,8 +180,30 @@ func (tx *Transaction) Validate() error {
                 if inp.KeyImage == (crypto.KeyImage{}) {
                         return fmt.Errorf("input %d: zero key image", i)
                 }
+		if tx.Version == TxVersionCommitmentBinding {
+			if int(inp.RealIndex) >= crypto.RingSize {
+				return fmt.Errorf("input %d: real index %d out of range", i, inp.RealIndex)
+			}
+			if tx.Signatures[i] != nil &&
+				(len(tx.Signatures[i].BlindSS) != crypto.RingSize ||
+					len(tx.Signatures[i].ValueSS) != crypto.RingSize) {
+				return fmt.Errorf("input %d: v4 signature opening response length mismatch", i)
+			}
+		}
         }
         return nil
+}
+
+// ValidateTxVersionAtHeight applies the height-gated consensus policy for new
+// transaction formats without changing historical replay semantics.
+func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight uint64) error {
+	if tx.Version == TxVersionCommitmentBinding &&
+		ringCTV4ActivationHeight > 0 &&
+		height < ringCTV4ActivationHeight {
+		return fmt.Errorf("transaction version %d is not active until height %d",
+			tx.Version, ringCTV4ActivationHeight)
+	}
+	return nil
 }
 
 // Size returns an approximate byte size for fee estimation.
@@ -175,10 +212,18 @@ func (tx *Transaction) Size() int {
         size := 1 + 8 + 32
         // Each input: keyImage(32) + ring(16×32) + amountCommit(32)
         size += len(tx.Inputs) * (32 + crypto.RingSize*32 + 32)
+	if tx.Version == TxVersionCommitmentBinding {
+		size += len(tx.Inputs) // disclosed real index
+	}
         // Each output: oneTimePub(32) + txPubKey(32) + amountCommit(32) + encAmount(8)
         size += len(tx.Outputs) * (32 + 32 + 32 + 8)
-        // MLSAG: c0(32) + ss(11×32) + keyImage(32) per input
-        size += len(tx.Signatures) * (32 + crypto.RingSize*32 + 32)
+	// MLSAG: c0(32) + ss(16×32) + keyImage(32) per input. v4 adds
+	// blind/value opening responses, one scalar per ring member each.
+	sigBytes := 32 + crypto.RingSize*32 + 32
+	if tx.Version == TxVersionCommitmentBinding {
+		sigBytes += 2*crypto.RingSize*32 + 64 // opening responses + link R/S
+	}
+	size += len(tx.Signatures) * sigBytes
         // Range proofs: simplified (real bulletproofs ~675 bytes each)
         size += len(tx.RangeProofs) * 675
         // Extra

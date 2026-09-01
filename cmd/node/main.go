@@ -6,6 +6,7 @@ import (
         "crypto/tls"
         "encoding/json"
         "fmt"
+        "io"
         "log/slog"
         "math"
         "math/rand/v2"
@@ -192,7 +193,20 @@ func runCompactDB() error {
                 return fmt.Errorf("--compact-db requires --data-dir=<path>")
         }
 
-        dbPath := filepath.Join(dataDir, "chain.db")
+        absDataDir, err := filepath.Abs(dataDir)
+        if err != nil {
+                return fmt.Errorf("compact-db: resolve data dir: %w", err)
+        }
+        dbPath := filepath.Join(absDataDir, "chain.db")
+        _, tipHeight, err := store.ReadTipOnly(dbPath)
+        if err != nil {
+                return fmt.Errorf("compact-db: inspect target before mutation: %w", err)
+        }
+        if err := maintenancePreflightResolved(
+                os.Stderr, "(not used; --data-dir supplied explicitly)", absDataDir, tipHeight,
+        ); err != nil {
+                return err
+        }
 
         // Measure disk use before compaction.
         sizeBefore := dirSize(dbPath)
@@ -249,6 +263,82 @@ func formatBytes(b int64) string {
         default:
                 return fmt.Sprintf("%d B", b)
         }
+}
+
+const maintenanceStaleMinGap uint64 = 10_000
+
+func maintenancePaths(cfgPath, dataDir string) (string, string, error) {
+        absConfig, err := filepath.Abs(cfgPath)
+        if err != nil {
+                return "", "", fmt.Errorf("resolve config path %q: %w", cfgPath, err)
+        }
+        absDataDir, err := filepath.Abs(dataDir)
+        if err != nil {
+                return "", "", fmt.Errorf("resolve data dir %q: %w", dataDir, err)
+        }
+        return filepath.Clean(absConfig), filepath.Clean(absDataDir), nil
+}
+
+func latestSnapshotHeight(dataDir string) uint64 {
+        entries, err := os.ReadDir(dataDir)
+        if err != nil {
+                return 0
+        }
+        prefix := fmt.Sprintf("snapshot-v%d-", snapVersion)
+        var highest uint64
+        for _, entry := range entries {
+                name := entry.Name()
+                if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, ".tmp") {
+                        continue
+                }
+                heightText := strings.TrimPrefix(name, prefix)
+                heightText = strings.TrimSuffix(heightText, "-prev.json.gz")
+                heightText = strings.TrimSuffix(heightText, ".json.gz")
+                height, parseErr := strconv.ParseUint(heightText, 10, 64)
+                if parseErr == nil && height > highest {
+                        highest = height
+                }
+        }
+        return highest
+}
+
+// maintenancePreflight prints the exact chain selected for a destructive or
+// long-running maintenance command and rejects a database tip that is far
+// behind a snapshot stored in the same data directory.
+func maintenancePreflight(out io.Writer, cfgPath, dataDir string, tipHeight uint64) error {
+        absConfig, absDataDir, err := maintenancePaths(cfgPath, dataDir)
+        if err != nil {
+                return err
+        }
+        return maintenancePreflightResolved(out, absConfig, absDataDir, tipHeight)
+}
+
+func maintenancePreflightResolved(out io.Writer, resolvedConfig, absDataDir string, tipHeight uint64) error {
+        snapshotHeight := latestSnapshotHeight(absDataDir)
+        fmt.Fprintf(out,
+                "\n================ MAINTENANCE PREFLIGHT ================\n"+
+                        "resolved_config: %s\n"+
+                        "absolute_data_dir: %s\n"+
+                        "tip_height: %d\n"+
+                        "latest_snapshot_height: %d\n"+
+                        "=======================================================\n",
+                resolvedConfig, absDataDir, tipHeight, snapshotHeight)
+
+        if snapshotHeight <= tipHeight {
+                return nil
+        }
+        gap := snapshotHeight - tipHeight
+        staleGap := snapshotHeight / 10
+        if staleGap < maintenanceStaleMinGap {
+                staleGap = maintenanceStaleMinGap
+        }
+        if gap < staleGap {
+                return nil
+        }
+        return fmt.Errorf(
+                "MAINTENANCE REFUSED: database tip %d is %d blocks behind snapshot height %d in %s; "+
+                        "this data directory appears stale or internally inconsistent — verify --config and data_dir before retrying",
+                tipHeight, gap, snapshotHeight, absDataDir)
 }
 
 // runCheckStore implements the --check-store subcommand.
@@ -419,7 +509,20 @@ func runRepairHeightIndex() error {
                 return fmt.Errorf("--repair-height-index requires --data-dir=<path>")
         }
 
-        dbPath := filepath.Join(dataDir, "chain.db")
+        absDataDir, err := filepath.Abs(dataDir)
+        if err != nil {
+                return fmt.Errorf("repair-height-index: resolve data dir: %w", err)
+        }
+        dbPath := filepath.Join(absDataDir, "chain.db")
+        _, inspectedTipHeight, err := store.ReadTipOnly(dbPath)
+        if err != nil {
+                return fmt.Errorf("repair-height-index: inspect target before mutation: %w", err)
+        }
+        if err := maintenancePreflightResolved(
+                os.Stderr, "(not used; --data-dir supplied explicitly)", absDataDir, inspectedTipHeight,
+        ); err != nil {
+                return err
+        }
         db, err := store.Open(dbPath)
         if err != nil {
                 return fmt.Errorf("repair-height-index: open %s: %w", dbPath, err)
@@ -700,6 +803,12 @@ func run() error {
                                         "  To silence this warning, pass --config %s explicitly.\n",
                                 systemConfigPath, cfgPath, systemConfigPath)
                         cfgPath = systemConfigPath
+                        configFlagExplicit = true
+                } else {
+                        return fmt.Errorf(
+                                "MAINTENANCE REFUSED: --config was not supplied and %s does not exist; "+
+                                        "pass --config <path> explicitly so a repair cannot run against the default data directory",
+                                systemConfigPath)
                 }
         }
 
@@ -709,6 +818,18 @@ func run() error {
         }
         if err := cfg.Validate(); err != nil {
                 return fmt.Errorf("invalid config: %w", err)
+        }
+        if maintenanceMode {
+                absConfig, absDataDir, pathErr := maintenancePaths(cfgPath, cfg.DataDir)
+                if pathErr != nil {
+                        return pathErr
+                }
+                fmt.Fprintf(os.Stderr,
+                        "\n================ MAINTENANCE TARGET ===================\n"+
+                                "resolved_config: %s\n"+
+                                "absolute_data_dir: %s\n"+
+                                "=======================================================\n",
+                        absConfig, absDataDir)
         }
 
         // --validate-config: exit 0 after a successful parse+validate so
@@ -836,6 +957,25 @@ func run() error {
         }
 
         // ── 3. Open storage ───────────────────────────────────────────────────────
+        // Maintenance commands must inspect the selected chain without writes
+        // before MkdirAll, Recover, or a normal LevelDB open can alter anything.
+        if maintenanceMode {
+                _, absDataDir, pathErr := maintenancePaths(cfgPath, cfg.DataDir)
+                if pathErr != nil {
+                        return pathErr
+                }
+                dbPath := filepath.Join(absDataDir, "chain.db")
+                _, inspectedTipHeight, inspectErr := store.ReadTipOnly(dbPath)
+                if inspectErr != nil {
+                        return fmt.Errorf(
+                                "MAINTENANCE REFUSED: cannot inspect %s read-only before mutation: %w; "+
+                                        "verify --config and data_dir, then repair from a verified copy",
+                                dbPath, inspectErr)
+                }
+                if err := maintenancePreflight(os.Stderr, cfgPath, cfg.DataDir, inspectedTipHeight); err != nil {
+                        return err
+                }
+        }
         if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
                 return fmt.Errorf("create data dir: %w", err)
         }
@@ -2185,6 +2325,7 @@ func run() error {
                 Store:              db,
                 OracleURL:          cfg.Consensus.OracleURL,
                 OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
+			RingCTV4ActivationHeight: cfg.Consensus.RingCTV4ActivationHeight,
                 OnBlockProduced: func(block *core.Block) {
                         if err := storeBlock(db, block); err != nil {
                                 log.Error("failed to persist block", "height", block.Header.Height, "err", err)
