@@ -20,10 +20,10 @@ import (
 // slogNop is a slog.Handler that discards all output — used in tests.
 type slogNop struct{}
 
-func (slogNop) Enabled(context.Context, slog.Level) bool { return false }
+func (slogNop) Enabled(context.Context, slog.Level) bool  { return false }
 func (slogNop) Handle(context.Context, slog.Record) error { return nil }
 func (slogNop) WithAttrs([]slog.Attr) slog.Handler        { return slogNop{} }
-func (slogNop) WithGroup(string) slog.Handler              { return slogNop{} }
+func (slogNop) WithGroup(string) slog.Handler             { return slogNop{} }
 
 func newNopLogger() *slog.Logger { return slog.New(slogNop{}) }
 
@@ -108,6 +108,7 @@ func TestVote_BFTFinalization(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: pubs[0],
@@ -287,6 +288,7 @@ func TestEngine_AcceptsIncomingBlock(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: pub,
@@ -339,6 +341,7 @@ func TestEngine_RejectsBlock_NoVerifier(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: pub,
@@ -379,6 +382,7 @@ func TestHandleIncomingBlock_FutureTooFar(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().Add(60 * time.Second).UnixNano(), // 60 s in the future
 		ValidatorPub: pub,
@@ -414,6 +418,7 @@ func TestHandleIncomingBlock_SlightlyAhead(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().Add(5 * time.Second).UnixNano(), // 5 s ahead — within tolerance
 		ValidatorPub: pub,
@@ -462,6 +467,7 @@ func TestHandleIncomingBlock_14sAhead(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().Add(14 * time.Second).UnixNano(), // 14 s ahead — within ±15 s tolerance
 		ValidatorPub: pub,
@@ -507,6 +513,7 @@ func TestHandleIncomingBlock_14sBehind(t *testing.T) {
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().Add(-14 * time.Second).UnixNano(), // 14 s behind — within ±15 s tolerance
 		ValidatorPub: pub,

@@ -91,15 +91,22 @@ cat > "${MOCK_BIN}/hostname" <<'SH'
 echo "192.0.2.1"
 SH
 
+# mock: fuser — exit 1 means no process currently has chain.db open.
+cat > "${MOCK_BIN}/fuser" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+
 chmod +x "${MOCK_BIN}/rsync" \
          "${MOCK_BIN}/systemctl" \
          "${MOCK_BIN}/ssh" \
-         "${MOCK_BIN}/hostname"
+         "${MOCK_BIN}/hostname" \
+         "${MOCK_BIN}/fuser"
 
 # ── Fake data directories ──────────────────────────────────────────────────────
 PRIMARY_DIR="${WORK}/primary"
 SECONDARY_DIR="${WORK}/secondary"
-mkdir -p "${PRIMARY_DIR}" "${SECONDARY_DIR}"
+mkdir -p "${PRIMARY_DIR}/chain.db" "${SECONDARY_DIR}"
 
 # Minimal node.yaml so the bootnode-config step has a file to edit
 NODE_YAML="${WORK}/node.yaml"

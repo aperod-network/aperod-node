@@ -203,6 +203,7 @@ func buildAndSendBlock(
 	tip := chain.Tip()
 	hdr := core.BlockHeader{
 		Height:       1,
+		Round:        1,
 		PrevHash:     tip.Hash(),
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: proposerPub,

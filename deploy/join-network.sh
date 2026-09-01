@@ -204,6 +204,10 @@ ${BOLD}╔═══════════════════════�
   # are still running — lets the operator fix VALIDATOR_DATA_DIR without
   # triggering the cleanup trap.
   info "Шаг 1b/9: Проверяем наличие ${VALIDATOR_DATA_DIR} на валидаторе (${VALIDATOR_IP})…"
+  if ! ssh "root@${VALIDATOR_IP}" true 2>/dev/null; then
+    die "SSH-соединение с валидатором ${VALIDATOR_IP} недоступно.
+  Проверьте сетевую доступность, SSH-сервис и авторизацию, затем повторите bootstrap."
+  fi
   if ! ssh "root@${VALIDATOR_IP}" "[ -d '${VALIDATOR_DATA_DIR}' ]" 2>/dev/null; then
     die "Директория данных валидатора не найдена: ${VALIDATOR_DATA_DIR}
   Если валидатор установлен по нестандартному пути, переопределите переменную:
@@ -641,6 +645,9 @@ PRIMARY_BOOTNODE="/ip4/${PRIMARY_IP}/tcp/${PRIMARY_P2P_PORT}"
 
 # ── Проверки ──────────────────────────────────────────────
 [[ -d "${PRIMARY_DATA_DIR}" ]] || die "Директория данных не найдена: ${PRIMARY_DATA_DIR}"
+[[ -d "${PRIMARY_DATA_DIR}/chain.db" ]] || die "Поддиректория chain.db не найдена: ${PRIMARY_DATA_DIR}/chain.db
+  Проверьте путь к данным валидатора или укажите его явно:
+  PRIMARY_DATA_DIR=/путь/к/данным bash join-network.sh ${TARGET_IP}"
 command -v rsync >/dev/null 2>&1 || die "rsync не установлен"
 command -v ssh >/dev/null 2>&1   || die "ssh не установлен"
 

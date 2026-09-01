@@ -43,8 +43,8 @@ func TestSlashing_DoubleSign(t *testing.T) {
 	if ev == nil {
 		t.Fatal("expected double-sign evidence")
 	}
-	if ev.Height != 2 || ev.Round != 0 {
-		t.Errorf("wrong slot: height=%d round=%d", ev.Height, ev.Round)
+	if ev.Height != 2 || ev.Round1 != 0 || ev.Round2 != 0 {
+		t.Errorf("wrong evidence location: height=%d rounds=%d,%d", ev.Height, ev.Round1, ev.Round2)
 	}
 	if ev.Hash1 != h1 || ev.Hash2 != h2 {
 		t.Error("wrong hashes in evidence")
@@ -61,11 +61,15 @@ func TestSlashing_DifferentSlots(t *testing.T) {
 	h1[0] = 0xAA
 	h2[0] = 0xBB
 
-	// Same height, different rounds — not a double-sign
+	// Same height, different rounds is also a double-sign: validators must
+	// not make competing proposals for one height.
 	sd.CheckBlock(3, 0, pub, h1, []byte("sig1"))
 	ev := sd.CheckBlock(3, 1, pub, h2, []byte("sig2"))
-	if ev != nil {
-		t.Error("different rounds should not trigger double-sign")
+	if ev == nil {
+		t.Fatal("different rounds at one height should trigger double-sign evidence")
+	}
+	if ev.Round1 != 0 || ev.Round2 != 1 {
+		t.Errorf("evidence rounds = %d,%d, want 0,1", ev.Round1, ev.Round2)
 	}
 }
 

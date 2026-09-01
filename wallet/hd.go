@@ -119,7 +119,7 @@ func DeriveKeys(seed []byte, account, index uint32) (*DerivedKeys, error) {
 
 // DeriveFromMnemonic is a convenience wrapper: mnemonic → seed → DeriveKeys.
 func DeriveFromMnemonic(mnemonic, passphrase string, account, index uint32) (*DerivedKeys, error) {
-	if err := ValidateMnemonic(mnemonic); err != nil {
+	if _, err := ValidateMnemonicForRecovery(mnemonic); err != nil {
 		return nil, fmt.Errorf("hd: invalid mnemonic: %w", err)
 	}
 	seed := MnemonicToSeed(mnemonic, passphrase)

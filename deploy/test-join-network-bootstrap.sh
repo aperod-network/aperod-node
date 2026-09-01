@@ -54,9 +54,15 @@
 #  ───────────────────────────────
 #  API never returns height > 0; script must exit non-zero.
 #
-#  Push-mode regression guard (PM1-PM2)
+#  Failure: SSH unreachable at step 1b (SE1-SE3)
+#  ──────────────────────────────────────────────
+#  Bootstrap must report connectivity trouble and exit before stopping either
+#  the local node or the validator.
+#
+#  Push-mode regression guards (PM1-PM5)
 #  ─────────────────────────────────────
-#  Running without --bootstrap-from still requires TARGET_IP.
+#  Running without --bootstrap-from still requires TARGET_IP, and a missing
+#  source chain.db fails before the banner or any remote service action.
 #
 #  Run from anywhere:
 #    bash blockchain/deploy/test-join-network-bootstrap.sh
@@ -1323,6 +1329,64 @@ else
 fi
 
 # =============================================================================
+# ── SSH UNREACHABLE AT STEP 1b ────────────────────────────────────────────────
+# A completely unreachable validator must be distinguished from a missing data
+# directory, and bootstrap must abort before either service is stopped.
+# =============================================================================
+section "SSH unreachable at step 1b → connectivity error, no services stopped"
+
+SE_DIR="${TMPDIR_TEST}/se"
+SE_DATA="${SE_DIR}/data"
+SE_BIN="${SE_DIR}/bin"
+SE_YAML="${SE_DIR}/node.yaml"
+SE_CONFIG="${SE_DIR}/node-config.sh"
+mkdir -p "${SE_DATA}/chain.db"
+touch "${SE_DATA}/chain.db/CURRENT"
+printf 'network: testnet\n' >"${SE_YAML}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${SE_CONFIG}"; chmod +x "${SE_CONFIG}"
+
+SE_LOCAL_STOPPED="${SE_DIR}/local-stopped"
+SE_SSH_LOG="${SE_DIR}/ssh-calls.log"
+
+make_stub "${SE_BIN}" "rsync" 'exit 0'
+make_stub "${SE_BIN}" "chown" 'exit 0'
+make_stub "${SE_BIN}" "sleep" 'exit 0'
+make_stub "${SE_BIN}" "systemctl" "
+case \"\$*\" in
+  *'stop aperod-node'*) touch '${SE_LOCAL_STOPPED}'; exit 0 ;;
+  *'is-active'*)       exit 1 ;;
+  *)                   exit 0 ;;
+esac
+"
+# Simulate connection refused / timeout for every SSH operation.
+make_stub "${SE_BIN}" "ssh" "
+echo \"\$*\" >> '${SE_SSH_LOG}'
+exit 1
+"
+make_stub "${SE_BIN}" "curl" "echo '{\"height\":0}'; exit 0"
+
+run_bootstrap "${SE_BIN}" "${SE_DATA}" "${SE_YAML}" "${SE_CONFIG}"
+
+if [[ ${LAST_EXIT} -ne 0 ]]; then
+  pass "SE1: script exits non-zero when SSH is unreachable"
+else
+  fail "SE1: expected non-zero exit when SSH is unreachable, got 0. Output:\n${LAST_OUTPUT}"
+fi
+
+if echo "${LAST_OUTPUT}" | grep -qi 'SSH\|соединени\|connectiv'; then
+  pass "SE2: error message identifies SSH / connectivity failure"
+else
+  fail "SE2: expected SSH / connectivity error in output. Got:\n${LAST_OUTPUT}"
+fi
+
+if [[ ! -f "${SE_LOCAL_STOPPED}" ]] \
+    && ! grep -q 'systemctl stop\| bash$' "${SE_SSH_LOG}" 2>/dev/null; then
+  pass "SE3: neither local node nor validator was stopped before exit"
+else
+  fail "SE3: a service stop was attempted despite unreachable SSH. Output:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
 # ── DATA DIR MISMATCH ─────────────────────────────────────────────────────────
 # If VALIDATOR_DATA_DIR is absent on the validator, the script must exit
 # non-zero with an actionable message BEFORE stopping either service.
@@ -1521,6 +1585,45 @@ if echo "${PM_OUTPUT}" | grep -qi "join-network.sh.*IP\|Укажите IP"; then
   pass "PM2: error message references push-mode usage"
 else
   fail "PM2: expected push-mode usage hint in output. Got:\n${PM_OUTPUT}"
+fi
+
+# ── PM3-PM5: existing PRIMARY_DATA_DIR without chain.db fails early ──────────
+PM3_DIR="${TMPDIR_TEST}/pm3"
+PM3_DATA="${PM3_DIR}/wrong-data"
+PM3_BIN="${PM3_DIR}/bin"
+PM3_SSH_CALLED="${PM3_DIR}/ssh-called"
+mkdir -p "${PM3_DATA}" "${PM3_BIN}"
+
+make_stub "${PM3_BIN}" "ssh" "touch '${PM3_SSH_CALLED}'; exit 0"
+make_stub "${PM3_BIN}" "rsync" 'exit 0'
+
+PM3_EXIT=0
+PM3_OUTPUT=$(
+  env \
+    PATH="${PM3_BIN}:${PATH}" \
+    PRIMARY_IP="127.0.0.1" \
+    PRIMARY_DATA_DIR="${PM3_DATA}" \
+  bash "${JOIN_SH}" "192.0.2.3" 2>&1
+) || PM3_EXIT=$?
+
+if [[ ${PM3_EXIT} -ne 0 ]]; then
+  pass "PM3: push mode exits non-zero when PRIMARY_DATA_DIR has no chain.db"
+else
+  fail "PM3: expected non-zero exit for missing source chain.db, got 0. Output:\n${PM3_OUTPUT}"
+fi
+
+if echo "${PM3_OUTPUT}" | grep -Fq "${PM3_DATA}/chain.db" \
+    && echo "${PM3_OUTPUT}" | grep -q 'PRIMARY_DATA_DIR'; then
+  pass "PM4: error shows the missing chain.db path and PRIMARY_DATA_DIR override hint"
+else
+  fail "PM4: expected actual chain.db path and PRIMARY_DATA_DIR hint. Got:\n${PM3_OUTPUT}"
+fi
+
+if [[ ! -f "${PM3_SSH_CALLED}" ]] \
+    && ! echo "${PM3_OUTPUT}" | grep -q 'Aperod — Join Network Script'; then
+  pass "PM5: push mode fails before the banner and any remote service action"
+else
+  fail "PM5: banner or SSH action occurred before source chain.db validation. Output:\n${PM3_OUTPUT}"
 fi
 
 # =============================================================================

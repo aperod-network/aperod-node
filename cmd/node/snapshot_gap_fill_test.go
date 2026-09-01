@@ -44,6 +44,7 @@ func makeSignedBlk(t *testing.T, height uint64, prev crypto.Hash32,
 	t.Helper()
 	hdr := core.BlockHeader{
 		Height:       height,
+		Round:        uint32(height),
 		PrevHash:     prev,
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: pub,

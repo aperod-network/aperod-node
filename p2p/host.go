@@ -2704,14 +2704,62 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 	peer.id = peerID
 	peer.height = peerHeight
 
+	// acceptLoop performs these checks as an early, pre-handshake optimization,
+	// but several connections can complete their handshakes concurrently after
+	// observing the same peer-table snapshot.  Re-check and register under one
+	// lock so inbound peers cannot race past MaxPeers, MaxPeersPerIP, or the
+	// MinOutbound reservation.  Do not do any network I/O while holding h.mu:
+	// rejected connections are logged and closed after releasing the lock.
+	rejectReason := ""
+	rejectFields := []any{"addr", addr}
 	h.mu.Lock()
 	if _, exists := h.peers[addr]; exists {
-		h.mu.Unlock()
+		rejectReason = "duplicate peer address"
+	} else if !outbound {
+		total := len(h.peers)
+		outboundCount := 0
+		if h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 {
+			for _, existing := range h.peers {
+				if existing.outbound {
+					outboundCount++
+				}
+			}
+		}
+
+		switch {
+		case h.cfg.MaxPeers > 0 && total >= h.cfg.MaxPeers:
+			rejectReason = "MaxPeers reached"
+			rejectFields = append(rejectFields, "max", h.cfg.MaxPeers)
+		case h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 &&
+			total-outboundCount >= h.cfg.MaxPeers-h.cfg.MinOutbound:
+			rejectReason = "MinOutbound slots reserved"
+			rejectFields = append(rejectFields,
+				"inbound", total-outboundCount,
+				"cap", h.cfg.MaxPeers-h.cfg.MinOutbound,
+				"min_outbound", h.cfg.MinOutbound)
+		case h.cfg.MaxPeersPerIP > 0:
+			remoteIP := connIP(addr)
+			ipCount := 0
+			for peerAddr := range h.peers {
+				if connIP(peerAddr) == remoteIP {
+					ipCount++
+				}
+			}
+			if ipCount >= h.cfg.MaxPeersPerIP {
+				rejectReason = "MaxPeersPerIP reached"
+				rejectFields = append(rejectFields, "ip", remoteIP, "max", h.cfg.MaxPeersPerIP)
+			}
+		}
+	}
+	if rejectReason == "" {
+		h.peers[addr] = peer
+	}
+	h.mu.Unlock()
+	if rejectReason != "" {
+		h.log.Debug("inbound connection rejected after handshake: "+rejectReason, rejectFields...)
 		conn.Close()
 		return
 	}
-	h.peers[addr] = peer
-	h.mu.Unlock()
 
 	h.log.Info("peer connected",
 		"addr", addr,

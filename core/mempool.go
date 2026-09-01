@@ -15,9 +15,8 @@ import (
 
 // mempoolDumpEntry is the on-disk representation of one mempool entry.
 type mempoolDumpEntry struct {
-	Tx         Transaction `json:"tx"`
-	Received   time.Time   `json:"received"`
-	Privileged bool        `json:"privileged,omitempty"`
+	Tx       Transaction `json:"tx"`
+	Received time.Time   `json:"received"`
 }
 
 // mempoolDump is the top-level JSON written to mempool.json.
@@ -28,15 +27,15 @@ type mempoolDump struct {
 
 // MempoolConfig holds tuning parameters for the transaction pool.
 type MempoolConfig struct {
-	MaxSize          int           // maximum number of transactions
-	MaxBytes         int           // maximum total byte size of all transactions (RAM cap)
-	MaxTxSize        int           // maximum size of a single transaction in bytes
-	TTL              time.Duration // evict transactions older than this
-	BaseFeePerByte   uint64        // current network base fee in nAPRO/byte (updated each block)
+	MaxSize        int           // maximum number of transactions
+	MaxBytes       int           // maximum total byte size of all transactions (RAM cap)
+	MaxTxSize      int           // maximum size of a single transaction in bytes
+	TTL            time.Duration // evict transactions older than this
+	BaseFeePerByte uint64        // current network base fee in nAPRO/byte (updated each block)
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
-	Verifier         *TxVerifier
+	Verifier *TxVerifier
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -52,10 +51,10 @@ func DefaultMempoolConfig() MempoolConfig {
 
 // mempoolEntry wraps a transaction with metadata.
 type mempoolEntry struct {
-	Tx         Transaction
-	Hash       crypto.Hash32
-	Size       int
-	Received   time.Time
+	Tx       Transaction
+	Hash     crypto.Hash32
+	Size     int
+	Received time.Time
 	// privileged marks entries added via AddPrivileged (e.g. admin mint).
 	// Privileged coinbase txs bypass the external-coinbase rejection guard
 	// and are NOT stripped by the consensus engine's coinbase filter in
@@ -73,7 +72,7 @@ type Mempool struct {
 	mu         sync.RWMutex
 	cfg        MempoolConfig
 	entries    map[crypto.Hash32]*mempoolEntry
-	totalBytes int             // running total of all entry sizes for RAM-cap enforcement
+	totalBytes int // running total of all entry sizes for RAM-cap enforcement
 	// Track key images to detect double-spend attempts before they reach a block.
 	keyImages map[crypto.KeyImage]crypto.Hash32 // ki → txHash
 	// stakeSenders prevents scripted validators from flooding the mempool with
@@ -429,9 +428,9 @@ func (m *Mempool) SelectTxs(n int) []Transaction {
 // MempoolConfig returns a snapshot of the config the pool was created with.
 // Useful for exposing limits in metrics endpoints.
 func (m *Mempool) MempoolConfig() MempoolConfig {
-        m.mu.RLock()
-        defer m.mu.RUnlock()
-        return m.cfg
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg
 }
 
 func (m *Mempool) Count() int {
@@ -621,14 +620,19 @@ func (m *Mempool) Save(dataDir string) error {
 	now := time.Now()
 	entries := make([]mempoolDumpEntry, 0, len(m.entries))
 	for _, e := range m.entries {
+		// Privileged admission is an in-memory authorization boundary. Never
+		// write it (or its coinbase) to disk, where it could be forged and
+		// replayed after restart.
+		if e.privileged {
+			continue
+		}
 		// Skip already-expired entries — no point persisting them.
 		if m.cfg.TTL > 0 && now.Sub(e.Received) >= m.cfg.TTL {
 			continue
 		}
 		entries = append(entries, mempoolDumpEntry{
-			Tx:         e.Tx,
-			Received:   e.Received,
-			Privileged: e.privileged,
+			Tx:       e.Tx,
+			Received: e.Received,
 		})
 	}
 	m.mu.RUnlock()
@@ -701,12 +705,10 @@ func (m *Mempool) Load(dataDir string, log *slog.Logger) int {
 			continue
 		}
 
-		var addErr error
-		if entry.Privileged {
-			addErr = m.AddPrivileged(entry.Tx)
-		} else {
-			addErr = m.Add(entry.Tx)
-		}
+		// Disk state is never trusted to confer privileged admission. In
+		// particular, a crafted legacy "privileged":true coinbase entry must
+		// take the public Add path and be rejected.
+		addErr := m.Add(entry.Tx)
 		if addErr != nil {
 			log.Debug("mempool load: skipping tx", "err", addErr)
 			skipped++

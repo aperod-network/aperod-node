@@ -11,8 +11,10 @@ package core_test
 // their own entries rather than legitimate high-value ones.
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -197,7 +199,7 @@ func TestMempool_ByteCapEnforced(t *testing.T) {
 
 	// Set MaxBytes to exactly 3 transaction-worth of bytes so a 4th forces eviction.
 	cfg := core.MempoolConfig{
-		MaxSize:        1_000,       // high count cap — bytes cap will trigger first
+		MaxSize:        1_000, // high count cap — bytes cap will trigger first
 		MaxBytes:       txSize * 3,
 		MaxTxSize:      1_000_000,
 		BaseFeePerByte: 1,
@@ -356,6 +358,70 @@ func TestAddPrivileged_VerifiesNonCoinbaseTx(t *testing.T) {
 	err := pool.AddPrivileged(tx)
 	if err == nil {
 		t.Error("AddPrivileged: expected non-nil error for non-coinbase tx with stub ring signature, got nil — verifier not enforced on privileged path?")
+	}
+}
+
+// TestMempoolPersistenceNeverRestoresPrivilegedCoinbase verifies that
+// privileged admission exists only in memory. A privileged coinbase is omitted
+// from Save, and a hand-crafted legacy dump cannot use "privileged":true to
+// restore one through Load.
+func TestMempoolPersistenceNeverRestoresPrivilegedCoinbase(t *testing.T) {
+	dir := t.TempDir()
+	cfg := core.DefaultMempoolConfig()
+	pool := core.NewMempool(cfg, silentLogger())
+	coinbase := core.CoinbaseTx(crypto.Point32{1}, 1_000_000)
+
+	if err := pool.AddPrivileged(coinbase); err != nil {
+		t.Fatalf("AddPrivileged coinbase: %v", err)
+	}
+	if err := pool.Save(dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var saved struct {
+		Entries []json.RawMessage `json:"entries"`
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "mempool.json"))
+	if err != nil {
+		t.Fatalf("read saved mempool: %v", err)
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("unmarshal saved mempool: %v", err)
+	}
+	if len(saved.Entries) != 0 {
+		t.Fatalf("Save persisted %d privileged entry(s), want 0", len(saved.Entries))
+	}
+
+	// Simulate a malicious or legacy on-disk dump attempting to grant its
+	// coinbase privileged admission after restart.
+	crafted := struct {
+		Entries []struct {
+			Tx         core.Transaction `json:"tx"`
+			Received   time.Time        `json:"received"`
+			Privileged bool             `json:"privileged"`
+		} `json:"entries"`
+	}{
+		Entries: []struct {
+			Tx         core.Transaction `json:"tx"`
+			Received   time.Time        `json:"received"`
+			Privileged bool             `json:"privileged"`
+		}{{
+			Tx:         coinbase,
+			Received:   time.Now(),
+			Privileged: true,
+		}},
+	}
+	data, err = json.Marshal(crafted)
+	if err != nil {
+		t.Fatalf("marshal crafted dump: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mempool.json"), data, 0o600); err != nil {
+		t.Fatalf("write crafted dump: %v", err)
+	}
+
+	restored := core.NewMempool(cfg, silentLogger()).Load(dir, silentLogger())
+	if restored != 0 {
+		t.Fatalf("crafted privileged coinbase restored %d transaction(s), want 0", restored)
 	}
 }
 

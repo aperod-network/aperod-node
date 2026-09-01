@@ -103,6 +103,7 @@ func buildVariedChain(
 		txs := []core.Transaction{coinbase}
 		hdr := core.BlockHeader{
 			Height:       height,
+			Round:        uint32(height),
 			PrevHash:     parent.Hash(),
 			Timestamp:    time.Now().UnixNano(),
 			ValidatorPub: pub,

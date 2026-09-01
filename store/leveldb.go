@@ -45,6 +45,66 @@ func Open(path string) (*DB, error) {
         return &DB{db: db}, nil
 }
 
+// ReadTipOnly opens an existing LevelDB in read-only mode and returns its
+// canonical tip without running recovery, compaction, or creating files.
+// Maintenance commands use this to validate their target before any mutation.
+func ReadTipOnly(path string) (crypto.Hash32, uint64, error) {
+        opts := &opt.Options{
+                ReadOnly:       true,
+                ErrorIfMissing: true,
+        }
+        db, err := leveldb.OpenFile(path, opts)
+        if err != nil {
+                return crypto.Hash32{}, 0, fmt.Errorf("open leveldb read-only %s: %w", path, err)
+        }
+        wrapped := &DB{db: db}
+        defer wrapped.Close()
+
+        hashBytes, err := wrapped.GetMeta("tip/hash")
+        if err != nil {
+                return crypto.Hash32{}, 0, fmt.Errorf("read canonical tip hash: %w", err)
+        }
+        if len(hashBytes) != len(crypto.Hash32{}) {
+                return crypto.Hash32{}, 0, fmt.Errorf(
+                        "canonical tip hash metadata missing or malformed: got %d bytes, want %d",
+                        len(hashBytes), len(crypto.Hash32{}))
+        }
+        var hash crypto.Hash32
+        copy(hash[:], hashBytes)
+        if hash == (crypto.Hash32{}) {
+                return crypto.Hash32{}, 0, fmt.Errorf("canonical tip hash metadata is all zeroes")
+        }
+
+        heightBytes, err := wrapped.GetMeta("tip/height")
+        if err != nil {
+                return crypto.Hash32{}, 0, fmt.Errorf("read canonical tip height: %w", err)
+        }
+        if len(heightBytes) != 8 {
+                return crypto.Hash32{}, 0, fmt.Errorf(
+                        "canonical tip height metadata missing or malformed: got %d bytes, want 8",
+                        len(heightBytes))
+        }
+        height := binary.LittleEndian.Uint64(heightBytes)
+
+        indexedHash, err := wrapped.get(heightKey(height))
+        if err != nil {
+                return crypto.Hash32{}, 0, fmt.Errorf("read canonical height index at %d: %w", height, err)
+        }
+        if len(indexedHash) != len(hash) || string(indexedHash) != string(hash[:]) {
+                return crypto.Hash32{}, 0, fmt.Errorf(
+                        "canonical tip metadata does not match height index at %d", height)
+        }
+        blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)
+        hasBlock, err := wrapped.has(blockKey)
+        if err != nil {
+                return crypto.Hash32{}, 0, fmt.Errorf("check canonical tip block at %d: %w", height, err)
+        }
+        if !hasBlock {
+                return crypto.Hash32{}, 0, fmt.Errorf("canonical tip block body missing at height %d", height)
+        }
+        return hash, height, nil
+}
+
 // Recover opens a LevelDB database using RecoverFile, which rebuilds the
 // on-disk SST files from the WAL and MANIFEST.  Use this when the normal
 // Open fails or when a startup integrity check detects that a putSync write

@@ -263,8 +263,12 @@ var walletRestoreCmd = &cobra.Command{
                         phrase = strings.TrimSpace(line)
                 }
 
-                if err := wallet.ValidateMnemonic(phrase); err != nil {
+                legacyMnemonic, err := wallet.ValidateMnemonicForRecovery(phrase)
+                if err != nil {
                         return fmt.Errorf("invalid mnemonic: %w", err)
+                }
+                if legacyMnemonic {
+                        fmt.Fprintln(os.Stderr, "  WARNING: legacy Aperod mnemonic detected; restore is supported, but create a new canonical BIP-39 backup.")
                 }
 
                 dk, err := wallet.DeriveFromMnemonic(phrase, "", accountIdx, 0)

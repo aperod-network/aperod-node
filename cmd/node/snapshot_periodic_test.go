@@ -50,6 +50,7 @@ func buildBlock(t *testing.T, priv crypto.ValidatorPrivKey, pub crypto.Validator
 	t.Helper()
 	hdr := core.BlockHeader{
 		Height:       h,
+		Round:        uint32(h),
 		PrevHash:     parent.Hash(),
 		Timestamp:    time.Now().UnixNano(),
 		ValidatorPub: pub,

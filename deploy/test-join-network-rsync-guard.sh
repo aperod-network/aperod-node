@@ -102,7 +102,7 @@ run_join() {
 section "Negative path — source node refuses to stop → script must abort"
 
 NEG_DATA="${TMPDIR_TEST}/neg-data"
-mkdir -p "${NEG_DATA}"
+mkdir -p "${NEG_DATA}/chain.db"
 
 NEG_BIN="${TMPDIR_TEST}/neg-bin"
 
@@ -169,7 +169,7 @@ section "Negative path (timeout variant) — node stays active for 15 s → abor
 # systemctl stop exits 0 (pretends to work), but is-active also exits 0
 # (pretends the service is still running) → the 15-s loop exhausts → abort.
 TMO_DATA="${TMPDIR_TEST}/tmo-data"
-mkdir -p "${TMO_DATA}"
+mkdir -p "${TMO_DATA}/chain.db"
 
 TMO_BIN="${TMPDIR_TEST}/tmo-bin"
 

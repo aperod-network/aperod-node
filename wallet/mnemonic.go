@@ -3,173 +3,203 @@
 package wallet
 
 import (
-        "crypto/rand"
-        "crypto/sha256"
-        "errors"
-        "fmt"
-        "strings"
+	"crypto/rand"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strings"
 )
 
 // Strength in bits for mnemonic entropy. 128 = 12 words, 256 = 24 words.
 const (
-        Strength128 = 128 // 12-word mnemonic
-        Strength256 = 256 // 24-word mnemonic
+	Strength128 = 128 // 12-word mnemonic
+	Strength256 = 256 // 24-word mnemonic
 )
 
-// GenerateMnemonic creates a BIP39-style mnemonic phrase with the given entropy
+// GenerateMnemonic creates a BIP39 mnemonic phrase with the given entropy
 // strength in bits. strength must be 128 or 256.
-//
-// Uses rejection sampling: if any derived word index exceeds the wordlist size
-// (possible when the list has fewer than 2048 entries), a fresh entropy block
-// is generated and re-tried. In practice this converges in ≤5 attempts.
 func GenerateMnemonic(strength int) (string, error) {
-        if strength != Strength128 && strength != Strength256 {
-                return "", errors.New("mnemonic: strength must be 128 or 256 bits")
-        }
-        entropy := make([]byte, strength/8)
-        const maxAttempts = 64
-        for i := 0; i < maxAttempts; i++ {
-                if _, err := rand.Read(entropy); err != nil {
-                        return "", fmt.Errorf("mnemonic: entropy: %w", err)
-                }
-                m, err := EntropyToMnemonic(entropy)
-                if err == nil {
-                        return m, nil
-                }
-                if err.Error() == errIndexOutOfRange.Error() {
-                        continue // retry with new entropy
-                }
-                return "", err
-        }
-        return "", fmt.Errorf("mnemonic: could not generate valid mnemonic in %d attempts", maxAttempts)
+	if strength != Strength128 && strength != Strength256 {
+		return "", errors.New("mnemonic: strength must be 128 or 256 bits")
+	}
+	entropy := make([]byte, strength/8)
+	if _, err := rand.Read(entropy); err != nil {
+		return "", fmt.Errorf("mnemonic: entropy: %w", err)
+	}
+	return EntropyToMnemonic(entropy)
 }
-
-var errIndexOutOfRange = errors.New("mnemonic: word index out of range for current wordlist")
 
 // EntropyToMnemonic converts raw entropy bytes to a BIP39 mnemonic.
 // len(entropy) must be 16 (128-bit) or 32 (256-bit).
 func EntropyToMnemonic(entropy []byte) (string, error) {
-        if len(entropy) != 16 && len(entropy) != 32 {
-                return "", errors.New("mnemonic: entropy must be 16 or 32 bytes")
-        }
-        // Compute checksum: first ENT/32 bits of SHA256(entropy)
-        h := sha256.Sum256(entropy)
-        checksumBits := len(entropy) * 8 / 32 // 4 or 8 bits
-        // Append checksum bits to entropy bits
-        bits := bytesToBits(entropy)
-        checksumAll := bytesToBits(h[:])
-        bits = append(bits, checksumAll[:checksumBits]...)
-        // Split into 11-bit groups → word indices
-        wordCount := len(bits) / 11
-        words := make([]string, wordCount)
-        for i := 0; i < wordCount; i++ {
-                idx := bitsToUint(bits[i*11 : i*11+11])
-                if int(idx) >= len(bip39WordList) {
-                        return "", errIndexOutOfRange
-                }
-                words[i] = bip39WordList[idx]
-        }
-        return strings.Join(words, " "), nil
+	if len(entropy) != 16 && len(entropy) != 32 {
+		return "", errors.New("mnemonic: entropy must be 16 or 32 bytes")
+	}
+	// Compute checksum: first ENT/32 bits of SHA256(entropy)
+	h := sha256.Sum256(entropy)
+	checksumBits := len(entropy) * 8 / 32 // 4 or 8 bits
+	// Append checksum bits to entropy bits
+	bits := bytesToBits(entropy)
+	checksumAll := bytesToBits(h[:])
+	bits = append(bits, checksumAll[:checksumBits]...)
+	// Split into 11-bit groups → word indices
+	wordCount := len(bits) / 11
+	words := make([]string, wordCount)
+	for i := 0; i < wordCount; i++ {
+		idx := bitsToUint(bits[i*11 : i*11+11])
+		words[i] = bip39WordList[idx]
+	}
+	return strings.Join(words, " "), nil
 }
 
 // MnemonicToEntropy converts a BIP39 mnemonic phrase back to raw entropy bytes.
 // Returns an error if the mnemonic is invalid or checksum fails.
 func MnemonicToEntropy(mnemonic string) ([]byte, error) {
-        words := strings.Fields(mnemonic)
-        if len(words) != 12 && len(words) != 24 {
-                return nil, errors.New("mnemonic: must be 12 or 24 words")
-        }
-        // Convert each word to its 11-bit index
-        bits := make([]byte, 0, len(words)*11)
-        for _, w := range words {
-                idx, ok := bip39Index[w]
-                if !ok {
-                        return nil, fmt.Errorf("mnemonic: unknown word %q", w)
-                }
-                bits = append(bits, uintToBits(idx, 11)...)
-        }
-        // Separate entropy bits from checksum bits
-        totalBits := len(bits)
-        checksumBits := totalBits / 33
-        entropyBits := totalBits - checksumBits
-        entropy := bitsToBytes(bits[:entropyBits])
-        // Verify checksum
-        h := sha256.Sum256(entropy)
-        expected := bytesToBits(h[:])[:checksumBits]
-        actual := bits[entropyBits:]
-        for i, b := range expected {
-                if b != actual[i] {
-                        return nil, errors.New("mnemonic: checksum mismatch")
-                }
-        }
-        return entropy, nil
+	return mnemonicToEntropyWithIndex(mnemonic, bip39Index)
+}
+
+func mnemonicToEntropyWithIndex(mnemonic string, index map[string]uint32) ([]byte, error) {
+	words := strings.Fields(mnemonic)
+	if len(words) != 12 && len(words) != 24 {
+		return nil, errors.New("mnemonic: must be 12 or 24 words")
+	}
+	// Convert each word to its 11-bit index
+	bits := make([]byte, 0, len(words)*11)
+	for _, w := range words {
+		idx, ok := index[w]
+		if !ok {
+			return nil, fmt.Errorf("mnemonic: unknown word %q", w)
+		}
+		bits = append(bits, uintToBits(idx, 11)...)
+	}
+	// Separate entropy bits from checksum bits
+	totalBits := len(bits)
+	checksumBits := totalBits / 33
+	entropyBits := totalBits - checksumBits
+	entropy := bitsToBytes(bits[:entropyBits])
+	// Verify checksum
+	h := sha256.Sum256(entropy)
+	expected := bytesToBits(h[:])[:checksumBits]
+	actual := bits[entropyBits:]
+	for i, b := range expected {
+		if b != actual[i] {
+			return nil, errors.New("mnemonic: checksum mismatch")
+		}
+	}
+	return entropy, nil
 }
 
 // MnemonicToSeed converts a BIP39 mnemonic + optional passphrase to a 64-byte
 // BIP39 seed using PBKDF2-HMAC-SHA512 with 2048 iterations (BIP39 standard).
 func MnemonicToSeed(mnemonic, passphrase string) []byte {
-        mnemonic = strings.TrimSpace(mnemonic)
-        salt := "mnemonic" + passphrase
-        return pbkdf2SHA512([]byte(mnemonic), []byte(salt), 2048, 64)
+	mnemonic = strings.TrimSpace(mnemonic)
+	salt := "mnemonic" + passphrase
+	return pbkdf2SHA512([]byte(mnemonic), []byte(salt), 2048, 64)
 }
 
 // ValidateMnemonic returns nil if the mnemonic is a valid BIP39 phrase
 // (correct word count, all words in wordlist, correct checksum).
 func ValidateMnemonic(mnemonic string) error {
-        _, err := MnemonicToEntropy(mnemonic)
-        return err
+	_, err := MnemonicToEntropy(mnemonic)
+	return err
+}
+
+// ValidateMnemonicForRecovery accepts both canonical BIP-39 phrases and
+// phrases generated by Aperod's historical truncated word list. The returned
+// legacy flag lets callers warn users and prompt them to create a canonical
+// replacement backup. New mnemonic generation never uses the legacy list.
+func ValidateMnemonicForRecovery(mnemonic string) (legacy bool, err error) {
+	if err := ValidateMnemonic(mnemonic); err == nil {
+		return false, nil
+	}
+	if _, legacyErr := mnemonicToEntropyWithIndex(mnemonic, legacyBIP39Index); legacyErr == nil {
+		return true, nil
+	}
+	return false, ValidateMnemonic(mnemonic)
 }
 
 // ─── bit helpers ──────────────────────────────────────────────────────────────
 
 func bytesToBits(b []byte) []byte {
-        bits := make([]byte, len(b)*8)
-        for i, by := range b {
-                for j := 0; j < 8; j++ {
-                        if by&(1<<uint(7-j)) != 0 {
-                                bits[i*8+j] = 1
-                        }
-                }
-        }
-        return bits
+	bits := make([]byte, len(b)*8)
+	for i, by := range b {
+		for j := 0; j < 8; j++ {
+			if by&(1<<uint(7-j)) != 0 {
+				bits[i*8+j] = 1
+			}
+		}
+	}
+	return bits
 }
 
 func bitsToBytes(bits []byte) []byte {
-        n := len(bits) / 8
-        out := make([]byte, n)
-        for i := 0; i < n; i++ {
-                for j := 0; j < 8; j++ {
-                        if bits[i*8+j] == 1 {
-                                out[i] |= 1 << uint(7-j)
-                        }
-                }
-        }
-        return out
+	n := len(bits) / 8
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		for j := 0; j < 8; j++ {
+			if bits[i*8+j] == 1 {
+				out[i] |= 1 << uint(7-j)
+			}
+		}
+	}
+	return out
 }
 
 func bitsToUint(bits []byte) uint32 {
-        var v uint32
-        for _, b := range bits {
-                v = v<<1 | uint32(b)
-        }
-        return v
+	var v uint32
+	for _, b := range bits {
+		v = v<<1 | uint32(b)
+	}
+	return v
 }
 
 func uintToBits(v uint32, n int) []byte {
-        bits := make([]byte, n)
-        for i := n - 1; i >= 0; i-- {
-                bits[i] = byte(v & 1)
-                v >>= 1
-        }
-        return bits
+	bits := make([]byte, n)
+	for i := n - 1; i >= 0; i-- {
+		bits[i] = byte(v & 1)
+		v >>= 1
+	}
+	return bits
 }
 
 // bip39Index is built at init from bip39WordList for O(1) word lookup.
 var bip39Index map[string]uint32
+var legacyBIP39Index map[string]uint32
 
 func init() {
-        bip39Index = make(map[string]uint32, len(bip39WordList))
-        for i, w := range bip39WordList {
-                bip39Index[w] = uint32(i)
-        }
+	if err := validateBIP39WordList(); err != nil {
+		panic(err)
+	}
+	bip39Index = make(map[string]uint32, len(bip39WordList))
+	for i, w := range bip39WordList {
+		bip39Index[w] = uint32(i)
+	}
+	legacyBIP39Index = make(map[string]uint32, len(bip39WordListBase))
+	for i, w := range bip39WordListBase {
+		legacyBIP39Index[w] = uint32(i)
+	}
+}
+
+const bip39EnglishSHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
+
+// validateBIP39WordList makes a corrupt, reordered, duplicate, or truncated
+// word list a fail-fast initialization error rather than silently changing
+// wallet recovery semantics.
+func validateBIP39WordList() error {
+	if len(bip39WordList) != 2048 {
+		return fmt.Errorf("mnemonic: BIP-39 wordlist has %d words, want 2048", len(bip39WordList))
+	}
+	for i, word := range bip39WordList {
+		if word == "" {
+			return fmt.Errorf("mnemonic: BIP-39 wordlist has empty word at index %d", i)
+		}
+		if i > 0 && bip39WordList[i-1] >= word {
+			return fmt.Errorf("mnemonic: BIP-39 wordlist is not strictly ordered at index %d", i)
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.Join(bip39WordList, "\n") + "\n"))
+	if fmt.Sprintf("%x", sum) != bip39EnglishSHA256 {
+		return errors.New("mnemonic: BIP-39 wordlist checksum mismatch")
+	}
+	return nil
 }
