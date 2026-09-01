@@ -14,7 +14,7 @@
 #    SW1. service already inactive  — exits immediately, no SIGKILL issued
 #    SW2. service deactivating      — polls until inactive, no SIGKILL
 #    SW3. service never stops       — SIGKILL escalation after timeout
-#    SW4. stop-wait runs BEFORE cp  — ordering guard
+#    SW4. stop-wait runs BEFORE binary install  — ordering guard
 #    SW5. SIGKILL fires send_telegram_alert (regression: alert must not abort)
 #
 #  Usage:  bash deploy/test-update-node-stop-wait.sh
@@ -126,15 +126,15 @@ SCENARIO
     fi
 }
 
-# ── SW4: stop-wait loop runs BEFORE the cp install step ──────────────────────
+# ── SW4: stop-wait loop runs BEFORE the binary install step ─────────────────
 {
     loop_line="$(grep -n '_stop_waited=0' "$UPDATE_NODE" | head -1 | cut -d: -f1 || true)"
-    cp_line="$(grep -n 'cp.*aperod-node\|/bin/cp.*aperod-node' "$UPDATE_NODE" \
-                | grep -v '^[0-9]*:[[:space:]]*#' | head -1 | cut -d: -f1 || true)"
-    if [[ -n "$loop_line" && -n "$cp_line" && "$loop_line" -lt "$cp_line" ]]; then
-        pass_test "SW4: stop-wait loop (line $loop_line) is BEFORE binary cp (line $cp_line) — no ETXTBSY risk"
+    install_line="$(grep -n 'cp.*BINARY_SRC.*BINARY_DST' "$UPDATE_NODE" \
+                     | grep -v '^[0-9]*:[[:space:]]*#' | head -1 | cut -d: -f1 || true)"
+    if [[ -n "$loop_line" && -n "$install_line" && "$loop_line" -lt "$install_line" ]]; then
+        pass_test "SW4: stop-wait loop (line $loop_line) is BEFORE binary install (line $install_line) — no ETXTBSY risk"
     else
-        fail_test "SW4: stop-wait loop must run BEFORE cp (loop=$loop_line, cp=$cp_line)"
+        fail_test "SW4: stop-wait loop must run BEFORE binary install (loop=$loop_line, install=$install_line)"
     fi
 }
 

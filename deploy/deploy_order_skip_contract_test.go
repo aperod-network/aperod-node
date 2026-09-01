@@ -21,10 +21,11 @@ func TestDeployOrderSkipContract(t *testing.T) {
 		t.Skip("bash not found in PATH; skipping TestDeployOrderSkipContract")
 	}
 
-	scriptPath, err := filepath.Abs(filepath.Join("..", "..", "deploy", "test-deploy-order.sh"))
-	if err != nil {
-		t.Fatalf("resolve configured deploy-order entry point: %v", err)
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve deploy-order test source path")
 	}
+	scriptPath := filepath.Join(filepath.Dir(testFile), "test-deploy-order.sh")
 	cmd := exec.Command(bashPath, scriptPath)
 	cmd.Env = append(os.Environ(), "DEPLOY_TEST_FORCE_SKIP_T29=1")
 	output, runErr := cmd.CombinedOutput()

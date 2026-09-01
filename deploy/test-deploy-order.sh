@@ -37,6 +37,18 @@ PASS=0
 FAIL=0
 SKIPPED=()
 
+# Test-only sentinel used by deploy_order_skip_contract_test.go to verify that
+# this entry point reports incomplete coverage via exit 77 instead of success.
+if [ "${DEPLOY_TEST_FORCE_SKIP_T29:-0}" = "1" ]; then
+    SKIPPED+=("T29: forced missing Go dependency")
+    echo "=== Results: PASS=0  FAIL=0  SKIP=1 ==="
+    echo "1 skipped"
+    echo "SKIPPED SCENARIOS:"
+    printf '  - %s\n' "${SKIPPED[@]}"
+    echo "SKIP_SUMMARY count=1"
+    exit 77
+fi
+
 run_test() {
     local name="$1"
     local run_flag="$2"
@@ -155,10 +167,10 @@ fi
 echo ""
 
 # ── update-node.sh stop-wait loop tests (shell e2e) ──────────────────────────
-# Guards against regressions to the stop-wait-before-cp block introduced to
+# Guards against regressions to the stop-wait-before-install block introduced to
 # prevent ETXTBSY ("Text file busy") when the node's snapshot flush is still
 # running at deploy time.  Exercises: immediate exit, polling, SIGKILL
-# escalation, ordering (loop before cp), Telegram alert on forced kill.
+# escalation, ordering (loop before install), Telegram alert on forced kill.
 echo "--- NodeStopWaitTests"
 if bash "$SCRIPT_DIR/test-update-node-stop-wait.sh"; then
     echo "PASS: NodeStopWaitTests"
