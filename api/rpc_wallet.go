@@ -425,14 +425,14 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
                         // Run `aperod-node --repair-db` to restore missing u/ entries.
                         s.log.Warn("WALLET_SEND: tx not found in u/ store or in-memory UTXO set — run --repair-db",
                                 "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                        return core.OwnedUTXO{}, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
-                                u.TxHash[:min(16, len(u.TxHash))])
+                        return core.OwnedUTXO{}, fmt.Errorf("tx %s[%d] not found on chain or mempool — re-mint required after node restart",
+                                u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
                 }
         } else {
                 s.log.Warn("WALLET_SEND: blockStore is nil — cannot look up tx",
                         "tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-                return core.OwnedUTXO{}, fmt.Errorf("tx %s not found on chain or mempool — re-mint required after node restart",
-                        u.TxHash[:min(16, len(u.TxHash))])
+                return core.OwnedUTXO{}, fmt.Errorf("tx %s[%d] not found on chain or mempool — re-mint required after node restart",
+                        u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
         }
 
         // Detect transparent mint output: TxPubKey == zero AND OneTimePub matches
