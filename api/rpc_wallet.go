@@ -168,24 +168,24 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 
 	// ── 6. Cryptographic verification ────────────────────────────────────────
 	// Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
-verifier := core.NewTxVerifier(s.utxos)
-verifyErr := verifier.VerifyTx(&result.Tx)
-if isKeyImageConflictErr(verifyErr) {
-			repaired, repairErr := s.repairPhantomKeyImages(result)
-			if repairErr != nil {
-				return nil, fmt.Errorf("verify: %w", repairErr)
-			}
-			if repaired {
-verifyErr = verifier.VerifyTx(&result.Tx)
-			}
-}
-if verifyErr != nil {
-if isKeyImageConflictErr(verifyErr) {
+	verifier := core.NewTxVerifier(s.utxos)
+	verifyErr := verifier.VerifyTx(&result.Tx)
+	if isKeyImageConflictErr(verifyErr) {
+		repaired, repairErr := s.repairPhantomKeyImages(result)
+		if repairErr != nil {
+			return nil, fmt.Errorf("verify: %w", repairErr)
+		}
+		if repaired {
+			verifyErr = verifier.VerifyTx(&result.Tx)
+		}
+	}
+	if verifyErr != nil {
+		if isKeyImageConflictErr(verifyErr) {
 			if dsErr := describeSpentInput(s.utxos, result); dsErr != nil {
 				return nil, fmt.Errorf("verify: %w", dsErr)
 			}
 		}
-return nil, fmt.Errorf("verify: %w", verifyErr)
+		return nil, fmt.Errorf("verify: %w", verifyErr)
 	}
 
 	// ── 7. Submit to mempool ──────────────────────────────────────────────────
@@ -735,14 +735,14 @@ func (s *Server) repairPhantomKeyImages(result *core.BuildResult) (bool, error) 
 		if found {
 			continue
 		}
-cleared, err := s.utxos.ClearPhantomSpent(inp.KeyImage)
-if err != nil {
+		cleared, err := s.utxos.ClearPhantomSpent(inp.KeyImage)
+		if err != nil {
 			return repaired, fmt.Errorf("clear phantom key image for utxo %x[%d]: %w",
 				result.SelectedUTXOs[i].TxHash[:], result.SelectedUTXOs[i].OutputIndex, err)
 		}
-if !cleared {
-continue
-}
+		if !cleared {
+			continue
+		}
 		repaired = true
 		s.log.Warn("WALLET_SEND: cleared phantom spent key image after confirmed-chain verification",
 			"utxo_tx", fmt.Sprintf("%x", result.SelectedUTXOs[i].TxHash[:]),
