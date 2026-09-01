@@ -61,6 +61,9 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		if err := crypto.Validate(r.Address); err != nil {
 			return nil, fmt.Errorf("recipients[%d]: invalid address: %w", i, err)
 		}
+		if crypto.IsBurnAddress(r.Address) {
+			return nil, fmt.Errorf("recipients[%d]: canonical burn address must be sent with Build, not BuildMulti", i)
+		}
 		totalAmount += r.AmountNAPR
 	}
 	if err := crypto.Validate(changeAddr); err != nil {

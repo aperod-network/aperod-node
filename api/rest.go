@@ -40,6 +40,7 @@ func (s *Server) registerRESTRoutes() {
         s.mux.HandleFunc("/api/v1/scan/outputs", s.restScanOutputs)
         s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
         s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
+        s.mux.HandleFunc("/api/v1/mempool", s.restMempoolTransactions)
         s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
         s.mux.HandleFunc("/api/v1/validators", s.restValidators)
         s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
@@ -82,6 +83,16 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
         writeJSON(w, code, map[string]string{"error": msg})
+}
+
+func burnAmountString(tx *core.Transaction) string {
+        _, amount, _ := txBurnResponseFields(tx)
+        return amount
+}
+
+func burnAddressString(tx *core.Transaction) string {
+        _, _, address := txBurnResponseFields(tx)
+        return address
 }
 
 // pathSuffix extracts the path segment after prefix.
@@ -485,6 +496,9 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
                         Fee:         tx.Fee,
                         Size:        tx.Size(),
                         Version:     uint8(tx.Version),
+                        IsBurn:      tx.IsBurnTx(),
+                        BurnedNAPRO: burnAmountString(&tx),
+                        BurnAddress: burnAddressString(&tx),
                 })
                 return
         }
@@ -500,6 +514,9 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
                         Size:       mp.Size(),
                         Version:    uint8(mp.Version),
                         Pending:    true,
+                        IsBurn:     mp.IsBurnTx(),
+                        BurnedNAPRO: burnAmountString(&mp),
+                        BurnAddress: burnAddressString(&mp),
                 })
                 return
         }
@@ -519,6 +536,9 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
                         Fee:         diskTx.Fee,
                         Size:        diskTx.Size(),
                         Version:     uint8(diskTx.Version),
+                        IsBurn:      diskTx.IsBurnTx(),
+                        BurnedNAPRO: burnAmountString(&diskTx),
+                        BurnAddress: burnAddressString(&diskTx),
                 })
                 return
         }
@@ -1448,6 +1468,9 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                         "peer_count":                 s.livePeerCount(),
                         "pending_handshakes":          s.livePendingHandshakes(),
                         "reconnect_backoff_active":    s.liveReconnectBackoff(),
+                        "burn_address":                  crypto.MainnetBurnAddress().String(),
+                        "block_reward_napro":            s.currentBlockRewardNAPRO(),
+                        "block_reward":                  s.currentBlockRewardAPRO(),
                 })
                 return
         }
@@ -1458,6 +1481,9 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
                 "tip_time":                   "",
                 "total_txs":                  0,
                 "mempool_count":              s.mempool.Count(),
+            "burn_address":               crypto.MainnetBurnAddress().String(),
+            "block_reward_napro":         s.currentBlockRewardNAPRO(),
+            "block_reward":               s.currentBlockRewardAPRO(),
                 "mempool_bytes":              s.mempool.TotalBytes(),
                 "mempool_evictions_total":    s.mempool.EvictionsTotal(),
                 "tps_last_10":                0,
@@ -2452,6 +2478,30 @@ func (s *Server) restMempoolMetrics(w http.ResponseWriter, r *http.Request) {
         })
 }
 
+// restMempoolTransactions returns public pending transaction summaries.
+func (s *Server) restMempoolTransactions(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+                writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+                return
+        }
+        hashes := s.mempool.Hashes()
+        txs := make([]TxResponse, 0, len(hashes))
+        for _, hash := range hashes {
+                tx, ok := s.mempool.Get(hash)
+                if !ok {
+                        continue
+                }
+                isBurn, burned, burnAddress := txBurnResponseFields(&tx)
+                txs = append(txs, TxResponse{
+                        Hash: fmt.Sprintf("%x", hash[:]), IsCoinbase: tx.IsCoinbase(),
+                        Inputs: len(tx.Inputs), Outputs: len(tx.Outputs), Fee: tx.Fee,
+                        Size: tx.Size(), Version: uint8(tx.Version), Pending: true,
+                        IsBurn: isBurn, BurnedNAPRO: burned, BurnAddress: burnAddress,
+                })
+        }
+        writeJSON(w, http.StatusOK, map[string]interface{}{"transactions": txs, "count": len(txs)})
+}
+
 // utxoMissingReason examines why a UTXO is absent from the active in-memory
 // set and returns a human-readable, actionable error string.  Three cases are
 // distinguished using the persisted LevelDB UTXO record:
@@ -2609,6 +2659,7 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
 		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
+		"burn_address":             crypto.MainnetBurnAddress().String(),
 	}
 	// Use the live whitelist from the P2P layer when wired; fall back to the
 	// startup snapshot so /api/v1/status is never stale after live edits.
@@ -2625,8 +2676,8 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 	if s.stakingPoolFn != nil {
 		remaining, init, mode := s.stakingPoolFn()
 		if init > 0 {
-			resp["staking_pool_remaining_napro"] = remaining
-			resp["staking_pool_init_napro"] = init
+			resp["staking_pool_remaining_napro"] = strconv.FormatUint(remaining, 10)
+			resp["staking_pool_init_napro"] = strconv.FormatUint(init, 10)
 			resp["reward_mode"] = mode
 		}
 	}

@@ -10,6 +10,7 @@ import (
         "log/slog"
         "net/http"
         "runtime"
+        "strconv"
         "sync"
         "sync/atomic"
         "time"
@@ -266,6 +267,9 @@ type Server struct {
         // stakingPoolFn returns (remaining nAPRO, init nAPRO, reward mode string).
         // Wired from consensus.Engine after startup.  nil = not wired.
         stakingPoolFn func() (uint64, uint64, string)
+        // blockRewardFn returns the consensus base reward for the next block.
+        // Priority tips are transaction-dependent and are not included.
+        blockRewardFn func() uint64
 
         // rssStatsFn returns the process Resident Set Size in bytes.
         // Wired from cmd/node after startup via SetRSSStatsFn.
@@ -420,6 +424,23 @@ func (s *Server) SetDataDir(dir string) { s.dataDir = dir }
 // fn must return (remaining nAPRO, init nAPRO, reward mode string).
 func (s *Server) SetStakingPoolFn(fn func() (uint64, uint64, string)) {
         s.stakingPoolFn = fn
+}
+
+// SetBlockRewardFn wires the consensus-derived next-block base reward.
+func (s *Server) SetBlockRewardFn(fn func() uint64) { s.blockRewardFn = fn }
+
+func (s *Server) currentBlockRewardNAPRO() string {
+        if s.blockRewardFn == nil {
+                return "0"
+        }
+        return strconv.FormatUint(s.blockRewardFn(), 10)
+}
+
+func (s *Server) currentBlockRewardAPRO() float64 {
+        if s.blockRewardFn == nil {
+                return 0
+        }
+        return float64(s.blockRewardFn()) / 1e8
 }
 
 // SetRSSStatsFn wires a function returning the process Resident Set Size in
@@ -962,6 +983,7 @@ type NodeInfo struct {
         Timestamp string `json:"timestamp"`
         Mempool   int    `json:"mempool_count"`
         Version   string `json:"version"`
+        BurnAddress string `json:"burn_address"`
 }
 
 func (s *Server) aprGetNodeInfo() (interface{}, error) {
@@ -977,6 +999,7 @@ func (s *Server) aprGetNodeInfo() (interface{}, error) {
                 Timestamp: time.Unix(0, tip.Header.Timestamp).UTC().Format(time.RFC3339),
                 Mempool:   s.mempool.Count(),
                 Version:   "0.1.0",
+                BurnAddress: crypto.MainnetBurnAddress().String(),
         }, nil
 }
 
@@ -995,9 +1018,9 @@ type BlockResponse struct {
         // expressed as USD-per-APRO × 10^9 (9-decimal fixed-point uint64).
         // Zero means no price was embedded (pre-oracle or non-oracle block).
         OraclePrice uint64 `json:"oracle_price"`
-        // FeesBurnedNAPRO is the sum of fees from all non-coinbase transactions
-        // in this block, expressed in nAPRO. All base fees are burned (100%).
-        FeesBurnedNAPRO uint64 `json:"fees_burned_napro"`
+        // FeesBurnedNAPRO includes both protocol base fees and explicit
+        // intentional burns, expressed in nAPRO.
+        FeesBurnedNAPRO string `json:"fees_burned_napro"`
 }
 
 func blockToResponse(b *core.Block) BlockResponse {
@@ -1017,6 +1040,10 @@ func blockToResponse(b *core.Block) BlockResponse {
                         burned += tx.Fee
                 } else {
                         burned += minFee
+                        if intentionalBurn, isBurn := tx.BurnAmount(); isBurn &&
+                                burned <= ^uint64(0)-intentionalBurn {
+                                burned += intentionalBurn
+                        }
                 }
         }
         return BlockResponse{
@@ -1030,7 +1057,7 @@ func blockToResponse(b *core.Block) BlockResponse {
                 TxCount:         len(b.Txs),
                 Size:            b.Size(),
                 OraclePrice:     b.Header.OraclePrice,
-                FeesBurnedNAPRO: burned,
+                FeesBurnedNAPRO: strconv.FormatUint(burned, 10),
         }
 }
 
@@ -1169,6 +1196,19 @@ type TxResponse struct {
         Version     uint8  `json:"version"`
         // Pending is true when the tx is in the mempool but not yet confirmed.
         Pending bool `json:"pending,omitempty"`
+        // IsBurn and BurnedNAPRO describe the explicit intentional burn marker.
+        // BurnedNAPRO is decimal because browser JSON numbers lose uint64 precision.
+        IsBurn bool `json:"is_burn"`
+        BurnedNAPRO string `json:"burned_napro"`
+        BurnAddress string `json:"burn_address"`
+}
+
+func txBurnResponseFields(tx *core.Transaction) (bool, string, string) {
+        amount, ok := tx.BurnAmount()
+        if !ok {
+                return false, "0", ""
+        }
+        return true, fmt.Sprintf("%d", amount), crypto.MainnetBurnAddress().String()
 }
 
 func (s *Server) aprGetTransaction(params json.RawMessage) (interface{}, error) {
@@ -1189,6 +1229,7 @@ func (s *Server) aprGetTransaction(params json.RawMessage) (interface{}, error) 
         tx, loc, ok := s.chain.GetTransaction(hash)
         if ok {
                 bHash := loc.Block.Hash()
+                isBurn, burned, burnAddress := txBurnResponseFields(&tx)
                 return TxResponse{
                         Hash:        args.Hash,
                         BlockHash:   fmt.Sprintf("%x", bHash[:]),
@@ -1200,11 +1241,15 @@ func (s *Server) aprGetTransaction(params json.RawMessage) (interface{}, error) 
                         Fee:         tx.Fee,
                         Size:        tx.Size(),
                         Version:     uint8(tx.Version),
+                        IsBurn:      isBurn,
+                        BurnedNAPRO: burned,
+                        BurnAddress: burnAddress,
                 }, nil
         }
 
         // Check mempool for unconfirmed tx
         if mp, found := s.mempool.Get(hash); found {
+                isBurn, burned, burnAddress := txBurnResponseFields(&mp)
                 return TxResponse{
                         Hash:       args.Hash,
                         IsCoinbase: mp.IsCoinbase(),
@@ -1214,6 +1259,9 @@ func (s *Server) aprGetTransaction(params json.RawMessage) (interface{}, error) 
                         Size:       mp.Size(),
                         Version:    uint8(mp.Version),
                         Pending:    true,
+                        IsBurn:     isBurn,
+                        BurnedNAPRO: burned,
+                        BurnAddress: burnAddress,
                 }, nil
         }
 

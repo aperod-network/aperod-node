@@ -166,6 +166,12 @@ func (m *Mempool) Add(tx Transaction) error {
 		baseFee := m.cfg.BaseFeePerByte
 		m.mu.RUnlock()
 		minFee := tx.MinFeeAt(baseFee)
+		if burn, isBurn := tx.BurnAmount(); isBurn {
+			if minFee > ^uint64(0)-burn || tx.Fee < minFee+burn {
+				return fmt.Errorf("mempool: intentional burn fee too low: %d nAPRO < %d nAPRO minimum base fee plus burn",
+					tx.Fee, minFee+burn)
+			}
+		}
 		if tx.Fee < minFee {
 			return fmt.Errorf("mempool: fee too low: %d nAPRO < %d nAPRO minimum (%d bytes × %d nAPRO/byte)",
 				tx.Fee, minFee, tx.Size(), baseFee)

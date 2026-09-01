@@ -7,6 +7,49 @@ import (
         "github.com/aperod/aperod/crypto"
 )
 
+var intentionalBurnPrefix = []byte("APRO-BURN\x01")
+
+// IntentionalBurnExtra encodes the consensus marker for a canonical-address
+// burn. Extra is covered by Transaction.Hash and therefore by every MLSAG
+// signature; the amount cannot be altered after signing.
+func IntentionalBurnExtra(amount uint64) []byte {
+        extra := make([]byte, len(intentionalBurnPrefix)+8)
+        copy(extra, intentionalBurnPrefix)
+        binary.LittleEndian.PutUint64(extra[len(intentionalBurnPrefix):], amount)
+        return extra
+}
+
+func parseIntentionalBurnExtra(extra []byte) (uint64, bool, error) {
+        if len(extra) < len(intentionalBurnPrefix) ||
+                string(extra[:len(intentionalBurnPrefix)]) != string(intentionalBurnPrefix) {
+                return 0, false, nil
+        }
+        if len(extra) != len(intentionalBurnPrefix)+8 {
+                return 0, true, fmt.Errorf("malformed intentional burn marker")
+        }
+        amount := binary.LittleEndian.Uint64(extra[len(intentionalBurnPrefix):])
+        if amount == 0 {
+                return 0, true, fmt.Errorf("intentional burn amount must be positive")
+        }
+        return amount, true, nil
+}
+
+func BurnAmount(tx *Transaction) (uint64, bool) {
+        if tx == nil {
+                return 0, false
+        }
+        amount, marked, err := parseIntentionalBurnExtra(tx.Extra)
+        return amount, marked && err == nil
+}
+
+func IsBurnTx(tx *Transaction) bool {
+        _, ok := BurnAmount(tx)
+        return ok
+}
+
+func (tx *Transaction) BurnAmount() (uint64, bool) { return BurnAmount(tx) }
+func (tx *Transaction) IsBurnTx() bool             { return IsBurnTx(tx) }
+
 // TxVersion identifies the transaction format version.
 type TxVersion uint8
 
@@ -152,7 +195,26 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("stake tx must not contain outputs")
         }
 
-        if len(tx.Outputs) == 0 {
+        burnAmount, burnMarked, burnErr := parseIntentionalBurnExtra(tx.Extra)
+        if burnErr != nil {
+                return burnErr
+        }
+        if burnMarked {
+                if tx.Version != TxVersionCommitmentBinding {
+                        return fmt.Errorf("intentional burn requires transaction version %d", TxVersionCommitmentBinding)
+                }
+                if tx.IsCoinbase() {
+                        return fmt.Errorf("coinbase must not carry an intentional burn marker")
+                }
+                if burnAmount == 0 {
+                        return fmt.Errorf("intentional burn amount must be positive")
+                }
+                if len(tx.Outputs) > 1 {
+                        return fmt.Errorf("intentional burn may contain only a change output")
+                }
+        }
+
+        if len(tx.Outputs) == 0 && !burnMarked {
                 return fmt.Errorf("tx has no outputs")
         }
         if len(tx.Outputs) > 16 {

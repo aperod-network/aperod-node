@@ -2746,6 +2746,7 @@ RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivation
                 apiSrv.SetStakingPoolFn(func() (uint64, uint64, string) {
                         return engine.StakingPoolRemaining(), engine.StakingPoolInit(), engine.RewardMode()
                 })
+                apiSrv.SetBlockRewardFn(engine.CurrentBlockRewardNAPR)
                 // Startup scan is complete — mark the node ready for UTXO queries.
                 apiSrv.SetReady()
                 log.Info("API server ready (startup scan complete)")

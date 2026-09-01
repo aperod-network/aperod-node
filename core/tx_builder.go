@@ -105,6 +105,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         if err := crypto.Validate(changeAddr); err != nil {
                 return nil, fmt.Errorf("invalid change address: %w", err)
         }
+        isBurn := crypto.IsBurnAddress(recipient)
 
         // Sort available UTXOs largest-first for greedy selection.
         available := make([]OwnedUTXO, len(b.ownedUTXOs))
@@ -146,7 +147,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         // Rough initial fee: assume 1 input, 2 outputs (pay + change).
         // txBytesPerInput already includes the MLSAG signature bytes.
         // txBytesPerOutput already includes the range proof bytes.
-        initialSize := txOverheadBytes + 1*txBytesPerInput + 2*txBytesPerOutput
+        initialOutputs := 2
+        burnExtraBytes := 0
+        if isBurn {
+                initialOutputs = 1
+                burnExtraBytes = len(IntentionalBurnExtra(amount))
+        }
+        initialSize := txOverheadBytes + 1*txBytesPerInput + initialOutputs*txBytesPerOutput + burnExtraBytes
         estimatedFee = uint64(initialSize) * b.feePerByte
         needed := amount + estimatedFee
 
@@ -162,7 +169,10 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         }
         // Recalculate fee based on actual number of selected inputs.
         nOut := 2 // pay + change; refined below
-        actualSize := txOverheadBytes + len(selected)*txBytesPerInput + nOut*txBytesPerOutput
+        if isBurn {
+                nOut = 1 // possible change output
+        }
+        actualSize := txOverheadBytes + len(selected)*txBytesPerInput + nOut*txBytesPerOutput + burnExtraBytes
         estimatedFee = uint64(actualSize) * b.feePerByte
         needed = amount + estimatedFee
 
@@ -173,6 +183,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 
         changeAmount := totalIn - amount - estimatedFee
         hasChange := changeAmount > 0
+        totalFee := estimatedFee
+        if isBurn {
+                if totalFee > ^uint64(0)-amount {
+                        return nil, fmt.Errorf("intentional burn fee overflows uint64")
+                }
+                totalFee += amount
+        }
 
         // ── Fee commitment ────────────────────────────────────────────────────────
         // Fee is a public plaintext value, so its Pedersen commitment uses a zero
@@ -182,7 +199,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         // balanced.  The blind-balance constraint still holds with r_fee = 0:
         //   Σr_in = Σr_out + 0  →  Σr_in = Σr_out.
         var feeBlind crypto.BlindFactor // zero blind — fee is public, not hidden
-        feeCommit, err := crypto.Commit(estimatedFee, feeBlind)
+        feeCommit, err := crypto.Commit(totalFee, feeBlind)
         if err != nil {
                 return nil, fmt.Errorf("fee commit: %w", err)
         }
@@ -216,7 +233,19 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         var payBlindResult crypto.BlindFactor
         changeOutIdx := -1
 
-        if hasChange {
+        if isBurn && hasChange {
+                changeBlind, err := crypto.BlindSum(inBlinds, []crypto.BlindFactor{feeBlind})
+                if err != nil {
+                        return nil, fmt.Errorf("change blind sum: %w", err)
+                }
+                chOut, err := txBuildOutputWithBlind(changeAddr, changeAmount, changeBlind)
+                if err != nil {
+                        return nil, fmt.Errorf("build change output: %w", err)
+                }
+                outEntries = append(outEntries, outEntry{chOut, changeBlind, changeAmount})
+                changeBlindResult = changeBlind
+                changeOutIdx = 0
+        } else if hasChange {
                 // Payment blind: random (recipient cannot see our change balance)
                 payOut, payBlind, err := txBuildOutput(recipient, amount)
                 if err != nil {
@@ -237,7 +266,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 outEntries = append(outEntries, outEntry{chOut, changeBlind, changeAmount})
                 changeBlindResult = changeBlind
                 changeOutIdx = 1
-        } else {
+        } else if !isBurn {
                 // No change: payment blind balances the equation directly
                 // pay_blind = Σr_in - r_fee
                 payBlind, err := crypto.BlindSum(inBlinds, []crypto.BlindFactor{feeBlind})
@@ -329,10 +358,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		Version:     TxVersionCommitmentBinding,
                 Inputs:      inputs,
                 Outputs:     outputs,
-                Fee:         estimatedFee,
+                Fee:         totalFee,
                 FeeCommit:   feeCommit,
                 RangeProofs: rangeProofs,
                 Signatures:  make([]*crypto.MLSAGSignature, len(inputs)),
+        }
+        if isBurn {
+                tx.Extra = IntentionalBurnExtra(amount)
         }
 
         // ── MLSAG sign each input ─────────────────────────────────────────────────
@@ -357,13 +389,13 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         return &BuildResult{
                 Tx:                 tx,
                 ChangeAmount:       changeAmount,
-                TotalFee:           estimatedFee,
+                TotalFee:           totalFee,
                 InputCount:         len(inputs),
                 OutputCount:        len(outputs),
                 ChangeBlind:        changeBlindResult,
                 ChangeOutIdx:       changeOutIdx,
                 PayBlind:           payBlindResult,
-                PayOutIdx:          0,
+                PayOutIdx:          func() int { if isBurn { return -1 }; return 0 }(),
                 RealDecoyCount:     totalRealDecoys,
                 FallbackDecoyCount: totalFallbackDecoys,
                 SelectedUTXOs:      selected,

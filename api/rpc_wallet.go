@@ -67,6 +67,9 @@ type walletSendResult struct {
 	// against GET /api/v1/keyimage/{ki}/is-spent gives an authoritative
 	// Monero-style spent check without needing the wallet's private key.
 	SpentKeyImages []spentInputKI `json:"spent_key_images,omitempty"`
+	IsBurn          bool           `json:"is_burn"`
+	BurnedNAPRO     string         `json:"burned_napro"`
+	BurnAddress     string         `json:"burn_address"`
 }
 
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
@@ -246,6 +249,9 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 		DecoyCount:         result.RealDecoyCount,
 		FallbackDecoyCount: result.FallbackDecoyCount,
 		SpentKeyImages:     spentKIs,
+		IsBurn:             result.Tx.IsBurnTx(),
+		BurnedNAPRO:        burnAmountString(&result.Tx),
+		BurnAddress:        burnAddressString(&result.Tx),
 	}, nil
 }
 

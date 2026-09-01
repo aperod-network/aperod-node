@@ -319,6 +319,26 @@ func (e *Engine) RewardMode() string {
 	}
 }
 
+// CurrentBlockRewardNAPR returns the consensus base reward for the next block.
+// Before a configured RingCT-v4 activation it follows the deployed legacy
+// pool/mint schedule. At and after activation (including activation height 0),
+// it is the immutable authorized 0.1 APRO base, before transaction tips.
+func (e *Engine) CurrentBlockRewardNAPR() uint64 {
+        height := e.chain.Height() + 1
+        activation := e.cfg.RingCTV4ActivationHeight
+        if activation == 0 || height >= activation {
+                return blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
+        }
+        base := e.cfg.BlockRewardNAPR
+        if base == 0 {
+                base = defaultBlockRewardNAPR
+        }
+        if e.stakingPoolInit > 0 && atomic.LoadInt64(&e.stakingPoolRemaining) == 0 {
+                return e.tailRewardNAPR
+        }
+        return blockRewardAtHeight(base, height)
+}
+
 // DecrementPool draws one block-reward from the staking pool.
 // Must be called exactly once per accepted block (in OnBlockAccepted) so that
 // the pool balance tracks the real chain state regardless of whether the block
@@ -704,8 +724,19 @@ func blockFeeStats(txs []core.Transaction, baseFeePerByte uint64) (burned, tipTo
 		}
 		minFee := tx.MinFeeAt(baseFeePerByte)
 		if tx.Fee >= minFee {
-			burned += minFee
-			tipTotal += tx.Fee - minFee
+burnForTx := minFee
+if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
+if burnForTx > ^uint64(0)-intentionalBurn {
+return ^uint64(0), 0
+}
+burnForTx += intentionalBurn
+}
+if tx.Fee < burnForTx {
+burned += tx.Fee
+continue
+}
+burned += burnForTx
+tipTotal += tx.Fee - burnForTx
 		} else {
 			// Malformed tx slipped through; treat entire fee as burned.
 			burned += tx.Fee
@@ -934,9 +965,16 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 			continue
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
-		if tx.Fee < minFee {
+requiredFee := minFee
+if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
+if requiredFee > ^uint64(0)-intentionalBurn {
+return fmt.Errorf("transaction %d intentional burn fee requirement overflows uint64", i)
+}
+requiredFee += intentionalBurn
+}
+if tx.Fee < requiredFee {
 			return fmt.Errorf("transaction %d fee below consensus minimum: got %d, want at least %d",
-				i, tx.Fee, minFee)
+i, tx.Fee, requiredFee)
 		}
 		if totalFees > ^uint64(0)-tx.Fee {
 			return fmt.Errorf("aggregate transaction fees overflow uint64")
