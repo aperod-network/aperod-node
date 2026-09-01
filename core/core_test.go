@@ -453,6 +453,30 @@ func TestRebuildKeyImages_MultipleStaleEntries(t *testing.T) {
         }
 }
 
+func TestClearPhantomSpent_PreservesRecentlyConfirmedSpend(t *testing.T) {
+	s := core.NewUTXOSet()
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	ki, err := crypto.ComputeKeyImage(keys.Spend.Private, keys.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage: %v", err)
+	}
+
+	s.MarkSpent(ki)
+	cleared, err := s.ClearPhantomSpent(ki)
+	if err != nil {
+		t.Fatalf("ClearPhantomSpent: %v", err)
+	}
+	if cleared {
+		t.Fatal("recently confirmed key image was cleared as phantom")
+	}
+	if !s.IsSpent(ki) {
+		t.Fatal("recently confirmed key image no longer marked spent")
+	}
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 func TestMempool_AddGet(t *testing.T) {
