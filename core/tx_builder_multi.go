@@ -278,7 +278,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 
 	// ── Assemble and MLSAG-sign ───────────────────────────────────────────────
 	tx := Transaction{
-		Version:     TxVersionCommitmentBinding,
+		Version:     b.txVersion,
 		Inputs:      inputs,
 		Outputs:     outputs,
 		Fee:         estimatedFee,
@@ -289,14 +289,25 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	txHashVal := tx.Hash()
 	for i := range inputs {
 		msg := ringSignMessage(txHashVal, uint32(i))
-		sig, err := crypto.MLSAGSignV4(
-			msg,
-			inputs[i].Ring,
-			inputRealIdxs[i],
-			inputPrivKeys[i],
-			selected[i].Blind,
-			selected[i].Amount,
-		)
+		var sig *crypto.MLSAGSignature
+		var err error
+		if tx.Version == TxVersionCommitmentBinding {
+			sig, err = crypto.MLSAGSignV4(
+				msg,
+				inputs[i].Ring,
+				inputRealIdxs[i],
+				inputPrivKeys[i],
+				selected[i].Blind,
+				selected[i].Amount,
+			)
+		} else {
+			sig, err = crypto.MLSAGSign(
+				msg,
+				inputs[i].Ring,
+				inputRealIdxs[i],
+				inputPrivKeys[i],
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("mlsag sign[%d]: %w", i, err)
 		}

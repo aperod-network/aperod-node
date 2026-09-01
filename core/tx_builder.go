@@ -20,6 +20,7 @@ type TxBuilder struct {
         ownedUTXOs   []OwnedUTXO
         feePerByte   uint64   // base-fee + optional tip per byte in nAPRO
         utxoSet      *UTXOSet // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
+	txVersion   TxVersion
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
@@ -44,6 +45,7 @@ func NewTxBuilder(
                 spendPub:   spendPub,
                 ownedUTXOs: ownedUTXOs,
                 feePerByte: feePerByte,
+		txVersion: TxVersionCommitmentBinding,
         }
 }
 
@@ -53,6 +55,13 @@ func NewTxBuilder(
 func (b *TxBuilder) WithDecoySet(utxos *UTXOSet) *TxBuilder {
         b.utxoSet = utxos
         return b
+}
+
+// WithVersion selects the consensus transaction format used by Build and
+// BuildMulti. Production callers should derive it from the next block height.
+func (b *TxBuilder) WithVersion(version TxVersion) *TxBuilder {
+	b.txVersion = version
+	return b
 }
 
 // BuildResult contains the signed transaction and its metadata.
@@ -106,6 +115,9 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
                 return nil, fmt.Errorf("invalid change address: %w", err)
         }
         isBurn := crypto.IsBurnAddress(recipient)
+	if isBurn && b.txVersion != TxVersionCommitmentBinding {
+		return nil, fmt.Errorf("intentional burn is unavailable before RingCT v4 activation")
+	}
 
         // Sort available UTXOs largest-first for greedy selection.
         available := make([]OwnedUTXO, len(b.ownedUTXOs))
@@ -355,7 +367,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 
         // ── Assemble unsigned transaction ─────────────────────────────────────────
         tx := Transaction{
-		Version:     TxVersionCommitmentBinding,
+		Version:     b.txVersion,
                 Inputs:      inputs,
                 Outputs:     outputs,
                 Fee:         totalFee,
@@ -371,14 +383,25 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
         txHash := tx.Hash()
         for i := range inputs {
                 msg := ringSignMessage(txHash, uint32(i))
-		sig, err := crypto.MLSAGSignV4(
-			msg,
-			inputs[i].Ring,
-			inputRealIdxs[i],
-			inputPrivKeys[i],
-			selected[i].Blind,
-			selected[i].Amount,
-		)
+		var sig *crypto.MLSAGSignature
+		var err error
+		if tx.Version == TxVersionCommitmentBinding {
+			sig, err = crypto.MLSAGSignV4(
+				msg,
+				inputs[i].Ring,
+				inputRealIdxs[i],
+				inputPrivKeys[i],
+				selected[i].Blind,
+				selected[i].Amount,
+			)
+		} else {
+			sig, err = crypto.MLSAGSign(
+				msg,
+				inputs[i].Ring,
+				inputRealIdxs[i],
+				inputPrivKeys[i],
+			)
+		}
                 if err != nil {
                         return nil, fmt.Errorf("mlsag sign [%d]: %w", i, err)
                 }

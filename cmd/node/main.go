@@ -1118,7 +1118,10 @@ func run() error {
                 chainMaxBlocks = core.MaxInMemoryBlocks
         }
         chain := core.NewChain(chainMaxBlocks)
-        mempool := core.NewMempool(core.DefaultMempoolConfig(), log)
+        mempoolCfg := core.DefaultMempoolConfig()
+        mempoolCfg.RingCTV4ActivationHeight = cfg.Consensus.RingCTV4ActivationHeight
+        mempoolCfg.CurrentHeight = chain.Height
+        mempool := core.NewMempool(mempoolCfg, log)
 
         // Create the UTXO set here (before chain loading) so the resume path
         // can populate it from stored blocks, ensuring historical spent key

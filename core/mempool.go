@@ -32,6 +32,12 @@ type MempoolConfig struct {
 	MaxTxSize      int           // maximum size of a single transaction in bytes
 	TTL            time.Duration // evict transactions older than this
 	BaseFeePerByte uint64        // current network base fee in nAPRO/byte (updated each block)
+	// RingCTV4ActivationHeight and CurrentHeight let production mempools reject
+	// transactions that cannot be included in the next block. Keeping this gate
+	// at admission prevents callers from receiving a successful hash for a tx
+	// that the block producer will immediately evict.
+	RingCTV4ActivationHeight uint64
+	CurrentHeight            func() uint64
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
@@ -125,6 +131,22 @@ func (m *Mempool) SetBaseFee(baseFeePerByte uint64) {
 	m.mu.Unlock()
 }
 
+// NextSpendVersion returns the RingCT format that can be included in the next
+// block under the configured activation policy.
+func (m *Mempool) NextSpendVersion() TxVersion {
+	if m.cfg.CurrentHeight == nil {
+		return TxVersionCommitmentBinding
+	}
+	nextHeight := m.cfg.CurrentHeight()
+	if nextHeight < ^uint64(0) {
+		nextHeight++
+	}
+	if m.cfg.RingCTV4ActivationHeight > 0 && nextHeight < m.cfg.RingCTV4ActivationHeight {
+		return TxVersionBase
+	}
+	return TxVersionCommitmentBinding
+}
+
 // Add attempts to add a transaction to the mempool.
 // Returns an error if the tx is invalid, duplicate, too large, or a double-spend.
 func (m *Mempool) Add(tx Transaction) error {
@@ -139,6 +161,16 @@ func (m *Mempool) Add(tx Transaction) error {
 	// be submitted via the public POST /api/v1/stake broadcast endpoint.
 	if tx.IsCoinbase() && !tx.IsStake() {
 		return fmt.Errorf("mempool: coinbase (zero-input) transactions are not accepted from external sources")
+	}
+
+	if m.cfg.CurrentHeight != nil {
+		nextHeight := m.cfg.CurrentHeight()
+		if nextHeight < ^uint64(0) {
+			nextHeight++
+		}
+		if err := ValidateTxVersionAtHeight(&tx, nextHeight, m.cfg.RingCTV4ActivationHeight); err != nil {
+			return fmt.Errorf("mempool: transaction activation policy: %w", err)
+		}
 	}
 
 	if err := tx.Validate(); err != nil {

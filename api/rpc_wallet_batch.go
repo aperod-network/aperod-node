@@ -281,7 +281,8 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 	}
 
 	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0).
-		WithDecoySet(s.utxos)
+		WithDecoySet(s.utxos).
+		WithVersion(s.mempool.NextSpendVersion())
 	result, err := builder.BuildMulti(batchRecipients, changeAddr)
 	if err != nil {
 		return nil, fmt.Errorf("build: %w", err)

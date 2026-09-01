@@ -95,7 +95,8 @@ func (s *Server) aprWalletMaxSpendable(rawParams json.RawMessage) (interface{}, 
 		owned = append(owned, o)
 	}
 
-	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, owned, 0)
+	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, owned, 0).
+		WithVersion(s.mempool.NextSpendVersion())
 	ms := builder.MaxSpendable()
 
 	return walletMaxSpendableResult{

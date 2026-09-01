@@ -144,7 +144,8 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 	// AmountCommit values — it requires only that AT LEAST ONE present ring
 	// member matches inp.AmountCommit (the real spender, always in byPubKey).
 	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, ownedUTXOs, 0).
-		WithDecoySet(s.utxos)
+		WithDecoySet(s.utxos).
+		WithVersion(s.mempool.NextSpendVersion())
 	result, err := builder.Build(p.AmountNAPR, crypto.Address(p.ToAddress), changeAddr)
 	if err != nil {
 		return nil, fmt.Errorf("build: %w", err)

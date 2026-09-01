@@ -88,7 +88,8 @@ func (s *Server) aprWalletEstimateFee(rawParams json.RawMessage) (interface{}, e
 
 	// Rate 0 → NewTxBuilder falls back to core.InitialBaseFeePerByte —
 	// exactly what apr_walletSend does, so the quote uses the same rate.
-	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, owned, 0)
+	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, owned, 0).
+		WithVersion(s.mempool.NextSpendVersion())
 	est := builder.EstimateFeeForAmount(p.AmountNAPR)
 
 	return walletEstimateFeeResult{

@@ -107,3 +107,103 @@ func TestBurnActivationVersionPolicy(t *testing.T) {
 		t.Fatalf("v4 burn rejected with activation height 0: %v", err)
 	}
 }
+
+func TestMempoolRejectsV4BurnBeforeActivation(t *testing.T) {
+	result, _ := buildBurnForTest(t)
+	const (
+		tip        = uint64(98)
+		activation = uint64(100)
+	)
+	cfg := core.DefaultMempoolConfig()
+	cfg.CurrentHeight = func() uint64 { return tip }
+	cfg.RingCTV4ActivationHeight = activation
+	pool := core.NewMempool(cfg)
+
+	err := pool.Add(result.Tx)
+	if err == nil {
+		t.Fatal("mempool accepted v4 burn before activation")
+	}
+	if got := err.Error(); got != "mempool: transaction activation policy: transaction version 4 is not active until height 100" {
+		t.Fatalf("unexpected activation error: %q", got)
+	}
+}
+
+func TestMempoolAcceptsV4BurnForActivationBlock(t *testing.T) {
+	result, _ := buildBurnForTest(t)
+	const (
+		tip        = uint64(99)
+		activation = uint64(100)
+	)
+	cfg := core.DefaultMempoolConfig()
+	cfg.CurrentHeight = func() uint64 { return tip }
+	cfg.RingCTV4ActivationHeight = activation
+	pool := core.NewMempool(cfg)
+
+	if err := pool.Add(result.Tx); err != nil {
+		t.Fatalf("mempool rejected v4 burn for activation block: %v", err)
+	}
+}
+
+func TestPreActivationWalletBuildsLegacyPaymentButRejectsBurn(t *testing.T) {
+	sender, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipient, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const supply = uint64(20_000_000)
+	chain, _, blind := makeGenesisWithCoinbase(t, sender, supply)
+	scanner := core.NewWalletScanner(
+		sender.View.Private,
+		sender.Spend.Public,
+		sender.View.Public,
+		crypto.MainnetByte,
+	)
+	owned := scanner.ScanChain(chain, 0, chain.Height())
+	if len(owned) != 1 {
+		t.Fatalf("owned UTXOs = %d, want 1", len(owned))
+	}
+	owned[0].Blind = blind
+
+	cfg := core.DefaultMempoolConfig()
+	cfg.BaseFeePerByte = 1
+	cfg.CurrentHeight = func() uint64 { return 98 }
+	cfg.RingCTV4ActivationHeight = 100
+	pool := core.NewMempool(cfg)
+	if got := pool.NextSpendVersion(); got != core.TxVersionBase {
+		t.Fatalf("pre-activation spend version = %d, want legacy v1", got)
+	}
+
+	builder := core.NewTxBuilder(
+		sender.Spend.Private,
+		sender.View.Private,
+		sender.Spend.Public,
+		owned,
+		1,
+	).WithVersion(pool.NextSpendVersion())
+	payment, err := builder.Build(
+		1_000_000,
+		crypto.AddressFromKeys(crypto.MainnetByte, recipient),
+		crypto.AddressFromKeys(crypto.MainnetByte, sender),
+	)
+	if err != nil {
+		t.Fatalf("legacy payment build failed: %v", err)
+	}
+	if payment.Tx.Version != core.TxVersionBase {
+		t.Fatalf("payment version = %d, want legacy v1", payment.Tx.Version)
+	}
+	if err := pool.Add(payment.Tx); err != nil {
+		t.Fatalf("pre-activation legacy payment rejected by mempool: %v", err)
+	}
+
+	_, err = builder.Build(
+		1_000_000,
+		crypto.MainnetBurnAddress(),
+		crypto.AddressFromKeys(crypto.MainnetByte, sender),
+	)
+	if err == nil {
+		t.Fatal("pre-activation intentional burn was built")
+	}
+}
