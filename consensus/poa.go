@@ -88,6 +88,10 @@ type Config struct {
 	// RingCTV4ActivationHeight is the first height at which v4 RingCT
 	// transactions are accepted. Zero means active from genesis.
 	RingCTV4ActivationHeight uint64
+	// RewardAuthorizationActivationHeight is the first height at which
+	// validator rewards must carry a consensus-verifiable on-chain
+	// authorization. Zero keeps the authorization feature disabled.
+	RewardAuthorizationActivationHeight uint64
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -323,6 +327,9 @@ func (e *Engine) RewardMode() string {
 func (e *Engine) DecrementPool(height uint64) {
 	if e.stakingPoolInit == 0 {
 		return // pool disabled
+	}
+	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 && height >= activation {
+		return // local pool accounting is not consensus state in the authorization era
 	}
 	baseReward := e.cfg.BlockRewardNAPR
 	if baseReward == 0 {
@@ -628,6 +635,12 @@ func (e *Engine) tick() error {
 // Source of truth: deploy/BURN_POLICY.md — "Block reward: 5 APRO per block".
 const DefaultBlockRewardNAPR uint64 = 500_000_000
 
+// AuthorizedBlockRewardNAPR is the immutable base reward for the on-chain
+// authorization era. It matches the currently deployed 0.1 APRO schedule.
+// Config.BlockRewardNAPR, staking-pool accounting, and tail rewards are legacy
+// local policies and are deliberately not consensus inputs after activation.
+const AuthorizedBlockRewardNAPR uint64 = 10_000_000
+
 // HalvingIntervalBlocks is the number of blocks between each block-reward
 // halving event.  At 3 s/block, 21 024 000 blocks ≈ 2 years.
 // Must match the "Halving interval" row in deploy/VALIDATORS.md and
@@ -699,6 +712,18 @@ func blockFeeStats(txs []core.Transaction, baseFeePerByte uint64) (burned, tipTo
 		}
 	}
 	return
+}
+
+// expectedAuthorizedRewardAmount is the exact amount an activated on-chain
+// reward authorization must mint. It uses only immutable protocol constants and
+// block data, so every validator derives the same value across restarts.
+func (e *Engine) expectedAuthorizedRewardAmount(block *core.Block) (uint64, error) {
+	baseReward := blockRewardAtHeight(AuthorizedBlockRewardNAPR, block.Header.Height)
+	_, tips := blockFeeStats(block.Txs, e.expectedBaseFeeAt(block.Header.Height))
+	if baseReward > ^uint64(0)-tips {
+		return 0, fmt.Errorf("authorized block reward plus tips overflows uint64")
+	}
+	return baseReward + tips, nil
 }
 
 // oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
@@ -821,32 +846,62 @@ func validateCoinbasePolicy(block *core.Block) error {
 	return nil
 }
 
-// validateCoinbasePolicy applies the historical structural policy before the
-// RingCT v4 activation and a fail-closed deterministic reward policy from the
-// activation height onward.
-//
-// Privileged/admin mint provenance, reward recipient, and staking-pool balance
-// are local configuration/state and cannot be independently reconstructed by
-// every validator.  All zero-input value creation is therefore forbidden after
-// activation until the protocol has an explicit on-chain authorization proof.
+// validateCoinbasePolicy applies three consensus eras:
+//   - historical structural coinbase rules before RingCT v4 activation;
+//   - no zero-input value creation after RingCT v4 activation but before reward
+//     authorization activation;
+//   - exactly one consensus-priced, proposer-signed validator reward once the
+//     on-chain authorization protocol is activated.
 func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
 	if err := validateCoinbasePolicy(block); err != nil {
 		return err
+	}
+
+	var coinbases []*core.Transaction
+	for i := range block.Txs {
+		tx := &block.Txs[i]
+		if tx.IsCoinbase() && !tx.IsStake() {
+			coinbases = append(coinbases, tx)
+		}
+	}
+
+	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
+	if rewardActivation > 0 && block.Header.Height >= rewardActivation {
+		expectedAmount, err := e.expectedAuthorizedRewardAmount(block)
+		if err != nil {
+			return err
+		}
+		if expectedAmount == 0 {
+			if len(coinbases) != 0 {
+				return fmt.Errorf("validator reward era has ended, got %d coinbase transaction(s)",
+					len(coinbases))
+			}
+			return nil
+		}
+		if len(coinbases) != 1 {
+			return fmt.Errorf("authorized reward block must contain exactly one coinbase transaction, got %d",
+				len(coinbases))
+		}
+		auth, err := core.ValidateAuthorizedRewardTx(
+			coinbases[0],
+			block.Header.Height,
+			block.Header.PrevHash,
+			block.Header.ValidatorPub,
+		)
+		if err != nil {
+			return fmt.Errorf("invalid validator reward authorization: %w", err)
+		}
+		if auth.Amount != expectedAmount {
+			return fmt.Errorf("authorized reward amount %d does not match consensus amount %d",
+				auth.Amount, expectedAmount)
+		}
+		return nil
 	}
 
 	activation := e.cfg.RingCTV4ActivationHeight
 	if activation > 0 && block.Header.Height < activation {
 		return nil
 	}
-
-	var coinbases []core.Transaction
-	for i := range block.Txs {
-		tx := block.Txs[i]
-		if tx.IsCoinbase() && !tx.IsStake() {
-			coinbases = append(coinbases, tx)
-		}
-	}
-
 	if len(coinbases) != 0 {
 		return fmt.Errorf("zero-input value creation is disabled from activation height %d, got %d mint transaction(s)",
 			activation, len(coinbases))
@@ -1087,6 +1142,8 @@ func (e *Engine) resolveAdminMintsCommitted(height uint64) {
 // produceBlock assembles a new block from the mempool.
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
 	raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
+	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
+	rewardAuthorizationActive := rewardActivation > 0 && height >= rewardActivation
 
 	// Defense-in-depth: strip any NON-PRIVILEGED coinbase (zero-input) txs that
 	// may have bypassed the mempool guard.  mempool.Add() already rejects
@@ -1107,7 +1164,13 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 					"hash", h)
 				continue
 			}
-			// Privileged admin mint — keep it.
+			if rewardAuthorizationActive {
+				e.log.Warn("produceBlock: dropping privileged legacy mint after reward authorization activation",
+					"hash", h, "height", height)
+				e.pool.Remove(h)
+				continue
+			}
+			// Privileged admin mint — keep it in the historical era.
 		}
 		txs = append(txs, tx)
 	}
@@ -1181,7 +1244,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 
 	// Compute burned fees and priority tips for selected txs, then include
 	// tips in the coinbase reward (validator earns block reward + tips).
-currentBaseFee := e.expectedBaseFeeAt(height)
+	currentBaseFee := e.expectedBaseFeeAt(height)
 
 	// Tips belong exclusively to this block's producer.  Never carry tips
 	// observed from blocks proposed by other validators into our coinbase.
@@ -1197,8 +1260,12 @@ currentBaseFee := e.expectedBaseFeeAt(height)
 	// (added below) and any privileged coinbases already selected from the
 	// pool — an over-limit block would fail our own validateCoinbasePolicy and
 	// stall production forever while the mints re-queue each slot.
+	activation := e.cfg.RingCTV4ActivationHeight
+	legacyRewardActive := activation > 0 && height < activation
+	rewardWillBeBuilt := e.cfg.RewardAddress != "" &&
+		(legacyRewardActive || rewardAuthorizationActive)
 	mintCapacity := maxCoinbasesPerBlock
-	if e.cfg.RewardAddress != "" {
+	if rewardWillBeBuilt {
 		mintCapacity--
 	}
 	for i := range txs {
@@ -1206,17 +1273,39 @@ currentBaseFee := e.expectedBaseFeeAt(height)
 			mintCapacity--
 		}
 	}
-	activation := e.cfg.RingCTV4ActivationHeight
-	if activation > 0 && height < activation {
+	if legacyRewardActive && !rewardAuthorizationActive {
 		if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
 			txs = append(adminMints, txs...)
 		}
 	}
 
-// Legacy reward mints remain available only before the activation boundary.
-// Post-activation reward distribution requires an on-chain authorization
-// format that every validator can verify without local configuration.
-if e.cfg.RewardAddress != "" && activation > 0 && height < activation {
+	// Once reward authorization is active, the local address only selects where
+	// this proposer wants to be paid. Peers validate its exact signed value from
+	// the on-chain payload and derive the amount from protocol constants.
+	if rewardAuthorizationActive {
+		if e.cfg.RewardAddress == "" {
+			return nil, fmt.Errorf("reward_address is required from reward authorization activation height %d",
+				rewardActivation)
+		}
+		rewardNAPR := blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
+		if rewardNAPR > ^uint64(0)-tips {
+			return nil, fmt.Errorf("authorized block reward plus tips overflows uint64")
+		}
+		totalReward := rewardNAPR + tips
+		if totalReward > 0 {
+			mintTx, err := core.BuildAuthorizedRewardTx(
+				crypto.Address(e.cfg.RewardAddress),
+				totalReward,
+				height,
+				parent.Hash(),
+				e.cfg.MyKey.PrivKey(),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("build authorized validator reward: %w", err)
+			}
+			txs = append([]core.Transaction{*mintTx}, txs...)
+		}
+	} else if e.cfg.RewardAddress != "" && legacyRewardActive {
 		baseReward := e.cfg.BlockRewardNAPR
 		if baseReward == 0 {
 			baseReward = defaultBlockRewardNAPR
@@ -1245,11 +1334,11 @@ if e.cfg.RewardAddress != "" && activation > 0 && height < activation {
 			rewardNAPR = blockRewardAtHeight(baseReward, height)
 		}
 
-// Validator earns base reward + priority tips from all txs in this block.
-if rewardNAPR > ^uint64(0)-tips {
-return nil, fmt.Errorf("block reward plus tips overflows uint64")
-}
-totalReward := rewardNAPR + tips
+		// Validator earns base reward + priority tips from all txs in this block.
+		if rewardNAPR > ^uint64(0)-tips {
+			return nil, fmt.Errorf("block reward plus tips overflows uint64")
+		}
+		totalReward := rewardNAPR + tips
 		mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
 		if err != nil {
 			e.log.Warn("failed to build coinbase reward tx", "err", err)

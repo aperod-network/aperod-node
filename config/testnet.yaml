@@ -18,6 +18,8 @@ consensus:
   validator_key: ""          # path to ED25519 private key file (leave empty for non-validator)
   reward_address: ""         # APRO wallet address for block rewards — get yours at https://t.me/aperod_bot
   block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
+  # 0 = disabled. Set the same future height on every validator.
+  reward_authorization_activation_height: 0
   block_time: "3s"
   # non_validator: true      # Set to true to run a sync-only / relay / RPC node.
   #                          # The node validates and relays every block but never

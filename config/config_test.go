@@ -5,7 +5,81 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/aperod/aperod/crypto"
 )
+
+func TestValidate_RewardAuthorizationActivation(t *testing.T) {
+	validRewardAddress := func(t *testing.T, network crypto.NetworkByte) string {
+		t.Helper()
+		keys, err := crypto.GenerateWalletKeys()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(crypto.AddressFromKeys(network, keys))
+	}
+
+	t.Run("rejects activation before RingCT v4", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 99
+		cfg.Consensus.RewardAddress = validRewardAddress(t, crypto.TestnetByte)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("activation before RingCT v4 was accepted")
+		}
+	})
+
+	t.Run("requires reward address for validator", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 100
+		cfg.Consensus.RewardAddress = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("validator activation without reward_address was accepted")
+		}
+	})
+
+	t.Run("allows relay without reward address", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.NonValidator = true
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 100
+		cfg.Consensus.RewardAddress = ""
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("relay configuration rejected: %v", err)
+		}
+	})
+
+	t.Run("accepts coordinated validator activation", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 101
+		cfg.Consensus.RewardAddress = validRewardAddress(t, crypto.TestnetByte)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid activation rejected: %v", err)
+		}
+	})
+
+	t.Run("rejects malformed validator reward address", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 100
+		cfg.Consensus.RewardAddress = "not-an-aperod-address"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("malformed reward_address was accepted")
+		}
+	})
+
+	t.Run("rejects reward address from another network", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.RingCTV4ActivationHeight = 100
+		cfg.Consensus.RewardAuthorizationActivationHeight = 100
+		cfg.Consensus.RewardAddress = validRewardAddress(t, crypto.MainnetByte)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("mainnet reward_address was accepted for testnet")
+		}
+	})
+}
 
 func TestValidate_BadBlockKnobs(t *testing.T) {
 	tests := []struct {
@@ -335,10 +409,10 @@ func TestValidate_MemoryLimitDisabled(t *testing.T) {
 // or below those limits.
 func TestWarnings_UnsafeBanValues(t *testing.T) {
 	tests := []struct {
-		name            string
-		mutate          func(cfg *Config)
-		wantBanWarn     bool // expect bad_block_ban_threshold warning
-		wantHeightWarn  bool // expect bad_block_height_lead warning
+		name           string
+		mutate         func(cfg *Config)
+		wantBanWarn    bool // expect bad_block_ban_threshold warning
+		wantHeightWarn bool // expect bad_block_height_lead warning
 	}{
 		// --- ban threshold ---
 		{
@@ -408,7 +482,7 @@ func TestWarnings_UnsafeBanValues(t *testing.T) {
 		},
 	}
 
-	const banSubstr    = "bad_block_ban_threshold"
+	const banSubstr = "bad_block_ban_threshold"
 	const heightSubstr = "bad_block_height_lead"
 
 	for _, tc := range tests {
@@ -558,9 +632,9 @@ func TestResolveMempoolEvictInterval(t *testing.T) {
 	const minimalYAML = "network: testnet\ndata_dir: ./data\nconsensus:\n  block_time: 1s\n"
 
 	tests := []struct {
-		name     string
-		extra    string        // appended to minimalYAML
-		wantDur  time.Duration
+		name    string
+		extra   string // appended to minimalYAML
+		wantDur time.Duration
 	}{
 		{
 			name:    "explicit 60s is respected",

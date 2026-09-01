@@ -2384,6 +2384,7 @@ func run() error {
                 OracleURL:          cfg.Consensus.OracleURL,
                 OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
 			RingCTV4ActivationHeight: cfg.Consensus.RingCTV4ActivationHeight,
+RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
                 OnBlockProduced: func(block *core.Block) {
                         if err := storeBlock(db, block); err != nil {
                                 log.Error("failed to persist block", "height", block.Header.Height, "err", err)

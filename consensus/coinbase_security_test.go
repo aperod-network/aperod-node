@@ -22,8 +22,8 @@ func TestStrictCoinbasePolicyDisablesLocalStateDependentMinting(t *testing.T) {
 	}
 	rewardAddress := crypto.AddressFromKeys(crypto.MainnetByte, keys)
 	engine := NewEngine(Config{
-		RewardAddress:              string(rewardAddress),
-		BlockRewardNAPR:            reward,
+		RewardAddress:            string(rewardAddress),
+		BlockRewardNAPR:          reward,
 		RingCTV4ActivationHeight: activation,
 	}, core.NewChain(), core.NewMempool(core.DefaultMempoolConfig()),
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -70,6 +70,170 @@ func TestStrictCoinbasePolicyDisablesLocalStateDependentMinting(t *testing.T) {
 	}
 	if err := engine.validateCoinbasePolicy(historical); err != nil {
 		t.Fatalf("pre-activation historical block was rejected: %v", err)
+	}
+}
+
+func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
+	const activation = uint64(100)
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipient, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewardAddress := crypto.AddressFromKeys(crypto.MainnetByte, recipient)
+	parentHash := crypto.HashBytes([]byte("reward-activation-parent"))
+
+	newEngine := func() *Engine {
+		return NewEngine(Config{
+			Validators:                          []crypto.ValidatorPubKey{validatorPub},
+			RingCTV4ActivationHeight:            50,
+			RewardAuthorizationActivationHeight: activation,
+		}, core.NewChain(), core.NewMempool(core.DefaultMempoolConfig()),
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	engine := newEngine()
+
+	authorized, err := core.BuildAuthorizedRewardTx(
+		rewardAddress,
+		AuthorizedBlockRewardNAPR,
+		activation,
+		parentHash,
+		validatorPriv,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := &core.Block{
+		Header: core.BlockHeader{
+			Height:       activation,
+			PrevHash:     parentHash,
+			ValidatorPub: validatorPub,
+			BaseFee:      core.InitialBaseFeePerByte,
+		},
+		Txs: []core.Transaction{*authorized},
+	}
+	if err := engine.validateCoinbasePolicy(valid); err != nil {
+		t.Fatalf("valid authorized reward rejected: %v", err)
+	}
+
+	// A restarted validator reconstructs the complete authorization decision
+	// from the block itself; no replay map or local reward settings are needed.
+	restarted := newEngine()
+	if err := restarted.validateCoinbasePolicy(valid); err != nil {
+		t.Fatalf("valid authorized reward rejected after restart: %v", err)
+	}
+
+	wrongAmount, err := core.BuildAuthorizedRewardTx(
+		rewardAddress,
+		AuthorizedBlockRewardNAPR+1,
+		activation,
+		parentHash,
+		validatorPriv,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongAmountBlock := *valid
+	wrongAmountBlock.Txs = []core.Transaction{*wrongAmount}
+	if err := engine.validateCoinbasePolicy(&wrongAmountBlock); err == nil {
+		t.Fatal("proposer-signed reward above the consensus amount was accepted")
+	}
+
+	missing := *valid
+	missing.Txs = nil
+	if err := engine.validateCoinbasePolicy(&missing); err == nil {
+		t.Fatal("activated block without its authorized reward was accepted")
+	}
+
+	duplicate := *valid
+	duplicate.Txs = []core.Transaction{*authorized, *authorized}
+	if err := engine.validateCoinbasePolicy(&duplicate); err == nil {
+		t.Fatal("duplicate authorized rewards were accepted")
+	}
+
+	// The separate activation boundary preserves the fail-closed RingCT gap.
+	preAuth := &core.Block{
+		Header: core.BlockHeader{
+			Height:       activation - 1,
+			PrevHash:     parentHash,
+			ValidatorPub: validatorPub,
+			BaseFee:      core.InitialBaseFeePerByte,
+		},
+	}
+	if err := engine.validateCoinbasePolicy(preAuth); err != nil {
+		t.Fatalf("mint-free pre-authorization block rejected: %v", err)
+	}
+	preAuth.Txs = []core.Transaction{*authorized}
+	if err := engine.validateCoinbasePolicy(preAuth); err == nil {
+		t.Fatal("authorized reward activated one block early")
+	}
+}
+
+func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Destroy()
+	recipient, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewardAddress := crypto.AddressFromKeys(crypto.MainnetByte, recipient)
+
+	genesisHeader := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := genesisHeader.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	chain := core.NewChain()
+	if err := chain.SetGenesis(&core.Block{Header: genesisHeader}); err != nil {
+		t.Fatal(err)
+	}
+	utxos := core.NewUTXOSet()
+	engine := NewEngine(Config{
+		Validators:                          []crypto.ValidatorPubKey{pub},
+		MyKey:                               locked,
+		RewardAddress:                       string(rewardAddress),
+		BlockRewardNAPR:                     DefaultBlockRewardNAPR,
+		RingCTV4ActivationHeight:            1,
+		RewardAuthorizationActivationHeight: 1,
+	}, chain, core.NewMempool(core.DefaultMempoolConfig()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	engine.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	if err := engine.tick(); err != nil {
+		t.Fatalf("produce authorized reward block: %v", err)
+	}
+	block := chain.GetByHeight(1)
+	if block == nil {
+		t.Fatal("produced block missing")
+	}
+	if len(block.Txs) != 1 {
+		t.Fatalf("produced block tx count = %d, want exactly one authorized reward", len(block.Txs))
+	}
+	auth, err := core.ValidateAuthorizedRewardTx(
+		&block.Txs[0],
+		block.Header.Height,
+		block.Header.PrevHash,
+		block.Header.ValidatorPub,
+	)
+	if err != nil {
+		t.Fatalf("produced reward is not consensus-valid: %v", err)
+	}
+	if auth.Amount != AuthorizedBlockRewardNAPR {
+		t.Fatalf("authorized reward = %d, want %d", auth.Amount, AuthorizedBlockRewardNAPR)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+"github.com/aperod/aperod/crypto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -315,7 +316,7 @@ type ConsensusConfig struct {
 	ValidatorKey       string        `yaml:"validator_key"`        // path to ED25519 key file
 	ViewKey            string        `yaml:"view_key"`             // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
 	RewardAddress      string        `yaml:"reward_address"`       // APRO wallet address for block rewards
-	BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // reward in nAPRO; mainnet: 500_000_000 = 5 APRO; testnet default: 10_000_000 = 0.1 APRO. See deploy/BURN_POLICY.md.
+BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
 	BlockTime          time.Duration `yaml:"block_time"`
 	OracleURL          string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
 	OracleMaxDeviation float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
@@ -330,7 +331,8 @@ type ConsensusConfig struct {
 	// StakingPoolNAPR is the total pre-allocated validator reward pool in nAPRO.
 	// When > 0, block rewards are drawn from this pool instead of minting new
 	// tokens, keeping Total Supply at 10 B during the pool phase.  After the
-	// pool is exhausted, tail_reward_napro is minted per block instead.
+// pool is exhausted, tail_reward_napro is minted per block instead. These
+// fields are legacy-only and stop affecting rewards at authorization activation.
 	// Default: 200_000_000_000_000_000 (= 2 000 000 000 APRO × 10^8 nAPRO/APRO).
 	// Set to 0 to disable pool-based rewards and use the legacy mint schedule.
 	StakingPoolNAPR uint64 `yaml:"staking_pool_napro"`
@@ -342,6 +344,10 @@ type ConsensusConfig struct {
 	// RingCTV4ActivationHeight is the first block height allowed to contain
 	// commitment-binding v4 transfers. Zero activates v4 immediately.
 	RingCTV4ActivationHeight uint64 `yaml:"ringct_v4_activation_height"`
+// RewardAuthorizationActivationHeight is the first block height whose
+// validator reward must carry an on-chain authorization. Zero disables the
+// post-RingCT reward path; set the same future value on every validator.
+RewardAuthorizationActivationHeight uint64 `yaml:"reward_authorization_activation_height"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -576,6 +582,38 @@ func (c *Config) Validate() error {
 	if c.Consensus.BlockTime <= 0 {
 		return fmt.Errorf("block_time must be positive")
 	}
+	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
+	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
+	if rewardActivation > 0 && ringCTActivation > 0 && rewardActivation < ringCTActivation {
+		return fmt.Errorf(
+			"reward_authorization_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
+			rewardActivation, ringCTActivation,
+		)
+	}
+	if rewardActivation > 0 && !c.Consensus.NonValidator && c.Consensus.RewardAddress == "" {
+		return fmt.Errorf(
+			"reward_address must be set for validator nodes when reward_authorization_activation_height is enabled",
+		)
+	}
+if rewardActivation > 0 && !c.Consensus.NonValidator {
+rewardNetwork, _, _, err := crypto.DecodeAddress(crypto.Address(c.Consensus.RewardAddress))
+if err != nil {
+return fmt.Errorf("invalid reward_address for reward authorization: %w", err)
+}
+expectedNetwork := crypto.MainnetByte
+switch c.Network {
+case Testnet:
+expectedNetwork = crypto.TestnetByte
+case Devnet:
+expectedNetwork = crypto.DevnetByte
+}
+if rewardNetwork != expectedNetwork {
+return fmt.Errorf(
+"reward_address network byte 0x%02x does not match configured network %q",
+byte(rewardNetwork), c.Network,
+)
+}
+}
 	if c.Pruning.Mode != "" && c.Pruning.Mode != "archive" && c.Pruning.Mode != "light" {
 		return fmt.Errorf("pruning.mode must be \"archive\" or \"light\", got %q", c.Pruning.Mode)
 	}
