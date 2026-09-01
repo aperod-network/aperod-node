@@ -491,6 +491,47 @@ func (d *DB) GetMeta(key string) ([]byte, error) {
         return d.get(k)
 }
 
+type AdminMintRecord struct {
+        // State is intent, prepared, or completed. Empty is accepted as
+        // completed for records written by versions predating this state
+        // machine.
+        State      string        `json:"state,omitempty"`
+        Address    string        `json:"address"`
+        AmountNAPR uint64        `json:"amount_napr"`
+        TxHash     crypto.Hash32 `json:"tx_hash"`
+        Height     uint64        `json:"height"`
+}
+
+// StoreAdminMintRecord synchronously persists an admin-mint state transition.
+// Callers must write intent before scheduling and prepared before attempting
+// the canonical chain commit. The synchronous write is the durable
+// idempotency fence for this externally authorized operation.
+func (d *DB) StoreAdminMintRecord(idempotencyKey string, record AdminMintRecord) error {
+        value, err := json.Marshal(record)
+        if err != nil {
+                return fmt.Errorf("store admin mint record: %w", err)
+        }
+        key := append(append([]byte{}, prefixMeta...), []byte("admin_mint/"+idempotencyKey)...)
+        if err := d.putSync(key, value); err != nil {
+                return fmt.Errorf("store admin mint record: %w", err)
+        }
+        return nil
+}
+
+func (d *DB) LoadAdminMintRecord(idempotencyKey string) (record AdminMintRecord, found bool, err error) {
+        value, err := d.GetMeta("admin_mint/" + idempotencyKey)
+        if err != nil {
+                return record, false, fmt.Errorf("load admin mint record: %w", err)
+        }
+        if value == nil {
+                return record, false, nil
+        }
+        if err := json.Unmarshal(value, &record); err != nil {
+                return record, false, fmt.Errorf("load admin mint record: corrupt value: %w", err)
+        }
+        return record, true, nil
+}
+
 // ─── Staking pool ─────────────────────────────────────────────────────────────
 
 // StoreStakingPoolRemaining persists the remaining staking reward pool in nAPRO.

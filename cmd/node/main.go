@@ -2385,14 +2385,15 @@ func run() error {
                 OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
 			RingCTV4ActivationHeight: cfg.Consensus.RingCTV4ActivationHeight,
 RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
-                OnBlockProduced: func(block *core.Block) {
+                OnBlockProduced: func(block *core.Block) error {
                         if err := storeBlock(db, block); err != nil {
                                 log.Error("failed to persist block", "height", block.Header.Height, "err", err)
-                        } else {
-                                hash := block.Hash()
-                                if err := db.PutTip(hash, block.Header.Height); err != nil {
-                                        log.Error("failed to update tip", "height", block.Header.Height, "err", err)
-                                }
+                                return err
+                        }
+                        hash := block.Hash()
+                        if err := db.PutTip(hash, block.Header.Height); err != nil {
+                                log.Error("failed to update tip", "height", block.Header.Height, "err", err)
+                                return err
                         }
                         // Increment cached tx counter (skip index-0 coinbase reward).
                         if apiSrv != nil {
@@ -2439,6 +2440,7 @@ RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivation
                                         break
                                 }
                         }
+                        return nil
                 },
                 // OnBlockAccepted fires for every canonical block regardless of
                 // whether it was produced locally or received from a P2P peer.
@@ -2736,8 +2738,8 @@ RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivation
                 apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
                 // Admin mints are built at block-production time so every mint gets a
                 // unique one-time pub (spend_pub + height*G) → unique key image.
-                apiSrv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
-                        h, height, err := engine.ScheduleAdminMint(addr, amountNAPR, timeout)
+                apiSrv.SetMintScheduler(func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+                        h, height, err := engine.ScheduleAdminMint(idempotencyKey, addr, amountNAPR, timeout)
                         if err != nil {
                                 return "", 0, err
                         }

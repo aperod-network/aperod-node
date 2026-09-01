@@ -37,8 +37,7 @@ func TestREST_AdminMint_RequiresAPIKey(t *testing.T) {
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"address":    string(addr),
-		"amount_apr": 1.0,
+		"idempotency_key": "auth-1", "address": string(addr), "amount_apr": 1.0,
 	})
 
 	// ── Without API key: must be rejected ────────────────────────────────────
@@ -56,8 +55,7 @@ func TestREST_AdminMint_RequiresAPIKey(t *testing.T) {
 
 	// ── With correct API key: must be accepted (not 401) ─────────────────────
 	body2, _ := json.Marshal(map[string]interface{}{
-		"address":    string(addr),
-		"amount_apr": 1.0,
+		"idempotency_key": "auth-2", "address": string(addr), "amount_apr": 1.0,
 	})
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body2))
 	req2.Host = "127.0.0.1:8545"
@@ -79,8 +77,7 @@ func TestREST_AdminMint_NoKeyConfigured_AllowsRequest(t *testing.T) {
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"address":    string(addr),
-		"amount_apr": 1.0,
+		"idempotency_key": "no-auth", "address": string(addr), "amount_apr": 1.0,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body))
 	req.Host = "127.0.0.1:8545"

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,14 @@ import (
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
 )
+
+// AdminMintRecordStore persists the idempotency state machine for admin mints.
+// It is separate from the concrete Store so tests and alternate durable stores
+// can precisely control these state transitions without affecting staking data.
+type AdminMintRecordStore interface {
+	StoreAdminMintRecord(idempotencyKey string, record store.AdminMintRecord) error
+	LoadAdminMintRecord(idempotencyKey string) (record store.AdminMintRecord, found bool, err error)
+}
 
 // Config holds PoA consensus parameters.
 type Config struct {
@@ -31,8 +40,10 @@ type Config struct {
 	// MyKey is this node's validator key (nil if not a validator).
 	MyKey *crypto.LockedValidatorKey
 	// OnBlockProduced is an optional callback called after each block is added
-	// to the chain. Use it to persist blocks to durable storage.
-	OnBlockProduced func(block *core.Block)
+	// to the chain. Use it to persist blocks to durable storage. Returning an
+	// error halts local consensus production because the in-memory chain has
+	// advanced beyond its durable counterpart.
+	OnBlockProduced func(block *core.Block) error
 	// OnBlockAccepted is an optional callback called after every canonical
 	// block is committed — whether produced locally by this node or received
 	// from a P2P peer.  Use it for work that must run regardless of the
@@ -85,6 +96,9 @@ type Config struct {
 	// Store is the LevelDB store used to persist the pool balance across restarts.
 	// When nil the pool state is held in memory only (lost on restart).
 	Store *store.DB
+	// AdminMintStore optionally overrides Store for durable admin-mint
+	// idempotency records. When nil, Store is used.
+	AdminMintStore AdminMintRecordStore
 	// RingCTV4ActivationHeight is the first height at which v4 RingCT
 	// transactions are accepted. Zero means active from genesis.
 	RingCTV4ActivationHeight uint64
@@ -143,6 +157,8 @@ type Engine struct {
 	tailRewardNAPR uint64
 	// store is the LevelDB backing for pool persistence across restarts.
 	store *store.DB
+	// adminMintStore is the durable idempotency store for admin mints.
+	adminMintStore AdminMintRecordStore
 
 	// timestampRejected counts how many incoming P2P blocks have been rejected by
 	// the timejacking guard since node start.  Incremented atomically; safe to
@@ -185,6 +201,7 @@ type Engine struct {
 	mintMu       sync.Mutex
 	mintQueue    []*adminMintReq // waiting to be included in a produced block
 	mintInFlight []*adminMintReq // included in a produced-but-not-yet-committed block
+	mintByKey    map[string]*adminMintReq
 }
 
 // adminMintOutcome is delivered on adminMintReq.result once the mint's block
@@ -195,16 +212,17 @@ type adminMintOutcome struct {
 	err    error
 }
 
-// adminMintReq is one queued admin mint.  result is buffered (capacity 1) so
-// the engine never blocks on a caller that has timed out and gone away.
+// adminMintReq is one queued admin mint. ready is closed after outcome is set,
+// allowing any number of callers sharing the key to observe the same result.
 type adminMintReq struct {
-	addr      string
-	amount    uint64
-	result    chan adminMintOutcome
-	cancelled bool          // set by ScheduleAdminMint on timeout; guarded by mintMu
-	done      bool          // set when an outcome has been delivered; guarded by mintMu
-	txHash    crypto.Hash32 // set once included in a produced block
-	height    uint64        // ditto
+	key     string
+	addr    string
+	amount  uint64
+	ready   chan struct{}
+	outcome adminMintOutcome
+	done    bool
+	txHash  crypto.Hash32
+	height  uint64
 }
 
 // defaultTailRewardNAPR is the per-block mint once the staking pool is exhausted.
@@ -215,6 +233,10 @@ const defaultTailRewardNAPR uint64 = 100_000_000
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
+	adminMintStore := cfg.AdminMintStore
+	if adminMintStore == nil && cfg.Store != nil {
+		adminMintStore = cfg.Store
+	}
 	e := &Engine{
 		cfg:               cfg,
 		chain:             chain,
@@ -229,6 +251,9 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		newVoteCh:         make(chan FinalizeMsg, 256),
 		producedCh:        make(chan *core.Block, 64),
 		tsPerValidator:    make(map[string]int),
+		mintByKey:         make(map[string]*adminMintReq),
+		store:             cfg.Store,
+		adminMintStore:    adminMintStore,
 	}
 	// Seed the registry with genesis validators so they start Active.
 	if cfg.Registry != nil && len(cfg.Validators) > 0 {
@@ -242,7 +267,6 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		if e.tailRewardNAPR == 0 {
 			e.tailRewardNAPR = defaultTailRewardNAPR
 		}
-		e.store = cfg.Store
 		// Try to restore persisted pool balance from LevelDB so restarts
 		// do not re-initialise to the full 2 B.
 		if cfg.Store != nil {
@@ -594,6 +618,18 @@ func (e *Engine) tick() error {
 		return fmt.Errorf("add produced block: %w", err)
 	}
 
+	// Persist the just-added block before exposing any commit side effects. A
+	// failure leaves the durable admin-mint records prepared and stops this
+	// engine: continuing would advance an in-memory-only chain.
+	if e.cfg.OnBlockProduced != nil {
+		if err := e.cfg.OnBlockProduced(block); err != nil {
+			persistErr := fmt.Errorf("persist produced block %d: %w", block.Header.Height, err)
+			e.resolveAdminMintsPersistenceFailed(persistErr)
+			e.halted.Store(true)
+			return persistErr
+		}
+	}
+
 	// Advance the fee state for locally produced blocks exactly as for peer
 	// blocks.  Omitting this transition makes a consecutive local proposal
 	// reuse the previous fee and diverge from validating peers.
@@ -621,17 +657,16 @@ func (e *Engine) tick() error {
 	// incoming blocks — without this, txs would be re-included every block).
 	e.pool.RemoveBlock(block)
 
-	// Deliver results for admin mints included in this committed block.
-	e.resolveAdminMintsCommitted(block.Header.Height)
-
-	// Persist block to durable storage (if callback configured)
-	if e.cfg.OnBlockProduced != nil {
-		e.cfg.OnBlockProduced(block)
-	}
 	// Notify any block-source-agnostic listeners (e.g. periodic snapshotting).
 	if e.cfg.OnBlockAccepted != nil {
 		e.cfg.OnBlockAccepted(block)
 	}
+
+	// The proposal identity was durably prepared before AddBlock.  Run block
+	// persistence callbacks before publishing the completed mint outcome so a
+	// successful response is never emitted ahead of the configured chain
+	// durability boundary.
+	e.resolveAdminMintsCommitted(block.Header.Height)
 
 	// Broadcast to P2P
 	select {
@@ -1020,11 +1055,12 @@ func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
 // admin mints to one address shared a single key image and one spent/phantom
 // key-image index entry blocked every future mint to that address.
 //
-// On timeout the request is cancelled: if it is still queued it will never be
-// included; if it was already included in an in-flight block, the commit is
-// logged loudly (see resolveAdminMintsCommitted) so operators can record the
-// mint manually.
-func (e *Engine) ScheduleAdminMint(addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
+// A caller timeout does not cancel the keyed request: it remains queued or
+// in-flight, and a retry with the same key joins it rather than minting again.
+func (e *Engine) ScheduleAdminMint(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
+	if strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 128 {
+		return crypto.Hash32{}, 0, fmt.Errorf("idempotency key must be between 1 and 128 bytes")
+	}
 	tip := e.chain.Tip()
 	if tip != nil {
 		nextHeight := tip.Header.Height + 1
@@ -1046,60 +1082,99 @@ func (e *Engine) ScheduleAdminMint(addr string, amountNAPR uint64, timeout time.
 			"cannot admin-mint to the validator reward address %s: the per-block "+
 				"coinbase reward would collide with the same one-time pub", addr)
 	}
-	req := &adminMintReq{
-		addr:   addr,
-		amount: amountNAPR,
-		result: make(chan adminMintOutcome, 1),
-	}
 	e.mintMu.Lock()
+	if req := e.mintByKey[idempotencyKey]; req != nil {
+		if req.addr != addr || req.amount != amountNAPR {
+			e.mintMu.Unlock()
+			return crypto.Hash32{}, 0, fmt.Errorf("idempotency key already used with different address or amount")
+		}
+		e.mintMu.Unlock()
+		return waitAdminMint(req, timeout)
+	}
+	if e.adminMintStore != nil {
+		record, found, err := e.adminMintStore.LoadAdminMintRecord(idempotencyKey)
+		if err != nil {
+			e.mintMu.Unlock()
+			return crypto.Hash32{}, 0, err
+		}
+		if found {
+			if record.Address != addr || record.AmountNAPR != amountNAPR {
+				e.mintMu.Unlock()
+				return crypto.Hash32{}, 0, fmt.Errorf("idempotency key already used with different address or amount")
+			}
+			switch record.State {
+			case "", "completed":
+				e.mintMu.Unlock()
+				return record.TxHash, record.Height, nil
+			case "prepared":
+				// A crash may happen after a proposal was prepared but before
+				// its result was recorded.  Only declare it complete when the
+				// exact prepared transaction is in the canonical block.
+				block := e.chain.GetByHeight(record.Height)
+				if block != nil {
+					for _, tx := range block.Txs {
+						if tx.Hash() == record.TxHash {
+							record.State = "completed"
+							if err := e.adminMintStore.StoreAdminMintRecord(idempotencyKey, record); err != nil {
+								e.mintMu.Unlock()
+								return crypto.Hash32{}, 0, fmt.Errorf("persist reconciled admin mint outcome: %w", err)
+							}
+							e.mintMu.Unlock()
+							return record.TxHash, record.Height, nil
+						}
+					}
+				}
+				e.mintMu.Unlock()
+				return crypto.Hash32{}, 0, fmt.Errorf("admin mint has an unresolved prepared operation; refusing to remint")
+			case "intent":
+				e.mintMu.Unlock()
+				return crypto.Hash32{}, 0, fmt.Errorf("admin mint has an unresolved persisted intent; refusing to remint")
+			default:
+				e.mintMu.Unlock()
+				return crypto.Hash32{}, 0, fmt.Errorf("admin mint record has invalid state %q", record.State)
+			}
+		}
+	}
+	// Write the durable fence before exposing this request to the producer.
+	// If this fails, it is safer to reject than to mint an operation which a
+	// crash could later forget.
+	if e.adminMintStore != nil {
+		if err := e.adminMintStore.StoreAdminMintRecord(idempotencyKey, store.AdminMintRecord{
+			State: "intent", Address: addr, AmountNAPR: amountNAPR,
+		}); err != nil {
+			e.mintMu.Unlock()
+			return crypto.Hash32{}, 0, fmt.Errorf("persist admin mint intent: %w", err)
+		}
+	}
+	req := &adminMintReq{
+		key: idempotencyKey, addr: addr, amount: amountNAPR,
+		ready: make(chan struct{}),
+	}
+	e.mintByKey[idempotencyKey] = req
 	e.mintQueue = append(e.mintQueue, req)
 	e.mintMu.Unlock()
+	return waitAdminMint(req, timeout)
+}
 
+func waitAdminMint(req *adminMintReq, timeout time.Duration) (crypto.Hash32, uint64, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case out := <-req.result:
+	case <-req.ready:
+		out := req.outcome
 		return out.txHash, out.height, out.err
 	case <-timer.C:
-	}
-
-	// Timeout fired.  Take the mutex to reach a single authoritative terminal
-	// state: either the engine already delivered an outcome (req.done — the
-	// commit raced the timer; consume it and report success) or we cancel the
-	// request so it is never included.
-	e.mintMu.Lock()
-	if req.done {
-		e.mintMu.Unlock()
-		out := <-req.result // buffered — outcome already delivered
-		return out.txHash, out.height, out.err
-	}
-	req.cancelled = true
-	for i, q := range e.mintQueue {
-		if q == req {
-			e.mintQueue = append(e.mintQueue[:i], e.mintQueue[i+1:]...)
-			break
+		// Prefer a concurrently published result over a timeout.
+		select {
+		case <-req.ready:
+			out := req.outcome
+			return out.txHash, out.height, out.err
+		default:
 		}
+		return crypto.Hash32{}, 0, fmt.Errorf(
+			"admin mint not committed within %s; it remains scheduled and retrying with the same idempotency key will return its outcome", timeout)
 	}
-	e.mintMu.Unlock()
-	return crypto.Hash32{}, 0, fmt.Errorf(
-		"admin mint not committed within %s (no block produced — validator idle, "+
-			"syncing, or not our slot); the mint was NOT recorded on-chain", timeout)
 }
-
-// takeQueuedAdminMints pops queued admin mints and builds their transactions
-// at the given block height.  Called from produceBlock (engine goroutine only).
-//
-// At most one mint per address is included per block: two mints to the same
-// address at the same height would share one one-time pub / key image.  At
-// most maxTake mints are included in total, so the block never exceeds
-// maxCoinbasesPerBlock once the reward coinbase and any privileged mempool
-// coinbases are counted (a violation would fail the engine's own
-// validateCoinbasePolicy check and stall production forever).  The rest stay
-// queued for the next block.
-//
-// Any entries left in mintInFlight belong to a previously produced block that
-// failed to commit (tick error path) — they are re-queued first so they are
-// rebuilt at the new height.
 func (e *Engine) takeQueuedAdminMints(height uint64, maxTake int) []core.Transaction {
 	e.mintMu.Lock()
 	defer e.mintMu.Unlock()
@@ -1116,9 +1191,6 @@ func (e *Engine) takeQueuedAdminMints(height uint64, maxTake int) []core.Transac
 	seen := make(map[string]bool)
 	remaining := e.mintQueue[:0]
 	for _, req := range e.mintQueue {
-		if req.cancelled {
-			continue // caller gave up while still queued — drop silently
-		}
 		if len(txs) >= maxTake || seen[req.addr] {
 			remaining = append(remaining, req) // next block
 			continue
@@ -1126,12 +1198,27 @@ func (e *Engine) takeQueuedAdminMints(height uint64, maxTake int) []core.Transac
 		tx, err := core.BuildMintTx(crypto.Address(req.addr), req.amount, height)
 		if err != nil {
 			req.done = true
-			req.result <- adminMintOutcome{err: fmt.Errorf("build mint tx: %w", err)}
+			req.outcome = adminMintOutcome{err: fmt.Errorf("build mint tx: %w", err)}
+			close(req.ready)
 			continue
 		}
 		seen[req.addr] = true
 		req.txHash = tx.Hash()
 		req.height = height
+		// Persist the exact transaction identity before it can enter the
+		// candidate block.  This makes the crash window fail closed and lets a
+		// restarted engine reconcile a completed canonical inclusion.
+		if e.adminMintStore != nil {
+			if err := e.adminMintStore.StoreAdminMintRecord(req.key, store.AdminMintRecord{
+				State: "prepared", Address: req.addr, AmountNAPR: req.amount,
+				TxHash: req.txHash, Height: req.height,
+			}); err != nil {
+				req.done = true
+				req.outcome = adminMintOutcome{err: fmt.Errorf("persist prepared admin mint: %w", err)}
+				close(req.ready)
+				continue
+			}
+		}
 		e.mintInFlight = append(e.mintInFlight, req)
 		txs = append(txs, *tx)
 	}
@@ -1143,41 +1230,50 @@ func (e *Engine) takeQueuedAdminMints(height uint64, maxTake int) []core.Transac
 // mints once their block has been committed to the chain.  Called from tick()
 // after chain.AddBlock succeeds.
 //
-// The cancelled/done transition happens under mintMu so it cannot race the
-// caller's timeout path in ScheduleAdminMint: exactly one of the two sides
-// reaches the terminal state first, and the other observes it.
+// Publishing the outcome happens under mintMu; closing ready then broadcasts
+// the immutable result to every waiter sharing the idempotency key.
 func (e *Engine) resolveAdminMintsCommitted(height uint64) {
 	e.mintMu.Lock()
 	inflight := e.mintInFlight
 	e.mintInFlight = nil
-	var orphans []*adminMintReq
 	for _, req := range inflight {
-		if req.cancelled {
-			orphans = append(orphans, req)
-			continue
+		out := adminMintOutcome{txHash: req.txHash, height: req.height}
+		if e.adminMintStore != nil {
+			if err := e.adminMintStore.StoreAdminMintRecord(req.key, store.AdminMintRecord{
+				State: "completed", Address: req.addr, AmountNAPR: req.amount, TxHash: req.txHash, Height: req.height,
+			}); err != nil {
+				out = adminMintOutcome{err: fmt.Errorf("persist committed admin mint outcome: %w", err)}
+			}
 		}
 		req.done = true
-		// result is buffered (cap 1) — never blocks while holding mintMu.
-		req.result <- adminMintOutcome{txHash: req.txHash, height: req.height}
+		req.outcome = out
+		close(req.ready)
+		// Durable state is the source of truth after a terminal outcome. Existing
+		// waiters retain req directly, while a later caller must reload either
+		// the completed record or the prepared record left by a failed completed
+		// write and reconcile it against the canonical chain.
+		if e.adminMintStore != nil && e.mintByKey[req.key] == req {
+			delete(e.mintByKey, req.key)
+		}
 	}
 	e.mintMu.Unlock()
 
-	for _, req := range orphans {
-		// The caller timed out but the block committed anyway — the mint
-		// IS on-chain.  Log loudly so operators can record it manually
-		// (the API server that requested it never saw the tx hash).
-		e.log.Error("admin mint committed AFTER caller timeout — record it manually",
-			"address", req.addr,
-			"amount_napro", req.amount,
-			"tx_hash", fmt.Sprintf("%x", req.txHash[:]),
-			"height", req.height)
-	}
 	if len(inflight) > 0 {
 		e.log.Info("admin mint(s) committed", "count", len(inflight), "height", height)
 	}
 }
 
-// produceBlock assembles a new block from the mempool.
+func (e *Engine) resolveAdminMintsPersistenceFailed(err error) {
+	e.mintMu.Lock()
+	inflight := e.mintInFlight
+	e.mintInFlight = nil
+	for _, req := range inflight {
+		req.done = true
+		req.outcome = adminMintOutcome{err: fmt.Errorf("admin mint persistence failed: %w", err)}
+		close(req.ready)
+	}
+	e.mintMu.Unlock()
+}
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
 	raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
 	rewardActivation := e.cfg.RewardAuthorizationActivationHeight

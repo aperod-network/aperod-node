@@ -173,12 +173,14 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
                 MyKey:        myKey,
                 // Persist every self-produced block synchronously inside tick()
                 // so the produced-block channel is only used for P2P broadcast.
-                OnBlockProduced: func(b *core.Block) {
+		OnBlockProduced: func(b *core.Block) error {
                         // UTXO state is already updated by engine.tick() before this
                         // callback fires. persistBlockToDB is DB-only — no ApplyBlock.
                         if err := persistBlockToDB(db, b); err != nil {
                                 log.Error("persist produced block failed", "height", b.Header.Height, "err", err)
+				return err
                         }
+			return nil
                 },
         }, chain, mempool, log)
 

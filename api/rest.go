@@ -2306,8 +2306,9 @@ func (s *Server) localOnly(next http.HandlerFunc) http.HandlerFunc {
 
 // mintRequest is the JSON body for the admin mint endpoint.
 type mintRequest struct {
-        Address   string  `json:"address"`    // Aperod wallet address
-        AmountAPR float64 `json:"amount_apr"` // amount in APRO, fractional allowed (converted to nAPRO internally)
+        Address        string  `json:"address"`         // Aperod wallet address
+        AmountAPR      float64 `json:"amount_apr"`      // amount in APRO, fractional allowed (converted to nAPRO internally)
+        IdempotencyKey string  `json:"idempotency_key"` // caller-generated retry key
 }
 
 // mintResponse is returned on success.
@@ -2378,6 +2379,10 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                 writeJSONError(w, http.StatusBadRequest, "address required")
                 return
         }
+        if strings.TrimSpace(req.IdempotencyKey) == "" || len(req.IdempotencyKey) > 128 {
+                writeJSONError(w, http.StatusBadRequest, "idempotency_key must be between 1 and 128 bytes")
+                return
+        }
         if err := crypto.Validate(crypto.Address(req.Address)); err != nil {
                 writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
                 return
@@ -2407,7 +2412,7 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
                         "admin mint unavailable: this node is not an active validator (mint scheduler not wired)")
                 return
         }
-        txHashHex, mintHeight, err := s.mintScheduler(req.Address, amountNAPR, adminMintWaitTimeout)
+        txHashHex, mintHeight, err := s.mintScheduler(req.IdempotencyKey, req.Address, amountNAPR, adminMintWaitTimeout)
         if err != nil {
                 s.log.Error("admin mint: schedule failed", "err", err)
                 writeJSONError(w, http.StatusServiceUnavailable, "schedule mint: "+err.Error())

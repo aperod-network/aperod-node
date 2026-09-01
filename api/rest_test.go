@@ -562,13 +562,13 @@ func TestREST_AdminMint_FractionalAmount(t *testing.T) {
 	srv, _ := newTestServer(t)
 	// Stub the engine mint scheduler (in production it is wired to
 	// consensus.Engine.ScheduleAdminMint by cmd/node).
-	srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+	srv.SetMintScheduler(func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
 		return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 42, nil
 	})
 	wk, _ := crypto.GenerateWalletKeys()
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-	body := []byte(`{"address":"` + string(addr) + `","amount_apr":5909.5}`)
+	body := []byte(`{"idempotency_key":"fractional","address":"` + string(addr) + `","amount_apr":5909.5}`)
 	code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
 	if code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %v", code, resp)
@@ -597,13 +597,13 @@ func TestREST_AdminMint_FractionalAmount(t *testing.T) {
 func TestREST_AdminMint_ReturnsV2BlindForScheduledHeight(t *testing.T) {
 	srv, _ := newTestServer(t)
 	const mintHeight = uint64(777)
-	srv.SetMintScheduler(func(addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+	srv.SetMintScheduler(func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
 		return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", mintHeight, nil
 	})
 	wk, _ := crypto.GenerateWalletKeys()
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-	body := []byte(`{"address":"` + string(addr) + `","amount_apr":500}`)
+	body := []byte(`{"idempotency_key":"blind","address":"` + string(addr) + `","amount_apr":500}`)
 	code, resp := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
 	if code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %v", code, resp)
@@ -632,7 +632,7 @@ func TestREST_AdminMint_ZeroAmount(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-	body := []byte(`{"address":"` + string(addr) + `","amount_apr":0}`)
+	body := []byte(`{"idempotency_key":"zero","address":"` + string(addr) + `","amount_apr":0}`)
 	code, _ := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
 	if code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for zero amount, got %d", code)
