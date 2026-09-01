@@ -461,8 +461,9 @@ func TestDBGapAtStartOfWindow(t *testing.T) {
 //     slice empty (entire window is a gap).
 //   - anchorTipIfNeeded is given the unfiltered store (block N present) and must
 //     advance chain.Height() from 0 to N.
-//   - HeadersFrom with a peer that only knows genesis must return ≥ 1 header
-//     (at minimum the tip block's header at height N).
+//   - HeadersFrom with a peer that only knows genesis must return exactly the
+//     one in-memory non-genesis header: the anchored tip at height N.
+//   - Once the peer knows that tip header, HeadersFrom must return no headers.
 func TestHeadersFromWithEntireWindowGap(t *testing.T) {
 	const (
 		nBlocks   = 9
@@ -511,26 +512,28 @@ func TestHeadersFromWithEntireWindowGap(t *testing.T) {
 	}
 	t.Logf("chain anchored to height %d after entire-window gap", chain.Height())
 
-	// ── Step D: HeadersFrom must serve at least the tip block ─────────────
+	// ── Step D: HeadersFrom must serve exactly the tip block ──────────────
 	// A syncing peer that only knows genesis sends genesis hash as its known tip.
-	// HeadersFrom must return ≥ 1 header (the tip block at height N).
+	// Intermediate heights are absent from byHeight, so only the anchored tip is
+	// available to return.
 	genesisHash := blocks[0].Hash()
 	headers := chain.HeadersFrom([]crypto.Hash32{genesisHash}, 500)
 
-	if len(headers) == 0 {
-		t.Fatal("HeadersFrom returned 0 headers: node cannot serve any blocks after entire-window gap + anchor")
+	if len(headers) != 1 {
+		t.Fatalf("HeadersFrom returned %d headers, want exactly 1 anchored tip header", len(headers))
+	}
+	if headers[0].Height != tipHeight {
+		t.Errorf("HeadersFrom returned header at height %d, want anchored tip height %d",
+			headers[0].Height, tipHeight)
 	}
 
-	maxServed := uint64(0)
-	for _, hdr := range headers {
-		if hdr.Height > maxServed {
-			maxServed = hdr.Height
-		}
+	// A peer that already knows the sole in-memory non-genesis header is caught
+	// up to this node's tip and must receive no further headers.
+	tipHash := blocks[nBlocks].Hash()
+	upToDateHeaders := chain.HeadersFrom([]crypto.Hash32{tipHash}, 500)
+	if len(upToDateHeaders) != 0 {
+		t.Errorf("HeadersFrom returned %d headers for peer already at tip, want 0", len(upToDateHeaders))
 	}
-	if maxServed < tipHeight {
-		t.Errorf("HeadersFrom served max height %d, want >= %d (tip must be reachable)", maxServed, tipHeight)
-	}
-	t.Logf("HeadersFrom served %d header(s), max height = %d (entire-window gap covered)", len(headers), maxServed)
 }
 
 // buildEntireWindowGapChain creates a chain of nBlocks blocks where only
@@ -796,6 +799,88 @@ func TestCorruptSnapshotFallsBackToGapResumeScan(t *testing.T) {
 		"chain anchored to height %d, corrupt snapshot rejected "+
 		"(startup_reason=corrupt_snapshot), gap-resume scan ran from block 1",
 		len(recentBlocks), tipHeight)
+}
+
+// TestCorruptSnapshotWithEntireWindowGapDoesNotFork covers the combined
+// restart failure mode where the startup snapshot is corrupt and every
+// intermediate block in the recent-block window is absent. The fallback scan
+// must tolerate the missing heights, while the in-memory chain must still be
+// anchored to the canonical DB tip before consensus can produce another block.
+func TestCorruptSnapshotWithEntireWindowGapDoesNotFork(t *testing.T) {
+	const (
+		nBlocks   = 9
+		tipHeight = uint64(nBlocks)
+	)
+
+	dir := t.TempDir()
+	db, blocks := buildEntireWindowGapChain(t, dir, nBlocks)
+	tipHashHex := fmt.Sprintf("%x", blocks[nBlocks].Hash())
+
+	if err := os.WriteFile(
+		snapshotPath(dir, tipHeight),
+		[]byte(`{"v":2,"tip_height":9,"tip_hash":"truncated`),
+		0644,
+	); err != nil {
+		t.Fatalf("write corrupt snapshot: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	snap, _, snapErr := tryLoadStartupSnapshot(dir, tipHeight, tipHashHex, log)
+	if snapErr == nil || snap != nil {
+		t.Fatalf("tryLoadStartupSnapshot accepted corrupt snapshot: snap=%v err=%v", snap, snapErr)
+	}
+	if !logContainsFieldValue(&logBuf, "startup_reason", "corrupt_snapshot") {
+		t.Fatalf("structured log field startup_reason=corrupt_snapshot not found\nlog:\n%s", logBuf.String())
+	}
+
+	// Production's fallback UTXO scan sees heights 1..8 missing and the
+	// canonical tip at 9. The tolerance is deliberately equal to the complete
+	// gap size so an off-by-one or fail-fast regression is caught.
+	utxos := core.NewUTXOSet()
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	var wg sync.WaitGroup
+	result, scanErr := runStartupScan(startupScanParams{
+		DataDir:          dir,
+		TipHeight:        tipHeight,
+		TipHashHex:       tipHashHex,
+		DB:               db,
+		UTXOs:            utxos,
+		Registry:         registry,
+		KiFromIndex:      false,
+		Log:              log,
+		SnapshotWg:       &wg,
+		MaxMissingBlocks: tipHeight - 1,
+	})
+	wg.Wait()
+	if scanErr != nil {
+		t.Fatalf("runStartupScan rejected an all-intermediate-height gap within tolerance: %v", scanErr)
+	}
+	if result.ScanFrom != 1 {
+		t.Errorf("runStartupScan ScanFrom = %d, want 1 after corrupt snapshot", result.ScanFrom)
+	}
+
+	// The recent window contains only the tip. Even if this changes to return an
+	// empty slice, anchorTipIfNeeded must leave the chain at the canonical tip,
+	// never at genesis where consensus would produce a duplicate height-1 block.
+	recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log)
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	chain.FastForward(recentBlocks)
+	if err := anchorTipIfNeeded(chain, db, tipHeight, log); err != nil {
+		t.Fatalf("anchorTipIfNeeded: %v", err)
+	}
+	if chain.Height() != tipHeight {
+		t.Fatalf("restart chain height = %d, want canonical tip %d; next block would fork at height %d",
+			chain.Height(), tipHeight, chain.Height()+1)
+	}
+	if nextHeight := chain.Height() + 1; nextHeight == 1 {
+		t.Fatal("restart would produce duplicate block at height 1 from genesis")
+	}
 }
 
 // TestCorruptPrimaryAndPrevSnapshotFallBackToRecentBlocks guards the
