@@ -46,9 +46,9 @@ type KeyImageStore interface {
 // The zero value (nil map, nil kiDB, nil slice) is valid: an empty set.
 // Use NewUTXOSet() for tests; NewUTXOSetWithDB(db) for production.
 type compactKeyImageSet struct {
-	sorted []crypto.KeyImage              // test-only fallback: compact, sorted, O(log n) lookup
-	recent map[crypto.KeyImage]struct{}   // runtime additions: O(1) insert, no disk I/O
-	kiDB   KeyImageStore                  // persistent backend; nil in tests
+	sorted []crypto.KeyImage            // test-only fallback: compact, sorted, O(log n) lookup
+	recent map[crypto.KeyImage]struct{} // runtime additions: O(1) insert, no disk I/O
+	kiDB   KeyImageStore                // persistent backend; nil in tests
 }
 
 // kiLess returns true when a < b in lexicographic byte order.
@@ -223,11 +223,11 @@ type rollbackEntry struct {
 type UTXOSet struct {
 	mu              sync.RWMutex
 	utxos           map[UTXOKey]*UTXO
-	keyImages       compactKeyImageSet           // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
-	byPubKey        map[crypto.Point32]*UTXO     // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
-	stakedUTXOs     map[UTXOKey]*UTXO            // UTXOs burned for staking (C-1 fix) — stores data for rollback
-	spentPubKeys    map[crypto.Point32]*UTXO     // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
-	rollbackJournal map[uint64][]rollbackEntry   // height → UTXOs spent at that height (for RollbackBlock)
+	keyImages       compactKeyImageSet         // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
+	byPubKey        map[crypto.Point32]*UTXO   // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
+	stakedUTXOs     map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	spentPubKeys    map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
+	rollbackJournal map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
 
 	// OnUTXOSpent, when non-nil, is called from ApplyBlock each time the
 	// real spending input for a ring transaction is identified and removed
@@ -378,18 +378,43 @@ func (s *UTXOSet) IsSpent(ki crypto.KeyImage) bool {
 	return s.keyImages.contains(canonical)
 }
 
+// ClearPhantomSpent removes a key image from the persistent spent set after an
+// authoritative confirmed-chain scan proves that it never appeared in a
+// transaction input. If the image was added to the current session's recent
+// set while that scan was running, it is preserved and cleared is false.
+func (s *UTXOSet) ClearPhantomSpent(ki crypto.KeyImage) (cleared bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	canonical, err := crypto.CanonicalKeyImage(ki)
+	if err == nil {
+		ki = canonical
+	}
+	if _, recentlySpent := s.keyImages.recent[ki]; recentlySpent {
+		return false, nil
+	}
+	if s.keyImages.kiDB != nil {
+		if err := s.keyImages.kiDB.DeleteKeyImage(ki); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	s.keyImages.remove(ki)
+	return true, nil
+}
+
 // ApplyBlock updates the UTXO set by processing all transactions in a block.
 // Inputs are removed (key images marked spent), outputs are added.
 //
 // The operation is transactional: a two-pass approach ensures that the UTXO
 // set is never partially mutated on rejection.
 //
-//   Pass 1 — pre-validation (read-only, whole-block lock held):
-//     • Check every input key image for historical or within-block double-spend.
-//     • If any check fails the function returns an error and the set is unchanged.
+//	Pass 1 — pre-validation (read-only, whole-block lock held):
+//	  • Check every input key image for historical or within-block double-spend.
+//	  • If any check fails the function returns an error and the set is unchanged.
 //
-//   Pass 2 — apply (write, same lock held throughout):
-//     • Mark key images spent and add outputs.  Cannot fail after pass 1.
+//	Pass 2 — apply (write, same lock held throughout):
+//	  • Mark key images spent and add outputs.  Cannot fail after pass 1.
 //
 // Holding the lock across both passes prevents a concurrent goroutine from
 // sneaking in a conflicting key image between validation and application.
