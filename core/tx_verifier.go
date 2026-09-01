@@ -129,6 +129,13 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // only and are never routed through the public tx pipeline.  Silently
         // accepting one here would allow inflation without any cryptographic check.
         if len(tx.Inputs) == 0 {
+			if tx.IsStake() {
+				// Stake payloads are authenticated and applied by the
+				// ValidatorRegistry path. Validate() already guarantees that
+				// stake transactions have no outputs, so they must not be
+				// rejected as coinbase-like zero-input transactions here.
+				return nil
+			}
                 return fmt.Errorf("tx verifier: coinbase (zero-input) transaction rejected — must be engine-synthesized only")
         }
 

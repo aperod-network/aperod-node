@@ -115,6 +115,10 @@ type Engine struct {
 	// baseFee is the current EIP-1559 base fee per byte (nAPRO/byte).
 	// Updated after every accepted block; embedded in every produced block header.
 	baseFee uint64
+	// halted is set when a transactional rollback cannot be persisted.  The
+	// process stays available for diagnostics but refuses all further consensus
+	// transitions until an operator restarts it after repairing storage.
+	halted atomic.Bool
 	// txVerifier performs full cryptographic verification of incoming block txs.
 	// If nil, cryptographic verification is skipped (dev/test only — never in production).
 	txVerifier *core.TxVerifier
@@ -262,6 +266,21 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 	} else {
 		// Pool disabled — -1 signals legacy mint behaviour.
 		atomic.StoreInt64(&e.stakingPoolRemaining, -1)
+	}
+	// Reconstruct the fee expected for the block after the current tip.  Without
+	// this restart path every node would reset to the genesis fee and could
+	// disagree with peers that stayed online.
+	if chain != nil {
+		if tip := chain.Tip(); tip != nil && tip.Header.Height > 0 {
+			tipBaseFee := tip.Header.BaseFee
+			if tipBaseFee == 0 {
+				tipBaseFee = core.InitialBaseFeePerByte
+			}
+			e.baseFee = nextBaseFee(tipBaseFee, tip.Size())
+		}
+	}
+	if pool != nil {
+		pool.SetBaseFee(e.baseFee)
 	}
 	return e
 }
@@ -432,6 +451,9 @@ func (e *Engine) Run(stop <-chan struct{}) {
 
 // tick is called once per block slot.
 func (e *Engine) tick() error {
+	if e.halted.Load() {
+		return fmt.Errorf("consensus engine halted after persistent rollback failure")
+	}
 	tip := e.chain.Tip()
 	if tip == nil {
 		return fmt.Errorf("no genesis block")
@@ -455,8 +477,12 @@ func (e *Engine) tick() error {
 	// Sanity-check the block we just produced against the same coinbase policy
 	// that peer blocks must satisfy.  Should always pass for engine-produced
 	// blocks; a failure here indicates a bug in produceBlock itself.
-	if err := validateCoinbasePolicy(block); err != nil {
+	if err := e.validateCoinbasePolicy(block); err != nil {
 		return fmt.Errorf("self-produced block %d failed coinbase policy (bug in produceBlock): %w",
+			block.Header.Height, err)
+	}
+	if err := e.validateBlockEconomics(block); err != nil {
+		return fmt.Errorf("self-produced block %d failed fee policy: %w",
 			block.Header.Height, err)
 	}
 	if err := e.validateRingCTV4Activation(block); err != nil {
@@ -503,6 +529,9 @@ func (e *Engine) tick() error {
 				if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
 					e.log.Error("UTXO rollback failed after ApplyBlockStakeTxs error (self-produced)",
 						"height", block.Header.Height, "err", rbErr)
+					e.halted.Store(true)
+					return fmt.Errorf("fatal persistent UTXO rollback failure at self-produced block %d: %w",
+						block.Header.Height, rbErr)
 				}
 			}
 			// Evict the offending stake txs so they are not re-selected.
@@ -518,8 +547,10 @@ func (e *Engine) tick() error {
 
 	// Add to canonical chain.  On failure, rollback BOTH UTXO outputs and stake state.
 	if err := e.chain.AddBlock(block); err != nil {
+		var rollbackErr error
 		if e.utxos != nil {
 			if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+				rollbackErr = rbErr
 				e.log.Error("UTXO rollback failed after chain.AddBlock error (self-produced)",
 					"height", block.Header.Height,
 					"chain_err", err, "rollback_err", rbErr)
@@ -528,8 +559,27 @@ func (e *Engine) tick() error {
 		if stakeRollback != nil {
 			stakeRollback()
 		}
+		if rollbackErr != nil {
+			e.halted.Store(true)
+			return fmt.Errorf("fatal persistent UTXO rollback failure at self-produced block %d: %w",
+				block.Header.Height, rollbackErr)
+		}
 		return fmt.Errorf("add produced block: %w", err)
 	}
+
+	// Advance the fee state for locally produced blocks exactly as for peer
+	// blocks.  Omitting this transition makes a consecutive local proposal
+	// reuse the previous fee and diverge from validating peers.
+	blockBaseFee := block.Header.BaseFee
+	if blockBaseFee == 0 {
+		blockBaseFee = e.expectedBaseFeeAt(block.Header.Height)
+	}
+	newFee := nextBaseFee(blockBaseFee, block.Size())
+	e.mu.Lock()
+	e.baseFee = newFee
+	e.mu.Unlock()
+	e.pool.SetBaseFee(newFee)
+
 	// Stake txs already applied above — no processStakeTxs call needed.
 	if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
 		newSet := e.cfg.Registry.UpdateEpoch(block.Header.Height)
@@ -771,6 +821,100 @@ func validateCoinbasePolicy(block *core.Block) error {
 	return nil
 }
 
+// validateCoinbasePolicy applies the historical structural policy before the
+// RingCT v4 activation and a fail-closed deterministic reward policy from the
+// activation height onward.
+//
+// Privileged/admin mint provenance, reward recipient, and staking-pool balance
+// are local configuration/state and cannot be independently reconstructed by
+// every validator.  All zero-input value creation is therefore forbidden after
+// activation until the protocol has an explicit on-chain authorization proof.
+func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
+	if err := validateCoinbasePolicy(block); err != nil {
+		return err
+	}
+
+	activation := e.cfg.RingCTV4ActivationHeight
+	if activation > 0 && block.Header.Height < activation {
+		return nil
+	}
+
+	var coinbases []core.Transaction
+	for i := range block.Txs {
+		tx := block.Txs[i]
+		if tx.IsCoinbase() && !tx.IsStake() {
+			coinbases = append(coinbases, tx)
+		}
+	}
+
+	if len(coinbases) != 0 {
+		return fmt.Errorf("zero-input value creation is disabled from activation height %d, got %d mint transaction(s)",
+			activation, len(coinbases))
+	}
+	return nil
+}
+
+func (e *Engine) validateBlockEconomics(block *core.Block) error {
+	activation := e.cfg.RingCTV4ActivationHeight
+	if activation > 0 && block.Header.Height < activation {
+		return nil
+	}
+
+	expectedBaseFee := e.expectedBaseFeeAt(block.Header.Height)
+	// Historical blocks encoded zero as "use the current protocol fee".
+	// Preserve that representation, but derive the effective fee locally.
+	if block.Header.BaseFee == 0 {
+		return fmt.Errorf("base fee must be explicitly committed after activation")
+	}
+	if block.Header.BaseFee != expectedBaseFee {
+		return fmt.Errorf("base fee mismatch: got %d, want %d",
+			block.Header.BaseFee, expectedBaseFee)
+	}
+
+	var totalFees uint64
+	var totalMinimum uint64
+	for i := range block.Txs {
+		tx := &block.Txs[i]
+		if tx.IsCoinbase() || tx.IsStake() {
+			continue
+		}
+		minFee := tx.MinFeeAt(expectedBaseFee)
+		if tx.Fee < minFee {
+			return fmt.Errorf("transaction %d fee below consensus minimum: got %d, want at least %d",
+				i, tx.Fee, minFee)
+		}
+		if totalFees > ^uint64(0)-tx.Fee {
+			return fmt.Errorf("aggregate transaction fees overflow uint64")
+		}
+		totalFees += tx.Fee
+		if totalMinimum > ^uint64(0)-minFee {
+			return fmt.Errorf("aggregate minimum fees overflow uint64")
+		}
+		totalMinimum += minFee
+	}
+	return nil
+}
+
+func (e *Engine) expectedBaseFee() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.baseFee == 0 {
+		return core.InitialBaseFeePerByte
+	}
+	return e.baseFee
+}
+
+func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
+	activation := e.cfg.RingCTV4ActivationHeight
+	if activation > 0 && height == activation {
+		// Establish an explicit consensus anchor at the hard-fork boundary.
+		// This makes the first strict block independent of how a pre-activation
+		// node represented or reconstructed legacy zero-valued fee headers.
+		return core.InitialBaseFeePerByte
+	}
+	return e.expectedBaseFee()
+}
+
 // ─── Admin mint scheduling ────────────────────────────────────────────────────
 
 // ScheduleAdminMint queues an admin mint and blocks until the mint is included
@@ -788,6 +932,15 @@ func validateCoinbasePolicy(block *core.Block) error {
 // logged loudly (see resolveAdminMintsCommitted) so operators can record the
 // mint manually.
 func (e *Engine) ScheduleAdminMint(addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
+	tip := e.chain.Tip()
+	if tip != nil {
+		nextHeight := tip.Header.Height + 1
+		activation := e.cfg.RingCTV4ActivationHeight
+		if activation == 0 || nextHeight >= activation {
+			return crypto.Hash32{}, 0, fmt.Errorf(
+				"admin mint is disabled from RingCT v4 activation height; use an on-chain authorized mint protocol")
+		}
+	}
 	if amountNAPR == 0 {
 		return crypto.Hash32{}, 0, fmt.Errorf("mint amount must be > 0")
 	}
@@ -981,6 +1134,16 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				screened = append(screened, *tx)
 				continue
 			}
+			if err := core.ValidateTxVersionAtHeight(tx, height, e.cfg.RingCTV4ActivationHeight); err != nil {
+				hash := tx.Hash()
+				e.log.Warn("produceBlock: banning tx rejected by RingCT activation policy",
+					"hash", hash,
+					"height", height,
+					"err", err,
+				)
+				e.pool.BanTx(hash)
+				continue
+			}
 			if err := e.txVerifier.VerifyTx(tx); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning mempool tx that failed re-verification",
@@ -1018,9 +1181,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 
 	// Compute burned fees and priority tips for selected txs, then include
 	// tips in the coinbase reward (validator earns block reward + tips).
-	e.mu.Lock()
-	currentBaseFee := e.baseFee
-	e.mu.Unlock()
+currentBaseFee := e.expectedBaseFeeAt(height)
 
 	// Tips belong exclusively to this block's producer.  Never carry tips
 	// observed from blocks proposed by other validators into our coinbase.
@@ -1045,12 +1206,17 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			mintCapacity--
 		}
 	}
-	if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
-		txs = append(adminMints, txs...)
+	activation := e.cfg.RingCTV4ActivationHeight
+	if activation > 0 && height < activation {
+		if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
+			txs = append(adminMints, txs...)
+		}
 	}
 
-	// Prepend coinbase block reward transaction when reward_address is configured.
-	if e.cfg.RewardAddress != "" {
+// Legacy reward mints remain available only before the activation boundary.
+// Post-activation reward distribution requires an on-chain authorization
+// format that every validator can verify without local configuration.
+if e.cfg.RewardAddress != "" && activation > 0 && height < activation {
 		baseReward := e.cfg.BlockRewardNAPR
 		if baseReward == 0 {
 			baseReward = defaultBlockRewardNAPR
@@ -1079,8 +1245,11 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			rewardNAPR = blockRewardAtHeight(baseReward, height)
 		}
 
-		// Validator earns base reward + priority tips from all txs in this block.
-		totalReward := rewardNAPR + tips
+// Validator earns base reward + priority tips from all txs in this block.
+if rewardNAPR > ^uint64(0)-tips {
+return nil, fmt.Errorf("block reward plus tips overflows uint64")
+}
+totalReward := rewardNAPR + tips
 		mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
 		if err != nil {
 			e.log.Warn("failed to build coinbase reward tx", "err", err)
@@ -1126,6 +1295,9 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 const maxClockSkewNs = int64(15 * 1_000_000_000)
 
 func (e *Engine) handleIncomingBlock(block *core.Block) error {
+	if e.halted.Load() {
+		return fmt.Errorf("consensus engine halted after persistent rollback failure")
+	}
 	// Basic structural validation
 	if err := block.Validate(); err != nil {
 		return fmt.Errorf("invalid block: %w", err)
@@ -1225,8 +1397,11 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	// This closes the free-mint attack: a block produced by a malicious or
 	// compromised proposer that includes multiple zero-input transactions
 	// (each creating new UTXOs) is rejected before any UTXO state is applied.
-	if err := validateCoinbasePolicy(block); err != nil {
+	if err := e.validateCoinbasePolicy(block); err != nil {
 		return fmt.Errorf("block %d: coinbase policy violation: %w", block.Header.Height, err)
+	}
+	if err := e.validateBlockEconomics(block); err != nil {
+		return fmt.Errorf("block %d: fee policy violation: %w", block.Header.Height, err)
 	}
 	if err := e.validateRingCTV4Activation(block); err != nil {
 		return fmt.Errorf("block %d: RingCT activation policy violation: %w", block.Header.Height, err)
@@ -1281,6 +1456,9 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 				if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
 					e.log.Error("UTXO rollback failed after ApplyBlockStakeTxs error",
 						"height", block.Header.Height, "err", rbErr)
+					e.halted.Store(true)
+					return fmt.Errorf("fatal persistent UTXO rollback failure at block %d: %w",
+						block.Header.Height, rbErr)
 				}
 			}
 			return fmt.Errorf("block %d: stake apply failed (block rejected): %w",
@@ -1291,8 +1469,10 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	if err := e.chain.AddBlock(block); err != nil {
 		// Chain insertion failed after UTXO and stake state were already updated.
 		// Roll back both to keep all state consistent.
+		var rollbackErr error
 		if e.utxos != nil {
 			if rbErr := e.utxos.RollbackBlock(block); rbErr != nil {
+				rollbackErr = rbErr
 				e.log.Error("UTXO rollback failed after chain.AddBlock error",
 					"height", block.Header.Height,
 					"chain_err", err, "rollback_err", rbErr)
@@ -1301,6 +1481,11 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 		if stakeRollback != nil {
 			stakeRollback()
 		}
+		if rollbackErr != nil {
+			e.halted.Store(true)
+			return fmt.Errorf("fatal persistent UTXO rollback failure at block %d: %w",
+				block.Header.Height, rollbackErr)
+		}
 		return fmt.Errorf("add block: %w", err)
 	}
 	// Stake txs already applied above — no processStakeTxs call needed.
@@ -1308,7 +1493,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	// ── EIP-1559 base fee update ─────────────────────────────────────────────
 	blockBaseFee := block.Header.BaseFee
 	if blockBaseFee == 0 {
-		blockBaseFee = core.InitialBaseFeePerByte
+		blockBaseFee = e.expectedBaseFee()
 	}
 	burnedNAPR, tipNAPR := blockFeeStats(block.Txs, blockBaseFee)
 	newFee := nextBaseFee(blockBaseFee, block.Size())

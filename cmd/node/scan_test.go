@@ -462,6 +462,7 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 		Validators:   activeValidators, // seeded by the observed-producer fallback
 		Registry:     registry,
 		MyKey:        nil, // non-validator relay: never produces blocks
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, relayChain, relayMp, discardLog())
 	relayEng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 

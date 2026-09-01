@@ -94,6 +94,7 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{pub},
 		MyKey:        nil, // not a producing validator in this test
+		RingCTV4ActivationHeight: ^uint64(0),
 		OnBlockAccepted: func(block *core.Block) {
 			h := block.Header.Height
 			mu.Lock()

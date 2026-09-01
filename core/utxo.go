@@ -235,6 +235,10 @@ type UTXOSet struct {
 	// the persistent su/ index stays current during both the startup block
 	// scan and live block acceptance.  Tests leave it nil.
 	OnUTXOSpent func(txHash crypto.Hash32, outIdx uint32)
+	// OnUTXORestored, when non-nil, is called when RollbackBlock restores an
+	// input to the active set.  Production wires this to the inverse su/ index
+	// operation so a failed block cannot leave a durable false-spent marker.
+	OnUTXORestored func(txHash crypto.Hash32, outIdx uint32) error
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set with no persistent
@@ -570,13 +574,13 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 // net, any input whose journal entry is missing (e.g. journal pruned for a
 // deep reorg beyond maxRollbackDepth) is also looked up in spentPubKeys.
 //
-// Caution: this is an in-memory rollback only.  The persistent store (LevelDB)
-// is not touched here; durable reorg recovery requires the store's revert journal.
+// When OnUTXORestored is configured, the persistent spent-UTXO index is rolled
+// back in lockstep with the in-memory state.
 func (s *UTXOSet) RollbackBlock(block *Block) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	height := block.Header.Height
+	restoredKeys := make([]UTXOKey, 0, len(s.rollbackJournal[height]))
 
 	// ── Step 1: restore spent inputs from the rollback journal ───────────────
 	// Build a set of ring members restored from the journal so we can skip
@@ -585,6 +589,9 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 	for _, entry := range s.rollbackJournal[height] {
 		s.utxos[UTXOKey{TxHash: entry.utxo.TxHash, OutputIndex: entry.utxo.OutputIndex}] = entry.utxo
 		s.byPubKey[entry.ringMember] = entry.utxo
+		restoredKeys = append(restoredKeys, UTXOKey{
+			TxHash: entry.utxo.TxHash, OutputIndex: entry.utxo.OutputIndex,
+		})
 		// Remove from decoy pool — the UTXO is unspent again after rollback.
 		delete(s.spentPubKeys, entry.ringMember)
 		journalRestored[entry.ringMember] = struct{}{}
@@ -619,13 +626,30 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 						delete(s.spentPubKeys, member)
 						s.byPubKey[member] = utxo
 						s.utxos[UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex}] = utxo
+						restoredKeys = append(restoredKeys, UTXOKey{
+							TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex,
+						})
 						break
 					}
 				}
 			}
 		}
 	}
-	return nil
+	onRestored := s.OnUTXORestored
+	s.mu.Unlock()
+
+	// Persistent I/O must not run while holding the UTXO mutex.  Attempt every
+	// inverse update so one failed key does not leave the remaining keys stale.
+	var firstErr error
+	if onRestored != nil {
+		for _, key := range restoredKeys {
+			if err := onRestored(key.TxHash, key.OutputIndex); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("persist restored UTXO %x:%d: %w",
+					key.TxHash[:8], key.OutputIndex, err)
+			}
+		}
+	}
+	return firstErr
 }
 
 // MarkStaked burns a UTXO for staking: removes it from the active set so it

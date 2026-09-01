@@ -8,11 +8,33 @@ package core
 // rollback state must come exclusively from the separate rollback journal.
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/aperod/aperod/crypto"
 )
+
+func TestRollbackBlockPropagatesPersistentIndexFailure(t *testing.T) {
+	utxos := NewUTXOSet()
+	var txHash crypto.Hash32
+	txHash[0] = 0xA5
+	var pub crypto.Point32
+	pub[0] = 0x02
+	u := &UTXO{TxHash: txHash, OutputIndex: 3, OneTimePub: pub}
+	utxos.rollbackJournal[7] = []rollbackEntry{{ringMember: pub, utxo: u}}
+
+	wantErr := errors.New("durable delete failed")
+	utxos.OnUTXORestored = func(crypto.Hash32, uint32) error { return wantErr }
+	err := utxos.RollbackBlock(&Block{Header: BlockHeader{Height: 7}})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("RollbackBlock error = %v, want wrapped persistence error", err)
+	}
+	// The callback executes outside the UTXO lock; a lookup must not deadlock.
+	if got := utxos.Get(txHash, 3); got == nil {
+		t.Fatal("in-memory UTXO was not restored")
+	}
+}
 
 // TestRollbackBlock_FullDecoyPool checks the scenario the reviewer flagged:
 //  1. Fill spentPubKeys to cap (temporarily lowered to 3 so we do not need
@@ -156,6 +178,11 @@ func TestRollbackBlock_FullDecoyPool(t *testing.T) {
 	}
 
 	// ── Roll back block 1 ─────────────────────────────────────────────────────
+	var restored []UTXOKey
+	utxos.OnUTXORestored = func(txHash crypto.Hash32, outIdx uint32) error {
+		restored = append(restored, UTXOKey{TxHash: txHash, OutputIndex: outIdx})
+		return nil
+	}
 	if err := utxos.RollbackBlock(b1); err != nil {
 		t.Fatalf("RollbackBlock(1): %v", err)
 	}
@@ -167,6 +194,9 @@ func TestRollbackBlock_FullDecoyPool(t *testing.T) {
 	}
 	if got := utxos.GetByPubKey(aliceUTXO.OneTimePub); got == nil {
 		t.Error("RollbackBlock: Alice's UTXO missing from GetByPubKey() — journal not used for restoration")
+	}
+	if len(restored) != 1 || restored[0] != (UTXOKey{TxHash: cb0Hash, OutputIndex: 0}) {
+		t.Fatalf("RollbackBlock: persistent-index callback got %v, want restored Alice UTXO", restored)
 	}
 
 	// Bob's output (created by block 1) must be absent after rollback.

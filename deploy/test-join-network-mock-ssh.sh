@@ -26,6 +26,7 @@
 #  Exit codes:
 #    0 — all tests passed
 #    1 — one or more tests failed
+#   77 — one or more scenarios were skipped
 # =============================================================================
 set -uo pipefail
 
@@ -37,10 +38,29 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\
 
 PASS=0
 FAIL=0
+SKIPPED=()
 
 pass()    { echo -e "${GREEN}  PASS${NC}  $*"; ((PASS++)); }
 fail()    { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
 section() { echo -e "\n${BOLD}▶ $*${NC}"; }
+skip()    { echo -e "${YELLOW}  SKIP${NC}  $*"; SKIPPED+=("$*"); }
+
+finish() {
+  echo
+  echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
+  echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${#SKIPPED[@]} skipped${NC}"
+  if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}  SKIPPED SCENARIOS:${NC}"
+    printf '    - %s\n' "${SKIPPED[@]}"
+    echo "  SKIP_SUMMARY count=${#SKIPPED[@]}"
+  fi
+  echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
+  echo
+
+  [[ ${FAIL} -gt 0 ]] && exit 1
+  [[ ${#SKIPPED[@]} -gt 0 ]] && exit 77
+  exit 0
+}
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 if [[ ! -f "${JOIN_SH}" ]]; then
@@ -49,13 +69,13 @@ if [[ ! -f "${JOIN_SH}" ]]; then
 fi
 
 if ! command -v python3 &>/dev/null; then
-  echo -e "${YELLOW}[SKIP]${NC}  python3 not found in PATH — skipping." >&2
-  exit 0
+  skip "M1-M6: python3 not found in PATH"
+  finish
 fi
 
 if ! python3 -c "import yaml" 2>/dev/null; then
-  echo -e "${YELLOW}[SKIP]${NC}  python3 pyyaml not available — skipping." >&2
-  exit 0
+  skip "M1-M6: python3 pyyaml not available"
+  finish
 fi
 
 TMPDIR_TEST=$(mktemp -d)
@@ -361,7 +381,7 @@ section "M2: Full script run — node-config.sh preferred path writes bootnode"
 # than falling through to the Python fallback.
 
 if [[ ! -f "${NODE_CONFIG_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  node-config.sh not found at ${NODE_CONFIG_SH} — skipping M2"
+  skip "M2: node-config.sh preferred path (${NODE_CONFIG_SH} not found)"
 else
   M2_DATA="${TMPDIR_TEST}/m2-data"
   mkdir -p "${M2_DATA}/chain.db" && touch "${M2_DATA}/chain.db/CURRENT"
@@ -628,13 +648,4 @@ fi
 # =============================================================================
 # ── Summary ───────────────────────────────────────────────────────────────────
 # =============================================================================
-echo
-echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
-echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}"
-echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
-echo
-
-if [[ ${FAIL} -gt 0 ]]; then
-  exit 1
-fi
-exit 0
+finish

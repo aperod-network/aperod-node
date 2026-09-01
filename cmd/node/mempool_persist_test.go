@@ -774,10 +774,11 @@ func TestMempoolSaveWriteFailureNoTmpLeftover(t *testing.T) {
 //     This guarantees both the genesis boot path and the resume boot path
 //     are covered by the cleanup — neither can be reached without it.
 //
-//  2. Every call to tryLoadStartupSnapshot is preceded (anywhere earlier in
-//     the file) by at least one cleanStaleSnapshotTmpFiles call.
+//  2. Every startup call to tryLoadStartupSnapshot is preceded (anywhere
+//     earlier in the file) by at least one cleanStaleSnapshotTmpFiles call.
 //     This prevents a .tmp left by a previous crash from being mistaken for a
-//     valid snapshot file.
+//     valid snapshot file. The read-only --check-snapshot command is excluded:
+//     it intentionally must not delete or modify operator data.
 //
 // The test fails immediately if:
 //   - cleanStaleSnapshotTmpFiles is removed from main.go.
@@ -799,10 +800,18 @@ func TestCleanStaleTmpFilesCalledBeforeLoad(t *testing.T) {
 	var cleanLines []int  // all cleanStaleSnapshotTmpFiles call sites
 	branchLine := -1      // genesis/resume branch split
 	var snapLoadLines []int // all tryLoadStartupSnapshot call sites
+checkSnapshotStart := -1
+checkSnapshotEnd := -1
 
 	for i, raw := range lines {
 		lineNo := i + 1
 		trimmed := strings.TrimSpace(raw)
+if strings.HasPrefix(trimmed, "func runCheckSnapshot()") {
+checkSnapshotStart = lineNo
+} else if checkSnapshotStart != -1 && checkSnapshotEnd == -1 &&
+lineNo > checkSnapshotStart && strings.HasPrefix(trimmed, "func ") {
+checkSnapshotEnd = lineNo
+}
 		switch {
 		case strings.Contains(trimmed, "cleanStaleSnapshotTmpFiles("):
 			cleanLines = append(cleanLines, lineNo)
@@ -831,12 +840,17 @@ func TestCleanStaleTmpFilesCalledBeforeLoad(t *testing.T) {
 		)
 	}
 
-	// ── Invariant 2: every tryLoadStartupSnapshot has a preceding cleanup ─────
-	// Checks that no new snapshot-load site was added without cleanup coverage.
+// ── Invariant 2: every startup snapshot load has a preceding cleanup ───────
+// Checks that no new startup load site was added without cleanup coverage.
+// The config-free checker is a deliberate exception because it is read-only.
 	if len(snapLoadLines) == 0 {
 		t.Error("tryLoadStartupSnapshot not found in main.go — was the snapshot load removed?")
 	}
 	for _, loadLine := range snapLoadLines {
+if checkSnapshotStart != -1 && loadLine > checkSnapshotStart &&
+(checkSnapshotEnd == -1 || loadLine < checkSnapshotEnd) {
+continue
+}
 		hasPrior := false
 		for _, cleanLine := range cleanLines {
 			if cleanLine < loadLine {

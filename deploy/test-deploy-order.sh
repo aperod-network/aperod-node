@@ -17,8 +17,9 @@
 #
 # Exit codes
 # ──────────
-#   0  all tests passed (skipped tests are not failures)
+#   0  all tests passed with no skips
 #   1  one or more tests failed
+#  77  one or more tests were skipped
 
 set -euo pipefail
 
@@ -34,6 +35,7 @@ echo ""
 
 PASS=0
 FAIL=0
+SKIPPED=()
 
 run_test() {
     local name="$1"
@@ -47,7 +49,7 @@ run_test() {
         # Detect a skip by looking for the canonical "--- SKIP:" marker in output.
         if grep -qE '^--- SKIP:' "$tmpout" 2>/dev/null; then
             echo "SKIP: $name"
-            # A skipped test is not a failure; do not increment FAIL.
+            SKIPPED+=("$name")
         else
             echo "PASS: $name"
             PASS=$((PASS + 1))
@@ -185,11 +187,18 @@ fi
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────
-echo "=== Results: PASS=$PASS  FAIL=$FAIL ==="
+echo "=== Results: PASS=$PASS  FAIL=$FAIL  SKIP=${#SKIPPED[@]} ==="
 
 if [ "$FAIL" -gt 0 ]; then
     echo "FAIL — $FAIL test(s) failed"
     exit 1
+fi
+
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+    echo "SKIPPED SCENARIOS:"
+    printf '  - %s\n' "${SKIPPED[@]}"
+    echo "SKIP_SUMMARY count=${#SKIPPED[@]}"
+    exit 77
 fi
 
 echo "OK"

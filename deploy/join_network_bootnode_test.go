@@ -14,7 +14,8 @@
 //
 //	go test ./deploy/...
 //
-// All tests are skipped automatically when bash or python3 is not available.
+// Missing runtime dependencies fail the shell-backed suite on supported
+// platforms so local runs cannot silently cover less than CI.
 package deploy_test
 
 import (
@@ -40,17 +41,6 @@ func TestJoinNetworkBootnode(t *testing.T) {
 		t.Skip("bash not found in PATH; skipping TestJoinNetworkBootnode")
 	}
 
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not found in PATH; skipping TestJoinNetworkBootnode")
-	}
-
-	// The script requires the pyyaml library; skip gracefully when absent.
-	checkYaml := exec.Command("python3", "-c", "import yaml")
-	if err := checkYaml.Run(); err != nil {
-		t.Skip("python3 pyyaml not available; skipping TestJoinNetworkBootnode " +
-			"(install with: pip3 install pyyaml)")
-	}
-
 	scriptDir, err := filepath.Abs(".")
 	if err != nil {
 		t.Fatalf("cannot determine script directory: %v", err)
@@ -66,6 +56,9 @@ func TestJoinNetworkBootnode(t *testing.T) {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 77 {
+			t.Fatalf("test-join-network-bootnode.sh skipped required scenarios (exit 77); install the dependencies named in SKIP_SUMMARY")
+		}
 		t.Errorf("test-join-network-bootnode.sh reported failures: %v", err)
 	}
 }

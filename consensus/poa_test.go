@@ -263,6 +263,7 @@ func buildEngineWithGenesis(t *testing.T) (
 		Validators:   []crypto.ValidatorPubKey{validatorPub},
 		Registry:     reg,
 		MyKey:        nil, // relay node — never produces blocks
+RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -451,6 +452,7 @@ func TestCrashRecovery_RelayFillsMultiHourGap(t *testing.T) {
 		Validators: []crypto.ValidatorPubKey{validatorPub},
 		Registry:   relayReg,
 		MyKey:      nil, // relay node — never produces blocks
+RingCTV4ActivationHeight: ^uint64(0),
 	}, relayChain, relayMp, newNopLogger())
 	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
 

@@ -146,7 +146,10 @@ func (tx *Transaction) Validate() error {
                 if len(tx.Outputs) == 0 {
                         return nil
                 }
-                // Has outputs → fall through to enforce len(RangeProofs)==len(Outputs).
+		// Stake transactions are state/registry operations, not value-transfer
+		// transactions.  Allowing outputs here would let VerifyBlock skip the
+		// RingCT checks below while ApplyBlock creates unbalanced UTXOs.
+		return fmt.Errorf("stake tx must not contain outputs")
         }
 
         if len(tx.Outputs) == 0 {
@@ -159,8 +162,14 @@ func (tx *Transaction) Validate() error {
                 return fmt.Errorf("tx extra too large: %d bytes (max 255)", len(tx.Extra))
         }
 
-        // Coinbase: no inputs required, no signatures or ring proofs
+	// Coinbase: no inputs required, no signatures or ring proofs.  Only the
+	// legacy mint wire version is a valid coinbase; otherwise a malformed v4
+	// zero-input transaction could bypass the activation policy.
         if tx.IsCoinbase() {
+		if tx.Version != TxVersionBase {
+			return fmt.Errorf("coinbase must use transaction version %d, got %d",
+				TxVersionBase, tx.Version)
+		}
                 return nil
         }
 
@@ -194,15 +203,49 @@ func (tx *Transaction) Validate() error {
         return nil
 }
 
-// ValidateTxVersionAtHeight applies the height-gated consensus policy for new
+// ValidateTxVersionAtHeight applies the height-gated consensus policy for RingCT
 // transaction formats without changing historical replay semantics.
+//
+// Before activation, legacy RingCT versions remain valid so nodes can replay
+// the pre-fork chain.  At and after activation, only the commitment-binding
+// format is valid for spend transactions.  Coinbase and stake transactions are
+// exempt because they are distinct consensus transaction types even though
+// coinbase mints currently use the legacy wire version.
 func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight uint64) error {
+	if tx == nil {
+		return fmt.Errorf("nil transaction")
+	}
+
+	// Stake transactions do not use the legacy spend proof that APD-002
+	// replaces.  Keep them valid across the activation boundary.
+	if tx.IsStake() {
+		return nil
+	}
+
+	// Only the legacy mint wire version is a valid coinbase.  Do not let an
+	// arbitrary zero-input v4 transaction use the coinbase exception.
+	if tx.IsCoinbase() {
+		if tx.Version != TxVersionBase {
+			return fmt.Errorf("coinbase must use transaction version %d, got %d",
+				TxVersionBase, tx.Version)
+		}
+		return nil
+	}
+
 	if tx.Version == TxVersionCommitmentBinding &&
 		ringCTV4ActivationHeight > 0 &&
 		height < ringCTV4ActivationHeight {
 		return fmt.Errorf("transaction version %d is not active until height %d",
 			tx.Version, ringCTV4ActivationHeight)
 	}
+
+	if (ringCTV4ActivationHeight == 0 || height >= ringCTV4ActivationHeight) &&
+		(tx.Version == TxVersionBase || tx.Version == TxVersionGameAsset) {
+		return fmt.Errorf("legacy RingCT transaction version %d is disabled at height %d; "+
+			"use commitment-binding version %d",
+			tx.Version, height, TxVersionCommitmentBinding)
+	}
+
 	return nil
 }
 
@@ -246,7 +289,13 @@ func (tx *Transaction) MinFeeAt(baseFeePerByte uint64) uint64 {
         if baseFeePerByte == 0 {
                 baseFeePerByte = InitialBaseFeePerByte
         }
-        return uint64(tx.Size()) * baseFeePerByte
+        size := uint64(tx.Size())
+        if size != 0 && baseFeePerByte > ^uint64(0)/size {
+                // Saturate rather than wrap.  Callers compare Fee against this
+                // value, so overflow becomes fail-closed.
+                return ^uint64(0)
+        }
+        return size * baseFeePerByte
 }
 
 // KeyImages returns all key images from inputs (for double-spend checking).

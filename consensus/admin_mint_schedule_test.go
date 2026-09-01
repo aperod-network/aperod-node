@@ -64,6 +64,10 @@ func newMintTestEngine(t *testing.T, rewardAddress string) (*consensus.Engine, *
 		Registry:      reg,
 		MyKey:         lk,
 		RewardAddress: rewardAddress,
+		// These tests cover the legacy admin-mint scheduler.  Keep them below
+		// the hard-fork boundary; post-activation mints require an on-chain
+		// authorization format that these legacy fixtures do not carry.
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -323,6 +327,7 @@ func TestScheduleAdminMint_TimeoutWhenNotProducing(t *testing.T) {
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{validatorPub},
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger()) // Run() never called — engine idle
 
 	keys, err := crypto.GenerateWalletKeys()

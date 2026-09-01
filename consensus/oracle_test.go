@@ -170,7 +170,6 @@ func TestOraclePrice_SurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lk.Destroy()
 
 	capture := &captureHandler{}
 	logger := slog.New(capture)
@@ -178,8 +177,16 @@ func TestOraclePrice_SurvivesRestart(t *testing.T) {
 	eng := newOracleEngine(t, []crypto.ValidatorPubKey{pub}, lk, chain, oracle.URL(), logger)
 
 	stop := make(chan struct{})
-	go eng.Run(stop)
-	defer close(stop)
+	done := make(chan struct{})
+	go func() {
+		eng.Run(stop)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+		lk.Destroy()
+	})
 
 	produced := eng.ProducedCh()
 

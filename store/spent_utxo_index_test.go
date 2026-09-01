@@ -88,6 +88,36 @@ func TestMarkUTXOSpent_Idempotent(t *testing.T) {
 	}
 }
 
+func TestUnmarkUTXOSpent_RestoresActiveOutput(t *testing.T) {
+	db := openTestDB(t)
+	h := randHash(t, 0x42)
+	putUTXO(t, db, h, 0)
+
+	if err := db.MarkUTXOSpent(h, 0); err != nil {
+		t.Fatalf("MarkUTXOSpent: %v", err)
+	}
+	if !db.IsUTXOSpent(h, 0) {
+		t.Fatal("output was not marked spent")
+	}
+	if err := db.UnmarkUTXOSpent(h, 0); err != nil {
+		t.Fatalf("UnmarkUTXOSpent: %v", err)
+	}
+	if db.IsUTXOSpent(h, 0) {
+		t.Fatal("spent marker survived rollback")
+	}
+
+	active := 0
+	if err := db.IterActiveUTXOs(func(*store.StoredUTXO) error {
+		active++
+		return nil
+	}); err != nil {
+		t.Fatalf("IterActiveUTXOs: %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("expected restored output in active iterator, got %d", active)
+	}
+}
+
 // ─── IterActiveUTXOs ─────────────────────────────────────────────────────────
 
 func TestIterActiveUTXOs_ExcludesSpent(t *testing.T) {

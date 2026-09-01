@@ -56,6 +56,7 @@ func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.
 		BFTThreshold: 0.667,
 		Validators:   validators,
 		MyKey:        myKey,
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
 }
 

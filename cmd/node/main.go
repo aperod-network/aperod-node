@@ -412,6 +412,56 @@ func runCheckStore() error {
         return nil
 }
 
+// runCheckSnapshot implements the --check-snapshot subcommand.
+//
+// Usage: aperod-node --check-snapshot --data-dir=<path>
+//
+// Reads the canonical tip from chain.db and validates the matching startup
+// snapshot through the same loader used by normal node startup. Missing,
+// truncated, corrupt, or tip-mismatched snapshots cause a non-zero exit.
+func runCheckSnapshot() error {
+        dataDir := ""
+        args := os.Args[1:]
+        for i, arg := range args {
+                switch {
+                case strings.HasPrefix(arg, "--data-dir="):
+                        dataDir = strings.TrimPrefix(arg, "--data-dir=")
+                case arg == "--data-dir" && i+1 < len(args):
+                        dataDir = args[i+1]
+                }
+        }
+        if dataDir == "" {
+                return fmt.Errorf("--check-snapshot requires --data-dir=<path>")
+        }
+
+        dbPath := filepath.Join(dataDir, "chain.db")
+        tipHash, tipHeight, err := store.ReadTipOnly(dbPath)
+        if err != nil {
+                return fmt.Errorf("check-snapshot: read canonical tip from %s: %w", dbPath, err)
+        }
+
+        log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+        _, isRelaxed, err := tryLoadStartupSnapshot(
+                dataDir, tipHeight, fmt.Sprintf("%x", tipHash), log,
+        )
+        if err != nil {
+                return fmt.Errorf(
+                        "check-snapshot: snapshot validation failed for tip height %d: %w",
+                        tipHeight, err,
+                )
+        }
+        if isRelaxed {
+                return fmt.Errorf(
+                        "check-snapshot: snapshot validation failed for tip height %d: "+
+                                "backup snapshot was accepted only by relaxed hash recovery and does not match chain.db",
+                        tipHeight,
+                )
+        }
+
+        fmt.Fprintf(os.Stdout, "check-snapshot OK: tip_height=%d\n", tipHeight)
+        return nil
+}
+
 // ─── Rsync-in-progress sentinel ──────────────────────────────────────────────
 //
 // join-network.sh writes .rsync-in-progress to the data directory before any
@@ -713,13 +763,15 @@ func checkStartupIntegrity(
 }
 
 func run() error {
-        // ── 0. check-store subcommand ─────────────────────────────────────────────
+        // ── 0. config-free maintenance subcommands ────────────────────────────────
         // Processed before config loading so operators can verify a chain.db that
         // was just rsync'd without needing a fully-configured node.yaml.
         for _, arg := range os.Args[1:] {
                 switch arg {
                 case "--check-store":
                         return runCheckStore()
+                case "--check-snapshot":
+                        return runCheckSnapshot()
                 case "--compact-db":
                         return runCompactDB()
                 case "--repair-height-index":
@@ -1084,6 +1136,9 @@ func run() error {
                         log.Warn("failed to persist spent UTXO to index",
                                 "out_idx", outIdx, "err", spentErr)
                 }
+        }
+        utxos.OnUTXORestored = func(txHash crypto.Hash32, outIdx uint32) error {
+                return db.UnmarkUTXOSpent(txHash, outIdx)
         }
 
         tipHash, tipHeight, err := db.GetTip()
@@ -2164,6 +2219,9 @@ func run() error {
                                                 if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
                                                         log.Warn("failed to persist spent UTXO", "err", spentErr)
                                                 }
+                                        }
+                                        utxos.OnUTXORestored = func(txHash crypto.Hash32, outIdx uint32) error {
+                                                return db.UnmarkUTXOSpent(txHash, outIdx)
                                         }
                                         log.Warn("db-index fast path unavailable; falling back to block scan",
                                                 "tip_height", tipHeight)

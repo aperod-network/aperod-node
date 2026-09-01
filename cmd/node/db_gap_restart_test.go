@@ -26,9 +26,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -204,63 +207,63 @@ func TestDBGapRestartLoadsRecentBlocks(t *testing.T) {
 // letting the test simulate a store that has a block in the tip slot but not
 // in the window visible to loadRecentBlocksFromStore.
 type filteredGetter struct {
-        inner      blockByHeightGetter
-        hideHeight uint64
+	inner      blockByHeightGetter
+	hideHeight uint64
 }
 
 func (f *filteredGetter) GetRawBlockByHeight(h uint64) ([]byte, error) {
-        if h == f.hideHeight {
-                return nil, nil
-        }
-        return f.inner.GetRawBlockByHeight(h)
+	if h == f.hideHeight {
+		return nil, nil
+	}
+	return f.inner.GetRawBlockByHeight(h)
 }
 
 // stubGetter is a minimal blockByHeightGetter backed by an in-memory map.
 // Used by anchor-guard unit tests that don't need a full LevelDB store.
 type stubGetter struct {
-        blocks map[uint64][]byte
+	blocks map[uint64][]byte
 }
 
 func (s *stubGetter) GetRawBlockByHeight(h uint64) ([]byte, error) {
-        b, ok := s.blocks[h]
-        if !ok {
-                return nil, nil
-        }
-        return b, nil
+	b, ok := s.blocks[h]
+	if !ok {
+		return nil, nil
+	}
+	return b, nil
 }
 
 // TestTipAnchorGuardNoopWhenTipIsCorrect verifies that anchorTipIfNeeded is a
 // no-op when the chain height already matches tipHeight (the common case after a
 // clean restart with no missing blocks).
 func TestTipAnchorGuardNoopWhenTipIsCorrect(t *testing.T) {
-        const tipHeight = uint64(5)
-        dir := t.TempDir()
-        db, blocks := buildChainWithGap(t, dir, int(tipHeight), 999 /* no gap */)
+	const tipHeight = uint64(5)
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, int(tipHeight), 999 /* no gap */)
 
-        chain := core.NewChain()
-        if err := chain.SetGenesis(blocks[0]); err != nil {
-                t.Fatalf("SetGenesis: %v", err)
-        }
-        // Load all blocks (no gap) and fast-forward.
-        loaded := loadRecentBlocksFromStore(db, tipHeight, newCaptureLogger(new(bytes.Buffer)))
-        chain.FastForward(loaded)
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	// Load all blocks (no gap) and fast-forward.
+	loaded := loadRecentBlocksFromStore(db, tipHeight, newCaptureLogger(new(bytes.Buffer)))
+	chain.FastForward(loaded)
 
-        if chain.Height() != tipHeight {
-                t.Fatalf("pre-condition: chain.Height() = %d, want %d", chain.Height(), tipHeight)
-        }
+	if chain.Height() != tipHeight {
+		t.Fatalf("pre-condition: chain.Height() = %d, want %d", chain.Height(), tipHeight)
+	}
 
-        var logBuf bytes.Buffer
-        err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&logBuf))
-        if err != nil {
-                t.Fatalf("anchorTipIfNeeded returned unexpected error: %v", err)
-        }
-        if chain.Height() != tipHeight {
-                t.Errorf("chain.Height() = %d after no-op, want %d", chain.Height(), tipHeight)
-        }
-        // The guard must not have logged the "anchor" message (it was a no-op).
-        if logContainsMsg(&logBuf, "tip block loaded as in-memory anchor") {
-                t.Error("anchor log message found but guard should have been a no-op")
-        }
+	var logBuf bytes.Buffer
+	err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("anchorTipIfNeeded returned unexpected error: %v", err)
+	}
+	if chain.Height() != tipHeight {
+		t.Errorf("chain.Height() = %d after no-op, want %d", chain.Height(), tipHeight)
+	}
+	// The guard must not have logged the "anchor" message (it was a no-op).
+	if logContainsMsg(&logBuf, "tip block loaded as in-memory anchor") {
+		t.Error("anchor log message found but guard should have been a no-op")
+	}
 }
 
 // TestTipAnchorGuardLoadsAndAnchorsTipBlock is the primary regression test for
@@ -276,43 +279,43 @@ func TestTipAnchorGuardNoopWhenTipIsCorrect(t *testing.T) {
 //   - anchorTipIfNeeded is given the unfiltered store (block 9 present) and must
 //     advance the chain to height 9.
 func TestTipAnchorGuardLoadsAndAnchorsTipBlock(t *testing.T) {
-        const (
-                nBlocks   = 9
-                tipHeight = uint64(nBlocks)
-        )
-        dir := t.TempDir()
-        db, blocks := buildChainWithGap(t, dir, nBlocks, 999 /* no gap in store */)
+	const (
+		nBlocks   = 9
+		tipHeight = uint64(nBlocks)
+	)
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, nBlocks, 999 /* no gap in store */)
 
-        // Phase 1: simulate loadRecentBlocksFromStore with the tip block hidden.
-        filtered := &filteredGetter{inner: db, hideHeight: tipHeight}
-        loaded := loadRecentBlocksFromStore(filtered, tipHeight, newCaptureLogger(new(bytes.Buffer)))
+	// Phase 1: simulate loadRecentBlocksFromStore with the tip block hidden.
+	filtered := &filteredGetter{inner: db, hideHeight: tipHeight}
+	loaded := loadRecentBlocksFromStore(filtered, tipHeight, newCaptureLogger(new(bytes.Buffer)))
 
-        chain := core.NewChain()
-        if err := chain.SetGenesis(blocks[0]); err != nil {
-                t.Fatalf("SetGenesis: %v", err)
-        }
-        chain.FastForward(loaded)
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	chain.FastForward(loaded)
 
-        // Pre-condition: tip must be below tipHeight to trigger the guard.
-        if chain.Height() >= tipHeight {
-                t.Fatalf("pre-condition failed: chain.Height() = %d, guard would be a no-op", chain.Height())
-        }
+	// Pre-condition: tip must be below tipHeight to trigger the guard.
+	if chain.Height() >= tipHeight {
+		t.Fatalf("pre-condition failed: chain.Height() = %d, guard would be a no-op", chain.Height())
+	}
 
-        // Phase 2: call the guard with the full (unfiltered) store.
-        var logBuf bytes.Buffer
-        if err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&logBuf)); err != nil {
-                t.Fatalf("anchorTipIfNeeded: %v", err)
-        }
+	// Phase 2: call the guard with the full (unfiltered) store.
+	var logBuf bytes.Buffer
+	if err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&logBuf)); err != nil {
+		t.Fatalf("anchorTipIfNeeded: %v", err)
+	}
 
-        // The chain tip must now equal tipHeight.
-        if chain.Height() != tipHeight {
-                t.Errorf("chain.Height() = %d after anchor, want %d", chain.Height(), tipHeight)
-        }
+	// The chain tip must now equal tipHeight.
+	if chain.Height() != tipHeight {
+		t.Errorf("chain.Height() = %d after anchor, want %d", chain.Height(), tipHeight)
+	}
 
-        // The guard must have logged that it fired.
-        if !logContainsMsg(&logBuf, "tip block loaded as in-memory anchor") {
-                t.Errorf("expected 'tip block loaded as in-memory anchor' log not found\nlog:\n%s", logBuf.String())
-        }
+	// The guard must have logged that it fired.
+	if !logContainsMsg(&logBuf, "tip block loaded as in-memory anchor") {
+		t.Errorf("expected 'tip block loaded as in-memory anchor' log not found\nlog:\n%s", logBuf.String())
+	}
 }
 
 // TestTipAnchorGuardErrorsWhenTipBlockMissing verifies that anchorTipIfNeeded
@@ -320,25 +323,25 @@ func TestTipAnchorGuardLoadsAndAnchorsTipBlock(t *testing.T) {
 // height) when the chain is below tipHeight AND the tip block is absent from
 // the store — indicating a corrupt or truncated database.
 func TestTipAnchorGuardErrorsWhenTipBlockMissing(t *testing.T) {
-        const tipHeight = uint64(9)
+	const tipHeight = uint64(9)
 
-        // Chain at height 8 (below tipHeight).
-        dir := t.TempDir()
-        db, blocks := buildChainWithGap(t, dir, 8 /* only build 8 blocks */, 999)
+	// Chain at height 8 (below tipHeight).
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, 8 /* only build 8 blocks */, 999)
 
-        chain := core.NewChain()
-        if err := chain.SetGenesis(blocks[0]); err != nil {
-                t.Fatalf("SetGenesis: %v", err)
-        }
-        loaded := loadRecentBlocksFromStore(db, 8, newCaptureLogger(new(bytes.Buffer)))
-        chain.FastForward(loaded)
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	loaded := loadRecentBlocksFromStore(db, 8, newCaptureLogger(new(bytes.Buffer)))
+	chain.FastForward(loaded)
 
-        // chain.Height() == 8 < tipHeight(9); block 9 is not in the store.
-        err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(new(bytes.Buffer)))
-        if err == nil {
-                t.Fatal("expected an error when tip block is missing from store, got nil")
-        }
-        t.Logf("anchorTipIfNeeded correctly returned error: %v", err)
+	// chain.Height() == 8 < tipHeight(9); block 9 is not in the store.
+	err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(new(bytes.Buffer)))
+	if err == nil {
+		t.Fatal("expected an error when tip block is missing from store, got nil")
+	}
+	t.Logf("anchorTipIfNeeded correctly returned error: %v", err)
 }
 
 // TestTipAnchorGuardEndToEnd simulates the full startup sequence after a gap is
@@ -355,44 +358,44 @@ func TestTipAnchorGuardErrorsWhenTipBlockMissing(t *testing.T) {
 // start producing block 9 again from the wrong parent, silently forking the
 // canonical chain.
 func TestTipAnchorGuardEndToEnd(t *testing.T) {
-        const (
-                nBlocks   = 9
-                tipHeight = uint64(nBlocks)
-        )
-        dir := t.TempDir()
-        db, blocks := buildChainWithGap(t, dir, nBlocks, 999 /* all blocks stored */)
+	const (
+		nBlocks   = 9
+		tipHeight = uint64(nBlocks)
+	)
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, nBlocks, 999 /* all blocks stored */)
 
-        chain := core.NewChain()
-        if err := chain.SetGenesis(blocks[0]); err != nil {
-                t.Fatalf("SetGenesis: %v", err)
-        }
+	chain := core.NewChain()
+	if err := chain.SetGenesis(blocks[0]); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
 
-        // Simulate the window scan with the tip block hidden (gap at tip).
-        filtered := &filteredGetter{inner: db, hideHeight: tipHeight}
-        var scanLog bytes.Buffer
-        recentBlocks := loadRecentBlocksFromStore(filtered, tipHeight, newCaptureLogger(&scanLog))
-        chain.FastForward(recentBlocks)
+	// Simulate the window scan with the tip block hidden (gap at tip).
+	filtered := &filteredGetter{inner: db, hideHeight: tipHeight}
+	var scanLog bytes.Buffer
+	recentBlocks := loadRecentBlocksFromStore(filtered, tipHeight, newCaptureLogger(&scanLog))
+	chain.FastForward(recentBlocks)
 
-        heightAfterFF := chain.Height()
-        if heightAfterFF >= tipHeight {
-                t.Fatalf("pre-condition: chain.Height() = %d, guard would be a no-op; tip must be < %d", heightAfterFF, tipHeight)
-        }
-        t.Logf("chain.Height() after FastForward = %d (gap at tip simulated)", heightAfterFF)
+	heightAfterFF := chain.Height()
+	if heightAfterFF >= tipHeight {
+		t.Fatalf("pre-condition: chain.Height() = %d, guard would be a no-op; tip must be < %d", heightAfterFF, tipHeight)
+	}
+	t.Logf("chain.Height() after FastForward = %d (gap at tip simulated)", heightAfterFF)
 
-        // The guard must restore the original tip height.
-        var anchorLog bytes.Buffer
-        if err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&anchorLog)); err != nil {
-                t.Fatalf("anchorTipIfNeeded: %v", err)
-        }
+	// The guard must restore the original tip height.
+	var anchorLog bytes.Buffer
+	if err := anchorTipIfNeeded(chain, db, tipHeight, newCaptureLogger(&anchorLog)); err != nil {
+		t.Fatalf("anchorTipIfNeeded: %v", err)
+	}
 
-        if chain.Height() != tipHeight {
-                t.Errorf("chain.Height() = %d after anchorTipIfNeeded, want %d (original tip)",
-                        chain.Height(), tipHeight)
-        }
-        if !logContainsMsg(&anchorLog, "tip block loaded as in-memory anchor") {
-                t.Errorf("guard log message not found\nlog:\n%s", anchorLog.String())
-        }
-        t.Logf("node successfully anchored to height %d after gap at tip", tipHeight)
+	if chain.Height() != tipHeight {
+		t.Errorf("chain.Height() = %d after anchorTipIfNeeded, want %d (original tip)",
+			chain.Height(), tipHeight)
+	}
+	if !logContainsMsg(&anchorLog, "tip block loaded as in-memory anchor") {
+		t.Errorf("guard log message not found\nlog:\n%s", anchorLog.String())
+	}
+	t.Logf("node successfully anchored to height %d after gap at tip", tipHeight)
 }
 
 // TestDBGapAtStartOfWindow confirms the helper loads blocks that follow a gap
@@ -656,7 +659,7 @@ func logContainsFieldValue(buf *bytes.Buffer, fieldName, wantValue string) bool 
 //   - runStartupScan returns ScanFrom == 1 (full scan — no partial checkpoint).
 func TestCorruptSnapshotFallsBackToGapResumeScan(t *testing.T) {
 	const (
-		nBlocks     = 9        // heights 0 – 9
+		nBlocks     = 9         // heights 0 – 9
 		gapInWindow = uint64(4) // block 4 absent from the LevelDB store
 	)
 	tipHeight := uint64(nBlocks)
@@ -793,4 +796,279 @@ func TestCorruptSnapshotFallsBackToGapResumeScan(t *testing.T) {
 		"chain anchored to height %d, corrupt snapshot rejected "+
 		"(startup_reason=corrupt_snapshot), gap-resume scan ran from block 1",
 		len(recentBlocks), tipHeight)
+}
+
+// TestCorruptPrimaryAndPrevSnapshotFallBackToRecentBlocks guards the
+// double-failure path after two interrupted snapshot writes. Neither a
+// truncated primary nor a truncated prev-backup may be accepted; startup must
+// report snapshot corruption and retain the recent block window loaded from
+// the canonical store for the full-scan path.
+func TestCorruptPrimaryAndPrevSnapshotFallBackToRecentBlocks(t *testing.T) {
+	const nBlocks = 9
+	tipHeight := uint64(nBlocks)
+
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, nBlocks, 999 /* no gap */)
+	tipHashHex := fmt.Sprintf("%x", blocks[nBlocks].Hash())
+
+	primaryPath := snapshotPath(dir, tipHeight)
+	prevPath := snapshotPrevPath(primaryPath)
+	for _, path := range []string{primaryPath, prevPath} {
+		if err := os.WriteFile(path, []byte("truncated snapshot"), 0644); err != nil {
+			t.Fatalf("write corrupt snapshot %s: %v", path, err)
+		}
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+
+	recentBlocks := loadRecentBlocksFromStore(db, tipHeight, log)
+	if len(recentBlocks) == 0 {
+		t.Fatalf("blocks_loaded_in_memory == 0 after snapshot double failure\nlog:\n%s",
+			logBuf.String())
+	}
+
+	snap, _, err := tryLoadStartupSnapshot(dir, tipHeight, tipHashHex, log)
+	if err == nil || snap != nil {
+		t.Fatalf("tryLoadStartupSnapshot accepted corrupt primary/prev: snap=%v err=%v",
+			snap, err)
+	}
+	if !logContainsFieldValue(&logBuf, "startup_reason", "corrupt_snapshot") {
+		t.Errorf("structured log field startup_reason=corrupt_snapshot not found\nlog:\n%s",
+			logBuf.String())
+	}
+}
+
+// TestCheckSnapshotCommandHelper runs the production command dispatcher in a
+// subprocess so TestCheckSnapshotCommandRejectsCorruption can assert its real
+// process exit status and stderr output.
+func TestCheckSnapshotCommandHelper(t *testing.T) {
+	if os.Getenv("APEROD_CHECK_SNAPSHOT_HELPER") != "1" {
+		return
+	}
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "aperod-node: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestCheckSnapshotCommandRejectsCorruption(t *testing.T) {
+	const tipHeight = uint64(3)
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, int(tipHeight), 999)
+	tipHashHex := fmt.Sprintf("%x", blocks[tipHeight].Hash())
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store before subprocess: %v", err)
+	}
+
+	corrupt := []byte(`{"v":2,"tip_height":3,"tip_hash":"` + tipHashHex[:8])
+	if err := os.WriteFile(snapshotPath(dir, tipHeight), corrupt, 0644); err != nil {
+		t.Fatalf("write corrupt snapshot: %v", err)
+	}
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestCheckSnapshotCommandHelper$",
+		"--",
+		"--check-snapshot",
+		"--data-dir="+dir,
+	)
+	cmd.Env = append(os.Environ(), "APEROD_CHECK_SNAPSHOT_HELPER=1")
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("--check-snapshot accepted a corrupt snapshot; stderr:\n%s", stderr.String())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+		t.Fatalf("--check-snapshot error = %v, want non-zero exit status", err)
+	}
+	for _, want := range []string{"check-snapshot: snapshot validation failed", "truncated or empty"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "check-snapshot OK") {
+		t.Errorf("corrupt snapshot printed success output:\n%s", stdout.String())
+	}
+}
+
+func TestCheckSnapshotCommandRejectsRelaxedMismatchedBackup(t *testing.T) {
+	const tipHeight = uint64(3)
+	dir := t.TempDir()
+	db, _ := buildChainWithGap(t, dir, int(tipHeight), 999)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store before subprocess: %v", err)
+	}
+
+	mismatched := startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: strings.Repeat("ab", 32),
+	}
+	if err := saveStartupSnapshot(dir, mismatched); err != nil {
+		t.Fatalf("write mismatched snapshot: %v", err)
+	}
+	primary := snapshotPath(dir, tipHeight)
+	prev := snapshotPrevPath(primary)
+	if err := os.Rename(primary, prev); err != nil {
+		t.Fatalf("move primary to prev backup: %v", err)
+	}
+	if err := os.Rename(snapshotChecksumPath(primary), snapshotChecksumPath(prev)); err != nil {
+		t.Fatalf("move checksum to prev backup: %v", err)
+	}
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestCheckSnapshotCommandHelper$",
+		"--",
+		"--check-snapshot",
+		"--data-dir="+dir,
+	)
+	cmd.Env = append(os.Environ(), "APEROD_CHECK_SNAPSHOT_HELPER=1")
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("--check-snapshot accepted a relaxed mismatched backup; stdout:\n%s", stdout.String())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+		t.Fatalf("--check-snapshot error = %v, want non-zero exit status", err)
+	}
+	for _, want := range []string{"check-snapshot: snapshot validation failed", "relaxed hash recovery"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "check-snapshot OK") {
+		t.Errorf("mismatched backup printed success output:\n%s", stdout.String())
+	}
+}
+
+func TestCheckSnapshotCommandRejectsAbsentSnapshot(t *testing.T) {
+	const tipHeight = uint64(3)
+	dir := t.TempDir()
+	db, _ := buildChainWithGap(t, dir, int(tipHeight), 999)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store before subprocess: %v", err)
+	}
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestCheckSnapshotCommandHelper$",
+		"--",
+		"--check-snapshot",
+		"--data-dir="+dir,
+	)
+	cmd.Env = append(os.Environ(), "APEROD_CHECK_SNAPSHOT_HELPER=1")
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("--check-snapshot accepted an absent snapshot; stdout:\n%s", stdout.String())
+	}
+	for _, want := range []string{"check-snapshot: snapshot validation failed", "no such file or directory"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "check-snapshot OK") {
+		t.Errorf("absent snapshot printed success output:\n%s", stdout.String())
+	}
+}
+
+func TestCheckSnapshotCommandDoesNotCreateMissingStore(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "prestage")
+	if err := os.Mkdir(dataDir, 0755); err != nil {
+		t.Fatalf("create data dir: %v", err)
+	}
+	dbPath := filepath.Join(dataDir, "chain.db")
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestCheckSnapshotCommandHelper$",
+		"--",
+		"--check-snapshot",
+		"--data-dir="+dataDir,
+	)
+	cmd.Env = append(os.Environ(), "APEROD_CHECK_SNAPSHOT_HELPER=1")
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("--check-snapshot accepted a missing store; stdout:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "check-snapshot: read canonical tip") {
+		t.Errorf("stderr missing canonical-tip error:\n%s", stderr.String())
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Errorf("--check-snapshot created or mutated missing store %s (stat err=%v)", dbPath, statErr)
+	}
+	if strings.Contains(stdout.String(), "check-snapshot OK") {
+		t.Errorf("missing store printed success output:\n%s", stdout.String())
+	}
+}
+
+func TestCheckSnapshotCommandLeavesStaleTmpFileUntouched(t *testing.T) {
+	const tipHeight = uint64(3)
+	dir := t.TempDir()
+	db, blocks := buildChainWithGap(t, dir, int(tipHeight), 999)
+	tipHashHex := fmt.Sprintf("%x", blocks[tipHeight].Hash())
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store before subprocess: %v", err)
+	}
+	if err := saveStartupSnapshot(dir, startupSnapshot{
+		Version:    snapVersion,
+		TipHeight:  tipHeight,
+		TipHashHex: tipHashHex,
+	}); err != nil {
+		t.Fatalf("write valid snapshot: %v", err)
+	}
+
+	tmpPath := snapshotPath(dir, tipHeight) + ".tmp"
+	tmpContent := []byte("unfinished snapshot must remain untouched")
+	if err := os.WriteFile(tmpPath, tmpContent, 0644); err != nil {
+		t.Fatalf("write stale tmp file: %v", err)
+	}
+	staleTime := time.Now().Add(-2 * snapshotStaleTmpMaxAge)
+	if err := os.Chtimes(tmpPath, staleTime, staleTime); err != nil {
+		t.Fatalf("age stale tmp file: %v", err)
+	}
+
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestCheckSnapshotCommandHelper$",
+		"--",
+		"--check-snapshot",
+		"--data-dir="+dir,
+	)
+	cmd.Env = append(os.Environ(), "APEROD_CHECK_SNAPSHOT_HELPER=1")
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("--check-snapshot rejected valid snapshot: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "check-snapshot OK") {
+		t.Errorf("success output missing:\n%s", stdout.String())
+	}
+	got, err := os.ReadFile(tmpPath)
+	if err != nil {
+		t.Fatalf("stale tmp file was removed or unreadable: %v", err)
+	}
+	if !bytes.Equal(got, tmpContent) {
+		t.Errorf("stale tmp file was modified: got %q, want %q", got, tmpContent)
+	}
 }

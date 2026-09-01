@@ -267,8 +267,9 @@ func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
 //
 // The su/ namespace records which UTXOs have been spent so that
 // IterActiveUTXOs can reconstruct the active set without scanning blocks.
-// Entries are written by the OnUTXOSpent callback wired in main.go; they
-// are never deleted (spent UTXOs stay spent on a linear chain).
+// Entries are written by the OnUTXOSpent callback wired in main.go.  A
+// transactional block rollback deletes the corresponding entry through
+// OnUTXORestored before the node can continue.
 
 // spentUTXOKey builds the su/ key for (txHash, outIdx).
 func spentUTXOKey(txHash crypto.Hash32, outIdx uint32) []byte {
@@ -284,6 +285,12 @@ func spentUTXOKey(txHash crypto.Hash32, outIdx uint32) []byte {
 // main.go; non-fatal on error (index is a startup-performance optimisation).
 func (d *DB) MarkUTXOSpent(txHash crypto.Hash32, outIdx uint32) error {
         return d.put(spentUTXOKey(txHash, outIdx), []byte{0x01})
+}
+
+// UnmarkUTXOSpent removes a false-spent marker when the block that consumed an
+// output is rolled back before becoming canonical.
+func (d *DB) UnmarkUTXOSpent(txHash crypto.Hash32, outIdx uint32) error {
+        return d.db.Delete(spentUTXOKey(txHash, outIdx), &opt.WriteOptions{Sync: true})
 }
 
 // IsUTXOSpent reports whether the given output has been marked as spent in the

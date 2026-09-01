@@ -17,6 +17,7 @@
 # Exit codes:
 #   0 — all tests passed
 #   1 — one or more tests failed
+#  77 — one or more scenarios were skipped
 #
 set -uo pipefail
 
@@ -27,15 +28,34 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\
 
 PASS=0
 FAIL=0
+SKIPPED=()
 
 pass() { echo -e "${GREEN}  PASS${NC}  $*"; ((PASS++)); }
 fail() { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
 section() { echo -e "\n${BOLD}▶ $*${NC}"; }
+skip() { echo -e "${YELLOW}  SKIP${NC}  $*"; SKIPPED+=("$*"); }
+
+finish() {
+  echo
+  echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
+  echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${#SKIPPED[@]} skipped${NC}"
+  if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}  SKIPPED SCENARIOS:${NC}"
+    printf '    - %s\n' "${SKIPPED[@]}"
+    echo "  SKIP_SUMMARY count=${#SKIPPED[@]}"
+  fi
+  echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
+  echo
+
+  [[ ${FAIL} -gt 0 ]] && exit 1
+  [[ ${#SKIPPED[@]} -gt 0 ]] && exit 77
+  exit 0
+}
 
 # ── Require python3 + pyyaml ──────────────────────────────────────────────────
 if ! python3 -c "import yaml" 2>/dev/null; then
-  echo -e "${RED}[ERR]${NC}  python3 + pyyaml required. Run: pip3 install pyyaml" >&2
-  exit 1
+  skip "Tests 1-18: python3 + pyyaml unavailable"
+  finish
 fi
 
 TMPDIR_TEST=$(mktemp -d)
@@ -292,7 +312,7 @@ fi
 # ── Test 5: node-config.sh path — nested schema ────────────────────────────────
 section "Test 5: node-config.sh add-bootnode writes to p2p.bootnodes (nested schema)"
 if [[ ! -f "${NODE_CONFIG_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  node-config.sh not found at ${NODE_CONFIG_SH}"
+  skip "Test 5: node-config.sh nested schema (${NODE_CONFIG_SH} not found)"
 else
   CFG5="${TMPDIR_TEST}/node-t5.yaml"
   make_nested_config "${CFG5}"
@@ -335,7 +355,7 @@ fi
 # existing entries and the Go runtime never sees them.
 section "Test 5b: node-config.sh add-bootnode MIGRATES legacy root-level bootnodes to p2p.bootnodes"
 if [[ ! -f "${NODE_CONFIG_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  node-config.sh not found at ${NODE_CONFIG_SH}"
+  skip "Test 5b: node-config.sh legacy schema migration (${NODE_CONFIG_SH} not found)"
 else
   CFG5B="${TMPDIR_TEST}/node-t5b.yaml"
   # Legacy config with an existing peer in root-level bootnodes (install-node.sh schema).
@@ -638,7 +658,7 @@ fi
 # root or a real /etc/aperod/ path) correctly redirects the injection.
 section "Test 13: aperod-join.sh — APEROD_NODE_YAML env override is honoured"
 if [[ ! -f "${APEROD_JOIN_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  aperod-join.sh not found at ${APEROD_JOIN_SH}"
+  skip "Test 13: aperod-join.sh environment override (${APEROD_JOIN_SH} not found)"
 else
   CFG13="${TMPDIR_TEST}/node-t13.yaml"
   make_nested_config "${CFG13}"
@@ -667,7 +687,7 @@ fi
 # executable, using APEROD_NODE_CONFIG_SH env var.
 section "Test 14: aperod-join.sh — node-config.sh path honoured when executable"
 if [[ ! -f "${NODE_CONFIG_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  node-config.sh not found at ${NODE_CONFIG_SH}"
+  skip "Test 14: node-config.sh override (${NODE_CONFIG_SH} not found)"
 else
   CFG14="${TMPDIR_TEST}/node-t14.yaml"
   make_nested_config "${CFG14}"
@@ -704,7 +724,7 @@ fi
 # APEROD_DROPIN_DIR env-var overrides to redirect filesystem writes.
 section "Test 15: aperod-join.sh end-to-end — --p2p-port 30304 written as bootnode port"
 if [[ ! -f "${APEROD_JOIN_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  aperod-join.sh not found at ${APEROD_JOIN_SH}"
+  skip "Test 15: aperod-join.sh non-default port (${APEROD_JOIN_SH} not found)"
 else
   STUB15="${TMPDIR_TEST}/stubs-t15"
   mkdir -p "${STUB15}"
@@ -854,7 +874,7 @@ PY
 # --no-chaindb on a guarded (non_validator: true) install.
 section "Test 16: --no-chaindb + consensus.non_validator: true exits nonzero and preserves chain.db"
 if [[ ! -f "${APEROD_JOIN_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  aperod-join.sh not found at ${APEROD_JOIN_SH}"
+  skip "Test 16: aperod-join.sh safe-mode guard (${APEROD_JOIN_SH} not found)"
 else
   STUB16="${TMPDIR_TEST}/stubs-t16"
   mkdir -p "${STUB16}"
@@ -984,7 +1004,7 @@ fi
 # ── Test 18: node-config.sh set-field / unset-field for nested key ────────────
 section "Test 18: node-config.sh set-field and unset-field support dotted paths (consensus.non_validator)"
 if [[ ! -f "${NODE_CONFIG_SH}" ]]; then
-  echo -e "${YELLOW}  SKIP${NC}  node-config.sh not found at ${NODE_CONFIG_SH}"
+  skip "Test 18: node-config.sh dotted fields (${NODE_CONFIG_SH} not found)"
 else
   CFG18="${TMPDIR_TEST}/node-t18.yaml"
   make_nested_config "${CFG18}"
@@ -1049,13 +1069,4 @@ PY
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-echo
-echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
-echo -e "  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}"
-echo -e "${BOLD}────────────────────────────────────────────────────────────${NC}"
-echo
-
-if [[ ${FAIL} -gt 0 ]]; then
-  exit 1
-fi
-exit 0
+finish

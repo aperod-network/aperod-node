@@ -25,12 +25,8 @@
 //   - Legacy root-level bootnodes key is migrated into p2p.bootnodes.
 //   - Running the script twice does not produce duplicate bootnode entries.
 //
-// # Skip conditions
-//
-//   - Running on Windows (test-join-network-mock-ssh.sh requires bash).
-//   - bash not found in PATH.
-//   - python3 not found in PATH.
-//   - python3 pyyaml library not available.
+// Missing runtime dependencies are failures on supported platforms: silently
+// skipping this suite locally previously allowed CI-only failures to ship.
 //
 // # Running manually
 //
@@ -46,6 +42,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -58,17 +55,6 @@ func TestJoinNetworkMockSSH(t *testing.T) {
 
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not found in PATH; skipping TestJoinNetworkMockSSH")
-	}
-
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not found in PATH; skipping TestJoinNetworkMockSSH")
-	}
-
-	// The script requires the pyyaml library; skip gracefully when absent.
-	checkYaml := exec.Command("python3", "-c", "import yaml")
-	if err := checkYaml.Run(); err != nil {
-		t.Skip("python3 pyyaml not available; skipping TestJoinNetworkMockSSH " +
-			"(install with: pip3 install pyyaml)")
 	}
 
 	scriptDir, err := filepath.Abs(".")
@@ -86,10 +72,62 @@ func TestJoinNetworkMockSSH(t *testing.T) {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 77 {
+			t.Fatalf("test-join-network-mock-ssh.sh skipped required scenarios (exit 77); install the dependencies named in SKIP_SUMMARY")
+		}
 		t.Errorf("test-join-network-mock-ssh.sh reported failures: %v\n"+
 			"  This means join-network.sh's bootnode injection (step 5/7)\n"+
 			"  is broken in the full-script execution path.\n"+
 			"  Re-run with: bash blockchain/deploy/test-join-network-mock-ssh.sh",
 			err)
+	}
+}
+
+// TestJoinNetworkMockSSHSkipContract ensures a missing optional dependency can
+// never look like a successful full run to either humans or test wrappers.
+func TestJoinNetworkMockSSHSkipContract(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test-join-network-mock-ssh.sh requires bash; skipping on Windows")
+	}
+
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not found in PATH; skipping TestJoinNetworkMockSSHSkipContract")
+	}
+	dirnamePath, err := exec.LookPath("dirname")
+	if err != nil {
+		t.Skip("dirname not found in PATH; skipping TestJoinNetworkMockSSHSkipContract")
+	}
+
+	binDir := t.TempDir()
+	if err := os.Symlink(bashPath, filepath.Join(binDir, "bash")); err != nil {
+		t.Fatalf("link bash stub: %v", err)
+	}
+	if err := os.Symlink(dirnamePath, filepath.Join(binDir, "dirname")); err != nil {
+		t.Fatalf("link dirname stub: %v", err)
+	}
+
+	scriptPath, err := filepath.Abs("test-join-network-mock-ssh.sh")
+	if err != nil {
+		t.Fatalf("resolve script path: %v", err)
+	}
+	cmd := exec.Command(bashPath, scriptPath)
+	cmd.Env = append(os.Environ(), "PATH="+binDir)
+	output, runErr := cmd.CombinedOutput()
+
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 77 {
+		t.Fatalf("missing python3 must exit 77, got %v\n%s", runErr, output)
+	}
+	for _, marker := range []string{
+		"0 passed",
+		"0 failed",
+		"1 skipped",
+		"M1-M6: python3 not found in PATH",
+		"SKIP_SUMMARY count=1",
+	} {
+		if !strings.Contains(string(output), marker) {
+			t.Errorf("skip output missing %q:\n%s", marker, output)
+		}
 	}
 }
