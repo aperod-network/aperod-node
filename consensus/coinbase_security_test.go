@@ -172,6 +172,81 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 	}
 }
 
+func TestHandleIncomingBlockRejectsUnauthorizedExtraCoinbase(t *testing.T) {
+	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipient, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewardAddress := crypto.AddressFromKeys(crypto.MainnetByte, recipient)
+
+	genesisHeader := core.BlockHeader{
+		Height:       0,
+		Timestamp:    time.Now().Add(-time.Second).UnixNano(),
+		ValidatorPub: validatorPub,
+		MerkleRoot:   core.MerkleRoot(nil),
+	}
+	if err := genesisHeader.Sign(validatorPriv); err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: genesisHeader}
+	chain := core.NewChain()
+	if err := chain.SetGenesis(genesis); err != nil {
+		t.Fatal(err)
+	}
+	utxos := core.NewUTXOSet()
+	engine := NewEngine(Config{
+		Validators:                          []crypto.ValidatorPubKey{validatorPub},
+		RingCTV4ActivationHeight:            1,
+		RewardAuthorizationActivationHeight: 1,
+	}, chain, core.NewMempool(core.DefaultMempoolConfig()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	engine.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	authorizedReward, err := core.BuildAuthorizedRewardTx(
+		rewardAddress,
+		AuthorizedBlockRewardNAPR,
+		1,
+		genesis.Hash(),
+		validatorPriv,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorizedMint, err := core.BuildMintTx(rewardAddress, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := &core.Block{
+		Header: core.BlockHeader{
+			Height:       1,
+			PrevHash:     genesis.Hash(),
+			Timestamp:    time.Now().UnixNano(),
+			Round:        1,
+			ValidatorPub: validatorPub,
+			BaseFee:      core.InitialBaseFeePerByte,
+		},
+		Txs: []core.Transaction{*authorizedReward, *unauthorizedMint},
+	}
+	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
+	if err := block.Header.Sign(validatorPriv); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.handleIncomingBlock(block); err == nil {
+		t.Fatal("P2P ingress accepted a block with an unauthorized extra coinbase")
+	}
+	if tip := chain.Tip(); tip == nil || tip.Header.Height != 0 {
+		t.Fatalf("rejected block changed canonical tip: %+v", tip)
+	}
+	if got := len(utxos.All()); got != 0 {
+		t.Fatalf("rejected block changed UTXO state: got %d entries", got)
+	}
+}
+
 func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
