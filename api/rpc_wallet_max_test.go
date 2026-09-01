@@ -23,6 +23,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
 )
 
 // rpcCall posts a JSON-RPC request to the server and returns the decoded body.
@@ -113,7 +114,12 @@ func TestRPC_WalletMaxSpendable_Height0Mints(t *testing.T) {
 	// All three share OneTimePub, so byPubKey keeps the last Add — add the
 	// smaller ones first and the largest LAST so the C-0 check sees the
 	// commitment of the UTXO that will actually be spent.
-	utxos := core.NewUTXOSet()
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	utxos := core.NewUTXOSetWithDB(db)
 	for i := len(mintTxs) - 1; i >= 0; i-- {
 		mt := mintTxs[i]
 		h := mt.Hash()
@@ -176,6 +182,20 @@ func TestRPC_WalletMaxSpendable_Height0Mints(t *testing.T) {
 		t.Fatalf("max_amount_napr = %d, fee = %d; want max+fee == %d", maxAmount, fee, mintAmounts[0])
 	}
 
+	// Simulate crash-era corruption after the quote: the persistent k/ index
+	// claims Alice's valid mint key image is spent, but no confirmed transaction
+	// on the chain carries it.
+	phantomKI, err := crypto.ComputeKeyImage(aliceKeys.Spend.Private, aliceKeys.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage: %v", err)
+	}
+	if err := db.MarkKeyImageSpent(phantomKI); err != nil {
+		t.Fatalf("inject phantom key image: %v", err)
+	}
+	if !utxos.IsSpent(phantomKI) {
+		t.Fatal("phantom key image injection did not reach persistent spent index")
+	}
+
 	// ── 2. Send exactly the quoted amount — must succeed on the FIRST try ────
 	sendResp := rpcCallMax(t, srv, "apr_walletSend", map[string]interface{}{
 		"spend_key_hex":  hex.EncodeToString(aliceKeys.Spend.Private[:]),
@@ -200,6 +220,11 @@ func TestRPC_WalletMaxSpendable_Height0Mints(t *testing.T) {
 	}
 	if got := uint64(sendResult["change_amount_napr"].(float64)); got != 0 {
 		t.Errorf("change_amount_napr = %d, want 0 for send-max", got)
+	}
+	if spent, err := db.IsKeyImageSpent(phantomKI); err != nil {
+		t.Fatalf("check repaired key image: %v", err)
+	} else if spent {
+		t.Fatal("apr_walletSend succeeded but phantom key image remains in persistent index")
 	}
 	t.Logf("send-max OK: max=%d fee=%d (naive DB balance was %d)", maxAmount, fee, naiveTotal)
 }
