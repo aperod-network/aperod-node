@@ -45,6 +45,11 @@
 #  both responses as unavailable, continue the full sequence, and report
 #  VALIDATOR_TIP=unknown.
 #
+#  Wrong-shape validator API at step 1 (WS1-WS8)
+#  ─────────────────────────────────────────────
+#  Validator stats returns valid JSON with a scalar or array at the top level.
+#  Bootstrap must treat both responses as unavailable and complete normally.
+#
 #  Failure: API timeout (AT1-AT2)
 #  ───────────────────────────────
 #  API never returns height > 0; script must exit non-zero.
@@ -1243,6 +1248,14 @@ run_invalid_validator_case "MV" \
 run_invalid_validator_case "TV" \
   "Truncated validator API at step 1 — incomplete JSON continues with unknown tip" \
   '{"tip_height":'
+
+run_invalid_validator_case "WA" \
+  "Wrong-shape validator API at step 1 — JSON array continues with unknown tip" \
+  '[{"tip_height":700}]'
+
+run_invalid_validator_case "WS" \
+  "Wrong-shape validator API at step 1 — JSON scalar continues with unknown tip" \
+  '700'
 
 # =============================================================================
 # ── FAILURE: API timeout ──────────────────────────────────────────────────────
