@@ -34,6 +34,11 @@
 #  API returns height > 0 on exactly the final allowed poll.
 #  Script must exit 0, not treat this as a timeout.
 #
+#  Slow validator API at step 1 (SV1-SV5)
+#  ───────────────────────────────────────
+#  Validator stats returns an empty response. Bootstrap must continue with
+#  VALIDATOR_TIP=unknown and still complete all stop, rsync, and start steps.
+#
 #  Failure: API timeout (AT1-AT2)
 #  ───────────────────────────────
 #  API never returns height > 0; script must exit non-zero.
@@ -992,6 +997,104 @@ if echo "${LAST_OUTPUT}" | grep -qE '42'; then
   pass "LA2: banner contains height 42 from last-attempt poll"
 else
   fail "LA2: expected height 42 in output. Got:\n${LAST_OUTPUT}"
+fi
+
+# =============================================================================
+# ── SLOW VALIDATOR API AT STEP 1 ──────────────────────────────────────────────
+# An empty validator stats response must be non-fatal. The script should retain
+# VALIDATOR_TIP=unknown and execute the complete bootstrap sequence.
+# =============================================================================
+section "Slow validator API at step 1 — empty response continues with unknown tip"
+
+SV_DIR="${TMPDIR_TEST}/sv"
+SV_DATA="${SV_DIR}/data"
+SV_BIN="${SV_DIR}/bin"
+SV_YAML="${SV_DIR}/node.yaml"
+SV_CONFIG="${SV_DIR}/node-config.sh"
+mkdir -p "${SV_DATA}/chain.db"
+touch "${SV_DATA}/chain.db/CURRENT"
+touch "${SV_DATA}/snapshot-v2-700.json.gz"
+printf 'network: testnet\n' >"${SV_YAML}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${SV_CONFIG}"; chmod +x "${SV_CONFIG}"
+
+SV_RSYNC_CALLED="${SV_DIR}/rsync-called"
+SV_VALIDATOR_STOPPED="${SV_DIR}/validator-stopped"
+SV_VALIDATOR_STARTED="${SV_DIR}/validator-started"
+SV_LOCAL_STARTED="${SV_DIR}/local-started"
+
+make_stub "${SV_BIN}" "rsync" "touch '${SV_RSYNC_CALLED}'; exit 0"
+make_stub "${SV_BIN}" "chown" 'exit 0'
+make_stub "${SV_BIN}" "sleep" 'exit 0'
+make_stub "${SV_BIN}" "aperod-node" "
+if echo \"\$*\" | grep -q -- '--check-store'; then
+  echo 'check-store OK: tip_height=700 missing=0 (threshold=5000)'
+fi
+exit 0
+"
+make_stub "${SV_BIN}" "systemctl" "
+case \"\$*\" in
+  *'stop aperod-node'*)  exit 0 ;;
+  *'is-active'*)         exit 1 ;;
+  *'enable --now'*|*'start aperod-node'*)
+    touch '${SV_LOCAL_STARTED}'
+    exit 0 ;;
+  *)                     exit 0 ;;
+esac
+"
+make_stub "${SV_BIN}" "ssh" "
+shift
+CMD=\"\$*\"
+if echo \"\$CMD\" | grep -q 'network/stats'; then
+  # Simulate curl timing out while the validator API is still starting.
+  exit 0
+elif echo \"\$CMD\" | grep -q 'systemctl start'; then
+  touch '${SV_VALIDATOR_STARTED}'
+  echo 'started'
+elif [[ \"\$CMD\" == 'bash' ]]; then
+  cat >/dev/null
+  touch '${SV_VALIDATOR_STOPPED}'
+  echo 'stopped'
+else
+  cat >/dev/null
+  echo 'ok'
+fi
+exit 0
+"
+make_stub "${SV_BIN}" "curl" "
+echo '{\"height\":700,\"peer_count\":1,\"syncing\":false}'
+exit 0
+"
+
+run_bootstrap "${SV_BIN}" "${SV_DATA}" "${SV_YAML}" "${SV_CONFIG}"
+
+if [[ ${LAST_EXIT} -eq 0 ]]; then
+  pass "SV1: script exited 0 despite an empty step-1 validator API response"
+else
+  fail "SV1: expected exit 0 but got ${LAST_EXIT}. Output:\n${LAST_OUTPUT}"
+fi
+
+if echo "${LAST_OUTPUT}" | grep -q 'Validator tip_height: unknown'; then
+  pass "SV2: completion banner shows validator tip_height as unknown"
+else
+  fail "SV2: expected completion banner to show unknown validator tip. Output:\n${LAST_OUTPUT}"
+fi
+
+if [[ -f "${SV_RSYNC_CALLED}" ]]; then
+  pass "SV3: rsync still executed after the empty step-1 response"
+else
+  fail "SV3: rsync did not execute. Output:\n${LAST_OUTPUT}"
+fi
+
+if [[ -f "${SV_VALIDATOR_STOPPED}" ]] && [[ -f "${SV_VALIDATOR_STARTED}" ]]; then
+  pass "SV4: validator stop and restart steps still executed"
+else
+  fail "SV4: validator stop/restart sequence was incomplete. Output:\n${LAST_OUTPUT}"
+fi
+
+if [[ -f "${SV_LOCAL_STARTED}" ]]; then
+  pass "SV5: local validator start step still executed"
+else
+  fail "SV5: local validator was not started. Output:\n${LAST_OUTPUT}"
 fi
 
 # =============================================================================
