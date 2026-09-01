@@ -1,6 +1,11 @@
 # Crypto donation addresses (BTC, ETH, USDT)
 
 custom:
+BTC
   - 'https://blockchair.com/ru/bitcoin/address/bc1qnphvlunglljg4j09244kwmntmuu4zfxl20203m'
+  
+  ETH
   - 'https://etherscan.io/address/0x0b7fead9aae0096c3030378556b7e4688b1afc1f#cards'
+  
+  USDT TRC20
   - 'https://tronscan.org/address/TADER1q4Nt1VA9PWiXhmtFPAjgY9zgWL6F/transactions'
