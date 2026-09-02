@@ -683,11 +683,10 @@ func (e *Engine) tick() error {
 	return nil
 }
 
-// DefaultBlockRewardNAPR is the block reward paid to the producing validator
-// when no override is set in Config.BlockRewardNAPR.
-// 5 APRO in base units: 1 APRO = 100_000_000 nAPRO → 5 APRO = 500_000_000 nAPRO.
-// At 3 s/block this yields ~52,560,000 APRO/year across all 21 validators.
-// Source of truth: deploy/BURN_POLICY.md — "Block reward: 5 APRO per block".
+// DefaultBlockRewardNAPR is the legacy pre-authorization reward used only when
+// Config.BlockRewardNAPR is zero and reward authorization is not active.
+// Current networks activate signed reward authorization and therefore use
+// AuthorizedBlockRewardNAPR instead.
 const DefaultBlockRewardNAPR uint64 = 500_000_000
 
 // AuthorizedBlockRewardNAPR is the immutable base reward for the on-chain
@@ -697,9 +696,8 @@ const DefaultBlockRewardNAPR uint64 = 500_000_000
 const AuthorizedBlockRewardNAPR uint64 = 10_000_000
 
 // HalvingIntervalBlocks is the number of blocks between each block-reward
-// halving event.  At 3 s/block, 21 024 000 blocks ≈ 2 years.
-// Must match the "Halving interval" row in deploy/VALIDATORS.md and
-// the "Halving interval" row in deploy/BURN_POLICY.md.
+// halving event. At a 3-second target interval, 21,024,000 blocks is about
+// two years.
 const HalvingIntervalBlocks uint64 = 21_024_000
 
 // defaultBlockRewardNAPR is an unexported alias kept for backward-compat
@@ -708,7 +706,7 @@ const defaultBlockRewardNAPR = DefaultBlockRewardNAPR
 
 // blockRewardAtHeight returns the coinbase reward in nAPRO for a block at the
 // given height, applying halvings per HalvingIntervalBlocks.
-// Era 0: DefaultBlockRewardNAPR; era 1: /2; era 2: /4; …
+// Era 0: base; era 1: base/2; era 2: base/4; …
 // The reward is halved at most 63 times (era ≥ 64 pays 0 to avoid overflow).
 func blockRewardAtHeight(base uint64, height uint64) uint64 {
 	era := height / HalvingIntervalBlocks

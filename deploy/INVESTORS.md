@@ -28,14 +28,14 @@ Key differentiators:
 
 | Property | Value |
 |---|---|
-| Consensus | Permissioned PoA (stake-weighted, rotating) |
+| Consensus | Permissionless PoA (stake-weighted, rotating) |
 | Privacy | RingCT confidential transactions |
 | Native token | APRO (1 APRO = 10⁸ nAPRO) |
 | Total supply (genesis) | **10 000 000 000 APRO** (10 billion) |
 | Fee model | EIP-1559: 100 % of base fee is **permanently burned** |
-| Block time | ~2 seconds |
-| Native wallet | Telegram bot `@aperod_bot` |
-| Explorer | [aperod.com/explorer](https://aperod.com/explorer/) |
+| Block time target | 3 seconds |
+| Native wallet | Telegram bot `@sup_apro_bot` |
+| Explorer | [explorer.aperod.com](https://explorer.aperod.com/) |
 
 ---
 
@@ -53,10 +53,10 @@ Public (launch / exchanges)    immediate            ~40 %
 > Exact vesting schedules are visible on the
 > [Tokenomics page](https://aperod.com/explorer/tokenomics).
 
-**Emission:** Validators earn a fixed block reward per block produced.  Rewards are
-halved every **21 024 000 blocks** (≈ 486 days at 2 s/block).  The first halving
-reduces the reward to ~50 % of genesis, the second to 25 %, and so on — mirroring
-Bitcoin's halving model but on a faster schedule because block time is 10× shorter.
+**Emission:** The current reward-authorization era starts at **0.1 APRO per
+block** plus optional priority tips. The base reward halves every
+**21,024,000 blocks** (about two years at the 3-second target). Every reward is
+signed by the scheduled validator and independently checked by peers.
 
 **Fee burn:** Every byte of every transaction costs a dynamic base fee.  That fee is
 **destroyed** — not paid to validators, not redistributed — which permanently reduces
@@ -91,16 +91,16 @@ rises to tens of millions of APRO per year — see scenarios below.
 
 ### Minimum stake
 
-To join the active validator set a node must stake at least **10 000 APRO**
-(10 000 000 000 000 nAPRO).  This is fixed by the protocol; the staking UI enforces
+To join the active validator set a node must stake at least **100,000 APRO**
+(10,000,000,000,000 nAPRO). This is fixed by the protocol; the staking UI enforces
 it, and the Go node rejects partial-unstake requests that would drop a validator
 below the minimum.
 
 ### Block rewards
 
 ```
-Phase 1 (genesis)  :  BlockReward  nAPRO per block produced
-Phase 2 (halving 1): ÷2 after 21 024 000 blocks (~486 days)
+Current era        :  10,000,000 nAPRO (0.1 APRO) per block produced
+Next era           :  ÷2 after 21,024,000 blocks (~2 years at 3 s/block)
 Phase 3 (halving 2): ÷4 …
 ```
 
@@ -109,11 +109,11 @@ validators can track their earned APRO without needing a ring-signature scan.
 
 ### Unbonding
 
-Full withdrawal: **7 200 blocks** (~4 hours) unbonding period.  
-Partial (excess) withdrawal: **604 800 blocks** (~7 days) unbonding period.
+Full withdrawal: **144,000 blocks** (~5 days) unbonding period.
+Partial (excess) withdrawal: **43,200 blocks** (~36 hours) unbonding period.
 
-Partial unstake lets a validator remove excess stake above 10 000 APRO without
-losing their validator slot, subject to the 7-day lock.
+Partial unstake lets a validator remove excess stake above 100,000 APRO without
+losing their validator slot, subject to the partial-unbonding lock.
 
 ### Running costs (reference, not a promise)
 
@@ -123,8 +123,8 @@ losing their validator slot, subject to the 7-day lock.
 | Bandwidth (1 TB) | included or $5 |
 | **Total** | **$15 – $35** |
 
-Break-even: at the genesis block reward rate and current APRO price, payback is
-typically reached within 6–12 months — exact figures depend on network TPS.
+Validator returns depend on produced blocks, missed slots, priority tips,
+operating costs and market conditions. No payback period is guaranteed.
 
 ---
 
@@ -134,13 +134,12 @@ The following scenarios are illustrative and do **not** constitute financial adv
 
 | Scenario | Driver | Supply Δ | Price target |
 |---|---|---|---|
-| **A · Conservative** | Deflation only, demand stable | −9.87 % by halving 2 | $0.001 → ~$0.00111 (+10.9 %) |
-| **B · Realistic Web3** | 20–30 games, organic demand ×10–15 | −10 % supply + demand shock | $0.001 → ~$0.011 (+1 100 %) |
-| **C · Global GameFi hub** | Top-tier L1, 3–4 B tokens burned (25 yr) | dominant supply sink | $0.001 → $0.15 – $0.30 (+15 000 – 30 000 %) |
+| **A · Low activity** | Reward issuance exceeds fee burn | Net supply increases | Market outcome is not predictable from protocol data alone |
+| **B · Balanced activity** | Fee burn approaches reward issuance | Net supply is approximately stable | Depends on real transaction demand and fees |
+| **C · High activity** | Fee burn exceeds reward issuance | Net supply decreases | Depends on sustained usage; no price target is implied |
 
-Scenario A requires nothing beyond the protocol working as designed.  
-Scenario B requires game developer adoption.  
-Scenario C is a maximum-extrapolation long-horizon model.
+These scenarios describe protocol supply mechanics only. They are not price
+forecasts, return projections or guarantees.
 
 ---
 
@@ -149,22 +148,12 @@ Scenario C is a maximum-extrapolation long-horizon model.
 ### Quick-start (Linux / Ubuntu 22.04+)
 
 ```bash
-# 1. Install the node binary
-curl -fsSL https://aperod.com/install-validator.sh | bash
+# Install and configure the validator service interactively.
+curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
 
-# 2. Generate a validator key
-aperod wallet keygen --network mainnet --out /opt/aperod/validator.key
-
-# 3. Configure the node
-cp /opt/aperod/config/mainnet.yaml.example /opt/aperod/config/mainnet.yaml
-# Set: validator_key, reward_address, p2p.external_ip
-
-# 4. Start the service
-systemctl enable aperod --now
-
-# 5. Stake APRO
-#    Send a StakeDeposit transaction via the admin panel or:
-aperod tx stake --amount 10000 --config /opt/aperod/config/mainnet.yaml
+# Verify the service and local REST API.
+systemctl status aperod-node
+curl -s http://127.0.0.1:8545/api/v1/status
 ```
 
 See [install-validator.sh](install-validator.sh) and
@@ -178,7 +167,7 @@ See [install-validator.sh](install-validator.sh) and
 | RAM | 4 GB | 8 GB |
 | Disk | 40 GB SSD | 200 GB NVMe |
 | OS | Ubuntu 22.04 | Ubuntu 22.04 / Debian 12 |
-| Outbound ports | 26656 (P2P) | 26656 + 8080 (API) |
+| Network ports | 30303/tcp (P2P) | 30303/tcp; 8545/tcp on loopback for local API access |
 
 ---
 
@@ -202,9 +191,9 @@ See [install-validator.sh](install-validator.sh) and
 | Resource | URL |
 |---|---|
 | Main website | https://aperod.com |
-| Block explorer | https://aperod.com/explorer/ |
-| Tokenomics | https://aperod.com/explorer/tokenomics |
-| Telegram wallet | https://t.me/aperod_bot |
+| Block explorer | https://explorer.aperod.com/ |
+| Tokenomics | https://explorer.aperod.com/tokenomics |
+| Telegram wallet | https://t.me/sup_apro_bot |
 | Public node repo | https://github.com/aperod-network/aperod-node |
 | Security policy | [SECURITY.md](SECURITY.md) |
 | Burn policy | [BURN_POLICY.md](BURN_POLICY.md) |

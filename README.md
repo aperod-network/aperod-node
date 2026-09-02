@@ -6,20 +6,15 @@
 
 RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&nbsp; 100 % fee burn &nbsp;·&nbsp; Permissionless PoA consensus
 
-[![Build Check](https://github.com/aperod-network/aperod-node/actions/workflows/build-check.yml/badge.svg)](https://github.com/aperod-network/aperod-node/actions/workflows/build-check.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
-[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://explorer.aperod.com/)
+[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://aperod.com/explorer/)
 [![Telegram](https://img.shields.io/badge/Wallet-@aperod__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/aperod_bot)
 
-**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com/) &nbsp;·&nbsp; [💬 Telegram Wallet](https://t.me/aperod_bot)**
+**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://aperod.com/explorer/) &nbsp;·&nbsp; [💬 Telegram Wallet](https://t.me/aperod_bot)**
 
 </div>
-
-<p align="center">
-  <img src="https://github.com/aperod-network/aperod-node/blob/main/.github/images/og.png?raw=true" alt="APEROD Preview" width="100%">
-</p>
 
 ---
 
@@ -49,7 +44,7 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 | **Telegram wallet** | Full wallet inside Telegram — create, send, receive, and stake APRO without any app download |
 | **100 % fee burn** | Every transaction fee is permanently destroyed, reducing total supply with every block |
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
-| **Block rewards** | 5 APRO per block paid directly to the validator's Telegram wallet + push notification |
+| **Block rewards** | 0.1 APRO authorized base reward per block in the current era, plus optional priority tips |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
 | **Open source** | Go 1.25, Apache 2.0, independently auditable cryptographic primitives |
 
@@ -113,7 +108,7 @@ The top 21 nodes by staked APRO form the active validator set — no operator ap
 
 Block rewards go directly to your **Telegram wallet**. You need an APRO address before installing the node.
 
-1. Open **[@aperod_bot](https://t.me/aperod_bot)**
+1. Open **[@sup_apro_bot](https://t.me/sup_apro_bot)**
 2. Tap **Create wallet**
 3. Copy your APRO address (≈ 95 characters, starts with `apr…`)
 
@@ -152,7 +147,7 @@ curl -s -X POST https://aperod.com/api/validators/apply \
 
 ### Step 4 — Stake APRO
 
-Transfer **≥ 100,000 APRO** to your wallet address via [@aperod_bot](https://t.me/aperod_bot).  
+Transfer **≥ 100,000 APRO** to your wallet address via [@sup_apro_bot](https://t.me/sup_apro_bot).
 Your node enters the active set automatically at the next epoch (~100 blocks · ≈ 5 min).
 
 ### Step 5 — You're live
@@ -175,7 +170,7 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 | Maximum active validators | **21** |
 | Epoch length | 100 blocks (~5 min) |
 | Churn limit per epoch | 3 new validators |
-| Unbonding period | 7,200 blocks (~6 hours) |
+| Full unbonding period | 144,000 blocks (~5 days) |
 | Liveness requirement | Sign ≥ 2/3 of blocks per epoch |
 | Slashing — double-sign | **10 % of stake, permanent ban** |
 | Slashing — extended downtime | **5 % of stake** |
@@ -187,17 +182,17 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 
 > **Every transaction fee is permanently burned. 100 %. Always.**
 
-Aperod has a **fixed supply cap** and a **deflationary fee model**:
+Aperod starts with a fixed genesis allocation and uses a deflationary fee model:
 
 ```
-Total supply cap:     10,000,000,000 APRO  (10B)
+Genesis supply:       10,000,000,000 APRO  (10B)
 Circulating (launch):  9,000,000,000 APRO  (9B — 90% Public / IDO / Liquidity)
 Dev Fund locked:       1,000,000,000 APRO  (10%, 12-month cliff + 48-month linear vest)
 Block time:            3 seconds
 Block throughput:      28,800 blocks / day
-Block reward:          5 APRO per block
-Annual emission:       52,560,000 APRO / year  (≈ 52.56 M APRO)
-Per-validator income:  ≈ 2,503,000 APRO / year (21 active validators, round-robin)
+Authorized reward:     0.1 APRO per block in the current era
+Annual base issuance:  1,051,200 APRO / year
+Per-validator base:    ≈ 50,057 APRO / year (21 equally productive validators)
 Halving interval:      every 21,024,000 blocks  (~2 years)
 Transaction fee:       dynamic EIP-1559 · base 200 nAPRO/byte · adjusts ±12.5%/block
                        P2P transfer ~2 KB ≈ 0.004 APRO
@@ -205,7 +200,8 @@ Transaction fee:       dynamic EIP-1559 · base 200 nAPRO/byte · adjusts ±12.5
 Fee destination:       🔥 base fee — burned 100% · priority tip → validator
 ```
 
-Validators earn **block rewards only**. Zero fees reach validator wallets.  
+Validators earn the authorized base reward plus optional priority tips.
+The base-fee portion never reaches validator wallets.
 The burn is enforced at the consensus layer — not a governance parameter, not toggleable.
 
 See [**BURN\_POLICY.md**](BURN_POLICY.md) for full tokenomics and deflationary mechanics.
@@ -246,16 +242,18 @@ The burn is consensus-enforced — not a governance parameter, not toggleable.
 
 ### Your APRO Validator Reward Grows in USD as Price Rises
 
-Validators earn **≈ 2,503,000 APRO / year** (round-robin across 21 active validators).  
+At the current reward era, an equally productive member of a 21-validator set
+earns a theoretical base reward of **≈ 50,057 APRO / year**, before priority
+tips and missed slots.
 As deflation drives the price up, that fixed reward becomes worth exponentially more in USD:
 
 | APRO price | Annual validator income (USD) |
 |-----------|------------------------------|
-| $0.001 (launch) | **$2,503 / year** |
-| $0.0011 (Scenario A, 2031) | **$2,753 / year** |
-| $0.011 (Scenario B, 2031) | **$27,533 / year** |
-| $0.15 (Scenario C, low) | **$375,450 / year** |
-| $0.30 (Scenario C, high) | **$750,900 / year** |
+| $0.001 (illustrative) | **≈ $50 / year** |
+| $0.0011 (illustrative) | **≈ $55 / year** |
+| $0.011 (illustrative) | **≈ $551 / year** |
+| $0.15 (illustrative) | **≈ $7,509 / year** |
+| $0.30 (illustrative) | **≈ $15,017 / year** |
 
 Run the node, earn APRO. Let deflation do the rest.
 
@@ -335,18 +333,34 @@ Outputs:
 ./build/aperod chain block <height>
 ```
 
-### Updating a running node (production)
+### Upgrading a running node (production)
 
-**Use `update-node.sh` — do not build and copy manually.**
+**Use `upgrade-node.sh` — the canonical single command for safe upgrades.**
 
 ```bash
-sudo bash /opt/aperod/blockchain/deploy/update-node.sh
+sudo bash /opt/aperod/blockchain/deploy/upgrade-node.sh
 ```
 
-The script stops the service, builds the binary, installs it to `/usr/local/bin/aperod-node` (the path the `systemd` service runs), starts the service, and waits for the API to respond. Telegram alerts are sent on build or startup failure.
+`upgrade-node.sh` is the recommended upgrade path. Before restarting the service it
+guarantees that the memory-protection systemd drop-ins are present and active:
+
+| Drop-in | Value | Purpose |
+|---------|-------|---------|
+| `timeout.conf` | `TimeoutStopSec=900` | Prevents SIGKILL mid-snapshot (Aug 2026 outage root cause) |
+| `gomemlimit.conf` | `GOMEMLIMIT=5 GiB` | Prevents OOM-kill and LevelDB corruption under memory pressure |
+
+The script then delegates to `update-node.sh`, which stops the service, pulls the
+latest source, rebuilds the binary, installs it to `/usr/local/bin/aperod-node`, restarts
+the service, and waits for the API to respond. Telegram alerts are sent on build or
+startup failure.
+
+The script is **idempotent** — safe to re-run at any time.
 
 > **Why not `make build` + `cp` directly?**
-> Copying over a running binary fails with `Text file busy`. Building to any path other than `/usr/local/bin/aperod-node` is silently ignored by the service. The update script prevents both mistakes.
+> Copying over a running binary fails with `Text file busy`. Building to any path other
+> than `/usr/local/bin/aperod-node` is silently ignored by the service. A manual sequence
+> also risks forgetting to apply the memory-protection drop-ins that prevent OOM-kill and
+> snapshot corruption. `upgrade-node.sh` prevents all of these mistakes in a single command.
 
 ### Run tests
 
@@ -432,7 +446,7 @@ go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30
 - **Consensus key ≠ wallet key** — the key that signs blocks has no ability to move funds
 - **RPC (port 8545) binds to `127.0.0.1` by default** — never expose externally without a firewall
 - **pprof (port 8546) disabled by default** — enable only for active diagnosis, loopback only
-- **Consensus key stored with `chmod 640`** — readable only by the `aperod` system user
+- **Consensus key stored with `chmod 600`** — readable only by the `aperod` system user
 - **Double-sign protection** — automatic on-chain slashing (10 % of stake, permanent ban from validator set)
 - **View key sharing** — share your view key for read-only auditing without granting spending ability
 
@@ -467,6 +481,6 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) fo
   <sub>
     <a href="https://aperod.com">aperod.com</a> &nbsp;·&nbsp;
     <a href="https://t.me/aperod_bot">Telegram Wallet</a> &nbsp;·&nbsp;
-    <a href="https://explorer.aperod.com/">Block Explorer</a>
+    <a href="https://aperod.com/explorer/">Block Explorer</a>
   </sub>
 </div>

@@ -4,6 +4,7 @@
 //
 // Checked constants
 // ─────────────────
+//   - consensus.AuthorizedBlockRewardNAPR must match the current-era reward
 //   - consensus.HalvingIntervalBlocks   must match "21,024,000 blocks" in doc
 //   - 28 800 blocks / day               derived from 3-second block time
 //
@@ -54,7 +55,18 @@ func extractBurnInt(t *testing.T, doc, pattern, label string) int64 {
 func TestBurnPolicyMatchesProtocolConstants(t *testing.T) {
 	doc := readBurnPolicy(t)
 
-	// ── 1. Halving interval ───────────────────────────────────────────────────
+	// ── 1. Authorized reward ──────────────────────────────────────────────────
+	mdRewardNAPR := extractBurnInt(t, doc,
+		`Authorized base reward\s*\|\s*\*\*0\.1 APRO\*\*\s*\(\*\*([\d,]+)\s*nAPRO\*\*\)`,
+		"AuthorizedBlockRewardNAPR")
+	if int64(consensus.AuthorizedBlockRewardNAPR) != mdRewardNAPR {
+		t.Errorf(
+			"burn_policy_sync MISMATCH — AuthorizedBlockRewardNAPR:\n  Go constant  : %d\n  BURN_POLICY.md: %d\n"+
+				"  → update one of them so they agree",
+			consensus.AuthorizedBlockRewardNAPR, mdRewardNAPR)
+	}
+
+	// ── 2. Halving interval ───────────────────────────────────────────────────
 	// BURN_POLICY.md: "| Halving interval | Every **21,024,000 blocks** (~2 years) |"
 	mdHalving := extractBurnInt(t, doc,
 		`Halving interval\s*\|\s*Every\s*\*\*([\d,]+)\s*blocks\*\*`,
@@ -66,7 +78,7 @@ func TestBurnPolicyMatchesProtocolConstants(t *testing.T) {
 			consensus.HalvingIntervalBlocks, mdHalving)
 	}
 
-	// ── 2. Blocks per day ─────────────────────────────────────────────────────
+	// ── 3. Blocks per day ─────────────────────────────────────────────────────
 	// BURN_POLICY.md: "| Block throughput | **28,800 blocks / day** |"
 	// Block time is 3 seconds → 86 400 / 3 = 28 800 blocks/day.
 	// There is no named Go constant for this; we derive it from the fixed

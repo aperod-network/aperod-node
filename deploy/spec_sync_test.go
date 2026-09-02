@@ -80,7 +80,7 @@ func assertMatch(t *testing.T, label string, got, want int64) {
 //   - core.ChurnLimit           New validators admitted per epoch
 //   - core.UnbondingBlocks      Unbonding cooldown in blocks
 //   - core.SlashPercent         Double-sign slash percentage
-//   - consensus.DefaultBlockRewardNAPR  Block reward (converted to whole APRO)
+//   - consensus.AuthorizedBlockRewardNAPR  Current authorized base reward
 //   - consensus.HalvingIntervalBlocks   Halving cadence in blocks
 func TestSpecMatchesProtocolConstants(t *testing.T) {
 	spec := readSpec(t)
@@ -124,7 +124,7 @@ func TestSpecMatchesProtocolConstants(t *testing.T) {
 		int64(core.ChurnLimit), mdChurn)
 
 	// ── 5. UnbondingBlocks ───────────────────────────────────────────────────
-	// VALIDATORS.md: "| 2. Unbonding period | **7,200 blocks** (~6 hours) — node leaves active set |"
+	// VALIDATORS.md: "| 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |"
 	mdUnbond := extractInt(t, spec,
 		`Unbonding period\s*\|\s*\*\*([\d,]+)\s*blocks\*\*`,
 		"UnbondingBlocks")
@@ -142,16 +142,15 @@ func TestSpecMatchesProtocolConstants(t *testing.T) {
 		fmt.Sprintf("SlashPercent (core=%d, md=%d)", core.SlashPercent, mdSlash),
 		int64(core.SlashPercent), mdSlash)
 
-	// ── 7. DefaultBlockRewardNAPR in whole APRO ──────────────────────────────
-	// VALIDATORS.md: "| Block reward | **5 APRO** per block produced |"
-	mdRewardAPRO := extractInt(t, spec,
-		`\|\s*Block reward\s*\|\s*\*\*(\d[\d,]*)\s*APRO\*\*\s*per block`,
-		"DefaultBlockRewardNAPR (in APRO)")
-	goRewardAPRO := int64(consensus.DefaultBlockRewardNAPR) / naprPerAPRO
+	// ── 7. AuthorizedBlockRewardNAPR in nAPRO ────────────────────────────────
+	// VALIDATORS.md documents the exact base-unit value as well as 0.1 APRO.
+	mdRewardNAPR := extractInt(t, spec,
+		`\*\*([\d,]+)\s*nAPRO\s*\(0\.1 APRO\)\*\*`,
+		"AuthorizedBlockRewardNAPR")
 	assertMatch(t,
-		fmt.Sprintf("DefaultBlockRewardNAPR (consensus=%d nAPRO = %d APRO, md=%d APRO)",
-			consensus.DefaultBlockRewardNAPR, goRewardAPRO, mdRewardAPRO),
-		goRewardAPRO, mdRewardAPRO)
+		fmt.Sprintf("AuthorizedBlockRewardNAPR (consensus=%d nAPRO, md=%d nAPRO)",
+			consensus.AuthorizedBlockRewardNAPR, mdRewardNAPR),
+		int64(consensus.AuthorizedBlockRewardNAPR), mdRewardNAPR)
 
 	// ── 8. HalvingIntervalBlocks ─────────────────────────────────────────────
 	// VALIDATORS.md: "| Halving interval | Every **21,024,000 blocks** (~2 years) |"

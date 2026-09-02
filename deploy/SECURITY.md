@@ -83,13 +83,14 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 - **HD derivation**: BIP-39 + SLIP-0010 + Ed25519 (matches Go node exactly)
 - **Address checksum**: double-SHA-256 (not SHA-3 despite internal naming — tested against Go reference)
 - **Consensus key ≠ spend key**: compromise of one does not affect the other
-- **Validator key permissions**: file must be `chmod 640`, owned by `aperod` user; node refuses to start on wrong permissions
+- **Validator key permissions**: file must be `chmod 600`, owned by `aperod` user; node refuses to start on unsafe permissions
 
-### Halving Schedule
+### Validator Reward Authorization
 
-- Block reward: **5 APRO** at genesis
+- Current authorized base reward: **0.1 APRO** per block, plus validated priority tips
 - Halving interval: **21,024,000 blocks** (≈ 2 years at 3 s/block)
-- Era boundaries checked in `consensus/poa.go`; tested to ensure finalization does not break at halving height
+- Every reward authorization is signed by the scheduled validator and binds the height, parent hash, destination and exact amount
+- Peers derive the protocol reward independently and reject unauthorized or incorrectly valued coinbase transactions
 
 ---
 
@@ -133,7 +134,7 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 ## Security Hardening Checklist (Validators)
 
 - [ ] Firewall: only `30303/tcp+udp` open externally; `8545` blocked
-- [ ] Consensus key: `/etc/aperod/validator.key`, `chmod 640`, owned by `aperod`
+- [ ] Consensus key: `/etc/aperod/validator.key`, `chmod 600`, owned by `aperod`
 - [ ] No duplicate processes: two instances with the same key trigger double-sign
 - [ ] Separate keys: consensus key ≠ wallet spend key
 - [ ] Updates: subscribe to GitHub releases for security patches

@@ -83,14 +83,17 @@ At each epoch boundary the consensus engine:
 
 | Item | Detail |
 |------|--------|
-| Block reward | **5 APRO** per block produced |
+| Authorized base reward | **0.1 APRO** per block produced in the current era |
 | Reward destination | Validator's configured `reward_address` (Telegram wallet) |
 | Notification | Telegram push notification on every reward payment |
-| Fee share | **0 %** — all fees are burned, none go to validators |
+| Fee share | Base fee is burned; optional priority tips go to the block producer |
 | Halving interval | Every **21,024,000 blocks** (~2 years) |
 
-Block rewards are minted directly to the `reward_address` in `node.yaml`.  
-You must configure a valid APRO address — rewards cannot be redirected after a block is produced.
+The producing validator signs an authorization that binds the block height,
+parent hash, destination and exact amount. Every peer derives the expected
+**10,000,000 nAPRO (0.1 APRO)** base reward for the current era and rejects
+unauthorized or incorrectly valued reward transactions. The configured
+`reward_address` must be a valid APRO address.
 
 ---
 
@@ -149,7 +152,7 @@ Staked APRO is locked while the validator is active. To withdraw:
 
 | Step | Detail |
 |------|--------|
-| 1. Initiate unbonding | Send unbonding request via [@aperod_bot](https://t.me/aperod_bot) |
+| 1. Initiate unbonding | Send unbonding request via [@sup_apro_bot](https://t.me/sup_apro_bot) |
 | 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
 | 3. Funds released | APRO returned to wallet after unbonding period |
 
