@@ -348,16 +348,14 @@ func (e *Engine) RewardMode() string {
 }
 
 // CurrentBlockRewardNAPR returns the base reward for the next block.
-// The deployed network uses a constant pool reward until the pre-allocated
-// staking pool is exhausted, then switches to the configured tail emission.
-// Reward authorization is a separate opt-in feature; activation height 0 means
-// disabled and must not override the deployed pool economics.
+// Reward authorization changes how the reward is authenticated, not its
+// economics: the amount remains the pool draw or tail emission.
 func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 	height := e.chain.Height() + 1
-	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
-	if rewardActivation > 0 && height >= rewardActivation {
-		return AuthorizedBlockRewardNAPR
-	}
+	return e.blockRewardNAPRAt(height)
+}
+
+func (e *Engine) blockRewardNAPRAt(height uint64) uint64 {
 	base := e.cfg.BlockRewardNAPR
 	if base == 0 {
 		if e.stakingPoolInit > 0 {
@@ -370,6 +368,10 @@ func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 		return e.tailRewardNAPR
 	}
 	if e.stakingPoolInit > 0 {
+		remaining := atomic.LoadInt64(&e.stakingPoolRemaining)
+		if remaining > 0 && uint64(remaining) < base {
+			return uint64(remaining)
+		}
 		return base
 	}
 	return blockRewardAtHeight(base, height)
@@ -383,9 +385,6 @@ func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 func (e *Engine) DecrementPool(height uint64) {
 	if e.stakingPoolInit == 0 {
 		return // pool disabled
-	}
-	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 && height >= activation {
-		return // local pool accounting is not consensus state in the authorization era
 	}
 	baseReward := e.cfg.BlockRewardNAPR
 	if baseReward == 0 {
@@ -695,17 +694,14 @@ func (e *Engine) tick() error {
 	return nil
 }
 
-// DefaultBlockRewardNAPR is the legacy pre-authorization reward used only when
-// Config.BlockRewardNAPR is zero and reward authorization is not active.
-// Current networks activate signed reward authorization and therefore use
-// AuthorizedBlockRewardNAPR instead.
+// DefaultBlockRewardNAPR is the legacy fallback used only when neither an
+// explicit block reward nor staking-pool economics are configured.
 const DefaultBlockRewardNAPR uint64 = 500_000_000
 
-// AuthorizedBlockRewardNAPR is the immutable base reward for the on-chain
-// authorization era. It matches the currently deployed 0.1 APRO schedule.
-// Config.BlockRewardNAPR, staking-pool accounting, and tail rewards are legacy
-// local policies and are deliberately not consensus inputs after activation.
-const AuthorizedBlockRewardNAPR uint64 = 10_000_000
+// AuthorizedBlockRewardNAPR is retained for compatibility with external code.
+// Authorization authenticates the active pool/tail amount; it does not define
+// a separate emission schedule.
+const AuthorizedBlockRewardNAPR uint64 = DefaultPoolBlockRewardNAPR
 
 // HalvingIntervalBlocks is the number of blocks between each block-reward
 // halving event. At a 3-second target interval, 21,024,000 blocks is about
@@ -784,7 +780,7 @@ func blockFeeStats(txs []core.Transaction, _ uint64) (burned, tipTotal uint64) {
 // reward authorization must mint. It uses only immutable protocol constants and
 // block data, so every validator derives the same value across restarts.
 func (e *Engine) expectedAuthorizedRewardAmount(block *core.Block) (uint64, error) {
-	return AuthorizedBlockRewardNAPR, nil
+	return e.blockRewardNAPRAt(block.Header.Height), nil
 }
 
 // oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
@@ -907,12 +903,13 @@ func validateCoinbasePolicy(block *core.Block) error {
 	return nil
 }
 
-// validateCoinbasePolicy applies three consensus eras:
-//   - historical structural coinbase rules before RingCT v4 activation;
-//   - no zero-input value creation after RingCT v4 activation but before reward
-//     authorization activation;
+// validateCoinbasePolicy applies two reward-authorization eras:
+//   - structural coinbase rules before reward authorization activation;
 //   - exactly one consensus-priced, proposer-signed validator reward once the
 //     on-chain authorization protocol is activated.
+//
+// RingCT activation is deliberately not consulted here: it governs transfer
+// proofs and fee rules, not whether the configured validator reward exists.
 func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
 	if err := validateCoinbasePolicy(block); err != nil {
 		return err
@@ -959,14 +956,6 @@ func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
 		return nil
 	}
 
-	activation := e.cfg.RingCTV4ActivationHeight
-	if activation > 0 && block.Header.Height < activation {
-		return nil
-	}
-	if len(coinbases) != 0 {
-		return fmt.Errorf("zero-input value creation is disabled from activation height %d, got %d mint transaction(s)",
-			activation, len(coinbases))
-	}
 	return nil
 }
 
@@ -995,16 +984,16 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 			continue
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
-requiredFee := minFee
-if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
-if requiredFee > ^uint64(0)-intentionalBurn {
-return fmt.Errorf("transaction %d intentional burn fee requirement overflows uint64", i)
-}
-requiredFee += intentionalBurn
-}
-if tx.Fee < requiredFee {
+		requiredFee := minFee
+		if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
+			if requiredFee > ^uint64(0)-intentionalBurn {
+				return fmt.Errorf("transaction %d intentional burn fee requirement overflows uint64", i)
+			}
+			requiredFee += intentionalBurn
+		}
+		if tx.Fee < requiredFee {
 			return fmt.Errorf("transaction %d fee below consensus minimum: got %d, want at least %d",
-i, tx.Fee, requiredFee)
+				i, tx.Fee, requiredFee)
 		}
 		if totalFees > ^uint64(0)-tx.Fee {
 			return fmt.Errorf("aggregate transaction fees overflow uint64")
@@ -1385,10 +1374,9 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 	// (added below) and any privileged coinbases already selected from the
 	// pool — an over-limit block would fail our own validateCoinbasePolicy and
 	// stall production forever while the mints re-queue each slot.
-	activation := e.cfg.RingCTV4ActivationHeight
-	legacyRewardActive := activation > 0 && height < activation
-	rewardWillBeBuilt := e.cfg.RewardAddress != "" &&
-		(legacyRewardActive || rewardAuthorizationActive)
+	ringCTActivation := e.cfg.RingCTV4ActivationHeight
+	adminMintActive := ringCTActivation > 0 && height < ringCTActivation
+	rewardWillBeBuilt := e.cfg.RewardAddress != ""
 	mintCapacity := maxCoinbasesPerBlock
 	if rewardWillBeBuilt {
 		mintCapacity--
@@ -1398,7 +1386,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			mintCapacity--
 		}
 	}
-	if legacyRewardActive && !rewardAuthorizationActive {
+	if adminMintActive && !rewardAuthorizationActive {
 		if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
 			txs = append(adminMints, txs...)
 		}
@@ -1412,7 +1400,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			return nil, fmt.Errorf("reward_address is required from reward authorization activation height %d",
 				rewardActivation)
 		}
-		rewardNAPR := AuthorizedBlockRewardNAPR
+		rewardNAPR := e.blockRewardNAPRAt(height)
 		if rewardNAPR > 0 {
 			mintTx, err := core.BuildAuthorizedRewardTx(
 				crypto.Address(e.cfg.RewardAddress),
@@ -1426,7 +1414,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			}
 			txs = append([]core.Transaction{*mintTx}, txs...)
 		}
-	} else if e.cfg.RewardAddress != "" && legacyRewardActive {
+	} else if e.cfg.RewardAddress != "" {
 		baseReward := e.cfg.BlockRewardNAPR
 		if baseReward == 0 {
 			if e.stakingPoolInit > 0 {

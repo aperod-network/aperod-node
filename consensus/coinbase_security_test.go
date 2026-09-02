@@ -10,7 +10,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-func TestStrictCoinbasePolicyDisablesLocalStateDependentMinting(t *testing.T) {
+func TestRingCTActivationDoesNotDisableValidatorRewards(t *testing.T) {
 	const (
 		activation = uint64(100)
 		reward     = uint64(10_000_000)
@@ -38,35 +38,31 @@ func TestStrictCoinbasePolicyDisablesLocalStateDependentMinting(t *testing.T) {
 			BaseFee: core.InitialBaseFeePerByte,
 		},
 	}
-	if err := engine.validateCoinbasePolicy(valid); err != nil {
-		t.Fatalf("mint-free post-activation block rejected: %v", err)
+	rewardBlock := &core.Block{
+		Header: valid.Header,
+		Txs:    []core.Transaction{*expected},
+	}
+	if err := engine.validateCoinbasePolicy(rewardBlock); err != nil {
+		t.Fatalf("configured validator reward rejected at RingCT activation: %v", err)
 	}
 
-	unauthorized, err := core.BuildMintTx(rewardAddress, reward+1, activation)
+	extraMint, err := core.BuildMintTx(rewardAddress, reward+1, activation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong := &core.Block{
-		Header: valid.Header,
-		Txs:    []core.Transaction{*unauthorized},
-	}
-	if err := engine.validateCoinbasePolicy(wrong); err == nil {
-		t.Fatal("zero-input mint was accepted after activation")
-	}
-
 	extra := &core.Block{
 		Header: valid.Header,
-		Txs:    []core.Transaction{*expected, *unauthorized},
+		Txs:    []core.Transaction{*expected, *extraMint},
 	}
-	if err := engine.validateCoinbasePolicy(extra); err == nil {
-		t.Fatal("additional zero-input mint was accepted after activation")
+	if err := engine.validateCoinbasePolicy(extra); err != nil {
+		t.Fatalf("structurally valid pre-authorization coinbase prefix rejected: %v", err)
 	}
 
 	// Historical replay below the activation height retains the previous
 	// structural policy.
 	historical := &core.Block{
 		Header: core.BlockHeader{Height: activation - 1},
-		Txs:    []core.Transaction{*expected, *unauthorized},
+		Txs:    []core.Transaction{*expected, *extraMint},
 	}
 	if err := engine.validateCoinbasePolicy(historical); err != nil {
 		t.Fatalf("pre-activation historical block was rejected: %v", err)
@@ -89,6 +85,9 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 	newEngine := func() *Engine {
 		return NewEngine(Config{
 			Validators:                          []crypto.ValidatorPubKey{validatorPub},
+			BlockRewardNAPR:                     DefaultPoolBlockRewardNAPR,
+			StakingPoolNAPR:                     2 * DefaultPoolBlockRewardNAPR,
+			TailRewardNAPR:                      defaultTailRewardNAPR,
 			RingCTV4ActivationHeight:            50,
 			RewardAuthorizationActivationHeight: activation,
 		}, core.NewChain(), core.NewMempool(core.DefaultMempoolConfig()),
@@ -154,7 +153,8 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 		t.Fatal("duplicate authorized rewards were accepted")
 	}
 
-	// The separate activation boundary preserves the fail-closed RingCT gap.
+	// Before authorization activation, the existing structural coinbase policy
+	// remains active even though RingCT v4 has already activated.
 	preAuth := &core.Block{
 		Header: core.BlockHeader{
 			Height:       activation - 1,
@@ -163,12 +163,17 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 			BaseFee:      core.InitialBaseFeePerByte,
 		},
 	}
-	if err := engine.validateCoinbasePolicy(preAuth); err != nil {
-		t.Fatalf("mint-free pre-authorization block rejected: %v", err)
+	legacyReward, err := core.BuildMintTx(
+		rewardAddress,
+		DefaultPoolBlockRewardNAPR,
+		activation-1,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	preAuth.Txs = []core.Transaction{*authorized}
-	if err := engine.validateCoinbasePolicy(preAuth); err == nil {
-		t.Fatal("authorized reward activated one block early")
+	preAuth.Txs = []core.Transaction{*legacyReward}
+	if err := engine.validateCoinbasePolicy(preAuth); err != nil {
+		t.Fatalf("pre-authorization pool reward rejected after RingCT activation: %v", err)
 	}
 }
 
@@ -281,7 +286,9 @@ func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 		Validators:                          []crypto.ValidatorPubKey{pub},
 		MyKey:                               locked,
 		RewardAddress:                       string(rewardAddress),
-		BlockRewardNAPR:                     DefaultBlockRewardNAPR,
+		BlockRewardNAPR:                     DefaultPoolBlockRewardNAPR,
+		StakingPoolNAPR:                     2 * DefaultPoolBlockRewardNAPR,
+		TailRewardNAPR:                      defaultTailRewardNAPR,
 		RingCTV4ActivationHeight:            1,
 		RewardAuthorizationActivationHeight: 1,
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()),
@@ -307,8 +314,12 @@ func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("produced reward is not consensus-valid: %v", err)
 	}
-	if auth.Amount != AuthorizedBlockRewardNAPR {
-		t.Fatalf("authorized reward = %d, want %d", auth.Amount, AuthorizedBlockRewardNAPR)
+	if auth.Amount != DefaultPoolBlockRewardNAPR {
+		t.Fatalf("authorized reward = %d, want pool reward %d", auth.Amount, DefaultPoolBlockRewardNAPR)
+	}
+	engine.DecrementPool(block.Header.Height)
+	if got, want := engine.StakingPoolRemaining(), DefaultPoolBlockRewardNAPR; got != want {
+		t.Fatalf("pool remaining after authorized reward = %d, want %d", got, want)
 	}
 }
 
