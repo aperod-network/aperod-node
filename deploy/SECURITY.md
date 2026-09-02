@@ -26,6 +26,11 @@ Include:
 - Steps to reproduce (or proof-of-concept)
 - Affected component (`core/`, `consensus/`, `p2p/`, etc.)
 
+Researchers repeating APD-2026 findings should first follow the
+[`APD Remediation Verification Guide`](../SECURITY-RESEARCHER-GUIDE.md). It
+identifies the current remediation baseline, activation-gated behavior, and
+the exact regression suites for each finding.
+
 Response within **48 hours**. Critical issues patched within **7 days**.
 
 ---
