@@ -18,7 +18,7 @@ const (
 )
 
 // Human-readable prefix prepended before the Base58Check payload.
-// Mainnet addresses look like:  apr<base58...>
+// Mainnet addresses look like:  apro<base58...>
 // Testnet addresses look like: tapr<base58...>
 const (
 	mainnetHRPrefix = "apro"
@@ -41,7 +41,7 @@ func hrPrefix(net NetworkByte) string {
 
 // Address is the human-readable representation of a wallet (spend + view public keys).
 // Format: <hrPrefix> + Base58Check( version_byte || spend_pubkey[32] || view_pubkey[32] )
-// Example mainnet:  aprXXXXXXX...  (~98 chars total)
+// Example mainnet:  aproXXXXXXX...  (~98 chars total)
 // Example testnet: taprXXXXXXX... (~99 chars total)
 type Address string
 
@@ -79,7 +79,7 @@ func DecodeAddress(addr Address) (net NetworkByte, spend, view Point32, err erro
 		stripped = s[len(mainnetHRPrefix):]
 		expectedNet = MainnetByte
 	default:
-		return 0, Point32{}, Point32{}, fmt.Errorf("invalid address: missing network prefix (apr/tapr/dapr)")
+		return 0, Point32{}, Point32{}, fmt.Errorf("invalid address: missing network prefix (apro/tapr/dapr)")
 	}
 
 	decoded := base58.Decode(stripped)
