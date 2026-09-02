@@ -178,6 +178,12 @@ func TestUTXOSet_ApplyBlock_DoubleSpend(t *testing.T) {
 
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	block := makeBlockWithKI(t, priv, pub, 1, crypto.Hash32{}, ki)
+	// ApplyBlock fail-closes unless the input resolves to an active UTXO.
+	s.Add(&core.UTXO{
+		TxHash:       crypto.HashStr("double-spend-source"),
+		OneTimePub:   block.Txs[0].Inputs[0].Ring[0],
+		AmountCommit: block.Txs[0].Inputs[0].AmountCommit,
+	})
 
 	if err := s.ApplyBlock(block); err != nil {
 		t.Fatalf("first apply: %v", err)

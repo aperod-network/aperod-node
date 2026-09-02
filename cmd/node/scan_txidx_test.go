@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -219,6 +220,81 @@ func TestScan_WritesTxIdxEntries(t *testing.T) {
 	}
 }
 
+func TestStartupScanApplyBlockFailureIsFatalBeforeIndexing(t *testing.T) {
+	dir := t.TempDir()
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	db, tipHeight := buildScanTxIdxChain(t, dir, priv, pub, 1, 1)
+
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	ring := make([]crypto.RingMember, crypto.RingSize)
+	ring[0] = keys.Spend.Public
+	for i := 1; i < len(ring); i++ {
+		decoy, genErr := crypto.GenerateWalletKeys()
+		if genErr != nil {
+			t.Fatalf("GenerateWalletKeys decoy: %v", genErr)
+		}
+		ring[i] = decoy.Spend.Public
+	}
+	sig, err := crypto.MLSAGSign(crypto.Hash32{}, ring, 0, keys.Spend.Private)
+	if err != nil {
+		t.Fatalf("MLSAGSign: %v", err)
+	}
+	badTx := core.Transaction{
+		Version: core.TxVersionBase,
+		Inputs: []core.RingInput{{
+			KeyImage:     sig.KeyImage,
+			Ring:         ring,
+			AmountCommit: crypto.Commitment{0x7f},
+		}},
+	}
+	badBlock := &core.Block{
+		Header: core.BlockHeader{
+			Height:       1,
+			Timestamp:    time.Now().UnixNano(),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot([]core.Transaction{badTx}),
+		},
+		Txs: []core.Transaction{badTx},
+	}
+	if err := badBlock.Header.Sign(priv); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	raw, err := json.Marshal(badBlock)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := db.PutRawBlock(badBlock.Hash(), 1, raw); err != nil {
+		t.Fatalf("PutRawBlock: %v", err)
+	}
+	if err := db.PutTip(badBlock.Hash(), 1); err != nil {
+		t.Fatalf("PutTip: %v", err)
+	}
+
+	_, err = runStartupScan(startupScanParams{
+		DataDir:    dir,
+		TipHeight:  tipHeight,
+		TipHashHex: fmt.Sprintf("%x", badBlock.Hash()),
+		DB:         db,
+		UTXOs:      core.NewUTXOSet(),
+		Registry:   core.NewValidatorRegistry(),
+		Log:        silentLog(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "ApplyBlock failed at height 1") {
+		t.Fatalf("runStartupScan error = %v, want fatal ApplyBlock failure", err)
+	}
+	if entry, lookupErr := db.LookupTxIdx(badTx.Hash()); lookupErr != nil {
+		t.Fatalf("LookupTxIdx: %v", lookupErr)
+	} else if entry != nil {
+		t.Fatal("startup scan indexed transaction after ApplyBlock failure")
+	}
+}
+
 // TestScan_MissingBlock_HighWaterStopsBeforeGap verifies that when the
 // startup scan tolerates a missing block (within maxMissing), the
 // txidx_complete_height marker is set to the last height before the gap
@@ -275,7 +351,7 @@ func TestScan_MissingBlock_HighWaterStopsBeforeGap(t *testing.T) {
 			Height: i, PrevHash: parent.Hash(),
 			MerkleRoot: core.MerkleRoot(txs),
 			Timestamp:  time.Now().UnixNano() + int64(i)*1_000_000,
-			Round: uint32(i), ValidatorPub: pub,
+			Round:      uint32(i), ValidatorPub: pub,
 		}
 		if serr := hdr.Sign(priv); serr != nil {
 			t.Fatalf("Sign h=%d: %v", i, serr)

@@ -415,6 +415,10 @@ func (s *UTXOSet) ClearPhantomSpent(ki crypto.KeyImage) (cleared bool, err error
 //
 //	Pass 1 — pre-validation (read-only, whole-block lock held):
 //	  • Check every input key image for historical or within-block double-spend.
+//	  • Resolve every non-coinbase/non-stake input to an active UTXO whose
+//	    commitment matches the input (the v4 RealIndex is authoritative).
+//	  • Reserve each resolved UTXO for the whole block to prevent two distinct
+//	    key images from consuming the same output.
 //	  • If any check fails the function returns an error and the set is unchanged.
 //
 //	Pass 2 — apply (write, same lock held throughout):
@@ -428,8 +432,12 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 
 	// Pass 1: validate all inputs without any state mutation.
 	seen := make(map[crypto.KeyImage]int) // ki → first tx index (for error reporting)
+	consumed := make(map[UTXOKey]int)     // UTXO identity → first tx index
 	for txIdx, tx := range block.Txs {
-		for _, inp := range tx.Inputs {
+		if tx.IsCoinbase() || tx.IsStake() {
+			continue
+		}
+		for inputIdx, inp := range tx.Inputs {
 			if tx.Version == TxVersionCommitmentBinding && int(inp.RealIndex) >= len(inp.Ring) {
 				return fmt.Errorf("block %d tx[%d]: v4 real index %d out of range",
 					block.Header.Height, txIdx, inp.RealIndex)
@@ -448,6 +456,49 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 					inp.KeyImage[:8], block.Header.Height, firstIdx, txIdx)
 			}
 			seen[canonical] = txIdx
+
+			var resolved *UTXO
+			if tx.Version == TxVersionCommitmentBinding {
+				resolved = s.byPubKey[inp.Ring[int(inp.RealIndex)]]
+				if resolved == nil {
+					return fmt.Errorf("block %d tx[%d] input[%d]: v4 real member is not an active UTXO",
+						block.Header.Height, txIdx, inputIdx)
+				}
+				if resolved.AmountCommit != inp.AmountCommit {
+					return fmt.Errorf("block %d tx[%d] input[%d]: v4 real member commitment mismatch",
+						block.Header.Height, txIdx, inputIdx)
+				}
+			} else {
+				var alreadyReserved *UTXO
+				for _, member := range inp.Ring {
+					if candidate := s.byPubKey[member]; candidate != nil &&
+						candidate.AmountCommit == inp.AmountCommit {
+						key := UTXOKey{TxHash: candidate.TxHash, OutputIndex: candidate.OutputIndex}
+						if _, duplicate := consumed[key]; duplicate {
+							alreadyReserved = candidate
+							continue
+						}
+						resolved = candidate
+						break
+					}
+				}
+				if resolved == nil {
+					if alreadyReserved != nil {
+						key := UTXOKey{TxHash: alreadyReserved.TxHash, OutputIndex: alreadyReserved.OutputIndex}
+						return fmt.Errorf("block %d tx[%d] input[%d]: UTXO %x:%d already consumed within block",
+							block.Header.Height, txIdx, inputIdx, key.TxHash[:8], key.OutputIndex)
+					}
+					return fmt.Errorf("block %d tx[%d] input[%d]: no active ring member has matching commitment",
+						block.Header.Height, txIdx, inputIdx)
+				}
+			}
+
+			key := UTXOKey{TxHash: resolved.TxHash, OutputIndex: resolved.OutputIndex}
+			if firstIdx, duplicate := consumed[key]; duplicate {
+				return fmt.Errorf("block %d tx[%d] input[%d]: UTXO %x:%d already consumed by tx[%d]",
+					block.Header.Height, txIdx, inputIdx, key.TxHash[:8], key.OutputIndex, firstIdx)
+			}
+			consumed[key] = txIdx
 		}
 	}
 

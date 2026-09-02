@@ -53,7 +53,7 @@ type startupScanParams struct {
 	// pre-seeded the UTXOSet and key-image set from a rescue snapshot so
 	// that only blocks after that snapshot height need processing.
 	ResumeScanFrom uint64
-	Log         *slog.Logger
+	Log            *slog.Logger
 
 	// UTXOCountTolerancePct is the maximum allowed percentage difference
 	// between a checkpoint's active UTXO count and the count stored in the DB
@@ -106,8 +106,8 @@ type startupScanParams struct {
 // The caller is responsible for loading the key-image index before calling
 // this function (when KiFromIndex is true).
 func runStartupScan(p startupScanParams) (startupScanResult, error) {
-	const syncProgressInterval = uint64(1000)   // report every 1 000 blocks
-	const gcUTXOInterval       = uint64(50000)  // force GC every 50 000 UTXOs processed
+	const syncProgressInterval = uint64(1000) // report every 1 000 blocks
+	const gcUTXOInterval = uint64(50000)      // force GC every 50 000 UTXOs processed
 
 	// ── DB-index fast path ────────────────────────────────────────────────
 	// When UTXOFromIndex is true, both the active UTXO set and the spent
@@ -328,8 +328,8 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 
 	var txCount int64
 	blocksWithStake := 0
-	kiCount    := 0     // only used when !KiFromIndex
-	utxoCount  := uint64(0) // cumulative output count; drives periodic GC
+	kiCount := 0           // only used when !KiFromIndex
+	utxoCount := uint64(0) // cumulative output count; drives periodic GC
 
 	// observedProducers collects every distinct ValidatorPub seen in block headers
 	// during this scan.  Used below to seed the registry when the partial snapshot
@@ -395,8 +395,10 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 		if p.KiFromIndex {
 			p.UTXOs.ReplayBlockKnownSpends(&b)
 		} else if applyErr := p.UTXOs.ApplyBlock(&b); applyErr != nil {
-			p.Log.Warn("startup scan: ApplyBlock failed (continuing)",
-				"height", h, "err", applyErr)
+			return startupScanResult{}, fmt.Errorf(
+				"startup scan: ApplyBlock failed at height %d: %w — "+
+					"node cannot start safely; repair the store and restart",
+				h, applyErr)
 		}
 
 		// UTXO index backfill + tx-hash index backfill.
@@ -630,7 +632,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			p.SnapshotWg.Add(1)
 		}
 		activeCount := len(snapToSave.UTXOs.ActiveUTXOs)
-	go func() {
+		go func() {
 			if p.SnapshotWg != nil {
 				defer p.SnapshotWg.Done()
 			}

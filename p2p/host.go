@@ -690,6 +690,12 @@ type Host struct {
 	// Always nil in production.
 	postConnectHook func()
 
+	// preRegisterHook, when non-nil, is called by handleConn after the
+	// application handshake and immediately before the final admission lock.
+	// It is a test-only barrier for deterministic admission/ban race tests.
+	// Always nil in production.
+	preRegisterHook func(outbound bool)
+
 	// listenFunc is the function used to open the TCP listener in Start().
 	// In production it is always net.Listen (set in NewHost).  Tests may
 	// replace it with a custom factory whose body runs at the real bind
@@ -2005,7 +2011,7 @@ func (h *Host) acceptLoop() {
 			}
 		}
 
-		go h.handleConn(conn, false)
+		go h.handleConn(conn, false, 0, 0, "")
 	}
 }
 
@@ -2359,14 +2365,16 @@ func (h *Host) dialPeer(addr string) {
 	h.dialingIPs[canonIP][dialID] = cancel
 	h.dialGateMu.Unlock()
 
-	// Remove the registration when the dial concludes (success or failure).
+	// Remove the reservation when the dial fails before ownership is handed to
+	// handleConn.  On success handleConn keeps it through the application
+	// handshake and atomically exchanges it for the final peer-table entry.
+	handedOff := false
 	defer func() {
-		h.dialGateMu.Lock()
-		delete(h.dialingIPs[canonIP], dialID)
-		if len(h.dialingIPs[canonIP]) == 0 {
-			delete(h.dialingIPs, canonIP)
+		if !handedOff {
+			h.dialGateMu.Lock()
+			h.releaseOutboundAdmissionLocked(canonIP, dialID, 0)
+			h.dialGateMu.Unlock()
 		}
-		h.dialGateMu.Unlock()
 		cancel()
 	}()
 
@@ -2439,11 +2447,33 @@ func (h *Host) dialPeer(addr string) {
 	// guard) or is never called at all (cases A and C).
 	pendingID := h.nextDialID.Add(1)
 	h.dialGateMu.Lock()
-	if h.mgr.IsBanned(addr) {
+	remoteAddr := conn.RemoteAddr().String()
+	if h.mgr.IsBanned(addr) || h.mgr.IsBanned(remoteAddr) {
 		h.dialGateMu.Unlock()
 		conn.Close()
 		h.log.Debug("dropping connection to just-banned peer", "addr", addr)
 		return
+	}
+
+	// A caller may dial a hostname even though RemoteAddr is an IP address.
+	// Once connected, move the reservation to that canonical IP so per-IP
+	// admission and BanPeer account for it throughout the application
+	// handshake rather than under an unresolvable hostname key.
+	remoteIP := connIP(remoteAddr)
+	if remoteIP != canonIP {
+		if reservations := h.dialingIPs[canonIP]; reservations != nil {
+			if reservationCancel, ok := reservations[dialID]; ok {
+				delete(reservations, dialID)
+				if len(reservations) == 0 {
+					delete(h.dialingIPs, canonIP)
+				}
+				if h.dialingIPs[remoteIP] == nil {
+					h.dialingIPs[remoteIP] = make(map[uint64]context.CancelFunc)
+				}
+				h.dialingIPs[remoteIP][dialID] = reservationCancel
+				canonIP = remoteIP
+			}
+		}
 	}
 	if h.pendingConns[canonIP] == nil {
 		h.pendingConns[canonIP] = make(map[uint64]net.Conn)
@@ -2458,23 +2488,48 @@ func (h *Host) dialPeer(addr string) {
 		h.postConnectHook()
 	}
 
-	go h.handleConn(conn, true)
-
-	// Deregister the pending conn — handleConn is now the owner.
-	// If BanPeer already ran and closed the conn, the entry was already
-	// removed from pendingConns by cancelInFlightDials; the delete is a no-op.
-	h.dialGateMu.Lock()
-	if m := h.pendingConns[canonIP]; m != nil {
-		delete(m, pendingID)
-		if len(m) == 0 {
-			delete(h.pendingConns, canonIP)
-		}
-	}
-	h.dialGateMu.Unlock()
+	// Transfer both the capacity reservation and pending-connection entry to
+	// handleConn.  They remain live throughout the application handshake:
+	// concurrent admission counts the reservation, and BanPeer can close the
+	// pending conn.  handleConn releases/exchanges both under dialGateMu.
+	handedOff = true
+	go h.handleConn(conn, true, dialID, pendingID, canonIP)
 }
 
-func (h *Host) handleConn(conn net.Conn, outbound bool) {
+// releaseOutboundAdmissionLocked drops one outbound capacity reservation and,
+// when pendingID is non-zero, its pre-registration connection entry.  The
+// caller must hold dialGateMu.  It is intentionally idempotent because
+// BanPeer may already have drained both maps.
+func (h *Host) releaseOutboundAdmissionLocked(ip string, dialID, pendingID uint64) {
+	if m := h.dialingIPs[ip]; m != nil {
+		delete(m, dialID)
+		if len(m) == 0 {
+			delete(h.dialingIPs, ip)
+		}
+	}
+	if pendingID != 0 {
+		if m := h.pendingConns[ip]; m != nil {
+			delete(m, pendingID)
+			if len(m) == 0 {
+				delete(h.pendingConns, ip)
+			}
+		}
+	}
+}
+
+func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64, reservedIP string) {
 	addr := conn.RemoteAddr().String()
+
+	// An outbound reservation is owned by this handler until final admission.
+	// Keep cleanup registered before every other defer/early return.  Successful
+	// registration removes it first, making this fallback a no-op.
+	if outbound {
+		defer func() {
+			h.dialGateMu.Lock()
+			h.releaseOutboundAdmissionLocked(reservedIP, dialID, pendingID)
+			h.dialGateMu.Unlock()
+		}()
+	}
 
 	// connectedAt is set (to non-zero) only once the peer reaches the
 	// message loop (i.e. both the TCP dial and the P2P handshake succeeded).
@@ -2704,6 +2759,10 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 	peer.id = peerID
 	peer.height = peerHeight
 
+	if h.preRegisterHook != nil {
+		h.preRegisterHook(outbound)
+	}
+
 	// acceptLoop performs these checks as an early, pre-handshake optimization,
 	// but several connections can complete their handshakes concurrently after
 	// observing the same peer-table snapshot.  Re-check and register under one
@@ -2712,13 +2771,16 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 	// rejected connections are logged and closed after releasing the lock.
 	rejectReason := ""
 	rejectFields := []any{"addr", addr}
+	h.dialGateMu.Lock()
 	h.mu.Lock()
-	if _, exists := h.peers[addr]; exists {
+	if h.mgr.IsBanned(addr) {
+		rejectReason = "peer banned during handshake"
+	} else if _, exists := h.peers[addr]; exists {
 		rejectReason = "duplicate peer address"
-	} else if !outbound {
+	} else {
 		total := len(h.peers)
 		outboundCount := 0
-		if h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 {
+		if !outbound && h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 {
 			for _, existing := range h.peers {
 				if existing.outbound {
 					outboundCount++
@@ -2726,37 +2788,63 @@ func (h *Host) handleConn(conn net.Conn, outbound bool) {
 			}
 		}
 
+		totalInflight := 0
+		for ip, reservations := range h.dialingIPs {
+			n := len(reservations)
+			if outbound && ip == reservedIP {
+				if _, owns := reservations[dialID]; owns {
+					n--
+				}
+			}
+			totalInflight += n
+		}
+
+		remoteIP := connIP(addr)
+		ipCount := 0
+		if h.cfg.MaxPeersPerIP > 0 {
+			for peerAddr := range h.peers {
+				if connIP(peerAddr) == remoteIP {
+					ipCount++
+				}
+			}
+			ipInflight := len(h.dialingIPs[remoteIP])
+			if outbound && remoteIP == reservedIP {
+				if _, owns := h.dialingIPs[reservedIP][dialID]; owns {
+					ipInflight--
+				}
+			}
+			ipCount += ipInflight
+		}
+
 		switch {
-		case h.cfg.MaxPeers > 0 && total >= h.cfg.MaxPeers:
+		case h.cfg.MaxPeers > 0 && total+totalInflight >= h.cfg.MaxPeers:
 			rejectReason = "MaxPeers reached"
-			rejectFields = append(rejectFields, "max", h.cfg.MaxPeers)
-		case h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 &&
+			rejectFields = append(rejectFields, "peers", total, "inflight", totalInflight, "max", h.cfg.MaxPeers)
+		case !outbound && h.cfg.MaxPeers > 0 && h.cfg.MinOutbound > 0 &&
 			total-outboundCount >= h.cfg.MaxPeers-h.cfg.MinOutbound:
 			rejectReason = "MinOutbound slots reserved"
 			rejectFields = append(rejectFields,
 				"inbound", total-outboundCount,
 				"cap", h.cfg.MaxPeers-h.cfg.MinOutbound,
 				"min_outbound", h.cfg.MinOutbound)
-		case h.cfg.MaxPeersPerIP > 0:
-			remoteIP := connIP(addr)
-			ipCount := 0
-			for peerAddr := range h.peers {
-				if connIP(peerAddr) == remoteIP {
-					ipCount++
-				}
-			}
-			if ipCount >= h.cfg.MaxPeersPerIP {
-				rejectReason = "MaxPeersPerIP reached"
-				rejectFields = append(rejectFields, "ip", remoteIP, "max", h.cfg.MaxPeersPerIP)
-			}
+		case h.cfg.MaxPeersPerIP > 0 && ipCount >= h.cfg.MaxPeersPerIP:
+			rejectReason = "MaxPeersPerIP reached"
+			rejectFields = append(rejectFields, "ip", remoteIP, "count", ipCount, "max", h.cfg.MaxPeersPerIP)
 		}
 	}
 	if rejectReason == "" {
+		if outbound {
+			// No admission gap and no double-count: exchange this handler's
+			// reservation/pending entry for the established peer while both
+			// the ban/admission gate and peer-table lock are held.
+			h.releaseOutboundAdmissionLocked(reservedIP, dialID, pendingID)
+		}
 		h.peers[addr] = peer
 	}
 	h.mu.Unlock()
+	h.dialGateMu.Unlock()
 	if rejectReason != "" {
-		h.log.Debug("inbound connection rejected after handshake: "+rejectReason, rejectFields...)
+		h.log.Debug("connection rejected after handshake: "+rejectReason, rejectFields...)
 		conn.Close()
 		return
 	}

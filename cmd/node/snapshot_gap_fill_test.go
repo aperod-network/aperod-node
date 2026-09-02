@@ -159,9 +159,26 @@ func TestReplayPostSnapshotGap_KeyImageMarkedSpent(t *testing.T) {
 	var ki crypto.KeyImage
 	ki[0] = 0xBB
 
+	owner, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	blind, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor: %v", err)
+	}
+	commit, err := crypto.Commit(1_000, blind)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
 	spendTx := core.Transaction{
 		Inputs: []core.RingInput{
-			{KeyImage: ki},
+			{
+				KeyImage:     ki,
+				Ring:         []crypto.RingMember{owner.Spend.Public},
+				AmountCommit: commit,
+			},
 		},
 	}
 
@@ -174,6 +191,12 @@ func TestReplayPostSnapshotGap_KeyImageMarkedSpent(t *testing.T) {
 	putRawBlk(t, db, blk1)
 
 	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:       crypto.HashStr("snapshot-gap-input"),
+		OneTimePub:   owner.Spend.Public,
+		AmountCommit: commit,
+		BlockHeight:  0,
+	})
 
 	added, spent, complete := replayPostSnapshotGap(db, utxos, core.NewValidatorRegistry(), 0, 1, silentLog())
 
