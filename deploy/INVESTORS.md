@@ -53,10 +53,10 @@ Public (launch / exchanges)    immediate            ~40 %
 > Exact vesting schedules are visible on the
 > [Tokenomics page](https://aperod.com/explorer/tokenomics).
 
-**Emission:** The current reward-authorization era starts at **0.1 APRO per
-block** plus optional priority tips. The base reward halves every
-**21,024,000 blocks** (about two years at the 3-second target). Every reward is
-signed by the scheduled validator and independently checked by peers.
+**Emission:** Validators receive **3 APRO per block** from a pre-allocated
+**2B APRO pool**. Pool rewards do not mint new supply and do not halve. After
+the pool is exhausted (approximately 63 years at the 3-second target), the
+protocol switches to a constant **1 APRO per block** tail emission.
 
 **Fee burn:** Every byte of every transaction costs a dynamic base fee.  That fee is
 **destroyed** — not paid to validators, not redistributed — which permanently reduces
@@ -99,9 +99,9 @@ below the minimum.
 ### Block rewards
 
 ```
-Current era        :  10,000,000 nAPRO (0.1 APRO) per block produced
-Next era           :  ÷2 after 21,024,000 blocks (~2 years at 3 s/block)
-Phase 3 (halving 2): ÷4 …
+Pool phase    : 300,000,000 nAPRO (3 APRO) per block from the 2B APRO pool
+Tail emission : 100,000,000 nAPRO (1 APRO) per block after pool exhaustion
+Halving       : none
 ```
 
 Rewards are issued as **transparent coinbase outputs** (not RingCT) so that
@@ -123,8 +123,9 @@ losing their validator slot, subject to the partial-unbonding lock.
 | Bandwidth (1 TB) | included or $5 |
 | **Total** | **$15 – $35** |
 
-Validator returns depend on produced blocks, missed slots, priority tips,
-operating costs and market conditions. No payback period is guaranteed.
+Validator returns depend on produced blocks, missed slots, operating costs and
+market conditions. Transaction fees are burned and are not validator income.
+No payback period is guaranteed.
 
 ---
 

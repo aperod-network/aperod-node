@@ -85,12 +85,13 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 - **Consensus key ≠ spend key**: compromise of one does not affect the other
 - **Validator key permissions**: file must be `chmod 600`, owned by `aperod` user; node refuses to start on unsafe permissions
 
-### Validator Reward Authorization
+### Validator Rewards
 
-- Current authorized base reward: **0.1 APRO** per block, plus validated priority tips
-- Halving interval: **21,024,000 blocks** (≈ 2 years at 3 s/block)
-- Every reward authorization is signed by the scheduled validator and binds the height, parent hash, destination and exact amount
-- Peers derive the protocol reward independently and reject unauthorized or incorrectly valued coinbase transactions
+- Pool phase: **3 APRO per block** from the pre-allocated **2B APRO** validator pool
+- Pool rewards redistribute genesis supply; they do not create new supply
+- After pool exhaustion (~63 years at a 3-second block target): **1 APRO per block** tail emission
+- There is **no halving**
+- Peers derive the expected reward independently and reject incorrectly valued coinbase transactions
 
 ---
 
@@ -105,7 +106,7 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 ### RPC / REST API (`/api/v1/*`)
 
-- **EIP-1559 fee model**: base fee (200 nAPRO/byte) burned 100%; priority tip to validator. Dynamic ±12.5%/block adjustment
+- **EIP-1559 fee model**: every transaction fee is burned 100%. Dynamic ±12.5%/block base-fee adjustment
 - **Rate limiting**: per-IP token-bucket limits — general 30-burst/1-per-sec; heavy endpoints (`/v1/blocks`, `/v1/network/stats`, `/v1/transactions`, `/v1/oracle`, `/v1/tokenomics`) capped at 10 req/min
 - **DDoS auto-ban**: any IP triggering the rate limiter 5+ times within 60 seconds is **permanently** blocked with no expiry. Bans persist across restarts (stored in DB). Applies to both heavy and general flood paths. Admin Telegram notification sent on every auto-ban.
 - **Input validation**: all user-supplied values validated and sanitised before DB writes or file operations

@@ -17,7 +17,7 @@ p2p:
 consensus:
   validator_key: ""          # path to ED25519 private key file (leave empty for non-validator)
   reward_address: ""         # APRO wallet address for block rewards — get yours at https://t.me/aperod_bot
-  block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
+  block_reward_napro: 300000000  # 3 APRO from the pre-allocated staking pool
   # 0 = disabled. Set the same future height on every validator.
   reward_authorization_activation_height: 0
   block_time: "3s"
@@ -31,7 +31,7 @@ consensus:
   # of minting new tokens.  Total Supply stays at 10B genesis and DECREASES as
   # EIP-1559 base fees are burned.  After the pool is exhausted, tail_reward_napro
   # is minted per block (tail emission phase).
-  # Set staking_pool_napro: 0 to revert to the legacy halving-mint schedule.
+  # Pool rewards stay at 3 APRO/block with no halving.
   staking_pool_napro: 200000000000000000  # 2 000 000 000 APRO × 10^8 nAPRO/APRO
   tail_reward_napro: 100000000            # 1 APRO/block tail emission after pool exhaustion
   oracle_url: "http://localhost:8080/api/v1/oracle/price"  # APRO/USD price endpoint (Node.js API server).

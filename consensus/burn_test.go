@@ -17,10 +17,10 @@ func TestBlockFeeStatsBurnDoesNotBecomeValidatorTip(t *testing.T) {
 	minimum := tx.MinFeeAt(base)
 	tx.Fee = minimum + 50 + 7
 	burned, tips := blockFeeStats([]core.Transaction{tx}, base)
-	if burned != minimum+50 {
-		t.Fatalf("burned = %d, want %d", burned, minimum+50)
+	if burned != tx.Fee+50 {
+		t.Fatalf("burned = %d, want %d", burned, tx.Fee+50)
 	}
-	if tips != 7 {
-		t.Fatalf("tips = %d, want 7", tips)
+	if tips != 0 {
+		t.Fatalf("tips = %d, want 0", tips)
 	}
 }

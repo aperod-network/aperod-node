@@ -83,17 +83,19 @@ At each epoch boundary the consensus engine:
 
 | Item | Detail |
 |------|--------|
-| Authorized base reward | **0.1 APRO** per block produced in the current era |
+| Pool-phase reward | **3 APRO** per block produced |
+| Reward pool | **2,000,000,000 APRO**, pre-allocated at genesis |
+| Tail emission | **1 APRO** per block after pool exhaustion (~63 years) |
 | Reward destination | Validator's configured `reward_address` (Telegram wallet) |
 | Notification | Telegram push notification on every reward payment |
-| Fee share | Base fee is burned; optional priority tips go to the block producer |
-| Halving interval | Every **21,024,000 blocks** (~2 years) |
+| Fee share | None — every transaction fee is burned 100% |
+| Halving | **None** |
 
-The producing validator signs an authorization that binds the block height,
-parent hash, destination and exact amount. Every peer derives the expected
-**10,000,000 nAPRO (0.1 APRO)** base reward for the current era and rejects
-unauthorized or incorrectly valued reward transactions. The configured
-`reward_address` must be a valid APRO address.
+During the pool phase each produced block transfers
+**300,000,000 nAPRO (3 APRO)** from the pre-allocated validator pool. This
+redistributes existing genesis supply and does not mint new APRO. After the pool
+is exhausted, the protocol mints a constant **100,000,000 nAPRO (1 APRO)** tail
+reward per block. The configured `reward_address` must be a valid APRO address.
 
 ---
 

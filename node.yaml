@@ -25,10 +25,12 @@ p2p:
 consensus:
   validator_key: "./data/testnet/validator.key"
   reward_address: "aproegZMzXpwdq4q72SZ4Wih2Li9H8eXE5q71MUabckAfaXrnDCZvBuGp547ozRMNTFpUMnrW1DQzQb5kYUdRLnCHxWHYGTFnC"
-  block_reward_napro: 10000000
+  block_reward_napro: 300000000
   # 0 = disabled. Set the same future height on every validator.
   reward_authorization_activation_height: 0
   block_time: "3s"
+  staking_pool_napro: 200000000000000000
+  tail_reward_napro: 100000000
 
 api:
   enabled: true

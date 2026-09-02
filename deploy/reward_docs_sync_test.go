@@ -20,8 +20,9 @@ func TestPublicRewardDocsRejectLegacyEconomics(t *testing.T) {
 	forbidden := []string{
 		"Block reward: **5 APRO**",
 		"| Block reward | **5 APRO**",
-		"3 APRO / block",
-		"no halving",
+		"0.1 APRO",
+		"priority tip",
+		"Halving interval",
 		"chmod 640",
 		"@aperod_bot",
 	}
@@ -46,8 +47,9 @@ func TestCurrentRewardIsDocumentedAcrossPublicSpecs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reward_docs_sync: cannot open %s: %v", name, err)
 		}
-		if !strings.Contains(string(data), "0.1 APRO") {
-			t.Errorf("%s must document the current 0.1 APRO authorized base reward", name)
+		doc := string(data)
+		if !strings.Contains(doc, "3 APRO") || !strings.Contains(doc, "1 APRO") {
+			t.Errorf("%s must document the 3 APRO pool reward and 1 APRO tail emission", name)
 		}
 	}
 }

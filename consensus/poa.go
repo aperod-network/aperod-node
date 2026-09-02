@@ -53,7 +53,7 @@ type Config struct {
 	// If empty, no coinbase transaction is added to produced blocks.
 	RewardAddress string
 	// BlockRewardNAPR is the block reward in base units (nAPRO).
-	// 0 uses the default: 10_000_000 nAPRO = 0.1 APRO.
+	// In pool mode the deployed value is 300_000_000 nAPRO = 3 APRO.
 	BlockRewardNAPR uint64
 	// OracleURL is the HTTP endpoint from which the node fetches the current
 	// APRO/USD price before embedding it in each produced block header.
@@ -86,7 +86,7 @@ type Config struct {
 	// When > 0, block rewards are drawn from this pool rather than minted as new
 	// tokens, keeping Total Supply at 10 B (deflationary from day 1).
 	// After exhaustion, TailRewardNAPR is minted per block instead.
-	// Set to 0 to disable pool-based rewards (legacy halving-mint behaviour).
+	// Set to 0 to disable pool-based rewards.
 	StakingPoolNAPR uint64
 
 	// TailRewardNAPR is the per-block mint in nAPRO once the pool is exhausted.
@@ -231,6 +231,10 @@ type adminMintReq struct {
 // EIP-1559 fee burns are non-trivial.
 const defaultTailRewardNAPR uint64 = 100_000_000
 
+// DefaultPoolBlockRewardNAPR is the deployed pool-phase reward:
+// 3 APRO per block, drawn from the pre-allocated 2B APRO staking pool.
+const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
+
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
 	adminMintStore := cfg.AdminMintStore
@@ -343,24 +347,32 @@ func (e *Engine) RewardMode() string {
 	}
 }
 
-// CurrentBlockRewardNAPR returns the consensus base reward for the next block.
-// Before a configured RingCT-v4 activation it follows the deployed legacy
-// pool/mint schedule. At and after activation (including activation height 0),
-// it is the immutable authorized 0.1 APRO base, before transaction tips.
+// CurrentBlockRewardNAPR returns the base reward for the next block.
+// The deployed network uses a constant pool reward until the pre-allocated
+// staking pool is exhausted, then switches to the configured tail emission.
+// Reward authorization is a separate opt-in feature; activation height 0 means
+// disabled and must not override the deployed pool economics.
 func (e *Engine) CurrentBlockRewardNAPR() uint64 {
-        height := e.chain.Height() + 1
-        activation := e.cfg.RingCTV4ActivationHeight
-        if activation == 0 || height >= activation {
-                return blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
-        }
-        base := e.cfg.BlockRewardNAPR
-        if base == 0 {
-                base = defaultBlockRewardNAPR
-        }
-        if e.stakingPoolInit > 0 && atomic.LoadInt64(&e.stakingPoolRemaining) == 0 {
-                return e.tailRewardNAPR
-        }
-        return blockRewardAtHeight(base, height)
+	height := e.chain.Height() + 1
+	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
+	if rewardActivation > 0 && height >= rewardActivation {
+		return AuthorizedBlockRewardNAPR
+	}
+	base := e.cfg.BlockRewardNAPR
+	if base == 0 {
+		if e.stakingPoolInit > 0 {
+			base = DefaultPoolBlockRewardNAPR
+		} else {
+			base = defaultBlockRewardNAPR
+		}
+	}
+	if e.stakingPoolInit > 0 && atomic.LoadInt64(&e.stakingPoolRemaining) == 0 {
+		return e.tailRewardNAPR
+	}
+	if e.stakingPoolInit > 0 {
+		return base
+	}
+	return blockRewardAtHeight(base, height)
 }
 
 // DecrementPool draws one block-reward from the staking pool.
@@ -377,9 +389,9 @@ func (e *Engine) DecrementPool(height uint64) {
 	}
 	baseReward := e.cfg.BlockRewardNAPR
 	if baseReward == 0 {
-		baseReward = defaultBlockRewardNAPR
+		baseReward = DefaultPoolBlockRewardNAPR
 	}
-	amount := blockRewardAtHeight(baseReward, height)
+	amount := baseReward
 	if amount == 0 {
 		return
 	}
@@ -747,33 +759,23 @@ func nextBaseFee(current uint64, blockSizeBytes int) uint64 {
 	return uint64(next)
 }
 
-// blockFeeStats computes burned nAPRO and priority-tip nAPRO for a block's transactions.
-// burned   = Σ tx.Size() × baseFeePerByte  (100% destroyed)
-// tipTotal = Σ tx.Fee - burned              (goes to validator)
-func blockFeeStats(txs []core.Transaction, baseFeePerByte uint64) (burned, tipTotal uint64) {
+// blockFeeStats computes the total nAPRO destroyed by a block's transactions.
+// The complete transaction fee is burned; validators are paid only by the
+// pool-phase reward or tail emission. The second return value remains for API
+// compatibility and is always zero.
+func blockFeeStats(txs []core.Transaction, _ uint64) (burned, tipTotal uint64) {
 	for _, tx := range txs {
 		if tx.IsCoinbase() || tx.IsStake() {
 			continue
 		}
-		minFee := tx.MinFeeAt(baseFeePerByte)
-		if tx.Fee >= minFee {
-burnForTx := minFee
-if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
-if burnForTx > ^uint64(0)-intentionalBurn {
-return ^uint64(0), 0
-}
-burnForTx += intentionalBurn
-}
-if tx.Fee < burnForTx {
-burned += tx.Fee
-continue
-}
-burned += burnForTx
-tipTotal += tx.Fee - burnForTx
-		} else {
-			// Malformed tx slipped through; treat entire fee as burned.
-			burned += tx.Fee
+		burnForTx := tx.Fee
+		if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
+			if burnForTx > ^uint64(0)-intentionalBurn {
+				return ^uint64(0), 0
+			}
+			burnForTx += intentionalBurn
 		}
+		burned += burnForTx
 	}
 	return
 }
@@ -782,12 +784,7 @@ tipTotal += tx.Fee - burnForTx
 // reward authorization must mint. It uses only immutable protocol constants and
 // block data, so every validator derives the same value across restarts.
 func (e *Engine) expectedAuthorizedRewardAmount(block *core.Block) (uint64, error) {
-	baseReward := blockRewardAtHeight(AuthorizedBlockRewardNAPR, block.Header.Height)
-	_, tips := blockFeeStats(block.Txs, e.expectedBaseFeeAt(block.Header.Height))
-	if baseReward > ^uint64(0)-tips {
-		return 0, fmt.Errorf("authorized block reward plus tips overflows uint64")
-	}
-	return baseReward + tips, nil
+	return AuthorizedBlockRewardNAPR, nil
 }
 
 // oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
@@ -1374,13 +1371,9 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		)
 	}
 
-	// Compute burned fees and priority tips for selected txs, then include
-	// tips in the coinbase reward (validator earns block reward + tips).
+	// Every transaction fee is burned in full. Validator compensation comes
+	// only from the pool reward or tail emission.
 	currentBaseFee := e.expectedBaseFeeAt(height)
-
-	// Tips belong exclusively to this block's producer.  Never carry tips
-	// observed from blocks proposed by other validators into our coinbase.
-	_, tips := blockFeeStats(txs, currentBaseFee)
 
 	// Prepend queued admin mints, built at THIS block's height so every mint
 	// gets a unique one-time pub (spend_pub + height*G) and therefore a
@@ -1419,15 +1412,11 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			return nil, fmt.Errorf("reward_address is required from reward authorization activation height %d",
 				rewardActivation)
 		}
-		rewardNAPR := blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
-		if rewardNAPR > ^uint64(0)-tips {
-			return nil, fmt.Errorf("authorized block reward plus tips overflows uint64")
-		}
-		totalReward := rewardNAPR + tips
-		if totalReward > 0 {
+		rewardNAPR := AuthorizedBlockRewardNAPR
+		if rewardNAPR > 0 {
 			mintTx, err := core.BuildAuthorizedRewardTx(
 				crypto.Address(e.cfg.RewardAddress),
-				totalReward,
+				rewardNAPR,
 				height,
 				parent.Hash(),
 				e.cfg.MyKey.PrivKey(),
@@ -1440,7 +1429,11 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 	} else if e.cfg.RewardAddress != "" && legacyRewardActive {
 		baseReward := e.cfg.BlockRewardNAPR
 		if baseReward == 0 {
-			baseReward = defaultBlockRewardNAPR
+			if e.stakingPoolInit > 0 {
+				baseReward = DefaultPoolBlockRewardNAPR
+			} else {
+				baseReward = defaultBlockRewardNAPR
+			}
 		}
 
 		var rewardNAPR uint64
@@ -1452,7 +1445,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			if remaining > 0 {
 				// Pool phase — draw from pre-allocated staking pool.
 				// Total Supply does NOT increase; 10 B stays constant.
-				poolDraw := blockRewardAtHeight(baseReward, height)
+				poolDraw := baseReward
 				if poolDraw > uint64(remaining) {
 					poolDraw = uint64(remaining) // last partial draw
 				}
@@ -1466,12 +1459,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			rewardNAPR = blockRewardAtHeight(baseReward, height)
 		}
 
-		// Validator earns base reward + priority tips from all txs in this block.
-		if rewardNAPR > ^uint64(0)-tips {
-			return nil, fmt.Errorf("block reward plus tips overflows uint64")
-		}
-		totalReward := rewardNAPR + tips
-		mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), totalReward, height)
+		mintTx, err := core.BuildMintTx(crypto.Address(e.cfg.RewardAddress), rewardNAPR, height)
 		if err != nil {
 			e.log.Warn("failed to build coinbase reward tx", "err", err)
 		} else {
@@ -1716,7 +1704,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	if blockBaseFee == 0 {
 		blockBaseFee = e.expectedBaseFee()
 	}
-	burnedNAPR, tipNAPR := blockFeeStats(block.Txs, blockBaseFee)
+	burnedNAPR, _ := blockFeeStats(block.Txs, blockBaseFee)
 	newFee := nextBaseFee(blockBaseFee, block.Size())
 
 	e.mu.Lock()
@@ -1727,14 +1715,12 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	// the correct rate immediately.
 	e.pool.SetBaseFee(newFee)
 
-	if burnedNAPR > 0 || tipNAPR > 0 {
+	if burnedNAPR > 0 {
 		e.log.Info("block fees",
 			"height", block.Header.Height,
 			"base_fee_per_byte", blockBaseFee,
 			"burned_napro", burnedNAPR,
 			"burned_apro", float64(burnedNAPR)/1e8,
-			"tip_napro", tipNAPR,
-			"tip_apro", float64(tipNAPR)/1e8,
 			"next_base_fee", newFee,
 		)
 	}

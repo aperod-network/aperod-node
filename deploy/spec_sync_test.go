@@ -142,23 +142,12 @@ func TestSpecMatchesProtocolConstants(t *testing.T) {
 		fmt.Sprintf("SlashPercent (core=%d, md=%d)", core.SlashPercent, mdSlash),
 		int64(core.SlashPercent), mdSlash)
 
-	// ── 7. AuthorizedBlockRewardNAPR in nAPRO ────────────────────────────────
-	// VALIDATORS.md documents the exact base-unit value as well as 0.1 APRO.
+	// ── 7. Pool-phase reward in nAPRO ────────────────────────────────────────
 	mdRewardNAPR := extractInt(t, spec,
-		`\*\*([\d,]+)\s*nAPRO\s*\(0\.1 APRO\)\*\*`,
-		"AuthorizedBlockRewardNAPR")
+		`\*\*([\d,]+)\s*nAPRO\s*\(3 APRO\)\*\*`,
+		"DefaultPoolBlockRewardNAPR")
 	assertMatch(t,
-		fmt.Sprintf("AuthorizedBlockRewardNAPR (consensus=%d nAPRO, md=%d nAPRO)",
-			consensus.AuthorizedBlockRewardNAPR, mdRewardNAPR),
-		int64(consensus.AuthorizedBlockRewardNAPR), mdRewardNAPR)
-
-	// ── 8. HalvingIntervalBlocks ─────────────────────────────────────────────
-	// VALIDATORS.md: "| Halving interval | Every **21,024,000 blocks** (~2 years) |"
-	mdHalving := extractInt(t, spec,
-		`Halving interval\s*\|\s*Every\s*\*\*([\d,]+)\s*blocks\*\*`,
-		"HalvingIntervalBlocks")
-	assertMatch(t,
-		fmt.Sprintf("HalvingIntervalBlocks (consensus=%d, md=%d)",
-			consensus.HalvingIntervalBlocks, mdHalving),
-		int64(consensus.HalvingIntervalBlocks), mdHalving)
+		fmt.Sprintf("DefaultPoolBlockRewardNAPR (consensus=%d nAPRO, md=%d nAPRO)",
+			consensus.DefaultPoolBlockRewardNAPR, mdRewardNAPR),
+		int64(consensus.DefaultPoolBlockRewardNAPR), mdRewardNAPR)
 }

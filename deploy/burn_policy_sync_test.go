@@ -4,8 +4,7 @@
 //
 // Checked constants
 // ─────────────────
-//   - consensus.AuthorizedBlockRewardNAPR must match the current-era reward
-//   - consensus.HalvingIntervalBlocks   must match "21,024,000 blocks" in doc
+//   - consensus.DefaultPoolBlockRewardNAPR must match the pool-phase reward
 //   - 28 800 blocks / day               derived from 3-second block time
 //
 // Run from the blockchain root:
@@ -55,30 +54,18 @@ func extractBurnInt(t *testing.T, doc, pattern, label string) int64 {
 func TestBurnPolicyMatchesProtocolConstants(t *testing.T) {
 	doc := readBurnPolicy(t)
 
-	// ── 1. Authorized reward ──────────────────────────────────────────────────
+	// ── 1. Pool-phase reward ──────────────────────────────────────────────────
 	mdRewardNAPR := extractBurnInt(t, doc,
-		`Authorized base reward\s*\|\s*\*\*0\.1 APRO\*\*\s*\(\*\*([\d,]+)\s*nAPRO\*\*\)`,
-		"AuthorizedBlockRewardNAPR")
-	if int64(consensus.AuthorizedBlockRewardNAPR) != mdRewardNAPR {
+		`Pool-phase reward\s*\|\s*\*\*3 APRO\*\*\s*\(\*\*([\d,]+)\s*nAPRO\*\*\)`,
+		"DefaultPoolBlockRewardNAPR")
+	if int64(consensus.DefaultPoolBlockRewardNAPR) != mdRewardNAPR {
 		t.Errorf(
-			"burn_policy_sync MISMATCH — AuthorizedBlockRewardNAPR:\n  Go constant  : %d\n  BURN_POLICY.md: %d\n"+
+			"burn_policy_sync MISMATCH — DefaultPoolBlockRewardNAPR:\n  Go constant  : %d\n  BURN_POLICY.md: %d\n"+
 				"  → update one of them so they agree",
-			consensus.AuthorizedBlockRewardNAPR, mdRewardNAPR)
+			consensus.DefaultPoolBlockRewardNAPR, mdRewardNAPR)
 	}
 
-	// ── 2. Halving interval ───────────────────────────────────────────────────
-	// BURN_POLICY.md: "| Halving interval | Every **21,024,000 blocks** (~2 years) |"
-	mdHalving := extractBurnInt(t, doc,
-		`Halving interval\s*\|\s*Every\s*\*\*([\d,]+)\s*blocks\*\*`,
-		"HalvingIntervalBlocks")
-	if int64(consensus.HalvingIntervalBlocks) != mdHalving {
-		t.Errorf(
-			"burn_policy_sync MISMATCH — HalvingIntervalBlocks:\n  Go constant  : %d\n  BURN_POLICY.md: %d\n"+
-				"  → update one of them so they agree",
-			consensus.HalvingIntervalBlocks, mdHalving)
-	}
-
-	// ── 3. Blocks per day ─────────────────────────────────────────────────────
+	// ── 2. Blocks per day ─────────────────────────────────────────────────────
 	// BURN_POLICY.md: "| Block throughput | **28,800 blocks / day** |"
 	// Block time is 3 seconds → 86 400 / 3 = 28 800 blocks/day.
 	// There is no named Go constant for this; we derive it from the fixed
