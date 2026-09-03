@@ -167,7 +167,9 @@ func localBuilder(r wasmRequest) (*core.TxBuilder, *wallet.DerivedKeys, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return core.NewTxBuilder(keys.Keys.Spend.Private, keys.Keys.View.Private, keys.Keys.Spend.Public, owned, r.FeePerByte).WithDecoys(decoys), keys, nil
+	return core.NewTxBuilder(keys.Keys.Spend.Private, keys.Keys.View.Private, keys.Keys.Spend.Public, owned, r.FeePerByte).
+		WithVersion(core.TxVersionCLSAG).
+		WithDecoys(decoys), keys, nil
 }
 func scanOutputs(_ js.Value, args []js.Value) any {
 	r, err := parseRequest(args)
