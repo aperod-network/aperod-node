@@ -102,6 +102,9 @@ type Config struct {
 	// RingCTV4ActivationHeight is the first height at which v4 RingCT
 	// transactions are accepted. Zero means active from genesis.
 	RingCTV4ActivationHeight uint64
+	// RingCTCLSAGActivationHeight is the first height requiring v5; zero
+	// disables activation to avoid an accidental uncoordinated fork.
+	RingCTCLSAGActivationHeight uint64
 	// RewardAuthorizationActivationHeight is the first height at which
 	// validator rewards must carry a consensus-verifiable on-chain
 	// authorization. Zero keeps the authorization feature disabled.
@@ -1332,7 +1335,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				screened = append(screened, *tx)
 				continue
 			}
-			if err := core.ValidateTxVersionAtHeight(tx, height, e.cfg.RingCTV4ActivationHeight); err != nil {
+			if err := core.ValidateTxVersionAtHeight(tx, height, e.cfg.RingCTV4ActivationHeight, e.cfg.RingCTCLSAGActivationHeight); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning tx rejected by RingCT activation policy",
 					"hash", hash,
@@ -1773,7 +1776,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
 	activation := e.cfg.RingCTV4ActivationHeight
 	for i := range block.Txs {
-		if err := core.ValidateTxVersionAtHeight(&block.Txs[i], block.Header.Height, activation); err != nil {
+		if err := core.ValidateTxVersionAtHeight(&block.Txs[i], block.Header.Height, activation, e.cfg.RingCTCLSAGActivationHeight); err != nil {
 			return fmt.Errorf("tx[%d]: %w", i, err)
 		}
 	}

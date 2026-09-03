@@ -175,7 +175,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		initialOutputs = 1
 		burnExtraBytes = len(IntentionalBurnExtra(amount))
 	}
-	initialSize := txOverheadBytes + 1*txBytesPerInput + initialOutputs*txBytesPerOutput + burnExtraBytes
+	initialSize := txEstimatedSize(b.txVersion, 1, initialOutputs) + burnExtraBytes
 	estimatedFee = uint64(initialSize) * b.feePerByte
 	needed := amount + estimatedFee
 
@@ -194,7 +194,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	if isBurn {
 		nOut = 1 // possible change output
 	}
-	actualSize := txOverheadBytes + len(selected)*txBytesPerInput + nOut*txBytesPerOutput + burnExtraBytes
+	actualSize := txEstimatedSize(b.txVersion, len(selected), nOut) + burnExtraBytes
 	estimatedFee = uint64(actualSize) * b.feePerByte
 	needed = amount + estimatedFee
 
@@ -326,7 +326,11 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			excludePubs[u.OneTimePub] = true
 		}
 		need := len(selected) * (crypto.RingSize - 1)
+		if b.txVersion == TxVersionCLSAG {
+			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
+		} else {
 		allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
+	}
 	}
 
 	// ── Build ring inputs and derive one-time spend keys ─────────────────────
@@ -355,6 +359,9 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			ringDecoys = allDecoys[start:end]
 		}
 
+		if b.txVersion == TxVersionCLSAG && len(ringDecoys) != crypto.RingSize-1 {
+			return nil, fmt.Errorf("v5 requires %d real on-chain decoys per input", crypto.RingSize-1)
+		}
 		ring, realIdx, fallbacks, err := txBuildRing(u.OneTimePub, ringDecoys)
 		if err != nil {
 			return nil, fmt.Errorf("build ring [%d]: %w", i, err)
@@ -374,6 +381,20 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			AmountCommit: u.AmountCommit,
 			RealIndex:    uint8(realIdx),
 		}
+		if b.txVersion == TxVersionCLSAG {
+			commits := make([]crypto.Commitment, crypto.RingSize)
+			di := 0
+			for j := range commits {
+				if j == realIdx {
+					commits[j] = u.AmountCommit
+				} else {
+					commits[j] = ringDecoys[di].AmountCommit
+					di++
+				}
+			}
+			inputs[i].RingCommitments = commits
+			inputs[i].RealIndex = 0 // never serialize or hash a real position in v5
+		}
 	}
 
 	// ── Range proofs ──────────────────────────────────────────────────────────
@@ -389,6 +410,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	}
 
 	// ── Assemble unsigned transaction ─────────────────────────────────────────
+	var pseudoBlinds []crypto.BlindFactor
 	tx := Transaction{
 		Version:     b.txVersion,
 		Inputs:      inputs,
@@ -396,7 +418,32 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		Fee:         totalFee,
 		FeeCommit:   feeCommit,
 		RangeProofs: rangeProofs,
-		Signatures:  make([]*crypto.MLSAGSignature, len(inputs)),
+	}
+	if tx.Version == TxVersionCLSAG {
+		pseudoBlinds = make([]crypto.BlindFactor, len(inputs))
+		for i := 0; i < len(inputs)-1; i++ {
+			pseudoBlinds[i], err = crypto.NewBlindFactor()
+			if err != nil {
+				return nil, fmt.Errorf("pseudo blind [%d]: %w", i, err)
+			}
+		}
+		outBlinds := []crypto.BlindFactor{feeBlind}
+		for _, e := range outEntries {
+			outBlinds = append(outBlinds, e.blind)
+		}
+		pseudoBlinds[len(inputs)-1], err = crypto.BlindSum(outBlinds, pseudoBlinds[:len(inputs)-1])
+		if err != nil {
+			return nil, fmt.Errorf("final pseudo blind: %w", err)
+		}
+		for i := range inputs {
+			tx.Inputs[i].PseudoOut, err = crypto.Commit(selected[i].Amount, pseudoBlinds[i])
+			if err != nil {
+				return nil, fmt.Errorf("pseudo output [%d]: %w", i, err)
+			}
+		}
+		tx.CLSAGSignatures = make([]*crypto.CLSAGSignature, len(inputs))
+	} else {
+		tx.Signatures = make([]*crypto.MLSAGSignature, len(inputs))
 	}
 	if isBurn {
 		tx.Extra = IntentionalBurnExtra(amount)
@@ -408,6 +455,15 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		msg := ringSignMessage(txHash, uint32(i))
 		var sig *crypto.MLSAGSignature
 		var err error
+		if tx.Version == TxVersionCLSAG {
+			cs, signErr := crypto.CLSAGSign(msg, inputs[i].Ring, inputs[i].RingCommitments, tx.Inputs[i].PseudoOut, inputRealIdxs[i], inputPrivKeys[i], selected[i].Blind, pseudoBlinds[i])
+			if signErr != nil {
+				return nil, fmt.Errorf("clsag sign [%d]: %w", i, signErr)
+			}
+			tx.CLSAGSignatures[i] = cs
+			tx.Inputs[i].KeyImage = cs.KeyImage
+			continue
+		}
 		if tx.Version == TxVersionCommitmentBinding {
 			sig, err = crypto.MLSAGSignV4(
 				msg,
@@ -544,6 +600,7 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
 func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMember, int, int, error) {
 	realIdx := int(realPub[0]) % crypto.RingSize
 	ring := make([]crypto.RingMember, crypto.RingSize)
+	seen := map[crypto.Point32]struct{}{realPub: {}}
 
 	di := 0
 	fallbackCount := 0
@@ -552,7 +609,11 @@ func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMembe
 			continue
 		}
 		if di < len(decoys) {
+			if _, duplicate := seen[decoys[di].OneTimePub]; duplicate {
+				return nil, 0, 0, fmt.Errorf("duplicate decoy ring member")
+			}
 			ring[i] = decoys[di].OneTimePub
+			seen[ring[i]] = struct{}{}
 			di++
 		} else {
 			// Phase 1 fallback: not enough real decoys — generate a random key.
@@ -772,4 +833,22 @@ func ExportedEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
 // txEstimateFee is the internal variant used during transaction construction.
 func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
 	return ExportedEstimateFee(nInputs, nOutputs, feePerByte)
+}
+
+// txEstimatedSize mirrors Transaction.Size for builder fee convergence.
+func txEstimatedSize(version TxVersion, nInputs, nOutputs int) int {
+	inputBytes := txBytesPerInput
+	if version == TxVersionCLSAG {
+		// base input body (576), ordered ring commitments (512), pseudo output
+		// (32), compact CLSAG (608).
+		inputBytes = 576 + crypto.RingSize*32 + 32 + 608
+	}
+	return txOverheadBytes + nInputs*inputBytes + nOutputs*txBytesPerOutput
+}
+
+func txEstimateFeeVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {
+	if feePerByte == 0 {
+		feePerByte = 1
+	}
+	return uint64(txEstimatedSize(version, nInputs, nOutputs)) * feePerByte
 }

@@ -95,7 +95,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	// Fee estimation: nOut = N recipients + 1 change slot.
 	const maxInputs = 8
 	nOut := len(recipients) + 1
-	estimatedFee := txEstimateFee(1, nOut, b.feePerByte)
+	estimatedFee := txEstimateFeeVersion(b.txVersion, 1, nOut, b.feePerByte)
 	needed := totalAmount + estimatedFee
 
 	var selected []OwnedUTXO
@@ -111,7 +111,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		}
 	}
 	// Recalculate with actual input count.
-	estimatedFee = txEstimateFee(len(selected), nOut, b.feePerByte)
+	estimatedFee = txEstimateFeeVersion(b.txVersion, len(selected), nOut, b.feePerByte)
 	needed = totalAmount + estimatedFee
 
 	if totalIn < needed {
@@ -212,13 +212,27 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 
 	// ── Sample ring decoys (Phase 2) ──────────────────────────────────────────
 	var allDecoys []DecoyUTXO
-	if b.utxoSet != nil {
+	if len(b.decoys) > 0 {
+		exclude := make(map[crypto.Point32]struct{}, len(selected))
+		for _, u := range selected {
+			exclude[u.OneTimePub] = struct{}{}
+		}
+		for _, d := range b.decoys {
+			if _, ok := exclude[d.OneTimePub]; !ok {
+				allDecoys = append(allDecoys, d)
+			}
+		}
+	} else if b.utxoSet != nil {
 		excludePubs := make(map[crypto.Point32]bool, len(selected))
 		for _, u := range selected {
 			excludePubs[u.OneTimePub] = true
 		}
 		need := len(selected) * (crypto.RingSize - 1)
+		if b.txVersion == TxVersionCLSAG {
+			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
+		} else {
 		allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
+	}
 	}
 
 	// ── Build ring inputs ─────────────────────────────────────────────────────
@@ -244,6 +258,9 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			ringDecoys = allDecoys[start:end]
 		}
 
+		if b.txVersion == TxVersionCLSAG && len(ringDecoys) != crypto.RingSize-1 {
+			return nil, fmt.Errorf("v5 requires %d real on-chain decoys per input", crypto.RingSize-1)
+		}
 		ring, realIdx, fallbacks, err := txBuildRing(u.OneTimePub, ringDecoys)
 		if err != nil {
 			return nil, fmt.Errorf("build ring[%d]: %w", i, err)
@@ -262,6 +279,20 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			AmountCommit: u.AmountCommit,
 			RealIndex:    uint8(realIdx),
 		}
+		if b.txVersion == TxVersionCLSAG {
+			commits := make([]crypto.Commitment, crypto.RingSize)
+			di := 0
+			for j := range commits {
+				if j == realIdx {
+					commits[j] = u.AmountCommit
+				} else {
+					commits[j] = ringDecoys[di].AmountCommit
+					di++
+				}
+			}
+			inputs[i].RingCommitments = commits
+			inputs[i].RealIndex = 0
+		}
 	}
 
 	// ── Range proofs ──────────────────────────────────────────────────────────
@@ -277,6 +308,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	}
 
 	// ── Assemble and MLSAG-sign ───────────────────────────────────────────────
+	var pseudoBlinds []crypto.BlindFactor
 	tx := Transaction{
 		Version:     b.txVersion,
 		Inputs:      inputs,
@@ -284,13 +316,47 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		Fee:         estimatedFee,
 		FeeCommit:   feeCommit,
 		RangeProofs: rangeProofs,
-		Signatures:  make([]*crypto.MLSAGSignature, len(inputs)),
+	}
+	if tx.Version == TxVersionCLSAG {
+		pseudoBlinds = make([]crypto.BlindFactor, len(inputs))
+		for i := 0; i < len(inputs)-1; i++ {
+			pseudoBlinds[i], err = crypto.NewBlindFactor()
+			if err != nil {
+				return nil, fmt.Errorf("pseudo blind[%d]: %w", i, err)
+			}
+		}
+		outBlinds := []crypto.BlindFactor{feeBlind}
+		for _, e := range outEntries {
+			outBlinds = append(outBlinds, e.blind)
+		}
+		pseudoBlinds[len(inputs)-1], err = crypto.BlindSum(outBlinds, pseudoBlinds[:len(inputs)-1])
+		if err != nil {
+			return nil, fmt.Errorf("final pseudo blind: %w", err)
+		}
+		for i := range inputs {
+			tx.Inputs[i].PseudoOut, err = crypto.Commit(selected[i].Amount, pseudoBlinds[i])
+			if err != nil {
+				return nil, fmt.Errorf("pseudo output[%d]: %w", i, err)
+			}
+		}
+		tx.CLSAGSignatures = make([]*crypto.CLSAGSignature, len(inputs))
+	} else {
+		tx.Signatures = make([]*crypto.MLSAGSignature, len(inputs))
 	}
 	txHashVal := tx.Hash()
 	for i := range inputs {
 		msg := ringSignMessage(txHashVal, uint32(i))
 		var sig *crypto.MLSAGSignature
 		var err error
+		if tx.Version == TxVersionCLSAG {
+			cs, signErr := crypto.CLSAGSign(msg, inputs[i].Ring, inputs[i].RingCommitments, tx.Inputs[i].PseudoOut, inputRealIdxs[i], inputPrivKeys[i], selected[i].Blind, pseudoBlinds[i])
+			if signErr != nil {
+				return nil, fmt.Errorf("clsag sign[%d]: %w", i, signErr)
+			}
+			tx.CLSAGSignatures[i] = cs
+			tx.Inputs[i].KeyImage = cs.KeyImage
+			continue
+		}
 		if tx.Version == TxVersionCommitmentBinding {
 			sig, err = crypto.MLSAGSignV4(
 				msg,

@@ -1120,6 +1120,7 @@ func run() error {
         chain := core.NewChain(chainMaxBlocks)
         mempoolCfg := core.DefaultMempoolConfig()
         mempoolCfg.RingCTV4ActivationHeight = cfg.Consensus.RingCTV4ActivationHeight
+        mempoolCfg.RingCTCLSAGActivationHeight = cfg.Consensus.RingCTCLSAGActivationHeight
         mempoolCfg.CurrentHeight = chain.Height
         mempool := core.NewMempool(mempoolCfg, log)
 
@@ -1131,6 +1132,12 @@ func run() error {
         // 700 MB in-memory sorted slice, eliminating the main RSS baseline
         // and the ≈768 KB/h growth that accumulated between restarts.
         utxos := core.NewUTXOSetWithDB(db)
+utxos.SetCLSAGActivationHeight(cfg.Consensus.RingCTCLSAGActivationHeight)
+	if cfg.Consensus.RingCTCLSAGActivationHeight != 0 {
+		if err := db.EnsureRingMemberIndex(); err != nil {
+			return fmt.Errorf("prepare CLSAG ring-member index: %w", err)
+		}
+	}
         // Wire the spent-UTXO index callback so ApplyBlock (called during the
         // startup scan and live block acceptance) keeps the su/ index current.
         // Non-fatal on DB error — the index is a startup-performance optimisation.
@@ -1143,6 +1150,9 @@ func run() error {
         utxos.OnUTXORestored = func(txHash crypto.Hash32, outIdx uint32) error {
                 return db.UnmarkUTXOSpent(txHash, outIdx)
         }
+	utxos.OnUTXODeleted = func(txHash crypto.Hash32, outIdx uint32) error {
+		return db.DeleteUTXO(txHash, outIdx)
+	}
 
         tipHash, tipHeight, err := db.GetTip()
         if err != nil {
@@ -2232,6 +2242,7 @@ func run() error {
                                 if !utxoFromIndex {
                                         // Partial load failed — clear and fall back to block scan.
                                         utxos = core.NewUTXOSetWithDB(db)
+utxos.SetCLSAGActivationHeight(cfg.Consensus.RingCTCLSAGActivationHeight)
                                         utxos.OnUTXOSpent = func(txHash crypto.Hash32, outIdx uint32) {
                                                 if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
                                                         log.Warn("failed to persist spent UTXO", "err", spentErr)
@@ -2240,6 +2251,9 @@ func run() error {
                                         utxos.OnUTXORestored = func(txHash crypto.Hash32, outIdx uint32) error {
                                                 return db.UnmarkUTXOSpent(txHash, outIdx)
                                         }
+						utxos.OnUTXODeleted = func(txHash crypto.Hash32, outIdx uint32) error {
+							return db.DeleteUTXO(txHash, outIdx)
+						}
                                         log.Warn("db-index fast path unavailable; falling back to block scan",
                                                 "tip_height", tipHeight)
                                 }
@@ -2401,6 +2415,7 @@ func run() error {
                 OracleURL:          cfg.Consensus.OracleURL,
                 OracleMaxDeviation: cfg.Consensus.OracleMaxDeviation,
 			RingCTV4ActivationHeight: cfg.Consensus.RingCTV4ActivationHeight,
+RingCTCLSAGActivationHeight: cfg.Consensus.RingCTCLSAGActivationHeight,
 RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
                 OnBlockProduced: func(block *core.Block) error {
                         if err := storeBlock(db, block); err != nil {
@@ -4659,8 +4674,6 @@ func storeBlock(db *store.DB, b *core.Block) error {
         }
         return nil
 }
-
-
 // validateAmountCommitsFromBlocks validates the AmountCommit field of every
 // active and staked UTXO in utxos against the authoritative raw block bytes
 // on disk.  For each mismatch found it:

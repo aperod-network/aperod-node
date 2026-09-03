@@ -62,6 +62,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
         // ── Chain state ───────────────────────────────────────────────────────────
         chain := core.NewChain()
         utxos := core.NewUTXOSetWithDB(db)
+	utxos.OnUTXODeleted = func(txHash crypto.Hash32, outIdx uint32) error {
+		return db.DeleteUTXO(txHash, outIdx)
+	}
         mempool := core.NewMempool(core.DefaultMempoolConfig())
 
         // ── Genesis ───────────────────────────────────────────────────────────────

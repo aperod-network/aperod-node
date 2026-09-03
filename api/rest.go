@@ -2072,6 +2072,20 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		"exists":            true,
 		"block_height":      blockHeight,
 	}
+	// Once CLSAG is active, absence from su/ cannot prove that a particular
+	// output is unspent: v5 intentionally hides the real ring member. Owners
+	// must derive the output key image and query /api/v1/keyimage/{ki}/is-spent.
+	// Keep "exists" as an output-existence statement and expose the spentness
+	// boundary explicitly so wallets cannot silently treat HTTP 200 as proof.
+	spentStatus := "unspent"
+	if s.mempool != nil {
+		cfg := s.mempool.MempoolConfig()
+		if cfg.RingCTCLSAGActivationHeight > 0 &&
+			s.chain != nil && s.chain.Height()+1 >= cfg.RingCTCLSAGActivationHeight {
+			spentStatus = "unknown_key_image_required"
+		}
+	}
+	resp["spent_status"] = spentStatus
 	// Include block_timestamp when the source block is available.
 	// Try the in-memory sliding window first; fall back to blockStore for
 	// blocks older than the in-memory window (archive nodes and restarted nodes).

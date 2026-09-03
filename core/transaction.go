@@ -60,6 +60,9 @@ const (
 	// TxVersionCommitmentBinding adds a linked Pedersen-opening proof to every
 	// MLSAG signature. Legacy versions remain valid for historical replay.
 	TxVersionCommitmentBinding TxVersion = 4
+	// TxVersionCLSAG replaces the v4 disclosed-real-member proof with a
+	// commitment-aware CLSAG.  The real ring position is never serialized.
+	TxVersionCLSAG TxVersion = 5
 )
 
 // Transaction is the core unit of value transfer in Aperod.
@@ -80,6 +83,9 @@ type Transaction struct {
         // Signature is the MLSAG ring signature covering all inputs.
         // One per input (multi-input MLSAG is concatenated here for simplicity).
         Signatures []*crypto.MLSAGSignature
+	// CLSAGSignatures is used exclusively by v5.  Keeping it separate makes
+	// cross-version signature confusion structurally impossible.
+	CLSAGSignatures []*crypto.CLSAGSignature
         // Extra holds optional data: game asset metadata, OP_RETURN-style notes.
         // Max 255 bytes.
         Extra []byte
@@ -94,6 +100,11 @@ type RingInput struct {
         Ring []crypto.RingMember // len = crypto.RingSize
         // AmountCommit is the Pedersen commitment of the UTXO being spent (from the original Output).
         AmountCommit crypto.Commitment
+	// RingCommitments are ordered exactly like Ring.  They are mandatory in v5
+	// and bind every anonymous ring member to an on-chain output commitment.
+	RingCommitments []crypto.Commitment
+	// PseudoOut is the v5 input pseudo-output commitment.
+	PseudoOut crypto.Commitment
 	// RealIndex is disclosed by v4 transactions so the state transition can
 	// remove the exact UTXO proven by the direct ownership link. It is ignored
 	// for legacy versions.
@@ -134,6 +145,15 @@ func (tx *Transaction) Hash() crypto.Hash32 {
 		if tx.Version == TxVersionCommitmentBinding {
 			parts = append(parts, []byte{inp.RealIndex})
 		}
+		if tx.Version == TxVersionCLSAG {
+			for i := range inp.Ring {
+				parts = append(parts, inp.Ring[i][:])
+				if i < len(inp.RingCommitments) {
+					parts = append(parts, inp.RingCommitments[i][:])
+				}
+			}
+			parts = append(parts, inp.PseudoOut[:])
+		}
         }
         for _, out := range tx.Outputs {
                 parts = append(parts, out.OneTimePub[:])
@@ -163,7 +183,7 @@ func (tx *Transaction) Validate() error {
                 return fmt.Errorf("tx version 0 is invalid")
         }
 	switch tx.Version {
-	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding:
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
@@ -200,7 +220,7 @@ func (tx *Transaction) Validate() error {
                 return burnErr
         }
         if burnMarked {
-                if tx.Version != TxVersionCommitmentBinding {
+		if tx.Version != TxVersionCommitmentBinding && tx.Version != TxVersionCLSAG {
                         return fmt.Errorf("intentional burn requires transaction version %d", TxVersionCommitmentBinding)
                 }
                 if tx.IsCoinbase() {
@@ -238,9 +258,21 @@ func (tx *Transaction) Validate() error {
         if len(tx.Inputs) == 0 {
                 return fmt.Errorf("tx has no inputs")
         }
+	if tx.Version == TxVersionCLSAG {
+		if len(tx.Signatures) != 0 {
+			return fmt.Errorf("tx: v5 must not contain legacy signatures")
+		}
+		if len(tx.CLSAGSignatures) != len(tx.Inputs) {
+			return fmt.Errorf("tx: %d CLSAG signatures for %d inputs", len(tx.CLSAGSignatures), len(tx.Inputs))
+		}
+	} else {
+		if len(tx.CLSAGSignatures) != 0 {
+			return fmt.Errorf("tx: legacy transaction must not contain CLSAG signatures")
+		}
         if len(tx.Signatures) != len(tx.Inputs) {
                 return fmt.Errorf("tx: %d signatures for %d inputs", len(tx.Signatures), len(tx.Inputs))
         }
+	}
         if len(tx.RangeProofs) != len(tx.Outputs) {
                 return fmt.Errorf("tx: %d range proofs for %d outputs", len(tx.RangeProofs), len(tx.Outputs))
         }
@@ -261,6 +293,17 @@ func (tx *Transaction) Validate() error {
 				return fmt.Errorf("input %d: v4 signature opening response length mismatch", i)
 			}
 		}
+		if tx.Version == TxVersionCLSAG {
+			if inp.RealIndex != 0 {
+				return fmt.Errorf("input %d: v5 must not disclose a real index", i)
+			}
+			if len(inp.RingCommitments) != crypto.RingSize {
+				return fmt.Errorf("input %d: ring commitment count %d != required %d", i, len(inp.RingCommitments), crypto.RingSize)
+			}
+			if tx.CLSAGSignatures[i] == nil || len(tx.CLSAGSignatures[i].S) != crypto.RingSize {
+				return fmt.Errorf("input %d: v5 CLSAG response length mismatch", i)
+			}
+		}
         }
         return nil
 }
@@ -273,7 +316,7 @@ func (tx *Transaction) Validate() error {
 // format is valid for spend transactions.  Coinbase and stake transactions are
 // exempt because they are distinct consensus transaction types even though
 // coinbase mints currently use the legacy wire version.
-func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight uint64) error {
+func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight uint64, clsagActivation ...uint64) error {
 	if tx == nil {
 		return fmt.Errorf("nil transaction")
 	}
@@ -294,6 +337,13 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 		return nil
 	}
 
+	clsagHeight := uint64(0)
+	if len(clsagActivation) > 0 {
+		clsagHeight = clsagActivation[0]
+	}
+	if tx.Version == TxVersionCLSAG && (clsagHeight == 0 || height < clsagHeight) {
+		return fmt.Errorf("transaction version %d is not active", tx.Version)
+	}
 	if tx.Version == TxVersionCommitmentBinding &&
 		ringCTV4ActivationHeight > 0 &&
 		height < ringCTV4ActivationHeight {
@@ -301,6 +351,9 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 			tx.Version, ringCTV4ActivationHeight)
 	}
 
+	if clsagHeight > 0 && height >= clsagHeight && tx.Version != TxVersionCLSAG {
+		return fmt.Errorf("RingCT v5 is required at height %d", height)
+	}
 	if (ringCTV4ActivationHeight == 0 || height >= ringCTV4ActivationHeight) &&
 		(tx.Version == TxVersionBase || tx.Version == TxVersionGameAsset) {
 		return fmt.Errorf("legacy RingCT transaction version %d is disabled at height %d; "+
@@ -328,7 +381,13 @@ func (tx *Transaction) Size() int {
 	if tx.Version == TxVersionCommitmentBinding {
 		sigBytes += 2*crypto.RingSize*32 + 64 // opening responses + link R/S
 	}
+	if tx.Version == TxVersionCLSAG {
+		// v5 additionally serializes 16 ring commitments and one pseudo-output;
+		// compact CLSAG is C1 + 16 S + KI + D = 608 bytes.
+		size += len(tx.Inputs) * (crypto.RingSize*32 + 32 + 608)
+	} else {
 	size += len(tx.Signatures) * sigBytes
+	}
         // Range proofs: simplified (real bulletproofs ~675 bytes each)
         size += len(tx.RangeProofs) * 675
         // Extra

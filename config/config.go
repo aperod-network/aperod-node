@@ -344,6 +344,9 @@ BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // legacy pre-aut
 	// RingCTV4ActivationHeight is the first block height allowed to contain
 	// commitment-binding v4 transfers. Zero activates v4 immediately.
 	RingCTV4ActivationHeight uint64 `yaml:"ringct_v4_activation_height"`
+// RingCTCLSAGActivationHeight is the first height requiring RingCT v5.
+// Zero deliberately disables v5 rather than activating it immediately.
+RingCTCLSAGActivationHeight uint64 `yaml:"ring_ct_clsag_activation_height"`
 // RewardAuthorizationActivationHeight is the first block height whose
 // validator reward must carry an on-chain authorization. Zero disables the
 // post-RingCT reward path; set the same future value on every validator.
@@ -584,6 +587,13 @@ func (c *Config) Validate() error {
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
+clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
+if clsagActivation > 0 && ringCTActivation > 0 && clsagActivation < ringCTActivation {
+return fmt.Errorf(
+"ring_ct_clsag_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
+clsagActivation, ringCTActivation,
+)
+}
 	if rewardActivation > 0 && ringCTActivation > 0 && rewardActivation < ringCTActivation {
 		return fmt.Errorf(
 			"reward_authorization_activation_height (%d) must be >= ringct_v4_activation_height (%d)",

@@ -3,11 +3,13 @@
 package store
 
 import (
+	cryptorand "crypto/rand"
         "encoding/binary"
         "encoding/json"
         "fmt"
         "math"
 
+	"github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
         "github.com/syndtr/goleveldb/leveldb"
         "github.com/syndtr/goleveldb/leveldb/opt"
@@ -23,6 +25,7 @@ var (
         prefixMeta       = []byte("m/")  // m/<key>                 → value (metadata)
         prefixTxIdx      = []byte("t/")  // t/<txhash32>            → height[8]+txIdx[4] (tx location)
         prefixSpentUTXO  = []byte("su/") // su/<txhash32><outIdx4>  → 0x01 (spent-UTXO fast-start index)
+	prefixRingMember = []byte("rm/") // rm/<oneTimePub32>        → StoredUTXO JSON (all canonical outputs)
         prefixStakeBlock = []byte("sb/") // sb/<height8>            → 0x01 (block contains stake txs)
 )
 
@@ -241,8 +244,10 @@ func (d *DB) PutUTXO(txHash crypto.Hash32, outIdx uint32, u *StoredUTXO) error {
         if err != nil {
                 return err
         }
-        key := utxoKey(txHash, outIdx)
-        return d.put(key, data)
+	batch := new(leveldb.Batch)
+	batch.Put(utxoKey(txHash, outIdx), data)
+	batch.Put(ringMemberKey(u.OneTimePub), data)
+	return d.db.Write(batch, nil)
 }
 
 // GetUTXO retrieves a UTXO. Returns nil if not found.
@@ -260,7 +265,123 @@ func (d *DB) GetUTXO(txHash crypto.Hash32, outIdx uint32) (*StoredUTXO, error) {
 
 // DeleteUTXO removes a UTXO (when spent).
 func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
-        return d.del(utxoKey(txHash, outIdx))
+	u, err := d.GetUTXO(txHash, outIdx)
+	if err != nil {
+		return err
+	}
+	batch := new(leveldb.Batch)
+	batch.Delete(utxoKey(txHash, outIdx))
+	batch.Delete(spentUTXOKey(txHash, outIdx))
+	if u != nil {
+		batch.Delete(ringMemberKey(u.OneTimePub))
+	}
+	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
+}
+
+func ringMemberKey(pub crypto.Point32) []byte {
+	key := make([]byte, len(prefixRingMember)+len(pub))
+	copy(key, prefixRingMember)
+	copy(key[len(prefixRingMember):], pub[:])
+	return key
+}
+
+// LookupRingMember resolves an authentic historical output by its one-time key.
+func (d *DB) LookupRingMember(pub crypto.Point32) (*core.UTXO, error) {
+	data, err := d.get(ringMemberKey(pub))
+	if err != nil || data == nil {
+		return nil, err
+	}
+	var u StoredUTXO
+	if err := json.Unmarshal(data, &u); err != nil {
+		return nil, err
+	}
+	return storedToCoreUTXO(&u), nil
+}
+
+// EnsureRingMemberIndex backfills rm/ exactly once from the authoritative u/
+// output store. New PutUTXO writes update both namespaces atomically.
+func (d *DB) EnsureRingMemberIndex() error {
+	marker := []byte("ring-member-index-v1")
+	if ready, err := d.get(append(prefixMeta, marker...)); err != nil {
+		return err
+	} else if ready != nil {
+		return nil
+	}
+	iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
+	defer iter.Release()
+	batch := new(leveldb.Batch)
+	pending := 0
+	for iter.Next() {
+		var u StoredUTXO
+		if err := json.Unmarshal(iter.Value(), &u); err != nil {
+			return fmt.Errorf("decode UTXO for ring-member backfill: %w", err)
+		}
+		value := append([]byte(nil), iter.Value()...)
+		batch.Put(ringMemberKey(u.OneTimePub), value)
+		pending++
+		if pending >= 10_000 {
+			if err := d.db.Write(batch, nil); err != nil {
+				return err
+			}
+			batch.Reset()
+			pending = 0
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	batch.Put(append(prefixMeta, marker...), []byte{0x01})
+	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
+}
+
+// SampleRingMembers performs bounded-cost random seeks in the disk index.
+// It does not materialize the complete historical output set in memory.
+func (d *DB) SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]core.DecoyUTXO, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	out := make([]core.DecoyUTXO, 0, count)
+	seen := make(map[crypto.Point32]struct{}, count)
+	iter := d.db.NewIterator(util.BytesPrefix(prefixRingMember), nil)
+	defer iter.Release()
+	attempts := count * 8
+	for len(out) < count && attempts > 0 {
+		attempts--
+		var random [32]byte
+		if _, err := cryptorand.Read(random[:]); err != nil {
+			return nil, err
+		}
+		seek := append(append([]byte(nil), prefixRingMember...), random[:]...)
+		if !iter.Seek(seek) {
+			if !iter.First() {
+				break
+			}
+		}
+		var u StoredUTXO
+		if err := json.Unmarshal(iter.Value(), &u); err != nil {
+			return nil, err
+		}
+		if exclude[u.OneTimePub] {
+			continue
+		}
+		if _, duplicate := seen[u.OneTimePub]; duplicate {
+			continue
+		}
+		seen[u.OneTimePub] = struct{}{}
+		out = append(out, core.DecoyUTXO{OneTimePub: u.OneTimePub, AmountCommit: u.AmountCommit})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func storedToCoreUTXO(u *StoredUTXO) *core.UTXO {
+	return &core.UTXO{
+		TxHash: u.TxHash, OutputIndex: u.OutputIndex, OneTimePub: u.OneTimePub,
+		TxPubKey: u.TxPubKey, AmountCommit: u.AmountCommit,
+		EncAmount: u.EncAmount, BlockHeight: u.BlockHeight,
+	}
 }
 
 // ─── Spent-UTXO fast-start index (su/) ───────────────────────────────────────

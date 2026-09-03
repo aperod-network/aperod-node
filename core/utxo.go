@@ -20,6 +20,15 @@ type KeyImageStore interface {
 	DeleteKeyImage(ki crypto.KeyImage) error
 }
 
+// RingMemberStore is the persistent append-only output index used by CLSAG.
+// v5 hides the real ring position, so spent outputs cannot be removed from the
+// anonymity set. Production resolves and samples members from LevelDB instead
+// of retaining the complete chain history in RAM.
+type RingMemberStore interface {
+	LookupRingMember(pub crypto.Point32) (*UTXO, error)
+	SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]DecoyUTXO, error)
+}
+
 // compactKeyImageSet stores spent key images using a three-tier design:
 //
 //  1. recent map[crypto.KeyImage]struct{} — O(1) insert/lookup for key images
@@ -204,6 +213,10 @@ type UTXOKey struct {
 // the cap without needing to pre-fill 10 000 entries.
 var maxSpentDecoys = 10_000
 
+// maxCLSAGRecentOutputs bounds post-activation output material retained in
+// memory. The complete canonical anonymity set is stored in RingMemberStore.
+var maxCLSAGRecentOutputs = 100_000
+
 // maxRollbackDepth is the number of recent block heights kept in the rollback
 // journal.  Any chain reorganisation deeper than this cannot be reversed in
 // memory.  On a PoA chain such deep reorgs are operationally impossible.
@@ -228,6 +241,9 @@ type UTXOSet struct {
 	stakedUTXOs     map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
 	spentPubKeys    map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
 	rollbackJournal map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
+	ringMembers     RingMemberStore
+	clsagActivationHeight uint64
+	clsagRecentOutputs []UTXOKey
 
 	// OnUTXOSpent, when non-nil, is called from ApplyBlock each time the
 	// real spending input for a ring transaction is identified and removed
@@ -239,6 +255,9 @@ type UTXOSet struct {
 	// input to the active set.  Production wires this to the inverse su/ index
 	// operation so a failed block cannot leave a durable false-spent marker.
 	OnUTXORestored func(txHash crypto.Hash32, outIdx uint32) error
+	// OnUTXODeleted removes outputs created by a rolled-back block from the
+	// persistent output and ring-member indexes.
+	OnUTXODeleted func(txHash crypto.Hash32, outIdx uint32) error
 }
 
 // NewUTXOSet creates an empty in-memory UTXO set with no persistent
@@ -264,7 +283,17 @@ func NewUTXOSet() *UTXOSet {
 func NewUTXOSetWithDB(kiDB KeyImageStore) *UTXOSet {
 	s := NewUTXOSet()
 	s.keyImages.kiDB = kiDB
+	if ringMembers, ok := kiDB.(RingMemberStore); ok {
+		s.ringMembers = ringMembers
+	}
 	return s
+}
+
+// SetCLSAGActivationHeight enables bounded post-v5 output caching.
+func (s *UTXOSet) SetCLSAGActivationHeight(height uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clsagActivationHeight = height
 }
 
 // Add inserts a new UTXO into the set.
@@ -274,6 +303,23 @@ func (s *UTXOSet) Add(u *UTXO) {
 	key := UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}
 	s.utxos[key] = u
 	s.byPubKey[u.OneTimePub] = u
+	s.trackCLSAGRecentLocked(key, u.BlockHeight)
+}
+
+func (s *UTXOSet) trackCLSAGRecentLocked(key UTXOKey, height uint64) {
+	if s.clsagActivationHeight == 0 || height < s.clsagActivationHeight {
+		return
+	}
+	s.clsagRecentOutputs = append(s.clsagRecentOutputs, key)
+	if len(s.clsagRecentOutputs) <= maxCLSAGRecentOutputs {
+		return
+	}
+	oldest := s.clsagRecentOutputs[0]
+	s.clsagRecentOutputs = s.clsagRecentOutputs[1:]
+	if old := s.utxos[oldest]; old != nil {
+		delete(s.byPubKey, old.OneTimePub)
+		delete(s.utxos, oldest)
+	}
 }
 
 // Get retrieves a UTXO by its key. Returns nil if not found.
@@ -290,6 +336,32 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.byPubKey[pub]
+}
+
+// GetRingMember returns an active output or a retained spent output suitable
+// only as an anonymity-set member. v5 must accept spent decoys because its real
+// member is intentionally undisclosed; key images, not UTXO deletion, prevent
+// double spending.
+func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
+	s.mu.RLock()
+	if u := s.byPubKey[pub]; u != nil {
+		s.mu.RUnlock()
+		return u
+	}
+	if u := s.spentPubKeys[pub]; u != nil {
+		s.mu.RUnlock()
+		return u
+	}
+	store := s.ringMembers
+	s.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	u, err := store.LookupRingMember(pub)
+	if err != nil {
+		return nil
+	}
+	return u
 }
 
 // ClearKeyImages resets the in-memory 'recent' key-image map to empty.
@@ -456,6 +528,13 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 					inp.KeyImage[:8], block.Header.Height, firstIdx, txIdx)
 			}
 			seen[canonical] = txIdx
+			if tx.Version == TxVersionCLSAG {
+				// A CLSAG hides its real position.  It is consequently unsafe to
+				// resolve or remove any ring member here; cryptographic verification
+				// binds all supplied key/commitment pairs and the KI is the sole
+				// spentness identifier.
+				continue
+			}
 
 			var resolved *UTXO
 			if tx.Version == TxVersionCommitmentBinding {
@@ -549,6 +628,13 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 			} else {
 				s.keyImages.insert(inp.KeyImage) // fallback: store raw (already validated)
 			}
+			if tx.Version == TxVersionCLSAG {
+				// Preserve every member as a future decoy.  Removing one would
+				// disclose the real index during state transition.
+				// TODO: v5's hidden real index requires a future accumulator or
+				// pruning design; active in-memory UTXOs cannot be deleted safely.
+				continue
+			}
 			for _, member := range stateTransitionRingMembers(tx, inp) {
 				if utxo, ok := s.byPubKey[member]; ok {
 					if utxo.AmountCommit == inp.AmountCommit {
@@ -610,6 +696,7 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 			}
 			s.utxos[key] = u
 			s.byPubKey[out.OneTimePub] = u
+			s.trackCLSAGRecentLocked(key, block.Header.Height)
 		}
 	}
 }
@@ -632,6 +719,7 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 
 	height := block.Header.Height
 	restoredKeys := make([]UTXOKey, 0, len(s.rollbackJournal[height]))
+	deletedKeys := make([]UTXOKey, 0)
 
 	// ── Step 1: restore spent inputs from the rollback journal ───────────────
 	// Build a set of ring members restored from the journal so we can skip
@@ -656,8 +744,10 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 		// and from byPubKey.  These UTXOs never made it onto a canonical chain,
 		// so they must not remain as usable ring decoys after rollback.
 		for i, out := range tx.Outputs {
-			delete(s.utxos, UTXOKey{TxHash: txHash, OutputIndex: uint32(i)})
+			key := UTXOKey{TxHash: txHash, OutputIndex: uint32(i)}
+			delete(s.utxos, key)
 			delete(s.byPubKey, out.OneTimePub)
+			deletedKeys = append(deletedKeys, key)
 		}
 		for _, inp := range tx.Inputs {
 			// Un-mark key images using the canonical form that ApplyBlock stored.
@@ -687,6 +777,7 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 		}
 	}
 	onRestored := s.OnUTXORestored
+	onDeleted := s.OnUTXODeleted
 	s.mu.Unlock()
 
 	// Persistent I/O must not run while holding the UTXO mutex.  Attempt every
@@ -696,6 +787,14 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 		for _, key := range restoredKeys {
 			if err := onRestored(key.TxHash, key.OutputIndex); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("persist restored UTXO %x:%d: %w",
+					key.TxHash[:8], key.OutputIndex, err)
+			}
+		}
+	}
+	if onDeleted != nil {
+		for _, key := range deletedKeys {
+			if err := onDeleted(key.TxHash, key.OutputIndex); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("delete rolled-back UTXO %x:%d: %w",
 					key.TxHash[:8], key.OutputIndex, err)
 			}
 		}
@@ -802,8 +901,66 @@ func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []Dec
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	candidates := make([]*UTXO, 0, len(s.spentPubKeys))
+	candidates := make([]*UTXO, 0, len(s.spentPubKeys)+len(s.byPubKey))
 	for pub, u := range s.spentPubKeys {
+		if !exclude[pub] {
+			candidates = append(candidates, u)
+		}
+	}
+
+	n := len(candidates)
+	want := count
+	if want > n {
+		want = n
+	}
+	if want == 0 {
+		return nil
+	}
+
+	// Fisher-Yates partial shuffle to pick `want` items in random order.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // privacy, not security
+	for i := 0; i < want; i++ {
+		j := i + rng.Intn(n-i)
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	}
+
+	out := make([]DecoyUTXO, want)
+	for i := 0; i < want; i++ {
+		out[i] = DecoyUTXO{
+			OneTimePub:   candidates[i].OneTimePub,
+			AmountCommit: candidates[i].AmountCommit,
+		}
+	}
+	return out
+}
+
+// SampleCLSAGDecoys returns real on-chain decoys for v5. Unlike historical
+// SampleDecoys, it may draw both active outputs and retained spent members:
+// CLSAG validates the commitment paired with every ring key and does not reveal
+// which member is being spent.
+func (s *UTXOSet) SampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool) []DecoyUTXO {
+	s.mu.RLock()
+	store := s.ringMembers
+	s.mu.RUnlock()
+	if store != nil {
+		decoys, err := store.SampleRingMembers(count, exclude)
+		if err == nil {
+			return decoys
+		}
+		// Fail closed for v5 builders: returning too few members makes Build
+		// reject the transaction rather than silently using fabricated decoys.
+		return nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	candidates := make([]*UTXO, 0, len(s.spentPubKeys)+len(s.byPubKey))
+	for pub, u := range s.spentPubKeys {
+		if !exclude[pub] {
+			candidates = append(candidates, u)
+		}
+	}
+	for pub, u := range s.byPubKey {
 		if !exclude[pub] {
 			candidates = append(candidates, u)
 		}
@@ -850,6 +1007,10 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, tx := range block.Txs {
+		if tx.Version == TxVersionCLSAG {
+			// The hidden real position cannot be safely removed on replay.
+			continue
+		}
 		for _, inp := range tx.Inputs {
 			for _, member := range stateTransitionRingMembers(tx, inp) {
 				if utxo, ok := s.byPubKey[member]; ok {

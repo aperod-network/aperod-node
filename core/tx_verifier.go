@@ -225,6 +225,18 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // first so that locked-genesis errors surface before C-0 fires.
         if v.utxos != nil {
                 for i, inp := range tx.Inputs {
+			if tx.Version == TxVersionCLSAG {
+				for j, member := range inp.Ring {
+					utxo := v.utxos.GetRingMember(member)
+					if utxo == nil {
+						return fmt.Errorf("tx %x: input %d ring member %d is not an on-chain UTXO", txHashPrefix[:8], i, j)
+					}
+					if utxo.AmountCommit != inp.RingCommitments[j] {
+						return fmt.Errorf("tx %x: input %d ring member %d commitment mismatch", txHashPrefix[:8], i, j)
+					}
+				}
+				continue
+			}
 			if tx.Version == TxVersionCommitmentBinding {
 				realMember := inp.Ring[int(inp.RealIndex)]
 				utxo := v.utxos.GetByPubKey(realMember)
@@ -287,28 +299,38 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 
         // 4. MLSAG ring signatures
         for i, inp := range tx.Inputs {
-                sig := tx.Signatures[i]
-                if sig == nil {
-                        return fmt.Errorf("tx %x: nil signature at input %d", txHashPrefix[:8], i)
-                }
                 // The signed message is H(txHash || inputIndex)
                 msg := ringSignMessage(txHash, uint32(i))
 		var ok bool
 		var err error
+		if tx.Version == TxVersionCLSAG {
+			sig := tx.CLSAGSignatures[i]
+			if sig == nil {
+				return fmt.Errorf("tx %x: nil CLSAG signature at input %d", txHashPrefix[:8], i)
+			}
+			ok, err = crypto.CLSAGVerify(msg, inp.Ring, inp.RingCommitments, inp.PseudoOut, sig)
+			if err == nil && sig.KeyImage != inp.KeyImage {
+				return fmt.Errorf("tx %x: key image mismatch at input %d", txHashPrefix[:8], i)
+			}
+		} else {
+			sig := tx.Signatures[i]
+			if sig == nil {
+				return fmt.Errorf("tx %x: nil signature at input %d", txHashPrefix[:8], i)
+			}
 		if tx.Version == TxVersionCommitmentBinding {
 			ok, err = crypto.MLSAGVerifyV4(msg, inp.Ring, inp.AmountCommit, int(inp.RealIndex), sig)
 		} else {
 			ok, err = crypto.MLSAGVerify(msg, inp.Ring, sig)
+		}
+			if err == nil && sig.KeyImage != inp.KeyImage {
+				return fmt.Errorf("tx %x: key image mismatch at input %d", txHashPrefix[:8], i)
+			}
 		}
                 if err != nil {
                         return fmt.Errorf("tx %x: ring sig error at input %d: %w", txHashPrefix[:8], i, err)
                 }
                 if !ok {
                         return fmt.Errorf("tx %x: invalid ring signature at input %d", txHashPrefix[:8], i)
-                }
-                // Verify that the key image in the signature matches the input's key image
-                if sig.KeyImage != inp.KeyImage {
-                        return fmt.Errorf("tx %x: key image mismatch at input %d", txHashPrefix[:8], i)
                 }
         }
 
@@ -359,8 +381,12 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
         // 6. Commitment balance: ΣC_in = ΣC_out + C_fee
         inCommits := make([]crypto.Commitment, len(tx.Inputs))
         for i, inp := range tx.Inputs {
+		if tx.Version == TxVersionCLSAG {
+			inCommits[i] = inp.PseudoOut
+		} else {
                 inCommits[i] = inp.AmountCommit
         }
+	}
         outCommits := make([]crypto.Commitment, len(tx.Outputs))
         for i, out := range tx.Outputs {
                 outCommits[i] = out.AmountCommit

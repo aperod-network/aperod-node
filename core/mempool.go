@@ -37,6 +37,7 @@ type MempoolConfig struct {
 	// at admission prevents callers from receiving a successful hash for a tx
 	// that the block producer will immediately evict.
 	RingCTV4ActivationHeight uint64
+	RingCTCLSAGActivationHeight uint64
 	CurrentHeight            func() uint64
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
@@ -141,6 +142,9 @@ func (m *Mempool) NextSpendVersion() TxVersion {
 	if nextHeight < ^uint64(0) {
 		nextHeight++
 	}
+	if m.cfg.RingCTCLSAGActivationHeight > 0 && nextHeight >= m.cfg.RingCTCLSAGActivationHeight {
+		return TxVersionCLSAG
+	}
 	if m.cfg.RingCTV4ActivationHeight > 0 && nextHeight < m.cfg.RingCTV4ActivationHeight {
 		return TxVersionBase
 	}
@@ -168,7 +172,7 @@ func (m *Mempool) Add(tx Transaction) error {
 		if nextHeight < ^uint64(0) {
 			nextHeight++
 		}
-		if err := ValidateTxVersionAtHeight(&tx, nextHeight, m.cfg.RingCTV4ActivationHeight); err != nil {
+		if err := ValidateTxVersionAtHeight(&tx, nextHeight, m.cfg.RingCTV4ActivationHeight, m.cfg.RingCTCLSAGActivationHeight); err != nil {
 			return fmt.Errorf("mempool: transaction activation policy: %w", err)
 		}
 	}
