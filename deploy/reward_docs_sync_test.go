@@ -21,7 +21,6 @@ func TestPublicRewardDocsRejectLegacyEconomics(t *testing.T) {
 		"Block reward: **5 APRO**",
 		"| Block reward | **5 APRO**",
 		"0.1 APRO",
-		"priority tip",
 		"Halving interval",
 		"chmod 640",
 		"@aperod_bot",

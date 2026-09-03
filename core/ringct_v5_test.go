@@ -19,7 +19,7 @@ func TestRingCTV5BuilderVerifierAndState(t *testing.T) {
 	}
 	const supply = uint64(10_000_000)
 	chain, _, blind := makeGenesisWithCoinbase(t, alice, supply)
-	scanner := core.NewWalletScanner(alice.View.Private, alice.Spend.Public, alice.View.Public, crypto.TestnetByte)
+	scanner := core.NewWalletScanner(alice.View.Private, alice.Spend.Public, alice.View.Public, crypto.MainnetByte)
 	owned := scanner.ScanChain(chain, 0, chain.Height())
 	owned[0].Blind = blind
 
@@ -109,5 +109,60 @@ func TestRingCTV5ActivationBoundary(t *testing.T) {
 	}
 	if err := core.ValidateTxVersionAtHeight(v4, activation, 1, activation); err == nil {
 		t.Fatal("v4 accepted after v5 activation")
+	}
+}
+
+func TestRingCTV5BuilderSupportsIntentionalBurn(t *testing.T) {
+	alice, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const supply = uint64(10_000_000)
+	chain, _, blind := makeGenesisWithCoinbase(t, alice, supply)
+	scanner := core.NewWalletScanner(alice.View.Private, alice.Spend.Public, alice.View.Public, crypto.TestnetByte)
+	owned := scanner.ScanChain(chain, 0, chain.Height())
+	owned[0].Blind = blind
+
+	set := core.NewUTXOSet()
+	set.Add(&core.UTXO{OneTimePub: owned[0].OneTimePub, AmountCommit: owned[0].AmountCommit})
+	decoys := make([]core.DecoyUTXO, crypto.RingSize-1)
+	for i := range decoys {
+		keys, keyErr := crypto.GenerateWalletKeys()
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		decoyBlind, blindErr := crypto.NewBlindFactor()
+		if blindErr != nil {
+			t.Fatal(blindErr)
+		}
+		decoyCommit, commitErr := crypto.Commit(uint64(i+1), decoyBlind)
+		if commitErr != nil {
+			t.Fatal(commitErr)
+		}
+		decoys[i] = core.DecoyUTXO{OneTimePub: keys.Spend.Public, AmountCommit: decoyCommit}
+		set.Add(&core.UTXO{OneTimePub: keys.Spend.Public, AmountCommit: decoyCommit})
+	}
+
+	result, err := core.NewTxBuilder(
+		alice.Spend.Private,
+		alice.View.Private,
+		alice.Spend.Public,
+		owned,
+		1,
+	).WithVersion(core.TxVersionCLSAG).
+		WithDecoys(decoys).
+		Build(1_000_000, crypto.MainnetBurnAddress(), crypto.AddressFromKeys(crypto.MainnetByte, alice))
+	if err != nil {
+		t.Fatalf("build v5 burn: %v", err)
+	}
+	if !result.Tx.IsBurnTx() {
+		t.Fatal("v5 burn marker was not preserved")
+	}
+	if len(result.Tx.Outputs) != 1 || result.ChangeOutIdx != 0 || result.PayOutIdx != -1 {
+		t.Fatalf("v5 burn outputs=%d change_index=%d pay_index=%d; want optional change only",
+			len(result.Tx.Outputs), result.ChangeOutIdx, result.PayOutIdx)
+	}
+	if err := core.NewTxVerifier(set).VerifyTx(&result.Tx); err != nil {
+		t.Fatalf("verify v5 burn: %v", err)
 	}
 }

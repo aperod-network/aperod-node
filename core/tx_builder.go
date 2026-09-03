@@ -125,7 +125,9 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		return nil, fmt.Errorf("invalid change address: %w", err)
 	}
 	isBurn := crypto.IsBurnAddress(recipient)
-	if isBurn && b.txVersion != TxVersionCommitmentBinding {
+	if isBurn &&
+		b.txVersion != TxVersionCommitmentBinding &&
+		b.txVersion != TxVersionCLSAG {
 		return nil, fmt.Errorf("intentional burn is unavailable before RingCT v4 activation")
 	}
 
@@ -329,8 +331,8 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		if b.txVersion == TxVersionCLSAG {
 			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
 		} else {
-		allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
-	}
+			allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
+		}
 	}
 
 	// ── Build ring inputs and derive one-time spend keys ─────────────────────
