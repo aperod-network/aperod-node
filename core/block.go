@@ -32,8 +32,7 @@ type BlockHeader struct {
 	// BaseFee is the protocol-level base fee per byte in nAPRO for this block,
 	// computed from the previous block's fill ratio (EIP-1559 style).
 	// Every transaction must satisfy tx.Fee >= tx.Size() × BaseFee.
-// Every transaction fee is burned; validators are paid by the staking reward pool
-// or, after it is exhausted, by tail emission.
+	// 100% of BaseFee × tx.Size() is burned; the excess (priority tip) goes to the validator.
 	// Encoded as nAPRO per byte (e.g. 200 = 200 nAPRO/byte).
 	// Zero is treated as InitialBaseFeePerByte (genesis / pre-dynamic-fee blocks).
 	BaseFee uint64

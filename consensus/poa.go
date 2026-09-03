@@ -756,20 +756,37 @@ func nextBaseFee(current uint64, blockSizeBytes int) uint64 {
 }
 
 // blockFeeStats computes the total nAPRO destroyed by a block's transactions.
-// The complete transaction fee is burned; validators are paid only by the
-// pool-phase reward or tail emission. The second return value remains for API
-// compatibility and is always zero.
-func blockFeeStats(txs []core.Transaction, _ uint64) (burned, tipTotal uint64) {
+// Only the protocol base fee is burned.  A transaction that carries the signed
+// intentional-burn marker adds its public marker amount to that destroyed
+// total.  The marker amount is already included in tx.Fee for commitment
+// balance purposes, so it must be separated from (rather than added to) the
+// fee before calculating the validator priority tip.
+func blockFeeStats(txs []core.Transaction, baseFee uint64) (burned, tipTotal uint64) {
 	for _, tx := range txs {
 		if tx.IsCoinbase() || tx.IsStake() {
 			continue
 		}
-		burnForTx := tx.Fee
+		minFee := tx.MinFeeAt(baseFee)
+		// Invalid underpriced transactions cannot enter a validated block, but
+		// retain a bounded result for callers inspecting historical data.
+		burnForTx := minFee
+		if tx.Fee < minFee {
+			burnForTx = tx.Fee
+		}
+		requiredFee := minFee
 		if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
-			if burnForTx > ^uint64(0)-intentionalBurn {
+			if burnForTx > ^uint64(0)-intentionalBurn ||
+				requiredFee > ^uint64(0)-intentionalBurn {
 				return ^uint64(0), 0
 			}
 			burnForTx += intentionalBurn
+			requiredFee += intentionalBurn
+		}
+		if tx.Fee > requiredFee {
+			tipTotal += tx.Fee - requiredFee
+		}
+		if burned > ^uint64(0)-burnForTx {
+			return ^uint64(0), tipTotal
 		}
 		burned += burnForTx
 	}

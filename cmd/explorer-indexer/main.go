@@ -226,6 +226,9 @@ func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *s
 			Fee:         t.Fee,
 			SizeBytes:   t.Size,
 			Version:     1,
+			IsBurn:      t.IsBurn,
+			BurnedNAPRO: t.BurnedNAPRO,
+			BurnAddress: t.BurnAddress,
 		})
 	}
 
@@ -298,6 +301,9 @@ type txItem struct {
 	Outputs    int    `json:"outputs"`
 	Fee        uint64 `json:"fee"`
 	Size       int    `json:"size"`
+	IsBurn      bool   `json:"is_burn"`
+	BurnedNAPRO string `json:"burned_napro"`
+	BurnAddress string `json:"burn_address"`
 }
 
 // blockOutputsAPIResponse maps GET /api/v1/blocks/{height}/outputs.

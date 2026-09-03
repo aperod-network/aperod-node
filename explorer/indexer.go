@@ -51,6 +51,9 @@ type TxData struct {
         Fee         uint64
         SizeBytes   int
         Version     int
+        IsBurn      bool
+        BurnedNAPRO string
+        BurnAddress string
 }
 
 // AddrTxData links a one-time output key to a transaction in address_txs.
@@ -136,6 +139,9 @@ func (idx *Indexer) migrate(ctx context.Context) error {
                         fee          BIGINT  NOT NULL DEFAULT 0,
                         size         INTEGER NOT NULL DEFAULT 0,
                         version      INTEGER NOT NULL DEFAULT 1,
+                        is_burn      BOOLEAN NOT NULL DEFAULT FALSE,
+                        burned_napro TEXT NOT NULL DEFAULT '0',
+                        burn_address TEXT,
                         indexed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 CREATE INDEX IF NOT EXISTS txs_block_height_idx ON transactions (block_height);
@@ -191,6 +197,16 @@ func (idx *Indexer) migrate(ctx context.Context) error {
                         END IF;
                 END $$;
         `)
+        if err != nil {
+                return err
+        }
+        // Existing production tables predate intentional-burn metadata. These
+        // migrations are safe on every startup and leave existing rows intact.
+        _, err = idx.db.ExecContext(ctx, `
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_burn BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS burned_napro TEXT NOT NULL DEFAULT '0';
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS burn_address TEXT;
+        `)
         return err
 }
 
@@ -224,11 +240,16 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
         // Insert transactions
         for _, tx := range txs {
                 _, err = dbTx.ExecContext(ctx, `
-                        INSERT INTO transactions (hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size, version)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                        ON CONFLICT (hash) DO NOTHING`,
+                        INSERT INTO transactions (hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size, version, is_burn, burned_napro, burn_address)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                        ON CONFLICT (hash) DO UPDATE SET
+                          is_burn = EXCLUDED.is_burn,
+                          burned_napro = EXCLUDED.burned_napro,
+                          burn_address = EXCLUDED.burn_address
+                        WHERE EXCLUDED.is_burn = TRUE AND transactions.is_burn = FALSE`,
                         tx.Hash, tx.BlockHash, int64(tx.BlockHeight), tx.TxIndex,
                         tx.IsCoinbase, tx.Inputs, tx.Outputs, int64(tx.Fee), tx.SizeBytes, tx.Version,
+                        tx.IsBurn, tx.BurnedNAPRO, tx.BurnAddress,
                 )
                 if err != nil {
                         return fmt.Errorf("indexer: upsert tx %s: %w", tx.Hash, err)

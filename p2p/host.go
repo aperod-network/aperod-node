@@ -1445,7 +1445,7 @@ func (h *Host) BanPeer(addr, reason string, d time.Duration) {
 		}
 	}
 	h.mu.Unlock()
-	h.log.Info("peer banned", "addr", addr, "ip", bannedIP, "reason", reason, "duration", d)
+	h.log.Info("peer banned", "reason", reason, "duration", d)
 }
 
 // banTxFlooder temporarily bans an IP that kept flooding transactions past
@@ -1464,7 +1464,7 @@ func (h *Host) banTxFlooder(peerIP string, peer *Peer, violations int) {
 	if len(wlNets) > 0 || len(wlIPs) > 0 {
 		if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
 			h.log.Warn("tx flood from whitelisted peer — throttled but not banned",
-				"peer", peer.addr, "ip", peerIP, "violations", violations)
+				"peer_id", peer.id, "violations", violations)
 			return
 		}
 	}
@@ -1488,8 +1488,8 @@ func (h *Host) banTxFlooder(peerIP string, peer *Peer, violations int) {
 	h.mu.Unlock()
 	// Forget the rate-limit state so a post-ban reconnect starts fresh.
 	h.txRate.forget(peerIP)
-	h.log.Info("peer IP banned for transaction flood",
-		"ip", peerIP, "addr", peer.addr, "violations", violations, "duration", banDuration)
+	h.log.Info("peer banned for transaction flood",
+		"peer_id", peer.id, "violations", violations, "duration", banDuration)
 	// Record the ban event so the API server can poll and notify admins.
 	h.banEventMu.Lock()
 	h.banEvents = append(h.banEvents, BanEvent{
@@ -1923,8 +1923,7 @@ func (h *Host) acceptLoop() {
 		if len(wlNets) > 0 || len(wlIPs) > 0 {
 			remoteIP := net.ParseIP(connIP(conn.RemoteAddr().String()))
 			if remoteIP == nil || !ipInWhitelist(remoteIP, wlNets, wlIPs) {
-				h.log.Info("inbound connection rejected: IP not in peer_whitelist",
-					"addr", conn.RemoteAddr().String())
+				h.log.Info("inbound connection rejected: source not in peer_whitelist")
 				conn.Close()
 				continue
 			}
@@ -1948,7 +1947,6 @@ func (h *Host) acceptLoop() {
 			// Hard cap on total peers.
 			if total >= h.cfg.MaxPeers {
 				h.log.Debug("inbound connection rejected: MaxPeers reached",
-					"addr", conn.RemoteAddr().String(),
 					"max", h.cfg.MaxPeers)
 				conn.Close()
 				continue
@@ -1962,7 +1960,6 @@ func (h *Host) acceptLoop() {
 				inboundCount := total - outCount
 				if inboundCount >= inboundCap {
 					h.log.Debug("inbound connection rejected: MinOutbound slots reserved",
-						"addr", conn.RemoteAddr().String(),
 						"inbound", inboundCount,
 						"cap", inboundCap,
 						"min_outbound", h.cfg.MinOutbound)
@@ -1986,8 +1983,6 @@ func (h *Host) acceptLoop() {
 			h.mu.RUnlock()
 			if ipCount >= h.cfg.MaxPeersPerIP {
 				h.log.Debug("inbound connection rejected: MaxPeersPerIP reached",
-					"addr", conn.RemoteAddr().String(),
-					"ip", remoteIP,
 					"max", h.cfg.MaxPeersPerIP)
 				conn.Close()
 				continue
@@ -2004,7 +1999,6 @@ func (h *Host) acceptLoop() {
 			if cur > int64(h.cfg.MaxPendingHandshakes) {
 				h.pendingHandshakes.Add(-1)
 				h.log.Info("MaxPendingHandshakes reached — inbound connection rejected",
-					"addr", conn.RemoteAddr().String(),
 					"limit", h.cfg.MaxPendingHandshakes)
 				conn.Close()
 				continue
@@ -2345,14 +2339,14 @@ func (h *Host) dialPeer(addr string) {
 			h.dialGateMu.Unlock()
 			cancel()
 			h.log.Debug("dialPeer: MaxPeers reached (incl. in-flight dials)",
-				"addr", addr, "peers", totalPeers, "inflight", totalInflight, "max", h.cfg.MaxPeers)
+				"peers", totalPeers, "inflight", totalInflight, "max", h.cfg.MaxPeers)
 			return
 		}
 		if h.cfg.MaxPeersPerIP > 0 && perIPPeers+perIPInflight >= h.cfg.MaxPeersPerIP {
 			h.dialGateMu.Unlock()
 			cancel()
 			h.log.Debug("dialPeer: MaxPeersPerIP reached (incl. in-flight dials)",
-				"addr", addr, "ip", canonIP, "ip_peers", perIPPeers, "ip_inflight", perIPInflight, "max", h.cfg.MaxPeersPerIP)
+				"ip_peers", perIPPeers, "ip_inflight", perIPInflight, "max", h.cfg.MaxPeersPerIP)
 			return
 		}
 	}
@@ -3197,8 +3191,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					h.tsMu.Unlock()
 
 					h.log.Debug("future-timestamp block from peer",
-						"peer", peer.addr,
-						"ip", peerIP,
+						"peer_id", peer.id,
 						"block_height", block.Header.Height,
 						"skew_ms", (block.Header.Timestamp-nowNs)/1_000_000,
 						"count", tsCount)
@@ -3221,8 +3214,8 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 						h.tsMu.Lock()
 						delete(h.tsStrikeCounts, peerIP)
 						h.tsMu.Unlock()
-						h.log.Info("peer IP banned for future-timestamp blocks",
-							"ip", peerIP, "addr", peer.addr, "duration", banDuration,
+						h.log.Info("peer banned for future-timestamp blocks",
+							"peer_id", peer.id, "duration", banDuration,
 							"violations", tsCount)
 						h.banEventMu.Lock()
 						h.banEvents = append(h.banEvents, BanEvent{
@@ -3282,8 +3275,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 				if len(wlNets) > 0 || len(wlIPs) > 0 {
 					if remoteIP := net.ParseIP(peerIP); remoteIP != nil && ipInWhitelist(remoteIP, wlNets, wlIPs) {
 						h.log.Debug("out-of-range block from whitelisted peer — strike skipped",
-							"peer", peer.addr,
-							"ip", peerIP,
+							"peer_id", peer.id,
 							"block_height", block.Header.Height,
 							"our_tip", ourTip)
 						// Record for the Admin Panel notification log so
@@ -3322,8 +3314,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 				h.badBlockMu.Unlock()
 
 				h.log.Debug("out-of-range block from peer",
-					"peer", peer.addr,
-					"ip", peerIP,
+					"peer_id", peer.id,
 					"block_height", block.Header.Height,
 					"our_tip", ourTip,
 					"count", count)
@@ -3353,8 +3344,8 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					h.badBlockMu.Lock()
 					delete(h.badBlockCounts, peerIP)
 					h.badBlockMu.Unlock()
-					h.log.Info("peer IP banned for wrong-fork blocks",
-						"ip", peerIP, "addr", peer.addr, "duration", banDuration)
+					h.log.Info("peer banned for wrong-fork blocks",
+						"peer_id", peer.id, "duration", banDuration)
 					// Record the ban event so the API server can poll
 					// and send an admin Telegram notification.
 					h.banEventMu.Lock()
@@ -3455,8 +3446,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 			allowed, banNow, violations := h.txRate.allow(txPeerIP)
 			if !allowed {
 				h.log.Warn("tx rate limit exceeded — dropping transaction",
-					"peer", peer.addr,
-					"ip", txPeerIP,
+					"peer_id", peer.id,
 					"violations", violations,
 					"burst", h.cfg.TxRateBurst,
 					"sustained_per_sec", h.cfg.TxRateSustained)
