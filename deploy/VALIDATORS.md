@@ -1,6 +1,6 @@
 # Aperod Validator Rules
 
-> **Network:** Aperod Mainnet &nbsp;·&nbsp; **Consensus:** Proof of Authority (stake-weighted, permissionless)
+> **Network:** Aperod Mainnet &nbsp;·&nbsp; **Consensus:** BFT Proof of Stake (stake-weighted, permissionless)
 
 This document is the authoritative specification for validator participation in the Aperod network. All rules are enforced at the protocol level in `consensus/poa.go`.
 
@@ -22,7 +22,7 @@ This document is the authoritative specification for validator participation in 
 
 ## Overview
 
-Aperod uses a **permissionless, stake-weighted Proof-of-Authority** consensus:
+Aperod uses **permissionless, stake-weighted BFT Proof of Stake**:
 
 - Validators are selected by stake size — no operator approval or whitelist.
 - The **top 21 nodes** by staked APRO form the active set at any given epoch.
@@ -88,7 +88,7 @@ At each epoch boundary the consensus engine:
 | Tail emission | **1 APRO** per block after pool exhaustion (~63 years) |
 | Reward destination | Validator's configured `reward_address` (Telegram wallet) |
 | Notification | Telegram push notification on every reward payment |
-| Fee share | None — every transaction fee is burned 100% |
+| Fee share | 100% of the base fee is burned; explicit priority tips go to the proposer |
 | Halving | **None** |
 
 During the pool phase each produced block transfers

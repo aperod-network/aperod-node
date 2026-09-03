@@ -4,7 +4,7 @@
 
 **Privacy-preserving blockchain built for the real world.**
 
-RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&nbsp; 100 % fee burn &nbsp;·&nbsp; Permissionless PoA consensus
+RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 activation-ready &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -21,6 +21,7 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 ## Table of Contents
 
 - [Why Aperod](#-why-aperod)
+- [Protocol Status](#-protocol-status)
 - [Install a Full Node](#-install-a-full-node)
 - [Become a Validator](#-become-a-validator)
 - [Validator Rules](#-validator-rules)
@@ -39,14 +40,34 @@ RingCT confidential transactions &nbsp;·&nbsp; Telegram-native wallet &nbsp;·&
 
 | Feature | Detail |
 |---------|--------|
-| **Privacy** | MLSAG ring signatures (ring size 16), Pedersen commitments, Bulletproofs range proofs — receiver and amount hidden on-chain |
+| **Privacy** | RingCT with 16-member rings, Pedersen commitments, Bulletproof range proofs, and stealth addresses. CLSAG v5 is implemented and height-gated for coordinated activation |
 | **Stealth addresses** | Every payment generates a one-time address; receiver identity is never revealed |
 | **Telegram wallet** | Full wallet inside Telegram — create, send, receive, and stake APRO without any app download |
-| **100 % fee burn** | Every transaction fee is permanently destroyed, reducing total supply with every block |
+| **Dynamic base-fee burn** | 100% of the protocol base fee is burned; any priority tip remains validator compensation |
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
-| **Block rewards** | 0.1 APRO authorized base reward per block in the current era, plus optional priority tips |
+| **Block rewards** | 3 APRO/block from a pre-allocated 2B APRO pool; then 1 APRO/block tail emission; no halving |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
 | **Open source** | Go 1.25, Apache 2.0, independently auditable cryptographic primitives |
+
+---
+
+## 🔐 Protocol Status
+
+The current public source contains the complete **RingCT + CLSAG v5** transaction path:
+
+- compact linkable ring signatures over public-key/commitment pairs;
+- 16-member rings and canonical key images for double-spend prevention;
+- Pedersen commitments, balanced pseudo-outputs, and Bulletproof range proofs;
+- a persistent canonical ring-member index with bounded in-memory caching;
+- replay compatibility for historical v1–v4 transactions.
+
+CLSAG is a separate transaction version controlled by `ring_ct_clsag_activation_height`.
+The value `0` keeps v5 disabled. A non-zero height requires a coordinated validator,
+wallet, storage, and API rollout. The repository therefore distinguishes **implemented**
+from **activated on the live network**.
+
+Transaction-layer privacy does not hide IP addresses, timing metadata, compromised
+wallets, exchange records, or other network/application-layer information.
 
 ---
 
@@ -180,7 +201,7 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 
 ## 🔥 Tokenomics & Fee Burn
 
-> **Every transaction fee is permanently burned. 100 %. Always.**
+> **Every protocol base fee is permanently burned. 100 %. Always.**
 
 Aperod starts with a fixed genesis allocation and uses a deflationary fee model:
 
@@ -190,18 +211,19 @@ Circulating (launch):  9,000,000,000 APRO  (9B — 90% Public / IDO / Liquidity)
 Dev Fund locked:       1,000,000,000 APRO  (10%, 12-month cliff + 48-month linear vest)
 Block time:            3 seconds
 Block throughput:      28,800 blocks / day
-Authorized reward:     0.1 APRO per block in the current era
-Annual base issuance:  1,051,200 APRO / year
-Per-validator base:    ≈ 50,057 APRO / year (21 equally productive validators)
-Halving interval:      every 21,024,000 blocks  (~2 years)
+Pool reward:           3 APRO per block from a pre-allocated 2B APRO pool
+Pool-phase issuance:   0 APRO (existing genesis supply is redistributed)
+Tail emission:         1 APRO per block after pool exhaustion (~63 years)
+Halving:               none
 Transaction fee:       dynamic EIP-1559 · base 200 nAPRO/byte · adjusts ±12.5%/block
                        P2P transfer ~2 KB ≈ 0.004 APRO
                        Game / NFT tx ~4 KB ≈ 0.008 APRO
-Fee destination:       🔥 base fee — burned 100% · priority tip → validator
+Base-fee destination:  🔥 complete base fee — burned 100%
+Priority tip:          optional proposer compensation
 ```
 
-Validators earn the authorized base reward plus optional priority tips.
-The base-fee portion never reaches validator wallets.
+Validators earn the pool reward and, after pool exhaustion, tail emission.
+Transaction fees never reach validator wallets.
 The burn is enforced at the consensus layer — not a governance parameter, not toggleable.
 
 See [**BURN\_POLICY.md**](BURN_POLICY.md) for full tokenomics and deflationary mechanics.
@@ -242,9 +264,8 @@ The burn is consensus-enforced — not a governance parameter, not toggleable.
 
 ### Your APRO Validator Reward Grows in USD as Price Rises
 
-At the current reward era, an equally productive member of a 21-validator set
-earns a theoretical base reward of **≈ 50,057 APRO / year**, before priority
-tips and missed slots.
+During the pool phase, an equally productive member of a 21-validator set earns
+a theoretical reward of **≈ 1,501,714 APRO / year**, before missed slots.
 As deflation drives the price up, that fixed reward becomes worth exponentially more in USD:
 
 | APRO price | Annual validator income (USD) |
@@ -268,9 +289,9 @@ aperod-node/
 ├── cmd/
 │   ├── node/        — aperod-node binary  (full node + RPC)
 │   └── cli/         — aperod binary       (wallet CLI + chain inspection)
-├── consensus/       — PoA engine: round-robin proposer selection, BFT 2/3 finality votes
+├── consensus/       — BFT-PoS engine: stake-selected active set, rotating proposer, ≥2/3 finality
 ├── core/            — Block, Transaction, UTXO, Mempool, Chain, Merkle root
-├── crypto/          — Ed25519, SHA3-256/512, RingCT, Pedersen commitments, Bulletproofs
+├── crypto/          — Ed25519, SHA3-256/512, RingCT, CLSAG, Pedersen commitments, Bulletproofs
 ├── p2p/             — Peer discovery, block/tx propagation, DNS bootnode resolution
 ├── store/           — LevelDB with typed key prefixes; archive + light pruning modes
 ├── wallet/          — HD wallet (BIP-39 + SLIP-0010 + Ed25519), stealth address builder
@@ -284,7 +305,7 @@ aperod-node/
 |-----------|-------------------|
 | Elliptic curve | Ed25519 — `filippo.io/edwards25519` |
 | Hash function | SHA3-256 / SHA3-512 — `golang.org/x/crypto` |
-| Ring signatures | MLSAG, ring size 16 |
+| Ring signatures | CLSAG v5, ring size 16 (height-gated); historical MLSAG formats remain replay-compatible |
 | Commitments | Pedersen over Ed25519 |
 | Range proofs | Bulletproofs (IPA variant) |
 | HD key derivation | BIP-39 mnemonics + SLIP-0010 + Ed25519 |

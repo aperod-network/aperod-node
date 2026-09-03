@@ -1,6 +1,6 @@
 # Aperod Fee Burn Policy
 
-> **100 % of every transaction fee is permanently burned.**  
+> **100 % of the protocol base fee is permanently burned.**
 > This is a protocol-level rule — not a governance parameter, not toggleable by validators.
 
 ---
@@ -12,7 +12,8 @@
 | Transaction fee | **dynamic EIP-1559** — base 200 nAPRO/byte, adjusts ±12.5%/block |
 | Typical P2P fee | **≈ 0.004 APRO** (2 KB transfer at genesis base fee) |
 | Typical game/NFT fee | **≈ 0.008 APRO** (4 KB tx at genesis base fee) |
-| Fee destination | 🔥 Burned **100%** — removed from supply forever |
+| Base-fee destination | 🔥 Burned **100%** — removed from supply forever |
+| Priority tip | Optional validator compensation; not part of the protocol burn |
 | Genesis supply | **10,000,000,000 APRO** (10B) |
 | Circulating at launch | **9,000,000,000 APRO** (9B — 90% Public/IDO/Liquidity) |
 | Dev Fund | **1,000,000,000 APRO** (10%, 12-month cliff + 48-month linear vest) |
@@ -31,11 +32,13 @@
 Every time a transaction is included in a block, the network charges a **dynamic EIP-1559 fee**:  
 `minimum_fee = tx_size_bytes × base_fee_per_byte`
 
-The **complete transaction fee is burned 100%**. No part is forwarded to the
-block proposer or any treasury.
+The **protocol base fee is burned 100%**. An optional priority tip may be paid
+to the block proposer; it is separate from the burned base fee. No base-fee
+revenue is routed to a validator or treasury.
 
 ```
-User sends TX  →  complete transaction fee  →  PoA engine burns it  →  supply decreases
+User sends TX  →  base fee burned by consensus  →  supply decreases
+              ↘ optional priority tip paid to proposer
 ```
 
 The base fee adjusts ±12.5% per block toward a 500 KB target block size (same mechanism as Ethereum EIP-1559). At genesis base fee (200 nAPRO/byte):
@@ -55,8 +58,8 @@ Aperod is designed to offset tail emission through **deflationary usage**.
 During the pool phase, rewards redistribute pre-allocated genesis supply, so
 network fees reduce total supply from the first transaction.
 
-- Validators are incentivised by **block rewards**, not by fee extraction — aligning their interests with network uptime rather than fee maximisation.
-- A predictable flat fee makes transaction costs easier to reason about for users and developers.
+- Validators are incentivised by **block rewards and optional priority tips**, while the complete base fee is removed from supply.
+- A deterministic size-based base fee makes transaction costs easier to reason about for users and developers.
 - Full burn prevents any privileged party from capturing fee revenue.
 
 ---
@@ -95,8 +98,9 @@ The same figure is shown on the **Tokenomics** page of the [Block Explorer](http
 
 ## Code Reference
 
-The burn and reward policy are enforced in `consensus/poa.go`. Transaction fees
-are never routed to a validator or treasury.
+The burn and reward policy are enforced in `consensus/poa.go`. Base fees are
+never routed to a validator or treasury; only an explicit priority tip may be
+paid to the proposer.
 
 ---
 

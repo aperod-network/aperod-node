@@ -20,16 +20,18 @@
 
 ## 1. What is Aperod?
 
-Aperod is a privacy-preserving proof-of-authority blockchain built for real-world
-payments and gaming.  Every transaction uses **RingCT** — the same scheme that powers
-Monero — so balances and sender/receiver identities are hidden on-chain.
+Aperod is a privacy-preserving BFT-PoS blockchain built for real-world payments
+and gaming. Confidential transfers use **RingCT** with Pedersen commitments,
+Bulletproof range proofs, and stealth addresses. **CLSAG v5** is implemented in
+the public node and remains height-gated until a coordinated network activation.
+Coinbase and staking transactions follow separate consensus formats.
 
 Key differentiators:
 
 | Property | Value |
 |---|---|
-| Consensus | Permissionless PoA (stake-weighted, rotating) |
-| Privacy | RingCT confidential transactions |
+| Consensus | Permissionless BFT-PoS (stake-weighted active set, rotating proposer, signed ≥2/3 finality) |
+| Privacy | RingCT; activation-gated CLSAG v5 with 16-member rings |
 | Native token | APRO (1 APRO = 10⁸ nAPRO) |
 | Total supply (genesis) | **10 000 000 000 APRO** (10 billion) |
 | Fee model | EIP-1559: 100 % of base fee is **permanently burned** |

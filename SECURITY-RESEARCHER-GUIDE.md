@@ -28,6 +28,7 @@ go version
 |---|---|---|
 | APD-2026-001 | `UTXOSet.ApplyBlock` completes a read-only preflight before mutating UTXOs, key images, outputs, or rollback state. Startup replay fails closed on application errors. | `core/utxo_preflight_test.go` |
 | APD-2026-002 | RingCT v4 binds the real input index, public key, and referenced commitment opening. Legacy history remains replayable before coordinated activation. | `core/ringct_v4_security_test.go`, `crypto/ringct_v4_test.go` |
+| CLSAG v5 migration | v5 removes the serialized real index, binds every ring key to its commitment and pseudo-output, and verifies members against a persistent canonical output index. Activation remains separately height-gated. | `core/ringct_v5_test.go`, `core/clsag_ring_store_test.go`, `crypto/clsag_test.go`, `store/ring_member_index_test.go` |
 | APD-2026-004 | Privileged mempool state is not restored from disk. Post-activation block rewards require authorization bound to the proposer, parent, height, amount, and authorization ID. | `core/mempool_test.go`, `core/reward_test.go`, `consensus/coinbase_security_test.go` |
 | APD-2026-006 | In-flight outbound handshakes reserve capacity, inbound admission counts reservations, and a final ban/capacity check occurs immediately before registration. | `p2p/admission_race_test.go`, `p2p/admission_closure_internal_test.go` |
 
@@ -55,6 +56,7 @@ consensus migrations. Production configuration coordinates both at height
 
 ```yaml
 ringct_v4_activation_height: 1750000
+ring_ct_clsag_activation_height: 0  # disabled until coordinated v5 rollout
 reward_authorization_activation_height: 1750000
 ```
 
@@ -70,6 +72,7 @@ Expected post-activation results:
 - authorization replay at another height, parent, validator, or amount is
   rejected;
 - historical pre-activation blocks still replay successfully.
+- when testing v5 on an isolated chain, all ring members resolve from the persistent index, key images prevent reuse, and no real ring index is serialized.
 
 ## Reporting results
 

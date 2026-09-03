@@ -56,8 +56,8 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 | Area | Notes |
 |------|-------|
-| Consensus manipulation | PoA double-sign, fork, finality break |
-| Cryptographic flaws | RingCT ring sigs, Bulletproofs range proofs, HD key derivation |
+| Consensus manipulation | BFT-PoS double-sign, fork, finality break |
+| Cryptographic flaws | RingCT/CLSAG signatures, Bulletproof range proofs, HD key derivation |
 | Double-spend / UTXO attacks | Replay, blind manipulation, output reuse |
 | P2P eclipse / Sybil attacks | Peer routing, DoS, partition |
 | RPC endpoint vulnerabilities | `/api/v1/*` public endpoints |
@@ -76,11 +76,13 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 ## Cryptographic Architecture
 
-### Privacy Layer — RingCT + Bulletproofs
+### Privacy Layer — RingCT + CLSAG v5 + Bulletproofs
 
 - **Transaction unlinkability**: one-time stealth addresses (per-height mint derivation: `mint_pub = spend_pub + height·G`)
 - **Amount confidentiality**: Pedersen commitments with Bulletproof range proofs
-- **Ring signatures**: linkable ring signatures hide sender among ring members
+- **Ring signatures**: CLSAG v5 proves ownership within a 16-member ring while binding every public key to its commitment; v5 is implemented but remains height-gated until coordinated activation
+- **Historical compatibility**: legacy v1–v4 transactions remain replayable; activation does not rewrite chain history
+- **Spentness boundary**: public nodes cannot identify the real CLSAG ring member; wallets determine owned-output spentness from owner-derived key images
 - **Blind balancing**: transaction builder enforces `Σin_blinds = Σout_blinds + fee_blind`; unbalanced transactions are rejected at consensus
 
 ### Key Management
@@ -111,7 +113,7 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 ### RPC / REST API (`/api/v1/*`)
 
-- **EIP-1559 fee model**: every transaction fee is burned 100%. Dynamic ±12.5%/block base-fee adjustment
+- **EIP-1559 fee model**: every protocol base fee is burned 100%; an explicit priority tip may compensate the proposer. Dynamic ±12.5%/block base-fee adjustment
 - **Rate limiting**: per-IP token-bucket limits — general 30-burst/1-per-sec; heavy endpoints (`/v1/blocks`, `/v1/network/stats`, `/v1/transactions`, `/v1/oracle`, `/v1/tokenomics`) capped at 10 req/min
 - **DDoS auto-ban**: any IP triggering the rate limiter 5+ times within 60 seconds is **permanently** blocked with no expiry. Bans persist across restarts (stored in DB). Applies to both heavy and general flood paths. Admin Telegram notification sent on every auto-ban.
 - **Input validation**: all user-supplied values validated and sanitised before DB writes or file operations
