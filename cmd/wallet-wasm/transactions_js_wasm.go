@@ -25,6 +25,7 @@ type wasmOutput struct {
 	EncAmount    string `json:"enc_amount"`
 	BlockHeight  uint64 `json:"block_height"`
 	Amount       uint64 `json:"amount_napr,omitempty"`
+	BlindHex     string `json:"blind_hex,omitempty"`
 }
 type wasmDecoy struct {
 	OneTimePub   string `json:"one_time_pub"`
@@ -110,6 +111,13 @@ func ownedOutputs(r wasmRequest, keys *wallet.DerivedKeys) ([]core.OwnedUTXO, er
 			}
 			hs, amount = *found, core.DecryptAmount(enc, found)
 			blind, err = crypto.DeterministicPaymentBlind(hs, amount)
+		}
+		if x.BlindHex != "" {
+			storedBlind, blindErr := hex32(x.BlindHex, "outputs.blind_hex")
+			if blindErr != nil {
+				return nil, blindErr
+			}
+			blind, err = crypto.BlindFactor(storedBlind), nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("outputs[%d] blind: %w", i, err)
