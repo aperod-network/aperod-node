@@ -3536,9 +3536,15 @@ func (h *Host) requestHeaders(peer *Peer) {
 func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
 	var headers []SerializedHeader
 	if h.headers != nil || (h.blockByHash != nil && h.blockByHeight != nil) {
+		// Keep batches short enough that older peers with synchronous block
+		// ingestion can drain the batch and process keepalive Pongs before
+		// their 20-second deadline. A requester may advertise a larger limit,
+		// but serving 500 blocks at 50 blocks/s leaves no margin for validation
+		// or simultaneous connections and causes a reconnect loop.
+		const maxHeadersPerResponse = 50
 		limit := msg.Limit
-		if limit <= 0 || limit > 500 {
-			limit = 500
+		if limit <= 0 || limit > maxHeadersPerResponse {
+			limit = maxHeadersPerResponse
 		}
 
 		var coreHeaders []core.BlockHeader
