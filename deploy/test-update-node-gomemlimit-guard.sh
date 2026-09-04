@@ -1,125 +1,69 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  test-update-node-gomemlimit-guard.sh — Tests for the Step 0d preflight
-#  guard in update-node.sh.
+# test-update-node-gomemlimit-guard.sh — fail-closed tests for Step 0d.
 #
-#  Strategy: extract and run the *real* Step 0d block from update-node.sh
-#  (via awk + sed seam injection) rather than hand-copying logic, so any
-#  future refactor that silently removes or breaks the preflight will also
-#  break this test.
-#
-#  What is tested:
-#    T1. Absent canonical gomemlimit.conf → guard exits non-zero,
-#        prints "NOT stopped" to stderr, does NOT invoke systemctl.
-#    T2. Corrupt canonical file (no GOMEMLIMIT=<digits> sequence) → guard
-#        exits non-zero, prints "could not parse GOMEMLIMIT" and "NOT stopped"
-#        to stderr, does NOT invoke systemctl.
-#    T3. Valid canonical file → guard exits 0, writes correct
-#        [Service] / Environment="GOMEMLIMIT=<N>" drop-in, and calls
-#        systemctl daemon-reload exactly once.
-#    T4. Static analysis: the Step 0d block still exists in update-node.sh
-#        and contains the expected sentinel strings (GOMEMLIMIT_CANONICAL,
-#        "NOT stopped", "could not parse GOMEMLIMIT", exit 1).
-#
-#  Seams injected by this test (all overrideable via environment or sed):
-#    GOMEMLIMIT_CANONICAL  — path to the canonical gomemlimit.conf source
-#    GOMEMLIMIT_CONF       — path where the drop-in is written
-#    SYSTEMCTL             — command used for daemon-reload
-#
-#  Run from anywhere:
-#    bash blockchain/deploy/test-update-node-gomemlimit-guard.sh
-#
-#  Exit codes:
-#    0 — all tests passed
-#    1 — one or more tests failed
+# Extract and execute the real Step 0d block rather than duplicating it.  The
+# shared policy is deliberately exercised with hostile/missing meminfo, a
+# low-memory relay, and an explicit operator override.  A policy failure must
+# occur before a drop-in write or systemctl invocation (and therefore before
+# update-node.sh can later stop the service).
 # =============================================================================
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UPDATE_SH="$SCRIPT_DIR/update-node.sh"
+UPDATE_SH="${SCRIPT_DIR}/update-node.sh"
+POLICY_SH="${SCRIPT_DIR}/gomemlimit-policy.sh"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; BOLD='\033[1m'; NC='\033[0m'
 PASS=0; FAIL=0
-
-pass()    { echo -e "${GREEN}  PASS${NC}  $*"; PASS=$((PASS+1)); }
-fail()    { echo -e "${RED}  FAIL${NC}  $*"; FAIL=$((FAIL+1)); }
+pass() { echo -e "${GREEN}  PASS${NC}  $*"; PASS=$((PASS + 1)); }
+fail() { echo -e "${RED}  FAIL${NC}  $*"; FAIL=$((FAIL + 1)); }
 section() { echo -e "\n${BOLD}▶ $*${NC}"; }
 
-# ── Ensure update-node.sh exists ──────────────────────────────────────────────
-if [[ ! -f "$UPDATE_SH" ]]; then
-  echo -e "${RED}[ERR]${NC}  update-node.sh not found at: $UPDATE_SH" >&2
+if [[ ! -f "${UPDATE_SH}" || ! -f "${POLICY_SH}" ]]; then
+  echo -e "${RED}[ERR]${NC} update-node.sh or gomemlimit-policy.sh is missing" >&2
   exit 1
 fi
 
-# ── Shared temp directory (cleaned on exit) ───────────────────────────────────
 TMPDIR_TEST=$(mktemp -d)
-trap 'rm -rf "$TMPDIR_TEST"' EXIT
+trap 'rm -rf "${TMPDIR_TEST}"' EXIT
 
-# ---------------------------------------------------------------------------
-# make_fake_bin CMD LOG_FILE
-#   Creates a stub executable for CMD in a fresh temp dir; every invocation
-#   appends "CMD <args>" to LOG_FILE.  Prints the bin-dir path to stdout.
-# ---------------------------------------------------------------------------
+# Creates a harmless systemctl replacement that records every invocation.
 make_fake_bin() {
-  local cmd="$1" log_file="$2"
-  local fake_dir
-  fake_dir=$(mktemp -d "$TMPDIR_TEST/fake-bin-XXXXXXXX")
-  cat >"$fake_dir/$cmd" <<STUB
+  local log_file="$1" fake_dir
+  fake_dir=$(mktemp -d "${TMPDIR_TEST}/fake-bin-XXXXXXXX")
+  cat > "${fake_dir}/systemctl" <<STUB
 #!/usr/bin/env bash
-echo "$cmd \$*" >> "$log_file"
-exit 0
+echo "systemctl \$*" >> "${log_file}"
 STUB
-  chmod +x "$fake_dir/$cmd"
-  echo "$fake_dir"
+  chmod +x "${fake_dir}/systemctl"
+  echo "${fake_dir}"
 }
 
-# ---------------------------------------------------------------------------
-# run_step0d_block CANONICAL_PATH DROPIN_DIR SC_LOG
-#
-#   Extracts the real Step 0d block from update-node.sh using awk (from the
-#   GOMEMLIMIT_CANONICAL= line up to, but not including, "# Step 1:"), then
-#   injects three seams via sed:
-#     • GOMEMLIMIT_CANONICAL  → CANONICAL_PATH (may or may not exist)
-#     • GOMEMLIMIT_CONF       → DROPIN_DIR/gomemlimit.conf
-#     • SYSTEMCTL             → path to a fake systemctl stub
-#   A send_telegram_alert stub is prepended so no real HTTP call is made.
-#
-#   The modified block is run in a bash subprocess whose stdin is a heredoc.
-#   stdout and stderr are not redirected here — callers redirect them.
-#   Return code is the block's exit code.
-# ---------------------------------------------------------------------------
+# run_step0d_block MEMINFO DROPIN_DIR SYSTEMCTL_LOG [OVERRIDE]
+# Extracts Step 0d from the production script and runs it in a child shell.
+# DEPLOY_DIR and DROPIN_DIR are injected as supported test seams; no production
+# paths, services, or network calls are used.
 run_step0d_block() {
-  local canonical_path="$1"
-  local dropin_dir="$2"
-  local sc_log="$3"
-
-  local fake_sc_dir
-  fake_sc_dir=$(make_fake_bin "systemctl" "$sc_log")
-
-  # Extract step 0d: from GOMEMLIMIT_CANONICAL= up to (not including) Step 1.
-  local block
+  local meminfo="$1" dropin_dir="$2" sc_log="$3" override="${4:-}"
+  local fake_sc_dir block
+  fake_sc_dir=$(make_fake_bin "${sc_log}")
   block=$(awk '
-    /^GOMEMLIMIT_CANONICAL=/ { f=1 }
-    f && /^# Step 1:/        { exit }
-    f                        { print }
-  ' "$UPDATE_SH")
-
-  if [[ -z "$block" ]]; then
-    echo "[ERR] Could not extract step 0d block from $UPDATE_SH" >&2
+    /^GOMEMLIMIT_CONF=/ { found=1 }
+    found && /^# Step 1:/ { exit }
+    found { print }
+  ' "${UPDATE_SH}")
+  if [[ -z "${block}" ]]; then
+    echo "[ERR] could not extract Step 0d from ${UPDATE_SH}" >&2
     return 1
   fi
 
-  # Inject seams: replace the three assignment lines with controlled values.
-  block=$(echo "$block" \
-    | sed "s|GOMEMLIMIT_CANONICAL=.*|GOMEMLIMIT_CANONICAL=\"${canonical_path}\"|" \
-    | sed "s|GOMEMLIMIT_CONF=.*|GOMEMLIMIT_CONF=\"${dropin_dir}/gomemlimit.conf\"|" \
-    | sed "s|SYSTEMCTL=.*|SYSTEMCTL=\"${fake_sc_dir}/systemctl\"|")
-
-  # Run the modified block.  The outer bash expands ${block} once into the
-  # heredoc; the inner bash then executes the resulting code, so variables
-  # set INSIDE the block (e.g. GOMEMLIMIT_CANONICAL) are available to later
-  # lines in the same block — exactly as they are in the real update-node.sh.
-  PATH="$fake_sc_dir:$PATH" \
+  DEPLOY_DIR="${SCRIPT_DIR}" \
+  DROPIN_DIR="${dropin_dir}" \
+  SYSTEMCTL="${fake_sc_dir}/systemctl" \
+  GOMEMLIMIT_MEMINFO="${meminfo}" \
+  GOMEMLIMIT_BYTES="${override}" \
+  PATH="${fake_sc_dir}:${PATH}" \
   bash -s <<RUNNER
 set -uo pipefail
 send_telegram_alert() { :; }
@@ -127,247 +71,153 @@ ${block}
 RUNNER
 }
 
-# =============================================================================
-# T1: absent canonical gomemlimit.conf → exit non-zero, service NOT stopped
-# =============================================================================
-section "T1: absent canonical gomemlimit.conf → guard aborts before stopping the service"
-
-T1_DROPIN_DIR=$(mktemp -d "$TMPDIR_TEST/t1-XXXXXXXX")
-T1_SC_LOG="$TMPDIR_TEST/t1-sc.log"
-T1_ERR="$TMPDIR_TEST/t1.err"
-T1_RC=0
-
-# The canonical file does NOT exist.
-T1_CANONICAL="$TMPDIR_TEST/nonexistent-gomemlimit.conf"
-
-run_step0d_block "$T1_CANONICAL" "$T1_DROPIN_DIR" "$T1_SC_LOG" \
-  >"$TMPDIR_TEST/t1.out" 2>"$T1_ERR" || T1_RC=$?
-
-if [[ $T1_RC -ne 0 ]]; then
-  pass "T1: guard exits non-zero when canonical file is absent (rc=$T1_RC)"
-else
-  fail "T1: guard exited 0 — expected non-zero (absent-file path should abort)"
-fi
-
-if grep -q "NOT stopped" "$T1_ERR" 2>/dev/null; then
-  pass "T1: stderr contains 'NOT stopped' — service was not touched"
-else
-  fail "T1: 'NOT stopped' not found on stderr (stderr: $(head -5 "$T1_ERR" 2>/dev/null || echo '<empty>'))"
-fi
-
-# systemctl must NOT have been invoked (service was never stopped)
-if [[ ! -s "$T1_SC_LOG" ]]; then
-  pass "T1: systemctl was not called — service was not stopped"
-else
-  fail "T1: systemctl was called unexpectedly (log: $(cat "$T1_SC_LOG"))"
-fi
-
-# Drop-in must NOT have been written (guard aborted before write)
-if [[ ! -f "$T1_DROPIN_DIR/gomemlimit.conf" ]]; then
-  pass "T1: drop-in was not written — guard aborted cleanly before write"
-else
-  fail "T1: drop-in was written unexpectedly — guard should have aborted before reaching the write step"
-fi
-
-# =============================================================================
-# T2: corrupt canonical file (no GOMEMLIMIT=<digits>) → exit non-zero, parse error
-# =============================================================================
-section "T2: corrupt canonical file (no GOMEMLIMIT=<digits>) → guard aborts with parse error"
-
-T2_DROPIN_DIR=$(mktemp -d "$TMPDIR_TEST/t2-XXXXXXXX")
-T2_SC_LOG="$TMPDIR_TEST/t2-sc.log"
-T2_ERR="$TMPDIR_TEST/t2.err"
-T2_RC=0
-
-# Create a canonical file that exists but contains no GOMEMLIMIT=<digits> line.
-T2_CANONICAL="$TMPDIR_TEST/corrupt-gomemlimit.conf"
-cat > "$T2_CANONICAL" <<'EOF'
-[Service]
-# GOMEMLIMIT intentionally omitted or non-numeric below
-Environment="GOMEMLIMIT=not-a-number"
-EOF
-
-run_step0d_block "$T2_CANONICAL" "$T2_DROPIN_DIR" "$T2_SC_LOG" \
-  >"$TMPDIR_TEST/t2.out" 2>"$T2_ERR" || T2_RC=$?
-
-if [[ $T2_RC -ne 0 ]]; then
-  pass "T2: guard exits non-zero when GOMEMLIMIT value cannot be parsed (rc=$T2_RC)"
-else
-  fail "T2: guard exited 0 — expected non-zero (corrupt file should abort)"
-fi
-
-if grep -q "could not parse GOMEMLIMIT" "$T2_ERR" 2>/dev/null; then
-  pass "T2: stderr contains 'could not parse GOMEMLIMIT'"
-else
-  fail "T2: 'could not parse GOMEMLIMIT' not found on stderr (stderr: $(head -5 "$T2_ERR" 2>/dev/null || echo '<empty>'))"
-fi
-
-if grep -q "NOT stopped" "$T2_ERR" 2>/dev/null; then
-  pass "T2: stderr confirms service was NOT stopped (corrupt-file path)"
-else
-  fail "T2: 'NOT stopped' not found on stderr for corrupt-file case"
-fi
-
-if [[ ! -s "$T2_SC_LOG" ]]; then
-  pass "T2: systemctl was not called — service was not stopped"
-else
-  fail "T2: systemctl was called unexpectedly on corrupt-file path (log: $(cat "$T2_SC_LOG"))"
-fi
-
-# =============================================================================
-# T3: valid canonical file → exit 0, correct drop-in written, daemon-reload called
-# =============================================================================
-section "T3: valid canonical file → guard exits 0, drop-in written, daemon-reload called"
-
-T3_DROPIN_DIR=$(mktemp -d "$TMPDIR_TEST/t3-XXXXXXXX")
-T3_SC_LOG="$TMPDIR_TEST/t3-sc.log"
-T3_ERR="$TMPDIR_TEST/t3.err"
-T3_RC=0
-
-# Valid canonical file using the production GOMEMLIMIT value.
-T3_CANONICAL="$TMPDIR_TEST/valid-gomemlimit.conf"
-EXPECTED_VALUE=5905580032
-printf '[Service]\nEnvironment="GOMEMLIMIT=%s"\n' "$EXPECTED_VALUE" > "$T3_CANONICAL"
-
-run_step0d_block "$T3_CANONICAL" "$T3_DROPIN_DIR" "$T3_SC_LOG" \
-  >"$TMPDIR_TEST/t3.out" 2>"$T3_ERR" || T3_RC=$?
-
-if [[ $T3_RC -eq 0 ]]; then
-  pass "T3: guard exits 0 with a valid canonical file"
-else
-  fail "T3: guard exited non-zero (rc=$T3_RC); stderr: $(head -5 "$T3_ERR" 2>/dev/null || echo '<empty>')"
-fi
-
-T3_DROPIN_FILE="$T3_DROPIN_DIR/gomemlimit.conf"
-if [[ -f "$T3_DROPIN_FILE" ]]; then
-  pass "T3: drop-in gomemlimit.conf was created"
-else
-  fail "T3: drop-in gomemlimit.conf was NOT created"
-fi
-
-if grep -q "^\[Service\]$" "$T3_DROPIN_FILE" 2>/dev/null; then
-  pass "T3: [Service] section header present in drop-in"
-else
-  fail "T3: [Service] header missing from drop-in (content: $(cat "$T3_DROPIN_FILE" 2>/dev/null || echo '<missing>'))"
-fi
-
-if grep -q "^Environment=\"GOMEMLIMIT=${EXPECTED_VALUE}\"$" "$T3_DROPIN_FILE" 2>/dev/null; then
-  pass "T3: Environment=\"GOMEMLIMIT=${EXPECTED_VALUE}\" written correctly to drop-in"
-else
-  fail "T3: Environment line missing or wrong (content: $(cat "$T3_DROPIN_FILE" 2>/dev/null || echo '<missing>'))"
-fi
-
-RELOAD_COUNT=$(grep -c "daemon-reload" "$T3_SC_LOG" 2>/dev/null || echo 0)
-if [[ "$RELOAD_COUNT" -eq 1 ]]; then
-  pass "T3: systemctl daemon-reload was called exactly once after writing the drop-in"
-else
-  fail "T3: expected exactly 1 daemon-reload call, got ${RELOAD_COUNT} (sc_log: $(cat "$T3_SC_LOG" 2>/dev/null || echo '<empty>'))"
-fi
-
-# =============================================================================
-# T4: static analysis — Step 0d block is still present and complete
-# =============================================================================
-
-section "T4: static analysis — Step 0d guard block still present in update-node.sh"
-
-EXTRACTED=$(awk '
-  /^GOMEMLIMIT_CANONICAL=/ { f=1 }
-  f && /^# Step 1:/        { exit }
-  f                        { print }
-' "$UPDATE_SH")
-
-if [[ -n "$EXTRACTED" ]]; then
-  pass "T4: Step 0d block is extractable from update-node.sh"
-else
-  fail "T4: Step 0d block NOT extractable — it may have been renamed or removed (check GOMEMLIMIT_CANONICAL= / Step 1: anchors)"
-fi
-
-if echo "$EXTRACTED" | grep -q 'GOMEMLIMIT_CANONICAL'; then
-  pass "T4: GOMEMLIMIT_CANONICAL variable is referenced in the extracted block"
-else
-  fail "T4: GOMEMLIMIT_CANONICAL NOT found in extracted block"
-fi
-
-if echo "$EXTRACTED" | grep -q 'NOT stopped'; then
-  pass "T4: 'NOT stopped' safety message present in Step 0d block"
-else
-  fail "T4: 'NOT stopped' NOT found in extracted Step 0d block"
-fi
-
-if echo "$EXTRACTED" | grep -q 'could not parse GOMEMLIMIT'; then
-  pass "T4: 'could not parse GOMEMLIMIT' parse-error message present"
-else
-  fail "T4: 'could not parse GOMEMLIMIT' NOT found in extracted block"
-fi
-
-if echo "$EXTRACTED" | grep -q 'exit 1'; then
-  pass "T4: 'exit 1' abort path present in Step 0d block"
-else
-  fail "T4: 'exit 1' NOT found in extracted block — guard has no abort path"
-fi
-
-# =============================================================================
-# T5: static ordering — Step 0d preflight precedes 'systemctl stop' in update-node.sh
-# =============================================================================
-section "T5: static ordering — Step 0d preflight precedes 'systemctl stop' in update-node.sh"
-
-# If Step 0d were ever moved below the stop command a corrupt or absent
-# gomemlimit.conf would only be discovered after the node is already dead.
-STEP0D_LINE=$(grep -n "^GOMEMLIMIT_CANONICAL=" "$UPDATE_SH" | head -1 | cut -d: -f1)
-# Match only non-comment lines (exclude lines starting with #) so script-header
-# comments like "# call systemctl stop" do not give a false early line number.
-STOP_LINE=$(grep -n "^[^#]*systemctl stop" "$UPDATE_SH" | head -1 | cut -d: -f1)
-
-if [[ -n "$STEP0D_LINE" && -n "$STOP_LINE" ]]; then
-  if [[ "$STEP0D_LINE" -lt "$STOP_LINE" ]]; then
-    pass "T5: Step 0d preflight (line $STEP0D_LINE) precedes 'systemctl stop' (line $STOP_LINE) — guard fires before the service is ever stopped"
+assert_failed_closed() {
+  local test_name="$1" rc="$2" err="$3" sc_log="$4" dropin="$5"
+  if [[ "${rc}" -ne 0 ]]; then
+    pass "${test_name}: policy failure exits non-zero"
   else
-    fail "T5: 'systemctl stop' (line $STOP_LINE) appears BEFORE Step 0d preflight (line $STEP0D_LINE) — a corrupt gomemlimit.conf would be discovered only after the node is already dead"
+    fail "${test_name}: policy failure exited 0"
   fi
+  if grep -q "NOT stopped" "${err}" 2>/dev/null; then
+    pass "${test_name}: stderr confirms service was NOT stopped"
+  else
+    fail "${test_name}: missing NOT-stopped safety message"
+  fi
+  if [[ ! -s "${sc_log}" ]]; then
+    pass "${test_name}: systemctl was not called"
+  else
+    fail "${test_name}: systemctl was called unexpectedly ($(cat "${sc_log}"))"
+  fi
+  if [[ ! -f "${dropin}/gomemlimit.conf" ]]; then
+    pass "${test_name}: no drop-in was written"
+  else
+    fail "${test_name}: drop-in was written despite failed policy"
+  fi
+}
+
+# =============================================================================
+# T1/T2: preserve the old absent/corrupt-source fail-closed scenarios, adapted
+# to the host-memory source now used by gomemlimit-policy.sh.
+# =============================================================================
+section "T1: absent meminfo aborts before service handling"
+T1_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t1-XXXXXXXX")
+T1_LOG="${TMPDIR_TEST}/t1-systemctl.log"; T1_ERR="${TMPDIR_TEST}/t1.err"; T1_RC=0
+run_step0d_block "${TMPDIR_TEST}/missing-meminfo" "${T1_DROPIN}" "${T1_LOG}" \
+  >"${TMPDIR_TEST}/t1.out" 2>"${T1_ERR}" || T1_RC=$?
+assert_failed_closed "T1" "${T1_RC}" "${T1_ERR}" "${T1_LOG}" "${T1_DROPIN}"
+
+section "T2: malformed MemTotal aborts before service handling"
+T2_MEMINFO="${TMPDIR_TEST}/malformed-meminfo"
+printf 'MemTotal: not-a-number kB\n' > "${T2_MEMINFO}"
+T2_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t2-XXXXXXXX")
+T2_LOG="${TMPDIR_TEST}/t2-systemctl.log"; T2_ERR="${TMPDIR_TEST}/t2.err"; T2_RC=0
+run_step0d_block "${T2_MEMINFO}" "${T2_DROPIN}" "${T2_LOG}" \
+  >"${TMPDIR_TEST}/t2.out" 2>"${T2_ERR}" || T2_RC=$?
+assert_failed_closed "T2" "${T2_RC}" "${T2_ERR}" "${T2_LOG}" "${T2_DROPIN}"
+
+assert_dropin_and_reload() {
+  local test_name="$1" rc="$2" dropin="$3" log="$4" expected="$5"
+  local file="${dropin}/gomemlimit.conf" reloads
+  if [[ "${rc}" -eq 0 ]]; then pass "${test_name}: guard exits 0"; else fail "${test_name}: guard exits ${rc}"; fi
+  if [[ "$(cat "${file}" 2>/dev/null)" == "$(printf '[Service]\nEnvironment="GOMEMLIMIT=%s"' "${expected}")" ]]; then
+    pass "${test_name}: writes GOMEMLIMIT=${expected} drop-in"
+  else
+    fail "${test_name}: drop-in content is wrong or absent"
+  fi
+  reloads=$(grep -c '^systemctl daemon-reload$' "${log}" 2>/dev/null || true)
+  if [[ "${reloads}" -eq 1 ]]; then
+    pass "${test_name}: daemon-reload called exactly once"
+  else
+    fail "${test_name}: expected one daemon-reload, got ${reloads}"
+  fi
+}
+
+# =============================================================================
+# T3: a 2 GiB relay must receive the 1.5 GiB floor, never the primary cap.
+# =============================================================================
+section "T3: low-memory relay receives host-aware floor"
+T3_MEMINFO="${TMPDIR_TEST}/relay-meminfo"
+printf 'MemTotal:       2097152 kB\n' > "${T3_MEMINFO}"
+T3_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t3-XXXXXXXX")
+T3_LOG="${TMPDIR_TEST}/t3-systemctl.log"; T3_RC=0
+run_step0d_block "${T3_MEMINFO}" "${T3_DROPIN}" "${T3_LOG}" >"${TMPDIR_TEST}/t3.out" 2>"${TMPDIR_TEST}/t3.err" || T3_RC=$?
+assert_dropin_and_reload "T3" "${T3_RC}" "${T3_DROPIN}" "${T3_LOG}" 1610612736
+
+# =============================================================================
+# T4: an explicit valid override wins even on a low-memory host.
+# =============================================================================
+section "T4: explicit operator override is preserved"
+T4_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t4-XXXXXXXX")
+T4_LOG="${TMPDIR_TEST}/t4-systemctl.log"; T4_RC=0; T4_OVERRIDE=2147483648
+run_step0d_block "${T3_MEMINFO}" "${T4_DROPIN}" "${T4_LOG}" "${T4_OVERRIDE}" \
+  >"${TMPDIR_TEST}/t4.out" 2>"${TMPDIR_TEST}/t4.err" || T4_RC=$?
+assert_dropin_and_reload "T4" "${T4_RC}" "${T4_DROPIN}" "${T4_LOG}" "${T4_OVERRIDE}"
+
+# =============================================================================
+# T5: an unchanged drop-in remains idempotent and does not daemon-reload.
+# =============================================================================
+section "T5: matching drop-in is idempotent"
+T5_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t5-XXXXXXXX")
+printf '[Service]\nEnvironment="GOMEMLIMIT=1610612736"' > "${T5_DROPIN}/gomemlimit.conf"
+T5_LOG="${TMPDIR_TEST}/t5-systemctl.log"; T5_RC=0
+run_step0d_block "${T3_MEMINFO}" "${T5_DROPIN}" "${T5_LOG}" >"${TMPDIR_TEST}/t5.out" 2>"${TMPDIR_TEST}/t5.err" || T5_RC=$?
+if [[ "${T5_RC}" -eq 0 && ! -s "${T5_LOG}" ]]; then
+  pass "T5: matching host-aware drop-in skips daemon-reload"
 else
-  fail "T5: could not locate ordering anchors — GOMEMLIMIT_CANONICAL= found on line '${STEP0D_LINE:-<missing>}', systemctl stop on '${STOP_LINE:-<missing>}'"
+  fail "T5: matching drop-in unexpectedly failed or reloaded"
 fi
 
 # =============================================================================
-# T6: self-check — detecting a script where 'systemctl stop' precedes Step 0d
+# T6/T7: static completeness and pre-stop ordering guards.
 # =============================================================================
-section "T6: self-check — detecting a script where 'systemctl stop' precedes Step 0d"
+section "T6: Step 0d still uses the shared fail-closed policy"
+EXTRACTED=$(awk '/^GOMEMLIMIT_CONF=/ { found=1 } found && /^# Step 1:/ { exit } found { print }' "${UPDATE_SH}")
+for sentinel in 'source "${DEPLOY_DIR}/gomemlimit-policy.sh"' 'gomemlimit_resolve' 'could not resolve host-aware GOMEMLIMIT policy' 'NOT stopped' 'exit 1'; do
+  if grep -qF "${sentinel}" <<< "${EXTRACTED}"; then
+    pass "T6: ${sentinel} is present"
+  else
+    fail "T6: ${sentinel} is missing"
+  fi
+done
+if grep -q 'GOMEMLIMIT_CANONICAL' <<< "${EXTRACTED}"; then
+  fail "T6: obsolete canonical-primary copy remains in Step 0d"
+else
+  pass "T6: Step 0d does not copy the canonical primary limit"
+fi
 
-FAKE_UPDATE="$TMPDIR_TEST/fake-update-node.sh"
-cat > "$FAKE_UPDATE" <<'FAKE'
+section "T7: policy preflight precedes systemctl stop"
+STEP0D_LINE=$(grep -n '^GOMEMLIMIT_CONF=' "${UPDATE_SH}" | head -1 | cut -d: -f1)
+STOP_LINE=$(grep -n '^[^#]*systemctl stop' "${UPDATE_SH}" | head -1 | cut -d: -f1)
+if [[ -n "${STEP0D_LINE}" && -n "${STOP_LINE}" && "${STEP0D_LINE}" -lt "${STOP_LINE}" ]]; then
+  pass "T7: Step 0d precedes systemctl stop"
+else
+  fail "T7: could not prove Step 0d runs before systemctl stop"
+fi
+
+# Retain a negative control for the ordering assertion: a script with a stop
+# before the policy block must be recognized as unsafe.
+section "T8: ordering check detects a stop-before-policy regression"
+FAKE_UPDATE="${TMPDIR_TEST}/fake-update-node.sh"
+cat > "${FAKE_UPDATE}" <<'FAKE'
 #!/usr/bin/env bash
-# fake update-node.sh: systemctl stop is placed BEFORE the Step 0d guard (wrong order)
-systemctl stop aperod-node || true
-
-GOMEMLIMIT_CANONICAL="/opt/aperod/deploy/gomemlimit.conf"
-
+systemctl stop aperod-node
+GOMEMLIMIT_CONF="/etc/systemd/system/aperod-node.service.d/gomemlimit.conf"
 # Step 1: Pull latest source
 FAKE
-
-FAKE_STEP0D=$(grep -n "^GOMEMLIMIT_CANONICAL=" "$FAKE_UPDATE" | head -1 | cut -d: -f1)
-FAKE_STOP=$(grep -n "systemctl stop" "$FAKE_UPDATE" | head -1 | cut -d: -f1)
-
-WRONG_ORDER_DETECTED=false
-if [[ -n "$FAKE_STEP0D" && -n "$FAKE_STOP" && "$FAKE_STEP0D" -gt "$FAKE_STOP" ]]; then
-  WRONG_ORDER_DETECTED=true
-fi
-
-if $WRONG_ORDER_DETECTED; then
-  pass "T6: self-check — wrong-order script (stop before guard) is correctly identified as a regression"
+FAKE_STEP0D_LINE=$(grep -n '^GOMEMLIMIT_CONF=' "${FAKE_UPDATE}" | head -1 | cut -d: -f1)
+FAKE_STOP_LINE=$(grep -n '^[^#]*systemctl stop' "${FAKE_UPDATE}" | head -1 | cut -d: -f1)
+if [[ -n "${FAKE_STEP0D_LINE}" && -n "${FAKE_STOP_LINE}" && "${FAKE_STEP0D_LINE}" -gt "${FAKE_STOP_LINE}" ]]; then
+  pass "T8: stop-before-policy regression is detected"
 else
-  fail "T6: self-check — wrong-order script was NOT detected; the T5 ordering check may have a bug"
+  fail "T8: stop-before-policy regression was not detected"
 fi
 
-# =============================================================================
-# Summary
-# =============================================================================
 echo ""
 echo "─────────────────────────────────────────────"
 TOTAL=$((PASS + FAIL))
-if [[ $FAIL -eq 0 ]]; then
-  echo -e "${GREEN}All $TOTAL tests passed.${NC}"
+if [[ "${FAIL}" -eq 0 ]]; then
+  echo -e "${GREEN}All ${TOTAL} tests passed.${NC}"
   exit 0
-else
-  echo -e "${RED}$FAIL of $TOTAL tests FAILED.${NC}"
-  exit 1
 fi
+echo -e "${RED}${FAIL} of ${TOTAL} tests FAILED.${NC}"
+exit 1

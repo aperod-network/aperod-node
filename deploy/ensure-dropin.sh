@@ -45,25 +45,14 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 DROPIN_DIR="${DROPIN_DIR:-/etc/systemd/system/aperod-node.service.d}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
-# ── Canonical GOMEMLIMIT source of truth ───────────────────
-# The expected GOMEMLIMIT is read from the canonical drop-in file that ships
-# in this directory (gomemlimit.conf) rather than being hard-coded here, so
-# bumping the production limit only requires editing one place.
-# CANONICAL_DROPIN — overridable so tests can point at a temp file.
+# ── Host-aware GOMEMLIMIT policy ───────────────────────────
+# The shipped gomemlimit.conf documents the primary's canonical cap. Relays
+# must instead use their own RAM so a later join/update never promotes a small
+# host to the primary's 5.5 GiB setting.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CANONICAL_DROPIN="${CANONICAL_DROPIN:-${SCRIPT_DIR}/gomemlimit.conf}"
-
-if [[ ! -f "${CANONICAL_DROPIN}" ]]; then
-  echo -e "${RED}[ERR]${NC}   Canonical drop-in not found: ${CANONICAL_DROPIN}" >&2
-  echo -e "${RED}[ERR]${NC}   This file holds the source-of-truth GOMEMLIMIT value. Restore it from the repo." >&2
-  exit 1
-fi
-
-GOMEMLIMIT_VALUE=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${CANONICAL_DROPIN}" | head -1 | cut -d= -f2)
-if [[ -z "${GOMEMLIMIT_VALUE}" ]]; then
-  echo -e "${RED}[ERR]${NC}   Could not parse GOMEMLIMIT from canonical drop-in: ${CANONICAL_DROPIN}" >&2
-  exit 1
-fi
+source "${SCRIPT_DIR}/gomemlimit-policy.sh"
+gomemlimit_resolve
+GOMEMLIMIT_VALUE="${GOMEMLIMIT_BYTES}"
 
 # ── Helper: write file only when content differs ──────────
 write_if_changed() {

@@ -329,50 +329,30 @@ fi
 # This step writes (or verifies) gomemlimit.conf ONLY.  It does not touch
 # timeout.conf, preserving whatever safe value Step 0c left in place.
 #
-# The canonical GOMEMLIMIT byte count is read from the repo drop-in file
-# (deploy/gomemlimit.conf) — the single source of truth — so bumping the
-# limit only requires editing one place.  If that file is missing the step
-# is a FATAL preflight failure: we must not restart the node without a
-# confirmed GOMEMLIMIT, so the service is never stopped.
+# GOMEMLIMIT is resolved from the local host's RAM (or explicit override).
+# This prevents an update from replacing a low-memory relay's limit with the
+# primary's canonical 5.5 GiB cap.
 #
 # Injectable seam: DROPIN_DIR is already set by Step 0c (honouring any
 # externally supplied value) and SYSTEMCTL defaults to `systemctl`.
 # ---------------------------------------------------------------------------
-GOMEMLIMIT_CANONICAL="${DEPLOY_DIR}/gomemlimit.conf"
 GOMEMLIMIT_CONF="${DROPIN_DIR}/gomemlimit.conf"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 echo "==> [0d] Ensuring gomemlimit.conf drop-in (OOM protection)..."
 
-if [[ ! -f "${GOMEMLIMIT_CANONICAL}" ]]; then
+if ! source "${DEPLOY_DIR}/gomemlimit-policy.sh" || ! gomemlimit_resolve; then
   echo "" >&2
-  echo "✗ FATAL: canonical gomemlimit.conf not found at ${GOMEMLIMIT_CANONICAL}." >&2
-  echo "  The GOMEMLIMIT drop-in could NOT be verified." >&2
-  echo "  Without GOMEMLIMIT the restarted node may be OOM-killed and corrupt its snapshot." >&2
-  echo "  The service was NOT stopped. The old binary is still running." >&2
-  echo "  Restore gomemlimit.conf from the repo and re-run update-node.sh." >&2
-  echo "" >&2
-  send_telegram_alert "🚨 <b>aperod-node: обновление ПРЕРВАНО — gomemlimit.conf не найден</b>
-Сервер: $(hostname)
-Файл <code>${GOMEMLIMIT_CANONICAL}</code> отсутствует — GOMEMLIMIT drop-in НЕ проверен.
-Без GOMEMLIMIT нода может быть убита OOM-киллером и повредить снимок UTXO.
-Сервис <b>НЕ остановлен</b> — старый бинарник всё ещё работает.
-Восстановите gomemlimit.conf из репозитория и запустите <code>update-node.sh</code> повторно."
-  exit 1
-fi
-
-_gomemlimit_value=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${GOMEMLIMIT_CANONICAL}" | head -1 | cut -d= -f2 || true)
-if [[ -z "${_gomemlimit_value}" ]]; then
-  echo "" >&2
-  echo "✗ FATAL: could not parse GOMEMLIMIT value from ${GOMEMLIMIT_CANONICAL}." >&2
+  echo "✗ FATAL: could not resolve host-aware GOMEMLIMIT policy." >&2
   echo "  The service was NOT stopped. The old binary is still running." >&2
   echo "" >&2
-  send_telegram_alert "🚨 <b>aperod-node: обновление ПРЕРВАНО — не удалось прочитать GOMEMLIMIT</b>
+  send_telegram_alert "🚨 <b>aperod-node: обновление ПРЕРВАНО — не удалось вычислить GOMEMLIMIT</b>
 Сервер: $(hostname)
-Не удалось распарсить GOMEMLIMIT из <code>${GOMEMLIMIT_CANONICAL}</code>.
+Не удалось применить политику GOMEMLIMIT для RAM данного хоста.
 Сервис <b>НЕ остановлен</b>. Проверьте файл и запустите <code>update-node.sh</code> повторно."
   exit 1
 fi
+_gomemlimit_value="${GOMEMLIMIT_BYTES}"
 
 _gomemlimit_required="[Service]
 Environment=\"GOMEMLIMIT=${_gomemlimit_value}\""

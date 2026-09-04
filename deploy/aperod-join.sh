@@ -142,14 +142,9 @@ PY
 fi
 
 # ── Автоопределение GOMEMLIMIT ────────────────────────────
-TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-TOTAL_RAM_BYTES=$(( TOTAL_RAM_KB * 1024 ))
-AUTO_GOMEMLIMIT=$(( TOTAL_RAM_BYTES * 3 / 4 ))
-MIN_GOMEMLIMIT=$(( 1536 * 1024 * 1024 ))   # 1.5 GiB
-MAX_GOMEMLIMIT=$(( 5905580032 ))            # 5500 MiB
-if (( AUTO_GOMEMLIMIT < MIN_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MIN_GOMEMLIMIT}; fi
-if (( AUTO_GOMEMLIMIT > MAX_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MAX_GOMEMLIMIT}; fi
-GOMEMLIMIT_BYTES="${GOMEMLIMIT_BYTES:-${AUTO_GOMEMLIMIT}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/gomemlimit-policy.sh"
+gomemlimit_resolve
 
 # ── Баннер ────────────────────────────────────────────────
 echo -e "

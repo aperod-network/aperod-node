@@ -25,28 +25,22 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERR]${NC}   $*"; exit 1; }
 
 # ── Expected values ──────────────────────────────────────────
-# EXPECTED_GOMEMLIMIT is read from the canonical drop-in file that ships in
-# this directory (gomemlimit.conf) rather than being hard-coded here.  That
-# file is the single source of truth for the production value, so bumping the
-# limit only requires editing one place and this check never goes stale.
-#
-# CANONICAL_DROPIN — overridable so tests can point at a temp file.
+# Resolve the policy using the TARGET host's RAM, not the controller's RAM.
+# GOMEMLIMIT_BYTES remains an explicit operator override.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CANONICAL_DROPIN="${CANONICAL_DROPIN:-${SCRIPT_DIR}/gomemlimit.conf}"
-
-[[ -f "${CANONICAL_DROPIN}" ]] \
-  || die "Canonical drop-in not found: ${CANONICAL_DROPIN}
-  This file holds the source-of-truth GOMEMLIMIT value. Restore it from the repo."
-
-EXPECTED_GOMEMLIMIT=$(grep -oE 'GOMEMLIMIT=[0-9]+' "${CANONICAL_DROPIN}" \
-  | head -1 | cut -d= -f2)
-[[ -n "${EXPECTED_GOMEMLIMIT}" ]] \
-  || die "Could not parse GOMEMLIMIT from canonical drop-in: ${CANONICAL_DROPIN}"
-
 EXPECTED_TIMEOUT="900"
 
 TARGET_IP="${1:-}"
 [[ -z "${TARGET_IP}" ]] && die "Usage: bash verify-dropin.sh <IP>"
+
+source "${SCRIPT_DIR}/gomemlimit-policy.sh"
+if [[ -z "${GOMEMLIMIT_BYTES:-}" ]]; then
+  REMOTE_MEMTOTAL_KB=$(ssh "root@${TARGET_IP}" "awk '/^MemTotal:/ {print \$2; exit}' /proc/meminfo" 2>/dev/null) \
+    || die "Failed to read MemTotal from ${TARGET_IP}"
+  GOMEMLIMIT_MEMTOTAL_KB="${REMOTE_MEMTOTAL_KB}"
+fi
+gomemlimit_resolve || die "Could not resolve GOMEMLIMIT policy"
+EXPECTED_GOMEMLIMIT="${GOMEMLIMIT_BYTES}"
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════════════════════╗

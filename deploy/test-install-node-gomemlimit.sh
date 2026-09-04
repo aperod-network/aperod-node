@@ -141,20 +141,10 @@ run_real_clamping_computation() {
   local fake_meminfo="$TMPDIR_TEST/meminfo-${total_ram_kb}"
   echo "MemTotal:       ${total_ram_kb} kB" > "$fake_meminfo"
 
-  # Extract the computation block: from TOTAL_RAM_KB= to GOMEMLIMIT_BYTES= (inclusive)
-  local comp_block
-  comp_block=$(awk '/^TOTAL_RAM_KB=/{f=1} f{print} /^GOMEMLIMIT_BYTES=/{f=0; print; exit}' "$INSTALL_SH")
-
-  if [[ -z "$comp_block" ]]; then
-    echo "[ERR] Could not extract GOMEMLIMIT computation block from $INSTALL_SH" >&2
-    return 1
-  fi
-
-  # Redirect /proc/meminfo references to our synthetic file
-  comp_block=$(echo "$comp_block" | sed "s|/proc/meminfo|${fake_meminfo}|g")
-
-  # Run the computation and print GOMEMLIMIT_BYTES
-  bash -c "${comp_block}; echo \"\$GOMEMLIMIT_BYTES\""
+  # install-node sources this shared implementation; exercise it against a
+  # synthetic host-memory input instead of duplicating its arithmetic.
+  GOMEMLIMIT_MEMINFO="$fake_meminfo" bash -c \
+    "source '$SCRIPT_DIR/gomemlimit-policy.sh'; gomemlimit_resolve; echo \"\$GOMEMLIMIT_BYTES\""
 }
 
 # =============================================================================
@@ -265,17 +255,17 @@ else
 fi
 
 # =============================================================================
-# Test 7: real computation block clamps to MAX (6500 MiB) for large RAM
+# Test 7: real computation block clamps to the canonical 5.5 GiB cap
 # =============================================================================
-section "Test 7: real installer computation clamps to MAX_GOMEMLIMIT (6500 MiB) for large RAM"
+section "Test 7: real installer computation clamps to canonical MAX_GOMEMLIMIT (5.5 GiB) for large RAM"
 
-LARGE_RAM_KB=$(( 64 * 1024 * 1024 ))   # 64 GiB → 75% = 48 GiB >> 6500 MiB
-MAX_EXPECTED=6979321856
+LARGE_RAM_KB=$(( 64 * 1024 * 1024 ))   # 64 GiB → 75% = 48 GiB >> cap
+MAX_EXPECTED=5905580032
 
 CLAMPED_MAX=$(run_real_clamping_computation "$LARGE_RAM_KB" 2>/dev/null)
 
 if [[ "$CLAMPED_MAX" -eq "$MAX_EXPECTED" ]]; then
-  pass "installer computation clamped to MAX=${MAX_EXPECTED} for 64 GiB host (got: $CLAMPED_MAX)"  # 6500 MiB
+  pass "installer computation clamped to MAX=${MAX_EXPECTED} for 64 GiB host (got: $CLAMPED_MAX)"  # 5.5 GiB
 else
   fail "expected MAX clamp=${MAX_EXPECTED}, got '$CLAMPED_MAX'"
 fi
