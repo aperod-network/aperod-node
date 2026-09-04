@@ -120,6 +120,19 @@ func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
 	if got := aheadHandler.onBlockCalls.Load(); got != 0 {
 		t.Fatalf("ahead node received %d stale block(s) from behind peer; want 0", got)
 	}
+
+	// A validator that just caught up may relay a historical block back over a
+	// parallel connection. The ahead node must discard it before OnBlock and
+	// before the per-peer ingest limiter can stall keepalive Pong processing.
+	historical := aheadChain.GetByHeight(2)
+	if historical == nil {
+		t.Fatal("historical block 2 missing")
+	}
+	behindHost.BroadcastBlock(historical)
+	time.Sleep(100 * time.Millisecond)
+	if got := aheadHandler.onBlockCalls.Load(); got != 0 {
+		t.Fatalf("ahead node dispatched %d relayed historical block(s); want 0", got)
+	}
 }
 func (h *minimalChainHandler) OnTransaction(_ *core.Transaction) {}
 func (h *minimalChainHandler) OnVote(_ p2p.VoteMsg)              {}

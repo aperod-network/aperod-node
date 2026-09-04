@@ -2934,8 +2934,13 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 				// The processBlock re-trigger relies on CurrentHeight() having
 				// already advanced (async engine), so it is unreliable for
 				// large sync gaps.  This periodic check fills that gap: every
-				// 3 s we ask for the next header batch until we catch up.
-				if h.handler.CurrentHeight() < peer.height {
+				// 3 s we ask for the next header batch until we catch up. Do
+				// not overlap batches: queued MsgBlocks are handled by this
+				// connection's sole reader and can otherwise starve Pongs.
+				peer.pendingBlocksMu.Lock()
+				hasPendingBlocks := len(peer.pendingBlocks) > 0
+				peer.pendingBlocksMu.Unlock()
+				if h.handler.CurrentHeight() < peer.height && !hasPendingBlocks {
 					h.requestHeaders(peer)
 				}
 			case <-stall.C:
@@ -3138,6 +3143,24 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		if block != nil {
 			ourTip := h.handler.CurrentHeight()
 			peerIP := connIP(peer.addr)
+
+			// A syncing peer may gossip canonical blocks back to the node that
+			// supplied them, especially when the same validators have parallel
+			// connections. Drop an already-known hash before the ingest rate
+			// limiter: sleeping in the sole reader goroutine would queue Pongs
+			// behind thousands of harmless duplicates. Do not use height alone
+			// here — an unknown competing block still needs normal validation.
+			blockHash := block.Hash()
+			knownBlock := h.handler.GetBlock(blockHash) != nil
+			if !knownBlock && h.blockByHash != nil {
+				knownBlock = h.blockByHash(blockHash) != nil
+			}
+			if knownBlock {
+				peer.pendingBlocksMu.Lock()
+				delete(peer.pendingBlocks, blockHash)
+				peer.pendingBlocksMu.Unlock()
+				return nil
+			}
 
 			// ── Step 1: Future-timestamp detection ───────────────────────────────
 			// This check runs FIRST — before any height-lead or whitelist branch —
@@ -3386,7 +3409,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 			// requests it sent, so deleting here is always safe.
 			// batchDone is true when the last block of the current
 			// GetHeaders batch has arrived; it gates the re-trigger below.
-			blockHash := block.Hash()
+			blockHash = block.Hash()
 			peer.pendingBlocksMu.Lock()
 			delete(peer.pendingBlocks, blockHash)
 			batchDone := len(peer.pendingBlocks) == 0
