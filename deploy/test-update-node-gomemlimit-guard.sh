@@ -133,7 +133,7 @@ assert_dropin_and_reload() {
 }
 
 # =============================================================================
-# T3: a 2 GiB relay must receive the 1.5 GiB floor, never the primary cap.
+# T3: a 2 GiB relay must receive 87.5% of RAM, never the primary cap.
 # =============================================================================
 section "T3: low-memory relay receives host-aware floor"
 T3_MEMINFO="${TMPDIR_TEST}/relay-meminfo"
@@ -141,7 +141,7 @@ printf 'MemTotal:       2097152 kB\n' > "${T3_MEMINFO}"
 T3_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t3-XXXXXXXX")
 T3_LOG="${TMPDIR_TEST}/t3-systemctl.log"; T3_RC=0
 run_step0d_block "${T3_MEMINFO}" "${T3_DROPIN}" "${T3_LOG}" >"${TMPDIR_TEST}/t3.out" 2>"${TMPDIR_TEST}/t3.err" || T3_RC=$?
-assert_dropin_and_reload "T3" "${T3_RC}" "${T3_DROPIN}" "${T3_LOG}" 1610612736
+assert_dropin_and_reload "T3" "${T3_RC}" "${T3_DROPIN}" "${T3_LOG}" 1879048192
 
 # =============================================================================
 # T4: an explicit valid override wins even on a low-memory host.
@@ -158,7 +158,7 @@ assert_dropin_and_reload "T4" "${T4_RC}" "${T4_DROPIN}" "${T4_LOG}" "${T4_OVERRI
 # =============================================================================
 section "T5: matching drop-in is idempotent"
 T5_DROPIN=$(mktemp -d "${TMPDIR_TEST}/t5-XXXXXXXX")
-printf '[Service]\nEnvironment="GOMEMLIMIT=1610612736"' > "${T5_DROPIN}/gomemlimit.conf"
+printf '[Service]\nEnvironment="GOMEMLIMIT=1879048192"' > "${T5_DROPIN}/gomemlimit.conf"
 T5_LOG="${TMPDIR_TEST}/t5-systemctl.log"; T5_RC=0
 run_step0d_block "${T3_MEMINFO}" "${T5_DROPIN}" "${T5_LOG}" >"${TMPDIR_TEST}/t5.out" 2>"${TMPDIR_TEST}/t5.err" || T5_RC=$?
 if [[ "${T5_RC}" -eq 0 && ! -s "${T5_LOG}" ]]; then

@@ -92,6 +92,7 @@ run_join() {
     PATH="${bdir}:${PATH}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${ddir}" \
+    GOMEMLIMIT_BYTES="5905580032" \
     bash "${JOIN_SH}" "${tip}" 2>&1 </dev/null
   ) || LAST_EXIT=$?
 }

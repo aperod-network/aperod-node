@@ -32,6 +32,9 @@ TRIGGER_FILE="${TRIGGER_DIR}/backup-trigger"
 API_UNIT="aperod-api.service"
 DROPIN_DIR="/etc/systemd/system/${API_UNIT}.d"
 DROPIN_FILE="${DROPIN_DIR}/backup-trigger.conf"
+BACKUP_DATA_DIR="${DATA_DIR:-/opt/aperod/data}"
+BACKUP_DROPIN_DIR="/etc/systemd/system/aperod-backup.service.d"
+BACKUP_DATA_DROPIN="${BACKUP_DROPIN_DIR}/data-dir.conf"
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -68,6 +71,16 @@ ok "aperod-backup.service → /etc/systemd/system/"
 
 install -o root -g root -m 644 "${SCRIPT_DIR}/aperod-backup.path" /etc/systemd/system/aperod-backup.path
 ok "aperod-backup.path → /etc/systemd/system/"
+
+mkdir -p "${BACKUP_DROPIN_DIR}"
+cat > "${BACKUP_DATA_DROPIN}" <<EOF
+# Drop-in created by blockchain/deploy/setup-backup.sh
+# Must match the API DATA_DIR that owns integration-settings.json.
+[Service]
+Environment=DATA_DIR=${BACKUP_DATA_DIR}
+EOF
+chmod 644 "${BACKUP_DATA_DROPIN}"
+ok "Backup DATA_DIR закреплён: ${BACKUP_DATA_DIR}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 step "3. Установка tmpfiles.d (создаёт /run/aperod, владелец: ${APEROD_USER})"

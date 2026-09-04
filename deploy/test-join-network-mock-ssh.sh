@@ -233,6 +233,7 @@ run_join() {
     PRIMARY_DATA_DIR="${ddir}" \
     SECONDARY_NODE_YAML="${node_yaml}" \
     SECONDARY_NODE_CONFIG_SH="${node_config_sh}" \
+    GOMEMLIMIT_BYTES="5905580032" \
     bash "${JOIN_SH}" "${tip}" 2>&1
   ) || LAST_EXIT=$?
 }
@@ -439,6 +440,7 @@ else
     PRIMARY_DATA_DIR="${M2_DATA}" \
     SECONDARY_NODE_YAML="${M2_YAML}" \
     SECONDARY_NODE_CONFIG_SH="${NODE_CONFIG_SH}" \
+    GOMEMLIMIT_BYTES="5905580032" \
     bash "${JOIN_SH}" "${TARGET_IP}" 2>&1
   ) || M2_SECOND_EXIT=$?
 

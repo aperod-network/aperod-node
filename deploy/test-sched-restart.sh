@@ -135,6 +135,7 @@ run_script() {
   local bindir="$1"; shift
   env PATH="$bindir:$PATH" \
       _APEROD_TEST=1 \
+      SCHED_RESTART_ENABLED=true \
       STATE_DIR="$TMPDIR_TEST/state_$$_$RANDOM" \
       "$@" \
       bash "$SCHED_SH"

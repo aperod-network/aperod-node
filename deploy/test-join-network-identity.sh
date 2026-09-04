@@ -234,6 +234,7 @@ run_join() {
     SECONDARY_DATA_DIR="${tgt}" \
     SECONDARY_NODE_YAML="${node_yaml}" \
     SECONDARY_NODE_CONFIG_SH="/nonexistent/node-config.sh" \
+    GOMEMLIMIT_BYTES="5905580032" \
     bash "${JOIN_SH}" "${tip}" 2>&1
   ) || LAST_EXIT=$?
 }

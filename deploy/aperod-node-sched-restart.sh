@@ -35,6 +35,13 @@ INTERVAL_SECS="${SCHED_RESTART_INTERVAL_SECS:-10800}"
 INTERVAL_H=$(( INTERVAL_SECS / 3600 ))
 HOSTNAME_LABEL="$(hostname 2>/dev/null || echo unknown)"
 
+# Scheduled restarts are opt-in. A missing config file or a deploy that restores
+# unit files must never resurrect an operator-disabled restart.
+if [[ "${SCHED_RESTART_ENABLED:-false}" != "true" ]]; then
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [sched-restart] disabled — no restart or notification"
+  exit 0
+fi
+
 # Track whether we paused the watchdog so the EXIT trap knows what to restore.
 WATCHDOG_WAS_ACTIVE=0
 
