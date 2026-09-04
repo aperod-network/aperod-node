@@ -3,11 +3,13 @@ name: Deploy E2E
 on:
   push:
     paths:
-      - 'blockchain/deploy/**'
+      - 'deploy/**'
+      - '.github/workflows/deploy-e2e.yml'
     branches: [main, master, develop]
   pull_request:
     paths:
-      - 'blockchain/deploy/**'
+      - 'deploy/**'
+      - '.github/workflows/deploy-e2e.yml'
 
 jobs:
   install-node-e2e:
@@ -29,11 +31,6 @@ jobs:
         ports:
           - 2375:2375
 
-    defaults:
-      run:
-        # The Go module is rooted at blockchain/; deploy/ is a sub-package.
-        working-directory: blockchain
-
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +38,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25.13"
-          cache-dependency-path: blockchain/go.sum
+          cache-dependency-path: go.sum
 
       - name: Verify Docker is available
         run: |
