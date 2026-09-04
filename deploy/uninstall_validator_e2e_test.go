@@ -62,6 +62,10 @@ import (
 // removed, directory not deleted, user not removed — will cause this test to
 // fail before it reaches production.
 func TestUninstallValidatorE2E(t *testing.T) {
+	if os.Getenv("APEROD_RUN_DOCKER_E2E") != "1" {
+		t.Skip("Docker E2E disabled by default; set APEROD_RUN_DOCKER_E2E=1 to run TestUninstallValidatorE2E")
+	}
+
 	if runtime.GOOS == "windows" {
 		t.Skip("test-uninstall-validator-e2e.sh requires bash; skipping on Windows")
 	}
