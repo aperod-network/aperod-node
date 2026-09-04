@@ -3541,7 +3541,7 @@ func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {
 		// their 20-second deadline. A requester may advertise a larger limit,
 		// but serving 500 blocks at 50 blocks/s leaves no margin for validation
 		// or simultaneous connections and causes a reconnect loop.
-		const maxHeadersPerResponse = 50
+		const maxHeadersPerResponse = 10
 		limit := msg.Limit
 		if limit <= 0 || limit > maxHeadersPerResponse {
 			limit = maxHeadersPerResponse
