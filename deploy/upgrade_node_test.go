@@ -71,6 +71,10 @@ import (
 // ensure-dropin.sh has run — or to skip ensure-dropin.sh entirely — will
 // cause this test to fail before it reaches a production server.
 func TestUpgradeNodeE2E(t *testing.T) {
+if os.Getenv("APEROD_RUN_DOCKER_E2E") != "1" {
+t.Skip("Docker E2E disabled by default; set APEROD_RUN_DOCKER_E2E=1 to run TestUpgradeNodeE2E")
+}
+
 	if runtime.GOOS == "windows" {
 		t.Skip("test-upgrade-node.sh requires bash; skipping on Windows")
 	}

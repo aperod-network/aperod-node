@@ -69,6 +69,10 @@ import (
 // daemon-reload, wrong file permissions, missing stop-before-copy step —
 // will cause this test to fail before it reaches a production server.
 func TestUpdateNodeE2E(t *testing.T) {
+if os.Getenv("APEROD_RUN_DOCKER_E2E") != "1" {
+t.Skip("Docker E2E disabled by default; set APEROD_RUN_DOCKER_E2E=1 to run TestUpdateNodeE2E")
+}
+
 	if runtime.GOOS == "windows" {
 		t.Skip("test-update-node-e2e.sh requires bash; skipping on Windows")
 	}

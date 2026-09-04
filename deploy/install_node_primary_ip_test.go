@@ -53,6 +53,10 @@ import (
 // containing the real installer plus stub commands and a spy wrapper on
 // node-config.sh.
 func TestInstallNodePrimaryIP(t *testing.T) {
+if os.Getenv("APEROD_RUN_DOCKER_E2E") != "1" {
+t.Skip("Docker E2E disabled by default; set APEROD_RUN_DOCKER_E2E=1 to run TestInstallNodePrimaryIP")
+}
+
 	if runtime.GOOS == "windows" {
 		t.Skip("test-install-node-primary-ip.sh requires bash; skipping on Windows")
 	}

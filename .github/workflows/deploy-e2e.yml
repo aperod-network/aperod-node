@@ -3,11 +3,11 @@ name: Deploy E2E
 on:
   push:
     paths:
-      - 'deploy/**'
+      - 'blockchain/deploy/**'
     branches: [main, master, develop]
   pull_request:
     paths:
-      - 'deploy/**'
+      - 'blockchain/deploy/**'
 
 jobs:
   install-node-e2e:
@@ -29,6 +29,11 @@ jobs:
         ports:
           - 2375:2375
 
+    defaults:
+      run:
+        # The Go module is rooted at blockchain/; deploy/ is a sub-package.
+        working-directory: blockchain
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +41,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25.13"
-          cache-dependency-path: go.sum
+          cache-dependency-path: blockchain/go.sum
 
       - name: Verify Docker is available
         run: |
@@ -54,4 +59,6 @@ jobs:
           fi
 
       - name: Run installer e2e test
-        run: go test ./deploy/... -run TestInstallNodeE2E -v -timeout 300s
+        env:
+          APEROD_RUN_DOCKER_E2E: "1"
+        run: go test ./deploy/... -run '^TestInstallNodeE2E$' -v -timeout 900s

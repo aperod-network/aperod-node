@@ -30,7 +30,7 @@
 // # Running manually
 //
 //	# From the blockchain root:
-//	go test ./deploy/... -run TestInstallNodeE2E -v
+//	APEROD_RUN_DOCKER_E2E=1 go test ./deploy/... -run TestInstallNodeE2E -v
 //
 //	# Or run the shell script directly:
 //	bash blockchain/deploy/test-install-node-e2e.sh
@@ -59,6 +59,10 @@ import (
 // wrong config path, removed service file — will cause this test to fail
 // before it reaches production.
 func TestInstallNodeE2E(t *testing.T) {
+	if os.Getenv("APEROD_RUN_DOCKER_E2E") != "1" {
+		t.Skip("Docker E2E disabled by default; set APEROD_RUN_DOCKER_E2E=1 to run TestInstallNodeE2E")
+	}
+
 	if runtime.GOOS == "windows" {
 		t.Skip("test-install-node-e2e.sh requires bash; skipping on Windows")
 	}
