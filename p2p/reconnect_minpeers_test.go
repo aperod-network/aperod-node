@@ -19,6 +19,7 @@ package p2p_test
 import (
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,14 +31,95 @@ import (
 // minimalChainHandler is a minimal p2p.Handler backed by a *core.Chain, used
 // to wire up p2p hosts without depending on the full engine stack.
 type minimalChainHandler struct {
-	chain *core.Chain
+	chain        *core.Chain
+	onBlockCalls atomic.Int64
 }
 
 func (h *minimalChainHandler) OnBlock(b *core.Block) {
+	h.onBlockCalls.Add(1)
 	if h.chain.GetByHash(b.Hash()) != nil {
 		return
 	}
 	_ = h.chain.AddBlock(b)
+}
+
+func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
+	genesis := buildTestBlock(t, nil, validatorPriv, validatorPub, 0)
+
+	aheadChain := core.NewChain()
+	if err := aheadChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("ahead SetGenesis: %v", err)
+	}
+	prev := genesis
+	for height := uint64(1); height <= 8; height++ {
+		block := buildTestBlock(t, prev, validatorPriv, validatorPub, height)
+		if err := aheadChain.AddBlock(block); err != nil {
+			t.Fatalf("ahead AddBlock %d: %v", height, err)
+		}
+		prev = block
+	}
+
+	behindChain := core.NewChain()
+	if err := behindChain.SetGenesis(genesis); err != nil {
+		t.Fatalf("behind SetGenesis: %v", err)
+	}
+	prev = genesis
+	for height := uint64(1); height <= 3; height++ {
+		block := aheadChain.GetByHeight(height)
+		if block == nil {
+			t.Fatalf("ahead block %d missing", height)
+		}
+		if err := behindChain.AddBlock(block); err != nil {
+			t.Fatalf("behind AddBlock %d: %v", height, err)
+		}
+		prev = block
+	}
+
+	aheadHandler := &minimalChainHandler{chain: aheadChain}
+	aheadHost := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "ahead",
+		UserAgent:  "aperod/test",
+	}, aheadHandler, log)
+	aheadHost.SetHeaderProvider(aheadChain)
+	if err := aheadHost.Start(); err != nil {
+		t.Fatalf("aheadHost.Start: %v", err)
+	}
+	t.Cleanup(aheadHost.Stop)
+
+	behindHandler := &minimalChainHandler{chain: behindChain}
+	behindHost := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		NodeID:     "behind",
+		UserAgent:  "aperod/test",
+	}, behindHandler, log)
+	behindHost.SetHeaderProvider(behindChain)
+	if err := behindHost.Start(); err != nil {
+		t.Fatalf("behindHost.Start: %v", err)
+	}
+	t.Cleanup(behindHost.Stop)
+
+	aheadHost.DialPeer(behindHost.ListenAddr())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if behindChain.Height() == aheadChain.Height() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if behindChain.Height() != aheadChain.Height() {
+		t.Fatalf("behind node did not sync: got height %d, want %d",
+			behindChain.Height(), aheadChain.Height())
+	}
+	if got := aheadHandler.onBlockCalls.Load(); got != 0 {
+		t.Fatalf("ahead node received %d stale block(s) from behind peer; want 0", got)
+	}
 }
 func (h *minimalChainHandler) OnTransaction(_ *core.Transaction) {}
 func (h *minimalChainHandler) OnVote(_ p2p.VoteMsg)              {}
@@ -136,11 +218,11 @@ func TestSync_RelayNode_ReconnectViaMinPeers(t *testing.T) {
 	// re-dials the peer from peerList.
 	relayHandler := &minimalChainHandler{chain: relayChain}
 	hostRelay := p2p.NewHost(p2p.Config{
-		ListenAddr:           "127.0.0.1:0",
-		MaxPeers:             10,
-		MinPeers:             1,
-		NodeID:               "relay",
-		UserAgent:            "aperod/test",
+		ListenAddr: "127.0.0.1:0",
+		MaxPeers:   10,
+		MinPeers:   1,
+		NodeID:     "relay",
+		UserAgent:  "aperod/test",
 		// No Bootnodes — this is the key difference from the existing
 		// TestSync_RelayNode_ReconnectAfterDrop test which bypasses back-off
 		// by registering the validator as a bootnode.

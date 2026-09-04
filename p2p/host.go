@@ -2849,21 +2849,17 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 		"direction", map[bool]string{true: "out", false: "in"}[outbound],
 	)
 
-	// Initiate header sync unconditionally now that the peer is registered.
+	// Initiate header sync only when the peer is not known to be behind us.
+	// Requesting our tip locator from a lagging peer makes its unknown-locator
+	// fallback return historical headers from height 1. We would then request
+	// and synchronously reject thousands of stale blocks, starving keepalive
+	// Pong handling until the otherwise healthy connection is evicted.
 	//
-	// Why unconditional (not "if peerHeight > CurrentHeight()"): the height
-	// carried by the handshake Ping/Pong is captured when the remote's
-	// handleConn starts — the inbound side builds its Pong payload BEFORE
-	// it even reads our Ping.  A block produced during the handshake window
-	// is broadcast before this peer entry exists in the remote's peer table
-	// (silently missed) AND leaves peerHeight stale-equal to our local
-	// height, so a height-gap guard here would skip the request and the
-	// node would stay stalled until the keepalive Pong cycle or the
-	// GetBlock stall timer fires (10–15 s by default).  One unconditional
-	// GetHeaders round-trip closes that window: when we are already at the
-	// remote tip the response is an empty header list and handleHeaders
-	// no-ops, so the extra cost is a single small message per connection.
-	h.requestHeaders(peer)
+	// Keep the equality case for the handshake race: peerHeight can be stale
+	// by one freshly produced block, and one empty GetHeaders response is cheap.
+	if peerHeight >= h.handler.CurrentHeight() {
+		h.requestHeaders(peer)
+	}
 
 	// Mark the connection as having reached the message loop.  The back-off
 	// defer registered at the top of handleConn reads this value to decide
