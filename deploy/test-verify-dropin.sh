@@ -4,10 +4,8 @@
 # Mocks the `ssh` binary via a PATH-prepended shim so no real SSH connection
 # is needed.  Each case exercises a distinct failure mode of verify-dropin.sh.
 #
-# The expected GOMEMLIMIT is parsed by verify-dropin.sh from the canonical
-# drop-in file (gomemlimit.conf) instead of a hard-coded constant.  These tests
-# point CANONICAL_DROPIN at a temp file with a known value so they stay decoupled
-# from whatever the repo's production number happens to be.
+# The expected GOMEMLIMIT is resolved with the shared policy. These cases use
+# GOMEMLIMIT_BYTES to make the expected target deterministic.
 #
 # Cases
 # ─────
@@ -38,18 +36,17 @@ FAIL=0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# run_case NAME EXPECTED_EXIT SYSTEMCTL_OUTPUT DROPIN_EXISTS CANON_GOMEMLIMIT
+# run_case NAME EXPECTED_EXIT SYSTEMCTL_OUTPUT DROPIN_EXISTS EXPECTED_GOMEMLIMIT [MEMTOTAL_KB]
 #   SYSTEMCTL_OUTPUT  — text returned when remote cmd contains "systemctl show"
 #   DROPIN_EXISTS     — "yes" or "no" returned for every drop-in file test
-#   CANON_GOMEMLIMIT  — expected GOMEMLIMIT written into a temp canonical
-#                       drop-in file that CANONICAL_DROPIN is pointed at.
-#                       Defaults to 5905580032 (matches CORRECT_OUTPUT below).
+#   EXPECTED_GOMEMLIMIT — explicit policy override used by the verifier.
 run_case() {
     local name="$1"
     local expected_exit="$2"
     local systemctl_output="$3"
     local dropin_exists="${4:-yes}"
-    local canon_gomemlimit="${5:-5905580032}"
+    local expected_gomemlimit="${5-5905580032}"
+    local memtotal_kb="${6:-10485760}"
 
     local tmpdir
     tmpdir="$(mktemp -d)"
@@ -57,12 +54,7 @@ run_case() {
     # Store mocked values in files (avoids quoting issues inside heredocs)
     printf '%s\n' "$systemctl_output" > "$tmpdir/systemctl_output.txt"
     printf '%s\n' "$dropin_exists"    > "$tmpdir/dropin_exists.txt"
-
-    # Write a canonical drop-in file that verify-dropin.sh parses for the
-    # expected GOMEMLIMIT.  This decouples the tests from the repo's actual
-    # production number and lets each case control the expected value.
-    printf '[Service]\nEnvironment="GOMEMLIMIT=%s"\n' "$canon_gomemlimit" \
-        > "$tmpdir/gomemlimit.conf"
+    printf '%s\n' "$memtotal_kb"      > "$tmpdir/memtotal_kb.txt"
 
     # Write the ssh shim.  It dispatches on what the remote command contains.
     cat > "$tmpdir/ssh" << 'SHIM_EOF'
@@ -74,6 +66,8 @@ REMOTE_CMD="$*"
 
 if echo "$REMOTE_CMD" | grep -q "systemctl show"; then
     cat "$MYDIR/systemctl_output.txt"
+elif echo "$REMOTE_CMD" | grep -q "MemTotal"; then
+    cat "$MYDIR/memtotal_kb.txt"
 elif echo "$REMOTE_CMD" | grep -q "test -f"; then
     cat "$MYDIR/dropin_exists.txt"
 else
@@ -85,9 +79,14 @@ SHIM_EOF
     chmod +x "$tmpdir/ssh"
 
     local actual_exit=0
-    PATH="$tmpdir:$PATH" CANONICAL_DROPIN="$tmpdir/gomemlimit.conf" \
-        bash "$VERIFY_SCRIPT" "127.0.0.1" > /dev/null 2>&1 \
-        || actual_exit=$?
+    if [[ -n "$expected_gomemlimit" ]]; then
+        PATH="$tmpdir:$PATH" GOMEMLIMIT_BYTES="$expected_gomemlimit" \
+            bash "$VERIFY_SCRIPT" "127.0.0.1" > /dev/null 2>&1 \
+            || actual_exit=$?
+    else
+        PATH="$tmpdir:$PATH" bash "$VERIFY_SCRIPT" "127.0.0.1" > /dev/null 2>&1 \
+            || actual_exit=$?
+    fi
 
     rm -rf "$tmpdir"
 
@@ -151,6 +150,12 @@ run_case "RepoConfAndInstalledDisagree_ExitsOne" 1 "$STALE_INSTALLED" "yes" "590
 CUSTOM_MATCH="Environment=GOMEMLIMIT=4294967296
 TimeoutStopUSec=15min"
 run_case "ExpectedParsedFromCanonicalFile_ExitsZero" 0 "$CUSTOM_MATCH" "yes" "4294967296"
+
+# Case 8: verifier must resolve against the remote relay's RAM, not the
+# controller's RAM or the primary's canonical cap. 4 GiB → 3.5 GiB.
+LOW_MEMORY_RELAY="Environment=GOMEMLIMIT=3758096384
+TimeoutStopUSec=15min"
+run_case "RemoteLowMemoryPolicy_ExitsZero" 0 "$LOW_MEMORY_RELAY" "yes" "" "4194304"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

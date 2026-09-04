@@ -64,17 +64,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Лимит памяти Go-рантайма (GOMEMLIMIT) ─────────────────
-# По умолчанию — 75 % от общей RAM хоста, но не меньше 1.5 ГБ и не больше
-# 5.5 ГБ (значение, проверенное на продакшн-ноде с 7.8 ГБ RAM).
-# Переопределить: GOMEMLIMIT_BYTES=3221225472 sudo bash install-node.sh
-TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-TOTAL_RAM_BYTES=$(( TOTAL_RAM_KB * 1024 ))
-AUTO_GOMEMLIMIT=$(( TOTAL_RAM_BYTES * 3 / 4 ))
-MIN_GOMEMLIMIT=$(( 1536 * 1024 * 1024 ))   # 1.5 GiB floor
-MAX_GOMEMLIMIT=$(( 6979321856 ))            # 6500 MiB ceiling — bumped Aug 2026 after UTXO set at 980k+ blocks hit 4.7 GB startup RSS; 5500 MiB caused GC thrash at 265% CPU
-if (( AUTO_GOMEMLIMIT < MIN_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MIN_GOMEMLIMIT}; fi
-if (( AUTO_GOMEMLIMIT > MAX_GOMEMLIMIT )); then AUTO_GOMEMLIMIT=${MAX_GOMEMLIMIT}; fi
-GOMEMLIMIT_BYTES="${GOMEMLIMIT_BYTES:-${AUTO_GOMEMLIMIT}}"
+# 87.5 % RAM, 1.5 GiB floor, and the canonical 5.5 GiB cap. The node's
+# RSS watchdog fires at 85 % of this value, leaving about 25 % RAM headroom.
+# An explicit
+# GOMEMLIMIT_BYTES override wins (including for non-standard hosts).
+source "${SCRIPT_DIR}/gomemlimit-policy.sh"
+gomemlimit_resolve
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════╗
