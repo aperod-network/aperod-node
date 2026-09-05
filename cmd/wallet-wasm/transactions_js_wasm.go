@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"syscall/js"
 
 	"github.com/aperod/aperod/core"
@@ -261,7 +262,7 @@ func buildSignedTransaction(_ js.Value, args []js.Value) any {
 	}
 	return promiseResult(wasmValue(map[string]any{
 		"tx": result.Tx, "tx_hash": hex.EncodeToString(hash[:]), "total_fee_napr": result.TotalFee,
-		"change_amount_napr": result.ChangeAmount, "change_out_idx": result.ChangeOutIdx,
+		"change_amount_napr": strconv.FormatUint(result.ChangeAmount, 10), "change_out_idx": result.ChangeOutIdx,
 		"change_blind_hex": hex.EncodeToString(result.ChangeBlind[:]), "payment_blind_hex": hex.EncodeToString(result.PayBlind[:]),
 		"payment_out_idx": result.PayOutIdx, "spent_key_images": spent,
 		"decoy_count": result.RealDecoyCount, "fallback_decoy_count": result.FallbackDecoyCount,

@@ -138,6 +138,7 @@ func TestHandleIncomingBlock_LockedGenesisSpendRejected(t *testing.T) {
 	// ── 7. Consensus engine with vesting-aware verifier ───────────────────────
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -284,6 +285,7 @@ func TestHandleIncomingBlock_UnlockedGenesisSpendPassesVestingCheck(t *testing.T
 
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},

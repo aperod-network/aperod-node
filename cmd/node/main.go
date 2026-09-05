@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/api"
+	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
@@ -1121,6 +1123,7 @@ func run() error {
 	mempoolCfg := core.DefaultMempoolConfig()
 	mempoolCfg.RingCTV4ActivationHeight = cfg.Consensus.RingCTV4ActivationHeight
 	mempoolCfg.RingCTCLSAGActivationHeight = cfg.Consensus.RingCTCLSAGActivationHeight
+	mempoolCfg.AVMActivationHeight = cfg.Consensus.AVMActivationHeight
 	mempoolCfg.CurrentHeight = chain.Height
 	mempool := core.NewMempool(mempoolCfg, log)
 
@@ -1272,6 +1275,10 @@ func run() error {
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
 		apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
 		apiSrv.SetStore(db)
+		apiSrv.SetAVMStore(
+			cfg.Consensus.AVMActivationHeight,
+			avm.LevelStore{DB: db},
+		)
 		apiSrv.SetRSSStatsFn(readRSSBytes)
 		apiSrv.SetDataDir(cfg.DataDir)
 		apiSrv.SetPruningMode(cfg.Pruning.Mode)
@@ -1404,6 +1411,27 @@ func run() error {
 		}
 		if done {
 			return nil
+		}
+
+		// Verify that the AVM state belongs to the canonical tip before any
+		// consensus processing begins. A missing marker or missing state is
+		// deterministically rebuilt from canonical blocks; conflicting data is
+		// corruption and must fail closed.
+		avmRebuilt, avmErr := avm.EnsureCanonicalState(
+			context.Background(), db, cfg.Consensus.AVMActivationHeight,
+			tipHeight, tipHash,
+		)
+		if avmErr != nil {
+			return fmt.Errorf("startup AVM integrity: %w", avmErr)
+		}
+		if avmRebuilt {
+			log.Info("startup AVM state rebuilt from canonical blocks",
+				"activation_height", cfg.Consensus.AVMActivationHeight,
+				"tip_height", tipHeight)
+		} else if cfg.Consensus.AVMActivationHeight != 0 &&
+			tipHeight >= cfg.Consensus.AVMActivationHeight {
+			log.Info("startup AVM commitment and state verified",
+				"tip_height", tipHeight)
 		}
 
 		// ── Validator startup full height-index check ─────────────────────────
@@ -2416,16 +2444,24 @@ func run() error {
 		OracleMaxDeviation:                  cfg.Consensus.OracleMaxDeviation,
 		RingCTV4ActivationHeight:            cfg.Consensus.RingCTV4ActivationHeight,
 		RingCTCLSAGActivationHeight:         cfg.Consensus.RingCTCLSAGActivationHeight,
+		AVMActivationHeight:                 cfg.Consensus.AVMActivationHeight,
+		AVMExecutor:                         avm.NewBlockExecutor(avm.LevelStore{DB: db}),
 		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
-		OnBlockProduced: func(block *core.Block) error {
-			if err := storeBlock(db, block); err != nil {
+		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
+			raw, err := json.Marshal(block)
+			if err != nil {
+				return fmt.Errorf("marshal canonical block: %w", err)
+			}
+			if err := avm.CommitCanonicalBlock(db, block, raw, prepared); err != nil {
 				log.Error("failed to persist block", "height", block.Header.Height, "err", err)
 				return err
 			}
-			hash := block.Hash()
-			if err := db.PutTip(hash, block.Header.Height); err != nil {
-				log.Error("failed to update tip", "height", block.Header.Height, "err", err)
-				return err
+			if err := storeBlockIndexes(db, block); err != nil {
+				// Canonical block+tip+AVM state already committed atomically.
+				// Secondary indexes are rebuildable; never report the canonical
+				// commit as failed after it has durably succeeded.
+				log.Warn("canonical block committed but secondary index update failed; startup repair will rebuild it",
+					"height", block.Header.Height, "err", err)
 			}
 			// Increment cached tx counter (skip index-0 coinbase reward).
 			if apiSrv != nil {
@@ -2445,10 +2481,6 @@ func run() error {
 							"height", block.Header.Height, "err", storeErr)
 					}
 				}
-			}
-			// Broadcast newly produced block to P2P peers (non-blocking).
-			if host != nil {
-				host.BroadcastBlock(block)
 			}
 			// Persist spent key images to the LevelDB key-image index so
 			// that future restarts can use db.IterKeyImages() instead of
@@ -2471,6 +2503,14 @@ func run() error {
 					}
 					break
 				}
+			}
+			return nil
+		},
+		OnBlockProduced: func(block *core.Block) error {
+			// Broadcast only locally-produced blocks; relaying an incoming block
+			// here would create a callback gossip loop.
+			if host != nil {
+				host.BroadcastBlock(block)
 			}
 			return nil
 		},
@@ -2885,6 +2925,9 @@ func run() error {
 			// requests from syncing peers return real block headers
 			// instead of an empty response.
 			host.SetHeaderProvider(chain)
+			if apiSrv != nil {
+				apiSrv.SetTransactionBroadcaster(host.BroadcastTx)
+			}
 
 			// Wire LevelDB-backed fallbacks so peers that are more
 			// than ringSize blocks behind can still sync: blocks
@@ -4651,6 +4694,10 @@ func storeBlock(db *store.DB, b *core.Block) error {
 	if err := db.PutRawBlock(hash, b.Header.Height, data); err != nil {
 		return err
 	}
+	return storeBlockIndexes(db, b)
+}
+
+func storeBlockIndexes(db *store.DB, b *core.Block) error {
 	for i, tx := range b.Txs {
 		txHash := tx.Hash()
 		// Persist tx location so FastForwardWithIndex can restore the

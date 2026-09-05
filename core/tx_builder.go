@@ -22,6 +22,7 @@ type TxBuilder struct {
 	utxoSet    *UTXOSet    // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
 	decoys     []DecoyUTXO // optional caller-supplied public chain decoys
 	txVersion  TxVersion
+	avmPayload *AVMPayload // optional signed AVM payload; forces TxVersionAVM
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
@@ -71,6 +72,25 @@ func (b *TxBuilder) WithDecoys(decoys []DecoyUTXO) *TxBuilder {
 // BuildMulti. Production callers should derive it from the next block height.
 func (b *TxBuilder) WithVersion(version TxVersion) *TxBuilder {
 	b.txVersion = version
+	return b
+}
+
+// WithAVM attaches an already-signed AVM payload before the transaction hash
+// and CLSAG signatures are computed. The payload is deep-copied so callers
+// cannot mutate consensus fields while Build is running.
+func (b *TxBuilder) WithAVM(payload AVMPayload) *TxBuilder {
+	cloned := payload
+	cloned.Code = append([]byte(nil), payload.Code...)
+	cloned.Calldata = append([]byte(nil), payload.Calldata...)
+	cloned.AccessList = make([]AVMAccess, len(payload.AccessList))
+	for i, access := range payload.AccessList {
+		cloned.AccessList[i] = AVMAccess{
+			Key:   append([]byte(nil), access.Key...),
+			Write: access.Write,
+		}
+	}
+	b.avmPayload = &cloned
+	b.txVersion = TxVersionAVM
 	return b
 }
 
@@ -124,10 +144,20 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	if err := crypto.Validate(changeAddr); err != nil {
 		return nil, fmt.Errorf("invalid change address: %w", err)
 	}
+	if b.txVersion == TxVersionAVM {
+		if b.avmPayload == nil {
+			return nil, fmt.Errorf("AVM transaction requires WithAVM")
+		}
+		if err := b.avmPayload.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid AVM payload: %w", err)
+		}
+	} else if b.avmPayload != nil {
+		return nil, fmt.Errorf("AVM payload requires transaction version %d", TxVersionAVM)
+	}
 	isBurn := crypto.IsBurnAddress(recipient)
 	if isBurn &&
 		b.txVersion != TxVersionCommitmentBinding &&
-		b.txVersion != TxVersionCLSAG {
+		!txVersionUsesCLSAG(b.txVersion) {
 		return nil, fmt.Errorf("intentional burn is unavailable before RingCT v4 activation")
 	}
 
@@ -177,8 +207,24 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		initialOutputs = 1
 		burnExtraBytes = len(IntentionalBurnExtra(amount))
 	}
-	initialSize := txEstimatedSize(b.txVersion, 1, initialOutputs) + burnExtraBytes
-	estimatedFee = uint64(initialSize) * b.feePerByte
+	avmPayloadBytes := 0
+	var avmGasFee uint64
+	if b.avmPayload != nil {
+		avmPayloadBytes = len(b.avmPayload.canonicalBytes(true))
+		var err error
+		avmGasFee, err = AVMGasFee(b.avmPayload.GasLimit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	initialSize := txEstimatedSize(b.txVersion, 1, initialOutputs) + burnExtraBytes + avmPayloadBytes
+	if uint64(initialSize) > (^uint64(0)-avmGasFee)/b.feePerByte {
+		return nil, fmt.Errorf("transaction fee estimate overflows uint64")
+	}
+	estimatedFee = uint64(initialSize)*b.feePerByte + avmGasFee
+	if amount > ^uint64(0)-estimatedFee {
+		return nil, fmt.Errorf("amount plus fee overflows uint64")
+	}
 	needed := amount + estimatedFee
 
 	for _, u := range available {
@@ -196,8 +242,14 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	if isBurn {
 		nOut = 1 // possible change output
 	}
-	actualSize := txEstimatedSize(b.txVersion, len(selected), nOut) + burnExtraBytes
-	estimatedFee = uint64(actualSize) * b.feePerByte
+	actualSize := txEstimatedSize(b.txVersion, len(selected), nOut) + burnExtraBytes + avmPayloadBytes
+	if uint64(actualSize) > (^uint64(0)-avmGasFee)/b.feePerByte {
+		return nil, fmt.Errorf("transaction fee estimate overflows uint64")
+	}
+	estimatedFee = uint64(actualSize)*b.feePerByte + avmGasFee
+	if amount > ^uint64(0)-estimatedFee {
+		return nil, fmt.Errorf("amount plus fee overflows uint64")
+	}
 	needed = amount + estimatedFee
 
 	if totalIn < needed {
@@ -328,7 +380,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			excludePubs[u.OneTimePub] = true
 		}
 		need := len(selected) * (crypto.RingSize - 1)
-		if b.txVersion == TxVersionCLSAG {
+		if txVersionUsesCLSAG(b.txVersion) {
 			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
 		} else {
 			allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
@@ -361,8 +413,8 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			ringDecoys = allDecoys[start:end]
 		}
 
-		if b.txVersion == TxVersionCLSAG && len(ringDecoys) != crypto.RingSize-1 {
-			return nil, fmt.Errorf("v5 requires %d real on-chain decoys per input", crypto.RingSize-1)
+		if txVersionUsesCLSAG(b.txVersion) && len(ringDecoys) != crypto.RingSize-1 {
+			return nil, fmt.Errorf("CLSAG transaction requires %d real on-chain decoys per input", crypto.RingSize-1)
 		}
 		ring, realIdx, fallbacks, err := txBuildRing(u.OneTimePub, ringDecoys)
 		if err != nil {
@@ -383,7 +435,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			AmountCommit: u.AmountCommit,
 			RealIndex:    uint8(realIdx),
 		}
-		if b.txVersion == TxVersionCLSAG {
+		if txVersionUsesCLSAG(b.txVersion) {
 			commits := make([]crypto.Commitment, crypto.RingSize)
 			di := 0
 			for j := range commits {
@@ -420,8 +472,9 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		Fee:         totalFee,
 		FeeCommit:   feeCommit,
 		RangeProofs: rangeProofs,
+		AVM:         b.avmPayload,
 	}
-	if tx.Version == TxVersionCLSAG {
+	if tx.UsesCLSAG() {
 		pseudoBlinds = make([]crypto.BlindFactor, len(inputs))
 		for i := 0; i < len(inputs)-1; i++ {
 			pseudoBlinds[i], err = crypto.NewBlindFactor()
@@ -457,7 +510,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		msg := ringSignMessage(txHash, uint32(i))
 		var sig *crypto.MLSAGSignature
 		var err error
-		if tx.Version == TxVersionCLSAG {
+		if tx.UsesCLSAG() {
 			cs, signErr := crypto.CLSAGSign(msg, inputs[i].Ring, inputs[i].RingCommitments, tx.Inputs[i].PseudoOut, inputRealIdxs[i], inputPrivKeys[i], selected[i].Blind, pseudoBlinds[i])
 			if signErr != nil {
 				return nil, fmt.Errorf("clsag sign [%d]: %w", i, signErr)
@@ -840,12 +893,16 @@ func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
 // txEstimatedSize mirrors Transaction.Size for builder fee convergence.
 func txEstimatedSize(version TxVersion, nInputs, nOutputs int) int {
 	inputBytes := txBytesPerInput
-	if version == TxVersionCLSAG {
+	if txVersionUsesCLSAG(version) {
 		// base input body (576), ordered ring commitments (512), pseudo output
 		// (32), compact CLSAG (608).
 		inputBytes = 576 + crypto.RingSize*32 + 32 + 608
 	}
 	return txOverheadBytes + nInputs*inputBytes + nOutputs*txBytesPerOutput
+}
+
+func txVersionUsesCLSAG(version TxVersion) bool {
+	return version == TxVersionCLSAG || version == TxVersionAVM
 }
 
 func txEstimateFeeVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {

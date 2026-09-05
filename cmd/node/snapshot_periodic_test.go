@@ -95,6 +95,7 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 		Validators:   []crypto.ValidatorPubKey{pub},
 		MyKey:        nil, // not a producing validator in this test
 		RingCTV4ActivationHeight: ^uint64(0),
+		OnCanonicalBlock: noopCanonicalPersistence,
 		OnBlockAccepted: func(block *core.Block) {
 			h := block.Header.Height
 			mu.Lock()

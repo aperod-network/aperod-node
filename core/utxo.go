@@ -234,16 +234,16 @@ type rollbackEntry struct {
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
-	mu              sync.RWMutex
-	utxos           map[UTXOKey]*UTXO
-	keyImages       compactKeyImageSet         // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
-	byPubKey        map[crypto.Point32]*UTXO   // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
-	stakedUTXOs     map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
-	spentPubKeys    map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
-	rollbackJournal map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
-	ringMembers     RingMemberStore
+	mu                    sync.RWMutex
+	utxos                 map[UTXOKey]*UTXO
+	keyImages             compactKeyImageSet         // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
+	byPubKey              map[crypto.Point32]*UTXO   // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
+	stakedUTXOs           map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	spentPubKeys          map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
+	rollbackJournal       map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
+	ringMembers           RingMemberStore
 	clsagActivationHeight uint64
-	clsagRecentOutputs []UTXOKey
+	clsagRecentOutputs    []UTXOKey
 
 	// OnUTXOSpent, when non-nil, is called from ApplyBlock each time the
 	// real spending input for a ring transaction is identified and removed
@@ -528,7 +528,7 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 					inp.KeyImage[:8], block.Header.Height, firstIdx, txIdx)
 			}
 			seen[canonical] = txIdx
-			if tx.Version == TxVersionCLSAG {
+			if tx.UsesCLSAG() {
 				// A CLSAG hides its real position.  It is consequently unsafe to
 				// resolve or remove any ring member here; cryptographic verification
 				// binds all supplied key/commitment pairs and the KI is the sole
@@ -628,7 +628,7 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 			} else {
 				s.keyImages.insert(inp.KeyImage) // fallback: store raw (already validated)
 			}
-			if tx.Version == TxVersionCLSAG {
+			if tx.UsesCLSAG() {
 				// Preserve every member as a future decoy.  Removing one would
 				// disclose the real index during state transition.
 				// TODO: v5's hidden real index requires a future accumulator or
@@ -1007,7 +1007,7 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, tx := range block.Txs {
-		if tx.Version == TxVersionCLSAG {
+		if tx.UsesCLSAG() {
 			// The hidden real position cannot be safely removed on replay.
 			continue
 		}

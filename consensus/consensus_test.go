@@ -52,6 +52,7 @@ func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	return consensus.NewEngine(consensus.Config{
+OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   validators,
@@ -659,6 +660,7 @@ func TestEngine_NonValidatorMode_NeverProducesBlock(t *testing.T) {
 	// MyKey is nil so the engine must never produce a block.
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{pub},

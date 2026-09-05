@@ -74,6 +74,7 @@ func newMintTestEngineWithAdminMintStore(t *testing.T, rewardAddress string, db 
 	reg := core.NewValidatorRegistry()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:       20 * time.Millisecond,
 		BFTThreshold:    0.667,
 		Validators:      []crypto.ValidatorPubKey{validatorPub},
@@ -380,6 +381,7 @@ func TestScheduleAdminMint_TimeoutWhenNotProducing(t *testing.T) {
 	}
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock:         noopCanonicalPersistence,
 		BlockTime:                20 * time.Millisecond,
 		BFTThreshold:             0.667,
 		Validators:               []crypto.ValidatorPubKey{validatorPub},
@@ -546,6 +548,7 @@ func newMintTestEngineOnChainWithStore(t *testing.T, chain *core.Chain, db *stor
 	}
 	utxos := core.NewUTXOSet()
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime: 20 * time.Millisecond, BFTThreshold: 0.667,
 		Validators: []crypto.ValidatorPubKey{validatorPub}, Registry: core.NewValidatorRegistry(),
 		MyKey: lk, Store: db, RingCTV4ActivationHeight: ^uint64(0),

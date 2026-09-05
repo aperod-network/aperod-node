@@ -36,9 +36,10 @@ type MempoolConfig struct {
 	// transactions that cannot be included in the next block. Keeping this gate
 	// at admission prevents callers from receiving a successful hash for a tx
 	// that the block producer will immediately evict.
-	RingCTV4ActivationHeight uint64
+	RingCTV4ActivationHeight    uint64
 	RingCTCLSAGActivationHeight uint64
-	CurrentHeight            func() uint64
+	AVMActivationHeight         uint64
+	CurrentHeight               func() uint64
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
@@ -172,7 +173,13 @@ func (m *Mempool) Add(tx Transaction) error {
 		if nextHeight < ^uint64(0) {
 			nextHeight++
 		}
-		if err := ValidateTxVersionAtHeight(&tx, nextHeight, m.cfg.RingCTV4ActivationHeight, m.cfg.RingCTCLSAGActivationHeight); err != nil {
+		if err := ValidateTxVersionAtHeight(
+			&tx,
+			nextHeight,
+			m.cfg.RingCTV4ActivationHeight,
+			m.cfg.RingCTCLSAGActivationHeight,
+			m.cfg.AVMActivationHeight,
+		); err != nil {
 			return fmt.Errorf("mempool: transaction activation policy: %w", err)
 		}
 	}
@@ -202,6 +209,13 @@ func (m *Mempool) Add(tx Transaction) error {
 		baseFee := m.cfg.BaseFeePerByte
 		m.mu.RUnlock()
 		minFee := tx.MinFeeAt(baseFee)
+		if tx.IsAVM() {
+			gasFee, err := AVMGasFee(tx.AVM.GasLimit)
+			if err != nil || minFee > ^uint64(0)-gasFee {
+				return fmt.Errorf("mempool: AVM gas fee overflows")
+			}
+			minFee += gasFee
+		}
 		if burn, isBurn := tx.BurnAmount(); isBurn {
 			if minFee > ^uint64(0)-burn || tx.Fee < minFee+burn {
 				return fmt.Errorf("mempool: intentional burn fee too low: %d nAPRO < %d nAPRO minimum base fee plus burn",
@@ -209,8 +223,8 @@ func (m *Mempool) Add(tx Transaction) error {
 			}
 		}
 		if tx.Fee < minFee {
-			return fmt.Errorf("mempool: fee too low: %d nAPRO < %d nAPRO minimum (%d bytes × %d nAPRO/byte)",
-				tx.Fee, minFee, tx.Size(), baseFee)
+			return fmt.Errorf("mempool: fee too low: %d nAPRO < %d nAPRO minimum (base plus reserved AVM gas)",
+				tx.Fee, minFee)
 		}
 	}
 

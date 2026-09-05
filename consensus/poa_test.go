@@ -82,6 +82,7 @@ func buildValidatorGenesisAndBlock(t *testing.T) (
 	validatorReg := core.NewValidatorRegistry()
 	validatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	validatorEng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{validatorPub},
@@ -127,6 +128,7 @@ func TestNonValidatorAcceptsBlockFromRealValidator(t *testing.T) {
 	nonValidatorReg := core.NewValidatorRegistry()
 	nonValidatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	nonValidatorEng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		// ← genesis validator's pub key (the fix): isKnownValidator() will return true.
@@ -193,6 +195,7 @@ func TestNonValidatorRejectsBlock_WhenSeededWithOwnKey(t *testing.T) {
 	nonValidatorReg := core.NewValidatorRegistry()
 	nonValidatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	nonValidatorEng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		// ← the node's OWN key (the regression): isKnownValidator() will return false
@@ -258,6 +261,7 @@ func buildEngineWithGenesis(t *testing.T) (
 	reg := core.NewValidatorRegistry()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng = consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{validatorPub},
@@ -446,6 +450,7 @@ func TestCrashRecovery_RelayFillsMultiHourGap(t *testing.T) {
 	relayReg := core.NewValidatorRegistry()
 	relayMp := core.NewMempool(core.DefaultMempoolConfig())
 	relayEng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		// Seeded with the genesis validator key so isKnownValidator() returns true.
@@ -553,6 +558,7 @@ func TestTimejackingBan_PeerBannedAfterThreshold(t *testing.T) {
 	reg := core.NewValidatorRegistry()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{validatorPub},

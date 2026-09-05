@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/crypto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -116,15 +116,15 @@ type PprofConfig struct {
 
 // Config is the top-level node configuration.
 type Config struct {
-	Network   Network         `yaml:"network"`
-	DataDir   string          `yaml:"data_dir"`
-	LogLevel  string          `yaml:"log_level"`
-	P2P       P2PConfig       `yaml:"p2p"`
-	Consensus ConsensusConfig `yaml:"consensus"`
-	API       APIConfig       `yaml:"api"`
-	Genesis   GenesisRef      `yaml:"genesis"`
-	Pruning   PruningConfig   `yaml:"pruning"`
-	Snapshot  SnapshotConfig  `yaml:"snapshot"`
+	Network     Network           `yaml:"network"`
+	DataDir     string            `yaml:"data_dir"`
+	LogLevel    string            `yaml:"log_level"`
+	P2P         P2PConfig         `yaml:"p2p"`
+	Consensus   ConsensusConfig   `yaml:"consensus"`
+	API         APIConfig         `yaml:"api"`
+	Genesis     GenesisRef        `yaml:"genesis"`
+	Pruning     PruningConfig     `yaml:"pruning"`
+	Snapshot    SnapshotConfig    `yaml:"snapshot"`
 	Pprof       PprofConfig       `yaml:"pprof"`
 	Maintenance MaintenanceConfig `yaml:"maintenance"`
 	// MemoryLimitBytes, when positive, is passed to runtime/debug.SetMemoryLimit
@@ -185,8 +185,8 @@ type Config struct {
 // at connect-time so that node operators can rotate IPs without changing
 // their configuration file.
 type P2PConfig struct {
-	ListenAddr    string   `yaml:"listen_addr"`      // e.g. "/ip4/0.0.0.0/tcp/30303"
-	Bootnodes     []string `yaml:"bootnodes"`        // "domain:port" or "ip:port"
+	ListenAddr    string   `yaml:"listen_addr"` // e.g. "/ip4/0.0.0.0/tcp/30303"
+	Bootnodes     []string `yaml:"bootnodes"`   // "domain:port" or "ip:port"
 	MaxPeers      int      `yaml:"max_peers"`
 	MinPeers      int      `yaml:"min_peers"`
 	MaxPeersPerIP int      `yaml:"max_peers_per_ip"` // max inbound connections per source IP (0 = unlimited, recommended: 3)
@@ -313,10 +313,10 @@ type P2PConfig struct {
 
 // ConsensusConfig holds PoA settings.
 type ConsensusConfig struct {
-	ValidatorKey       string        `yaml:"validator_key"`        // path to ED25519 key file
-	ViewKey            string        `yaml:"view_key"`             // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
-	RewardAddress      string        `yaml:"reward_address"`       // APRO wallet address for block rewards
-BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
+	ValidatorKey       string        `yaml:"validator_key"`      // path to ED25519 key file
+	ViewKey            string        `yaml:"view_key"`           // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
+	RewardAddress      string        `yaml:"reward_address"`     // APRO wallet address for block rewards
+	BlockRewardNAPR    uint64        `yaml:"block_reward_napro"` // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
 	BlockTime          time.Duration `yaml:"block_time"`
 	OracleURL          string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
 	OracleMaxDeviation float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
@@ -331,8 +331,8 @@ BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // legacy pre-aut
 	// StakingPoolNAPR is the total pre-allocated validator reward pool in nAPRO.
 	// When > 0, block rewards are drawn from this pool instead of minting new
 	// tokens, keeping Total Supply at 10 B during the pool phase.  After the
-// pool is exhausted, tail_reward_napro is minted per block instead. These
-// fields are legacy-only and stop affecting rewards at authorization activation.
+	// pool is exhausted, tail_reward_napro is minted per block instead. These
+	// fields are legacy-only and stop affecting rewards at authorization activation.
 	// Default: 200_000_000_000_000_000 (= 2 000 000 000 APRO × 10^8 nAPRO/APRO).
 	// Set to 0 to disable pool-based rewards and use the legacy mint schedule.
 	StakingPoolNAPR uint64 `yaml:"staking_pool_napro"`
@@ -344,13 +344,16 @@ BlockRewardNAPR    uint64        `yaml:"block_reward_napro"`   // legacy pre-aut
 	// RingCTV4ActivationHeight is the first block height allowed to contain
 	// commitment-binding v4 transfers. Zero activates v4 immediately.
 	RingCTV4ActivationHeight uint64 `yaml:"ringct_v4_activation_height"`
-// RingCTCLSAGActivationHeight is the first height requiring RingCT v5.
-// Zero deliberately disables v5 rather than activating it immediately.
-RingCTCLSAGActivationHeight uint64 `yaml:"ring_ct_clsag_activation_height"`
-// RewardAuthorizationActivationHeight is the first block height whose
-// validator reward must carry an on-chain authorization. Zero disables the
-// post-RingCT reward path; set the same future value on every validator.
-RewardAuthorizationActivationHeight uint64 `yaml:"reward_authorization_activation_height"`
+	// RingCTCLSAGActivationHeight is the first height requiring RingCT v5.
+	// Zero deliberately disables v5 rather than activating it immediately.
+	RingCTCLSAGActivationHeight uint64 `yaml:"ring_ct_clsag_activation_height"`
+	// RewardAuthorizationActivationHeight is the first block height whose
+	// validator reward must carry an on-chain authorization. Zero disables the
+	// post-RingCT reward path; set the same future value on every validator.
+	RewardAuthorizationActivationHeight uint64 `yaml:"reward_authorization_activation_height"`
+	// AVMActivationHeight is the first block allowed to execute native Wasm
+	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
+	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -361,7 +364,7 @@ type APIConfig struct {
 	// Key, when non-empty, requires all write RPC methods (apr_sendRawTransaction
 	// etc.) to supply a matching api_key param or X-API-Key header.
 	// Empty = dev/open mode (F-5 fix: must be set in production node.yaml).
-	Key        string   `yaml:"key"`
+	Key string `yaml:"key"`
 }
 
 // GenesisRef points to the genesis file.
@@ -387,24 +390,24 @@ func DefaultConfig() *Config {
 		DataDir:  "./data",
 		LogLevel: "info",
 		P2P: P2PConfig{
-			ListenAddr:           "/ip4/0.0.0.0/tcp/30303",
-			MaxPeers:             50,
-			MinPeers:             4,
-			MaxPeersPerIP:        3,  // eclipse/partition guard: max 3 connections per source IP
-			MinOutbound:          4,  // always keep 4 slots free for outbound dial-outs
-			MaxPendingHandshakes: 20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
+			ListenAddr:            "/ip4/0.0.0.0/tcp/30303",
+			MaxPeers:              50,
+			MinPeers:              4,
+			MaxPeersPerIP:         3,  // eclipse/partition guard: max 3 connections per source IP
+			MinOutbound:           4,  // always keep 4 slots free for outbound dial-outs
+			MaxPendingHandshakes:  20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
 			BadBlockHeightLead:    1000,
 			BadBlockBanThreshold:  5,
 			BadBlockBanDuration:   24 * time.Hour,
-			TimestampBanThreshold: 5,       // ban peers that send 5+ future-timestamped blocks
+			TimestampBanThreshold: 5, // ban peers that send 5+ future-timestamped blocks
 			TimestampBanDuration:  time.Hour,
-			MaxBlockIngestPerSec:  50,      // cap sync-peer block delivery to prevent CPU spikes
-TxRateBurst:          50,       // per-IP tx burst allowance (mempool-flood guard)
-TxRateSustained:      10,       // per-IP sustained tx/sec after burst is spent
-TxRateBanThreshold:   100,      // sustained violations before a temporary ban
-TxRateBanDuration:    time.Hour,
-			MaxStaleBootnodeAge:  24 * time.Hour, // warn when a bootnode DNS hasn't resolved for this long
-			MaxDialBackoff:       5 * time.Minute, // cap per-bootnode retry interval so relay always recovers
+			MaxBlockIngestPerSec:  50,  // cap sync-peer block delivery to prevent CPU spikes
+			TxRateBurst:           50,  // per-IP tx burst allowance (mempool-flood guard)
+			TxRateSustained:       10,  // per-IP sustained tx/sec after burst is spent
+			TxRateBanThreshold:    100, // sustained violations before a temporary ban
+			TxRateBanDuration:     time.Hour,
+			MaxStaleBootnodeAge:   24 * time.Hour,  // warn when a bootnode DNS hasn't resolved for this long
+			MaxDialBackoff:        5 * time.Minute, // cap per-bootnode retry interval so relay always recovers
 		},
 		Consensus: ConsensusConfig{
 			BlockTime: time.Second,
@@ -587,17 +590,27 @@ func (c *Config) Validate() error {
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
-clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
-if clsagActivation > 0 && ringCTActivation > 0 && clsagActivation < ringCTActivation {
-return fmt.Errorf(
-"ring_ct_clsag_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
-clsagActivation, ringCTActivation,
-)
-}
+	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
+	if clsagActivation > 0 && ringCTActivation > 0 && clsagActivation < ringCTActivation {
+		return fmt.Errorf(
+			"ring_ct_clsag_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
+			clsagActivation, ringCTActivation,
+		)
+	}
 	if rewardActivation > 0 && ringCTActivation > 0 && rewardActivation < ringCTActivation {
 		return fmt.Errorf(
 			"reward_authorization_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
 			rewardActivation, ringCTActivation,
+		)
+	}
+	avmActivation := c.Consensus.AVMActivationHeight
+	if avmActivation > 0 && clsagActivation == 0 {
+		return fmt.Errorf("avm_activation_height requires ring_ct_clsag_activation_height")
+	}
+	if avmActivation > 0 && avmActivation < clsagActivation {
+		return fmt.Errorf(
+			"avm_activation_height (%d) must be >= ring_ct_clsag_activation_height (%d)",
+			avmActivation, clsagActivation,
 		)
 	}
 	if rewardActivation > 0 && !c.Consensus.NonValidator && c.Consensus.RewardAddress == "" {
@@ -605,25 +618,25 @@ clsagActivation, ringCTActivation,
 			"reward_address must be set for validator nodes when reward_authorization_activation_height is enabled",
 		)
 	}
-if rewardActivation > 0 && !c.Consensus.NonValidator {
-rewardNetwork, _, _, err := crypto.DecodeAddress(crypto.Address(c.Consensus.RewardAddress))
-if err != nil {
-return fmt.Errorf("invalid reward_address for reward authorization: %w", err)
-}
-expectedNetwork := crypto.MainnetByte
-switch c.Network {
-case Testnet:
-expectedNetwork = crypto.TestnetByte
-case Devnet:
-expectedNetwork = crypto.DevnetByte
-}
-if rewardNetwork != expectedNetwork {
-return fmt.Errorf(
-"reward_address network byte 0x%02x does not match configured network %q",
-byte(rewardNetwork), c.Network,
-)
-}
-}
+	if rewardActivation > 0 && !c.Consensus.NonValidator {
+		rewardNetwork, _, _, err := crypto.DecodeAddress(crypto.Address(c.Consensus.RewardAddress))
+		if err != nil {
+			return fmt.Errorf("invalid reward_address for reward authorization: %w", err)
+		}
+		expectedNetwork := crypto.MainnetByte
+		switch c.Network {
+		case Testnet:
+			expectedNetwork = crypto.TestnetByte
+		case Devnet:
+			expectedNetwork = crypto.DevnetByte
+		}
+		if rewardNetwork != expectedNetwork {
+			return fmt.Errorf(
+				"reward_address network byte 0x%02x does not match configured network %q",
+				byte(rewardNetwork), c.Network,
+			)
+		}
+	}
 	if c.Pruning.Mode != "" && c.Pruning.Mode != "archive" && c.Pruning.Mode != "light" {
 		return fmt.Errorf("pruning.mode must be \"archive\" or \"light\", got %q", c.Pruning.Mode)
 	}

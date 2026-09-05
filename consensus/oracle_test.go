@@ -122,6 +122,7 @@ func newOracleEngine(
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	return consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    15 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   validators,
@@ -347,6 +348,7 @@ func TestOraclePrice_NoURLSkipsEmbedding(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	// No OracleURL → embedding disabled.
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    15 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{pub},
@@ -447,6 +449,7 @@ func TestOracleSlowFetch_DoesNotDelayBlockProduction(t *testing.T) {
 
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    blockTime,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{pub},

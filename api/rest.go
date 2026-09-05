@@ -67,6 +67,13 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
 	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
+	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
+	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
+	s.mux.HandleFunc("/api/v1/avm/receipts/", s.restAVMReceipt)
+	s.mux.HandleFunc("/api/v1/avm/signers/", s.restAVMSigner)
+	s.mux.HandleFunc("/api/v1/avm/query", s.restAVMQuery)
+	s.mux.HandleFunc("/api/v1/avm/simulate", s.restAVMSimulate)
+	s.mux.HandleFunc("/api/v1/avm/transactions", s.restAVMTransaction)
 	// Node-join workflow: export endpoints consumed by aperod-join.sh.
 	s.mux.HandleFunc("/api/v1/snapshot/export", s.restSnapshotExport)
 	s.mux.HandleFunc("/api/v1/chaindb/export", s.restChainDBExport)
@@ -1962,7 +1969,10 @@ func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
 		count = n
 	}
 
-	decoys := s.utxos.SampleDecoys(count, nil)
+	// Browser-local signers build v5 CLSAG transactions, whose ring commits
+	// bind every member to the canonical on-chain commitment. Sample from the
+	// persistent ring-member store rather than the legacy spent-only pool.
+	decoys := s.utxos.SampleCLSAGDecoys(count, nil)
 
 	type decoyEntry struct {
 		OneTimePubHex   string `json:"one_time_pub_hex"`

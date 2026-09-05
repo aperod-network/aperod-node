@@ -2191,9 +2191,7 @@ func (h *Host) maintainLoop() {
 			if h.mgr.IsBanned(addr) {
 				continue
 			}
-			h.mu.RLock()
-			_, connected := h.peers[addr]
-			h.mu.RUnlock()
+			connected := h.hasConnectedPeerHost(addr)
 			if connected {
 				// Peer is up — reset any accumulated back-off so a
 				// future restart reconnects quickly from the start.
@@ -2246,6 +2244,54 @@ func (h *Host) maintainLoop() {
 			go h.dialPeer(addr)
 		}
 	}
+}
+
+// hasConnectedPeerHost reports whether addr is connected, either under its
+// exact peer-table key or from another source port on the same host. Inbound
+// connections use an ephemeral source port, so an active bootnode may be keyed
+// differently from its configured listening address.
+//
+// Host/port parsing and comparison happen outside h.mu. Besides keeping the
+// peer-table critical section short, this ensures host matching never adds a
+// DNS lookup while the table is locked. Malformed and non-hostport addresses
+// retain the old exact-key behavior.
+func (h *Host) hasConnectedPeerHost(addr string) bool {
+	host, _, splitErr := net.SplitHostPort(addr)
+
+	h.mu.RLock()
+	if _, connected := h.peers[addr]; connected {
+		h.mu.RUnlock()
+		return true
+	}
+	if splitErr != nil {
+		h.mu.RUnlock()
+		return false
+	}
+	inboundPeerAddrs := make([]string, 0, len(h.peers))
+	for peerAddr, peer := range h.peers {
+		if peer != nil && !peer.outbound {
+			inboundPeerAddrs = append(inboundPeerAddrs, peerAddr)
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, peerAddr := range inboundPeerAddrs {
+		peerHost, _, err := net.SplitHostPort(peerAddr)
+		if err == nil && samePeerHost(host, peerHost) {
+			return true
+		}
+	}
+	return false
+}
+
+// samePeerHost compares IP literals canonically and DNS host names without
+// case sensitivity. It deliberately performs no name resolution.
+func samePeerHost(a, b string) bool {
+	aIP, bIP := net.ParseIP(a), net.ParseIP(b)
+	if aIP != nil || bIP != nil {
+		return aIP != nil && bIP != nil && aIP.Equal(bIP)
+	}
+	return strings.EqualFold(a, b)
 }
 
 // isBootnode reports whether addr is a resolved address of a configured

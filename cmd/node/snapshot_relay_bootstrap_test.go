@@ -257,6 +257,7 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 		Validators:   []crypto.ValidatorPubKey{valPub},
 		Registry:     validatorReg,
 		MyKey:        lk,
+		OnCanonicalBlock: noopCanonicalPersistence,
 	}, validatorChain, validatorMp, silentLog())
 	validatorEng.SetTxVerifier(core.NewTxVerifier(validatorUTXOs), validatorUTXOs)
 
@@ -368,6 +369,7 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 		Validators:   restoredVals, // seeded from restored snapshot registry
 		Registry:     relayReg,
 		MyKey:        nil, // non-validator: never produces blocks
+		OnCanonicalBlock: noopCanonicalPersistence,
 	}, relayChain, relayMp, silentLog())
 	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
 

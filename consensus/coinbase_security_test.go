@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 )
@@ -283,6 +284,7 @@ func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 	}
 	utxos := core.NewUTXOSet()
 	engine := NewEngine(Config{
+		OnCanonicalBlock:                    func(*core.Block, *avm.PreparedBlock) error { return nil },
 		Validators:                          []crypto.ValidatorPubKey{pub},
 		MyKey:                               locked,
 		RewardAddress:                       string(rewardAddress),
@@ -466,6 +468,7 @@ func TestConsecutiveLocalBlocksAdvanceBaseFee(t *testing.T) {
 	}
 	utxos := core.NewUTXOSet()
 	engine := NewEngine(Config{
+		OnCanonicalBlock:         func(*core.Block, *avm.PreparedBlock) error { return nil },
 		Validators:               []crypto.ValidatorPubKey{pub},
 		MyKey:                    locked,
 		RingCTV4ActivationHeight: 1,

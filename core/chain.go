@@ -29,6 +29,13 @@ type Chain struct {
         tip               *Block
         genesis           *Block
         maxInMemoryBlocks uint64 // sliding-window size; default MaxInMemoryBlocks
+        lastAdd           *chainAddRollback
+}
+
+type chainAddRollback struct {
+        blockHash   crypto.Hash32
+        previousTip *Block
+        evicted     *Block
 }
 
 // InMemoryBlockCount returns the number of blocks currently held in the
@@ -69,6 +76,7 @@ func (c *Chain) SetGenesis(b *Block) error {
         c.byHeight[0] = b
         c.tip = b
         c.genesis = b
+        c.lastAdd = nil
         c.indexTxs(b)
         return nil
 }
@@ -137,6 +145,10 @@ func (c *Chain) AddBlock(b *Block) error {
         }
 
         h := b.Hash()
+        rollback := &chainAddRollback{
+                blockHash:   h,
+                previousTip: c.tip,
+        }
         c.blocks[h] = b
         c.byHeight[b.Header.Height] = b
         c.tip = b
@@ -146,6 +158,7 @@ func (c *Chain) AddBlock(b *Block) error {
         if b.Header.Height >= c.maxInMemoryBlocks {
                 evictH := b.Header.Height - c.maxInMemoryBlocks
                 if old, ok := c.byHeight[evictH]; ok {
+                        rollback.evicted = old
                         delete(c.byHeight, evictH)
                         delete(c.blocks, old.Hash())
                         for _, tx := range old.Txs {
@@ -153,7 +166,55 @@ func (c *Chain) AddBlock(b *Block) error {
                         }
                 }
         }
+        c.lastAdd = rollback
 
+        return nil
+}
+
+// RollbackLastBlock reverses the most recent successful AddBlock. Consensus
+// calls it when the canonical durability callback fails after the in-memory
+// transition. It also restores any block evicted from the sliding window by
+// that AddBlock, so readers see the exact pre-add chain state.
+func (c *Chain) RollbackLastBlock(b *Block) error {
+        if b == nil {
+                return fmt.Errorf("rollback last block: nil block")
+        }
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        hash := b.Hash()
+        rollback := c.lastAdd
+        if c.tip == nil || c.tip.Hash() != hash || rollback == nil ||
+                rollback.blockHash != hash || rollback.previousTip == nil {
+                return fmt.Errorf("rollback last block: block is not the latest AddBlock")
+        }
+        if b.Header.Height == 0 ||
+                rollback.previousTip.Header.Height+1 != b.Header.Height ||
+                b.Header.PrevHash != rollback.previousTip.Hash() {
+                return fmt.Errorf("rollback last block: invalid parent linkage")
+        }
+
+        delete(c.blocks, hash)
+        delete(c.byHeight, b.Header.Height)
+        for _, tx := range b.Txs {
+                delete(c.txIndex, tx.Hash())
+        }
+
+        restore := func(block *Block) {
+                if block == nil {
+                        return
+                }
+                blockHash := block.Hash()
+                c.blocks[blockHash] = block
+                c.byHeight[block.Header.Height] = block
+                c.indexTxs(block)
+        }
+        restore(rollback.previousTip)
+        if rollback.evicted != rollback.previousTip {
+                restore(rollback.evicted)
+        }
+        c.tip = rollback.previousTip
+        c.lastAdd = nil
         return nil
 }
 
@@ -171,6 +232,7 @@ func (c *Chain) FastForward(blocks []*Block) {
         }
         c.mu.Lock()
         defer c.mu.Unlock()
+        c.lastAdd = nil
         for _, b := range blocks {
                 h := b.Hash()
                 c.blocks[h] = b
@@ -213,6 +275,7 @@ func (c *Chain) FastForwardWithIndex(blocks []*Block, txEntries map[crypto.Hash3
         }
         c.mu.Lock()
         defer c.mu.Unlock()
+        c.lastAdd = nil
         // First pass: populate blocks and byHeight maps with sliding-window eviction.
         for _, b := range blocks {
                 h := b.Hash()
@@ -294,6 +357,7 @@ func (c *Chain) PruneOldData(pruner BlockPruner, keepBlocks uint64) (int, error)
 func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
         c.mu.Lock()
         defer c.mu.Unlock()
+        c.lastAdd = nil
 
         if len(newBlocks) == 0 {
                 return fmt.Errorf("reorg: no new blocks")

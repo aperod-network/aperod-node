@@ -4,7 +4,9 @@
 package consensus
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -40,10 +43,13 @@ type Config struct {
 	// MyKey is this node's validator key (nil if not a validator).
 	MyKey *crypto.LockedValidatorKey
 	// OnBlockProduced is an optional callback called after each block is added
-	// to the chain. Use it to persist blocks to durable storage. Returning an
-	// error halts local consensus production because the in-memory chain has
-	// advanced beyond its durable counterpart.
+	// to the chain locally. Use it for source-specific notification such as
+	// gossip; canonical persistence belongs in OnCanonicalBlock.
 	OnBlockProduced func(block *core.Block) error
+	// OnCanonicalBlock is the required durability boundary for every accepted
+	// block, local or P2P. The prepared AVM write set must be committed in the
+	// same atomic batch as block, height index and tip.
+	OnCanonicalBlock func(block *core.Block, prepared *avm.PreparedBlock) error
 	// OnBlockAccepted is an optional callback called after every canonical
 	// block is committed — whether produced locally by this node or received
 	// from a P2P peer.  Use it for work that must run regardless of the
@@ -105,6 +111,12 @@ type Config struct {
 	// RingCTCLSAGActivationHeight is the first height requiring v5; zero
 	// disables activation to avoid an accidental uncoordinated fork.
 	RingCTCLSAGActivationHeight uint64
+	// AVMActivationHeight is the first height accepting v6 AVM transactions.
+	// Zero disables AVM consensus.
+	AVMActivationHeight uint64
+	// AVMExecutor performs deterministic block preparation. It is mandatory
+	// once AVMActivationHeight is reached.
+	AVMExecutor *avm.BlockExecutor
 	// RewardAuthorizationActivationHeight is the first height at which
 	// validator rewards must carry a consensus-verifiable on-chain
 	// authorization. Zero keeps the authorization feature disabled.
@@ -205,6 +217,40 @@ type Engine struct {
 	mintQueue    []*adminMintReq // waiting to be included in a produced block
 	mintInFlight []*adminMintReq // included in a produced-but-not-yet-committed block
 	mintByKey    map[string]*adminMintReq
+}
+
+// rollbackUnpersistedBlock reverses the in-memory parts of a canonical
+// transition when the atomic durability callback rejects the block. The engine
+// still halts after a persistence error, but API readers must never observe a
+// chain/UTXO/stake state that the database did not commit.
+func (e *Engine) rollbackUnpersistedBlock(block *core.Block, stakeRollback func()) error {
+	var rollbackErrors []error
+	if err := e.chain.RollbackLastBlock(block); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Errorf("chain rollback: %w", err))
+	}
+	if e.utxos != nil {
+		if err := e.utxos.RollbackBlock(block); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("UTXO rollback: %w", err))
+		}
+	}
+	if stakeRollback != nil {
+		stakeRollback()
+	}
+	return errors.Join(rollbackErrors...)
+}
+
+func (e *Engine) failCanonicalPersistence(
+	block *core.Block,
+	stakeRollback func(),
+	persistErr error,
+) error {
+	rollbackErr := e.rollbackUnpersistedBlock(block, stakeRollback)
+	e.resolveAdminMintsPersistenceFailed(persistErr)
+	e.halted.Store(true)
+	if rollbackErr != nil {
+		return fmt.Errorf("%w; fatal in-memory rollback failure: %v", persistErr, rollbackErr)
+	}
+	return persistErr
 }
 
 // adminMintOutcome is delivered on adminMintReq.result once the mint's block
@@ -573,6 +619,16 @@ func (e *Engine) tick() error {
 		}
 	}
 
+	preparedAVM, err := e.prepareAVMBlock(block)
+	if err != nil {
+		for _, tx := range block.Txs {
+			if tx.IsAVM() {
+				e.pool.BanTx(tx.Hash())
+			}
+		}
+		return fmt.Errorf("self-produced block %d AVM execution failed: %w", block.Header.Height, err)
+	}
+
 	// Apply UTXO outputs BEFORE stake application and chain insertion.
 	if e.utxos != nil {
 		if err := e.utxos.ApplyBlock(block); err != nil {
@@ -632,9 +688,23 @@ func (e *Engine) tick() error {
 		return fmt.Errorf("add produced block: %w", err)
 	}
 
-	// Persist the just-added block before exposing any commit side effects. A
-	// failure leaves the durable admin-mint records prepared and stops this
+	// Persist the just-added block and prepared AVM state before exposing any
+	// commit side effects. This callback is shared with incoming P2P blocks.
+	if e.cfg.OnCanonicalBlock != nil {
+		if err := e.cfg.OnCanonicalBlock(block, preparedAVM); err != nil {
+			persistErr := fmt.Errorf("persist canonical block %d: %w", block.Header.Height, err)
+			return e.failCanonicalPersistence(block, stakeRollback, persistErr)
+		}
+	} else {
+		persistErr := fmt.Errorf("persist canonical block %d: OnCanonicalBlock is required", block.Header.Height)
+		return e.failCanonicalPersistence(block, stakeRollback, persistErr)
+	}
+
+	// Notify local-producer listeners after the canonical durability boundary.
+	// A failure leaves the durable admin-mint records prepared and stops this
 	// engine: continuing would advance an in-memory-only chain.
+	//
+	// Deprecated for persistence: use OnCanonicalBlock.
 	if e.cfg.OnBlockProduced != nil {
 		if err := e.cfg.OnBlockProduced(block); err != nil {
 			persistErr := fmt.Errorf("persist produced block %d: %w", block.Header.Height, err)
@@ -998,6 +1068,7 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 
 	var totalFees uint64
 	var totalMinimum uint64
+	var totalAVMGas uint64
 	for i := range block.Txs {
 		tx := &block.Txs[i]
 		if tx.IsCoinbase() || tx.IsStake() {
@@ -1005,6 +1076,19 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
 		requiredFee := minFee
+		if tx.IsAVM() {
+			gasLimit := tx.AVM.GasLimit
+			if gasLimit > core.AVMMaxBlockGas-totalAVMGas {
+				return fmt.Errorf("transaction %d exceeds AVM block gas limit: %d + %d > %d",
+					i, totalAVMGas, gasLimit, core.AVMMaxBlockGas)
+			}
+			totalAVMGas += gasLimit
+			gasFee, err := core.AVMGasFee(gasLimit)
+			if err != nil || requiredFee > ^uint64(0)-gasFee {
+				return fmt.Errorf("transaction %d AVM gas fee requirement overflows uint64", i)
+			}
+			requiredFee += gasFee
+		}
 		if intentionalBurn, isBurn := tx.BurnAmount(); isBurn {
 			if requiredFee > ^uint64(0)-intentionalBurn {
 				return fmt.Errorf("transaction %d intentional burn fee requirement overflows uint64", i)
@@ -1294,6 +1378,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 	// NOT be dropped here; they enter the pool via the public POST /api/v1/stake
 	// endpoint and must survive into the block for ProcessStakeTx to apply them.
 	txs := raw[:0]
+	var selectedAVMGas uint64
 	for _, tx := range raw {
 		if tx.IsCoinbase() && !tx.IsStake() {
 			h := tx.Hash()
@@ -1309,6 +1394,13 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				continue
 			}
 			// Privileged admin mint — keep it in the historical era.
+		}
+		if tx.IsAVM() {
+			gasLimit := tx.AVM.GasLimit
+			if gasLimit > core.AVMMaxBlockGas-selectedAVMGas {
+				continue
+			}
+			selectedAVMGas += gasLimit
 		}
 		txs = append(txs, tx)
 	}
@@ -1335,7 +1427,13 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				screened = append(screened, *tx)
 				continue
 			}
-			if err := core.ValidateTxVersionAtHeight(tx, height, e.cfg.RingCTV4ActivationHeight, e.cfg.RingCTCLSAGActivationHeight); err != nil {
+			if err := core.ValidateTxVersionAtHeight(
+				tx,
+				height,
+				e.cfg.RingCTV4ActivationHeight,
+				e.cfg.RingCTCLSAGActivationHeight,
+				e.cfg.AVMActivationHeight,
+			); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning tx rejected by RingCT activation policy",
 					"hash", hash,
@@ -1652,6 +1750,11 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 		return fmt.Errorf("tx crypto verification failed: %w", err)
 	}
 
+	preparedAVM, err := e.prepareAVMBlock(block)
+	if err != nil {
+		return fmt.Errorf("block %d: AVM execution failed: %w", block.Header.Height, err)
+	}
+
 	// Apply UTXO outputs BEFORE stake application and chain insertion.
 	if e.utxos != nil {
 		if err := e.utxos.ApplyBlock(block); err != nil {
@@ -1704,6 +1807,16 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 				block.Header.Height, rollbackErr)
 		}
 		return fmt.Errorf("add block: %w", err)
+	}
+
+	if e.cfg.OnCanonicalBlock != nil {
+		if err := e.cfg.OnCanonicalBlock(block, preparedAVM); err != nil {
+			persistErr := fmt.Errorf("persist canonical block %d: %w", block.Header.Height, err)
+			return e.failCanonicalPersistence(block, stakeRollback, persistErr)
+		}
+	} else {
+		persistErr := fmt.Errorf("persist canonical block %d: OnCanonicalBlock is required", block.Header.Height)
+		return e.failCanonicalPersistence(block, stakeRollback, persistErr)
 	}
 	// Stake txs already applied above — no processStakeTxs call needed.
 
@@ -1776,11 +1889,37 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
 	activation := e.cfg.RingCTV4ActivationHeight
 	for i := range block.Txs {
-		if err := core.ValidateTxVersionAtHeight(&block.Txs[i], block.Header.Height, activation, e.cfg.RingCTCLSAGActivationHeight); err != nil {
+		if err := core.ValidateTxVersionAtHeight(
+			&block.Txs[i],
+			block.Header.Height,
+			activation,
+			e.cfg.RingCTCLSAGActivationHeight,
+			e.cfg.AVMActivationHeight,
+		); err != nil {
 			return fmt.Errorf("tx[%d]: %w", i, err)
 		}
 	}
 	return nil
+}
+
+func (e *Engine) prepareAVMBlock(block *core.Block) (*avm.PreparedBlock, error) {
+	hasAVM := false
+	for i := range block.Txs {
+		if block.Txs[i].IsAVM() {
+			hasAVM = true
+			break
+		}
+	}
+	if e.cfg.AVMActivationHeight == 0 || block.Header.Height < e.cfg.AVMActivationHeight {
+		if hasAVM {
+			return nil, fmt.Errorf("AVM is not active at height %d", block.Header.Height)
+		}
+		return &avm.PreparedBlock{Height: block.Header.Height, BlockHash: block.Hash()}, nil
+	}
+	if e.cfg.AVMExecutor == nil {
+		return nil, fmt.Errorf("AVM executor is not configured at active height %d", block.Header.Height)
+	}
+	return e.cfg.AVMExecutor.PrepareBlock(context.Background(), block)
 }
 
 // castVote signs and broadcasts a finalization vote for a block.

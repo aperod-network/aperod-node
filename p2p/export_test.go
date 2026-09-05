@@ -192,6 +192,15 @@ func HostSeedConnectedPeer(h *Host, addr string) {
 	h.mu.Unlock()
 }
 
+// HostRemoveConnectedPeer removes a synthetic peer inserted by
+// HostSeedConnectedPeer. Exported for test cleanup before Host.Stop attempts to
+// close all peer connections.
+func HostRemoveConnectedPeer(h *Host, addr string) {
+	h.mu.Lock()
+	delete(h.peers, addr)
+	h.mu.Unlock()
+}
+
 // HostPeersToAdvertise returns the addresses the host would include in an
 // outbound MsgPeers reply (banned IPs filtered out).  Exercises the exact
 // production filter used by the MsgGetPeers handler.

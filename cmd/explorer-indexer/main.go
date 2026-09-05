@@ -4,9 +4,12 @@
 // Environment variables:
 //
 //	DATABASE_URL  — PostgreSQL connection string (required)
-//	NODE_API_URL  — Go node REST base URL (default: http://127.0.0.1:8545)
+//	GO_NODE_URL   — Go node REST base URL shared with aperod-api
+//	NODE_API_URL  — legacy override for the Go node REST base URL
 //	POLL_INTERVAL — seconds between tip polls after catch-up (default: 5)
 //	BATCH_SIZE    — blocks per batch during initial catch-up (default: 50)
+//	BACKFILL_FROM_HEIGHT — optional initial catch-up start; invalid values fail
+//	  startup and this value is never used for steady-state polling
 //
 // Startup behaviour:
 //   - Waits for the Go node to report ok:true and syncing:false before indexing.
@@ -46,7 +49,12 @@ func run() error {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
 
+	// GO_NODE_URL is the canonical shared deployment setting used by the API.
+	// Keep NODE_API_URL as a backwards-compatible override for existing units.
 	nodeURL := os.Getenv("NODE_API_URL")
+	if nodeURL == "" {
+		nodeURL = os.Getenv("GO_NODE_URL")
+	}
 	if nodeURL == "" {
 		nodeURL = "http://127.0.0.1:8545"
 	}
@@ -65,11 +73,20 @@ func run() error {
 		}
 	}
 
+	backfillFrom, err := backfillFromHeightFromEnv()
+	if err != nil {
+		return err
+	}
+
 	log.Info("explorer-indexer starting",
 		"node_url", nodeURL,
 		"poll_interval", pollInterval,
 		"batch_size", batchSize,
 	)
+	if backfillFrom != nil {
+		log.Info("initial catch-up override enabled; steady-state resumes chain_stats checkpoint",
+			"backfill_from_height", *backfillFrom)
+	}
 
 	// ── Connect to PostgreSQL ──────────────────────────────────────────────────
 	idx, err := explorer.New(dbURL)
@@ -100,7 +117,7 @@ func run() error {
 	}
 
 	// ── Initial catch-up ───────────────────────────────────────────────────────
-	if err := catchUp(idx, client, batchSize, log); err != nil {
+	if err := catchUp(idx, client, batchSize, backfillFrom, log); err != nil {
 		return fmt.Errorf("initial catch-up failed: %w", err)
 	}
 
@@ -110,7 +127,7 @@ func run() error {
 
 	tpsTick := 0
 	for range ticker.C {
-		if err := catchUp(idx, client, batchSize, log); err != nil {
+		if err := catchUp(idx, client, batchSize, nil, log); err != nil {
 			log.Error("catch-up error", "err", err)
 		}
 
@@ -127,7 +144,19 @@ func run() error {
 // catchUp indexes all blocks from last_indexed_height+1 up to the current
 // node tip.  Returns nil when the node is temporarily unreachable (logs warning
 // and defers to the next tick) to avoid crashing the polling loop.
-func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *slog.Logger) error {
+func backfillFromHeightFromEnv() (*uint64, error) {
+	value, ok := os.LookupEnv("BACKFILL_FROM_HEIGHT")
+	if !ok || value == "" {
+		return nil, nil
+	}
+	height, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("BACKFILL_FROM_HEIGHT must be an unsigned integer: %w", err)
+	}
+	return &height, nil
+}
+
+func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, initialStartOverride *uint64, log *slog.Logger) error {
 	stats, err := idx.GetStats()
 	if err != nil {
 		return fmt.Errorf("get chain stats: %w", err)
@@ -136,6 +165,9 @@ func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *s
 	startHeight := uint64(0)
 	if stats.LastIndexedHeight >= 0 {
 		startHeight = uint64(stats.LastIndexedHeight) + 1
+	}
+	if initialStartOverride != nil {
+		startHeight = *initialStartOverride
 	}
 
 	tipHeight, err := client.getTipHeight()
@@ -164,7 +196,7 @@ func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, log *s
 			if err := indexBlock(idx, client, bh, log); err != nil {
 				log.Warn("failed to index block — stopping batch",
 					"height", bh, "err", err)
-				return nil // next tick retries from the persisted height
+				return err
 			}
 			indexed++
 		}
@@ -294,13 +326,13 @@ type blockTxsAPIResponse struct {
 }
 
 type txItem struct {
-	Hash       string `json:"hash"`
-	TxIndex    int    `json:"tx_index"`
-	IsCoinbase bool   `json:"is_coinbase"`
-	Inputs     int    `json:"inputs"`
-	Outputs    int    `json:"outputs"`
-	Fee        uint64 `json:"fee"`
-	Size       int    `json:"size"`
+	Hash        string `json:"hash"`
+	TxIndex     int    `json:"tx_index"`
+	IsCoinbase  bool   `json:"is_coinbase"`
+	Inputs      int    `json:"inputs"`
+	Outputs     int    `json:"outputs"`
+	Fee         uint64 `json:"fee"`
+	Size        int    `json:"size"`
 	IsBurn      bool   `json:"is_burn"`
 	BurnedNAPRO string `json:"burned_napro"`
 	BurnAddress string `json:"burn_address"`

@@ -463,6 +463,7 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 		Registry:     registry,
 		MyKey:        nil, // non-validator relay: never produces blocks
 		RingCTV4ActivationHeight: ^uint64(0),
+		OnCanonicalBlock: noopCanonicalPersistence,
 	}, relayChain, relayMp, discardLog())
 	relayEng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 

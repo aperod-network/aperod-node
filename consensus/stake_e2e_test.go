@@ -126,6 +126,7 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	defer lk.Destroy()
 
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -262,6 +263,7 @@ func TestStakeDeposit_IncomingBlock_BadSig(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -315,6 +317,7 @@ func TestStakeDeposit_IncomingBlock_UTXONotFound(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -373,6 +376,7 @@ func TestStakeDeposit_IncomingBlock_DuplicateBurnUTXO(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -425,6 +429,7 @@ func TestStakeDeposit_IncomingBlock_BelowMinimum(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -487,6 +492,7 @@ func TestStakeDeposit_SelfProduced_InvalidStakeEvicted(t *testing.T) {
 	defer lk.Destroy()
 
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -552,6 +558,7 @@ func TestStakeDeposit_IncomingBlock_CommitMismatch(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -606,6 +613,7 @@ func TestStakeDeposit_IncomingBlock_TopupBelowMinimum(t *testing.T) {
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -747,6 +755,7 @@ func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
 	defer lk.Destroy()
 
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},
@@ -825,6 +834,7 @@ func TestStakeDeposit_SelfProduced_ResumesAfterDuplicateEviction(t *testing.T) {
 	defer lk.Destroy()
 
 	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:    20 * time.Millisecond,
 		BFTThreshold: 0.667,
 		Validators:   []crypto.ValidatorPubKey{proposerPub},

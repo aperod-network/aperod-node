@@ -168,6 +168,10 @@ func isHeavyPath(path string) bool {
 			return true
 		}
 	}
+	switch path {
+	case "/api/v1/avm/query", "/api/v1/avm/simulate", "/api/v1/avm/transactions":
+		return true
+	}
 	return false
 }
 

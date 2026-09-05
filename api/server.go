@@ -15,6 +15,7 @@ import (
         "sync/atomic"
         "time"
 
+        "github.com/aperod/aperod/avm"
         "github.com/aperod/aperod/core"
         "github.com/aperod/aperod/crypto"
         "github.com/aperod/aperod/store"
@@ -288,6 +289,13 @@ type Server struct {
         // Wired to p2p.Host.GetStaleBootnodes by cmd/node.
         // nil = P2P layer not running (field omitted from /health response).
         staleBootnodeFn func() []StaleBootnodeEntry
+
+        // avmStore is the canonical AVM state reader used by the public,
+        // read-only contract API. It never receives private signing material.
+        avmStore            avm.Store
+        avmActivationHeight uint64
+        broadcastTxMu       sync.RWMutex
+        broadcastTxFn       func(*core.Transaction)
 }
 
 // NewServer creates a new API server.
@@ -442,6 +450,21 @@ func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 // when looking up old or pruned blocks that have been evicted from memory.
 // Optional — endpoints return 404 for old blocks when no store is wired.
 func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
+
+// SetAVMStore enables the public AVM read/query API against canonical state.
+// activationHeight is the first block at which v6 transactions are valid.
+func (s *Server) SetAVMStore(activationHeight uint64, state avm.Store) {
+        s.avmActivationHeight = activationHeight
+        s.avmStore = state
+}
+
+// SetTransactionBroadcaster wires accepted locally-submitted transactions to
+// the node's normal P2P gossip path (normally p2p.Host.BroadcastTx).
+func (s *Server) SetTransactionBroadcaster(fn func(*core.Transaction)) {
+        s.broadcastTxMu.Lock()
+        s.broadcastTxFn = fn
+        s.broadcastTxMu.Unlock()
+}
 
 // SetDataDir records the node's data directory so the snapshot and chaindb
 // export endpoints can locate files for the one-command node-join workflow.

@@ -67,7 +67,7 @@ func TestBootnodeDialBackoff_InBackoffAfterFail(t *testing.T) {
 		NodeID:              "test-backoff-in-window",
 		UserAgent:           "aperod-test/0.1",
 		MaxDialBackoff:      2 * time.Second, // short for test
-		MaxStaleBootnodeAge: time.Hour,        // long so the stale WARN doesn't interfere
+		MaxStaleBootnodeAge: time.Hour,       // long so the stale WARN doesn't interfere
 	}, &stubHandler{}, log)
 
 	// Pre-register the bootnode address so isBootnode() returns true.
@@ -424,5 +424,106 @@ func TestBootnodeDialBackoff_RetryAfterExpiry(t *testing.T) {
 	if !retried {
 		t.Errorf("maintainLoop did not retry the bootnode dial after the back-off expired (count before=%d, after=%d)",
 			beforeCount, dialCount.Load())
+	}
+}
+
+func TestBootnodeDialBackoff_InboundSameIPClearsAndSkipsDial(t *testing.T) {
+	const (
+		bootnodeAddr = "77.221.153.86:30303"
+		inboundAddr  = "77.221.153.86:58248"
+	)
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		Bootnodes:           []string{bootnodeAddr},
+		MaxPeers:            5,
+		NodeID:              "test-inbound-bootnode-same-ip",
+		UserAgent:           "aperod-test/0.1",
+		MaxDialBackoff:      time.Minute,
+		MaxStaleBootnodeAge: time.Hour,
+	}, &stubHandler{}, log)
+
+	var dialCount atomic.Int64
+	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return stubDialFail(ctx, network, addr)
+	})
+	if err := h.Start(); err != nil {
+		t.Fatalf("Host.Start: %v", err)
+	}
+	defer h.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !p2p.HostBootnodeInBackoff(h, bootnodeAddr) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("startup dial did not establish bootnode back-off")
+	}
+
+	p2p.HostSeedConnectedPeer(h, inboundAddr)
+	defer p2p.HostRemoveConnectedPeer(h, inboundAddr)
+	before := dialCount.Load()
+	p2p.HostTriggerMaintain(h)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for p2p.HostBootnodeInBackoff(h, bootnodeAddr) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("same-IP inbound peer did not clear configured bootnode back-off")
+	}
+	if got := dialCount.Load(); got != before {
+		t.Fatalf("same-IP inbound peer did not skip bootnode dial: count changed from %d to %d", before, got)
+	}
+}
+
+func TestBootnodeDialBackoff_InboundDifferentIPDoesNotClear(t *testing.T) {
+	const (
+		bootnodeAddr = "77.221.153.86:30303"
+		inboundAddr  = "77.221.153.87:58248"
+	)
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:          "127.0.0.1:0",
+		Bootnodes:           []string{bootnodeAddr},
+		MaxPeers:            5,
+		NodeID:              "test-inbound-bootnode-different-ip",
+		UserAgent:           "aperod-test/0.1",
+		MaxDialBackoff:      time.Minute,
+		MaxStaleBootnodeAge: time.Hour,
+	}, &stubHandler{}, log)
+
+	var dialCount atomic.Int64
+	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCount.Add(1)
+		return stubDialFail(ctx, network, addr)
+	})
+	if err := h.Start(); err != nil {
+		t.Fatalf("Host.Start: %v", err)
+	}
+	defer h.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !p2p.HostBootnodeInBackoff(h, bootnodeAddr) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("startup dial did not establish bootnode back-off")
+	}
+
+	p2p.HostSeedConnectedPeer(h, inboundAddr)
+	defer p2p.HostRemoveConnectedPeer(h, inboundAddr)
+	before := dialCount.Load()
+	p2p.HostTriggerMaintain(h)
+	time.Sleep(150 * time.Millisecond)
+
+	if !p2p.HostBootnodeInBackoff(h, bootnodeAddr) {
+		t.Fatal("different-IP inbound peer incorrectly cleared configured bootnode back-off")
+	}
+	if got := dialCount.Load(); got != before {
+		t.Fatalf("bootnode was dialled during active back-off: count changed from %d to %d", before, got)
 	}
 }
