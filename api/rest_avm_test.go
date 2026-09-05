@@ -160,6 +160,41 @@ func TestAVMReadOnlyQueryExecutesCanonicalCode(t *testing.T) {
 	}
 }
 
+func TestAVMSimulateAcceptsHexEncodedCodeBeyondLegacyBodyLimit(t *testing.T) {
+	srv, _ := buildChainServer(t, 0)
+	srv.SetAVMStore(1, avm.NewMemoryStore())
+	srv.SetReady()
+
+	code := bytes.Repeat([]byte{0}, 600*1024)
+	if len(code) >= core.AVMMaxCodeSize {
+		t.Fatalf("test code is not below AVMMaxCodeSize: %d", len(code))
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"action":      "deploy",
+		"contract_id": strings.Repeat("00", 32),
+		"code_hex":    hex.EncodeToString(code),
+		"entry":       "run",
+		"gas_limit":   1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyLimit := core.AVMMaxCodeSize + core.AVMMaxCalldataSize + 64*1024
+	if len(body) <= legacyLimit {
+		t.Fatalf("wire body did not exceed legacy limit: body=%d limit=%d", len(body), legacyLimit)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/avm/simulate", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("invalid JSON")) {
+		t.Fatalf("request was rejected before semantic validation: %s", rec.Body.String())
+	}
+}
+
 func TestAVMEndpointsStayUnavailableDuringStartupRecovery(t *testing.T) {
 	srv, _ := buildChainServer(t, 0)
 	srv.SetAVMStore(1, avm.NewMemoryStore())

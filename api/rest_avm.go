@@ -24,6 +24,8 @@ var (
 	avmReceiptPrefix = []byte{0xff, 'a', 'v', 'm', '/', 'r', '/'}
 )
 
+const avmReadOnlyRequestMaxBytes = 2*(core.AVMMaxCodeSize+core.AVMMaxCalldataSize) + 512*1024
+
 type avmAccessJSON struct {
 	KeyHex string `json:"key_hex"`
 	Write  bool   `json:"write"`
@@ -283,7 +285,7 @@ func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simu
 		return
 	}
 	var req avmExecutionJSON
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, core.AVMMaxCodeSize+core.AVMMaxCalldataSize+64*1024))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, avmReadOnlyRequestMaxBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
