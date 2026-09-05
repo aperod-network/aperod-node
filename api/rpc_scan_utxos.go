@@ -1,12 +1,12 @@
 package api
 
 import (
-        "encoding/hex"
-        "encoding/json"
-        "fmt"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 
-        "github.com/aperod/aperod/core"
-        "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 // ─── apr_scanUTXOs ───────────────────────────────────────────────────────────
@@ -18,82 +18,114 @@ import (
 // from the ECDH shared secret (HsScalar + amount).
 
 type scanUTXOsParams struct {
-        SpendPubHex string `json:"spend_pub_hex"` // 32-byte spend public key hex
-        ViewKeyHex  string `json:"view_key_hex"`  // 32-byte view private scalar hex
+	SpendPubHex string  `json:"spend_pub_hex"` // 32-byte spend public key hex
+	ViewKeyHex  string  `json:"view_key_hex"`  // 32-byte view private scalar hex
+	FromHeight  *uint64 `json:"from_height,omitempty"`
+	ToHeight    *uint64 `json:"to_height,omitempty"`
 }
 
 type scannedUTXO struct {
-        TxHash      string `json:"tx_hash"`
-        OutIdx      uint32 `json:"out_idx"`
-        AmountNAPR  uint64 `json:"amount_napr"`
-        BlindHex    string `json:"blind_hex"`     // always "" — Go recomputes deterministically
-        HsScalarHex string `json:"hs_scalar_hex"` // ECDH shared secret; pass to stake-deposit to derive blind
+	TxHash          string `json:"tx_hash"`
+	OutIdx          uint32 `json:"out_idx"`
+	AmountNAPR      uint64 `json:"amount_napr"`
+	AmountNAPRExact string `json:"amount_napr_str"` // exact decimal form for JavaScript BigInt consumers
+	BlockHeight     uint64 `json:"block_height"`
+	BlockTimestamp  string `json:"block_timestamp_ns"`
+	BlindHex        string `json:"blind_hex"`     // always "" — Go recomputes deterministically
+	HsScalarHex     string `json:"hs_scalar_hex"` // ECDH shared secret; pass to stake-deposit to derive blind
 }
 
 func (s *Server) aprScanUTXOs(params json.RawMessage) (interface{}, error) {
-        var p scanUTXOsParams
-        if err := json.Unmarshal(params, &p); err != nil {
-                return nil, fmt.Errorf("params: %w", err)
-        }
+	var p scanUTXOsParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("params: %w", err)
+	}
 
-        // Decode spend public key
-        spendPubBytes, err := hex.DecodeString(p.SpendPubHex)
-        if err != nil || len(spendPubBytes) != 32 {
-                return nil, fmt.Errorf("spend_pub_hex: expected 32-byte hex")
-        }
-        var spendPub crypto.Point32
-        copy(spendPub[:], spendPubBytes)
+	// Decode spend public key
+	spendPubBytes, err := hex.DecodeString(p.SpendPubHex)
+	if err != nil || len(spendPubBytes) != 32 {
+		return nil, fmt.Errorf("spend_pub_hex: expected 32-byte hex")
+	}
+	var spendPub crypto.Point32
+	copy(spendPub[:], spendPubBytes)
 
-        // Decode view private scalar
-        viewPriv, err := scalar32FromHex(p.ViewKeyHex, "view_key_hex")
-        if err != nil {
-                return nil, err
-        }
+	// Decode view private scalar
+	viewPriv, err := scalar32FromHex(p.ViewKeyHex, "view_key_hex")
+	if err != nil {
+		return nil, err
+	}
 
-        // Derive view public key for scanner
-        viewPub, err := crypto.PublicKeyFromPrivate(viewPriv)
-        if err != nil {
-                return nil, fmt.Errorf("derive view pub: %w", err)
-        }
+	// Derive view public key for scanner
+	viewPub, err := crypto.PublicKeyFromPrivate(viewPriv)
+	if err != nil {
+		return nil, fmt.Errorf("derive view pub: %w", err)
+	}
 
-        // Build a scanner and scan the whole chain
-        scanner := core.NewWalletScanner(viewPriv, spendPub, viewPub, crypto.MainnetByte)
-        tip := s.chain.Height()
-        owned := scanner.ScanChain(s.chain, 0, tip)
+	// Build a scanner and scan the whole chain
+	scanner := core.NewWalletScanner(viewPriv, spendPub, viewPub, crypto.MainnetByte)
+	tip := s.chain.Height()
+	start := uint64(0)
+	if p.FromHeight != nil {
+		start = *p.FromHeight
+	}
+	end := tip
+	if p.ToHeight != nil && *p.ToHeight < end {
+		end = *p.ToHeight
+	}
+	if start > end {
+		return map[string]interface{}{
+			"utxos":        []scannedUTXO{},
+			"count":        0,
+			"scanned_from": start,
+			"scanned_to":   end,
+			"tip_height":   tip,
+		}, nil
+	}
+	owned := scanner.ScanChain(s.chain, start, end)
 
-        // Check which UTXOs are still unspent (UTXO set membership)
-        result := make([]scannedUTXO, 0, len(owned))
-        for _, u := range owned {
-                // Skip if already spent (not in UTXO set)
-                if s.utxos.Get(u.TxHash, u.OutputIndex) == nil {
-                        continue
-                }
+	// Check which UTXOs are still unspent (UTXO set membership)
+	result := make([]scannedUTXO, 0, len(owned))
+	for _, u := range owned {
+		// Skip if already spent (not in UTXO set)
+		if s.utxos.Get(u.TxHash, u.OutputIndex) == nil {
+			continue
+		}
 
-                // Verify the deterministic blind matches the on-chain commitment.
-                // UTXOs built before the deterministic-blind migration won't match;
-                // we skip them (they require the stored blind_hex from utxo_blinds).
-                deterministicBlind, bErr := crypto.DeterministicPaymentBlind(u.HsScalar, u.Amount)
-                if bErr != nil {
-                        continue
-                }
-                commit, cErr := crypto.Commit(u.Amount, deterministicBlind)
-                if cErr != nil || commit != u.AmountCommit {
-                        // Pre-migration UTXO with random blind — not recoverable via scan.
-                        // Caller must use utxo_blinds or request admin re-mint.
-                        continue
-                }
+		// Verify the deterministic blind matches the on-chain commitment.
+		// UTXOs built before the deterministic-blind migration won't match;
+		// we skip them (they require the stored blind_hex from utxo_blinds).
+		deterministicBlind, bErr := crypto.DeterministicPaymentBlind(u.HsScalar, u.Amount)
+		if bErr != nil {
+			continue
+		}
+		commit, cErr := crypto.Commit(u.Amount, deterministicBlind)
+		if cErr != nil || commit != u.AmountCommit {
+			// Pre-migration UTXO with random blind — not recoverable via scan.
+			// Caller must use utxo_blinds or request admin re-mint.
+			continue
+		}
+		block := s.chain.GetByHeight(u.BlockHeight)
+		if block == nil {
+			continue
+		}
 
-                result = append(result, scannedUTXO{
-                        TxHash:      fmt.Sprintf("%x", u.TxHash[:]),
-                        OutIdx:      u.OutputIndex,
-                        AmountNAPR:  u.Amount,
-                        BlindHex:    "", // Go spending path derives this deterministically
-                        HsScalarHex: fmt.Sprintf("%x", u.HsScalar[:]),
-                })
-        }
+		result = append(result, scannedUTXO{
+			TxHash:          fmt.Sprintf("%x", u.TxHash[:]),
+			OutIdx:          u.OutputIndex,
+			AmountNAPR:      u.Amount,
+			AmountNAPRExact: fmt.Sprintf("%d", u.Amount),
+			BlockHeight:     u.BlockHeight,
+			BlockTimestamp:  fmt.Sprintf("%d", block.Header.Timestamp),
+			BlindHex:        "", // Go spending path derives this deterministically
+			HsScalarHex:     fmt.Sprintf("%x", u.HsScalar[:]),
+		})
+	}
 
-        return map[string]interface{}{
-                "utxos": result,
-                "count": len(result),
-        }, nil
+	return map[string]interface{}{
+		"utxos":        result,
+		"count":        len(result),
+		"scanned_from": start,
+		"scanned_to":   end,
+		"tip_height":   tip,
+	}, nil
 }
