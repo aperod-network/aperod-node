@@ -44,6 +44,10 @@ type MempoolConfig struct {
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
 	Verifier *TxVerifier
+	// AVMNonceLookup returns the canonical next nonce for a signer. Production
+	// nodes MUST wire this when AVM is enabled so stale/future nonces are
+	// rejected before expensive RingCT verification and block selection.
+	AVMNonceLookup func([32]byte) (uint64, error)
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -87,7 +91,11 @@ type Mempool struct {
 	// multiple stake transactions before any of them are confirmed.
 	// Maps hex(validatorPubKey) → txHash of the pending stake TX.
 	stakeSenders map[string]crypto.Hash32
-	log          *slog.Logger
+	// avmSigners permits only one pending AVM transaction per signer. This
+	// prevents same-nonce floods and avoids fee-rate sorting placing nonce N+1
+	// before nonce N in a candidate block.
+	avmSigners map[[32]byte]crypto.Hash32
+	log        *slog.Logger
 	// evictionsTotal counts every transaction evicted from the pool since
 	// process start (TTL expiry, capacity-pressure fee-rate eviction, and
 	// FIFO fallback).  Exposed via /api/v1/network/stats and /metrics so
@@ -116,6 +124,7 @@ func NewMempool(cfg MempoolConfig, logger ...*slog.Logger) *Mempool {
 		entries:      make(map[crypto.Hash32]*mempoolEntry),
 		keyImages:    make(map[crypto.KeyImage]crypto.Hash32),
 		stakeSenders: make(map[string]crypto.Hash32),
+		avmSigners:   make(map[[32]byte]crypto.Hash32),
 		bannedHashes: make(map[crypto.Hash32]time.Time),
 		log:          l,
 	}
@@ -186,6 +195,9 @@ func (m *Mempool) Add(tx Transaction) error {
 
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
+	}
+	if err := m.validateAVMNonce(&tx); err != nil {
+		return err
 	}
 
 	// Full RingCT cryptographic verification (ring sigs, range proofs, Pedersen balance).
@@ -265,6 +277,14 @@ func (m *Mempool) Add(tx Transaction) error {
 				stakeSenderKey[:8], conflicting[:8])
 		}
 	}
+	var avmSigner [32]byte
+	if tx.IsAVM() {
+		avmSigner = tx.AVM.Signer
+		if conflicting, pending := m.avmSigners[avmSigner]; pending {
+			return fmt.Errorf("mempool: AVM transaction from signer %x already pending (tx %x); wait for confirmation before submitting another",
+				avmSigner[:8], conflicting[:8])
+		}
+	}
 
 	// Check for double-spend via key images
 	for _, inp := range tx.Inputs {
@@ -309,6 +329,9 @@ func (m *Mempool) Add(tx Transaction) error {
 	if stakeSenderKey != "" {
 		m.stakeSenders[stakeSenderKey] = hash
 	}
+	if avmSigner != ([32]byte{}) {
+		m.avmSigners[avmSigner] = hash
+	}
 
 	return nil
 }
@@ -322,6 +345,7 @@ func (m *Mempool) Remove(hash crypto.Hash32) {
 			delete(m.keyImages, inp.KeyImage)
 		}
 		m.removeStakeSenderLocked(entry)
+		m.removeAVMSignerLocked(entry)
 		m.totalBytes -= entry.Size
 		if m.totalBytes < 0 {
 			m.totalBytes = 0
@@ -345,6 +369,32 @@ func (m *Mempool) removeStakeSenderLocked(entry *mempoolEntry) {
 	// Only delete if the map still points to this entry's hash (not a later one).
 	if m.stakeSenders[key] == entry.Hash {
 		delete(m.stakeSenders, key)
+	}
+}
+
+func (m *Mempool) validateAVMNonce(tx *Transaction) error {
+	if tx == nil || !tx.IsAVM() || m.cfg.AVMNonceLookup == nil {
+		return nil
+	}
+	expected, err := m.cfg.AVMNonceLookup(tx.AVM.Signer)
+	if err != nil {
+		return fmt.Errorf("mempool: AVM nonce lookup failed: %w", err)
+	}
+	if tx.AVM.Nonce != expected {
+		return fmt.Errorf("mempool: AVM nonce %d, expected %d", tx.AVM.Nonce, expected)
+	}
+	return nil
+}
+
+// removeAVMSignerLocked clears the per-signer pending reservation.
+// Must be called with m.mu held for writing.
+func (m *Mempool) removeAVMSignerLocked(entry *mempoolEntry) {
+	if !entry.Tx.IsAVM() || entry.Tx.AVM == nil {
+		return
+	}
+	signer := entry.Tx.AVM.Signer
+	if m.avmSigners[signer] == entry.Hash {
+		delete(m.avmSigners, signer)
 	}
 }
 
@@ -388,6 +438,9 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
+	if err := m.validateAVMNonce(&tx); err != nil {
+		return err
+	}
 	// C1 fix: run full cryptographic verification even for privileged transactions,
 	// EXCEPT for coinbase (zero-input) transactions.  VerifyTx explicitly rejects
 	// coinbase txs to prevent external inflation attacks; engine-synthesized mints
@@ -407,6 +460,13 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	defer m.mu.Unlock()
 	if _, exists := m.entries[hash]; exists {
 		return fmt.Errorf("mempool: duplicate tx %x", hash[:8])
+	}
+	if tx.IsAVM() {
+		signer := tx.AVM.Signer
+		if conflicting, pending := m.avmSigners[signer]; pending {
+			return fmt.Errorf("mempool: AVM transaction from signer %x already pending (tx %x); wait for confirmation before submitting another",
+				signer[:8], conflicting[:8])
+		}
 	}
 	if len(m.entries) >= m.cfg.MaxSize || (m.cfg.MaxBytes > 0 && m.totalBytes+size > m.cfg.MaxBytes) {
 		m.log.Warn("mempool: capacity reached, evicting lowest-fee-rate tx (privileged add)",
@@ -428,6 +488,9 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	}
 	m.entries[hash] = entry
 	m.totalBytes += size
+	if tx.IsAVM() {
+		m.avmSigners[tx.AVM.Signer] = hash
+	}
 	return nil
 }
 
@@ -510,6 +573,7 @@ func (m *Mempool) BanTx(hash crypto.Hash32) {
 			delete(m.keyImages, inp.KeyImage)
 		}
 		m.removeStakeSenderLocked(entry)
+		m.removeAVMSignerLocked(entry)
 		m.totalBytes -= entry.Size
 		if m.totalBytes < 0 {
 			m.totalBytes = 0
@@ -578,6 +642,7 @@ func (m *Mempool) Evict() int {
 				delete(m.keyImages, inp.KeyImage)
 			}
 			m.removeStakeSenderLocked(e)
+			m.removeAVMSignerLocked(e)
 			m.totalBytes -= e.Size
 			if m.totalBytes < 0 {
 				m.totalBytes = 0
@@ -612,6 +677,7 @@ func (m *Mempool) evictOldest() bool {
 		delete(m.keyImages, inp.KeyImage)
 	}
 	m.removeStakeSenderLocked(oldest)
+	m.removeAVMSignerLocked(oldest)
 	m.totalBytes -= oldest.Size
 	if m.totalBytes < 0 {
 		m.totalBytes = 0
@@ -831,6 +897,8 @@ func (m *Mempool) evictLowestFeeRate() bool {
 	for _, inp := range cheapest.Tx.Inputs {
 		delete(m.keyImages, inp.KeyImage)
 	}
+	m.removeStakeSenderLocked(cheapest)
+	m.removeAVMSignerLocked(cheapest)
 	m.totalBytes -= cheapest.Size
 	if m.totalBytes < 0 {
 		m.totalBytes = 0

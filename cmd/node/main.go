@@ -1125,6 +1125,12 @@ func run() error {
 	mempoolCfg.RingCTCLSAGActivationHeight = cfg.Consensus.RingCTCLSAGActivationHeight
 	mempoolCfg.AVMActivationHeight = cfg.Consensus.AVMActivationHeight
 	mempoolCfg.CurrentHeight = chain.Height
+	if cfg.Consensus.AVMActivationHeight != 0 {
+		avmStateStore := avm.LevelStore{DB: db}
+		mempoolCfg.AVMNonceLookup = func(signer [32]byte) (uint64, error) {
+			return avm.SignerNonce(avmStateStore, signer)
+		}
+	}
 	mempool := core.NewMempool(mempoolCfg, log)
 
 	// Create the UTXO set here (before chain loading) so the resume path

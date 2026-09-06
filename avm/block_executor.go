@@ -161,6 +161,12 @@ func loadNonce(store Store, signer [32]byte) (uint64, error) {
 	return binary.LittleEndian.Uint64(value), nil
 }
 
+// SignerNonce returns the canonical next AVM nonce for signer. It is exported
+// for mempool admission; consensus still rechecks the nonce during execution.
+func SignerNonce(store Store, signer [32]byte) (uint64, error) {
+	return loadNonce(store, signer)
+}
+
 func encodeNonce(nonce uint64) []byte {
 	var value [8]byte
 	binary.LittleEndian.PutUint64(value[:], nonce)
