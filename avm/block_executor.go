@@ -167,6 +167,54 @@ func SignerNonce(store Store, signer [32]byte) (uint64, error) {
 	return loadNonce(store, signer)
 }
 
+// ValidateMempoolAdmission performs bounded checks against canonical AVM state.
+// Consensus repeats all checks during block execution; this is only an early
+// rejection layer to prevent known-invalid payloads from stalling a producer.
+func ValidateMempoolAdmission(store Store, payload *core.AVMPayload) error {
+	if store == nil || payload == nil {
+		return fmt.Errorf("AVM store and payload are required")
+	}
+	var code []byte
+	switch payload.Action {
+	case core.AVMDeployContract:
+		code = payload.Code
+		if _, found, err := store.Get(contractCodeKey(payload.ContractID)); err != nil {
+			return fmt.Errorf("contract lookup: %w", err)
+		} else if found {
+			return fmt.Errorf("contract already exists")
+		}
+	case core.AVMExecuteContract:
+		var found bool
+		var err error
+		code, found, err = store.Get(contractCodeKey(payload.ContractID))
+		if err != nil {
+			return fmt.Errorf("load contract: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("contract not found")
+		}
+	default:
+		return fmt.Errorf("unknown action %d", payload.Action)
+	}
+	accessList := make([]Access, len(payload.AccessList))
+	for i, access := range payload.AccessList {
+		accessList[i] = Access{Key: bytes.Clone(access.Key), Write: access.Write}
+	}
+	engine := NewEngine(NewOverlayStore(store))
+	defer engine.Close(context.Background())
+	if _, err := engine.Execute(context.Background(), ExecutionRequest{
+		ContractID: [32]byte(payload.ContractID),
+		Code:       code,
+		Entry:      payload.Entry,
+		Input:      payload.Calldata,
+		GasLimit:   payload.GasLimit,
+		AccessList: accessList,
+	}); err != nil {
+		return fmt.Errorf("execution preflight: %w", err)
+	}
+	return nil
+}
+
 func encodeNonce(nonce uint64) []byte {
 	var value [8]byte
 	binary.LittleEndian.PutUint64(value[:], nonce)

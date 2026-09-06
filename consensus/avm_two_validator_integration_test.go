@@ -247,6 +247,18 @@ func newAVMEngineNodeAtActivation(
 	n.registry = core.NewValidatorRegistry()
 	n.registry.SetUTXOSet(n.utxos)
 	n.executor = avm.NewBlockExecutor(avm.LevelStore{DB: db})
+	poolCfg := core.DefaultMempoolConfig()
+	poolCfg.CurrentHeight = n.chain.Height
+	poolCfg.RingCTV4ActivationHeight = 1
+	poolCfg.RingCTCLSAGActivationHeight = 1
+	poolCfg.AVMActivationHeight = activationHeight
+	avmStore := avm.LevelStore{DB: db}
+	poolCfg.AVMNonceLookup = func(signer [32]byte) (uint64, error) {
+		return avm.SignerNonce(avmStore, signer)
+	}
+	poolCfg.AVMAdmissionCheck = func(payload *core.AVMPayload) error {
+		return avm.ValidateMempoolAdmission(avmStore, payload)
+	}
 	n.engine = NewEngine(Config{BlockTime: time.Hour, BFTThreshold: .667, Validators: pubs,
 		Registry: n.registry, RingCTCLSAGActivationHeight: 1,
 		AVMActivationHeight: activationHeight, AVMExecutor: n.executor,
@@ -256,7 +268,7 @@ func newAVMEngineNodeAtActivation(
 				return err
 			}
 			return avm.CommitCanonicalBlock(db, block, raw, prepared)
-		}}, n.chain, core.NewMempool(core.DefaultMempoolConfig()), testNopLogger())
+		}}, n.chain, core.NewMempool(poolCfg), testNopLogger())
 	n.engine.SetTxVerifier(core.NewTxVerifier(n.utxos), n.utxos)
 	t.Cleanup(func() {
 		if n.db != nil {

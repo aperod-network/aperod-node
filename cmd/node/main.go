@@ -1130,6 +1130,9 @@ func run() error {
 		mempoolCfg.AVMNonceLookup = func(signer [32]byte) (uint64, error) {
 			return avm.SignerNonce(avmStateStore, signer)
 		}
+		mempoolCfg.AVMAdmissionCheck = func(payload *core.AVMPayload) error {
+			return avm.ValidateMempoolAdmission(avmStateStore, payload)
+		}
 	}
 	mempool := core.NewMempool(mempoolCfg, log)
 

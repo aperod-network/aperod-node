@@ -89,6 +89,22 @@ func TestMempoolAVMNonceLookupFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMempoolAVMAdmissionCheckFailsClosed(t *testing.T) {
+	var checks atomic.Int32
+	pool := avmNonceMempool(t, func([32]byte) (uint64, error) { return 0, nil })
+	pool.cfg.AVMAdmissionCheck = func(*AVMPayload) error {
+		checks.Add(1)
+		return errors.New("malformed module")
+	}
+	err := pool.Add(mempoolAVMTx(t, 0, 1))
+	if err == nil || !strings.Contains(err.Error(), "AVM admission rejected") {
+		t.Fatalf("got %v, want fail-closed admission error", err)
+	}
+	if checks.Load() != 1 || pool.Count() != 0 {
+		t.Fatalf("checks=%d count=%d, want one check and empty pool", checks.Load(), pool.Count())
+	}
+}
+
 func TestMempoolAllowsOnlyOnePendingAVMTransactionPerSigner(t *testing.T) {
 	pool := avmNonceMempool(t, func([32]byte) (uint64, error) { return 0, nil })
 	first := mempoolAVMTx(t, 0, 1)

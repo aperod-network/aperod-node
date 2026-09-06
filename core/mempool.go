@@ -48,6 +48,11 @@ type MempoolConfig struct {
 	// nodes MUST wire this when AVM is enabled so stale/future nonces are
 	// rejected before expensive RingCT verification and block selection.
 	AVMNonceLookup func([32]byte) (uint64, error)
+	// AVMAdmissionCheck performs bounded state/module checks which core cannot
+	// implement without importing the AVM package. Production nodes wire this
+	// to reject malformed modules, missing contracts and execution failures
+	// before they can stall candidate block execution.
+	AVMAdmissionCheck func(*AVMPayload) error
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -382,6 +387,11 @@ func (m *Mempool) validateAVMNonce(tx *Transaction) error {
 	}
 	if tx.AVM.Nonce != expected {
 		return fmt.Errorf("mempool: AVM nonce %d, expected %d", tx.AVM.Nonce, expected)
+	}
+	if m.cfg.AVMAdmissionCheck != nil {
+		if err := m.cfg.AVMAdmissionCheck(tx.AVM); err != nil {
+			return fmt.Errorf("mempool: AVM admission rejected: %w", err)
+		}
 	}
 	return nil
 }
