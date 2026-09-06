@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/aperod-network/aperod-node/main/.github/images/og.png" alt="Aperod APRO — privacy-first Layer-1 network" width="1280" />
+
 # APEROD · APRO
 
 **Privacy-preserving blockchain built for the real world.**
@@ -9,12 +11,23 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
-[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://aperod.com/explorer/)
-[![Telegram](https://img.shields.io/badge/Wallet-@aperod__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/aperod_bot)
+[![Explorer](https://img.shields.io/badge/Explorer-explorer.aperod.com-informational)](https://explorer.aperod.com)
+[![Telegram](https://img.shields.io/badge/Support-@sup__apro__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/sup_apro_bot)
 
-**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://aperod.com/explorer/) &nbsp;·&nbsp; [💬 Telegram Wallet](https://t.me/aperod_bot)**
+**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com) &nbsp;·&nbsp; [💬 Telegram Bot](https://t.me/sup_apro_bot)**
 
 </div>
+
+---
+
+## Official Links
+
+- 🌐 **Website:** [aperod.com](https://aperod.com)
+- 🔍 **Explorer:** [explorer.aperod.com](https://explorer.aperod.com)
+- 📊 **Live Status:** [status.aperod.com](https://status.aperod.com)
+- 🔐 **Security Log:** [explorer.aperod.com/security-reports](https://explorer.aperod.com/security-reports)
+- ⚙️ **Source Code:** [github.com/aperod-network/aperod-node](https://github.com/aperod-network/aperod-node)
+- 💬 **Telegram Bot:** [t.me/sup_apro_bot](https://t.me/sup_apro_bot)
 
 ---
 
@@ -499,8 +512,11 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) fo
 
 <div align="center">
   <sub>
-    <a href="https://aperod.com">aperod.com</a> &nbsp;·&nbsp;
-    <a href="https://t.me/aperod_bot">Telegram Wallet</a> &nbsp;·&nbsp;
-    <a href="https://aperod.com/explorer/">Block Explorer</a>
+    <a href="https://aperod.com">Website</a> &nbsp;·&nbsp;
+    <a href="https://explorer.aperod.com">Explorer</a> &nbsp;·&nbsp;
+    <a href="https://status.aperod.com">Live Status</a> &nbsp;·&nbsp;
+    <a href="https://explorer.aperod.com/security-reports">Security Log</a> &nbsp;·&nbsp;
+    <a href="https://github.com/aperod-network/aperod-node">Source Code</a> &nbsp;·&nbsp;
+    <a href="https://t.me/sup_apro_bot">Telegram Bot</a>
   </sub>
 </div>

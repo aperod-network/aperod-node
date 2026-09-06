@@ -1,20 +1,33 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/aperod-network/aperod-node/main/.github/images/og.png" alt="Aperod APRO — privacy-first Layer-1 network" width="1280" />
+
 # APEROD · APRO
 
 **Privacy-preserving blockchain built for the real world.**
 
-RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 activation-ready &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
+RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
-[![Explorer](https://img.shields.io/badge/Explorer-aperod.com-informational)](https://aperod.com/explorer/)
-[![Telegram](https://img.shields.io/badge/Wallet-@aperod__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/aperod_bot)
+[![Explorer](https://img.shields.io/badge/Explorer-explorer.aperod.com-informational)](https://explorer.aperod.com)
+[![Telegram](https://img.shields.io/badge/Support-@sup__apro__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/sup_apro_bot)
 
-**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://aperod.com/explorer/) &nbsp;·&nbsp; [💬 Telegram Wallet](https://t.me/aperod_bot)**
+**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com) &nbsp;·&nbsp; [💬 Telegram Bot](https://t.me/sup_apro_bot)**
 
 </div>
+
+---
+
+## Official Links
+
+- 🌐 **Website:** [aperod.com](https://aperod.com)
+- 🔍 **Explorer:** [explorer.aperod.com](https://explorer.aperod.com)
+- 📊 **Live Status:** [status.aperod.com](https://status.aperod.com)
+- 🔐 **Security Log:** [explorer.aperod.com/security-reports](https://explorer.aperod.com/security-reports)
+- ⚙️ **Source Code:** [github.com/aperod-network/aperod-node](https://github.com/aperod-network/aperod-node)
+- 💬 **Telegram Bot:** [t.me/sup_apro_bot](https://t.me/sup_apro_bot)
 
 ---
 
@@ -40,7 +53,7 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 activation-ready &nbsp;·&nbs
 
 | Feature | Detail |
 |---------|--------|
-| **Privacy** | RingCT with 16-member rings, Pedersen commitments, Bulletproof range proofs, and stealth addresses. CLSAG v5 is implemented and height-gated for coordinated activation |
+| **Privacy** | RingCT with 16-member rings, Pedersen commitments, Bulletproof range proofs, and stealth addresses. CLSAG v5 is active from coordinated block 1,769,500 |
 | **Stealth addresses** | Every payment generates a one-time address; receiver identity is never revealed |
 | **Telegram wallet** | Full wallet inside Telegram — create, send, receive, and stake APRO without any app download |
 | **Dynamic base-fee burn** | 100% of the protocol base fee is burned; any priority tip remains validator compensation |
@@ -62,9 +75,8 @@ The current public source contains the complete **RingCT + CLSAG v5** transactio
 - replay compatibility for historical v1–v4 transactions.
 
 CLSAG is a separate transaction version controlled by `ring_ct_clsag_activation_height`.
-The value `0` keeps v5 disabled. A non-zero height requires a coordinated validator,
-wallet, storage, and API rollout. The repository therefore distinguishes **implemented**
-from **activated on the live network**.
+The value `0` keeps v5 disabled. The live network activated v5 at coordinated block
+1,769,500 after the validator, wallet, storage, and API rollout completed.
 
 Transaction-layer privacy does not hide IP addresses, timing metadata, compromised
 wallets, exchange records, or other network/application-layer information.
@@ -305,7 +317,7 @@ aperod-node/
 |-----------|-------------------|
 | Elliptic curve | Ed25519 — `filippo.io/edwards25519` |
 | Hash function | SHA3-256 / SHA3-512 — `golang.org/x/crypto` |
-| Ring signatures | CLSAG v5, ring size 16 (height-gated); historical MLSAG formats remain replay-compatible |
+| Ring signatures | CLSAG v5, ring size 16 (active since block 1,769,500); historical MLSAG formats remain replay-compatible |
 | Commitments | Pedersen over Ed25519 |
 | Range proofs | Bulletproofs (IPA variant) |
 | HD key derivation | BIP-39 mnemonics + SLIP-0010 + Ed25519 |
@@ -500,8 +512,11 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) fo
 
 <div align="center">
   <sub>
-    <a href="https://aperod.com">aperod.com</a> &nbsp;·&nbsp;
-    <a href="https://t.me/aperod_bot">Telegram Wallet</a> &nbsp;·&nbsp;
-    <a href="https://aperod.com/explorer/">Block Explorer</a>
+    <a href="https://aperod.com">Website</a> &nbsp;·&nbsp;
+    <a href="https://explorer.aperod.com">Explorer</a> &nbsp;·&nbsp;
+    <a href="https://status.aperod.com">Live Status</a> &nbsp;·&nbsp;
+    <a href="https://explorer.aperod.com/security-reports">Security Log</a> &nbsp;·&nbsp;
+    <a href="https://github.com/aperod-network/aperod-node">Source Code</a> &nbsp;·&nbsp;
+    <a href="https://t.me/sup_apro_bot">Telegram Bot</a>
   </sub>
 </div>
