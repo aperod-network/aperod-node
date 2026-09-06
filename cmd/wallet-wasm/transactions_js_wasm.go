@@ -41,6 +41,10 @@ type wasmRequest struct {
 	FeePerByte uint64       `json:"fee_per_byte"`
 	Outputs    []wasmOutput `json:"outputs"`
 	Decoys     []wasmDecoy  `json:"decoys"`
+	// AVM carries an already locally signed payload. The fee-paying wallet
+	// remains responsible only for the RingCT inputs and never derives or
+	// receives the AVM signer's private key.
+	AVM *core.AVMPayload `json:"avm,omitempty"`
 }
 
 func wasmJSON(v js.Value, out any) error {
@@ -176,9 +180,13 @@ func localBuilder(r wasmRequest) (*core.TxBuilder, *wallet.DerivedKeys, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return core.NewTxBuilder(keys.Keys.Spend.Private, keys.Keys.View.Private, keys.Keys.Spend.Public, owned, r.FeePerByte).
+	builder := core.NewTxBuilder(keys.Keys.Spend.Private, keys.Keys.View.Private, keys.Keys.Spend.Public, owned, r.FeePerByte).
 		WithVersion(core.TxVersionCLSAG).
-		WithDecoys(decoys), keys, nil
+		WithDecoys(decoys)
+	if r.AVM != nil {
+		builder = builder.WithAVM(*r.AVM)
+	}
+	return builder, keys, nil
 }
 func scanOutputs(_ js.Value, args []js.Value) any {
 	r, err := parseRequest(args)
