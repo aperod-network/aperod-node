@@ -77,6 +77,10 @@ const (
 // 3 days × 86,400 s/day ÷ 6 s/block = 43,200 blocks.
 const PartialUnbondingBlocks uint64 = 43_200
 
+// StakeWithdrawalMaxExpiryBlocks prevents an operator authorization from
+// becoming an evergreen withdrawal signature.
+const StakeWithdrawalMaxExpiryBlocks uint64 = 100
+
 // StakePayloadSize is the fixed byte length of tx.Extra for v1 stake txs.
 // Layout: action(1) + pubkey(32) + amount_nAPR(8) + ed25519_sig(64) = 105
 // Used for StakeWithdraw and StakePartialWithdraw only.
@@ -107,6 +111,82 @@ const StakePayloadSizeV2 = 173
 // stake deposit.  V3 also permits transparent/mint outputs (TxPubKey==zero) as
 // long as the ownership proof verifies.
 const StakePayloadSizeV3 = 237
+
+// StakeWithdrawalPayloadSizeV2 is the fixed encoding for chain-bound,
+// state-bound validator withdrawal authorization.
+// Layout: action(1) + pubkey(32) + amount(8) + genesis(32) + nonce(8) +
+// generation(8) + expiry_height(8) + stake_ref(32) + ed25519_sig(64).
+const StakeWithdrawalPayloadSizeV2 = 193
+
+type StakeWithdrawalAuthorizationV2 struct {
+	Action       StakeAction
+	PubKey       crypto.ValidatorPubKey
+	Amount       uint64
+	Genesis      crypto.Hash32
+	Nonce        uint64
+	Generation   uint64
+	ExpiryHeight uint64
+	StakeRef     crypto.Hash32
+	Signature    []byte
+}
+
+func StakeReferenceV2(genesis crypto.Hash32, pub crypto.ValidatorPubKey, generation, stake uint64) crypto.Hash32 {
+	var g, s [8]byte
+	binary.BigEndian.PutUint64(g[:], generation)
+	binary.BigEndian.PutUint64(s[:], stake)
+	return crypto.HashBytes([]byte("aperod/stake-withdrawal/reference/v2"), genesis[:], pub, g[:], s[:])
+}
+
+func StakeWithdrawalSignMsgV2(a StakeWithdrawalAuthorizationV2) crypto.Hash32 {
+	var amount, nonce, generation, expiry [8]byte
+	binary.BigEndian.PutUint64(amount[:], a.Amount)
+	binary.BigEndian.PutUint64(nonce[:], a.Nonce)
+	binary.BigEndian.PutUint64(generation[:], a.Generation)
+	binary.BigEndian.PutUint64(expiry[:], a.ExpiryHeight)
+	return crypto.HashBytes([]byte("aperod/stake-withdrawal/authorization/v2"),
+		[]byte{byte(a.Action)}, a.PubKey, amount[:], a.Genesis[:], nonce[:],
+		generation[:], expiry[:], a.StakeRef[:])
+}
+
+func EncodeStakeWithdrawalExtraV2(a StakeWithdrawalAuthorizationV2) ([]byte, error) {
+	if len(a.PubKey) != 32 || len(a.Signature) != 64 {
+		return nil, fmt.Errorf("stake withdrawal v2: invalid public key or signature length")
+	}
+	if a.Action != StakeWithdraw && a.Action != StakePartialWithdraw {
+		return nil, fmt.Errorf("stake withdrawal v2: invalid action %d", a.Action)
+	}
+	b := make([]byte, StakeWithdrawalPayloadSizeV2)
+	b[0] = byte(a.Action)
+	copy(b[1:33], a.PubKey)
+	binary.BigEndian.PutUint64(b[33:41], a.Amount)
+	copy(b[41:73], a.Genesis[:])
+	binary.BigEndian.PutUint64(b[73:81], a.Nonce)
+	binary.BigEndian.PutUint64(b[81:89], a.Generation)
+	binary.BigEndian.PutUint64(b[89:97], a.ExpiryHeight)
+	copy(b[97:129], a.StakeRef[:])
+	copy(b[129:193], a.Signature)
+	return b, nil
+}
+
+func DecodeStakeWithdrawalExtraV2(extra []byte) (StakeWithdrawalAuthorizationV2, error) {
+	var a StakeWithdrawalAuthorizationV2
+	if len(extra) != StakeWithdrawalPayloadSizeV2 {
+		return a, fmt.Errorf("stake withdrawal v2: expected %d bytes, got %d", StakeWithdrawalPayloadSizeV2, len(extra))
+	}
+	a.Action = StakeAction(extra[0])
+	a.PubKey = append(crypto.ValidatorPubKey(nil), extra[1:33]...)
+	a.Amount = binary.BigEndian.Uint64(extra[33:41])
+	copy(a.Genesis[:], extra[41:73])
+	a.Nonce = binary.BigEndian.Uint64(extra[73:81])
+	a.Generation = binary.BigEndian.Uint64(extra[81:89])
+	a.ExpiryHeight = binary.BigEndian.Uint64(extra[89:97])
+	copy(a.StakeRef[:], extra[97:129])
+	a.Signature = append([]byte(nil), extra[129:193]...)
+	if a.Action != StakeWithdraw && a.Action != StakePartialWithdraw {
+		return StakeWithdrawalAuthorizationV2{}, fmt.Errorf("stake withdrawal v2: invalid action %d", a.Action)
+	}
+	return a, nil
+}
 
 // EncodeStakeExtra packs a withdraw/partial-withdraw operation into 105 bytes.
 // sig must be an ED25519 signature of StakeSignMsg(action, pub, amount).
@@ -349,6 +429,10 @@ type ValidatorEntry struct {
 	// stake deposit for ANY pubkey demotes all remaining seeded entries to
 	// ValidatorExited; a deposit for the same pubkey replaces the sentinel entirely.
 	Seeded bool `json:"seeded,omitempty"`
+	// StakeGeneration changes whenever collateral is deposited/top-upped.
+	// StakeAuthNonce changes only after a canonical v2 withdrawal.
+	StakeGeneration uint64 `json:"stake_generation"`
+	StakeAuthNonce  uint64 `json:"stake_auth_nonce"`
 }
 
 // APRStake returns the stake in whole APRO (for display).
@@ -380,10 +464,35 @@ const Phase2StartYear = 2031
 // ValidatorRegistry tracks all validator stakes and drives automatic set
 // selection.  It is thread-safe and is updated as blocks are processed.
 type ValidatorRegistry struct {
-	mu             sync.RWMutex
-	validators     map[string]*ValidatorEntry // hex(pubkey) → entry
-	dynamicMinNAPR uint64                     // 0 = use static MinStakeNAPR constant
-	utxos          *UTXOSet                   // required for C-1 UTXO-backed deposit check
+	mu                        sync.RWMutex
+	validators                map[string]*ValidatorEntry // hex(pubkey) → entry
+	dynamicMinNAPR            uint64                     // 0 = use static MinStakeNAPR constant
+	utxos                     *UTXOSet                   // required for C-1 UTXO-backed deposit check
+	stakeWithdrawalGenesis    crypto.Hash32
+	stakeWithdrawalActivation uint64
+}
+
+// ConfigureStakeWithdrawalV2 binds the registry to the quorum-attested LPoD
+// lifecycle fork. Reconfiguration is forbidden after the first binding.
+func (r *ValidatorRegistry) ConfigureStakeWithdrawalV2(genesis crypto.Hash32, activation uint64) error {
+	if genesis == (crypto.Hash32{}) || activation == 0 {
+		return fmt.Errorf("stake withdrawal v2: genesis and activation height required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stakeWithdrawalActivation != 0 &&
+		(r.stakeWithdrawalActivation != activation || r.stakeWithdrawalGenesis != genesis) {
+		return fmt.Errorf("stake withdrawal v2: conflicting activation binding")
+	}
+	r.stakeWithdrawalGenesis = genesis
+	r.stakeWithdrawalActivation = activation
+	return nil
+}
+
+func (r *ValidatorRegistry) StakeWithdrawalV2Config() (crypto.Hash32, uint64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.stakeWithdrawalGenesis, r.stakeWithdrawalActivation, r.stakeWithdrawalActivation != 0
 }
 
 // NewValidatorRegistry creates an empty registry.
@@ -405,7 +514,7 @@ func (r *ValidatorRegistry) SetUTXOSet(utxos *UTXOSet) {
 // UpdateMinStake recalculates the minimum stake from the current APRO market
 // price (in USD).  Called by the oracle price-update path on each new price.
 //
-//   minStakeNAPR = ⌈DSTTargetUSD / priceUSD × BaseUnitsPerAPR⌉
+//	minStakeNAPR = ⌈DSTTargetUSD / priceUSD × BaseUnitsPerAPR⌉
 //
 // If priceUSD ≤ 0 the dynamic threshold is cleared and the static constant
 // MinStakeNAPR is used instead (prevents division-by-zero and protects
@@ -451,6 +560,7 @@ func (r *ValidatorRegistry) InitFromGenesis(pubs []crypto.ValidatorPubKey, genes
 				StakeNAPR:       genesisStake,
 				Status:          ValidatorActive,
 				ActivationEpoch: 0,
+				StakeGeneration: 1,
 			}
 		}
 	}
@@ -480,9 +590,64 @@ func (r *ValidatorRegistry) SeedFromObservedProducers(pubs []crypto.ValidatorPub
 				Status:          ValidatorActive,
 				ActivationEpoch: 0,
 				Seeded:          true,
+				StakeGeneration: 1,
 			}
 		}
 	}
+}
+
+func (r *ValidatorRegistry) validateWithdrawalV2Locked(a StakeWithdrawalAuthorizationV2, height uint64) (*ValidatorEntry, error) {
+	if r.stakeWithdrawalActivation == 0 || height < r.stakeWithdrawalActivation {
+		return nil, fmt.Errorf("stake withdrawal v2: transaction before attested activation")
+	}
+	if a.Genesis != r.stakeWithdrawalGenesis {
+		return nil, fmt.Errorf("stake withdrawal v2: wrong chain genesis")
+	}
+	if a.ExpiryHeight < height {
+		return nil, fmt.Errorf("stake withdrawal v2: authorization expired at height %d", a.ExpiryHeight)
+	}
+	if a.ExpiryHeight-height > StakeWithdrawalMaxExpiryBlocks {
+		return nil, fmt.Errorf("stake withdrawal v2: expiry exceeds %d-block authorization window", StakeWithdrawalMaxExpiryBlocks)
+	}
+	entry, ok := r.validators[a.PubKey.Hex()]
+	if !ok || entry.Seeded {
+		return nil, fmt.Errorf("stake withdrawal v2: validator is not authentically registered")
+	}
+	if entry.StakeAuthNonce == ^uint64(0) || a.Nonce != entry.StakeAuthNonce+1 || a.Generation != entry.StakeGeneration {
+		return nil, fmt.Errorf("stake withdrawal v2: stale nonce or collateral generation")
+	}
+	wantRef := StakeReferenceV2(a.Genesis, a.PubKey, entry.StakeGeneration, entry.StakeNAPR)
+	if a.StakeRef != wantRef {
+		return nil, fmt.Errorf("stake withdrawal v2: current stake reference mismatch")
+	}
+	if !a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+		return nil, fmt.Errorf("stake withdrawal v2: invalid validator signature")
+	}
+	return entry, nil
+}
+
+func (r *ValidatorRegistry) applyWithdrawalV2Locked(a StakeWithdrawalAuthorizationV2, height uint64) error {
+	entry, err := r.validateWithdrawalV2Locked(a, height)
+	if err != nil {
+		return err
+	}
+	switch a.Action {
+	case StakeWithdraw:
+		if a.Amount != 0 {
+			return fmt.Errorf("stake withdrawal v2: full exit amount must be zero")
+		}
+		if err := r.applyWithdraw(a.PubKey.Hex(), height); err != nil {
+			return err
+		}
+	case StakePartialWithdraw:
+		if err := r.applyPartialWithdraw(a.PubKey.Hex(), a.Amount, height); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("stake withdrawal v2: invalid action")
+	}
+	entry.StakeAuthNonce = a.Nonce
+	return nil
 }
 
 // ProcessStakeTx validates and applies a stake transaction to the registry.
@@ -510,6 +675,12 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		if action == StakeDeposit {
 			return fmt.Errorf("registry: StakeDeposit requires v2 payload (173 bytes) with UTXO burn proof — v1 deposits no longer accepted (C-1 fix)")
 		}
+		r.mu.RLock()
+		legacyDisabled := r.stakeWithdrawalActivation != 0 && height >= r.stakeWithdrawalActivation
+		r.mu.RUnlock()
+		if legacyDisabled {
+			return fmt.Errorf("registry: legacy stake withdrawal disabled after attested v2 activation")
+		}
 		msg := StakeSignMsg(action, pub, amount)
 		if !pub.Verify(msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
@@ -525,6 +696,15 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		default:
 			return fmt.Errorf("registry: unknown stake action %d in v1 payload", action)
 		}
+
+	case StakeWithdrawalPayloadSizeV2:
+		a, err := DecodeStakeWithdrawalExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.applyWithdrawalV2Locked(a, height)
 
 	// ── v2: UTXO-backed deposit (stealth outputs only) ────────────────────────
 	case StakePayloadSizeV2:
@@ -682,6 +862,9 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 		if action == StakeDeposit {
 			return nil, fmt.Errorf("StakeDeposit requires v2 payload (C-1 fix)")
 		}
+		if r.stakeWithdrawalActivation != 0 && height >= r.stakeWithdrawalActivation {
+			return nil, fmt.Errorf("legacy stake withdrawal disabled after attested v2 activation")
+		}
 		msg := StakeSignMsg(action, pub, amount)
 		if !pub.Verify(msg, sig) {
 			return nil, fmt.Errorf("invalid stake signature from %s", pub.ID())
@@ -695,6 +878,13 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 		default:
 			return nil, fmt.Errorf("unknown stake action %d", action)
 		}
+
+	case StakeWithdrawalPayloadSizeV2:
+		a, err := DecodeStakeWithdrawalExtraV2(tx.Extra)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r.applyWithdrawalV2Locked(a, height)
 
 	case StakePayloadSizeV2:
 		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
@@ -893,13 +1083,17 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 		effectiveMin = MinStakeNAPR
 	}
 	type shadowEntry struct {
-		stakeNAPR uint64
-		status    ValidatorStatus
+		stakeNAPR  uint64
+		status     ValidatorStatus
+		generation uint64
+		nonce      uint64
+		seeded     bool
 	}
 	snapshot := make(map[string]shadowEntry, len(r.validators))
 	for k, v := range r.validators {
-		snapshot[k] = shadowEntry{stakeNAPR: v.StakeNAPR, status: v.Status}
+		snapshot[k] = shadowEntry{stakeNAPR: v.StakeNAPR, status: v.Status, generation: v.StakeGeneration, nonce: v.StakeAuthNonce, seeded: v.Seeded}
 	}
+	withdrawalGenesis, withdrawalActivation := r.stakeWithdrawalGenesis, r.stakeWithdrawalActivation
 	r.mu.RUnlock()
 
 	// Per-block reservation: burn UTXOs claimed by earlier txs in this block.
@@ -927,6 +1121,9 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 			}
 			if action == StakeDeposit {
 				return fmt.Errorf("stake tx[%d]: StakeDeposit requires v2 payload with UTXO proof (C-1 fix)", i)
+			}
+			if withdrawalActivation != 0 && height >= withdrawalActivation {
+				return fmt.Errorf("stake tx[%d]: legacy withdrawal disabled after attested v2 activation", i)
 			}
 			msg := StakeSignMsg(action, pub, amount)
 			if !pub.Verify(msg, sig) {
@@ -967,6 +1164,41 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 			default:
 				return fmt.Errorf("stake tx[%d]: unknown action %d", i, action)
 			}
+
+		case StakeWithdrawalPayloadSizeV2:
+			a, err := DecodeStakeWithdrawalExtraV2(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: %w", i, err)
+			}
+			if withdrawalActivation == 0 || height < withdrawalActivation || a.Genesis != withdrawalGenesis ||
+				a.ExpiryHeight < height || a.ExpiryHeight-height > StakeWithdrawalMaxExpiryBlocks ||
+				!a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+				return fmt.Errorf("stake tx[%d]: invalid, expired, cross-chain, or pre-activation v2 withdrawal", i)
+			}
+			key := a.PubKey.Hex()
+			se, known := snapshot[key]
+			if !known || se.seeded || se.nonce == ^uint64(0) || a.Nonce != se.nonce+1 || a.Generation != se.generation ||
+				a.StakeRef != StakeReferenceV2(a.Genesis, a.PubKey, se.generation, se.stakeNAPR) {
+				return fmt.Errorf("stake tx[%d]: stale validator nonce, generation, or stake reference", i)
+			}
+			switch a.Action {
+			case StakeWithdraw:
+				if a.Amount != 0 || se.status == ValidatorUnbonding || se.status == ValidatorExited {
+					return fmt.Errorf("stake tx[%d]: invalid full v2 withdrawal state or amount", i)
+				}
+				se.status = ValidatorUnbonding
+			case StakePartialWithdraw:
+				if a.Amount == 0 || a.Amount >= se.stakeNAPR || se.status == ValidatorUnbonding || se.status == ValidatorExited {
+					return fmt.Errorf("stake tx[%d]: invalid partial v2 withdrawal", i)
+				}
+				remaining := se.stakeNAPR - a.Amount
+				if remaining < effectiveMin {
+					return fmt.Errorf("stake tx[%d]: partial v2 withdrawal leaves stake below minimum", i)
+				}
+				se.stakeNAPR = remaining
+			}
+			se.nonce = a.Nonce
+			snapshot[key] = se
 
 		// ── v2: UTXO-backed deposit (stealth outputs only) ───────────────
 		case StakePayloadSizeV2:
@@ -1031,10 +1263,14 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 					if se.stakeNAPR > math.MaxUint64-amount {
 						return fmt.Errorf("stake tx[%d]: stake top-up overflow", i)
 					}
+					if se.generation == ^uint64(0) {
+						return fmt.Errorf("stake tx[%d]: collateral generation exhausted", i)
+					}
 					se.stakeNAPR += amount
+					se.generation++
 				}
 			} else {
-				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending}
+				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending, generation: 1}
 			}
 			reserved[uk] = i
 			snapshot[key] = se
@@ -1103,17 +1339,20 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 					if se.stakeNAPR > math.MaxUint64-amount {
 						return fmt.Errorf("stake tx[%d]: stake top-up overflow", i)
 					}
+					if se.generation == ^uint64(0) {
+						return fmt.Errorf("stake tx[%d]: collateral generation exhausted", i)
+					}
 					se.stakeNAPR += amount
+					se.generation++
 				}
 			} else {
-				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending}
+				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending, generation: 1}
 			}
 			reserved[uk] = i
 			snapshot[key] = se
 
 		default:
-			return fmt.Errorf("stake tx[%d]: invalid extra length %d (expected %d, %d, or %d)",
-				i, len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
+			return fmt.Errorf("stake tx[%d]: invalid extra length %d", i, len(tx.Extra))
 		}
 	}
 	return nil
@@ -1148,6 +1387,20 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 		msg := StakeSignMsg(action, pub, amount)
 		if !pub.Verify(msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
+		}
+		return nil
+
+	case StakeWithdrawalPayloadSizeV2:
+		a, err := DecodeStakeWithdrawalExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		r.mu.RLock()
+		genesis := r.stakeWithdrawalGenesis
+		enabled := r.stakeWithdrawalActivation != 0
+		r.mu.RUnlock()
+		if !enabled || a.Genesis != genesis || !a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+			return fmt.Errorf("registry: invalid or unconfigured stake withdrawal v2 authorization")
 		}
 		return nil
 
@@ -1282,6 +1535,10 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 		if err != nil {
 			return fmt.Errorf("replay: %w", err)
 		}
+		if r.stakeWithdrawalActivation != 0 && height >= r.stakeWithdrawalActivation &&
+			(action == StakeWithdraw || action == StakePartialWithdraw) {
+			return fmt.Errorf("replay: legacy withdrawal after attested v2 activation at height %d", height)
+		}
 		msg := StakeSignMsg(action, pub, amount)
 		if !pub.Verify(msg, sig) {
 			return fmt.Errorf("replay: invalid stake sig from %s at height %d", pub.ID(), height)
@@ -1299,6 +1556,16 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 		default:
 			return fmt.Errorf("replay: unknown stake action %d at height %d", action, height)
 		}
+
+	case StakeWithdrawalPayloadSizeV2:
+		a, err := DecodeStakeWithdrawalExtraV2(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		if err := r.applyWithdrawalV2Locked(a, height); err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		return nil
 
 	case StakePayloadSizeV2:
 		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, err := DecodeStakeExtraV2(tx.Extra)
@@ -1408,6 +1675,10 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 				existing.Seeded = false
 				existing.UnbondEndBlock = 0
 				existing.UnbondingQueue = nil
+				existing.StakeGeneration++
+				if existing.StakeGeneration == 0 {
+					existing.StakeGeneration = 1
+				}
 			} else {
 				// Top-up: increase stake — checked addition prevents uint64 overflow.
 				if existing.StakeNAPR > math.MaxUint64-amount {
@@ -1415,7 +1686,11 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 						float64(existing.StakeNAPR)/float64(BaseUnitsPerAPR),
 						float64(amount)/float64(BaseUnitsPerAPR))
 				}
+				if existing.StakeGeneration == ^uint64(0) {
+					return fmt.Errorf("stake collateral generation exhausted")
+				}
 				existing.StakeNAPR += amount
+				existing.StakeGeneration++
 			}
 			// Any real deposit (same pubkey) also clears remaining seeded sentinels.
 			r.demoteSeededLocked()
@@ -1429,6 +1704,7 @@ func (r *ValidatorRegistry) applyDeposit(key string, pub crypto.ValidatorPubKey,
 		StakeNAPR:       amount,
 		Status:          ValidatorPending,
 		ActivationEpoch: epoch + 1, // earliest: next epoch
+		StakeGeneration: 1,
 	}
 	// Any real deposit (new pubkey) clears all remaining seeded sentinels.
 	r.demoteSeededLocked()
@@ -1653,4 +1929,3 @@ func (r *ValidatorRegistry) Count() (active, total int) {
 	}
 	return
 }
-

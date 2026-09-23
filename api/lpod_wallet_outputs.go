@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package api

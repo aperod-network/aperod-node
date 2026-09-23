@@ -53,6 +53,10 @@ type MempoolConfig struct {
 	// to reject malformed modules, missing contracts and execution failures
 	// before they can stall candidate block execution.
 	AVMAdmissionCheck func(*AVMPayload) error
+	// StakeAdmissionCheck performs canonical registry/UTXO validation at the
+	// next inclusion height. Production nodes must wire this before accepting
+	// P2P/API traffic or restoring a persisted pool.
+	StakeAdmissionCheck func(Transaction, uint64) error
 }
 
 // DefaultMempoolConfig returns sensible production defaults.
@@ -147,6 +151,15 @@ func (m *Mempool) SetBaseFee(baseFeePerByte uint64) {
 	m.mu.Unlock()
 }
 
+// SetStakeAdmissionCheck installs the canonical stake preflight. The callback
+// is always invoked without holding the mempool lock, avoiding registry/UTXO ↔
+// mempool lock inversion.
+func (m *Mempool) SetStakeAdmissionCheck(check func(Transaction, uint64) error) {
+	m.mu.Lock()
+	m.cfg.StakeAdmissionCheck = check
+	m.mu.Unlock()
+}
+
 // NextSpendVersion returns the RingCT format that can be included in the next
 // block under the configured activation policy.
 func (m *Mempool) NextSpendVersion() TxVersion {
@@ -169,7 +182,7 @@ func (m *Mempool) NextSpendVersion() TxVersion {
 // Add attempts to add a transaction to the mempool.
 // Returns an error if the tx is invalid, duplicate, too large, or a double-spend.
 func (m *Mempool) Add(tx Transaction) error {
-if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
+	if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
 		return fmt.Errorf("mempool: guardian fund transaction is consensus-synthesized only")
 	}
 	// Security: coinbase (zero-input) transactions are synthesized exclusively
@@ -224,7 +237,7 @@ if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
 
 	// Stake transactions are fee-exempt:
 	// stake = validator deposit/withdrawal (protocol-level, not ring-sig tx)
-if !tx.IsStake() && !tx.IsLPoDPosition() {
+	if !tx.IsStake() && !tx.IsLPoDPosition() {
 		m.mu.RLock()
 		baseFee := m.cfg.BaseFeePerByte
 		m.mu.RUnlock()
@@ -250,6 +263,48 @@ if !tx.IsStake() && !tx.IsLPoDPosition() {
 
 	hash := tx.Hash()
 
+	var stakeSenderKey string
+	if tx.IsStake() {
+		stakePub, err := stakeExtraPubKey(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("mempool: malformed stake extra: %w", err)
+		}
+		stakeSenderKey = stakePub.Hex()
+		m.mu.RLock()
+		check := m.cfg.StakeAdmissionCheck
+		currentHeight := m.cfg.CurrentHeight
+		m.mu.RUnlock()
+		if check == nil && currentHeight != nil {
+			return fmt.Errorf("mempool: canonical stake admission unavailable")
+		}
+		height := uint64(0)
+		if currentHeight != nil {
+			height = currentHeight()
+			if height < ^uint64(0) {
+				height++
+			}
+		}
+		if check != nil {
+			if err := check(tx, height); err != nil {
+				return fmt.Errorf("mempool: stale or invalid stake transaction: %w", err)
+			}
+			// A canonical state transition may have made an older pending stake
+			// transaction stale before RemoveBlock reached this pool. Revalidate
+			// it without holding m.mu; if stale, release its reservation so the
+			// validator's valid next nonce/deposit can replace it.
+			m.mu.RLock()
+			pendingHash, pending := m.stakeSenders[stakeSenderKey]
+			pendingEntry := m.entries[pendingHash]
+			m.mu.RUnlock()
+			if pending && pendingEntry != nil {
+				pendingTx := pendingEntry.Tx
+				if err := check(pendingTx, height); err != nil {
+					m.Remove(pendingHash)
+				}
+			}
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -273,13 +328,7 @@ if !tx.IsStake() && !tx.IsLPoDPosition() {
 	//
 	// stakeExtraPubKey handles both v1 (105-byte withdraw) and v2 (173-byte
 	// deposit) payloads — the pubkey occupies bytes [1:33] in both layouts.
-	var stakeSenderKey string
 	if tx.IsStake() {
-		stakePub, err := stakeExtraPubKey(tx.Extra)
-		if err != nil {
-			return fmt.Errorf("mempool: malformed stake extra: %w", err)
-		}
-		stakeSenderKey = stakePub.Hex()
 		if conflicting, pending := m.stakeSenders[stakeSenderKey]; pending {
 			return fmt.Errorf("mempool: stake tx from validator %s already pending (tx %x); wait for confirmation before submitting another",
 				stakeSenderKey[:8], conflicting[:8])
@@ -416,7 +465,7 @@ func (m *Mempool) removeAVMSignerLocked(entry *mempoolEntry) {
 // v3 (237-byte deposit with one-time-key ownership proof — F-049 fix) layouts.
 // In all three cases the 32-byte pubkey occupies bytes [1:33].
 func stakeExtraPubKey(extra []byte) (crypto.ValidatorPubKey, error) {
-	if len(extra) != StakePayloadSize && len(extra) != StakePayloadSizeV2 && len(extra) != StakePayloadSizeV3 {
+	if len(extra) != StakePayloadSize && len(extra) != StakeWithdrawalPayloadSizeV2 && len(extra) != StakePayloadSizeV2 && len(extra) != StakePayloadSizeV3 {
 		return nil, fmt.Errorf("stake extra: expected %d or %d bytes, got %d",
 			StakePayloadSize, StakePayloadSizeV2, len(extra))
 	}
@@ -448,7 +497,7 @@ func (m *Mempool) Get(hash crypto.Hash32) (Transaction, bool) {
 // Never call from P2P handlers or public API routes — use Add() for those.
 // All other guards (size, duplicate, double-spend) still apply.
 func (m *Mempool) AddPrivileged(tx Transaction) error {
-if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
+	if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
 		return fmt.Errorf("mempool: guardian fund transaction is never admitted")
 	}
 	if err := tx.Validate(); err != nil {
@@ -892,7 +941,7 @@ func (m *Mempool) evictLowestFeeRate() bool {
 	var cheapest *mempoolEntry
 	var cheapestRate uint64
 	for _, e := range m.entries {
-if e.Tx.IsCoinbase() || e.Tx.IsStake() || e.Tx.IsLPoDPosition() {
+		if e.Tx.IsCoinbase() || e.Tx.IsStake() || e.Tx.IsLPoDPosition() {
 			continue
 		}
 		sz := uint64(e.Size)

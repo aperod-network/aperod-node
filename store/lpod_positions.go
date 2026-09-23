@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package store
@@ -33,6 +33,12 @@ type LPoDPosition struct {
 	Due          uint64                  `json:"due_napro,string"`
 	APRCarry     uint64                  `json:"apr_carry,string"`
 	Withdrawn    uint64                  `json:"withdrawn_napro,string"`
+	// EffectiveVault is set only after a consensus-driven reassignment. The
+	// original signed Deposit.Vault remains immutable so the owner's existing
+	// withdrawal authorization continues to verify.
+	EffectiveVault *crypto.Point32 `json:"effective_vault,omitempty"`
+	RouteHeight    uint64          `json:"route_height,omitempty"`
+	AutoReturned   bool            `json:"auto_returned,omitempty"`
 }
 
 // LPoDWithdrawalAmount validates the signed request against remaining principal.
@@ -68,6 +74,20 @@ func lpodAdd(a, b uint64) (uint64, error) {
 func lpodPositionID(a core.LPoDPositionAction) string { return hex.EncodeToString(a.PositionID[:]) }
 func lpodVaultID(a core.LPoDPositionAction) string    { return hex.EncodeToString(a.Vault[:]) }
 
+// LPoDEffectiveVault returns the current accounting destination without
+// changing the immutable validator identity signed into the deposit.
+func LPoDEffectiveVault(p LPoDPosition) crypto.Point32 {
+	if p.EffectiveVault != nil {
+		return *p.EffectiveVault
+	}
+	return p.Deposit.Vault
+}
+
+func lpodPositionVaultID(p LPoDPosition) string {
+	v := LPoDEffectiveVault(p)
+	return hex.EncodeToString(v[:])
+}
+
 func (c *LPoDCheckpoint) validatePositions() error {
 	var locked, due uint64
 	if len(c.Positions) > LPoDMaxPositions {
@@ -76,10 +96,15 @@ func (c *LPoDCheckpoint) validatePositions() error {
 	for id, p := range c.Positions {
 		if id != lpodPositionID(p.Deposit) || p.Deposit.Action != core.LPoDDeposit || p.Deposit.Nonce != 0 ||
 			p.Deposit.WithdrawAmount != 0 || p.Deposit.Amount == 0 || p.Withdrawn > p.Deposit.Amount ||
-			p.Returned != (p.Withdrawn == p.Deposit.Amount) || (p.Nonce == 0) != (p.Withdrawn == 0) ||
+			p.Returned != (p.Withdrawn == p.Deposit.Amount) ||
+			(!p.AutoReturned && (p.Nonce == 0) != (p.Withdrawn == 0)) ||
+			(p.AutoReturned && !p.Returned) ||
 			p.APRCarry >= lpodAPRDenominator || (p.UnlockHeight == 0) != (!p.Returned) ||
 			p.UnlockHeight > c.State.LastHeight {
 			return fmt.Errorf("lpod: corrupt canonical position")
+		}
+		if p.EffectiveVault != nil && (*p.EffectiveVault == p.Deposit.Vault || p.RouteHeight == 0 || p.RouteHeight > c.State.LastHeight) {
+			return fmt.Errorf("lpod: corrupt effective vault route")
 		}
 		var err error
 		if !p.Returned {
@@ -106,19 +131,19 @@ func (c *LPoDCheckpoint) validatePositions() error {
 // future APR while any remaining principal continues accruing. Withdrawal
 // preserves earned arrears and pays in its canonical block. Validator unbonding is unchanged. Every vault accrues,
 // regardless of this block's proposer.
-func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSettlement) (*LPoDCheckpoint, []lpod.Vault, error) {
+func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSettlement) (*LPoDCheckpoint, []lpod.Vault, map[string]string, error) {
 	if before.Allocation == nil {
-		return nil, nil, fmt.Errorf("lpod: positions require reconciled allocation")
+		return nil, nil, nil, fmt.Errorf("lpod: positions require reconciled allocation")
 	}
 	if err := before.validatePositions(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	parent, err := d.readLPoDCanonicalBlock(height - 1)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if parent.Hash() != r.Parent || r.Timestamp <= parent.Header.Timestamp {
-		return nil, nil, fmt.Errorf("lpod: nonmonotonic or noncanonical accrual clock")
+		return nil, nil, nil, fmt.Errorf("lpod: nonmonotonic or noncanonical accrual clock")
 	}
 	elapsed := uint64(r.Timestamp - parent.Header.Timestamp)
 	if elapsed > LPoDMaxElapsedNS {
@@ -128,6 +153,7 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 	next.Positions = make(map[string]LPoDPosition, len(before.Positions))
 	vaultIDs := map[string]bool{r.Proposer: true}
 	totals := map[string]uint64{}
+	entitlementVault := map[string]string{}
 	for id, p := range before.Positions {
 		// Fully closed positions no longer occupy capacity. Reopening their
 		// deposit still requires its already-spent, cryptographically linked KI.
@@ -135,37 +161,41 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 			continue
 		}
 		next.Positions[id] = p
-		v := lpodVaultID(p.Deposit)
+		v := lpodPositionVaultID(p)
+		entitlementVault[id] = v
 		vaultIDs[v] = true
 		if p.UnlockHeight == 0 {
 			totals[v], err = lpodAdd(totals[v], p.Deposit.Amount-p.Withdrawn)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
 	accrual := map[string]uint64{}
 	arrears := map[string]uint64{}
 	for id, p := range next.Positions {
-		v := lpodVaultID(p.Deposit)
+		v := lpodPositionVaultID(p)
 		arrears[v], err = lpodAdd(arrears[v], p.Due)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		stake := r.Stake[v]
+		if prior := r.PreviousStake[v]; !stake.Active && prior.Active {
+			stake = prior
+		}
 		if p.UnlockHeight != 0 || !stake.Active {
 			continue
 		}
 		total, err := lpodAdd(stake.Amount, totals[v])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if total > 100_000_000*lpod.Unit {
 			total = 100_000_000 * lpod.Unit
 		}
 		tier, err := lpod.TierFor(total)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		n := new(big.Int).SetUint64(p.Deposit.Amount - p.Withdrawn)
 		n.Mul(n, new(big.Int).SetUint64(tier.APRPercent))
@@ -174,16 +204,16 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 		q, rem := new(big.Int), new(big.Int)
 		q.QuoRem(n, new(big.Int).SetUint64(lpodAPRDenominator), rem)
 		if !q.IsUint64() {
-			return nil, nil, fmt.Errorf("lpod: accrued liability overflow")
+			return nil, nil, nil, fmt.Errorf("lpod: accrued liability overflow")
 		}
 		p.APRCarry = rem.Uint64()
 		p.Due, err = lpodAdd(p.Due, q.Uint64())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		accrual[v], err = lpodAdd(accrual[v], q.Uint64())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		next.Positions[id] = p
 	}
@@ -194,55 +224,55 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 		}
 		a, err := tx.LPoDPositionAction()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if a.Genesis != before.Allocation.Genesis {
-			return nil, nil, fmt.Errorf("lpod: position belongs to another chain")
+			return nil, nil, nil, fmt.Errorf("lpod: position belongs to another chain")
 		}
 		id, v := lpodPositionID(*a), lpodVaultID(*a)
 		switch a.Action {
 		case core.LPoDDeposit:
 			if _, exists := next.Positions[id]; exists || len(next.Positions) >= LPoDMaxPositions {
-				return nil, nil, fmt.Errorf("lpod: replayed deposit or position capacity reached")
+				return nil, nil, nil, fmt.Errorf("lpod: replayed deposit or position capacity reached")
 			}
 			stake := r.Stake[v]
 			if !stake.Active {
-				return nil, nil, fmt.Errorf("lpod: deposits require an active authenticated validator")
+				return nil, nil, nil, fmt.Errorf("lpod: deposits require an active authenticated validator")
 			}
 			total, err := lpodAdd(stake.Amount, totals[v])
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			total, err = lpodAdd(total, a.Amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			tier, err := lpod.TierFor(total)
 			if err != nil || a.Amount < tier.MinimumDeposit {
-				return nil, nil, fmt.Errorf("lpod: deposit outside vault tier limits")
+				return nil, nil, nil, fmt.Errorf("lpod: deposit outside vault tier limits")
 			}
 			next.Positions[id] = LPoDPosition{Deposit: *a}
 			next.PrincipalDeposited, err = lpodAdd(next.PrincipalDeposited, a.Amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			next.PrincipalLocked, err = lpodAdd(next.PrincipalLocked, a.Amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			totals[v], err = lpodAdd(totals[v], a.Amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			vaultIDs[v] = true
 		case core.LPoDWithdraw:
 			p, exists := next.Positions[id]
 			if !exists {
-				return nil, nil, fmt.Errorf("lpod: unknown or replayed withdrawal")
+				return nil, nil, nil, fmt.Errorf("lpod: unknown or replayed withdrawal")
 			}
 			amount, err := LPoDWithdrawalAmount(p, *a)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			p.Nonce++
 			p.Withdrawn += amount
@@ -253,11 +283,84 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 			next.PrincipalLocked -= amount
 			next.PrincipalReturned, err = lpodAdd(next.PrincipalReturned, amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
-			totals[v] -= amount
+			effective := lpodPositionVaultID(p)
+			totals[effective] -= amount
 			next.Positions[id] = p
 		}
+	}
+	// Apply lifecycle routing after signed operations. A deposit targeting a
+	// validator that exits in this block was already rejected above; an owner's
+	// withdrawal wins over an automatic route/refund, preventing double return.
+	positionIDs := make([]string, 0, len(next.Positions))
+	for id := range next.Positions {
+		positionIDs = append(positionIDs, id)
+	}
+	sort.Strings(positionIDs)
+	const minValidator = 100_000 * lpod.Unit
+	sourceBeforeTotals := make(map[string]uint64, len(totals))
+	for source, guardian := range totals {
+		previous := r.PreviousStake[source]
+		sourceBeforeTotals[source], err = lpodAdd(previous.Amount, guardian)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	ranked := LPoDEligibleVaults(r.Stake, totals)
+	eligible := make(map[string]bool, len(ranked))
+	for _, vault := range ranked {
+		eligible[vault.ID] = true
+	}
+	for _, id := range positionIDs {
+		p := next.Positions[id]
+		if p.Returned {
+			continue
+		}
+		source := lpodPositionVaultID(p)
+		sourceStake := r.Stake[source]
+		if sourceStake.Active && sourceStake.Amount >= minValidator {
+			continue
+		}
+		sourceBefore := sourceBeforeTotals[source]
+		remaining := p.Deposit.Amount - p.Withdrawn
+		best, err := lpodRouteDestination(source, sourceBefore, remaining, r.Stake, totals, eligible)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		totals[source] -= remaining
+		if best == "" {
+			p.Withdrawn = p.Deposit.Amount
+			p.Returned = true
+			p.AutoReturned = true
+			p.UnlockHeight = height
+			next.PrincipalLocked -= remaining
+			next.PrincipalReturned, err = lpodAdd(next.PrincipalReturned, remaining)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			next.Positions[id] = p
+			continue
+		}
+		raw, err := hex.DecodeString(best)
+		if err != nil || len(raw) != 32 {
+			return nil, nil, nil, fmt.Errorf("lpod: invalid lifecycle destination")
+		}
+		var destination crypto.Point32
+		copy(destination[:], raw)
+		if destination == p.Deposit.Vault {
+			p.EffectiveVault = nil
+			p.RouteHeight = 0
+		} else {
+			p.EffectiveVault = &destination
+			p.RouteHeight = height
+		}
+		next.Positions[id] = p
+		totals[best], err = lpodAdd(totals[best], remaining)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		vaultIDs[best] = true
 	}
 	ids := make([]string, 0, len(vaultIDs))
 	for id := range vaultIDs {
@@ -269,18 +372,21 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 	priorTotals := map[string]uint64{}
 	for _, p := range before.Positions {
 		if p.UnlockHeight == 0 {
-			v := lpodVaultID(p.Deposit)
+			v := lpodPositionVaultID(p)
 			priorTotals[v], err = lpodAdd(priorTotals[v], p.Deposit.Amount-p.Withdrawn)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
 	for _, id := range ids {
 		stake := r.Stake[id]
+		if prior := r.PreviousStake[id]; !stake.Active && prior.Active {
+			stake = prior
+		}
 		total, err := lpodAdd(stake.Amount, priorTotals[id])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !stake.Active || total < 100_000*lpod.Unit {
 			total = 100_000 * lpod.Unit
@@ -295,17 +401,17 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 		}
 		if id == r.Proposer {
 			if !stake.Active {
-				return nil, nil, fmt.Errorf("lpod: proposer has no authenticated active stake")
+				return nil, nil, nil, fmt.Errorf("lpod: proposer has no authenticated active stake")
 			}
 			v.ActualIncome = LPoDRewardFor(before.Allocation.ValidatorRemaining)
 		}
 		vaults = append(vaults, v)
 	}
-	return &next, vaults, nil
+	return &next, vaults, entitlementVault, nil
 }
 
 func (d *DB) previewPositions(before *LPoDCheckpoint, height uint64, r *LPoDSettlement) (*LPoDCheckpoint, []lpod.Payment, error) {
-	next, vaults, err := d.positionTransition(before, height, r)
+	next, vaults, entitlementVault, err := d.positionTransition(before, height, r)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -327,7 +433,7 @@ func (d *DB) previewPositions(before *LPoDCheckpoint, height uint64, r *LPoDSett
 		var due uint64
 		for _, id := range ids {
 			p := next.Positions[id]
-			if lpodVaultID(p.Deposit) == payment.VaultID {
+			if entitlementVault[id] == payment.VaultID {
 				due, err = lpodAdd(due, p.Due)
 				if err != nil {
 					return nil, nil, err
@@ -337,7 +443,7 @@ func (d *DB) previewPositions(before *LPoDCheckpoint, height uint64, r *LPoDSett
 		left := payment.Angels
 		for _, id := range ids {
 			p := next.Positions[id]
-			if lpodVaultID(p.Deposit) != payment.VaultID || p.Due == 0 {
+			if entitlementVault[id] != payment.VaultID || p.Due == 0 {
 				continue
 			}
 			q := new(big.Int).Mul(new(big.Int).SetUint64(left), new(big.Int).SetUint64(p.Due))
@@ -378,7 +484,7 @@ func (d *DB) PayoutLPoD(height uint64, r *LPoDSettlement, after *LPoDCheckpoint,
 			return core.Transaction{}, err
 		}
 	}
-	accrued, _, err := d.positionTransition(base, height, r)
+	accrued, _, _, err := d.positionTransition(base, height, r)
 	if err != nil {
 		return core.Transaction{}, err
 	}

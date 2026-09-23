@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package store
@@ -39,7 +39,11 @@ type LPoDSettlement struct {
 	Proposer         string
 	Leader           crypto.Address
 	Stake            map[string]LPoDValidatorStake
-	Transactions     []core.Transaction
+	// PreviousStake is the registry snapshot before stake operations in this
+	// block. It is used only to rank deterministic destinations when a vault
+	// loses canonical eligibility; it is never a second source of funds.
+	PreviousStake map[string]LPoDValidatorStake
+	Transactions  []core.Transaction
 }
 
 func lpodKey(hash crypto.Hash32) []byte {
@@ -67,7 +71,7 @@ func (d *DB) lpodCheckpoint(hash crypto.Hash32) (*LPoDCheckpoint, error) {
 		if drawn > a.InitialValidatorRemaining {
 			drawn = a.InitialValidatorRemaining
 		}
-		if a.Version != 1 || a.InitialValidatorRemaining > 2_000_000_000*lpod.Unit ||
+		if a.Version != 1 || a.PositionLifecycleVersion != 1 || a.InitialValidatorRemaining > 2_000_000_000*lpod.Unit ||
 			a.HistoricalIssued > 9_000_000_000*lpod.Unit-a.InitialValidatorRemaining-lpod.InitialNAPRO ||
 			a.Remaining != 9_000_000_000*lpod.Unit-a.InitialValidatorRemaining-a.HistoricalIssued-lpod.InitialNAPRO ||
 			a.FundingHeight == 0 || c.State.LastHeight < a.FundingHeight ||

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- Copyright (c) web3 Aperod APRO team -->
+
 # LPoD: a guide to positions, rewards, withdrawals, and activation
 
 LPoD is an Aperod protocol subsystem developed and owned by the web3
@@ -6,20 +9,13 @@ with a selected validator vault, accrue validator-linked rewards, and
 request the return of some or all of that principal.
 This guide uses the protocol name without inventing an acronym expansion.
 
-**Production status: disabled by default; not funded or activated by this
-repository.** The code, a wallet control, or an API capability flag is not
-evidence that the 1B APRO reserve exists on the production chain.
-An approved reconciliation, validator attestations, coordinated upgrade,
-canonical activation block, and appropriate deployment authorization are required.
-
 **Guardian principal is liquid reserved principal, not validator bonded stake.**
 A valid full or partial Guardian withdrawal creates its refund in the same
 canonical block that includes the request. There is no Guardian unbonding period.
 The validator's own stake retains its separate validator-protocol lock.
 
 This document describes implemented rules and current integration boundaries.
-It is not a promise of yield, production readiness, or an instruction to activate
-an unapproved fork. Software permissions are described at the end.
+Operator prerequisites are in section 11; authorship and licensing are at the end.
 
 ## 1. The problem LPoD addresses
 
@@ -78,6 +74,73 @@ Full validator withdrawal still uses `UnbondingBlocks = 144000`;
 the separate partial-validator withdrawal rule uses `43200` blocks.
 Neither waiting period applies to a Guardian position.
 
+### Validator operator proof and locally authorized exits
+
+Validator management is separate from Guardian ownership. A connected wallet
+session or a typed validator public key alone does not prove possession of a
+validator signing key. The account flow requests a short-lived challenge bound
+to the wallet session, wallet identity/address, validator public key, chain
+anchor, challenge ID, and expiry. The operator signs its domain-separated
+`aperod/validator-session/v1` message locally, then uploads only the signed proof.
+An accepted possession proof enables the session's operator controls; it is
+not a stake-withdrawal signature and does not bypass canonical eligibility.
+
+For an authorized operator using the matching account integration:
+
+1. Connect the wallet session, choose the validator, and download the possession
+   challenge. Check the displayed identity and chain before signing locally:
+
+   ```sh
+   aperod validator prove-session --challenge challenge.json --key-file validator.key --out proof.json
+   ```
+
+2. Upload `proof.json` to that same session. The private `validator.key` file
+   stays on the operator's machine; never upload it, paste it into the website,
+   or send it to the backend.
+3. Choose a full or exact partial validator withdrawal, review the consequences,
+   and download the separate exit challenge. Sign it locally:
+
+   ```sh
+   aperod validator approve-lpod-exit --challenge exit.json --key-file validator.key --out signed-exit.json
+   ```
+
+4. Review the CLI's action, validator, exact nAPRO amount, current collateral,
+   chain, nonce, generation, and expiry. Its interactive confirmation requires
+   `EXIT ` followed by the last eight characters of the validator public key.
+   Cancellation creates no approval. Upload only `signed-exit.json`, containing
+   the signed transaction, for submission through the bound session.
+5. Follow canonical inclusion and the actual unbonding queue. Submission is
+   not confirmation, and an expired or stale challenge needs fresh material.
+
+The v2 withdrawal authorization is a **193-byte payload**, not a new Guardian
+transaction version. Its signed hash uses
+`aperod/stake-withdrawal/authorization/v2` and binds action, validator public
+key, exact amount, chain genesis, next nonce, collateral generation, expiry
+height, and stake reference. The reference separately binds genesis, validator,
+generation, and current collateral under
+`aperod/stake-withdrawal/reference/v2`. This prevents an old approval from
+authorizing a different chain, changed collateral, or another nonce.
+
+At inclusion height `H`, expiry must satisfy `H <= expiry_height <= H + 100`.
+The maximum is **100 blocks**, not a wall-clock promise. The registry checks the
+current reference and generation, the next nonce, authentic registration, and
+the signature again; merely uploading well-formed JSON grants no authority.
+
+A full validator withdrawal enters unbonding with an end height of
+`inclusion_height + 144000`. A partial withdrawal queues the requested portion
+until `inclusion_height + 43200`; it must leave enough validator collateral and
+can retain the validator's active/pending status. Do not interpret a generic
+exit warning as a guarantee that all rewards on eligible remaining collateral
+cease after every partial withdrawal. Actual eligibility and subsequent
+canonical lifecycle transitions control routing and rewards.
+These block-height rules are authoritative; estimated dates are not.
+
+At the attested lifecycle activation, legacy unbound validator withdrawal
+authorization is disabled. The new authorization does not remove either
+validator cooldown or impose one on Guardians. Implementation:
+[shared validator staking](core/staking.go) and
+[local operator CLI](cmd/cli/main.go).
+
 ## 3. Choosing a validator and entering a vault
 
 Use current canonical validator and position data, not a remembered UI total.
@@ -131,6 +194,55 @@ Crossing a threshold changes the applicable tier.
 No automatic post-2088 percentage change is inferred from projections.
 
 Source of truth: [tier definitions and accounting](lpod/accounting.go).
+
+### When the selected validator exits
+
+A position keeps its original signed `Deposit`, including `Deposit.Vault`,
+source identity, owner, and beneficiary. A separate **effective vault** records
+where its remaining principal is currently accounted. `store.LPoDEffectiveVault`
+resolves that current destination; a reassignment never rewrites the owner's
+original signature or creates another deposit.
+
+When the effective validator exits, becomes inactive, or falls below the
+100,000 APRO validator minimum, the canonical transition handles the remaining
+principal as follows:
+
+1. Apply valid owner-signed operations first. A full withdrawal leaves nothing
+   to reroute or refund again; after a partial withdrawal, only the remainder
+   is considered. New deposits targeting a validator exiting in that same
+   block are rejected.
+2. Build the eligible top-21 view from canonically active, minimum-stake
+   validators, ranked by validator stake plus effective Guardian principal.
+   Equal combined totals use ascending validator public-key order.
+3. Process affected positions in ascending position-ID order. Select the
+   eligible destination with the nearest **equal or lower combined total**
+   relative to the source's pre-exit comparison total. This comparison uses
+   the source validator's previous stake plus the remaining Guardian totals
+   after signed operations, before automatic routing.
+4. Require that the entire remaining position fits without exceeding the
+   destination's 100M APRO cap. Equal destination totals use ascending
+   public-key order. Earlier routes update destination totals and capacity
+   before later positions are considered; positions are never split.
+5. If a destination qualifies, update the effective route and its height.
+   Otherwise, return the entire remaining principal through a real protocol
+   payout in that same canonical block. This automatic refund reduces locked
+   principal, not the APR reserve, and preserves earned unpaid `Due`.
+
+The exit-block entitlement remains associated with the prior effective route;
+later accrual follows the new route and its applicable tier. A route change
+does not erase accrued rewards, reset source ownership, or require a new
+owner signature. Existing withdrawal authorization continues to refer to the
+original signed deposit and the next position nonce.
+
+The top-21 view is **LPoD vault eligibility and display ranking, not a BFT
+quorum or grant of block-signing authority**. Effective Guardian totals must
+exclude returned principal and group live positions by their effective route,
+not by the original `Deposit.Vault`. See
+[ranking and effective totals](store/lpod_vault_rank.go) and
+[canonical position transitions](store/lpod_positions.go).
+The storage helpers are `LPoDEligibleVaults` and
+`LPoDCheckpoint.LPoDEffectiveGuardianTotals`; these views must not be
+substituted for the consensus validator signing set.
 
 ## 4. Accrual and the settlement waterfall
 
@@ -253,7 +365,8 @@ It does require the Guardian owner's valid signature and canonical position stat
 
 For a native withdrawal:
 
-- Keep the original deposit/source identity, owner, beneficiary, and vault unchanged.
+- Keep the original deposit/source identity, owner, beneficiary, and signed
+  deposit vault unchanged, even if the effective accounting route has changed.
 - Use `Nonce = current position nonce + 1`.
 - Set `withdraw_amount_napro` to a positive requested partial amount,
   or omit it/use zero to request all remaining principal.
@@ -344,7 +457,8 @@ by this LPoD builder.
 Wallet reserved totals must come from canonical positions:
 
 - Per owner: sum remaining principal for that beneficiary.
-- Per vault: validator self-stake plus remaining Guardian principal in that vault.
+- Per vault: validator self-stake plus remaining Guardian principal currently
+  assigned to that effective vault, including canonical reassignments.
 - Network Guardian total: canonical `PrincipalLocked`.
 - Spendable funds: eligible discovered outputs, excluding consumed and pending-spent sources.
 
@@ -367,8 +481,7 @@ The full-workspace integration test has passed with an initially empty SQL
 wallet index, the actual WASM signer/scanner, and a native test chain:
 deposit, partial refund, rollback/replay, rewards, full refund, ordinary
 version-5 spending, and a version-9 redeposit.
-This is integration evidence, not a production activation or multi-node
-finality claim.
+This is integration evidence, not a multi-node finality claim.
 
 The current wallet scan has a **4,096-native-output bound**.
 Exceeding it returns an explicit error, rather than silently truncating a
@@ -376,7 +489,7 @@ balance or claiming unlimited scalability.
 This per-wallet scan bound is distinct from the protocol's position capacity.
 An old activated store without the wallet-index readiness marker requires
 canonical replay from activation; an index-not-ready error is not proof of
-an empty wallet. Production has not been activated by this work.
+an empty wallet.
 Verify deployment of the matching node, WASM bundle, discovery integration,
 and index together before relying on a deployed wallet.
 
@@ -462,6 +575,16 @@ It becomes a spendable wallet output only through an authorized funded payout.
 
 ## 11. Historical reconciliation and activation
 
+Production funding and activation have not been performed by this work.
+An approved reconciliation, trusted-validator attestations, coordinated
+compatible upgrade, canonical activation block, and appropriate deployment
+authorization remain prerequisites. Code, wallet controls, API capabilities,
+and passing tests are not evidence of a funded production reserve.
+Before enabling validator exit controls, verify that the deployed account
+gateway and CLI consume the exact node authorization fields below, require
+the active canonical proof, and obey the advertised expiry-height bounds.
+Stale field aliases or longer-lived challenges are not compatible approvals.
+
 There is no self-declared “set pool to 1B” configuration path.
 The witness must cover every historical coinbase output in canonical order
 through activation height minus one, with amount openings verified against
@@ -482,9 +605,17 @@ This remains an explicit governance trust boundary requiring independent review.
 The `LPoDMigration` JSON fields are:
 
 ```text
-version, height, genesis, reconciliation_root, openings, body_root,
+version, position_lifecycle_version, height, genesis,
+reconciliation_root, openings, body_root,
 historical_issued_napro, validator_remaining_napro, attestations
 ```
+
+The current signed migration requires `position_lifecycle_version = 1`.
+This explicitly authorizes deterministic effective-vault reassignment and
+same-block automatic principal refunds when no destination qualifies.
+The lifecycle version is part of the validator-attested migration message;
+it is not an unsigned wallet preference or an optional local routing toggle.
+An older witness without the required version cannot authorize these rules.
 
 Each opening contains `height`, `tx_index`, `output_index`,
 `amount_napro`, and `blind`.
@@ -503,8 +634,8 @@ They must not be re-created by guessing JSON field order or hash algorithms.
 
 ### Conceptual activation checklist
 
-1. Obtain required written software/deployment permissions separately from
-   chain governance approval.
+1. Confirm the software license, deployment plan, and chain governance approval.
+   Apache 2.0 does not itself activate LPoD on a network.
 2. Review the implementation, consensus change, threat model, and wallet path.
    Exercise independent multi-node acceptance, restart, rollback, and discovery.
 3. Agree on the exact chain/genesis and an activation checkpoint.
@@ -532,7 +663,7 @@ No complete reconciliation-generation/attestation CLI is supplied.
 The existing `cmd/mintblind` utility is a limited legacy mint-candidate tool,
 not a migration tool; its floating-point argument path is not an appropriate
 source of exact funding arithmetic.
-This guide intentionally supplies no fake witness, private-key command,
+This guide intentionally supplies no fake witness, key-export instruction,
 remote-validator access procedure, or bypass of a failed verification.
 
 ## 12. Public node API
@@ -583,10 +714,50 @@ Active data additionally exposes `chain_anchor` and eligible `vaults`.
 Each position has `id`, `vault`, `principal_napro` (remaining),
 `returned_napro` (cumulative), `due_napro`, `nonce`, and
 `deposit_action_json` (the already-public original native action).
+It also exposes `effective_vault`, `route_height`, and `auto_returned`.
+Both `vault` and `effective_vault` identify the current accounting destination;
+`deposit_action_json` retains the original signed vault and remains the
+authorization source. `auto_returned` identifies the no-destination lifecycle
+refund, not an unfunded promise of future principal.
 Rows are sorted by position ID.
 Vault rows include `id`, `total_napro`, `minimum_napro`,
 `apr_percent`, and `leader_percent`.
 Clients must still allow the node to revalidate eligibility at inclusion.
+
+### Validator registry authorization contract
+
+`GET /api/v1/validators` and
+`GET /api/v1/validators/{pubkey}/unbonding` expose the validator authorization
+material. Preserve the exact spelling and types; do not invent compatibility
+aliases or derive an authorization from floating-point APRO displays.
+
+| Field | Encoding and meaning |
+| --- | --- |
+| `stake_napr` | Decimal string: current validator collateral in nAPRO; the existing field spelling is intentional. |
+| `stake_generation` | Decimal string: collateral generation. |
+| `stake_auth_nonce` | Decimal string: last accepted authorization nonce. |
+| `stake_auth_next_nonce` | Decimal string: required next nonce; empty if the counter is exhausted. |
+| `stake_reference` | Hex-encoded current v2 stake reference. |
+| `stake_auth_genesis` | Hex-encoded configured chain genesis. |
+| `stake_auth_activation_height` | Decimal string: configured attested activation height. |
+| `stake_auth_current_height` | Decimal string: current canonical height used for the response. |
+| `stake_auth_expiry_min_height` | Decimal string: earliest advertised next-block expiry height. |
+| `stake_auth_expiry_max_height` | Decimal string: upper advertised expiry bound for that next-block window. |
+| `stake_withdrawal_v2_active` | Boolean: the node's current canonical activation/finality checks passed. |
+
+The expiry bounds start at the next height and extend by at most 100 blocks,
+with integer-overflow handling. Clients must refresh stale material rather than
+substitute a longer authorization period. Keep all nonce, generation, height,
+and monetary arithmetic exact.
+
+`stake_withdrawal_v2_active` is not merely “this binary supports v2.”
+It requires matching registry configuration and lifecycle-version-1 migration,
+the activation height to have been reached, a matching canonical funded
+checkpoint/allocation and reconciliation root, exact-tip finality, and a stable
+tip through the check. Missing evidence leaves it false. Conversely, true
+does not prove that a website visitor possesses the validator key: the local
+session proof and separately signed exit are still required.
+See [REST registration and projections](api/rest.go).
 
 ### Payout discovery and spent-source checks
 
@@ -645,10 +816,11 @@ Its publication rule concerns the exact current tip.
 A new tip may not yet have the required finality evidence.
 Do not substitute stale values and label them current finality.
 
-**Does this prevent every possible fork or unauthorized deployment?**
+**Does this prevent every possible fork or uncoordinated deployment?**
 No. Consensus validation, governance trust, local security, operational
 coordination, and software licensing are distinct boundaries.
-The implementation does not make hostile forks logically impossible.
+Apache 2.0 permits forks under its terms, and the implementation does not make
+hostile or incompatible forks logically impossible.
 
 ## 14. Developer map and verification
 
@@ -662,6 +834,7 @@ The source inventory below also uses public-root paths.
 | Checkpoint transaction | [core/lpod.go](core/lpod.go) |
 | Tiers, rounding, reward conservation | [lpod/accounting.go](lpod/accounting.go) |
 | Position transitions, partial returns, arrears | [store/lpod_positions.go](store/lpod_positions.go) |
+| Effective-vault totals, top-21 ranking, deterministic destinations | [store/lpod_vault_rank.go](store/lpod_vault_rank.go) |
 | Checkpoint persistence and payout validation | [store/lpod.go](store/lpod.go) |
 | Historical allocation proof and attestations | [store/lpod_migration.go](store/lpod_migration.go) |
 | Canonical preparation and stateful filtering | [consensus/lpod.go](consensus/lpod.go) |
@@ -676,7 +849,7 @@ The source inventory below also uses public-root paths.
 Use the signing/validation helpers rather than copying an API balance into
 a transaction and expecting ownership to follow.
 
-For an appropriately authorized development environment, relevant checks are:
+For a development environment, relevant checks are:
 
 ```sh
 go test ./lpod ./store ./core ./config ./consensus ./api ./cmd/node ./avm ./node -count=1
@@ -684,8 +857,8 @@ go test ./cmd/wallet-wasm -run LPoD -count=1
 go test -race ./lpod ./store ./consensus -run 'LPoD|Arrears' -count=1
 ```
 
-The complete WASM/discovery integration can be reproduced, from the Go root
-**within the authorized full development workspace**, with:
+The complete WASM/discovery integration can be reproduced from the Go root,
+within a full development workspace that includes the integration harness, with:
 
 ```sh
 LPOD_WASM_E2E=1 go test ./consensus -run TestLPoDCanonicalWalletPayoutDiscovery -count=1 -v
@@ -703,31 +876,43 @@ See [position integration tests](consensus/lpod_positions_test.go),
 [finality regressions](consensus/lpod_finality_test.go),
 [local signer tests](cmd/wallet-wasm/lpod_test.go), and
 [wallet discovery tests](consensus/lpod_wallet_discovery_test.go).
+Lifecycle regressions are in
+[ranking and routing tests](store/lpod_vault_rank_test.go) and
+[validator-exit integration tests](consensus/lpod_lifecycle_test.go):
+deterministic reassignment, preserved owner authorization, and a real
+spendable principal refund when no destination qualifies.
 Tests cover real deposits/refunds and ordinary spending, partial exits/topups,
 APR boundaries, replay/overdraw rejection, restart/rollback, and preserved
 validator unbonding. Depleted-reserve and API projection fixtures explicitly
 isolate arithmetic/projection cases; they are not authentic production witnesses.
-Passing tests do not replace independent multi-node validation or authorization.
+Passing tests do not replace independent multi-node validation or chain
+governance review.
 
-## 15. Software approval is not protocol activation
+## 15. Software licensing is not protocol activation
 
-Prior explicit written approval under [LICENSE-LPOD](LICENSE-LPOD) concerns
-developer activities such as execution, development, deployment, forking, or
-reuse of Covered Code. It is separate from an end user's supported transaction
-on an authorized deployment and separate from any chain-level activation.
-Requests must use the verified official route
-[@sup_apro_bot](https://t.me/sup_apro_bot); a request or automated response is
-not approval. Issued permissions will be published in the official
-[Aperod LPoD permission registry](https://aperod.com/vaults#lpod-permissions), which
-currently records no permissions. Publication does not expand an approval
-beyond its identified recipient, Covered Code, permitted activity, or other
-stated terms.
+The LPoD source code and tests are licensed under
+[Apache License 2.0](LICENSE). That license permits use, modification, and
+distribution under its terms without separate prior approval from the Aperod
+APRO team. It does not activate LPoD on a chain, supply a reconciliation
+witness, satisfy validator attestations, or replace deployment and governance
+review.
 
-## 16. Exact Covered Code inventory
+This guide and other original LPoD documentation are licensed under
+[Creative Commons Attribution 4.0 International](LICENSE-DOCS). When reusing
+licensed documentation, provide the attribution and other notices required by
+CC BY 4.0. The official project attribution is published at
+[aperod.com/vaults#lpod-authorship](https://aperod.com/vaults#lpod-authorship).
 
-Covered Code is limited to the original copyrightable source-code expression
-of the Aperod APRO team in the following **27 public-repository paths**, each marked
-with `SPDX-License-Identifier: LicenseRef-Aperod-LPoD`:
+Neither license claims ownership of LPoD as an abstract idea, method, algorithm,
+or protocol concept. Independently developed clean-room implementations are not
+restricted by these notices, and no attribution is required merely for using an
+idea rather than licensed Aperod code or documentation.
+
+## 16. LPoD source map and authorship
+
+The web3 Aperod APRO team authored the original LPoD implementation represented
+by the following **31 public-repository paths**. Each dedicated file is marked
+with `SPDX-License-Identifier: Apache-2.0`:
 
 - `api/lpod_pool.go`
 - `api/lpod_pool_test.go`
@@ -740,11 +925,13 @@ with `SPDX-License-Identifier: LicenseRef-Aperod-LPoD`:
 - `cmd/wallet-wasm/lpod_test.go`
 - `consensus/lpod.go`
 - `consensus/lpod_finality_test.go`
+- `consensus/lpod_lifecycle_test.go`
 - `consensus/lpod_positions_test.go`
 - `consensus/lpod_test.go`
 - `consensus/lpod_wallet_discovery_test.go`
 - `core/lpod.go`
 - `core/lpod_position.go`
+- `core/stake_withdrawal_v2_test.go`
 - `lpod/accounting.go`
 - `lpod/accounting_test.go`
 - `lpod/arrears_test.go`
@@ -755,29 +942,29 @@ with `SPDX-License-Identifier: LicenseRef-Aperod-LPoD`:
 - `store/lpod_positions.go`
 - `store/lpod_positions_test.go`
 - `store/lpod_test.go`
+- `store/lpod_vault_rank.go`
+- `store/lpod_vault_rank_test.go`
 - `store/lpod_wallet_index.go`
 
-The inventory does **not** cover shared files merely modified to call LPoD,
-documentation, unrelated Aperod code, dependencies, generated code, or
-third-party material. If any inventoried file contains such material,
-[LICENSE-LPOD](LICENSE-LPOD) applies only to the original portions owned by the
-applicable copyright holder.
+This is an attribution and navigation map, not a boundary that removes Apache
+2.0 permissions from shared repository files. Dependencies, generated code,
+and third-party material remain subject to their own terms. Shared staking,
+registry REST, and CLI files remain under the repository's applicable licensing;
+the v2 authorization and operator-flow changes do not make them original
+dedicated LPoD files.
 
-## 17. License boundary
+## 17. Attribution and compatibility notice
 
-The Aperod APRO team has not issued permission to execute, develop, deploy,
-fork, distribute, or reuse Covered Code. Prior explicit written approval is
-required for every such use. All rights not expressly granted for inspection
-are reserved.
+**Code and tests:** Apache License 2.0, with the web3 Aperod APRO team copyright
+notice retained as required by the license. See [LICENSE](LICENSE).
 
-Issued permissions will be recorded at
-[aperod.com/vaults#lpod-permissions](https://aperod.com/vaults#lpod-permissions).
-The registry is currently empty. A registry listing is not a general license
-and does not authorize use outside the recipient and scope stated in the
-written approval.
+**This guide and original LPoD documentation:** Creative Commons Attribution
+4.0 International. See [LICENSE-DOCS](LICENSE-DOCS). A suggested attribution is:
+"LPoD documentation by the web3 Aperod APRO team, licensed under CC BY 4.0,"
+with a link to the source and license and an indication of changes when required.
 
-The root Apache License 2.0 applies separately to non-Covered Code identified
-under it. Dependencies and third-party material remain subject to their own
-terms. `LICENSE-LPOD` claims no ownership of abstract ideas, methods, protocol
-concepts, or independently developed code; it governs only the designated
-original copyrightable expression. See [NOTICE](NOTICE).
+The former restrictive `LICENSE-LPOD` notice is superseded for the current
+release by the Apache 2.0 code license and CC BY 4.0 documentation license.
+These current licenses are permissive grants governed by their own terms; they
+do not require prior written Aperod approval. See [NOTICE](NOTICE) and the
+official [LPoD authorship section](https://aperod.com/vaults#lpod-authorship).

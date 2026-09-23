@@ -179,7 +179,7 @@ func (tx *Transaction) Hash() crypto.Hash32 {
 // replay, except for the explicitly distinct Guardian protocol allocation.
 // Coinbase transactions skip ring signature and range proof requirements.
 func (tx *Transaction) IsCoinbase() bool {
-return tx != nil && len(tx.Inputs) == 0 && !tx.IsGuardianFund() && !tx.IsLPoD() && !tx.IsLPoDPosition() && !tx.IsLPoDPayout()
+	return tx != nil && len(tx.Inputs) == 0 && !tx.IsGuardianFund() && !tx.IsLPoD() && !tx.IsLPoDPosition() && !tx.IsLPoDPayout()
 }
 
 // IsStake returns true if this is a validator stake deposit or withdrawal.
@@ -207,14 +207,22 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("tx version 0 is invalid")
 	}
 	switch tx.Version {
-case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout:
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
 
-	if tx.IsLPoD() { return tx.validateLPoD() }
-if tx.IsLPoDPosition() { _,err:=tx.LPoDPositionAction();return err }
-if tx.IsLPoDPayout() { _,err:=tx.LPoDPayoutAuthorization();return err }
+	if tx.IsLPoD() {
+		return tx.validateLPoD()
+	}
+	if tx.IsLPoDPosition() {
+		_, err := tx.LPoDPositionAction()
+		return err
+	}
+	if tx.IsLPoDPayout() {
+		_, err := tx.LPoDPayoutAuthorization()
+		return err
+	}
 	if tx.IsAVM() {
 		if len(tx.Extra) != 0 {
 			return fmt.Errorf("avm transaction must not use Extra")
@@ -250,7 +258,7 @@ if tx.IsLPoDPayout() { _,err:=tx.LPoDPayoutAuthorization();return err }
 	// v3 payload (237 bytes): StakeDeposit with UTXO burn proof + one-time-key ownership proof (F-049 fix)
 	if tx.IsStake() {
 		extraLen := len(tx.Extra)
-		if extraLen != StakePayloadSize && extraLen != StakePayloadSizeV2 && extraLen != StakePayloadSizeV3 {
+		if extraLen != StakePayloadSize && extraLen != StakeWithdrawalPayloadSizeV2 && extraLen != StakePayloadSizeV2 && extraLen != StakePayloadSizeV3 {
 			return fmt.Errorf("stake tx: extra must be %d bytes (withdraw) or %d bytes (deposit), got %d",
 				StakePayloadSize, StakePayloadSizeV2, extraLen)
 		}
@@ -373,8 +381,12 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 	if tx == nil {
 		return fmt.Errorf("nil transaction")
 	}
-	if tx.IsLPoD() { return tx.validateLPoD() } // Engine enforces activation and exact digest.
-if tx.IsLPoDPosition() || tx.IsLPoDPayout() {return tx.Validate()}
+	if tx.IsLPoD() {
+		return tx.validateLPoD()
+	} // Engine enforces activation and exact digest.
+	if tx.IsLPoDPosition() || tx.IsLPoDPayout() {
+		return tx.Validate()
+	}
 
 	// Stake transactions do not use the legacy spend proof that APD-002
 	// replaces.  Keep them valid across the activation boundary.

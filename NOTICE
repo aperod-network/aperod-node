@@ -1,46 +1,50 @@
-Aperod APRO repository licensing notice
+Aperod APRO repository licensing and attribution notice
 
-This repository contains material under more than one set of terms.
+1. Source code and tests
 
-1. Apache-licensed repository material
+Source code and tests in this repository, including the original LPoD
+implementation authored by the web3 Aperod APRO team, are licensed under
+Apache License 2.0. See LICENSE and:
 
-The root Apache License 2.0 governs non-LPoD repository material identified
-under it. It does not govern files designated as Covered Code under
-LICENSE-LPOD.
+https://www.apache.org/licenses/LICENSE-2.0
 
-2. Original LPoD code
+The dedicated LPoD files use `SPDX-License-Identifier: Apache-2.0` and retain
+the web3 Aperod APRO team copyright notice.
 
-Only the original copyrightable LPoD source-code expression in files expressly
-inventoried in LPOD.md and marked
-`SPDX-License-Identifier: LicenseRef-Aperod-LPoD` is Covered Code.
-LICENSE-LPOD is source-available and inspection-only, not open source. The
-Aperod APRO team has not issued permission to execute, develop, deploy, fork,
-distribute, or reuse Covered Code; prior explicit written approval is required.
-All rights not expressly granted for inspection are reserved.
+2. LPoD documentation
 
-Issued permissions will be published in the official registry at
-https://aperod.com/vaults#lpod-permissions. The registry is currently empty. A listing
-does not authorize anyone outside the recipient, Covered Code, activity, or
-other scope stated in the written approval.
+LPOD.md and other original LPoD documentation identified by the project are
+licensed under Creative Commons Attribution 4.0 International. See
+LICENSE-DOCS and:
 
-3. Third-party material
+https://creativecommons.org/licenses/by/4.0/
 
-Third-party software, generated material, and dependencies remain subject to
-their own notices and licenses. Inclusion in an LPoD-related file does not
-convert third-party material into Covered Code.
+Suggested attribution:
 
-LICENSE-LPOD claims no ownership of abstract ideas, methods, protocol concepts,
-or independently developed code. It governs only the designated original
-copyrightable expression.
+"LPoD documentation by the web3 Aperod APRO team, licensed under CC BY 4.0."
 
-4. No technical access control claim
+Provide the source and license links and indicate changes when required by
+CC BY 4.0.
 
-Repository visibility can allow technical copying or forking. Visibility is not
-permission, and these notices do not claim to prevent those actions
-cryptographically.
+3. Authorship scope
 
-Verified route for requesting prior written LPoD software approval:
-https://t.me/sup_apro_bot
+The official LPoD authorship section is:
 
-Official registry for issued LPoD permissions:
-https://aperod.com/vaults#lpod-permissions
+https://aperod.com/vaults#lpod-authorship
+
+Authorship identifies the published Aperod implementation and documentation.
+It does not claim ownership of abstract ideas, methods, algorithms, facts, or
+protocol concepts. Independently developed clean-room implementations are not
+restricted. Attribution is not required merely for using an idea; it applies
+only as required by the applicable license when Aperod code or documentation
+is used.
+
+4. Compatibility and third-party terms
+
+LICENSE-LPOD is now a compatibility notice explaining that the former
+restrictive LPoD notice does not govern the current release. The current code
+grant is Apache 2.0 and the current original-documentation grant is CC BY 4.0,
+each governed by its published terms and requiring no separate prior approval.
+
+Dependencies, generated material, and third-party material remain subject to
+their own licenses and notices.

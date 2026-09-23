@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package consensus
@@ -57,7 +57,7 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 	if err := db.CommitRawBlockWithAVM(parent.Hash(), 1, raw, nil, crypto.Hash32{}); err != nil {
 		t.Fatal(err)
 	}
-	m := &store.LPoDMigration{Version: 1, Height: 2, Genesis: g.Hash()}
+	m := &store.LPoDMigration{Version: 1, PositionLifecycleVersion: 1, Height: 2, Genesis: g.Hash()}
 	m.BodyRoot = store.LPoDBodyRootStep(store.LPoDBodyRootStep(crypto.HashBytes([]byte("aperod/lpod/historical-bodies/v1")), g), parent)
 	m.ValidatorRemaining = 2_000_000_000*lpod.Unit - 3*lpod.Unit
 	m.TrustedValidators = []crypto.ValidatorPubKey{pub}

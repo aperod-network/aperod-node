@@ -5,6 +5,7 @@ package consensus
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,8 +34,8 @@ type AdminMintRecordStore interface {
 // Config holds PoA consensus parameters.
 type Config struct {
 	LPoDMigration *store.LPoDMigration
-	BlockTime    time.Duration
-	BFTThreshold float64 // fraction of validators needed to finalize (e.g. 0.667)
+	BlockTime     time.Duration
+	BFTThreshold  float64 // fraction of validators needed to finalize (e.g. 0.667)
 	// Validators is the bootstrap list from genesis (used to seed the Registry).
 	// After startup the active set is managed by Registry.
 	Validators []crypto.ValidatorPubKey
@@ -140,10 +141,10 @@ type FinalizeMsg struct {
 // Engine is the PoA consensus engine.
 type Engine struct {
 	lpodFinalizedHashes map[uint64]crypto.Hash32
-	cfg   Config
-	chain *core.Chain
-	pool  *core.Mempool
-	log   *slog.Logger
+	cfg                 Config
+	chain               *core.Chain
+	pool                *core.Mempool
+	log                 *slog.Logger
 
 	mu sync.Mutex
 	// votes collected for each block hash: pubkey hex → signature
@@ -293,10 +294,15 @@ const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
-	if cfg.LPoDMigration!=nil {
-		m:=*cfg.LPoDMigration
-		m.TrustedValidators=append([]crypto.ValidatorPubKey(nil),cfg.Validators...)
-		cfg.LPoDMigration=&m
+	if cfg.LPoDMigration != nil {
+		m := *cfg.LPoDMigration
+		m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), cfg.Validators...)
+		cfg.LPoDMigration = &m
+		if cfg.Registry != nil && m.PositionLifecycleVersion == 1 {
+			if err := cfg.Registry.ConfigureStakeWithdrawalV2(m.Genesis, m.Height); err != nil {
+				log.Error("stake withdrawal v2 activation binding failed", "err", err)
+			}
+		}
 	}
 	adminMintStore := cfg.AdminMintStore
 	if adminMintStore == nil && cfg.Store != nil {
@@ -324,6 +330,10 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 	if cfg.Registry != nil && len(cfg.Validators) > 0 {
 		genesisStake := core.MinStakeNAPR * 10 // genesis validators credited 10× min
 		cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
+	}
+	if err := e.restoreFinalityCertificate(); err != nil {
+		e.halted.Store(true)
+		log.Warn("finality certificate not restored; finality remains fail-closed", "err", err)
 	}
 	// ── Staking pool initialisation ──────────────────────────────────────────
 	if cfg.StakingPoolNAPR > 0 {
@@ -447,8 +457,8 @@ func (e *Engine) DecrementPool(height uint64) {
 	if e.lpodActive(height) && e.store != nil {
 		// The validator debit and LPoD credit already committed in the same
 		// block batch. Refresh RAM only; never deduct the reward a second time.
-		if c,err:=e.store.LoadLPoDCheckpoint();err==nil && c!=nil && c.Allocation!=nil {
-			atomic.StoreInt64(&e.stakingPoolRemaining,int64(c.Allocation.ValidatorRemaining))
+		if c, err := e.store.LoadLPoDCheckpoint(); err == nil && c != nil && c.Allocation != nil {
+			atomic.StoreInt64(&e.stakingPoolRemaining, int64(c.Allocation.ValidatorRemaining))
 		}
 		return
 	}
@@ -1021,7 +1031,9 @@ func validateCoinbasePolicy(block *core.Block) error {
 // RingCT activation is deliberately not consulted here: it governs transfer
 // proofs and fee rules, not whether the configured validator reward exists.
 func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
-	if e.lpodActive(block.Header.Height){return e.validateLPoD(block)}
+	if e.lpodActive(block.Header.Height) {
+		return e.validateLPoD(block)
+	}
 	if err := validateCoinbasePolicy(block); err != nil {
 		return err
 	}
@@ -1092,7 +1104,7 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 	var totalAVMGas uint64
 	for i := range block.Txs {
 		tx := &block.Txs[i]
-if tx.IsCoinbase() || tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() {
+		if tx.IsCoinbase() || tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() {
 			continue
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
@@ -1150,9 +1162,9 @@ func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
 		return core.InitialBaseFeePerByte
 	}
 	if e.lpodActive(height) {
-		parent:=e.chain.Tip()
-		if parent!=nil && parent.Header.Height+1==height {
-			return nextBaseFee(parent.Header.BaseFee,parent.Size())
+		parent := e.chain.Tip()
+		if parent != nil && parent.Header.Height+1 == height {
+			return nextBaseFee(parent.Header.BaseFee, parent.Size())
 		}
 	}
 	return e.expectedBaseFee()
@@ -1417,7 +1429,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 					"hash", h)
 				continue
 			}
-if rewardAuthorizationActive {
+			if rewardAuthorizationActive {
 				e.log.Warn("produceBlock: dropping privileged legacy mint after reward authorization activation",
 					"hash", h, "height", height)
 				e.pool.Remove(h)
@@ -1488,6 +1500,25 @@ if rewardAuthorizationActive {
 		}
 		txs = screened
 	}
+	if e.cfg.Registry != nil {
+		screened := make([]core.Transaction, 0, len(txs))
+		stakePrefix := make([]core.Transaction, 0)
+		for i := range txs {
+			tx := txs[i]
+			if tx.IsStake() {
+				probe := append(append([]core.Transaction(nil), stakePrefix...), tx)
+				if err := e.cfg.Registry.ValidateBlockStakeTxs(probe, height); err != nil {
+					e.log.Warn("produceBlock: evicting stale stake transaction",
+						"hash", tx.Hash(), "height", height, "err", err)
+					e.pool.Remove(tx.Hash())
+					continue
+				}
+				stakePrefix = append(stakePrefix, tx)
+			}
+			screened = append(screened, tx)
+		}
+		txs = screened
+	}
 
 	// EIP-1559–style 100% base-fee burn: fees are NOT forwarded to the
 	// validator — they are destroyed upon block finalization by never
@@ -1542,8 +1573,10 @@ if rewardAuthorizationActive {
 
 	// Once reward authorization is active, the local address only selects where
 	var positionErr error
-	txs,positionErr=e.filterLPoDPositions(txs,height)
-	if positionErr!=nil{return nil,positionErr}
+	txs, positionErr = e.filterLPoDPositions(txs, height)
+	if positionErr != nil {
+		return nil, positionErr
+	}
 
 	// Once reward authorization is active, the local address only selects where
 	// this proposer wants to be paid. Peers validate its exact signed value from
@@ -1625,7 +1658,6 @@ if rewardAuthorizationActive {
 		txs[index] = guardian
 	}
 
-
 	// Read the last price fetched by the background oracle goroutine.
 	// This is an atomic load — never blocks on network I/O.
 	oraclePrice := atomic.LoadUint64(&e.cachedOraclePrice)
@@ -1640,15 +1672,20 @@ if rewardAuthorizationActive {
 		OraclePrice:  oraclePrice,
 		BaseFee:      currentBaseFee,
 	}
-if e.lpodActive(height) {
-	draft:=&core.Block{Header:header,Txs:txs}
-	r,c,payments,err:=e.prepareLPoD(draft,crypto.Address(e.cfg.RewardAddress))
-	if err!=nil{return nil,err}
-	payout,err:=e.cfg.Store.PayoutLPoD(height,r,c,payments);if err!=nil{return nil,err}
-	txs=append([]core.Transaction{payout,core.LPoDCheckpointTx(c.Digest())},txs...)
-	header.MerkleRoot=core.MerkleRoot(txs)
-}
-if err := header.Sign(e.cfg.MyKey.PrivKey()); err != nil {
+	if e.lpodActive(height) {
+		draft := &core.Block{Header: header, Txs: txs}
+		r, c, payments, err := e.prepareLPoD(draft, crypto.Address(e.cfg.RewardAddress))
+		if err != nil {
+			return nil, err
+		}
+		payout, err := e.cfg.Store.PayoutLPoD(height, r, c, payments)
+		if err != nil {
+			return nil, err
+		}
+		txs = append([]core.Transaction{payout, core.LPoDCheckpointTx(c.Digest())}, txs...)
+		header.MerkleRoot = core.MerkleRoot(txs)
+	}
+	if err := header.Sign(e.cfg.MyKey.PrivKey()); err != nil {
 		return nil, err
 	}
 	if oraclePrice > 0 {
@@ -1948,7 +1985,9 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 }
 
 func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
-	if err := e.validateLPoD(block); err != nil { return err }
+	if err := e.validateLPoD(block); err != nil {
+		return err
+	}
 	if err := e.validateGuardianFund(block); err != nil {
 		return err
 	}
@@ -2017,10 +2056,14 @@ func (e *Engine) validateGuardianConfig() error {
 
 func (e *Engine) prepareAVMBlock(block *core.Block) (*avm.PreparedBlock, error) {
 	prepared, err := e.prepareAVMOnly(block)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	if e.lpodActive(block.Header.Height) {
-prepared.LPoD, _, _, err = e.prepareLPoD(block,"")
-		if err != nil { return nil, err }
+		prepared.LPoD, _, _, err = e.prepareLPoD(block, "")
+		if err != nil {
+			return nil, err
+		}
 	}
 	return prepared, nil
 }
@@ -2067,8 +2110,8 @@ func (e *Engine) castVote(block *core.Block) error {
 func (e *Engine) handleVote(vote FinalizeMsg) error {
 	// Height is not authenticated by legacy v1 signatures. Resolve the signed
 	// hash to the canonical block BEFORE recording a vote or pruning any state.
-	block:=e.chain.GetByHeight(vote.Height)
-	if block==nil || block.Header.Height!=vote.Height || block.Hash()!=vote.BlockHash {
+	block := e.chain.GetByHeight(vote.Height)
+	if block == nil || block.Header.Height != vote.Height || block.Hash() != vote.BlockHash {
 		return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
 	}
 	if !e.isKnownValidator(vote.ValidatorPub) {
@@ -2098,8 +2141,29 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 	// Check if we've reached BFT threshold (2/3 of active validators)
 	needed := int(float64(len(e.activeValidators()))*e.cfg.BFTThreshold) + 1
 	if len(e.votes[vote.BlockHash]) >= needed {
+		certificate := store.FinalityCertificate{
+			Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
+			Votes: make([]store.FinalityVote, 0, len(e.votes[vote.BlockHash])),
+		}
+		for validatorHex, signature := range e.votes[vote.BlockHash] {
+			raw, err := hex.DecodeString(validatorHex)
+			if err != nil || len(raw) != 32 {
+				return fmt.Errorf("finality: corrupt in-memory validator identity")
+			}
+			certificate.Votes = append(certificate.Votes, store.FinalityVote{
+				Validator: crypto.ValidatorPubKey(raw),
+				Signature: append([]byte(nil), signature...),
+			})
+		}
+		if e.cfg.Store != nil {
+			if err := e.cfg.Store.SaveFinalityCertificate(certificate); err != nil {
+				return fmt.Errorf("finality: persist quorum certificate: %w", err)
+			}
+		}
 		e.finalized[vote.Height] = true
-		if e.lpodFinalizedHashes == nil { e.lpodFinalizedHashes = make(map[uint64]crypto.Hash32) }
+		if e.lpodFinalizedHashes == nil {
+			e.lpodFinalizedHashes = make(map[uint64]crypto.Hash32)
+		}
 		e.lpodFinalizedHashes[vote.Height] = vote.BlockHash
 		e.log.Info("block finalized",
 			"height", vote.Height,
@@ -2132,6 +2196,50 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 		}
 	}
 
+	return nil
+}
+
+func (e *Engine) restoreFinalityCertificate() error {
+	if e.cfg.Store == nil {
+		return nil
+	}
+	certificate, err := e.cfg.Store.LoadFinalityCertificate()
+	if err != nil || certificate == nil {
+		return err
+	}
+	tip := e.chain.Tip()
+	if tip == nil || tip.Header.Height != certificate.Height || tip.Hash() != certificate.BlockHash {
+		return fmt.Errorf("finality: only a certificate for the exact canonical tip can be restored")
+	}
+	block := e.chain.GetByHeight(certificate.Height)
+	if block == nil || block.Hash() != certificate.BlockHash || block.Header.Height != certificate.Height {
+		return fmt.Errorf("finality: certificate is not bound to the canonical chain")
+	}
+	active := e.activeValidators()
+	committee := make(map[string]bool, len(active))
+	for _, validator := range active {
+		committee[validator.Hex()] = true
+	}
+	needed := int(float64(len(active))*e.cfg.BFTThreshold) + 1
+	seen := make(map[string]bool, len(certificate.Votes))
+	message := crypto.HashBytes([]byte("aperod/finalize/v1"), certificate.BlockHash[:])
+	for _, vote := range certificate.Votes {
+		id := vote.Validator.Hex()
+		if !committee[id] || seen[id] || !vote.Validator.Verify(message, vote.Signature) {
+			return fmt.Errorf("finality: invalid, duplicate, or non-committee certificate vote")
+		}
+		seen[id] = true
+	}
+	if len(seen) < needed {
+		return fmt.Errorf("finality: certificate has %d votes, need %d", len(seen), needed)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.finalized[certificate.Height] = true
+	if e.lpodFinalizedHashes == nil {
+		e.lpodFinalizedHashes = make(map[uint64]crypto.Hash32)
+	}
+	e.lpodFinalizedHashes[certificate.Height] = certificate.BlockHash
 	return nil
 }
 

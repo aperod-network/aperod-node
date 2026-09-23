@@ -1,9 +1,10 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package api
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,13 +20,17 @@ import (
 // never returns private keys. DepositJSON is the already-public v9 action:
 // its deposit opening is disclosed by the protocol itself, not a wallet secret.
 type lpodWalletPosition struct {
-	ID          string `json:"id"`
-	Vault       string `json:"vault"`
-	Principal   string `json:"principal_napro"`
-	Returned    string `json:"returned_napro"`
-	Due         string `json:"due_napro"`
-	Nonce       string `json:"nonce"`
-	DepositJSON string `json:"deposit_action_json"`
+	ID             string `json:"id"`
+	Vault          string `json:"vault"`
+	Principal      string `json:"principal_napro"`
+	Returned       string `json:"returned_napro"`
+	Due            string `json:"due_napro"`
+	Nonce          string `json:"nonce"`
+	DepositJSON    string `json:"deposit_action_json"`
+	EffectiveVault string `json:"effective_vault"`
+	RouteHeight    string `json:"route_height"`
+	AutoReturned   bool   `json:"auto_returned"`
+	Beneficiary    string `json:"beneficiary"`
 }
 
 func lpodWalletProjection(c *store.LPoDCheckpoint, address crypto.Address) ([]lpodWalletPosition, uint64, error) {
@@ -50,15 +55,48 @@ func lpodWalletProjection(c *store.LPoDCheckpoint, address crypto.Address) ([]lp
 		if err != nil {
 			return nil, 0, err
 		}
+		effective := store.LPoDEffectiveVault(p)
 		rows = append(rows, lpodWalletPosition{
-			ID: id, Vault: fmt.Sprintf("%x", p.Deposit.Vault[:]),
+			ID: id, Vault: fmt.Sprintf("%x", effective[:]), EffectiveVault: fmt.Sprintf("%x", effective[:]),
 			Principal: strconv.FormatUint(principal, 10), Returned: strconv.FormatUint(p.Withdrawn, 10),
 			Due: strconv.FormatUint(p.Due, 10), Nonce: strconv.FormatUint(p.Nonce, 10),
-			DepositJSON: string(action),
+			DepositJSON: string(action), RouteHeight: strconv.FormatUint(p.RouteHeight, 10), AutoReturned: p.AutoReturned,
+			Beneficiary: string(p.Deposit.Beneficiary),
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows, reserved, nil
+}
+
+func lpodVaultProjection(c *store.LPoDCheckpoint, vault crypto.Point32) ([]lpodWalletPosition, uint64, error) {
+	rows := make([]lpodWalletPosition, 0)
+	var total uint64
+	for id, p := range c.Positions {
+		if store.LPoDEffectiveVault(p) != vault {
+			continue
+		}
+		if p.Withdrawn > p.Deposit.Amount {
+			return nil, 0, fmt.Errorf("invalid principal")
+		}
+		principal := p.Deposit.Amount - p.Withdrawn
+		if p.Returned {
+			principal = 0
+		}
+		if principal > ^uint64(0)-total {
+			return nil, 0, fmt.Errorf("principal overflow")
+		}
+		total += principal
+		action, err := json.Marshal(p.Deposit)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows = append(rows, lpodWalletPosition{ID: id, Vault: fmt.Sprintf("%x", vault[:]), EffectiveVault: fmt.Sprintf("%x", vault[:]),
+			Principal: strconv.FormatUint(principal, 10), Returned: strconv.FormatUint(p.Withdrawn, 10), Due: strconv.FormatUint(p.Due, 10),
+			Nonce: strconv.FormatUint(p.Nonce, 10), DepositJSON: string(action), RouteHeight: strconv.FormatUint(p.RouteHeight, 10),
+			AutoReturned: p.AutoReturned, Beneficiary: string(p.Deposit.Beneficiary)})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows, total, nil
 }
 
 func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +106,17 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	address := crypto.Address(r.URL.Query().Get("address"))
-	if _, _, _, err := crypto.DecodeAddress(address); err != nil {
+	vaultHex := r.URL.Query().Get("vault")
+	var vault crypto.Point32
+	vaultMode := vaultHex != ""
+	if vaultMode {
+		b, err := hex.DecodeString(vaultHex)
+		if err != nil || len(b) != 32 {
+			writeJSONError(w, 400, "valid vault required")
+			return
+		}
+		copy(vault[:], b)
+	} else if _, _, _, err := crypto.DecodeAddress(address); err != nil {
 		writeJSONError(w, 400, "valid wallet address required")
 		return
 	}
@@ -104,11 +152,22 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 		out["state"] = "pending"
 		return
 	}
-	rows, total, err := lpodWalletProjection(c, address)
+	var rows []lpodWalletPosition
+	var total uint64
+	if vaultMode {
+		rows, total, err = lpodVaultProjection(c, vault)
+		out["vault"] = vaultHex
+	} else {
+		rows, total, err = lpodWalletProjection(c, address)
+	}
 	if err != nil {
 		return
 	}
 	vaults := make([]map[string]interface{}, 0)
+	guardianTotals, totalsErr := c.LPoDEffectiveGuardianTotals()
+	if totalsErr != nil {
+		return
+	}
 	if s.registry != nil {
 		for _, pub := range s.registry.GetActiveValidators() {
 			entry, ok := s.registry.GetEntry(pub)
@@ -116,16 +175,11 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			total := entry.StakeNAPR
-			for _, p := range c.Positions {
-				if fmt.Sprintf("%x", p.Deposit.Vault[:]) != pub.Hex() || p.Returned {
-					continue
-				}
-				n := p.Deposit.Amount - p.Withdrawn
-				if n > ^uint64(0)-total {
-					return
-				}
-				total += n
+			n := guardianTotals[pub.Hex()]
+			if n > ^uint64(0)-total {
+				return
 			}
+			total += n
 			tier, err := lpod.TierFor(total)
 			if err != nil {
 				continue
@@ -146,4 +200,5 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 	out["reserved_napro"] = strconv.FormatUint(total, 10)
 	out["checkpoint_hash"] = fmt.Sprintf("%x", hash[:])
 	out["finalized_height"] = height
+	out["position_lifecycle_version"] = a.PositionLifecycleVersion
 }

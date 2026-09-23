@@ -1,121 +1,63 @@
-LPoD SOURCE-AVAILABLE RESTRICTED LICENSE
+LPoD LICENSING COMPATIBILITY NOTICE
 
-This license is not an open-source license.
+This file replaces the former restrictive LPoD notice for the current release.
+It is retained under the historical filename so links to LICENSE-LPOD explain
+the migration instead of presenting obsolete permission requirements.
 
-1. Parties and scope
+1. Code and tests
 
-"Licensor" means the copyright holder or holders identified in the applicable
-copyright notice for the Covered Code, publicly described in this repository as
-the web3 Aperod APRO team.
+The original LPoD source code and tests authored by the web3 Aperod APRO team
+are licensed under the Apache License, Version 2.0. The complete license is in
+the repository root LICENSE file:
 
-"Covered Code" means only the original copyrightable LPoD source-code
-expression owned by Licensor, expressly listed in LPOD.md, and marked
-`SPDX-License-Identifier: LicenseRef-Aperod-LPoD`. It does not include code
-merely used by, linked to, called by, or stored in the same repository as LPoD.
-It also excludes every third-party component and every portion for which
-Licensor does not hold the necessary rights.
+https://www.apache.org/licenses/LICENSE-2.0
 
-Covered Code does not include abstract ideas, methods, algorithms, protocol
-concepts, facts, or code independently developed without copying Covered Code.
+Dedicated LPoD source files carry:
 
-2. Inspection-only permission
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) web3 Aperod APRO team
 
-Licensor permits you to access, download, and make the transient or local copies
-reasonably necessary solely to read and evaluate the Covered Code privately.
-You must retain all copyright, license, and attribution notices. No other right
-or permission is granted by public availability, repository access, or viewing.
+Apache License 2.0 permits use, reproduction, modification, distribution, and
+other activities under its terms without separate prior approval. Its grants
+are governed by the license, including its conditions and irrevocability
+language.
 
-Without Licensor's prior explicit written approval, you may not, directly or
-indirectly:
+2. Documentation
 
-(a) execute, compile, build, test, deploy, host, operate, or integrate the
-    Covered Code;
-(b) copy beyond the limited inspection permission above, modify, adapt,
-    translate, reverse engineer, or create derivative works from it;
-(c) publish, distribute, sublicense, sell, transfer, mirror, or make it
-    available to another person;
-(d) fork a repository for the purpose of using or developing the Covered Code;
-    or
-(e) use or reuse the Covered Code for any commercial or noncommercial purpose.
+LPOD.md and other original LPoD documentation identified by the project are
+licensed under Creative Commons Attribution 4.0 International (CC BY 4.0). The
+complete license is in LICENSE-DOCS:
 
-Technical ability to copy or fork a public repository is not legal
-authorization to do so. This notice does not claim to make copying or forking
-technically or cryptographically impossible.
+https://creativecommons.org/licenses/by/4.0/
 
-3. Written approval
+Attribution applies when exercising rights in the licensed documentation. A
+suggested attribution is:
 
-Permission for any activity outside Section 2 requires a separate, prior,
-explicit written approval from Licensor that identifies the recipient, the
-Covered Code, and the permitted activity. The verified public request route is:
+"LPoD documentation by the web3 Aperod APRO team, licensed under CC BY 4.0."
 
-https://t.me/sup_apro_bot
+Include a link to the source and license and indicate changes when required by
+CC BY 4.0.
 
-Sending a request, receiving an automated acknowledgement, participating in the
-network, or obtaining an end-user activation does not itself constitute
-approval. Approval is effective only when an authorized Aperod APRO team
-representative provides an explicit written response. Any additional agreement
-controls to the extent it expressly conflicts with this license.
+3. Authorship and ideas
 
-Issued permissions will be published in the official Aperod LPoD permission
-registry:
+The official LPoD authorship section is:
 
-https://aperod.com/vaults#lpod-permissions
+https://aperod.com/vaults#lpod-authorship
 
-The registry currently records no issued permissions. Publication of an entry
-does not itself grant or expand permission beyond the recipient, Covered Code,
-permitted activity, and other terms identified in the corresponding written
-approval.
+These notices identify authorship of the published implementation and
+documentation. They do not claim ownership of abstract ideas, methods,
+algorithms, facts, or protocol concepts. Independently developed clean-room
+implementations are not restricted by these notices. Attribution is not
+required merely for using an idea; it applies only as required by the license
+for Aperod code or documentation actually used.
 
-4. Developer permission is separate from end-user activation
+4. Historical notice
 
-An authorized production deployment may permit end users to submit supported
-protocol transactions under its user-facing terms. That end-user capability is
-not a software license and does not authorize any person to execute, deploy,
-modify, fork, distribute, or reuse the Covered Code. Conversely, written
-developer approval does not by itself activate LPoD on any chain.
+Earlier repository history may contain a restrictive LPoD notice. That notice
+does not govern the current release. The copyright holders now offer the
+current LPoD code and tests under Apache License 2.0 and the current original
+LPoD documentation under CC BY 4.0. These current grants are governed only by
+those published licenses.
 
-5. Scope exclusions and separate terms
-
-The repository's Apache License 2.0 applies separately to non-Covered Code
-identified under it. Third-party software, generated material, and dependencies
-remain subject to their own terms. Inclusion in a Covered Code file does not
-change those terms or make third-party material Covered Code.
-
-Licensor states that it has not issued permission to execute, develop, deploy,
-fork, distribute, or reuse Covered Code. Every such activity requires prior
-explicit written approval under Section 3.
-
-6. Ownership and reservations
-
-The Covered Code is licensed, not sold. All rights not expressly granted for
-inspection in Section 2 are reserved. No rights are granted by implication,
-estoppel, repository visibility, or otherwise. This license does not grant
-rights in Aperod or APRO names, logos, or other branding except as needed to
-reproduce required notices.
-
-7. Compliance and termination
-
-The limited permission in Section 2 terminates automatically if you breach this
-license. On termination, you must stop relying on that permission and delete
-inspection copies of the Covered Code, except copies that applicable law
-requires you to retain.
-
-8. Disclaimer
-
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COVERED CODE IS PROVIDED
-"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EXPRESS OR IMPLIED,
-INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
-NON-INFRINGEMENT.
-
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR AND CONTRIBUTORS
-WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR
-EXEMPLARY DAMAGES, OR FOR LOSS OF DATA, PROFITS, GOODWILL, OR BUSINESS, ARISING
-FROM ACCESS TO OR INABILITY TO ACCESS THE COVERED CODE, EVEN IF ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGES.
-
-9. General
-
-If a provision is unenforceable, it will be limited to the minimum extent
-necessary and the remaining provisions will continue in effect. Failure to
-enforce a provision is not a waiver. No governing law, venue, legal entity, or
-contact other than the verified route above is asserted by this license.
+Dependencies and third-party material remain subject to their own licenses and
+notices.

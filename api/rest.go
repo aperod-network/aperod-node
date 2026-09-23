@@ -68,10 +68,10 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
 	s.mux.HandleFunc("/api/v1/guardian-fund", s.restGuardianFund)
-s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
-s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
-s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
-s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
+	s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
+	s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
+	s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
+	s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
 	s.mux.HandleFunc("/api/v1/avm/receipts/", s.restAVMReceipt)
@@ -1638,7 +1638,7 @@ func (s *Server) liveReconnectBackoff() bool {
 // validatorResponse is one validator entry returned by the REST API.
 type validatorResponse struct {
 	PubKey               string                   `json:"pub_key"`
-	StakeNAPR            uint64                   `json:"stake_napr"`
+	StakeNAPR            string                   `json:"stake_napr"`
 	StakeAPR             float64                  `json:"stake_apr"`
 	Status               string                   `json:"status"`
 	ActivationEpoch      uint64                   `json:"activation_epoch"`
@@ -1646,6 +1646,16 @@ type validatorResponse struct {
 	PendingUnbondingNAPR uint64                   `json:"pending_unbonding_napr"`
 	PendingUnbondingAPR  float64                  `json:"pending_unbonding_apr"`
 	UnbondingQueue       []unbondingEntryResponse `json:"unbonding_queue"`
+	StakeGeneration      string                   `json:"stake_generation"`
+	StakeAuthNonce       string                   `json:"stake_auth_nonce"`
+	StakeAuthNextNonce   string                   `json:"stake_auth_next_nonce"`
+	StakeReference       string                   `json:"stake_reference"`
+	StakeAuthGenesis     string                   `json:"stake_auth_genesis"`
+	StakeAuthActivation  string                   `json:"stake_auth_activation_height"`
+	StakeAuthCurrent     string                   `json:"stake_auth_current_height"`
+	StakeAuthExpiryMin   string                   `json:"stake_auth_expiry_min_height"`
+	StakeAuthExpiryMax   string                   `json:"stake_auth_expiry_max_height"`
+	StakeAuthV2          bool                     `json:"stake_withdrawal_v2_active"`
 }
 
 // unbondingEntryResponse is one entry in a validator's partial unbonding queue.
@@ -1656,7 +1666,7 @@ type unbondingEntryResponse struct {
 	EndEstimatedMs int64   `json:"end_estimated_ms"` // wall-clock estimate at 1 block/s
 }
 
-func validatorToResponse(e core.ValidatorEntry, currentHeight uint64) validatorResponse {
+func validatorToResponse(e core.ValidatorEntry, currentHeight uint64, genesis crypto.Hash32, activation uint64, active bool) validatorResponse {
 	queue := make([]unbondingEntryResponse, 0, len(e.UnbondingQueue))
 	nowMs := time.Now().UnixMilli()
 	for _, ub := range e.UnbondingQueue {
@@ -1672,9 +1682,24 @@ func validatorToResponse(e core.ValidatorEntry, currentHeight uint64) validatorR
 		})
 	}
 	pending := e.PendingUnbondingNAPR()
+	ref := core.StakeReferenceV2(genesis, e.PubKey, e.StakeGeneration, e.StakeNAPR)
+	nextNonce := ""
+	if e.StakeAuthNonce != ^uint64(0) {
+		nextNonce = strconv.FormatUint(e.StakeAuthNonce+1, 10)
+	}
+	expiryMin := currentHeight
+	if expiryMin != ^uint64(0) {
+		expiryMin++
+	}
+	expiryMax := expiryMin
+	if expiryMax <= ^uint64(0)-core.StakeWithdrawalMaxExpiryBlocks {
+		expiryMax += core.StakeWithdrawalMaxExpiryBlocks
+	} else {
+		expiryMax = ^uint64(0)
+	}
 	return validatorResponse{
 		PubKey:               e.PubKey.Hex(),
-		StakeNAPR:            e.StakeNAPR,
+		StakeNAPR:            strconv.FormatUint(e.StakeNAPR, 10),
 		StakeAPR:             float64(e.StakeNAPR) / 1e8,
 		Status:               e.Status.String(),
 		ActivationEpoch:      e.ActivationEpoch,
@@ -1682,7 +1707,46 @@ func validatorToResponse(e core.ValidatorEntry, currentHeight uint64) validatorR
 		PendingUnbondingNAPR: pending,
 		PendingUnbondingAPR:  float64(pending) / 1e8,
 		UnbondingQueue:       queue,
+		StakeGeneration:      strconv.FormatUint(e.StakeGeneration, 10),
+		StakeAuthNonce:       strconv.FormatUint(e.StakeAuthNonce, 10),
+		StakeAuthNextNonce:   nextNonce,
+		StakeReference:       hex.EncodeToString(ref[:]),
+		StakeAuthGenesis:     hex.EncodeToString(genesis[:]),
+		StakeAuthActivation:  strconv.FormatUint(activation, 10),
+		StakeAuthCurrent:     strconv.FormatUint(currentHeight, 10),
+		StakeAuthExpiryMin:   strconv.FormatUint(expiryMin, 10),
+		StakeAuthExpiryMax:   strconv.FormatUint(expiryMax, 10),
+		StakeAuthV2:          active,
 	}
+}
+
+func (s *Server) stakeWithdrawalV2Status(currentHeight uint64) (crypto.Hash32, uint64, bool) {
+	if s.registry == nil {
+		return crypto.Hash32{}, 0, false
+	}
+	genesis, activation, configured := s.registry.StakeWithdrawalV2Config()
+	if !configured || s.lpodMigration == nil || s.lpodMigration.PositionLifecycleVersion != 1 ||
+		s.lpodMigration.Genesis != genesis || s.lpodMigration.Height != activation ||
+		currentHeight < activation || s.blockStore == nil || s.lpodFinalized == nil {
+		return genesis, activation, false
+	}
+	tip, height, err := s.blockStore.GetTip()
+	if err != nil || height != currentHeight {
+		return genesis, activation, false
+	}
+	checkpoint, err := s.blockStore.LoadLPoDCheckpointAt(tip)
+	if err != nil || checkpoint == nil || checkpoint.Allocation == nil {
+		return genesis, activation, false
+	}
+	allocation := checkpoint.Allocation
+	if allocation.PositionLifecycleVersion != 1 || allocation.Genesis != genesis ||
+		allocation.FundingHeight != activation ||
+		allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
+		checkpoint.State.LastHeight != height || !s.lpodFinalized(height, tip) {
+		return genesis, activation, false
+	}
+	after, afterHeight, err := s.blockStore.GetTip()
+	return genesis, activation, err == nil && after == tip && afterHeight == height
 }
 
 func (s *Server) restValidators(w http.ResponseWriter, r *http.Request) {
@@ -1700,8 +1764,9 @@ func (s *Server) restValidators(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := s.registry.AllEntries()
 	result := make([]validatorResponse, 0, len(entries))
+	genesis, activation, active := s.stakeWithdrawalV2Status(currentHeight)
 	for _, e := range entries {
-		result = append(result, validatorToResponse(e, currentHeight))
+		result = append(result, validatorToResponse(e, currentHeight, genesis, activation, active))
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"validators": result,
@@ -1749,15 +1814,26 @@ func (s *Server) restValidatorUnbonding(w http.ResponseWriter, r *http.Request) 
 	if tip := s.chain.Tip(); tip != nil {
 		currentHeight = tip.Header.Height
 	}
-	resp := validatorToResponse(entry, currentHeight)
+	genesis, activation, active := s.stakeWithdrawalV2Status(currentHeight)
+	resp := validatorToResponse(entry, currentHeight, genesis, activation, active)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pub_key":                resp.PubKey,
-		"stake_napr":             resp.StakeNAPR,
-		"stake_apr":              resp.StakeAPR,
-		"status":                 resp.Status,
-		"pending_unbonding_napr": resp.PendingUnbondingNAPR,
-		"pending_unbonding_apr":  resp.PendingUnbondingAPR,
-		"unbonding_queue":        resp.UnbondingQueue,
+		"pub_key":                      resp.PubKey,
+		"stake_napr":                   resp.StakeNAPR,
+		"stake_apr":                    resp.StakeAPR,
+		"status":                       resp.Status,
+		"pending_unbonding_napr":       resp.PendingUnbondingNAPR,
+		"pending_unbonding_apr":        resp.PendingUnbondingAPR,
+		"unbonding_queue":              resp.UnbondingQueue,
+		"stake_generation":             resp.StakeGeneration,
+		"stake_auth_nonce":             resp.StakeAuthNonce,
+		"stake_auth_next_nonce":        resp.StakeAuthNextNonce,
+		"stake_reference":              resp.StakeReference,
+		"stake_auth_genesis":           resp.StakeAuthGenesis,
+		"stake_auth_activation_height": resp.StakeAuthActivation,
+		"stake_auth_current_height":    resp.StakeAuthCurrent,
+		"stake_auth_expiry_min_height": resp.StakeAuthExpiryMin,
+		"stake_auth_expiry_max_height": resp.StakeAuthExpiryMax,
+		"stake_withdrawal_v2_active":   resp.StakeAuthV2,
 	})
 }
 
@@ -2415,7 +2491,7 @@ type stakeDepositRequest struct {
 // ─── POST /api/v1/stake ───────────────────────────────────────────────────────
 
 // stakeBroadcastRequest is the JSON body for POST /api/v1/stake.
-// The caller supplies a pre-signed 173-byte v2 stake payload (CLI-signed).
+// The caller supplies a pre-signed deposit or chain-bound withdrawal payload.
 type stakeBroadcastRequest struct {
 	TxExtraHex string `json:"tx_extra_hex"` // hex-encoded 173-byte v2 stake payload
 }
@@ -2714,10 +2790,9 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "tx_extra_hex is not valid hex: "+err.Error())
 		return
 	}
-	if len(extraBytes) != core.StakePayloadSizeV2 {
-		writeJSONError(w, http.StatusBadRequest,
-			fmt.Sprintf("tx_extra_hex must decode to %d bytes (v2 stake payload), got %d",
-				core.StakePayloadSizeV2, len(extraBytes)))
+	if len(extraBytes) != core.StakePayloadSizeV2 &&
+		len(extraBytes) != core.StakeWithdrawalPayloadSizeV2 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported stake payload length %d", len(extraBytes)))
 		return
 	}
 
@@ -2753,6 +2828,20 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		Version: core.TxVersionStake,
 		Extra:   extraBytes,
 	}
+	if len(extraBytes) == core.StakeWithdrawalPayloadSizeV2 {
+		if s.registry == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "validator registry unavailable")
+			return
+		}
+		nextHeight := s.chain.Height()
+		if nextHeight < ^uint64(0) {
+			nextHeight++
+		}
+		if err := s.registry.ValidateBlockStakeTxs([]core.Transaction{tx}, nextHeight); err != nil {
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+	}
 	if err := s.mempool.Add(tx); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "mempool: "+err.Error())
 		return
@@ -2760,12 +2849,12 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	txHash := tx.Hash()
 	txHashHex := fmt.Sprintf("%x", txHash[:])
-	s.log.Info("stake deposit broadcast", "tx_hash", txHashHex)
+	s.log.Info("signed stake transaction broadcast", "tx_hash", txHashHex)
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"tx_hash": txHashHex,
 		"status":  "pending",
-		"message": "StakeDeposit v2 transaction submitted to mempool; applied when included in the next block",
+		"message": "Signed stake transaction submitted to mempool; applied when included in a canonical block",
 	})
 }
 

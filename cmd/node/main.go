@@ -1287,6 +1287,7 @@ func run() error {
 	// The genesis path leaves it nil; NewEngine creates a fresh registry.
 	// The resume path initialises it inside the startup scan below.
 	var registry *core.ValidatorRegistry
+	var lpodMigration *store.LPoDMigration
 
 	// ── Early API server (syncing phase) ─────────────────────────────────────
 	// Create and start the API server before the startup block scan so that
@@ -1749,6 +1750,23 @@ func run() error {
 		// replay stake txs (including withdrawals by genesis validators).
 		registry = core.NewValidatorRegistry()
 		registry.SetUTXOSet(utxos)
+		// Load and bind the quorum-attested lifecycle fork before stake replay.
+		// Otherwise a restart could not validate chain-bound v2 withdrawal
+		// nonces, and legacy withdrawals after activation would be replayed under
+		// obsolete rules.
+		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
+		if err != nil {
+			return err
+		}
+		if registry == nil {
+			registry = core.NewValidatorRegistry()
+			registry.SetUTXOSet(utxos)
+		}
+		if lpodMigration != nil && lpodMigration.PositionLifecycleVersion == 1 {
+			if err := registry.ConfigureStakeWithdrawalV2(lpodMigration.Genesis, lpodMigration.Height); err != nil {
+				return err
+			}
+		}
 		// InitFromGenesis is idempotent (!exists guard), so NewEngine's later
 		// call is a safe no-op for genesis validators already in the registry.
 		genesisStakeForReplay := core.MinStakeNAPR * 10 // must match consensus.NewEngine
@@ -2509,10 +2527,26 @@ func run() error {
 		return err
 	}
 
-lpodMigration, err := loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
-if err != nil { return err }
-engine = consensus.NewEngine(consensus.Config{
-LPoDMigration: lpodMigration,
+	if lpodMigration == nil {
+		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
+		if err != nil {
+			return err
+		}
+		if lpodMigration != nil && lpodMigration.PositionLifecycleVersion == 1 {
+			if err := registry.ConfigureStakeWithdrawalV2(lpodMigration.Genesis, lpodMigration.Height); err != nil {
+				return err
+			}
+		}
+	}
+	if registry == nil {
+		registry = core.NewValidatorRegistry()
+		registry.SetUTXOSet(utxos)
+	}
+	mempool.SetStakeAdmissionCheck(func(tx core.Transaction, height uint64) error {
+		return registry.ValidateBlockStakeTxs([]core.Transaction{tx}, height)
+	})
+	engine = consensus.NewEngine(consensus.Config{
+		LPoDMigration:                       lpodMigration,
 		BlockTime:                           cfg.Consensus.BlockTime,
 		BFTThreshold:                        genesisConfig.BFTThreshold,
 		Validators:                          validators,
@@ -2762,7 +2796,9 @@ LPoDMigration: lpodMigration,
 			}(periodicSnap, h, periodicActive)
 		},
 	}, chain, mempool, log)
-if apiSrv != nil { apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash) }
+	if apiSrv != nil {
+		apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash)
+	}
 
 	// ── 8. Wire TxVerifier BEFORE starting the engine goroutine ──────────────
 	// engine.Run launches handleIncomingBlock immediately on incoming P2P

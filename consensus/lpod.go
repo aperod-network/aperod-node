@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package consensus
@@ -13,6 +13,22 @@ import (
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
+
+func lpodStakeOperation(tx *core.Transaction) (core.StakeAction, crypto.ValidatorPubKey, uint64, bool, error) {
+	if tx == nil || !tx.IsStake() {
+		return 0, nil, 0, false, nil
+	}
+	switch len(tx.Extra) {
+	case core.StakePayloadSize:
+		action, pub, amount, _, err := core.DecodeStakeExtra(tx.Extra)
+		return action, pub, amount, true, err
+	case core.StakeWithdrawalPayloadSizeV2:
+		a, err := core.DecodeStakeWithdrawalExtraV2(tx.Extra)
+		return a.Action, a.PubKey, a.Amount, true, err
+	default:
+		return 0, nil, 0, false, nil // deposit payload
+	}
+}
 
 func (e *Engine) lpodActive(height uint64) bool {
 	return e.cfg.LPoDMigration != nil && height >= e.cfg.LPoDMigration.Height
@@ -46,7 +62,8 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 	}
 	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true, Timestamp: block.Header.Timestamp,
-		Proposer: block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{}}
+		Proposer: block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
+		PreviousStake: map[string]store.LPoDValidatorStake{}}
 	if height == m.Height {
 		r.Migration = m
 	}
@@ -99,6 +116,18 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 		r.Transactions = append(r.Transactions, tx)
 	}
+	// Snapshot every non-seeded validator, not only vaults already referenced by
+	// positions. Lifecycle routing must choose from the same canonical candidate
+	// set on every node and cannot depend on a local API/database inventory.
+	for _, entry := range e.cfg.Registry.AllEntries() {
+		if entry.Seeded {
+			continue
+		}
+		id := entry.PubKey.Hex()
+		stake := store.LPoDValidatorStake{Amount: entry.StakeNAPR, Active: entry.Status == core.ValidatorActive}
+		r.Stake[id], r.PreviousStake[id] = stake, stake
+		vaults[id] = true
+	}
 	for id := range vaults {
 		raw, err := hex.DecodeString(id)
 		if err != nil || len(raw) != 32 {
@@ -106,8 +135,40 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 		entry, found := e.cfg.Registry.GetEntry(crypto.ValidatorPubKey(raw))
 		if found && !entry.Seeded {
-			r.Stake[id] = store.LPoDValidatorStake{Amount: entry.StakeNAPR, Active: entry.Status == core.ValidatorActive}
+			stake := store.LPoDValidatorStake{Amount: entry.StakeNAPR, Active: entry.Status == core.ValidatorActive}
+			r.Stake[id], r.PreviousStake[id] = stake, stake
 		}
+	}
+	// Stake operations become canonical in this block. Reflect their resulting
+	// eligibility in LPoD before previewing routes, while retaining the prior
+	// snapshot for this block's already-earned accrual and source ranking.
+	for i := start; i < len(block.Txs); i++ {
+		tx := &block.Txs[i]
+		action, pub, amount, withdrawal, err := lpodStakeOperation(tx)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !withdrawal {
+			continue
+		}
+		id := pub.Hex()
+		stake, found := r.Stake[id]
+		if !found {
+			continue
+		}
+		switch action {
+		case core.StakeWithdraw:
+			stake.Active = false
+		case core.StakePartialWithdraw:
+			if amount > stake.Amount {
+				return nil, nil, nil, fmt.Errorf("lpod: invalid validator stake transition")
+			}
+			stake.Amount -= amount
+			if stake.Amount < core.MinStakeNAPR {
+				stake.Active = false
+			}
+		}
+		r.Stake[id] = stake
 	}
 	c, payments, err := e.cfg.Store.PreviewLPoD(height, r)
 	return r, c, payments, err
@@ -135,12 +196,24 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 				}
 				positions[id] = p
 				if p.UnlockHeight == 0 {
-					totals[hex.EncodeToString(p.Deposit.Vault[:])] += p.Deposit.Amount - p.Withdrawn
+					effective := store.LPoDEffectiveVault(p)
+					totals[hex.EncodeToString(effective[:])] += p.Deposit.Amount - p.Withdrawn
 				}
 			}
 		}
 	}
 	out := make([]core.Transaction, 0, len(txs))
+	exiting := map[string]bool{}
+	for i := range txs {
+		tx := &txs[i]
+		action, pub, _, withdrawal, err := lpodStakeOperation(tx)
+		if err != nil || !withdrawal {
+			continue
+		}
+		if action == core.StakeWithdraw {
+			exiting[pub.Hex()] = true
+		}
+	}
 	for _, tx := range txs {
 		if !tx.IsLPoDPosition() {
 			out = append(out, tx)
@@ -162,7 +235,7 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 				stake, found := e.cfg.Registry.GetEntry(crypto.ValidatorPubKey(a.Vault[:]))
 				max := uint64(100_000_000 * lpod.Unit)
 				if exists || len(positions) >= store.LPoDMaxPositions || !found || stake.Seeded ||
-					stake.Status != core.ValidatorActive || stake.StakeNAPR > max || totals[v] > max-stake.StakeNAPR ||
+					stake.Status != core.ValidatorActive || exiting[v] || stake.StakeNAPR > max || totals[v] > max-stake.StakeNAPR ||
 					a.Amount > max-stake.StakeNAPR-totals[v] {
 					valid = false
 					break
@@ -187,7 +260,8 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 				if p.Returned {
 					p.UnlockHeight = height
 				}
-				totals[v] -= amount
+				effective := store.LPoDEffectiveVault(p)
+				totals[hex.EncodeToString(effective[:])] -= amount
 				positions[id] = p
 			default:
 				valid = false

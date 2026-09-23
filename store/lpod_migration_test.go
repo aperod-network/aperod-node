@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package store
@@ -55,7 +55,7 @@ func lpodMigrationFixture(t *testing.T) (*DB, *LPoDMigration, crypto.ValidatorPr
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &LPoDMigration{Version: 1, Height: 2, Genesis: genesis.Hash(), Openings: []LPoDOpening{{Height: 1, Amount: 3 * lpod.Unit, Blind: blind}}}
+	m := &LPoDMigration{Version: 1, PositionLifecycleVersion: 1, Height: 2, Genesis: genesis.Hash(), Openings: []LPoDOpening{{Height: 1, Amount: 3 * lpod.Unit, Blind: blind}}}
 	m.BodyRoot = LPoDBodyRootStep(LPoDBodyRootStep(crypto.HashBytes([]byte("aperod/lpod/historical-bodies/v1")), genesis), b)
 	m.HistoricalIssued = 3 * lpod.Unit
 	m.ValidatorRemaining = lpodValidatorRemaining(1)

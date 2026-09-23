@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package consensus
@@ -19,7 +19,7 @@ import (
 )
 
 func positionEngine(t *testing.T) (*Engine, *store.DB, *core.Transaction, core.LPoDPositionAction, *crypto.WalletKeyPair, crypto.ValidatorPrivKey, string) {
-return positionEngineWithOwner(t,nil)
+	return positionEngineWithOwner(t, nil)
 }
 func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine, *store.DB, *core.Transaction, core.LPoDPositionAction, *crypto.WalletKeyPair, crypto.ValidatorPrivKey, string) {
 	t.Helper()
@@ -33,7 +33,9 @@ func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine
 	}
 	t.Cleanup(key.Destroy)
 	wallet, err := crypto.GenerateWalletKeys()
-if owner!=nil{wallet=owner}
+	if owner != nil {
+		wallet = owner
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +83,7 @@ if owner!=nil{wallet=owner}
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &store.LPoDMigration{Version: 1, Height: 2, Genesis: g.Hash(), HistoricalIssued: principal,
+	m := &store.LPoDMigration{Version: 1, PositionLifecycleVersion: 1, Height: 2, Genesis: g.Hash(), HistoricalIssued: principal,
 		ValidatorRemaining: 2_000_000_000*lpod.Unit - 3*lpod.Unit,
 		Openings:           []store.LPoDOpening{{Height: 1, Amount: principal, Blind: blind}}}
 	m.BodyRoot = store.LPoDBodyRootStep(store.LPoDBodyRootStep(crypto.HashBytes([]byte("aperod/lpod/historical-bodies/v1")), g), parent)
@@ -683,8 +685,29 @@ func TestLPoDPositionsRestartRollbackAndWithdrawalReplay(t *testing.T) {
 	}
 	restarted := NewEngine(cfg, chain, core.NewMempool(core.DefaultMempoolConfig()), e.log)
 	restarted.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
-	if restarted.IsFinalizedHash(block.Header.Height, block.Hash()) {
-		t.Fatal("restart invented finality evidence")
+	if !restarted.IsFinalizedHash(block.Header.Height, block.Hash()) {
+		t.Fatal("restart lost the durable quorum finality certificate")
+	}
+	entry, found := restarted.cfg.Registry.GetEntry(priv.Public())
+	if !found {
+		t.Fatal("restart lost validator authorization state")
+	}
+	auth := core.StakeWithdrawalAuthorizationV2{Action: core.StakeWithdraw, PubKey: priv.Public(),
+		Genesis: restarted.cfg.LPoDMigration.Genesis, Nonce: entry.StakeAuthNonce + 1,
+		Generation: entry.StakeGeneration, ExpiryHeight: block.Header.Height + 10}
+	auth.StakeRef = core.StakeReferenceV2(auth.Genesis, auth.PubKey, auth.Generation, entry.StakeNAPR)
+	auth.Signature, err = priv.Sign(core.StakeWithdrawalSignMsgV2(auth))
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, err := core.EncodeStakeWithdrawalExtraV2(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.cfg.Registry.ValidateBlockStakeTxs([]core.Transaction{{
+		Version: core.TxVersionStake, Extra: extra,
+	}}, block.Header.Height+1); err != nil {
+		t.Fatalf("restart could not validate a fresh v2 withdrawal: %v", err)
 	}
 	if err := restarted.txVerifier.VerifyTx(deposit); err == nil {
 		t.Fatal("restart lost consumed principal key image")
@@ -710,16 +733,7 @@ func TestLPoDPreservesSignedValidatorWithdrawalAndDraftProgress(t *testing.T) {
 	if err := e.pool.Add(*stale); err != nil {
 		t.Fatal(err)
 	}
-	message := core.StakeSignMsg(core.StakeWithdraw, priv.Public(), 0)
-	signature, err := priv.Sign(message)
-	if err != nil {
-		t.Fatal(err)
-	}
-	extra, err := core.EncodeStakeExtra(core.StakeWithdraw, priv.Public(), 0, signature)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stake := core.Transaction{Version: core.TxVersionStake, Extra: extra}
+	stake := lifecycleFullExit(t, e, priv, e.chain.Tip().Header.Height+10)
 	if !stake.IsStake() || !stake.IsCoinbase() {
 		t.Fatal("fixture must exercise historical zero-input stake classification")
 	}

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package store
@@ -48,7 +48,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 			DeficitOutflow: lpod.InitialNAPRO, UnfundedLiability: debt,
 			AccruedLiability: lpod.InitialNAPRO + 276_000_000 + debt, LastHeight: deadline - 1},
 		Carries: map[string]lpod.Carry{pub.Hex(): {}},
-		Allocation: &LPoDAllocation{Version: 1, Genesis: genesis, FundingHeight: 2, HistoricalIssued: principal,
+		Allocation: &LPoDAllocation{Version: 1, PositionLifecycleVersion: 1, Genesis: genesis, FundingHeight: 2, HistoricalIssued: principal,
 			InitialValidatorRemaining: 2_000_000_000 * lpod.Unit, ValidatorRemaining: 2_000_000_000*lpod.Unit - 300_000_000,
 			Remaining: LPoDPublicAllocationNAPRO - principal - lpod.InitialNAPRO},
 		PrincipalDeposited: principal, PrincipalLocked: principal,

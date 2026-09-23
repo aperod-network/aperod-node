@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package api_test
@@ -39,7 +39,7 @@ func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {
 		State: lpod.State{FundingDebit: lpod.InitialNAPRO, RewardInflow: reward, LeaderPaid: 24_000_000,
 			AngelPaid: lpod.InitialNAPRO + reward - 24_000_000, DeficitOutflow: lpod.InitialNAPRO,
 			AccruedLiability: lpod.InitialNAPRO + reward - 24_000_000 + due, UnfundedLiability: due, LastHeight: 2},
-		Allocation: &store.LPoDAllocation{Version: 1, Genesis: genesis, FundingHeight: 2, ReconciliationRoot: root,
+		Allocation: &store.LPoDAllocation{Version: 1, PositionLifecycleVersion: 1, Genesis: genesis, FundingHeight: 2, ReconciliationRoot: root,
 			HistoricalIssued: principal, InitialValidatorRemaining: 2_000_000_000 * lpod.Unit,
 			ValidatorRemaining: 2_000_000_000*lpod.Unit - reward,
 			Remaining:          6_000_000_000*lpod.Unit - principal},

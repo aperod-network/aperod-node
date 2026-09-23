@@ -20,7 +20,7 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 
 ---
 
-## ⚠ LPoD — functionality and restricted terms
+## LPoD — functionality, authorship, and licensing
 
 LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
@@ -32,25 +32,21 @@ validator protocol.
 **Detailed functionality guide:** [LPOD.md — protocol behavior, status, and
 source scope](LPOD.md).
 
-The designated original LPoD source files listed in [LPOD.md](LPOD.md) are
-**not open-source software** and are governed by the scoped
-[LICENSE-LPOD](LICENSE-LPOD). The Aperod APRO team has not issued permission to
-execute, develop, deploy, fork, distribute, or reuse that LPoD code. **All
-rights not expressly granted for inspection are reserved.**
-Public visibility permits inspection only: it is not permission to execute,
-deploy, modify, fork, redistribute, or reuse the covered code, commercially or
-noncommercially. Those activities require prior, explicit written software
-approval from the Aperod APRO team through the verified official route
-[@sup_apro_bot](https://t.me/sup_apro_bot). Developer approval is distinct from
-an end user's protocol activation or transaction. Issued permissions will be
-published in the official
-[Aperod LPoD permission registry](https://aperod.com/vaults#lpod-permissions), which
-currently records no permissions. A registry entry does not authorize anyone
-outside its named recipient, code, activity, or other stated scope.
+The original LPoD implementation was authored by the web3 **Aperod APRO team**.
+Its source code and tests are licensed under the repository's
+[Apache License 2.0](LICENSE), including the dedicated files identified in the
+[LPoD source map](LPOD.md#16-lpod-source-map-and-authorship). The guide and
+other original LPoD documentation are licensed under
+[CC BY 4.0](LICENSE-DOCS). Attribution details are published in the official
+[LPoD authorship section](https://aperod.com/vaults#lpod-authorship).
 
-The repository's Apache License 2.0 applies separately to non-LPoD repository
-material identified under it. Dependencies and third-party material remain
-under their own terms. See [NOTICE](NOTICE) for the exact boundary.
+These licenses permit use under their terms without prior approval. They do not
+claim ownership of LPoD as an abstract idea, method, algorithm, or protocol
+concept, and do not restrict independently developed clean-room
+implementations. Attribution requirements apply only when exercising rights in
+the licensed code or documentation. Dependencies and third-party material
+remain under their own terms. [LICENSE-LPOD](LICENSE-LPOD) records the
+compatibility migration from the former restrictive notice.
 
 ---
 
@@ -73,7 +69,7 @@ under their own terms. See [NOTICE](NOTICE) for the exact boundary.
 - [Become a Validator](#-become-a-validator)
 - [Validator Rules](#-validator-rules)
 - [Tokenomics & Fee Burn](#-tokenomics--fee-burn)
-- [LPoD functionality and restricted terms](#-lpod--functionality-and-restricted-terms)
+- [LPoD functionality, authorship, and licensing](#lpod--functionality-authorship-and-licensing)
 - [📈 Why APRO? The Deflationary Case](#-why-apro-the-deflationary-case)
 - [Architecture](#-architecture)
 - [Building from Source](#-building-from-source)
@@ -95,7 +91,7 @@ under their own terms. See [NOTICE](NOTICE) for the exact boundary.
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
 | **Block rewards** | 3 APRO/block from a pre-allocated 2B APRO pool; then 1 APRO/block tail emission; no halving |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
-| **Source licensing** | Mixed: designated original LPoD files are restricted by `LICENSE-LPOD`; other repository material identified under Apache 2.0 and dependencies under their own terms remain separate |
+| **Source licensing** | Go source and tests, including LPoD, are Apache 2.0; original LPoD documentation is CC BY 4.0; dependencies retain their own terms |
 
 ---
 
@@ -324,8 +320,8 @@ finality from height alone. Native position capability is reported separately
 from activation; pending/disabled balances remain null. Source attestations,
 protocol review, coordinated node upgrades and deployment authorization are
 still required before any production activation. Such activation is a
-protocol/governance event; it is not the prior written software approval
-required by `LICENSE-LPOD`.
+protocol/governance event; availability under Apache License 2.0 does not itself
+activate LPoD on any chain.
 
 ```
 Genesis supply:       10,000,000,000 APRO  (10B)
@@ -601,17 +597,17 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 Copyright 2024 [aperod-network](https://github.com/aperod-network)
 
-This repository uses **mixed licensing**:
+Source code and tests are licensed under the **Apache License, Version 2.0**;
+see [LICENSE](LICENSE). This includes the original LPoD implementation authored
+by the web3 Aperod APRO team.
 
-- the designated original LPoD files expressly listed in [LPOD.md](LPOD.md)
-  and carrying `SPDX-License-Identifier: LicenseRef-Aperod-LPoD` are governed
-  by the restrictive, source-available [LICENSE-LPOD](LICENSE-LPOD); and
-- other repository material identified under the **Apache License, Version
-  2.0** remains governed by [LICENSE](LICENSE). Dependencies and third-party
-  material remain under their own terms.
+Original LPoD documentation, including [LPOD.md](LPOD.md), is licensed under
+**Creative Commons Attribution 4.0 International**; see
+[LICENSE-DOCS](LICENSE-DOCS).
 
-No permission to execute, develop, deploy, fork, distribute, or reuse Covered
-Code has been issued. See [NOTICE](NOTICE) for the exact scope.
+Attribution and the superseded LPoD notice are explained in [NOTICE](NOTICE)
+and [LICENSE-LPOD](LICENSE-LPOD). Dependencies and third-party material remain
+under their own terms.
 
 ---
 

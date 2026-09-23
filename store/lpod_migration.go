@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Aperod-LPoD
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) web3 Aperod APRO team
 
 package store
@@ -29,15 +29,19 @@ type LPoDOpening struct {
 }
 
 type LPoDMigration struct {
-	Version            uint8             `json:"version"`
-	Height             uint64            `json:"height"`
-	Genesis            crypto.Hash32     `json:"genesis"`
-	ReconciliationRoot crypto.Hash32     `json:"reconciliation_root"`
-	Openings           []LPoDOpening     `json:"openings"`
-	BodyRoot           crypto.Hash32     `json:"body_root"`
-	HistoricalIssued   uint64            `json:"historical_issued_napro,string"`
-	ValidatorRemaining uint64            `json:"validator_remaining_napro,string"`
-	Attestations       []LPoDAttestation `json:"attestations"`
+	Version uint8 `json:"version"`
+	// PositionLifecycleVersion is quorum-attested separately from the historical
+	// accounting format. Version 1 enables deterministic effective-vault
+	// reassignment and canonical automatic principal refunds.
+	PositionLifecycleVersion uint8             `json:"position_lifecycle_version"`
+	Height                   uint64            `json:"height"`
+	Genesis                  crypto.Hash32     `json:"genesis"`
+	ReconciliationRoot       crypto.Hash32     `json:"reconciliation_root"`
+	Openings                 []LPoDOpening     `json:"openings"`
+	BodyRoot                 crypto.Hash32     `json:"body_root"`
+	HistoricalIssued         uint64            `json:"historical_issued_napro,string"`
+	ValidatorRemaining       uint64            `json:"validator_remaining_napro,string"`
+	Attestations             []LPoDAttestation `json:"attestations"`
 	// Injected ONLY from the node's trusted genesis validator configuration.
 	// Not supplied by an untrusted witness file.
 	TrustedValidators []crypto.ValidatorPubKey `json:"-"`
@@ -79,20 +83,21 @@ func (m *LPoDMigration) verifyAttestations() error {
 }
 
 func (m *LPoDMigration) VerifyAuthorization() error {
-	if m == nil || m.Version != 1 || m.Height == 0 || m.Root() != m.ReconciliationRoot {
+	if m == nil || m.Version != 1 || m.PositionLifecycleVersion != 1 || m.Height == 0 || m.Root() != m.ReconciliationRoot {
 		return fmt.Errorf("lpod: invalid reconciliation authorization")
 	}
 	return m.verifyAttestations()
 }
 
 type LPoDAllocation struct {
-	Version            uint8         `json:"version"`
-	Genesis            crypto.Hash32 `json:"genesis"`
-	FundingHeight      uint64        `json:"funding_height"`
-	FundingBlock       crypto.Hash32 `json:"funding_block"`
-	ReconciliationRoot crypto.Hash32 `json:"reconciliation_root"`
-	HistoricalIssued   uint64        `json:"historical_issued_napro,string"`
-	Remaining          uint64        `json:"remaining_napro,string"`
+	Version                  uint8         `json:"version"`
+	PositionLifecycleVersion uint8         `json:"position_lifecycle_version"`
+	Genesis                  crypto.Hash32 `json:"genesis"`
+	FundingHeight            uint64        `json:"funding_height"`
+	FundingBlock             crypto.Hash32 `json:"funding_block"`
+	ReconciliationRoot       crypto.Hash32 `json:"reconciliation_root"`
+	HistoricalIssued         uint64        `json:"historical_issued_napro,string"`
+	Remaining                uint64        `json:"remaining_napro,string"`
 	// Historical budget is explicitly quorum-attested and must match the
 	// existing durable validator pool. Subsequent draws are checkpoint-bound.
 	ValidatorRemaining        uint64 `json:"validator_remaining_napro,string"`
@@ -105,19 +110,20 @@ type LPoDAllocation struct {
 func (m *LPoDMigration) Root() crypto.Hash32 {
 	b, _ := json.Marshal(struct {
 		Version                              uint8
+		PositionLifecycleVersion             uint8
 		Height                               uint64
 		Genesis                              crypto.Hash32
 		Openings                             []LPoDOpening
 		BodyRoot                             crypto.Hash32
 		HistoricalIssued, ValidatorRemaining uint64
-	}{m.Version, m.Height, m.Genesis, m.Openings, m.BodyRoot, m.HistoricalIssued, m.ValidatorRemaining})
+	}{m.Version, m.PositionLifecycleVersion, m.Height, m.Genesis, m.Openings, m.BodyRoot, m.HistoricalIssued, m.ValidatorRemaining})
 	return crypto.HashBytes([]byte("aperod/lpod/reconciliation/v1"), b)
 }
 
 // ReconcileLPoD scans FULL canonical history. Missing openings or pruned blocks are
 // hard errors. No estimate from the API, supply display or amount index is accepted.
 func ReconcileLPoD(m *LPoDMigration, read func(uint64) (*core.Block, error)) (uint64, crypto.Hash32, error) {
-	if m == nil || m.Version != 1 || m.Height == 0 || m.Genesis == (crypto.Hash32{}) ||
+	if m == nil || m.Version != 1 || m.PositionLifecycleVersion != 1 || m.Height == 0 || m.Genesis == (crypto.Hash32{}) ||
 		m.Root() != m.ReconciliationRoot {
 		return 0, crypto.Hash32{}, fmt.Errorf("lpod: invalid version, activation, genesis or reconciliation root")
 	}
@@ -245,7 +251,7 @@ func (d *DB) appendLPoDMigration(batch *leveldb.Batch, hash crypto.Hash32, heigh
 		State:   lpod.State{FundingDebit: lpod.InitialNAPRO, Balance: lpod.InitialNAPRO, LastHeight: height - 1},
 		Carries: map[string]lpod.Carry{},
 		Allocation: &LPoDAllocation{
-			Version: 1, Genesis: m.Genesis, FundingHeight: height, FundingBlock: hash,
+			Version: 1, PositionLifecycleVersion: m.PositionLifecycleVersion, Genesis: m.Genesis, FundingHeight: height, FundingBlock: hash,
 			ReconciliationRoot: root, HistoricalIssued: issued,
 			Remaining:                 9_000_000_000*lpod.Unit - m.ValidatorRemaining - issued - lpod.InitialNAPRO,
 			ValidatorRemaining:        m.ValidatorRemaining,
