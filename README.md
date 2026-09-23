@@ -9,7 +9,7 @@
 RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Mixed-blue.svg)](#-license)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
 [![Explorer](https://img.shields.io/badge/Explorer-explorer.aperod.com-informational)](https://explorer.aperod.com)
 [![Telegram](https://img.shields.io/badge/Support-@sup__apro__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/sup_apro_bot)
@@ -17,6 +17,48 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 **[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com) &nbsp;·&nbsp; [💬 Telegram Bot](https://t.me/sup_apro_bot)**
 
 </div>
+
+---
+
+## ⚠ LPoD — separate restricted terms / отдельные ограничительные условия
+
+**EN.** LPoD is an Aperod protocol subsystem developed and owned by the web3
+**Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
+canonical accounting and confirmed Guardian-principal refunds. LPoD is disabled
+by default and this repository does not claim that a 1B APRO production
+activation is live. The validator stake lock remains governed separately by the
+validator protocol.
+
+Original LPoD code first validly placed prospectively under the scoped
+[LICENSE-LPOD](LICENSE-LPOD) is **not open-source software**; the exact intended
+inventory and prior-grant boundary are recorded in [LPOD.md](LPOD.md).
+Public visibility permits inspection only: it is not permission to execute,
+deploy, modify, fork, redistribute, or reuse the covered code, commercially or
+noncommercially. Those activities require prior, explicit written software
+approval from the Aperod APRO team through the verified official route
+[@sup_apro_bot](https://t.me/sup_apro_bot). Developer approval is distinct from
+an end user's protocol activation or transaction.
+
+**RU.** LPoD — подсистема протокола Aperod, разработанная и принадлежащая web3
+команде **Aperod APRO**. Она координирует добровольные позиции, начисления,
+связанные с валидаторами, канонический учёт и подтверждённый возврат основной
+суммы Guardian. LPoD по умолчанию отключён; репозиторий не утверждает, что
+активация 1B APRO запущена в production. Блокировка стейка валидатора регулируется
+отдельно протоколом валидаторов.
+
+Оригинальный код LPoD, в дальнейшем правомерно помещённый под действие отдельной
+[LICENSE-LPOD](LICENSE-LPOD), **не является ПО с открытым исходным кодом**;
+точный предполагаемый состав и границы прежних лицензий указаны в
+[LPOD.md](LPOD.md). Публичный просмотр не разрешает запуск,
+развёртывание, изменение, форк, распространение либо коммерческое или
+некоммерческое повторное использование. Для этого заранее требуется явное
+письменное разрешение команды Aperod APRO через официальный канал
+[@sup_apro_bot](https://t.me/sup_apro_bot). Разрешение разработчику не равно
+активации или транзакции конечного пользователя.
+
+The scoped terms preserve all third-party licenses and all rights already
+granted under an earlier license; a repository notice cannot revoke an
+irrevocable prior grant. See [NOTICE](NOTICE) for the license boundary.
 
 ---
 
@@ -39,6 +81,7 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 - [Become a Validator](#-become-a-validator)
 - [Validator Rules](#-validator-rules)
 - [Tokenomics & Fee Burn](#-tokenomics--fee-burn)
+- [LPoD restricted terms](#-lpod--separate-restricted-terms--отдельные-ограничительные-условия)
 - [📈 Why APRO? The Deflationary Case](#-why-apro-the-deflationary-case)
 - [Architecture](#-architecture)
 - [Building from Source](#-building-from-source)
@@ -60,7 +103,7 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
 | **Block rewards** | 3 APRO/block from a pre-allocated 2B APRO pool; then 1 APRO/block tail emission; no halving |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
-| **Open source** | Go 1.25, Apache 2.0, independently auditable cryptographic primitives |
+| **Source licensing** | Mixed: material already offered under Apache 2.0 remains under that license; eligible original LPoD code may be separately scoped by `LICENSE-LPOD`, without changing prior grants or third-party terms |
 
 ---
 
@@ -216,6 +259,81 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 > **Every protocol base fee is permanently burned. 100 %. Always.**
 
 Aperod starts with a fixed genesis allocation and uses a deflationary fee model:
+
+> **Guardian Fund preparation is not active.** The documented nominal
+> allocations already total 10B APRO, and no allocation debit for the proposed
+> 1B APRO protocol lock has been approved. Node startup therefore rejects every
+> nonzero Guardian activation setting. The node API may report
+> `canonical_detected` when it sees the canonical transaction, but that is not
+> BFT finality and must not reduce circulating supply; finality wiring is still
+> incomplete. This preparation does not assert that the actual production
+> genesis is empty, nor that global UTXO supply has been proven.
+
+### Coordinated LPoD protocol — disabled by default
+
+`consensus.lpod_migration_file` is an opt-in **coordinated consensus fork**, not
+an administrative mint switch. No production reconciliation witness or approved
+activation is included in the repository. The legacy Guardian activation must
+remain disabled.
+
+Activation requires the complete historical coinbase commitment openings and a
+strictly greater-than-two-thirds quorum of the **trusted genesis validator set**
+attesting the genesis, activation height, unambiguous full-body root, issued
+total, validator reserve remaining, and reconciliation witness root. Historical
+transaction hashes alone do not commit unambiguously to legacy bodies. Auditors
+must independently approve those bodies and budget; a self-hashed witness is not
+an audit. Missing, pruned, altered, or unattested history fails closed. The
+attested validator budget must equal the existing durable pool balance: it is
+never reset or silently reduced.
+
+Available funding is computed as 10B minus historical issuance, the attested
+**remaining** validator reserve, and an additional protected 1B development
+reservation. The once-only 1B LPoD debit/credit, checkpoint, block, validator
+draw, payout outputs, consumed position key images, and AVM writes commit in one
+batch. Historical validator rewards are not charged twice. The full development
+reservation is conservative; this fork grants no authority to spend it.
+
+* Version 9 positions use the existing MLSAG-v4 direct ownership/opening proof
+  with a linked source key image, plus a separate beneficiary spend-key proof.
+  Signatures bind genesis, source/position, vault, beneficiary, action and nonce.
+  Deposits consume real unvested UTXOs; web sessions never create principal.
+* Positions accrue individually with persistent integer APR remainders, including
+  vaults whose validator did not propose. Canonical timestamp deltas are capped
+  at 15 seconds per block. Newly deposited principal earns from the following
+  block; inactive validators stop new accrual but existing arrears remain due.
+* Signed full withdrawals stop subsequent accrual. After the withdrawal is
+  canonically confirmed, Guardian principal is refunded exactly once without
+  the former 144,000-block Guardian wait. This does not shorten or bypass the
+  separate validator stake lock. Paid, fully closed positions release the
+  4,096-live-position capacity; spent source key images still prevent reopening
+  an old deposit.
+* Version 10 pays the exact leader, Angels and mature-principal plan as real
+  wallet-scannable outputs; recipients are aggregated and sorted. Output
+  ephemeral scalars are deterministic and parent/checkpoint-bound, not secret;
+  protocol beneficiaries and amounts are public. Ordinary CLSAG spending works.
+  Version 8 commits the complete resulting position/accounting checkpoint.
+* Nine-tier leader shares and APRs use canonical stake. Scarce funds are allocated
+  in canonical vault order, proportionally within each vault; unpaid amounts
+  remain position-specific arrears and are retried, never counted as paid.
+  Subsequent self-stake growth above 100M uses the top tier, while new Guardian
+  deposits cannot push a vault above 100M.
+* The existing 3-APRO pool reward, last partial draw, and 1-APRO tail continue.
+  Tail issuance is recorded separately; after exhaustion the conservation
+  equation is the initial 10B **plus explicitly recorded tail issuance**.
+* Restart reads hash-keyed committed positions and carries, not a default pool.
+  Ancestor rollback restores native indices and reserve selection. Rewind first
+  to the common parent, then commit alternate blocks normally. Rewinding earlier
+  than the attested funding parent requires additional historical budget evidence
+  and fails closed; it does not guess the old reserve.
+
+`GET /api/v1/lpod-pool` reports active monetary state only when the exact current
+canonical checkpoint hash has live finality evidence. Restart does not invent
+finality from height alone. Native position capability is reported separately
+from activation; pending/disabled balances remain null. Source attestations,
+protocol review, coordinated node upgrades and deployment authorization are
+still required before any production activation. Such activation is a
+protocol/governance event; it is not the prior written software approval
+required by `LICENSE-LPOD`.
 
 ```
 Genesis supply:       10,000,000,000 APRO  (10B)
@@ -491,7 +609,18 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 Copyright 2024 [aperod-network](https://github.com/aperod-network)
 
-Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) for the full text.
+This repository uses **mixed licensing**:
+
+- material already offered under the **Apache License, Version 2.0** remains
+  under that license; see [LICENSE](LICENSE), together with any applicable
+  third-party terms; and
+- only eligible original LPoD code expressly listed in [LPOD.md](LPOD.md) is
+  intended to be governed by the separate, source-available
+  [LICENSE-LPOD](LICENSE-LPOD).
+
+`LICENSE-LPOD` does not relicense third-party material, code outside its exact
+scope, or any copy already received under an irrevocable prior grant. See
+[NOTICE](NOTICE).
 
 ---
 

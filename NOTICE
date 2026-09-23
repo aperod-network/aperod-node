@@ -1,0 +1,34 @@
+Aperod APRO repository licensing notice
+
+This repository contains material under more than one set of terms.
+
+1. Existing Aperod work
+
+The existing work identified by the repository's Apache License 2.0 notice
+remains under that license. Apache License 2.0 grants already made are
+perpetual and irrevocable subject to its terms; this NOTICE and LICENSE-LPOD do
+not retroactively withdraw or narrow them.
+
+2. Original LPoD code
+
+Only original LPoD code expressly inventoried in LPOD.md, owned by the relevant
+copyright holder, and first publicly distributed with the complete mixed-license
+document set is intended to be subject to LICENSE-LPOD. Previously distributed
+Apache-licensed revisions remain Apache-licensed. LICENSE-LPOD is prospective,
+source-available, and inspection-only, not open source.
+
+3. Third-party material
+
+Third-party software, copied or adapted material, generated material, and
+contributions remain subject to their own notices and licenses. Neither this
+NOTICE nor LICENSE-LPOD overrides those terms. Inclusion in an LPoD-related file
+does not convert third-party material into Covered Code.
+
+4. No technical access control claim
+
+Repository visibility can allow technical copying or forking. Visibility is not
+permission, and these notices do not claim to prevent those actions
+cryptographically.
+
+Verified route for requesting prior written LPoD software approval:
+https://t.me/sup_apro_bot
