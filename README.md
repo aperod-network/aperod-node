@@ -29,9 +29,11 @@ by default and this repository does not claim that a 1B APRO production
 activation is live. The validator stake lock remains governed separately by the
 validator protocol.
 
-Original LPoD code first validly placed prospectively under the scoped
-[LICENSE-LPOD](LICENSE-LPOD) is **not open-source software**; the exact intended
-inventory and prior-grant boundary are recorded in [LPOD.md](LPOD.md).
+The designated original LPoD source files listed in [LPOD.md](LPOD.md) are
+**not open-source software** and are governed by the scoped
+[LICENSE-LPOD](LICENSE-LPOD). The Aperod APRO team has not issued permission to
+execute, develop, deploy, fork, distribute, or reuse that LPoD code. **All
+rights not expressly granted for inspection are reserved.**
 Public visibility permits inspection only: it is not permission to execute,
 deploy, modify, fork, redistribute, or reuse the covered code, commercially or
 noncommercially. Those activities require prior, explicit written software
@@ -46,19 +48,21 @@ an end user's protocol activation or transaction.
 активация 1B APRO запущена в production. Блокировка стейка валидатора регулируется
 отдельно протоколом валидаторов.
 
-Оригинальный код LPoD, в дальнейшем правомерно помещённый под действие отдельной
-[LICENSE-LPOD](LICENSE-LPOD), **не является ПО с открытым исходным кодом**;
-точный предполагаемый состав и границы прежних лицензий указаны в
-[LPOD.md](LPOD.md). Публичный просмотр не разрешает запуск,
+Обозначенные оригинальные исходные файлы LPoD, перечисленные в
+[LPOD.md](LPOD.md), **не являются ПО с открытым исходным кодом** и регулируются
+отдельной [LICENSE-LPOD](LICENSE-LPOD). Команда Aperod APRO не выдавала
+разрешений на запуск, разработку, развёртывание, форк, распространение или
+повторное использование этого кода LPoD. **Все права, кроме прямо разрешённого
+ознакомительного просмотра, сохранены.** Публичный просмотр не разрешает запуск,
 развёртывание, изменение, форк, распространение либо коммерческое или
 некоммерческое повторное использование. Для этого заранее требуется явное
 письменное разрешение команды Aperod APRO через официальный канал
 [@sup_apro_bot](https://t.me/sup_apro_bot). Разрешение разработчику не равно
 активации или транзакции конечного пользователя.
 
-The scoped terms preserve all third-party licenses and all rights already
-granted under an earlier license; a repository notice cannot revoke an
-irrevocable prior grant. See [NOTICE](NOTICE) for the license boundary.
+The repository's Apache License 2.0 applies separately to non-LPoD repository
+material identified under it. Dependencies and third-party material remain
+under their own terms. See [NOTICE](NOTICE) for the exact boundary.
 
 ---
 
@@ -103,7 +107,7 @@ irrevocable prior grant. See [NOTICE](NOTICE) for the license boundary.
 | **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
 | **Block rewards** | 3 APRO/block from a pre-allocated 2B APRO pool; then 1 APRO/block tail emission; no halving |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
-| **Source licensing** | Mixed: material already offered under Apache 2.0 remains under that license; eligible original LPoD code may be separately scoped by `LICENSE-LPOD`, without changing prior grants or third-party terms |
+| **Source licensing** | Mixed: designated original LPoD files are restricted by `LICENSE-LPOD`; other repository material identified under Apache 2.0 and dependencies under their own terms remain separate |
 
 ---
 
@@ -611,16 +615,15 @@ Copyright 2024 [aperod-network](https://github.com/aperod-network)
 
 This repository uses **mixed licensing**:
 
-- material already offered under the **Apache License, Version 2.0** remains
-  under that license; see [LICENSE](LICENSE), together with any applicable
-  third-party terms; and
-- only eligible original LPoD code expressly listed in [LPOD.md](LPOD.md) is
-  intended to be governed by the separate, source-available
-  [LICENSE-LPOD](LICENSE-LPOD).
+- the designated original LPoD files expressly listed in [LPOD.md](LPOD.md)
+  and carrying `SPDX-License-Identifier: LicenseRef-Aperod-LPoD` are governed
+  by the restrictive, source-available [LICENSE-LPOD](LICENSE-LPOD); and
+- other repository material identified under the **Apache License, Version
+  2.0** remains governed by [LICENSE](LICENSE). Dependencies and third-party
+  material remain under their own terms.
 
-`LICENSE-LPOD` does not relicense third-party material, code outside its exact
-scope, or any copy already received under an irrevocable prior grant. See
-[NOTICE](NOTICE).
+No permission to execute, develop, deploy, fork, distribute, or reuse Covered
+Code has been issued. See [NOTICE](NOTICE) for the exact scope.
 
 ---
 

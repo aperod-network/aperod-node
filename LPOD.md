@@ -43,13 +43,18 @@ not approval.
 
 ## Exact Covered Code inventory
 
-Subject to the exclusions below, the intended Covered Code is limited to the
-original Aperod APRO team LPoD material first publicly distributed with
-`LICENSE-LPOD` in these public-repository paths:
+Covered Code is limited to the original copyrightable source-code expression
+of the Aperod APRO team in the following public-repository paths, each marked
+with `SPDX-License-Identifier: LicenseRef-Aperod-LPoD`:
 
 - `api/lpod_pool.go`
 - `api/lpod_pool_test.go`
+- `api/lpod_positions.go`
+- `api/lpod_positions_test.go`
 - `cmd/node/lpod.go`
+- `cmd/wallet-wasm/lpod.go`
+- `cmd/wallet-wasm/lpod_js_wasm.go`
+- `cmd/wallet-wasm/lpod_test.go`
 - `consensus/lpod.go`
 - `consensus/lpod_finality_test.go`
 - `consensus/lpod_positions_test.go`
@@ -71,11 +76,17 @@ The inventory does **not** cover shared files merely modified to call LPoD,
 documentation, unrelated Aperod code, dependencies, generated code, or
 third-party material. If any inventoried file contains such material,
 [LICENSE-LPOD](LICENSE-LPOD) applies only to the original portions owned by the
-applicable copyright holder and never supersedes prior grants.
+applicable copyright holder.
 
 ## License boundary
 
-The repository's existing Apache License 2.0 terms, third-party terms, and all
-irrevocable prior grants remain intact. LICENSE-LPOD can govern only material
-validly placed under it prospectively by the relevant copyright holder. See
-[NOTICE](NOTICE).
+The Aperod APRO team has not issued permission to execute, develop, deploy,
+fork, distribute, or reuse Covered Code. Prior explicit written approval is
+required for every such use. All rights not expressly granted for inspection
+are reserved.
+
+The root Apache License 2.0 applies separately to non-Covered Code identified
+under it. Dependencies and third-party material remain subject to their own
+terms. `LICENSE-LPOD` claims no ownership of abstract ideas, methods, protocol
+concepts, or independently developed code; it governs only the designated
+original copyrightable expression. See [NOTICE](NOTICE).

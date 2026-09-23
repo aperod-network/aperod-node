@@ -2,27 +2,31 @@ Aperod APRO repository licensing notice
 
 This repository contains material under more than one set of terms.
 
-1. Existing Aperod work
+1. Apache-licensed repository material
 
-The existing work identified by the repository's Apache License 2.0 notice
-remains under that license. Apache License 2.0 grants already made are
-perpetual and irrevocable subject to its terms; this NOTICE and LICENSE-LPOD do
-not retroactively withdraw or narrow them.
+The root Apache License 2.0 governs non-LPoD repository material identified
+under it. It does not govern files designated as Covered Code under
+LICENSE-LPOD.
 
 2. Original LPoD code
 
-Only original LPoD code expressly inventoried in LPOD.md, owned by the relevant
-copyright holder, and first publicly distributed with the complete mixed-license
-document set is intended to be subject to LICENSE-LPOD. Previously distributed
-Apache-licensed revisions remain Apache-licensed. LICENSE-LPOD is prospective,
-source-available, and inspection-only, not open source.
+Only the original copyrightable LPoD source-code expression in files expressly
+inventoried in LPOD.md and marked
+`SPDX-License-Identifier: LicenseRef-Aperod-LPoD` is Covered Code.
+LICENSE-LPOD is source-available and inspection-only, not open source. The
+Aperod APRO team has not issued permission to execute, develop, deploy, fork,
+distribute, or reuse Covered Code; prior explicit written approval is required.
+All rights not expressly granted for inspection are reserved.
 
 3. Third-party material
 
-Third-party software, copied or adapted material, generated material, and
-contributions remain subject to their own notices and licenses. Neither this
-NOTICE nor LICENSE-LPOD overrides those terms. Inclusion in an LPoD-related file
-does not convert third-party material into Covered Code.
+Third-party software, generated material, and dependencies remain subject to
+their own notices and licenses. Inclusion in an LPoD-related file does not
+convert third-party material into Covered Code.
+
+LICENSE-LPOD claims no ownership of abstract ideas, methods, protocol concepts,
+or independently developed code. It governs only the designated original
+copyrightable expression.
 
 4. No technical access control claim
 

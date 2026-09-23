@@ -8,16 +8,15 @@ This license is not an open-source license.
 copyright notice for the Covered Code, publicly described in this repository as
 the web3 Aperod APRO team.
 
-"Restricted Release" means the first public repository release that includes
-this LICENSE-LPOD, LPOD.md, NOTICE, and the Apache License 2.0 file together.
+"Covered Code" means only the original copyrightable LPoD source-code
+expression owned by Licensor, expressly listed in LPOD.md, and marked
+`SPDX-License-Identifier: LicenseRef-Aperod-LPoD`. It does not include code
+merely used by, linked to, called by, or stored in the same repository as LPoD.
+It also excludes every third-party component and every portion for which
+Licensor does not hold the necessary rights.
 
-"Covered Code" means only the original LPoD code owned by Licensor, expressly
-listed in LPOD.md, and first publicly distributed under this license in the
-Restricted Release or a later release. It does not include an earlier copy or
-revision distributed under Apache License 2.0 or another license. It does not
-include code merely used by, linked to, called by, or stored in the same
-repository as LPoD. It also excludes every third-party component and every
-portion for which Licensor does not hold the necessary rights.
+Covered Code does not include abstract ideas, methods, algorithms, protocol
+concepts, facts, or code independently developed without copying Covered Code.
 
 2. Inspection-only permission
 
@@ -65,39 +64,31 @@ not a software license and does not authorize any person to execute, deploy,
 modify, fork, distribute, or reuse the Covered Code. Conversely, written
 developer approval does not by itself activate LPoD on any chain.
 
-5. Existing grants and third-party rights
+5. Scope exclusions and separate terms
 
-Nothing in this license revokes, narrows, or replaces:
+The repository's Apache License 2.0 applies separately to non-Covered Code
+identified under it. Third-party software, generated material, and dependencies
+remain subject to their own terms. Inclusion in a Covered Code file does not
+change those terms or make third-party material Covered Code.
 
-(a) an earlier license grant for a copy or contribution, including any
-    perpetual or irrevocable grant;
-(b) a third-party license or attribution requirement; or
-(c) rights in code outside the Covered Code.
-
-If a Covered Code file combines separately licensed material with Licensor's
-original material, this license applies only to Licensor's original material
-and only to the extent it was not already distributed under another license.
-Recipients may continue to rely on applicable prior grants for copies received
-under those grants.
-
-This license is prospective only. It does not convert a previously Apache-
-licensed revision into Covered Code, even if that revision later appears in an
-inventoried path or is redistributed beside this license.
+Licensor states that it has not issued permission to execute, develop, deploy,
+fork, distribute, or reuse Covered Code. Every such activity requires prior
+explicit written approval under Section 3.
 
 6. Ownership and reservations
 
-The Covered Code is licensed, not sold. Licensor retains its rights in the
-Covered Code. No rights are granted by implication, estoppel, repository
-visibility, or otherwise. This license does not grant rights in Aperod or APRO
-names, logos, or other branding except as needed to reproduce required notices.
+The Covered Code is licensed, not sold. All rights not expressly granted for
+inspection in Section 2 are reserved. No rights are granted by implication,
+estoppel, repository visibility, or otherwise. This license does not grant
+rights in Aperod or APRO names, logos, or other branding except as needed to
+reproduce required notices.
 
 7. Compliance and termination
 
 The limited permission in Section 2 terminates automatically if you breach this
 license. On termination, you must stop relying on that permission and delete
 inspection copies of the Covered Code, except copies that applicable law
-requires you to retain. Termination does not affect rights validly obtained
-under an earlier irrevocable license.
+requires you to retain.
 
 8. Disclaimer
 
