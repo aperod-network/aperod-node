@@ -342,12 +342,17 @@ MY_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null \
 
 if [[ "${MY_IP}" == "0.0.0.0" ]]; then
   warn "Не удалось определить внешний IP автоматически."
-  read -rp "Введите публичный IP этого сервера (или Enter чтобы пропустить): " MY_IP
-  MY_IP="${MY_IP:-0.0.0.0}"
+  read -rp "Введите публичный IP этого сервера: " MY_IP
 fi
+[[ -n "${MY_IP}" && "${MY_IP}" != "0.0.0.0" ]] \
+  || die "Публичный IP обязателен; отказано в создании небезопасной конфигурации с 0.0.0.0"
 info "Внешний IP: ${MY_IP}"
 
 # ── 8. Конфигурация ноды ──────────────────────────────────
+command -v openssl >/dev/null 2>&1 || die "openssl необходим для генерации API-ключа"
+umask 077
+API_KEY="$(openssl rand -hex 32)" || die "Не удалось сгенерировать API-ключ"
+[[ ${#API_KEY} -eq 64 ]] || die "Генератор API-ключа вернул некорректный результат"
 cat > "${CONFIG_DIR}/node.yaml" <<EOF
 # Aperod Node Configuration
 # Автоматически создан install-node.sh $(date -u +"%Y-%m-%d %H:%M UTC")
@@ -364,10 +369,12 @@ p2p:
   # Do NOT start the node until aperod-join.sh has been run.
   bootnodes: []
 
-rpc:
+api:
+  enabled: true
   # ВАЖНО: только localhost! Никогда не меняйте на 0.0.0.0
-  listen: 127.0.0.1:${RPC_PORT}
-  cors_origins: []
+  listen_addr: 127.0.0.1:${RPC_PORT}
+  key: ${API_KEY}
+  cors: []
 
 wallet:
   key_file: ${WALLET_FILE}
@@ -388,6 +395,9 @@ metrics:
   enabled: true
   listen: 127.0.0.1:9090
 EOF
+chmod 600 "${CONFIG_DIR}/node.yaml"
+chown aperod:aperod "${CONFIG_DIR}/node.yaml"
+unset API_KEY
 
 ok "Конфигурация сохранена: ${CONFIG_DIR}/node.yaml"
 

@@ -302,6 +302,7 @@ func buildAdminStakeServer(t *testing.T, db *store.DB, pruningMode string) (
 	const fakeOutIdx uint32 = 0
 
 	srv = api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey("test-api-key")
 	srv.SetValidatorKey(lockedKey)
 	if db != nil {
 		srv.SetStore(db)
@@ -327,7 +328,9 @@ func postAdminStakePayload(t *testing.T, srv *api.Server, pubHex string, txHash 
 	)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/stake-deposit", strings.NewReader(body))
 	req.Host = "127.0.0.1" // localOnly DNS-rebinding guard requires a loopback Host
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	return rr.Code, rr.Body.String()

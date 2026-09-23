@@ -994,11 +994,13 @@ const maxCoinbasesPerBlock = 11
 //  2. All coinbase transactions must form a contiguous prefix (appear before
 //     any non-coinbase transaction).
 //
-// The reward-amount cap cannot be checked here because the Pedersen-committed
-// output amount is hidden.  The cap is enforced structurally: external coinbases
-// are blocked by mempool.Add; the engine-reward coinbase is capped by
-// blockRewardAtHeight; and admin mints go through AddPrivileged which is only
-// reachable from the localhost-only admin RPC.
+// The reward amount cannot be checked under this legacy policy because the
+// Pedersen-committed output amount is hidden.  This function exists only for
+// canonical replay below RewardAuthorizationActivationHeight.  It is not an
+// authorization boundary: a malicious proposer can construct a structurally
+// valid arbitrary-supply coinbase directly.  New local legacy-mint creation is
+// disabled; coordinated activation of the signed reward policy is what closes
+// acceptance at consensus.
 //
 // Stake transactions (TxVersionStake) have zero inputs but are NOT coinbases —
 // they do not create supply and are exempt from this policy.
@@ -1172,19 +1174,39 @@ func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
 
 // ─── Admin mint scheduling ────────────────────────────────────────────────────
 
-// ScheduleAdminMint queues an admin mint and blocks until the mint is included
-// in a committed block (returning its tx hash and inclusion height) or the
-// timeout expires.
+// ScheduleAdminMint is retained for API compatibility but fails closed while
+// the legacy admin-mint transaction has no consensus-authenticated envelope.
 //
-// The mint transaction is built inside produceBlock with the block's own
-// height, so its one-time pub is spend_pub + height*G — cryptographically
-// unique per mint.  This replaces the legacy height=0 mempool path, where all
-// admin mints to one address shared a single key image and one spent/phantom
-// key-image index entry blocked every future mint to that address.
-//
-// A caller timeout does not cancel the keyed request: it remains queued or
-// in-flight, and a retry with the same key joins it rather than minting again.
+// The dormant implementation below is kept only so a future consensus-visible
+// authorization format can reuse its durable idempotency and inclusion-height
+// scheduling. It must not be re-enabled merely by an RPC credential or local
+// configuration.
+func legacyAdminMintAuthorizationAvailable() bool {
+	// There is intentionally no configuration or key-based override.  This may
+	// become true only when ScheduleAdminMint accepts and validates a
+	// consensus-visible envelope with protocol-defined supply limits.
+	return false
+}
+
 func (e *Engine) ScheduleAdminMint(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
+	// Legacy admin mints have no consensus-authenticated envelope.  In
+	// particular, the idempotency key authenticates nothing: the resulting
+	// zero-input transaction contains no signed intent, proposer binding, or
+	// consensus amount cap.  A locally protected RPC therefore cannot make the
+	// transaction safe once it is relayed to peers.
+	//
+	// Fail closed for all newly scheduled legacy mints.  Do not key this
+	// decision to RingCT activation: deployments intentionally configure that
+	// height in the future, which previously reopened unlimited mint creation.
+	// Historical blocks are unaffected because block validation retains the
+	// pre-RewardAuthorizationActivationHeight policy below.  The existing
+	// proposer-signed, height/parent/recipient/amount-bound reward protocol is
+	// the only supported new coinbase creation path.
+	if !legacyAdminMintAuthorizationAvailable() {
+		return crypto.Hash32{}, 0, fmt.Errorf(
+			"legacy admin mint scheduling is disabled: no consensus-authenticated mint authorization envelope")
+	}
+
 	if strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 128 {
 		return crypto.Hash32{}, 0, fmt.Errorf("idempotency key must be between 1 and 128 bytes")
 	}
@@ -1412,8 +1434,9 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 	// Defense-in-depth: strip any NON-PRIVILEGED coinbase (zero-input) txs that
 	// may have bypassed the mempool guard.  mempool.Add() already rejects
 	// external coinbases, so finding one here indicates a bug; log and drop it.
-	// PRIVILEGED coinbases (added via mempool.AddPrivileged, e.g. admin mints)
-	// are intentional and must pass through to the block.
+	// PRIVILEGED legacy coinbases are also dropped while there is no
+	// consensus-authenticated admin-mint envelope.  Local privilege is not
+	// consensus authorization.
 	//
 	// Stake transactions (TxVersionStake) also have zero inputs — they carry
 	// their payload in Extra, not in Inputs.  They are NOT coinbases and must
@@ -1427,6 +1450,12 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			if !e.pool.IsPrivileged(h) {
 				e.log.Warn("produceBlock: dropping unexpected non-privileged coinbase from pool",
 					"hash", h)
+				continue
+			}
+			if !legacyAdminMintAuthorizationAvailable() {
+				e.log.Warn("produceBlock: dropping privileged legacy mint without consensus authorization",
+					"hash", h, "height", height)
+				e.pool.Remove(h)
 				continue
 			}
 			if rewardAuthorizationActive {
@@ -1565,7 +1594,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			mintCapacity--
 		}
 	}
-	if adminMintActive && !rewardAuthorizationActive {
+	if legacyAdminMintAuthorizationAvailable() && adminMintActive && !rewardAuthorizationActive {
 		if adminMints := e.takeQueuedAdminMints(height, mintCapacity); len(adminMints) > 0 {
 			txs = append(adminMints, txs...)
 		}

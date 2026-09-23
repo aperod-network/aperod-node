@@ -4,13 +4,18 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,19 +43,19 @@ const utxoCacheTTL = 90 * time.Second
 type Server struct {
 	lpodMigration *store.LPoDMigration
 	lpodFinalized func(uint64, crypto.Hash32) bool
-	addr        string
-	chain       *core.Chain
-	mempool     *core.Mempool
-	utxos       *core.UTXOSet
-	registry    *core.ValidatorRegistry    // live PoS validator registry (optional)
-	myKey       *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
-	blockStore  *store.DB                  // optional: LevelDB store for pruned-block fallback
-	log         *slog.Logger
-	mux         *http.ServeMux
-	hub         *Hub
-	apiKey      string   // optional; empty = dev mode (no auth)
-	corsOrigins []string // empty = allow all ("*")
-	rateLimiter *RateLimiter
+	addr          string
+	chain         *core.Chain
+	mempool       *core.Mempool
+	utxos         *core.UTXOSet
+	registry      *core.ValidatorRegistry    // live PoS validator registry (optional)
+	myKey         *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
+	blockStore    *store.DB                  // optional: LevelDB store for pruned-block fallback
+	log           *slog.Logger
+	mux           *http.ServeMux
+	hub           *Hub
+	apiKey        string   // empty fails closed for privileged operations
+	corsOrigins   []string // empty = do not grant cross-origin browser access
+	rateLimiter   *RateLimiter
 
 	// utxoAudit holds the latest background UTXO-store audit result,
 	// pushed by cmd/node via SetUTXOAuditResult and served on
@@ -964,10 +969,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	// CORS
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	s.applyRPCCORS(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -976,6 +978,17 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, nil, errCodeInvalid, "only POST is supported")
 		return
 	}
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		s.writeError(w, nil, errCodeInvalid, "Content-Type must be application/json")
+		return
+	}
+	if r.ContentLength > maxPrivilegedRequestBody {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		s.writeError(w, nil, errCodeInvalid, "request body too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPrivilegedRequestBody)
 
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -985,6 +998,18 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	if req.JSONRPC != "2.0" {
 		s.writeError(w, req.ID, errCodeInvalid, "jsonrpc must be '2.0'")
 		return
+	}
+	if rpcMethodRequiresAuth(req.Method) {
+		if err := s.checkBrowserMutation(r, false); err != nil {
+			w.WriteHeader(http.StatusForbidden)
+			s.writeError(w, req.ID, errCodeInvalid, err.Error())
+			return
+		}
+		if !s.rpcAPIKeyMatches(r, req.Params) {
+			w.WriteHeader(http.StatusUnauthorized)
+			s.writeError(w, req.ID, errCodeInvalid, "unauthorized: missing or invalid API key")
+			return
+		}
 	}
 
 	result, err := s.dispatch(r.Context(), req.Method, req.Params)
@@ -997,6 +1022,82 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		ID:      req.ID,
 		Result:  result,
 	})
+}
+
+const maxPrivilegedRequestBody int64 = 1 << 20
+
+func isJSONContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && strings.EqualFold(mediaType, "application/json")
+}
+
+func (s *Server) applyRPCCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	for _, allowed := range s.corsOrigins {
+		if allowed == origin {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+			return
+		}
+	}
+}
+
+func rpcMethodRequiresAuth(method string) bool {
+	switch method {
+	case "apr_sendRawTransaction", "apr_walletSend", "apr_walletMaxSpendable",
+		"apr_walletEstimateFee", "apr_walletBatchSend", "apr_scanUTXOs":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) apiKeyMatches(candidate string) bool {
+	if s.apiKey == "" || candidate == "" || len(candidate) != len(s.apiKey) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(s.apiKey)) == 1
+}
+
+func (s *Server) rpcAPIKeyMatches(r *http.Request, params json.RawMessage) bool {
+	if s.apiKeyMatches(r.Header.Get("X-API-Key")) {
+		return true
+	}
+	var auth struct {
+		APIKey string `json:"api_key"`
+	}
+	return json.Unmarshal(params, &auth) == nil && s.apiKeyMatches(auth.APIKey)
+}
+
+// checkBrowserMutation rejects browser cross-site requests before any
+// privileged operation is dispatched. REST admin operations pass local=true;
+// RPC operations may additionally use an explicitly configured CORS origin.
+func (s *Server) checkBrowserMutation(r *http.Request, local bool) error {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return fmt.Errorf("forbidden: cross-site request")
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return nil
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("forbidden: invalid Origin")
+	}
+	host := u.Hostname()
+	if local && (host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())) {
+		return nil
+	}
+	if !local {
+		for _, allowed := range s.corsOrigins {
+			if subtle.ConstantTimeCompare([]byte(origin), []byte(allowed)) == 1 {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("forbidden: Origin is not allowed")
 }
 
 func (s *Server) dispatch(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
@@ -1176,15 +1277,10 @@ func (s *Server) aprGetMempoolTxs() (interface{}, error) {
 
 func (s *Server) aprSendRawTransaction(params json.RawMessage) (interface{}, error) {
 	var args struct {
-		Tx     json.RawMessage `json:"tx"`
-		APIKey string          `json:"api_key"` // alternative to X-API-Key header
+		Tx json.RawMessage `json:"tx"`
 	}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
-	}
-	// Check API key when one is configured
-	if s.apiKey != "" && args.APIKey != s.apiKey {
-		return nil, fmt.Errorf("unauthorized: missing or invalid api_key")
 	}
 	var tx core.Transaction
 	if err := json.Unmarshal(args.Tx, &tx); err != nil {

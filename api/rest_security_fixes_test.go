@@ -45,6 +45,7 @@ func TestREST_AdminMint_RequiresAPIKey(t *testing.T) {
 	// bypasses the DNS-rebinding guard — set it explicitly to a loopback value.
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body))
 	req.Host = "127.0.0.1:8545"
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -59,6 +60,7 @@ func TestREST_AdminMint_RequiresAPIKey(t *testing.T) {
 	})
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body2))
 	req2.Host = "127.0.0.1:8545"
+	req2.RemoteAddr = "127.0.0.1:54321"
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("X-API-Key", apiKey)
 	rr2 := httptest.NewRecorder()
@@ -68,9 +70,9 @@ func TestREST_AdminMint_RequiresAPIKey(t *testing.T) {
 	}
 }
 
-// TestREST_AdminMint_NoKeyConfigured_AllowsRequest confirms that when no API
-// key is configured (dev mode), admin/mint is accepted without a header.
-func TestREST_AdminMint_NoKeyConfigured_AllowsRequest(t *testing.T) {
+// TestREST_AdminMint_NoKeyConfigured_FailsClosed confirms that an omitted
+// configuration key never turns a privileged endpoint into an open endpoint.
+func TestREST_AdminMint_NoKeyConfigured_FailsClosed(t *testing.T) {
 	srv, _ := buildUTXOServer(t) // no SetAPIKey call
 
 	wk, _ := crypto.GenerateWalletKeys()
@@ -81,11 +83,153 @@ func TestREST_AdminMint_NoKeyConfigured_AllowsRequest(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body))
 	req.Host = "127.0.0.1:8545"
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
-	if rr.Code == http.StatusUnauthorized {
-		t.Errorf("no API key configured: status = %d, want != 401 (dev mode must work without header)", rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("no API key configured: status = %d, want 401 (privileged API must fail closed)", rr.Code)
+	}
+}
+
+func TestREST_AdminMint_LocalAndBrowserGuards(t *testing.T) {
+	const key = "test-secret-key-abc123"
+	tests := []struct {
+		name       string
+		host       string
+		remoteAddr string
+		apiKey     string
+		content    string
+		origin     string
+		fetchSite  string
+		want       int
+	}{
+		{name: "invalid key", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: "wrong", content: "application/json", want: http.StatusUnauthorized},
+		{name: "spoofed host", host: "attacker.example", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/json", want: http.StatusForbidden},
+		{name: "empty host", host: "", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/json", want: http.StatusForbidden},
+		{name: "forged forwarded", host: "127.0.0.1", remoteAddr: "192.0.2.10:1", apiKey: key, content: "application/json", want: http.StatusForbidden},
+		{name: "cross site origin", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/json", origin: "https://attacker.example", want: http.StatusForbidden},
+		{name: "cross site fetch", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/json", fetchSite: "cross-site", want: http.StatusForbidden},
+		{name: "text plain", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: key, content: "text/plain", want: http.StatusUnsupportedMediaType},
+		{name: "permissive content type", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/jsonp", want: http.StatusUnsupportedMediaType},
+		{name: "authenticated", host: "127.0.0.1", remoteAddr: "127.0.0.1:1", apiKey: key, content: "application/json", want: http.StatusServiceUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := buildUTXOServer(t)
+			srv.SetAPIKey(key)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader([]byte(`{"idempotency_key":"security-test","address":"bad","amount_apr":1}`)))
+			req.Host = tc.host
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("Content-Type", tc.content)
+			req.Header.Set("X-API-Key", tc.apiKey)
+			req.Header.Set("Origin", tc.origin)
+			req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			req.Header.Set("X-Forwarded-For", "127.0.0.1")
+			rr := httptest.NewRecorder()
+			srv.ServeHTTP(rr, req)
+			if tc.name == "authenticated" {
+				if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden || rr.Code == http.StatusUnsupportedMediaType {
+					t.Fatalf("authenticated request rejected by security guard: %d", rr.Code)
+				}
+				return
+			}
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestREST_AdminBodyLimit(t *testing.T) {
+	srv, _ := buildUTXOServer(t)
+	srv.SetAPIKey("test-secret-key-abc123")
+	body := bytes.Repeat([]byte("a"), (1<<20)+1)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/mint", bytes.NewReader(body))
+	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:1"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-secret-key-abc123")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized admin request status=%d, want 413; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRPC_WalletAuthAndCORS(t *testing.T) {
+	srv, _ := newTestServer(t)
+	const key = "wallet-rpc-test-key"
+	srv.SetAPIKey(key)
+	srv.SetAllowedOrigins([]string{"https://admin.example"})
+
+	call := func(apiKey, contentType, origin, fetchSite string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := []byte(`{"jsonrpc":"2.0","id":1,"method":"apr_walletMaxSpendable","params":{}}`)
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-API-Key", apiKey)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Sec-Fetch-Site", fetchSite)
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := call("", "application/json", "", ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status=%d, want 401", rr.Code)
+	}
+	if rr := call("wrong", "application/json", "", ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid key status=%d, want 401", rr.Code)
+	}
+	if rr := call(key, "text/plain", "", ""); rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("text/plain status=%d, want 415", rr.Code)
+	}
+	if rr := call(key, "application/jsonp", "", ""); rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("permissive content type status=%d, want 415", rr.Code)
+	}
+	if rr := call(key, "application/json", "https://attacker.example", "cross-site"); rr.Code != http.StatusForbidden {
+		t.Fatalf("cross-site status=%d, want 403", rr.Code)
+	}
+	rr := call(key, "application/json", "https://admin.example", "same-site")
+	if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden {
+		t.Fatalf("authenticated configured-origin request rejected: %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://admin.example" {
+		t.Fatalf("CORS origin=%q, want configured origin", got)
+	}
+	rr = call(key, "application/json", "https://attacker.example", "same-site")
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("unconfigured origin received CORS header %q", got)
+	}
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/", nil)
+	preflight.Header.Set("Origin", "https://admin.example")
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	preflight.Header.Set("Access-Control-Request-Headers", "Content-Type, X-API-Key")
+	preflightRR := httptest.NewRecorder()
+	srv.ServeHTTP(preflightRR, preflight)
+	if preflightRR.Code != http.StatusOK {
+		t.Fatalf("unauthenticated preflight status=%d, want 200", preflightRR.Code)
+	}
+	if got := preflightRR.Header().Get("Access-Control-Allow-Origin"); got != "https://admin.example" {
+		t.Fatalf("preflight CORS origin=%q, want configured origin", got)
+	}
+}
+
+func TestRPC_PrivilegedBodyLimit(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.SetAPIKey("wallet-rpc-test-key")
+	padding := bytes.Repeat([]byte("a"), (1<<20)+1)
+	body := append([]byte(`{"jsonrpc":"2.0","id":1,"method":"apr_walletMaxSpendable","params":{"padding":"`), padding...)
+	body = append(body, []byte(`"}}`)...)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "wallet-rpc-test-key")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized RPC status=%d, want 413; body=%s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -38,6 +38,7 @@ func rpcCallMax(t *testing.T, srv *api.Server, method string, params interface{}
 	})
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	var resp map[string]interface{}
@@ -135,6 +136,7 @@ func TestRPC_WalletMaxSpendable_Height0Mints(t *testing.T) {
 
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey("test-api-key")
 
 	// The wallet DB view of the same UTXOs (sums to far more than spendable).
 	utxoList := make([]map[string]interface{}, len(mintTxs))

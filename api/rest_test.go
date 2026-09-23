@@ -551,7 +551,9 @@ func restLocalPostJSON(t *testing.T, srv *api.Server, path string, body []byte) 
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	var resp map[string]interface{}
@@ -1250,6 +1252,8 @@ func restLocalDelete(t *testing.T, srv *api.Server, path string) (int, map[strin
 	t.Helper()
 	req := httptest.NewRequest(http.MethodDelete, path, nil)
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	var resp map[string]interface{}

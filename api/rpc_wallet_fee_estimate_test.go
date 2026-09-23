@@ -119,8 +119,10 @@ func newFeeEstEnv(t *testing.T, mintSpecs []struct {
 	}
 
 	mp := core.NewMempool(core.DefaultMempoolConfig())
+	srv := api.NewServer(":0", chain, mp, utxosSet, testLogger())
+	srv.SetAPIKey("test-api-key")
 	return &feeEstTestEnv{
-		srv:      api.NewServer(":0", chain, mp, utxosSet, testLogger()),
+		srv:      srv,
 		keys:     keys,
 		addr:     addr,
 		utxoList: utxoList,

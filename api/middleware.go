@@ -8,6 +8,7 @@ package api
 //   - WS client cap         (2.2.5): max 1000 concurrent / 10 per IP
 
 import (
+	"crypto/subtle"
 	"net"
 	"net/http"
 	"sync"
@@ -122,8 +123,8 @@ func newHeavyRL() *heavyRL {
 }
 
 const (
-	heavyRate  = 2   // tokens per second
-	heavyBurst = 5   // bucket capacity
+	heavyRate  = 2 // tokens per second
+	heavyBurst = 5 // bucket capacity
 )
 
 func (h *heavyRL) allow(ip string) bool {
@@ -253,12 +254,10 @@ func trimSpace(s string) string {
 // APIKeyMiddleware requires X-API-Key to match key for the wrapped handler.
 // Used for write-operation endpoints (sendRawTransaction).
 func APIKeyMiddleware(key string, next http.HandlerFunc) http.HandlerFunc {
-	if key == "" {
-		// No key configured — allow all (dev mode)
-		return next
-	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-API-Key") != key {
+		candidate := r.Header.Get("X-API-Key")
+		if key == "" || candidate == "" || len(candidate) != len(key) ||
+			subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) != 1 {
 			http.Error(w, `{"error":"unauthorized: missing or invalid X-API-Key"}`, http.StatusUnauthorized)
 			return
 		}
@@ -268,7 +267,8 @@ func APIKeyMiddleware(key string, next http.HandlerFunc) http.HandlerFunc {
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
-// CORSConfig holds allowed origins. Empty slice means all origins ("*").
+// CORSConfig holds allowed origins. An empty slice grants no cross-origin
+// browser access; same-origin and non-browser callers do not need CORS headers.
 type CORSConfig struct {
 	AllowedOrigins []string // e.g. ["https://explorer.aperod.io"]
 }
@@ -278,18 +278,15 @@ func (c CORSConfig) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		allowed := ""
-		if len(c.AllowedOrigins) == 0 {
-			allowed = "*"
-		} else {
-			for _, o := range c.AllowedOrigins {
-				if o == origin {
-					allowed = origin
-					break
-				}
+		for _, o := range c.AllowedOrigins {
+			if o == origin {
+				allowed = origin
+				break
 			}
 		}
 		if allowed != "" {
 			w.Header().Set("Access-Control-Allow-Origin", allowed)
+			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		}

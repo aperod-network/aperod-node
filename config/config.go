@@ -362,9 +362,9 @@ type ConsensusConfig struct {
 	// Startup verifies it against the stored chain. It must be set together
 	// with a non-zero activation height.
 	GuardianFundChainAnchor string `yaml:"guardian_fund_chain_anchor"`
-// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
-// Empty disables the fork. Merely setting a target amount never funds the pool.
-LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
+	// Empty disables the fork. Merely setting a target amount never funds the pool.
+	LPoDMigrationFile string `yaml:"lpod_migration_file"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -372,9 +372,8 @@ type APIConfig struct {
 	Enabled    bool     `yaml:"enabled"`
 	ListenAddr string   `yaml:"listen_addr"`
 	CORS       []string `yaml:"cors"`
-	// Key, when non-empty, requires all write RPC methods (apr_sendRawTransaction
-	// etc.) to supply a matching api_key param or X-API-Key header.
-	// Empty = dev/open mode (F-5 fix: must be set in production node.yaml).
+	// Key gates every privileged RPC, admin, and network-mutation method.
+	// Privileged methods fail closed when this is empty.
 	Key string `yaml:"key"`
 }
 
@@ -793,6 +792,21 @@ func (c *Config) Validate() error {
 	if c.Maintenance.RestartAt != "" {
 		if _, _, err := ParseRestartAt(c.Maintenance.RestartAt); err != nil {
 			return fmt.Errorf("maintenance.restart_at %w", err)
+		}
+	}
+	if c.API.Enabled {
+		host, _, splitErr := net.SplitHostPort(c.API.ListenAddr)
+		if splitErr != nil {
+			return fmt.Errorf("api.listen_addr %q is not a valid host:port address: %w", c.API.ListenAddr, splitErr)
+		}
+		ip := net.ParseIP(host)
+		publicBind := host == "" || ip == nil || !ip.IsLoopback()
+		if publicBind && strings.TrimSpace(c.API.Key) == "" {
+			return fmt.Errorf(
+				"api.key must be non-empty when api.listen_addr %q is not loopback; "+
+					"refusing to expose privileged RPC methods without authentication",
+				c.API.ListenAddr,
+			)
 		}
 	}
 	if c.Pprof.Enabled {

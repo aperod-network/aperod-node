@@ -16,8 +16,11 @@ import (
 // restGetLocal sends a GET with a loopback Host so localOnly() passes.
 func restGetLocal(t *testing.T, srv *api.Server, path string) (int, map[string]interface{}) {
 	t.Helper()
+	srv.SetAPIKey("test-api-key")
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	var resp map[string]interface{}
@@ -84,6 +87,7 @@ func TestRESTUTXOAudit_LocalOnly(t *testing.T) {
 	srv, _ := buildChainServer(t, 1)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/utxo-audit", nil)
 	req.Host = "attacker.example.com"
+	req.RemoteAddr = "127.0.0.1:54321"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -102,6 +106,7 @@ func TestRESTUTXOAudit_APIKeyRequired(t *testing.T) {
 	// Without the key → 401.
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/utxo-audit", nil)
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -111,6 +116,7 @@ func TestRESTUTXOAudit_APIKeyRequired(t *testing.T) {
 	// With the key → 200 + audit payload.
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/utxo-audit", nil)
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("X-API-Key", "audit-key")
 	rr = httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -127,8 +133,12 @@ func TestRESTUTXOAudit_APIKeyRequired(t *testing.T) {
 // TestRESTUTXOAudit_MethodNotAllowed — POST is rejected.
 func TestRESTUTXOAudit_MethodNotAllowed(t *testing.T) {
 	srv, _ := buildChainServer(t, 1)
+	srv.SetAPIKey("test-api-key")
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/utxo-audit", nil)
 	req.Host = "127.0.0.1"
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {

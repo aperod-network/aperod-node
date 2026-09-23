@@ -252,10 +252,11 @@ if [[ "${MY_IP}" == "0.0.0.0" ]]; then
   if [[ "${IS_TTY:-false}" == "true" ]]; then
     read -rp "Введите публичный IP этого сервера: " MY_IP
   else
-    MY_IP="0.0.0.0"
-    warn "Укажите IP вручную в ${CONFIG_DIR}/node.yaml после установки"
+		die "Публичный IP обязателен; отказано в создании небезопасной конфигурации с 0.0.0.0"
   fi
 fi
+[[ -n "${MY_IP}" && "${MY_IP}" != "0.0.0.0" ]] \
+	|| die "Публичный IP обязателен; установка остановлена"
 info "Внешний IP: ${MY_IP}"
 
 # ── 9. Копируем genesis конфиг ────────────────────────────
@@ -268,6 +269,10 @@ else
 fi
 
 # ── 10. Конфигурация ноды ─────────────────────────────────
+command -v openssl >/dev/null 2>&1 || die "openssl необходим для генерации API-ключа"
+umask 077
+API_KEY="$(openssl rand -hex 32)" || die "Не удалось сгенерировать API-ключ"
+[[ ${#API_KEY} -eq 64 ]] || die "Генератор API-ключа вернул некорректный результат"
 cat > "${CONFIG_DIR}/node.yaml" <<EOF
 # Aperod Node Configuration
 # Автоматически создан install-validator.sh $(date -u +"%Y-%m-%d %H:%M UTC")
@@ -289,10 +294,14 @@ consensus:
 api:
   enabled: true
   listen_addr: 127.0.0.1:${RPC_PORT}
+  key: ${API_KEY}
 
 genesis:
   file: ${CONFIG_DIR}/genesis-testnet.yaml
 EOF
+chmod 600 "${CONFIG_DIR}/node.yaml"
+chown "${APEROD_USER}:${APEROD_USER}" "${CONFIG_DIR}/node.yaml"
+unset API_KEY
 
 ok "Конфигурация сохранена: ${CONFIG_DIR}/node.yaml"
 

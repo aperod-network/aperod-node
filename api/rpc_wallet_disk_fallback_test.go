@@ -169,7 +169,7 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 
 	utxos := core.NewUTXOSet()
 	utxos.Add(&core.UTXO{
-		TxHash:       fakeTxHash,              // blocks Fallback 4
+		TxHash:       fakeTxHash, // blocks Fallback 4
 		OutputIndex:  0,
 		OneTimePub:   mintTx.Outputs[0].OneTimePub,
 		TxPubKey:     mintTx.Outputs[0].TxPubKey,
@@ -182,6 +182,7 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 	// (Fallback 3) also returns nil.  The only working fallback is Fallback 2.
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey("test-api-key")
 	srv.SetStore(db) // enables getTransactionFromDisk() (Fallback 2)
 
 	// ── 9. Call apr_walletSend via JSON-RPC ──────────────────────────────────
@@ -215,6 +216,7 @@ func TestRPC_WalletSend_DiskFallbackForOldUTXO(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 

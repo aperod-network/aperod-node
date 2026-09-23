@@ -161,12 +161,12 @@ func TestRPC_WalletSend_InMemoryUTXOFallback(t *testing.T) {
 	// from the actual mint output so both checks pass.
 	utxos := core.NewUTXOSet()
 	utxos.Add(&core.UTXO{
-		TxHash:       mintTxHash,                        // real hash — Get() returns this entry
+		TxHash:       mintTxHash, // real hash — Get() returns this entry
 		OutputIndex:  0,
 		OneTimePub:   mintTx.Outputs[0].OneTimePub,
 		TxPubKey:     mintTx.Outputs[0].TxPubKey,
-		AmountCommit: mintTx.Outputs[0].AmountCommit,   // correct — satisfies VerifyTx C-0
-		BlockHeight:  mintHeight,                        // used by Fallback 4 to call GetRawBlockByHeight
+		AmountCommit: mintTx.Outputs[0].AmountCommit, // correct — satisfies VerifyTx C-0
+		BlockHeight:  mintHeight,                     // used by Fallback 4 to call GetRawBlockByHeight
 	})
 
 	// ── 7. Create the server with the chain + LevelDB + seeded UTXOSet ───────
@@ -175,6 +175,7 @@ func TestRPC_WalletSend_InMemoryUTXOFallback(t *testing.T) {
 	// Fallback 4 then fires because utxos.Get(mintTxHash, 0) returns non-nil.
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey("test-api-key")
 	srv.SetStore(db)
 
 	// ── 8. Call apr_walletSend via JSON-RPC ──────────────────────────────────
@@ -206,6 +207,7 @@ func TestRPC_WalletSend_InMemoryUTXOFallback(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 

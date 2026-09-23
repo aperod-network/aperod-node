@@ -44,23 +44,23 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
 	s.mux.HandleFunc("/api/v1/validators", s.restValidators)
 	s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
-	s.mux.HandleFunc("/api/v1/admin/mint", s.localOnly(s.restAdminMint))
-	s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.restAdminPartialUnstake))
-	s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.restAdminFullUnstake))
-	s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.restAdminStakeDeposit))
-	s.mux.HandleFunc("/api/v1/admin/utxo-audit", s.localOnly(s.restAdminUTXOAudit))
+	s.mux.HandleFunc("/api/v1/admin/mint", s.localOnly(s.requireAPIKey(s.restAdminMint)))
+	s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.requireAPIKey(s.restAdminPartialUnstake)))
+	s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.requireAPIKey(s.restAdminFullUnstake)))
+	s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.requireAPIKey(s.restAdminStakeDeposit)))
+	s.mux.HandleFunc("/api/v1/admin/utxo-audit", s.localOnly(s.requireAPIKey(s.restAdminUTXOAudit)))
 	s.mux.HandleFunc("/api/v1/my-validator", s.restMyValidator)
 	s.mux.HandleFunc("/api/v1/network/identity", s.restNetworkIdentity)
-	s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.restNetworkBans))
-	s.mux.HandleFunc("/api/v1/network/bans/", s.localOnly(s.restNetworkBanByAddr))
-	s.mux.HandleFunc("/api/v1/network/whitelist", s.localOnly(s.restNetworkWhitelist))
-	s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.restNetworkWhitelistByEntry))
+	s.mux.HandleFunc("/api/v1/network/bans", s.localOnly(s.requireMutationAPIKey(s.restNetworkBans)))
+	s.mux.HandleFunc("/api/v1/network/bans/", s.localOnly(s.requireMutationAPIKey(s.restNetworkBanByAddr)))
+	s.mux.HandleFunc("/api/v1/network/whitelist", s.localOnly(s.requireMutationAPIKey(s.restNetworkWhitelist)))
+	s.mux.HandleFunc("/api/v1/network/whitelist/", s.localOnly(s.requireMutationAPIKey(s.restNetworkWhitelistByEntry)))
 	s.mux.HandleFunc("/api/v1/network/whitelist-exemptions", s.localOnly(s.restNetworkWhitelistExemptions))
 	s.mux.HandleFunc("/api/v1/network/ban-events", s.localOnly(s.restNetworkBanEvents))
 	s.mux.HandleFunc("/api/v1/network/stall-events", s.localOnly(s.restNetworkStallEvents))
 	s.mux.HandleFunc("/api/v1/network/bootnode-warn-events", s.localOnly(s.restNetworkBootnodeWarnEvents))
 	s.mux.HandleFunc("/api/v1/network/duplicate-identity-events", s.localOnly(s.restNetworkDuplicateIdentityEvents))
-	s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.restNetworkP2PConfig))
+	s.mux.HandleFunc("/api/v1/network/p2p-config", s.localOnly(s.requireMutationAPIKey(s.restNetworkP2PConfig)))
 	s.mux.HandleFunc("/api/v1/network/peers", s.localOnly(s.restNetworkPeers))
 	s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
 	s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
@@ -181,7 +181,6 @@ func (s *Server) restGuardianFund(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
@@ -2496,23 +2495,72 @@ type stakeBroadcastRequest struct {
 	TxExtraHex string `json:"tx_extra_hex"` // hex-encoded 173-byte v2 stake payload
 }
 
-// localOnly wraps an http.HandlerFunc with a DNS-rebinding guard.
-// It rejects any request whose Host header is not the loopback address,
-// preventing a malicious web page from POST-ing to admin endpoints via
-// DNS rebinding (attacker.com resolves to 127.0.0.1, browser sends
-// Host: attacker.com — the guard catches it).
+// localOnly requires both the actual TCP peer and the HTTP Host to be loopback.
+// Forwarded headers are deliberately ignored: only RemoteAddr establishes the
+// peer, while the independent Host check prevents DNS rebinding.
 func (s *Server) localOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, "forbidden: admin endpoints require a loopback TCP peer")
+			return
+		}
+		remoteIP := net.ParseIP(remoteHost)
+		if remoteIP == nil || !remoteIP.IsLoopback() {
+			writeJSONError(w, http.StatusForbidden, "forbidden: admin endpoints require a loopback TCP peer")
+			return
+		}
+
 		host := r.Host
-		// Strip port if present.
-		if h, _, err := net.SplitHostPort(host); err == nil {
+		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
 			host = h
 		}
-		if host != "" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		hostIP := net.ParseIP(host)
+		if host == "" || (host != "localhost" && (hostIP == nil || !hostIP.IsLoopback())) {
 			writeJSONError(w, http.StatusForbidden, "forbidden: admin endpoints are local-only")
 			return
 		}
 		next(w, r)
+	}
+}
+
+func isMutationMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut ||
+		method == http.MethodPatch || method == http.MethodDelete
+}
+
+func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if isMutationMethod(r.Method) {
+			if err := s.checkBrowserMutation(r, true); err != nil {
+				writeJSONError(w, http.StatusForbidden, err.Error())
+				return
+			}
+			if r.Method != http.MethodDelete && !isJSONContentType(r.Header.Get("Content-Type")) {
+				writeJSONError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+				return
+			}
+			if r.ContentLength > maxPrivilegedRequestBody {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxPrivilegedRequestBody)
+		}
+		if !s.apiKeyMatches(r.Header.Get("X-API-Key")) {
+			writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) requireMutationAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isMutationMethod(r.Method) {
+			next(w, r)
+			return
+		}
+		s.requireAPIKey(next)(w, r)
 	}
 }
 
@@ -2555,7 +2603,7 @@ func (s *Server) restNetworkIdentity(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
+	if s.apiKey != "" && !s.apiKeyMatches(r.Header.Get("X-API-Key")) {
 		writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
 		return
 	}
@@ -2575,14 +2623,6 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	// Authentication: require X-API-Key when the node has one configured.
-	// Defense-in-depth on top of localOnly() — guards against SSRF and
-	// any future proxy configuration that widens the loopback restriction.
-	if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
-		writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
-		return
-	}
-
 	var req mintRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -3151,10 +3191,6 @@ func (s *Server) UTXOAuditResultSnapshot() *UTXOAuditResult {
 func (s *Server) restAdminUTXOAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
-		return
-	}
-	if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
-		writeJSONError(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
 		return
 	}
 	res := s.UTXOAuditResultSnapshot()
