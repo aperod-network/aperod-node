@@ -66,6 +66,9 @@ const (
 	// TxVersionAVM carries a signed native Wasm contract payload while using
 	// the v5 CLSAG spend proof for fee payment and change.
 	TxVersionAVM TxVersion = 6
+	// TxVersionGuardianFund is the one-off, consensus-synthesized Guardian
+	// allocation. It is not a coinbase and can never be admitted to the pool.
+	TxVersionGuardianFund TxVersion = 7
 )
 
 // Transaction is the core unit of value transfer in Aperod.
@@ -172,10 +175,11 @@ func (tx *Transaction) Hash() crypto.Hash32 {
 	return crypto.HashBytes(parts...)
 }
 
-// IsCoinbase returns true if this transaction has no inputs (miner reward).
+// IsCoinbase preserves the historical zero-input semantics used by legacy
+// replay, except for the explicitly distinct Guardian protocol allocation.
 // Coinbase transactions skip ring signature and range proof requirements.
 func (tx *Transaction) IsCoinbase() bool {
-	return len(tx.Inputs) == 0
+return tx != nil && len(tx.Inputs) == 0 && !tx.IsGuardianFund() && !tx.IsLPoD() && !tx.IsLPoDPosition() && !tx.IsLPoDPayout()
 }
 
 // IsStake returns true if this is a validator stake deposit or withdrawal.
@@ -188,6 +192,10 @@ func (tx *Transaction) IsAVM() bool {
 	return tx.Version == TxVersionAVM
 }
 
+// IsGuardianFund identifies the dedicated, protocol-locked nominal-supply
+// materialization. Its full identity is checked by GuardianFundTxAt.
+func (tx *Transaction) IsGuardianFund() bool { return tx != nil && tx.Version == TxVersionGuardianFund }
+
 func (tx *Transaction) UsesCLSAG() bool {
 	return tx.Version == TxVersionCLSAG || tx.Version == TxVersionAVM
 }
@@ -199,11 +207,14 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("tx version 0 is invalid")
 	}
 	switch tx.Version {
-	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM:
+case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
 
+	if tx.IsLPoD() { return tx.validateLPoD() }
+if tx.IsLPoDPosition() { _,err:=tx.LPoDPositionAction();return err }
+if tx.IsLPoDPayout() { _,err:=tx.LPoDPayoutAuthorization();return err }
 	if tx.IsAVM() {
 		if len(tx.Extra) != 0 {
 			return fmt.Errorf("avm transaction must not use Extra")
@@ -216,6 +227,18 @@ func (tx *Transaction) Validate() error {
 		}
 	} else if tx.AVM != nil {
 		return fmt.Errorf("non-avm transaction must not carry an avm payload")
+	}
+
+	if tx.IsGuardianFund() {
+		if len(tx.Inputs) != 0 || len(tx.Outputs) != 1 || tx.Fee != 0 ||
+			tx.FeeCommit != (crypto.Commitment{}) || len(tx.RangeProofs) != 0 ||
+			len(tx.Signatures) != 0 || len(tx.CLSAGSignatures) != 0 {
+			return fmt.Errorf("guardian fund transaction has non-canonical structure")
+		}
+		if len(tx.Extra) != guardianFundExtraSize {
+			return fmt.Errorf("guardian fund transaction has malformed extra")
+		}
+		return nil
 	}
 
 	// Stake transactions carry payload in Extra.  Validate the Extra field,
@@ -350,10 +373,16 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 	if tx == nil {
 		return fmt.Errorf("nil transaction")
 	}
+	if tx.IsLPoD() { return tx.validateLPoD() } // Engine enforces activation and exact digest.
+if tx.IsLPoDPosition() || tx.IsLPoDPayout() {return tx.Validate()}
 
 	// Stake transactions do not use the legacy spend proof that APD-002
 	// replaces.  Keep them valid across the activation boundary.
 	if tx.IsStake() {
+		return nil
+	}
+	if tx.IsGuardianFund() {
+		// Exact anchor/height validation is an Engine responsibility.
 		return nil
 	}
 

@@ -123,6 +123,18 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return err
 	}
+if tx.IsLPoDPosition() {
+	a,err:=tx.LPoDPositionAction();if err!=nil{return err}
+	if a.Action==LPoDWithdraw {return nil}
+	if v.utxos==nil || v.utxos.IsSpent(tx.Inputs[0].KeyImage) {return fmt.Errorf("lpod: source key image unavailable or spent")}
+	u:=v.utxos.Get(a.SourceTx,a.SourceIndex)
+	if u==nil || u.OneTimePub!=a.SourcePub || u.AmountCommit!=tx.Inputs[0].AmountCommit || u.ProtocolLocked ||
+		v.utxos.IsStaked(a.SourceTx,a.SourceIndex) {return fmt.Errorf("lpod: source is not an available matching UTXO")}
+	resolved:=v.utxos.GetByPubKey(a.SourcePub)
+	if resolved==nil || resolved.TxHash!=a.SourceTx || resolved.OutputIndex!=a.SourceIndex{return fmt.Errorf("lpod: ambiguous source output key")}
+	if v.vestingLock!=nil && v.vestingLock.lockedAt(a.SourcePub,v.vestingLock.nowFn())>0 {return fmt.Errorf("lpod: source is vesting locked")}
+	return nil
+}
 
 	// Coinbase (zero-input) transactions must never arrive at the verifier
 	// from external sources.  They are synthesized by the consensus engine
@@ -412,7 +424,7 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 // this function is called.
 func (v *TxVerifier) VerifyBlock(block *Block) error {
 	for i, tx := range block.Txs {
-		if tx.IsCoinbase() {
+if tx.IsCoinbase() || tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
 			continue // no crypto proofs on coinbase; policy checked separately
 		}
 		if err := v.VerifyTx(&tx); err != nil {

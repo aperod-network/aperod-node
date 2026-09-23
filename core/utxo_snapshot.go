@@ -115,7 +115,8 @@ func (s *UTXOSet) ReconcileWithStore(
 			if u.AmountCommit == disk.AmountCommit &&
 				u.TxPubKey == disk.TxPubKey &&
 				u.EncAmount == disk.EncAmount &&
-				u.BlockHeight == disk.BlockHeight {
+				u.BlockHeight == disk.BlockHeight &&
+				u.ProtocolLocked == disk.ProtocolLocked {
 				continue
 			}
 			if onFix != nil {
@@ -125,6 +126,11 @@ func (s *UTXOSet) ReconcileWithStore(
 			u.TxPubKey = disk.TxPubKey
 			u.EncAmount = disk.EncAmount
 			u.BlockHeight = disk.BlockHeight
+			u.ProtocolLocked = disk.ProtocolLocked
+			if u.ProtocolLocked {
+				delete(s.byPubKey, u.OneTimePub)
+				delete(s.spentPubKeys, u.OneTimePub)
+			}
 			fixed++
 		}
 	}
@@ -145,7 +151,9 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 	for _, u := range snap.ActiveUTXOs {
 		k := UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}
 		s.utxos[k] = u
-		s.byPubKey[u.OneTimePub] = u
+		if !isProtocolLockedUTXO(u) {
+			s.byPubKey[u.OneTimePub] = u
+		}
 	}
 
 	s.stakedUTXOs = make(map[UTXOKey]*UTXO, len(snap.StakedUTXOs))
@@ -156,7 +164,9 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 
 	s.spentPubKeys = make(map[crypto.Point32]*UTXO, len(snap.SpentDecoys))
 	for _, u := range snap.SpentDecoys {
-		s.spentPubKeys[u.OneTimePub] = u
+		if !isProtocolLockedUTXO(u) {
+			s.spentPubKeys[u.OneTimePub] = u
+		}
 	}
 
 	// restoreFromSlice is a no-op in the LevelDB-backed design: historical
@@ -171,6 +181,9 @@ func (s *UTXOSet) RestoreFromSnapshot(snap UTXOSnapshot) {
 	// block applied after the restore will populate the journal via ApplyBlock.
 	s.rollbackJournal = make(map[uint64][]rollbackEntry, len(snap.RollbackJournal))
 	for _, e := range snap.RollbackJournal {
+		if e.UTXO == nil || isProtocolLockedUTXO(e.UTXO) {
+			continue
+		}
 		s.rollbackJournal[e.Height] = append(s.rollbackJournal[e.Height], rollbackEntry{
 			ringMember: e.RingMember,
 			utxo:       e.UTXO,

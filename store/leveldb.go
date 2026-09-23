@@ -230,13 +230,14 @@ func (d *DB) GetBlockByHeight(height uint64) (*StoredBlock, error) {
 
 // StoredUTXO is the persistent UTXO representation.
 type StoredUTXO struct {
-	TxHash       crypto.Hash32     `json:"tx_hash"`
-	OutputIndex  uint32            `json:"output_index"`
-	OneTimePub   crypto.Point32    `json:"one_time_pub"`
-	TxPubKey     crypto.Point32    `json:"tx_pub_key"`
-	AmountCommit crypto.Commitment `json:"amount_commit"`
-	EncAmount    [8]byte           `json:"enc_amount"`
-	BlockHeight  uint64            `json:"block_height"`
+	TxHash          crypto.Hash32     `json:"tx_hash"`
+	OutputIndex     uint32            `json:"output_index"`
+	OneTimePub      crypto.Point32    `json:"one_time_pub"`
+	TxPubKey        crypto.Point32    `json:"tx_pub_key"`
+	AmountCommit    crypto.Commitment `json:"amount_commit"`
+	EncAmount       [8]byte           `json:"enc_amount"`
+	BlockHeight     uint64            `json:"block_height"`
+	ProtocolLocked bool              `json:"protocol_locked,omitempty"`
 }
 
 // PutUTXO persists a UTXO.
@@ -295,6 +296,9 @@ func (d *DB) LookupRingMember(pub crypto.Point32) (*core.UTXO, error) {
 	var u StoredUTXO
 	if err := json.Unmarshal(data, &u); err != nil {
 		return nil, err
+	}
+	if u.ProtocolLocked {
+		return nil, nil
 	}
 	return storedToCoreUTXO(&u), nil
 }
@@ -369,7 +373,11 @@ func (d *DB) SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]co
 			continue
 		}
 		seen[u.OneTimePub] = struct{}{}
-		out = append(out, core.DecoyUTXO{OneTimePub: u.OneTimePub, AmountCommit: u.AmountCommit})
+		// Permanently locked consensus allocations are retained for audit but must
+		// never enter the CLSAG anonymity set.
+		if !u.ProtocolLocked {
+			out = append(out, core.DecoyUTXO{OneTimePub: u.OneTimePub, AmountCommit: u.AmountCommit})
+		}
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
@@ -381,7 +389,7 @@ func storedToCoreUTXO(u *StoredUTXO) *core.UTXO {
 	return &core.UTXO{
 		TxHash: u.TxHash, OutputIndex: u.OutputIndex, OneTimePub: u.OneTimePub,
 		TxPubKey: u.TxPubKey, AmountCommit: u.AmountCommit,
-		EncAmount: u.EncAmount, BlockHeight: u.BlockHeight,
+		EncAmount: u.EncAmount, BlockHeight: u.BlockHeight, ProtocolLocked: u.ProtocolLocked,
 	}
 }
 
@@ -613,6 +621,39 @@ func (d *DB) GetMeta(key string) ([]byte, error) {
 	return d.get(k)
 }
 
+// BindGuardianFundConfig durably binds this chain database to its first
+// Guardian activation configuration. Once written, disabling or moving the
+// activation is rejected so a restart cannot materialize a second reserve.
+func (d *DB) BindGuardianFundConfig(height uint64, genesis crypto.Hash32) error {
+	const key = "guardian_fund_binding_v1"
+	existing, err := d.GetMeta(key)
+	if err != nil {
+		return fmt.Errorf("load guardian fund binding: %w", err)
+	}
+	if existing != nil {
+		if len(existing) != 40 {
+			return fmt.Errorf("guardian fund binding is corrupt")
+		}
+		boundHeight := binary.LittleEndian.Uint64(existing[:8])
+		var boundGenesis crypto.Hash32
+		copy(boundGenesis[:], existing[8:])
+		if height == 0 || boundHeight != height || boundGenesis != genesis {
+			return fmt.Errorf("guardian fund configuration conflicts with durable binding (height %d, genesis %x)", boundHeight, boundGenesis)
+		}
+		return nil
+	}
+	if height == 0 {
+		return nil
+	}
+	value := make([]byte, 40)
+	binary.LittleEndian.PutUint64(value[:8], height)
+	copy(value[8:], genesis[:])
+	if err := d.putSync(append(append([]byte{}, prefixMeta...), key...), value); err != nil {
+		return fmt.Errorf("persist guardian fund binding: %w", err)
+	}
+	return nil
+}
+
 type AdminMintRecord struct {
 	// State is intent, prepared, or completed. Empty is accepted as
 	// completed for records written by versions predating this state
@@ -715,6 +756,8 @@ func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
+	if err:=d.restoreLPoDPool(batch,hash,height);err!=nil {return err}
+	if err:=d.rollbackLPoDIndices(batch,hash,height);err!=nil{return err}
 	batch.Put(hashKey, hash[:])
 	batch.Put(heightKey2, hb[:])
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
@@ -785,10 +828,23 @@ func (d *DB) CommitRawBlockWithAVM(
 	data []byte,
 	writes []AVMWrite,
 	writeSetCommitment crypto.Hash32,
+lpodSettlement ...*LPoDSettlement,
 ) error {
+	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil { return err }
 	batch, err := avmBatch(writes)
 	if err != nil {
 		return err
+	}
+// Reserve and carries share the same fsynced batch as the canonical tip.
+// With no approved source allocation there is no initial LPoD checkpoint.
+if err := d.appendLPoDSettlement(batch, hash, height, lpodSettlement); err != nil {
+return err
+}
+	if len(lpodSettlement)==1 && lpodSettlement[0]!=nil && lpodSettlement[0].PositionProtocol{
+		var block core.Block
+		if err:=json.Unmarshal(data,&block);err!=nil{return err}
+		if err:=appendLPoDIndices(batch,&block,false);err!=nil{return err}
+if err:=d.appendLPoDWalletIndex(batch,&block,lpodSettlement[0]);err!=nil{return err}
 	}
 	blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)
 	batch.Put(blockKey, data)

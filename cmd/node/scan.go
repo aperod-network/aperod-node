@@ -420,13 +420,14 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			}
 			for i, out := range tx.Outputs {
 				su := &store.StoredUTXO{
-					TxHash:       txHash,
-					OutputIndex:  uint32(i),
-					OneTimePub:   out.OneTimePub,
-					TxPubKey:     out.TxPubKey,
-					AmountCommit: out.AmountCommit,
-					EncAmount:    out.EncAmount,
-					BlockHeight:  b.Header.Height,
+					TxHash:          txHash,
+					OutputIndex:     uint32(i),
+					OneTimePub:      out.OneTimePub,
+					TxPubKey:        out.TxPubKey,
+					AmountCommit:    out.AmountCommit,
+					EncAmount:       out.EncAmount,
+					BlockHeight:     b.Header.Height,
+ProtocolLocked: tx.IsGuardianFund(),
 				}
 				_ = p.DB.PutUTXO(txHash, uint32(i), su)
 				utxoCount++

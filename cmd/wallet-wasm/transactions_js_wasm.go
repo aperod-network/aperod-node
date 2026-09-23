@@ -202,14 +202,28 @@ func scanOutputs(_ js.Value, args []js.Value) any {
 		return promiseResult(nil, err)
 	}
 	type scanned struct {
-		TxHash string `json:"tx_hash"`
-		OutIdx uint32 `json:"out_idx"`
-		Amount uint64 `json:"amount_napr"`
-		Blind  string `json:"blind_hex"`
+		TxHash      string `json:"tx_hash"`
+		OutIdx      uint32 `json:"out_idx"`
+		Amount      uint64 `json:"amount_napr"`
+		Blind       string `json:"blind_hex"`
+		ExactAmount string `json:"amount_napro"`
+		KeyImage    string `json:"key_image_hex"`
 	}
 	result := make([]scanned, len(outs))
 	for i, u := range outs {
-		result[i] = scanned{hex.EncodeToString(u.TxHash[:]), u.OutputIndex, u.Amount, hex.EncodeToString(u.Blind[:])}
+		priv, err := crypto.AddScalars(u.HsScalar, keys.Keys.Spend.Private)
+		if err != nil {
+			return promiseResult(nil, err)
+		}
+		ki, err := crypto.ComputeKeyImage(priv, u.OneTimePub)
+		if err != nil {
+			return promiseResult(nil, err)
+		}
+		ki, err = crypto.CanonicalKeyImage(ki)
+		if err != nil {
+			return promiseResult(nil, err)
+		}
+		result[i] = scanned{hex.EncodeToString(u.TxHash[:]), u.OutputIndex, u.Amount, hex.EncodeToString(u.Blind[:]), strconv.FormatUint(u.Amount, 10), hex.EncodeToString(ki[:])}
 	}
 	return promiseResult(wasmValue(map[string]any{"outputs": result}), nil)
 }

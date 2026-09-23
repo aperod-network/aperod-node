@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -354,6 +355,16 @@ type ConsensusConfig struct {
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
 	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
+	// GuardianFundActivationHeight activates the one-off locked 1B APRO
+	// nominal-supply materialization. Zero disables it.
+	GuardianFundActivationHeight uint64 `yaml:"guardian_fund_activation_height"`
+	// GuardianFundChainAnchor is the 32-byte canonical genesis block hash.
+	// Startup verifies it against the stored chain. It must be set together
+	// with a non-zero activation height.
+	GuardianFundChainAnchor string `yaml:"guardian_fund_chain_anchor"`
+// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
+// Empty disables the fork. Merely setting a target amount never funds the pool.
+LPoDMigrationFile string `yaml:"lpod_migration_file"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -604,6 +615,21 @@ func (c *Config) Validate() error {
 		)
 	}
 	avmActivation := c.Consensus.AVMActivationHeight
+	guardianActivation := c.Consensus.GuardianFundActivationHeight
+	guardianAnchor := c.Consensus.GuardianFundChainAnchor
+	if (guardianActivation == 0) != (guardianAnchor == "") {
+		return fmt.Errorf("guardian_fund_activation_height and guardian_fund_chain_anchor must be set together")
+	}
+	if guardianActivation > 0 {
+		raw, err := hex.DecodeString(guardianAnchor)
+		if err != nil || len(raw) != 32 {
+			return fmt.Errorf("guardian_fund_chain_anchor must be exactly 32-byte hex")
+		}
+		var zero = make([]byte, 32)
+		if string(raw) == string(zero) {
+			return fmt.Errorf("guardian_fund_chain_anchor must not be zero")
+		}
+	}
 	if avmActivation > 0 && clsagActivation == 0 {
 		return fmt.Errorf("avm_activation_height requires ring_ct_clsag_activation_height")
 	}

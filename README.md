@@ -20,14 +20,17 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 
 ---
 
-## ⚠ LPoD — separate restricted terms / отдельные ограничительные условия
+## ⚠ LPoD — functionality and restricted terms
 
-**EN.** LPoD is an Aperod protocol subsystem developed and owned by the web3
+LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
 canonical accounting and confirmed Guardian-principal refunds. LPoD is disabled
 by default and this repository does not claim that a 1B APRO production
 activation is live. The validator stake lock remains governed separately by the
 validator protocol.
+
+**Detailed functionality guide:** [LPOD.md — protocol behavior, status, and
+source scope](LPOD.md).
 
 The designated original LPoD source files listed in [LPOD.md](LPOD.md) are
 **not open-source software** and are governed by the scoped
@@ -39,26 +42,11 @@ deploy, modify, fork, redistribute, or reuse the covered code, commercially or
 noncommercially. Those activities require prior, explicit written software
 approval from the Aperod APRO team through the verified official route
 [@sup_apro_bot](https://t.me/sup_apro_bot). Developer approval is distinct from
-an end user's protocol activation or transaction.
-
-**RU.** LPoD — подсистема протокола Aperod, разработанная и принадлежащая web3
-команде **Aperod APRO**. Она координирует добровольные позиции, начисления,
-связанные с валидаторами, канонический учёт и подтверждённый возврат основной
-суммы Guardian. LPoD по умолчанию отключён; репозиторий не утверждает, что
-активация 1B APRO запущена в production. Блокировка стейка валидатора регулируется
-отдельно протоколом валидаторов.
-
-Обозначенные оригинальные исходные файлы LPoD, перечисленные в
-[LPOD.md](LPOD.md), **не являются ПО с открытым исходным кодом** и регулируются
-отдельной [LICENSE-LPOD](LICENSE-LPOD). Команда Aperod APRO не выдавала
-разрешений на запуск, разработку, развёртывание, форк, распространение или
-повторное использование этого кода LPoD. **Все права, кроме прямо разрешённого
-ознакомительного просмотра, сохранены.** Публичный просмотр не разрешает запуск,
-развёртывание, изменение, форк, распространение либо коммерческое или
-некоммерческое повторное использование. Для этого заранее требуется явное
-письменное разрешение команды Aperod APRO через официальный канал
-[@sup_apro_bot](https://t.me/sup_apro_bot). Разрешение разработчику не равно
-активации или транзакции конечного пользователя.
+an end user's protocol activation or transaction. Issued permissions will be
+published in the official
+[Aperod LPoD permission registry](https://aperod.com/vaults#lpod-permissions), which
+currently records no permissions. A registry entry does not authorize anyone
+outside its named recipient, code, activity, or other stated scope.
 
 The repository's Apache License 2.0 applies separately to non-LPoD repository
 material identified under it. Dependencies and third-party material remain
@@ -85,7 +73,7 @@ under their own terms. See [NOTICE](NOTICE) for the exact boundary.
 - [Become a Validator](#-become-a-validator)
 - [Validator Rules](#-validator-rules)
 - [Tokenomics & Fee Burn](#-tokenomics--fee-burn)
-- [LPoD restricted terms](#-lpod--separate-restricted-terms--отдельные-ограничительные-условия)
+- [LPoD functionality and restricted terms](#-lpod--functionality-and-restricted-terms)
 - [📈 Why APRO? The Deflationary Case](#-why-apro-the-deflationary-case)
 - [Architecture](#-architecture)
 - [Building from Source](#-building-from-source)

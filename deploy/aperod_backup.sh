@@ -169,6 +169,129 @@ export RCLONE_CONFIG_S3BACKUP_ACL="private"
 
 RCLONE_REMOTE="s3backup:${S3_BUCKET}"
 
+# Backblaze B2 keeps every overwrite as a full historical file version.  The
+# S3-compatible `rclone cleanup` command only removes stale multipart uploads,
+# so old backup versions must be removed through the native B2 API by fileId.
+# This function keeps the newest upload version and removes every older upload
+# or hide marker for this exact object name.
+_cleanup_b2_object_versions() {
+  local object_name="$1"
+
+  case "$S3_ENDPOINT" in
+    *backblazeb2.com*) ;;
+    *)
+      echo "  Version cleanup skipped: provider is not Backblaze B2."
+      return 0
+      ;;
+  esac
+
+  B2_CLEANUP_ACCESS="$S3_ACCESS" \
+  B2_CLEANUP_SECRET="$S3_SECRET" \
+  B2_CLEANUP_BUCKET="$S3_BUCKET" \
+  B2_CLEANUP_OBJECT="$object_name" \
+  python3 - <<'PY'
+import base64
+import json
+import os
+import urllib.request
+
+access = os.environ["B2_CLEANUP_ACCESS"]
+secret = os.environ["B2_CLEANUP_SECRET"]
+bucket_name = os.environ["B2_CLEANUP_BUCKET"]
+object_name = os.environ["B2_CLEANUP_OBJECT"]
+
+credentials = base64.b64encode(f"{access}:{secret}".encode()).decode()
+request = urllib.request.Request(
+    "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
+    headers={"Authorization": f"Basic {credentials}"},
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    auth = json.load(response)
+
+api_url = auth.get("apiUrl")
+token = auth.get("authorizationToken")
+account_id = auth.get("accountId")
+allowed = auth.get("allowed") or {}
+bucket_id = allowed.get("bucketId")
+if not api_url or not token or not account_id:
+    raise RuntimeError("Backblaze authorization response is incomplete")
+
+def post(path, payload):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        api_url + path,
+        data=data,
+        headers={
+            "Authorization": token,
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response)
+
+if not bucket_id:
+    buckets = post(
+        "/b2api/v2/b2_list_buckets",
+        {"accountId": account_id, "bucketName": bucket_name},
+    ).get("buckets", [])
+    exact_buckets = [bucket for bucket in buckets if bucket.get("bucketName") == bucket_name]
+    if len(exact_buckets) != 1:
+        raise RuntimeError(f"expected one Backblaze bucket named {bucket_name!r}")
+    bucket_id = exact_buckets[0]["bucketId"]
+
+def list_exact_versions():
+    exact = []
+    next_name = None
+    next_id = None
+    while True:
+        payload = {
+            "bucketId": bucket_id,
+            "prefix": object_name,
+            "maxFileCount": 1000,
+        }
+        if next_name:
+            payload["startFileName"] = next_name
+        if next_id:
+            payload["startFileId"] = next_id
+        page = post("/b2api/v2/b2_list_file_versions", payload)
+        exact.extend(
+            item for item in page.get("files", [])
+            if item.get("fileName") == object_name
+        )
+        next_name = page.get("nextFileName")
+        next_id = page.get("nextFileId")
+        if not next_name:
+            return exact
+
+versions = list_exact_versions()
+uploads = [item for item in versions if item.get("action") == "upload"]
+if not uploads:
+    raise RuntimeError(f"no current upload version found for {object_name}")
+
+keep = max(uploads, key=lambda item: int(item.get("uploadTimestamp", 0)))
+victims = [item for item in versions if item.get("fileId") != keep.get("fileId")]
+reclaimed_bytes = 0
+for item in victims:
+    post(
+        "/b2api/v2/b2_delete_file_version",
+        {"fileName": object_name, "fileId": item["fileId"]},
+    )
+    if item.get("action") == "upload":
+        reclaimed_bytes += int(item.get("contentLength", 0))
+
+remaining = list_exact_versions()
+if len(remaining) != 1 or remaining[0].get("fileId") != keep.get("fileId"):
+    raise RuntimeError(
+        f"version cleanup verification failed: expected 1 version, found {len(remaining)}"
+    )
+
+print(
+    f"  Backblaze versions removed: {len(victims)}; "
+    f"reclaimed: {reclaimed_bytes / (1024 ** 3):.2f} GiB; current version preserved."
+)
+PY
+}
+
 # ── Clean up stale backup-tmp dirs from previous crashed runs ──────────────────
 # If the server was hard-killed (OOM, power loss), the EXIT trap never ran and
 # the temp dir remains, potentially consuming hundreds of MBs or more — which
@@ -419,6 +542,12 @@ rclone copyto \
   "${RCLONE_REMOTE}/${BACKUP_NAME}.tar.gpg" \
   --s3-no-check-bucket
 echo "  Загружено: ${BACKUP_NAME}.tar.gpg"
+
+# Backblaze B2 keeps every overwrite of a fixed object name as a separate file
+# version.  copyto replaces the visible object but does not reclaim the previous
+# version's storage, so remove old versions only after the new upload succeeds.
+echo "  Удаляем старые версии ${BACKUP_NAME}.tar.gpg..."
+_cleanup_b2_object_versions "${BACKUP_NAME}.tar.gpg"
 
 # Remove legacy timestamped backups only after the new fixed-name object has
 # uploaded successfully.  This preserves the previous good backup if upload

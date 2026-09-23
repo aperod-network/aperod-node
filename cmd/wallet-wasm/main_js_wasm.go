@@ -5,10 +5,13 @@
 package main
 
 import (
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"syscall/js"
 
+	"filippo.io/edwards25519"
 	"github.com/aperod/aperod/wallet"
 )
 
@@ -20,6 +23,45 @@ func promiseResult(value any, err error) js.Value {
 		return promise.Call("reject", err.Error())
 	}
 	return promise.Call("resolve", value)
+}
+
+// signWebAuthChallenge creates a Schnorr proof over the wallet spend key.  The
+// mnemonic only crosses into WASM; JavaScript receives only the signature.
+func signWebAuthChallenge(_ js.Value, args []js.Value) any {
+	if len(args) < 2 || args[0].Type() != js.TypeString || args[1].Type() != js.TypeString {
+		return promiseResult(nil, fmt.Errorf("mnemonic and challenge are required"))
+	}
+	account, err := argumentIndex(args, 2)
+	if err != nil {
+		return promiseResult(nil, err)
+	}
+	index, err := argumentIndex(args, 3)
+	if err != nil {
+		return promiseResult(nil, err)
+	}
+	dk, err := wallet.DeriveFromMnemonic(args[0].String(), "", account, index)
+	if err != nil {
+		return promiseResult(nil, err)
+	}
+	x, err := edwards25519.NewScalar().SetCanonicalBytes(dk.Keys.Spend.Private[:])
+	if err != nil {
+		return promiseResult(nil, err)
+	}
+	h := sha512.New()
+	h.Write([]byte("APRO_WEB_AUTH_NONCE_V1\x00"))
+	h.Write(dk.Keys.Spend.Private[:])
+	h.Write([]byte(args[1].String()))
+	r, _ := edwards25519.NewScalar().SetUniformBytes(h.Sum(nil))
+	R := new(edwards25519.Point).ScalarBaseMult(r)
+	h.Reset()
+	h.Write([]byte("APRO_WEB_AUTH_CHALLENGE_V1\x00"))
+	h.Write([]byte(args[1].String()))
+	h.Write(dk.Keys.Spend.Public[:])
+	h.Write(R.Bytes())
+	c, _ := edwards25519.NewScalar().SetUniformBytes(h.Sum(nil))
+	s := new(edwards25519.Scalar).MultiplyAdd(c, x, r)
+	sig := append(append([]byte{}, R.Bytes()...), s.Bytes()...)
+	return promiseResult(map[string]any{"signature": hex.EncodeToString(sig)}, nil)
 }
 
 func generateMnemonic(_ js.Value, args []js.Value) any {
@@ -78,13 +120,16 @@ func deriveAddress(_ js.Value, args []js.Value) any {
 
 func main() {
 	api := js.Global().Get("Object").New()
-	callbacks = append(callbacks, js.FuncOf(generateMnemonic), js.FuncOf(deriveAddress), js.FuncOf(scanOutputs), js.FuncOf(estimateLocalFee), js.FuncOf(maxSpendable), js.FuncOf(buildSignedTransaction))
+	callbacks = append(callbacks, js.FuncOf(generateMnemonic), js.FuncOf(deriveAddress), js.FuncOf(signWebAuthChallenge), js.FuncOf(scanOutputs), js.FuncOf(estimateLocalFee), js.FuncOf(maxSpendable), js.FuncOf(buildSignedTransaction))
 	api.Set("generateMnemonic", callbacks[0])
 	api.Set("deriveAddress", callbacks[1])
-	api.Set("scanOutputs", callbacks[2])
-	api.Set("estimateFee", callbacks[3])
-	api.Set("maxSpendable", callbacks[4])
-	api.Set("buildSignedTransaction", callbacks[5])
+	api.Set("signWebAuthChallenge", callbacks[2])
+	api.Set("scanOutputs", callbacks[3])
+	api.Set("estimateFee", callbacks[4])
+	api.Set("maxSpendable", callbacks[5])
+	api.Set("buildSignedTransaction", callbacks[6])
+	callbacks = append(callbacks, js.FuncOf(buildLPoDTransaction))
+	api.Set("buildLPoDTransaction", callbacks[7])
 	js.Global().Set("AperodWalletWasm", api)
 	select {}
 }

@@ -169,6 +169,9 @@ func (m *Mempool) NextSpendVersion() TxVersion {
 // Add attempts to add a transaction to the mempool.
 // Returns an error if the tx is invalid, duplicate, too large, or a double-spend.
 func (m *Mempool) Add(tx Transaction) error {
+if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
+		return fmt.Errorf("mempool: guardian fund transaction is consensus-synthesized only")
+	}
 	// Security: coinbase (zero-input) transactions are synthesized exclusively
 	// by the consensus engine inside produceBlock.  Accepting one from an
 	// external caller (P2P peer, admin RPC, etc.) would let an attacker inject
@@ -221,7 +224,7 @@ func (m *Mempool) Add(tx Transaction) error {
 
 	// Stake transactions are fee-exempt:
 	// stake = validator deposit/withdrawal (protocol-level, not ring-sig tx)
-	if !tx.IsStake() {
+if !tx.IsStake() && !tx.IsLPoDPosition() {
 		m.mu.RLock()
 		baseFee := m.cfg.BaseFeePerByte
 		m.mu.RUnlock()
@@ -445,6 +448,9 @@ func (m *Mempool) Get(hash crypto.Hash32) (Transaction, bool) {
 // Never call from P2P handlers or public API routes — use Add() for those.
 // All other guards (size, duplicate, double-spend) still apply.
 func (m *Mempool) AddPrivileged(tx Transaction) error {
+if tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
+		return fmt.Errorf("mempool: guardian fund transaction is never admitted")
+	}
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
@@ -886,7 +892,7 @@ func (m *Mempool) evictLowestFeeRate() bool {
 	var cheapest *mempoolEntry
 	var cheapestRate uint64
 	for _, e := range m.entries {
-		if e.Tx.IsCoinbase() || e.Tx.IsStake() {
+if e.Tx.IsCoinbase() || e.Tx.IsStake() || e.Tx.IsLPoDPosition() {
 			continue
 		}
 		sz := uint64(e.Size)

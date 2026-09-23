@@ -2146,6 +2146,150 @@ else
 fi
 
 # =============================================================================
+# Test 25: native B2 version cleanup keeps newest upload and deletes old versions
+#
+# Python automatically imports sitecustomize from PYTHONPATH.  The fake module
+# below intercepts urllib.request.urlopen inside the real embedded cleanup code,
+# providing deterministic B2 API responses without touching a live bucket.
+# =============================================================================
+section "Test 25: Backblaze version cleanup keeps only the newest upload"
+
+T25_DIR=$(mktemp -d "$TMPDIR_TEST/run-t25-XXXXXXXX")
+make_settings_json "$T25_DIR/data"
+sed -i 's#https://s3.example.com#https://s3.us-west-004.backblazeb2.com#' \
+  "$T25_DIR/data/integration-settings.json"
+mkdir -p "$T25_DIR/metrics" "$T25_DIR/python"
+
+cat >"$T25_DIR/python/sitecustomize.py" <<'PY'
+import io
+import json
+import os
+import urllib.request
+
+_versions = [
+    {"fileName": "aperod_backup.tar.gpg", "fileId": "newest", "action": "upload", "uploadTimestamp": 5000, "contentLength": 1026280162},
+    {"fileName": "aperod_backup.tar.gpg", "fileId": "old-1", "action": "upload", "uploadTimestamp": 4000, "contentLength": 1003770137},
+    {"fileName": "aperod_backup.tar.gpg", "fileId": "old-2", "action": "upload", "uploadTimestamp": 3000, "contentLength": 986932663},
+    {"fileName": "aperod_backup.tar.gpg", "fileId": "old-3", "action": "upload", "uploadTimestamp": 2000, "contentLength": 981098561},
+    {"fileName": "aperod_backup.tar.gpg", "fileId": "old-4", "action": "upload", "uploadTimestamp": 1000, "contentLength": 2706053080},
+    {"fileName": "unrelated.tar.gpg", "fileId": "unrelated", "action": "upload", "uploadTimestamp": 6000, "contentLength": 123},
+]
+
+class _Response(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+def _response(payload):
+    return _Response(json.dumps(payload).encode())
+
+def _log(message):
+    with open(os.environ["B2_MOCK_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def _urlopen(request, timeout=0):
+    global _versions
+    url = request.full_url
+    payload = json.loads(request.data or b"{}")
+    if url.endswith("/b2_authorize_account"):
+        return _response({
+            "apiUrl": "https://mock.invalid",
+            "authorizationToken": "mock-token",
+            "accountId": "mock-account",
+            "allowed": {"bucketId": "mock-bucket-id"},
+        })
+    if url.endswith("/b2_list_file_versions"):
+        exact = [
+            item for item in _versions
+            if item["fileName"].startswith(payload.get("prefix", ""))
+        ]
+        _log(f"LIST count={len(exact)}")
+        return _response({"files": exact, "nextFileName": None, "nextFileId": None})
+    if url.endswith("/b2_delete_file_version"):
+        file_id = payload["fileId"]
+        _log(f"DELETE {file_id}")
+        if os.environ.get("B2_MOCK_KEEP_DELETED") != "1":
+            _versions = [item for item in _versions if item["fileId"] != file_id]
+        return _response({"fileName": payload["fileName"], "fileId": file_id})
+    raise AssertionError(f"unexpected URL: {url}")
+
+urllib.request.urlopen = _urlopen
+PY
+
+T25_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t25-XXXXXXXX")
+T25_LOG="$T25_DIR/b2.log"
+T25_OUTPUT="$T25_DIR/output.log"
+T25_EXIT=0
+APEROD_BACKUP_PASSWORD="test-pass-t25" \
+  DATA_DIR="$T25_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T25_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T25_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T25_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="" \
+  ADMIN_TELEGRAM_CHAT_ID="" \
+  PYTHONPATH="$T25_DIR/python" \
+  B2_MOCK_LOG="$T25_LOG" \
+  PATH="$T9_FAKE_CURL:$T9_FAKE_SUDO_DIR:$T9_FAKE_PGDUMP:$T9_FAKE_GPG_DIR:$T9_FAKE_TAR_DIR:$T9_FAKE_RCLONE_DIR:$T9_FAKE_DF_DIR:$PATH" \
+  bash "$BACKUP_SH" >"$T25_OUTPUT" 2>&1 || T25_EXIT=$?
+
+if [[ "$T25_EXIT" -eq 0 ]]; then
+  pass "backup succeeds after verified B2 version cleanup"
+else
+  fail "backup exited $T25_EXIT during successful B2 cleanup simulation ($(cat "$T25_OUTPUT"))"
+fi
+
+if [[ "$(grep -c '^DELETE old-' "$T25_LOG" 2>/dev/null || true)" -eq 4 ]] \
+   && ! grep -q '^DELETE newest$' "$T25_LOG" 2>/dev/null \
+   && grep -q '^LIST count=5$' "$T25_LOG" \
+   && grep -q '^LIST count=1$' "$T25_LOG"; then
+  pass "cleanup deletes four old fileIds, preserves newest, and verifies one remains"
+else
+  fail "unexpected B2 cleanup calls (log: $(cat "$T25_LOG" 2>/dev/null || echo '<missing>'))"
+fi
+
+if grep -q 'reclaimed: 5.29 GiB' "$T25_OUTPUT"; then
+  pass "cleanup accounts reclaimed storage from B2 contentLength"
+else
+  fail "cleanup did not report expected reclaimed contentLength ($(cat "$T25_OUTPUT"))"
+fi
+
+# =============================================================================
+# Test 26: cleanup verification failure makes the backup fail
+# =============================================================================
+section "Test 26: Backblaze cleanup fails closed when old versions remain"
+
+T26_DIR=$(mktemp -d "$TMPDIR_TEST/run-t26-XXXXXXXX")
+make_settings_json "$T26_DIR/data"
+sed -i 's#https://s3.example.com#https://s3.us-west-004.backblazeb2.com#' \
+  "$T26_DIR/data/integration-settings.json"
+mkdir -p "$T26_DIR/metrics"
+T26_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t26-XXXXXXXX")
+T26_LOG="$T26_DIR/b2.log"
+T26_EXIT=0
+APEROD_BACKUP_PASSWORD="test-pass-t26" \
+  DATA_DIR="$T26_DIR/data" \
+  APEROD_TEXTFILE_DIR="$T26_DIR/metrics" \
+  APEROD_HISTORY_LOG="$T26_DIR/backup.log" \
+  APEROD_BACKUP_DIR_OVERRIDE="$T26_BACKUP_DIR" \
+  TELEGRAM_BOT_TOKEN="" \
+  ADMIN_TELEGRAM_CHAT_ID="" \
+  PYTHONPATH="$T25_DIR/python" \
+  B2_MOCK_LOG="$T26_LOG" \
+  B2_MOCK_KEEP_DELETED=1 \
+  PATH="$T9_FAKE_CURL:$T9_FAKE_SUDO_DIR:$T9_FAKE_PGDUMP:$T9_FAKE_GPG_DIR:$T9_FAKE_TAR_DIR:$T9_FAKE_RCLONE_DIR:$T9_FAKE_DF_DIR:$PATH" \
+  bash "$BACKUP_SH" >/dev/null 2>&1 || T26_EXIT=$?
+
+if [[ "$T26_EXIT" -ne 0 ]] \
+   && grep -q '^LIST count=5$' "$T26_LOG" \
+   && [[ "$(grep -c '^DELETE old-' "$T26_LOG" 2>/dev/null || true)" -eq 4 ]]; then
+  pass "backup fails when B2 still reports old versions after delete calls"
+else
+  fail "cleanup verification did not fail closed (exit=$T26_EXIT log: $(cat "$T26_LOG" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

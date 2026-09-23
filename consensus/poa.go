@@ -32,6 +32,7 @@ type AdminMintRecordStore interface {
 
 // Config holds PoA consensus parameters.
 type Config struct {
+	LPoDMigration *store.LPoDMigration
 	BlockTime    time.Duration
 	BFTThreshold float64 // fraction of validators needed to finalize (e.g. 0.667)
 	// Validators is the bootstrap list from genesis (used to seed the Registry).
@@ -121,6 +122,11 @@ type Config struct {
 	// validator rewards must carry a consensus-verifiable on-chain
 	// authorization. Zero keeps the authorization feature disabled.
 	RewardAuthorizationActivationHeight uint64
+	// GuardianFundActivationHeight and GuardianFundChainAnchor gate the
+	// consensus-synthesized, protocol-locked 1B APRO allocation. ChainAnchor
+	// is always the canonical genesis block hash, never the activation parent.
+	GuardianFundActivationHeight uint64
+	GuardianFundChainAnchor      crypto.Hash32
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -133,6 +139,7 @@ type FinalizeMsg struct {
 
 // Engine is the PoA consensus engine.
 type Engine struct {
+	lpodFinalizedHashes map[uint64]crypto.Hash32
 	cfg   Config
 	chain *core.Chain
 	pool  *core.Mempool
@@ -286,6 +293,11 @@ const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
+	if cfg.LPoDMigration!=nil {
+		m:=*cfg.LPoDMigration
+		m.TrustedValidators=append([]crypto.ValidatorPubKey(nil),cfg.Validators...)
+		cfg.LPoDMigration=&m
+	}
 	adminMintStore := cfg.AdminMintStore
 	if adminMintStore == nil && cfg.Store != nil {
 		adminMintStore = cfg.Store
@@ -432,6 +444,14 @@ func (e *Engine) blockRewardNAPRAt(height uint64) uint64 {
 // was produced locally or received from a peer.
 // Safe to call concurrently; uses atomic CAS.  Does nothing when pool is disabled.
 func (e *Engine) DecrementPool(height uint64) {
+	if e.lpodActive(height) && e.store != nil {
+		// The validator debit and LPoD credit already committed in the same
+		// block batch. Refresh RAM only; never deduct the reward a second time.
+		if c,err:=e.store.LoadLPoDCheckpoint();err==nil && c!=nil && c.Allocation!=nil {
+			atomic.StoreInt64(&e.stakingPoolRemaining,int64(c.Allocation.ValidatorRemaining))
+		}
+		return
+	}
 	if e.stakingPoolInit == 0 {
 		return // pool disabled
 	}
@@ -1001,6 +1021,7 @@ func validateCoinbasePolicy(block *core.Block) error {
 // RingCT activation is deliberately not consulted here: it governs transfer
 // proofs and fee rules, not whether the configured validator reward exists.
 func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
+	if e.lpodActive(block.Header.Height){return e.validateLPoD(block)}
 	if err := validateCoinbasePolicy(block); err != nil {
 		return err
 	}
@@ -1071,7 +1092,7 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 	var totalAVMGas uint64
 	for i := range block.Txs {
 		tx := &block.Txs[i]
-		if tx.IsCoinbase() || tx.IsStake() {
+if tx.IsCoinbase() || tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() {
 			continue
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
@@ -1127,6 +1148,12 @@ func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
 		// This makes the first strict block independent of how a pre-activation
 		// node represented or reconstructed legacy zero-valued fee headers.
 		return core.InitialBaseFeePerByte
+	}
+	if e.lpodActive(height) {
+		parent:=e.chain.Tip()
+		if parent!=nil && parent.Header.Height+1==height {
+			return nextBaseFee(parent.Header.BaseFee,parent.Size())
+		}
 	}
 	return e.expectedBaseFee()
 }
@@ -1363,6 +1390,9 @@ func (e *Engine) resolveAdminMintsPersistenceFailed(err error) {
 	e.mintMu.Unlock()
 }
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
+	if err := e.validateGuardianConfig(); err != nil {
+		return nil, err
+	}
 	raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
 	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
 	rewardAuthorizationActive := rewardActivation > 0 && height >= rewardActivation
@@ -1387,7 +1417,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 					"hash", h)
 				continue
 			}
-			if rewardAuthorizationActive {
+if rewardAuthorizationActive {
 				e.log.Warn("produceBlock: dropping privileged legacy mint after reward authorization activation",
 					"hash", h, "height", height)
 				e.pool.Remove(h)
@@ -1511,9 +1541,14 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 	}
 
 	// Once reward authorization is active, the local address only selects where
+	var positionErr error
+	txs,positionErr=e.filterLPoDPositions(txs,height)
+	if positionErr!=nil{return nil,positionErr}
+
+	// Once reward authorization is active, the local address only selects where
 	// this proposer wants to be paid. Peers validate its exact signed value from
 	// the on-chain payload and derive the amount from protocol constants.
-	if rewardAuthorizationActive {
+	if rewardAuthorizationActive && !e.lpodActive(height) {
 		if e.cfg.RewardAddress == "" {
 			return nil, fmt.Errorf("reward_address is required from reward authorization activation height %d",
 				rewardActivation)
@@ -1532,7 +1567,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			}
 			txs = append([]core.Transaction{*mintTx}, txs...)
 		}
-	} else if e.cfg.RewardAddress != "" {
+	} else if e.cfg.RewardAddress != "" && !e.lpodActive(height) {
 		baseReward := e.cfg.BlockRewardNAPR
 		if baseReward == 0 {
 			if e.stakingPoolInit > 0 {
@@ -1573,6 +1608,24 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		}
 	}
 
+	// The Guardian transaction is positioned immediately after the reward
+	// coinbase when one exists, otherwise at index zero. It is never selected
+	// from the mempool and is included only at the single configured height.
+	if e.cfg.GuardianFundActivationHeight > 0 && height == e.cfg.GuardianFundActivationHeight {
+		guardian, err := core.BuildGuardianFundTx(e.cfg.GuardianFundChainAnchor, height)
+		if err != nil {
+			return nil, fmt.Errorf("build guardian fund transaction: %w", err)
+		}
+		index := 0
+		if len(txs) > 0 && txs[0].IsCoinbase() {
+			index = 1
+		}
+		txs = append(txs, core.Transaction{})
+		copy(txs[index+1:], txs[index:])
+		txs[index] = guardian
+	}
+
+
 	// Read the last price fetched by the background oracle goroutine.
 	// This is an atomic load — never blocks on network I/O.
 	oraclePrice := atomic.LoadUint64(&e.cachedOraclePrice)
@@ -1587,7 +1640,15 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		OraclePrice:  oraclePrice,
 		BaseFee:      currentBaseFee,
 	}
-	if err := header.Sign(e.cfg.MyKey.PrivKey()); err != nil {
+if e.lpodActive(height) {
+	draft:=&core.Block{Header:header,Txs:txs}
+	r,c,payments,err:=e.prepareLPoD(draft,crypto.Address(e.cfg.RewardAddress))
+	if err!=nil{return nil,err}
+	payout,err:=e.cfg.Store.PayoutLPoD(height,r,c,payments);if err!=nil{return nil,err}
+	txs=append([]core.Transaction{payout,core.LPoDCheckpointTx(c.Digest())},txs...)
+	header.MerkleRoot=core.MerkleRoot(txs)
+}
+if err := header.Sign(e.cfg.MyKey.PrivKey()); err != nil {
 		return nil, err
 	}
 	if oraclePrice > 0 {
@@ -1887,6 +1948,10 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 }
 
 func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
+	if err := e.validateLPoD(block); err != nil { return err }
+	if err := e.validateGuardianFund(block); err != nil {
+		return err
+	}
 	activation := e.cfg.RingCTV4ActivationHeight
 	for i := range block.Txs {
 		if err := core.ValidateTxVersionAtHeight(
@@ -1902,7 +1967,65 @@ func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
 	return nil
 }
 
+func (e *Engine) validateGuardianFund(block *core.Block) error {
+	if err := e.validateGuardianConfig(); err != nil {
+		return err
+	}
+	active := e.cfg.GuardianFundActivationHeight
+	count := 0
+	for i := range block.Txs {
+		if !block.Txs[i].IsGuardianFund() {
+			continue
+		}
+		count++
+		if active == 0 || block.Header.Height != active {
+			return fmt.Errorf("guardian fund tx[%d] is not permitted at height %d", i, block.Header.Height)
+		}
+		expectedIndex := 0
+		// The scheduled validator reward, when present, remains first.
+		if len(block.Txs) > 0 && block.Txs[0].IsCoinbase() {
+			expectedIndex = 1
+		}
+		if i != expectedIndex || !core.GuardianFundTxAt(&block.Txs[i], e.cfg.GuardianFundChainAnchor, active) {
+			return fmt.Errorf("guardian fund tx[%d] is not canonical", i)
+		}
+	}
+	if active > 0 && block.Header.Height == active && count != 1 {
+		return fmt.Errorf("guardian fund transaction missing or duplicated at activation height %d", active)
+	}
+	return nil
+}
+
+func (e *Engine) validateGuardianConfig() error {
+	active := e.cfg.GuardianFundActivationHeight
+	anchor := e.cfg.GuardianFundChainAnchor
+	if active == 0 {
+		if anchor != (crypto.Hash32{}) {
+			return fmt.Errorf("guardian fund genesis anchor configured while activation is disabled")
+		}
+		return nil
+	}
+	genesis := e.chain.Genesis()
+	if genesis == nil {
+		return fmt.Errorf("guardian fund requires canonical genesis")
+	}
+	if anchor == (crypto.Hash32{}) || genesis.Hash() != anchor {
+		return fmt.Errorf("guardian fund chain anchor is not the canonical genesis block hash")
+	}
+	return nil
+}
+
 func (e *Engine) prepareAVMBlock(block *core.Block) (*avm.PreparedBlock, error) {
+	prepared, err := e.prepareAVMOnly(block)
+	if err != nil { return nil, err }
+	if e.lpodActive(block.Header.Height) {
+prepared.LPoD, _, _, err = e.prepareLPoD(block,"")
+		if err != nil { return nil, err }
+	}
+	return prepared, nil
+}
+
+func (e *Engine) prepareAVMOnly(block *core.Block) (*avm.PreparedBlock, error) {
 	hasAVM := false
 	for i := range block.Txs {
 		if block.Txs[i].IsAVM() {
@@ -1942,6 +2065,12 @@ func (e *Engine) castVote(block *core.Block) error {
 
 // handleVote processes a finalization vote from any validator.
 func (e *Engine) handleVote(vote FinalizeMsg) error {
+	// Height is not authenticated by legacy v1 signatures. Resolve the signed
+	// hash to the canonical block BEFORE recording a vote or pruning any state.
+	block:=e.chain.GetByHeight(vote.Height)
+	if block==nil || block.Header.Height!=vote.Height || block.Hash()!=vote.BlockHash {
+		return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+	}
 	if !e.isKnownValidator(vote.ValidatorPub) {
 		return fmt.Errorf("vote from unknown validator %s", vote.ValidatorPub.ID())
 	}
@@ -1970,6 +2099,8 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 	needed := int(float64(len(e.activeValidators()))*e.cfg.BFTThreshold) + 1
 	if len(e.votes[vote.BlockHash]) >= needed {
 		e.finalized[vote.Height] = true
+		if e.lpodFinalizedHashes == nil { e.lpodFinalizedHashes = make(map[uint64]crypto.Hash32) }
+		e.lpodFinalizedHashes[vote.Height] = vote.BlockHash
 		e.log.Info("block finalized",
 			"height", vote.Height,
 			"votes", len(e.votes[vote.BlockHash]),
@@ -1995,6 +2126,7 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 		}
 		for h := range e.finalized {
 			if h < pruneBelow {
+				delete(e.lpodFinalizedHashes, h)
 				delete(e.finalized, h)
 			}
 		}

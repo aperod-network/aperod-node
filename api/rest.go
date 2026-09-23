@@ -67,6 +67,11 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
 	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
+	s.mux.HandleFunc("/api/v1/guardian-fund", s.restGuardianFund)
+s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
+s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
+s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
+s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
 	s.mux.HandleFunc("/api/v1/avm/receipts/", s.restAVMReceipt)
@@ -77,6 +82,99 @@ func (s *Server) registerRESTRoutes() {
 	// Node-join workflow: export endpoints consumed by aperod-join.sh.
 	s.mux.HandleFunc("/api/v1/snapshot/export", s.restSnapshotExport)
 	s.mux.HandleFunc("/api/v1/chaindb/export", s.restChainDBExport)
+}
+
+// restGuardianFund reports the anchored one-off allocation. Status is derived
+// only from the configured activation and the exact canonical transaction;
+// configuration alone is never treated as proof of funding. Canonical block
+// presence is not BFT-finality evidence, so it is reported separately until
+// the endpoint is wired to consensus finality.
+func (s *Server) restGuardianFund(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	height := s.guardianFundActivationHeight
+	anchor := s.guardianFundChainAnchor
+	response := map[string]interface{}{
+		"state":                      "disabled",
+		"version":                    core.GuardianFundVersion,
+		"lock_id":                    fmt.Sprintf("%x", core.GuardianFundID[:]),
+		"amount_napro":               strconv.FormatUint(core.GuardianFundNAPR, 10),
+		"amount_apro":                uint64(1_000_000_000),
+		"nominal_total_supply_napro": "1000000000000000000",
+		"protocol_locked":            true,
+		"lock_policy":                "consensus_locked_v1",
+		"activation_height":          height,
+		"chain_anchor":               nil,
+		"funding_tx_hash":            nil,
+		"output_index":               nil,
+		"block_hash":                 nil,
+		"confirmations":              nil,
+	}
+	if height == 0 || anchor == (crypto.Hash32{}) {
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["chain_anchor"] = fmt.Sprintf("%x", anchor[:])
+	genesis := s.chain.Genesis()
+	if genesis == nil || genesis.Hash() != anchor {
+		response["state"] = "invalid_configuration"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	tip := s.chain.Tip()
+	if tip == nil || tip.Header.Height < height {
+		response["state"] = "pending"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	block := s.chain.GetByHeight(height)
+	var pruned *store.StoredBlock
+	if block == nil && s.blockStore != nil {
+		full, prunedBlock, _ := s.lookupBlockFromDisk(strconv.FormatUint(height, 10))
+		block = full
+		pruned = prunedBlock
+	}
+	// A pruned header plus an arbitrary UTXO record is not transaction
+	// inclusion evidence. Without the canonical block body (or a future Merkle
+	// proof API) funding cannot be reported as finalized.
+	if block == nil && pruned != nil {
+		response["state"] = "unverifiable"
+		response["block_hash"] = fmt.Sprintf("%x", pruned.Hash[:])
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if block == nil || block.Header.Height != height {
+		response["state"] = "missing"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	expectedIndex := 0
+	if len(block.Txs) > 0 && block.Txs[0].IsCoinbase() {
+		expectedIndex = 1
+	}
+	guardianCount := 0
+	for i := range block.Txs {
+		if block.Txs[i].IsGuardianFund() {
+			guardianCount++
+		}
+	}
+	if expectedIndex >= len(block.Txs) ||
+		guardianCount != 1 ||
+		!core.GuardianFundTxAt(&block.Txs[expectedIndex], anchor, height) {
+		response["state"] = "missing"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	txHash := block.Txs[expectedIndex].Hash()
+	blockHash := block.Hash()
+	response["state"] = "canonical_detected"
+	response["funding_tx_hash"] = fmt.Sprintf("%x", txHash[:])
+	response["output_index"] = uint32(0)
+	response["block_hash"] = fmt.Sprintf("%x", blockHash[:])
+	response["confirmations"] = tip.Header.Height - height + 1
+	writeJSON(w, http.StatusOK, response)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

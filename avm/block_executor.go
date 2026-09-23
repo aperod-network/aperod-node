@@ -8,6 +8,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
 )
 
 var (
@@ -28,6 +29,7 @@ type Receipt struct {
 // durable state. Consensus must persist Writes atomically with the block body,
 // canonical height index and tip.
 type PreparedBlock struct {
+	LPoD *store.LPoDSettlement
 	Height             uint64
 	BlockHash          crypto.Hash32
 	Receipts           []Receipt

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,6 +41,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "aperod-node: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+const guardianEconomicReconciliationNotApproved = "guardian fund activation refused: economic reconciliation not approved; nominal allocations already total 10B APRO and no allocation debit has been approved"
+
+// guardGuardianFundActivation is the production startup interlock. Guardian
+// transaction and consensus primitives remain testable, but configuration must
+// not activate them until an allocation debit has been reviewed and approved.
+// run calls this immediately after loading configuration, before any data-dir
+// creation, database open, durable binding, or other startup disk write.
+func guardGuardianFundActivation(cfg *config.Config) error {
+	if cfg.Consensus.GuardianFundActivationHeight != 0 {
+		return fmt.Errorf("%s", guardianEconomicReconciliationNotApproved)
+	}
+	return nil
 }
 
 // multiaddrRe matches /ip4/<host>/tcp/<port> and extracts host and port.
@@ -870,6 +885,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if err := guardGuardianFundActivation(cfg); err != nil {
+		return err
+	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
@@ -1284,6 +1302,11 @@ func run() error {
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
 		apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
 		apiSrv.SetStore(db)
+		var apiGuardianAnchor crypto.Hash32
+		if raw, err := hex.DecodeString(cfg.Consensus.GuardianFundChainAnchor); err == nil && len(raw) == 32 {
+			copy(apiGuardianAnchor[:], raw)
+		}
+		apiSrv.SetGuardianFundConfig(cfg.Consensus.GuardianFundActivationHeight, apiGuardianAnchor)
 		apiSrv.SetAVMStore(
 			cfg.Consensus.AVMActivationHeight,
 			avm.LevelStore{DB: db},
@@ -1821,13 +1844,14 @@ func run() error {
 								return nil, false
 							}
 							return &core.UTXO{
-								TxHash:       su.TxHash,
-								OutputIndex:  su.OutputIndex,
-								OneTimePub:   su.OneTimePub,
-								TxPubKey:     su.TxPubKey,
-								AmountCommit: su.AmountCommit,
-								EncAmount:    su.EncAmount,
-								BlockHeight:  su.BlockHeight,
+								TxHash:         su.TxHash,
+								OutputIndex:    su.OutputIndex,
+								OneTimePub:     su.OneTimePub,
+								TxPubKey:       su.TxPubKey,
+								AmountCommit:   su.AmountCommit,
+								EncAmount:      su.EncAmount,
+								BlockHeight:    su.BlockHeight,
+								ProtocolLocked: su.ProtocolLocked,
 							}, true
 						},
 						func(u *core.UTXO, disk *core.UTXO) {
@@ -2249,13 +2273,14 @@ func run() error {
 					activeCount := 0
 					iterErr := db.IterActiveUTXOs(func(su *store.StoredUTXO) error {
 						utxos.Add(&core.UTXO{
-							TxHash:       su.TxHash,
-							OutputIndex:  su.OutputIndex,
-							OneTimePub:   su.OneTimePub,
-							TxPubKey:     su.TxPubKey,
-							AmountCommit: su.AmountCommit,
-							EncAmount:    su.EncAmount,
-							BlockHeight:  su.BlockHeight,
+							TxHash:         su.TxHash,
+							OutputIndex:    su.OutputIndex,
+							OneTimePub:     su.OneTimePub,
+							TxPubKey:       su.TxPubKey,
+							AmountCommit:   su.AmountCommit,
+							EncAmount:      su.EncAmount,
+							BlockHeight:    su.BlockHeight,
+							ProtocolLocked: su.ProtocolLocked,
 						})
 						activeCount++
 						return nil
@@ -2438,7 +2463,56 @@ func run() error {
 		consensusMyKey = nil
 	}
 
-	engine = consensus.NewEngine(consensus.Config{
+	var guardianAnchor crypto.Hash32
+	if cfg.Consensus.GuardianFundChainAnchor != "" {
+		rawAnchor, err := hex.DecodeString(cfg.Consensus.GuardianFundChainAnchor)
+		if err != nil || len(rawAnchor) != len(guardianAnchor) {
+			return fmt.Errorf("decode guardian fund chain anchor: configuration validation should have rejected this")
+		}
+		copy(guardianAnchor[:], rawAnchor)
+	}
+	genesisBlock := chain.Genesis()
+	if genesisBlock == nil {
+		return fmt.Errorf("guardian fund startup validation requires canonical genesis")
+	}
+	canonicalGenesis := genesisBlock.Hash()
+	if cfg.Consensus.GuardianFundActivationHeight > 0 && guardianAnchor != canonicalGenesis {
+		return fmt.Errorf("guardian_fund_chain_anchor must equal canonical genesis hash %x", canonicalGenesis)
+	}
+	if activation := cfg.Consensus.GuardianFundActivationHeight; activation > 0 && activation <= chain.Height() {
+		raw, err := db.GetRawBlockByHeight(activation)
+		if err != nil || raw == nil {
+			return fmt.Errorf("guardian fund activation block %d is unavailable for startup verification", activation)
+		}
+		var activationBlock core.Block
+		if err := json.Unmarshal(raw, &activationBlock); err != nil {
+			return fmt.Errorf("decode guardian fund activation block %d: %w", activation, err)
+		}
+		expectedIndex := 0
+		if len(activationBlock.Txs) > 0 && activationBlock.Txs[0].IsCoinbase() {
+			expectedIndex = 1
+		}
+		guardianCount := 0
+		for i := range activationBlock.Txs {
+			if activationBlock.Txs[i].IsGuardianFund() {
+				guardianCount++
+			}
+		}
+		if activationBlock.Header.Height != activation ||
+			guardianCount != 1 ||
+			expectedIndex >= len(activationBlock.Txs) ||
+			!core.GuardianFundTxAt(&activationBlock.Txs[expectedIndex], guardianAnchor, activation) {
+			return fmt.Errorf("guardian fund activation evidence at height %d conflicts with configuration", activation)
+		}
+	}
+	if err := db.BindGuardianFundConfig(cfg.Consensus.GuardianFundActivationHeight, canonicalGenesis); err != nil {
+		return err
+	}
+
+lpodMigration, err := loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
+if err != nil { return err }
+engine = consensus.NewEngine(consensus.Config{
+LPoDMigration: lpodMigration,
 		BlockTime:                           cfg.Consensus.BlockTime,
 		BFTThreshold:                        genesisConfig.BFTThreshold,
 		Validators:                          validators,
@@ -2456,6 +2530,8 @@ func run() error {
 		AVMActivationHeight:                 cfg.Consensus.AVMActivationHeight,
 		AVMExecutor:                         avm.NewBlockExecutor(avm.LevelStore{DB: db}),
 		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
+		GuardianFundActivationHeight:        cfg.Consensus.GuardianFundActivationHeight,
+		GuardianFundChainAnchor:             guardianAnchor,
 		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
 			raw, err := json.Marshal(block)
 			if err != nil {
@@ -2686,6 +2762,7 @@ func run() error {
 			}(periodicSnap, h, periodicActive)
 		},
 	}, chain, mempool, log)
+if apiSrv != nil { apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash) }
 
 	// ── 8. Wire TxVerifier BEFORE starting the engine goroutine ──────────────
 	// engine.Run launches handleIncomingBlock immediately on incoming P2P
@@ -4437,13 +4514,14 @@ func rebuildMissingUTXOs(blockStore *store.DB, tipHeight uint64, log *slog.Logge
 					continue // already in store, skip
 				}
 				su := &store.StoredUTXO{
-					TxHash:       txHash,
-					OutputIndex:  uint32(outIdx),
-					OneTimePub:   out.OneTimePub,
-					TxPubKey:     out.TxPubKey,
-					AmountCommit: out.AmountCommit,
-					EncAmount:    out.EncAmount,
-					BlockHeight:  h,
+					TxHash:         txHash,
+					OutputIndex:    uint32(outIdx),
+					OneTimePub:     out.OneTimePub,
+					TxPubKey:       out.TxPubKey,
+					AmountCommit:   out.AmountCommit,
+					EncAmount:      out.EncAmount,
+					BlockHeight:    h,
+					ProtocolLocked: tx.IsGuardianFund(),
 				}
 				if putErr := blockStore.PutUTXO(txHash, uint32(outIdx), su); putErr != nil {
 					if firstErr == nil {
@@ -4525,13 +4603,14 @@ func verifyUTXOStoreEntries(blockStore *store.DB, tipHeight uint64, log *slog.Lo
 					"store_commit", fmt.Sprintf("%x", existing.AmountCommit[:]),
 					"block_commit", fmt.Sprintf("%x", out.AmountCommit[:]))
 				su := &store.StoredUTXO{
-					TxHash:       txHash,
-					OutputIndex:  uint32(outIdx),
-					OneTimePub:   out.OneTimePub,
-					TxPubKey:     out.TxPubKey,
-					AmountCommit: out.AmountCommit,
-					EncAmount:    out.EncAmount,
-					BlockHeight:  h,
+					TxHash:         txHash,
+					OutputIndex:    uint32(outIdx),
+					OneTimePub:     out.OneTimePub,
+					TxPubKey:       out.TxPubKey,
+					AmountCommit:   out.AmountCommit,
+					EncAmount:      out.EncAmount,
+					BlockHeight:    h,
+					ProtocolLocked: tx.IsGuardianFund(),
 				}
 				if putErr := blockStore.PutUTXO(txHash, uint32(outIdx), su); putErr != nil {
 					if firstErr == nil {
@@ -4717,13 +4796,14 @@ func storeBlockIndexes(db *store.DB, b *core.Block) error {
 		}
 		for i, out := range tx.Outputs {
 			su := &store.StoredUTXO{
-				TxHash:       txHash,
-				OutputIndex:  uint32(i),
-				OneTimePub:   out.OneTimePub,
-				TxPubKey:     out.TxPubKey,
-				AmountCommit: out.AmountCommit,
-				EncAmount:    out.EncAmount,
-				BlockHeight:  b.Header.Height,
+				TxHash:         txHash,
+				OutputIndex:    uint32(i),
+				OneTimePub:     out.OneTimePub,
+				TxPubKey:       out.TxPubKey,
+				AmountCommit:   out.AmountCommit,
+				EncAmount:      out.EncAmount,
+				BlockHeight:    b.Header.Height,
+				ProtocolLocked: tx.IsGuardianFund(),
 			}
 			if err := db.PutUTXO(txHash, uint32(i), su); err != nil {
 				return fmt.Errorf("put utxo (height %d, tx %x, idx %d): %w",

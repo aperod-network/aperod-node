@@ -36,12 +36,15 @@ func CommitCanonicalBlock(db *store.DB, block *core.Block, rawBlock []byte, prep
 	if prepared.Height != block.Header.Height || prepared.BlockHash != hash {
 		return fmt.Errorf("avm: prepared effects do not match block")
 	}
+	var settlement []*store.LPoDSettlement
+	if prepared.LPoD != nil { settlement = append(settlement, prepared.LPoD) }
 	return db.CommitRawBlockWithAVM(
 		hash,
 		block.Header.Height,
 		rawBlock,
 		toStoreWrites(prepared.Writes),
 		prepared.WriteSetCommitment,
+		settlement...,
 	)
 }
 

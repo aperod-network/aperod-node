@@ -190,7 +190,12 @@ type UTXO struct {
 	EncAmount [8]byte
 	// BlockHeight is where this UTXO was created.
 	BlockHeight uint64
+	// ProtocolLocked marks consensus-created outputs which are deliberately
+	// retained in the UTXO record but excluded from every spend/ring index.
+	ProtocolLocked bool `json:"protocol_locked,omitempty"`
 }
+
+func isProtocolLockedUTXO(u *UTXO) bool { return u != nil && u.ProtocolLocked }
 
 // UTXOKey uniquely identifies a UTXO in the set.
 type UTXOKey struct {
@@ -302,11 +307,18 @@ func (s *UTXOSet) Add(u *UTXO) {
 	defer s.mu.Unlock()
 	key := UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}
 	s.utxos[key] = u
-	s.byPubKey[u.OneTimePub] = u
+	// Guardian outputs are retained for audit/rollback but are permanently
+	// locked and therefore must never become spendable or ring members.
+	if !isProtocolLockedUTXO(u) {
+		s.byPubKey[u.OneTimePub] = u
+	}
 	s.trackCLSAGRecentLocked(key, u.BlockHeight)
 }
 
 func (s *UTXOSet) trackCLSAGRecentLocked(key UTXOKey, height uint64) {
+	if isProtocolLockedUTXO(s.utxos[key]) {
+		return
+	}
 	if s.clsagActivationHeight == 0 || height < s.clsagActivationHeight {
 		return
 	}
@@ -344,11 +356,11 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 // double spending.
 func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
 	s.mu.RLock()
-	if u := s.byPubKey[pub]; u != nil {
+	if u := s.byPubKey[pub]; u != nil && !isProtocolLockedUTXO(u) {
 		s.mu.RUnlock()
 		return u
 	}
-	if u := s.spentPubKeys[pub]; u != nil {
+	if u := s.spentPubKeys[pub]; u != nil && !isProtocolLockedUTXO(u) {
 		s.mu.RUnlock()
 		return u
 	}
@@ -358,7 +370,7 @@ func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
 		return nil
 	}
 	u, err := store.LookupRingMember(pub)
-	if err != nil {
+	if err != nil || isProtocolLockedUTXO(u) {
 		return nil
 	}
 	return u
@@ -686,16 +698,19 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 		for i, out := range tx.Outputs {
 			key := UTXOKey{TxHash: txHash, OutputIndex: uint32(i)}
 			u := &UTXO{
-				TxHash:       txHash,
-				OutputIndex:  uint32(i),
-				OneTimePub:   out.OneTimePub,
-				TxPubKey:     out.TxPubKey,
-				AmountCommit: out.AmountCommit,
-				EncAmount:    out.EncAmount,
-				BlockHeight:  block.Header.Height,
+				TxHash:          txHash,
+				OutputIndex:     uint32(i),
+				OneTimePub:      out.OneTimePub,
+				TxPubKey:        out.TxPubKey,
+				AmountCommit:    out.AmountCommit,
+				EncAmount:       out.EncAmount,
+				BlockHeight:     block.Header.Height,
+				ProtocolLocked: tx.IsGuardianFund(),
 			}
 			s.utxos[key] = u
-			s.byPubKey[out.OneTimePub] = u
+			if !u.ProtocolLocked {
+				s.byPubKey[out.OneTimePub] = u
+			}
 			s.trackCLSAGRecentLocked(key, block.Header.Height)
 		}
 	}
@@ -903,7 +918,7 @@ func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []Dec
 
 	candidates := make([]*UTXO, 0, len(s.spentPubKeys)+len(s.byPubKey))
 	for pub, u := range s.spentPubKeys {
-		if !exclude[pub] {
+		if !exclude[pub] && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
 	}
@@ -956,12 +971,12 @@ func (s *UTXOSet) SampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool) 
 	defer s.mu.RUnlock()
 	candidates := make([]*UTXO, 0, len(s.spentPubKeys)+len(s.byPubKey))
 	for pub, u := range s.spentPubKeys {
-		if !exclude[pub] {
+		if !exclude[pub] && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
 	}
 	for pub, u := range s.byPubKey {
-		if !exclude[pub] {
+		if !exclude[pub] && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
 	}
@@ -1032,6 +1047,10 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 }
 
 func stateTransitionRingMembers(tx Transaction, inp RingInput) []crypto.RingMember {
+	if tx.IsLPoDPosition(){
+		if len(inp.Ring)==0{return nil}
+		return inp.Ring[:1] // native proof authenticates exactly source index zero
+	}
 	if tx.Version != TxVersionCommitmentBinding {
 		return inp.Ring
 	}

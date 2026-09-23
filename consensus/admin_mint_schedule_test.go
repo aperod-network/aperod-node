@@ -555,11 +555,19 @@ func newMintTestEngineOnChainWithStore(t *testing.T, chain *core.Chain, db *stor
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()), newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 	stop := make(chan struct{})
-	go eng.Run(stop)
+engineDone := make(chan struct{})
+go func() {
+defer close(engineDone)
+eng.Run(stop)
+}()
 	var once sync.Once
 	return eng, func() {
 		once.Do(func() {
 			close(stop)
+// Closing stop requests shutdown; an in-flight tick may still use MyKey
+// and Store. Join the loop before destroying the key or returning to a
+// caller that closes/reuses the database.
+<-engineDone
 			lk.Destroy()
 		})
 	}

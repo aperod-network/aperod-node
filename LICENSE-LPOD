@@ -56,6 +56,16 @@ approval. Approval is effective only when an authorized Aperod APRO team
 representative provides an explicit written response. Any additional agreement
 controls to the extent it expressly conflicts with this license.
 
+Issued permissions will be published in the official Aperod LPoD permission
+registry:
+
+https://aperod.com/vaults#lpod-permissions
+
+The registry currently records no issued permissions. Publication of an entry
+does not itself grant or expand permission beyond the recipient, Covered Code,
+permitted activity, and other terms identified in the corresponding written
+approval.
+
 4. Developer permission is separate from end-user activation
 
 An authorized production deployment may permit end users to submit supported

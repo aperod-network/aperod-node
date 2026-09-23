@@ -379,6 +379,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 										AmountCommit: out.AmountCommit,
 										EncAmount:    out.EncAmount,
 										BlockHeight:  blk.Header.Height,
+										ProtocolLocked: bTx.IsGuardianFund(),
 									}
 									if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, healEntry); putErr != nil {
 										s.log.Warn("fallback4: failed to heal u/ entry in LevelDB",
@@ -425,6 +426,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 						AmountCommit: memUTXO.AmountCommit,
 						EncAmount:    memUTXO.EncAmount,
 						BlockHeight:  memUTXO.BlockHeight,
+						ProtocolLocked: memUTXO.ProtocolLocked,
 					}
 					if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, snapHeal); putErr != nil {
 						s.log.Warn("fallback4: failed to heal u/ entry (snapshot)",
