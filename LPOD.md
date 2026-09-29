@@ -3,6 +3,14 @@
 
 # LPoD: a guide to positions, rewards, withdrawals, and activation
 
+> **Mainnet status: LPoD v3 ACTIVATED at canonical height 2,493,218.**
+> Its 1B APRO Guardian reserve is within the 10B APRO nominal allocation,
+> not additional issuance. Funding is active; exact checkpoint finality
+> must be verified at the current tip. This does not claim that a funded
+> deposit/withdrawal cycle has been tested or global issuance audited.
+> For the live account and protocol description, see
+> [APRO Vaults](https://aperod.com/vaults).
+
 LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It lets a Guardian reserve eligible on-chain APRO
 with a selected validator vault, accrue validator-linked rewards, and
