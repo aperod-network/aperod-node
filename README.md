@@ -26,10 +26,11 @@ LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
 canonical accounting and confirmed Guardian-principal refunds. LPoD v3 is **ACTIVE on mainnet from canonical height 2,493,218**. Its
 1B APRO Guardian reserve belongs within the existing 10B APRO nominal
-allocation; this is not additional issuance. Node configuration remains
-fail-closed without a valid coordinated migration. This status does not
-claim that real deposits or withdrawals have been tested or that global
-issuance has been independently audited. The validator stake lock remains governed separately by the
+allocation; this is not additional issuance. The coordinated v3 migration
+is active on mainnet, with funding and finalized pool accounting visible at
+[`GET /api/v1/lpod-pool`](https://aperod.com/api/v1/lpod-pool).
+Standalone nodes require an authenticated migration witness to follow this
+activated chain. The validator stake lock remains governed separately by the
 validator protocol.
 
 **Detailed functionality guide:** [LPOD.md — protocol behavior, status, and
@@ -254,9 +255,9 @@ Aperod starts with a fixed genesis allocation and uses a deflationary fee model:
 > **LPoD v3 activated at canonical height 2,493,218.** The 1B APRO
 > Guardian reserve is part of the existing 10B APRO nominal allocation,
 > not a new mint. Active funding and a finalized tip-bound checkpoint can
-> be checked through `GET /api/v1/lpod-pool`. This activation is not a
-> claim of independently audited historical global issuance or a tested
-> real-money deposit/withdrawal lifecycle.
+> be checked through [`GET /api/v1/lpod-pool`](https://aperod.com/api/v1/lpod-pool).
+> The live response reports the funding height, finalized height, pool balance,
+> reward inflows and current position count.
 
 ### Coordinated LPoD protocol — active from height 2,493,218
 
