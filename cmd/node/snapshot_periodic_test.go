@@ -177,7 +177,7 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 // contract: a snapshot file must exist at each interval boundary, and all
 // earlier snapshot files must be removed.  The interval size used here (500)
 // is arbitrary — the production value is now configurable via
-// SnapshotConfig.PeriodicSnapshotInterval (default 10 000).
+// SnapshotConfig.PeriodicSnapshotInterval (disabled by default).
 func TestPeriodicSnapshot_SaveDeleteContract(t *testing.T) {
 	dir := t.TempDir()
 

@@ -81,6 +81,120 @@ func TestValidate_RewardAuthorizationActivation(t *testing.T) {
 	})
 }
 
+func TestStopProducingAtHeightValidationAndPersistence(t *testing.T) {
+	t.Run("zero disables barrier", func(t *testing.T) {
+		cfg := DefaultConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("zero barrier should be disabled: %v", err)
+		}
+	})
+
+	t.Run("rejects unsupported height", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.StopProducingAtHeight = ^uint64(0)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("unsupported barrier height was accepted")
+		}
+	})
+
+	t.Run("rejects barrier on non-validator", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Consensus.NonValidator = true
+		cfg.Consensus.StopProducingAtHeight = 100
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("non-validator barrier configuration was accepted")
+		}
+	})
+
+	t.Run("retains barrier when config is reloaded", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "node.yaml")
+		if err := os.WriteFile(path, []byte("consensus:\n  stop_producing_at_height: 123456\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := reloaded.Consensus.StopProducingAtHeight; got != 123456 {
+			t.Fatalf("reloaded barrier height = %d, want 123456", got)
+		}
+	})
+}
+
+func TestValidate_AVMGasBurnActivation(t *testing.T) {
+	tests := []struct {
+		name      string
+		avm       uint64
+		reward    uint64
+		gasBurn   uint64
+		wantError bool
+	}{
+		{name: "disabled by zero", wantError: false},
+		{name: "requires AVM activation", reward: 100, gasBurn: 120, wantError: true},
+		{name: "requires reward authorization", avm: 100, gasBurn: 120, wantError: true},
+		{name: "strictly follows AVM activation", avm: 100, reward: 100, gasBurn: 100, wantError: true},
+		{name: "not before reward authorization", avm: 100, reward: 120, gasBurn: 119, wantError: true},
+		{name: "accepts coordinated future activation", avm: 100, reward: 120, gasBurn: 120},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Consensus.NonValidator = true
+			cfg.Consensus.RingCTV4ActivationHeight = 1
+			cfg.Consensus.RingCTCLSAGActivationHeight = 2
+			cfg.Consensus.AVMActivationHeight = tc.avm
+			cfg.Consensus.RewardAuthorizationActivationHeight = tc.reward
+			cfg.Consensus.AVMGasBurnActivationHeight = tc.gasBurn
+			err := cfg.Validate()
+			if tc.wantError && err == nil {
+				t.Fatal("invalid AVM gas burn activation was accepted")
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("valid AVM gas burn activation rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "node.yaml")
+	configYAML := []byte(`consensus:
+  non_validator: true
+  ringct_v4_activation_height: 100
+  ring_ct_clsag_activation_height: 101
+  avm_activation_height: 110
+  reward_authorization_activation_height: 120
+  avm_gas_burn_activation_height: 125
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	firstStart, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if err := firstStart.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+	if got := firstStart.Consensus.AVMGasBurnActivationHeight; got != 125 {
+		t.Fatalf("loaded activation height = %d, want 125", got)
+	}
+
+	restarted, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() after restart: %v", err)
+	}
+	if got := restarted.Consensus.AVMGasBurnActivationHeight; got != firstStart.Consensus.AVMGasBurnActivationHeight {
+		t.Fatalf("activation after restart = %d, want %d",
+			got, firstStart.Consensus.AVMGasBurnActivationHeight)
+	}
+	if err := restarted.Validate(); err != nil {
+		t.Fatalf("Validate() after restart: %v", err)
+	}
+}
+
 func TestValidate_BadBlockKnobs(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -689,28 +803,28 @@ func TestWarnings_BootnodeNotWhitelisted(t *testing.T) {
 	}{
 		{
 			name:        "bootnode not in whitelist — warn",
-			bootnodes:   []string{"89.169.53.128:30303"},
+			bootnodes:   []string{"192.0.2.128:30303"},
 			whitelist:   []string{},
 			threshold:   5,
 			wantWarning: true,
 		},
 		{
 			name:        "bootnode in whitelist by IP — no warn",
-			bootnodes:   []string{"89.169.53.128:30303"},
-			whitelist:   []string{"89.169.53.128"},
+			bootnodes:   []string{"192.0.2.128:30303"},
+			whitelist:   []string{"192.0.2.128"},
 			threshold:   5,
 			wantWarning: false,
 		},
 		{
 			name:        "bootnode covered by CIDR — no warn",
-			bootnodes:   []string{"89.169.53.128:30303"},
-			whitelist:   []string{"89.169.53.0/24"},
+			bootnodes:   []string{"192.0.2.128:30303"},
+			whitelist:   []string{"192.0.2.0/24"},
 			threshold:   5,
 			wantWarning: false,
 		},
 		{
 			name:        "threshold zero (banning disabled) — no warn even without whitelist",
-			bootnodes:   []string{"89.169.53.128:30303"},
+			bootnodes:   []string{"192.0.2.128:30303"},
 			whitelist:   []string{},
 			threshold:   0,
 			wantWarning: false,
@@ -731,8 +845,8 @@ func TestWarnings_BootnodeNotWhitelisted(t *testing.T) {
 		},
 		{
 			name:        "multiple bootnodes — warns only for uncovered IP",
-			bootnodes:   []string{"89.169.53.128:30303", "10.0.0.1:30303"},
-			whitelist:   []string{"89.169.53.128"},
+			bootnodes:   []string{"192.0.2.128:30303", "10.0.0.1:30303"},
+			whitelist:   []string{"192.0.2.128"},
 			threshold:   5,
 			wantWarning: true, // 10.0.0.1 not covered
 		},

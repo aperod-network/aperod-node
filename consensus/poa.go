@@ -48,6 +48,10 @@ type Config struct {
 	// to the chain locally. Use it for source-specific notification such as
 	// gossip; canonical persistence belongs in OnCanonicalBlock.
 	OnBlockProduced func(block *core.Block) error
+	// OnVoteCast is called after this node's vote has been processed locally.
+	// It must be nonblocking; production wiring should enqueue for asynchronous
+	// P2P dissemination.
+	OnVoteCast func(vote FinalizeMsg)
 	// OnCanonicalBlock is the required durability boundary for every accepted
 	// block, local or P2P. The prepared AVM write set must be committed in the
 	// same atomic batch as block, height index and tip.
@@ -60,6 +64,9 @@ type Config struct {
 	// RewardAddress is the APRO wallet address that receives block rewards.
 	// If empty, no coinbase transaction is added to produced blocks.
 	RewardAddress string
+	// StopProducingAtHeight is an operator safety barrier. When nonzero, tick
+	// will not propose a block whose height is at or above this value.
+	StopProducingAtHeight uint64
 	// BlockRewardNAPR is the block reward in base units (nAPRO).
 	// In pool mode the deployed value is 300_000_000 nAPRO = 3 APRO.
 	BlockRewardNAPR uint64
@@ -116,6 +123,11 @@ type Config struct {
 	// AVMActivationHeight is the first height accepting v6 AVM transactions.
 	// Zero disables AVM consensus.
 	AVMActivationHeight uint64
+	// AVMGasBurnActivationHeight is the first height at which mandatory AVM
+	// gas fees are burned instead of counted as validator priority tips.
+	// Zero preserves the historical fee policy and disables this rule. Every
+	// validator must use the same coordinated future activation height.
+	AVMGasBurnActivationHeight uint64
 	// AVMExecutor performs deterministic block preparation. It is mandatory
 	// once AVMActivationHeight is reached.
 	AVMExecutor *avm.BlockExecutor
@@ -138,6 +150,17 @@ type FinalizeMsg struct {
 	Signature    []byte
 }
 
+type futureVoteKey struct {
+	height uint64
+	hash   crypto.Hash32
+	pub    string
+}
+
+const (
+	futureVoteWindow = uint64(2)
+	futureVoteLimit  = 256
+)
+
 // Engine is the PoA consensus engine.
 type Engine struct {
 	lpodFinalizedHashes map[uint64]crypto.Hash32
@@ -147,6 +170,10 @@ type Engine struct {
 	log                 *slog.Logger
 
 	mu sync.Mutex
+	// productionMu serializes complete production attempts, including the
+	// tip/barrier check, so concurrent tick calls cannot race past the barrier.
+	productionMu  sync.Mutex
+	barrierLogged bool
 	// votes collected for each block hash: pubkey hex → signature
 	votes map[crypto.Hash32]map[string][]byte
 	// finalized tracks which heights have been finalized
@@ -169,6 +196,8 @@ type Engine struct {
 	// pendingVoteHeight maps block hash → height for blocks with pending (non-finalized)
 	// votes. Used to prune the votes map by height to prevent unbounded growth.
 	pendingVoteHeight map[crypto.Hash32]uint64
+	futureVotes       map[futureVoteKey]FinalizeMsg
+	latestLocalVote   *FinalizeMsg
 
 	// staking pool state ─────────────────────────────────────────────────────
 	// stakingPoolInit is the initial pool size in nAPRO (0 = pool disabled).
@@ -296,7 +325,14 @@ const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
 	if cfg.LPoDMigration != nil {
 		m := *cfg.LPoDMigration
-		m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), cfg.Validators...)
+		if m.Version == 1 {
+			// Preserve the legacy v1 trust behavior exactly.
+			m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), cfg.Validators...)
+		} else if m.Version == 2 || m.Version == 3 {
+			// Trusted checkpoint authority is configured separately from consensus.
+			// Never replace it with the effective consensus validator set.
+			m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), m.TrustedValidators...)
+		}
 		cfg.LPoDMigration = &m
 		if cfg.Registry != nil && m.PositionLifecycleVersion == 1 {
 			if err := cfg.Registry.ConfigureStakeWithdrawalV2(m.Genesis, m.Height); err != nil {
@@ -316,6 +352,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		votes:             make(map[crypto.Hash32]map[string][]byte),
 		finalized:         make(map[uint64]bool),
 		pendingVoteHeight: make(map[crypto.Hash32]uint64),
+		futureVotes:       make(map[futureVoteKey]FinalizeMsg),
 		slashing:          newSlashingDetector(),
 		baseFee:           core.InitialBaseFeePerByte,
 		newBlockCh:        make(chan *core.Block, 600),
@@ -326,14 +363,23 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		store:             cfg.Store,
 		adminMintStore:    adminMintStore,
 	}
-	// Seed the registry with genesis validators so they start Active.
-	if cfg.Registry != nil && len(cfg.Validators) > 0 {
+	// Seed only a fresh registry. A restored snapshot is authoritative: adding
+	// missing static fallback keys after restore would invent active validators
+	// (notably the placeholder genesis key on a non-validator node) and turn
+	// an authentic historical quorum certificate into an apparent shortfall.
+	if cfg.Registry != nil && len(cfg.Validators) > 0 &&
+		len(cfg.Registry.TakeSnapshot().Validators) == 0 {
 		genesisStake := core.MinStakeNAPR * 10 // genesis validators credited 10× min
 		cfg.Registry.InitFromGenesis(cfg.Validators, genesisStake)
 	}
 	if err := e.restoreFinalityCertificate(); err != nil {
 		e.halted.Store(true)
 		log.Warn("finality certificate not restored; finality remains fail-closed", "err", err)
+	}
+	if err := e.restoreLocalFinalityVote(); err != nil {
+		e.halted.Store(true)
+		log.Warn("local finality vote lacks canonical durable ancestry; consensus halted",
+			"err", err)
 	}
 	// ── Staking pool initialisation ──────────────────────────────────────────
 	if cfg.StakingPoolNAPR > 0 {
@@ -419,10 +465,17 @@ func (e *Engine) RewardMode() string {
 }
 
 // CurrentBlockRewardNAPR returns the base reward for the next block.
-// Reward authorization changes how the reward is authenticated, not its
-// economics: the amount remains the pool draw or tail emission.
+// The authorized reward is a protocol amount, independent of the legacy
+// staking-pool and tail-emission configuration.
 func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 	height := e.chain.Height() + 1
+	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 &&
+		height >= activation && !e.lpodActive(height) {
+		if e.usesHistoricalMainnetReward(height) {
+			return DefaultPoolBlockRewardNAPR
+		}
+		return blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
+	}
 	return e.blockRewardNAPRAt(height)
 }
 
@@ -464,6 +517,9 @@ func (e *Engine) DecrementPool(height uint64) {
 	}
 	if e.stakingPoolInit == 0 {
 		return // pool disabled
+	}
+	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 && height >= activation {
+		return // legacy local pool accounting is not consensus state in the authorization era
 	}
 	baseReward := e.cfg.BlockRewardNAPR
 	if baseReward == 0 {
@@ -521,7 +577,9 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 func (e *Engine) activeValidators() []crypto.ValidatorPubKey {
 	if e.cfg.Registry != nil {
 		vs := e.cfg.Registry.GetActiveValidators()
-		if len(vs) > 0 {
+		// An existing registry with no active members is not an invitation
+		// to re-authorize static fallback keys (including exited validators).
+		if len(vs) > 0 || len(e.cfg.Registry.TakeSnapshot().Validators) > 0 {
 			return vs
 		}
 	}
@@ -564,6 +622,7 @@ func (e *Engine) Run(stop <-chan struct{}) {
 		"validators", len(e.cfg.Validators),
 		"block_time", e.cfg.BlockTime,
 		"bft_threshold", e.cfg.BFTThreshold,
+		"stop_producing_at_height", e.cfg.StopProducingAtHeight,
 	)
 
 	for {
@@ -592,6 +651,9 @@ func (e *Engine) Run(stop <-chan struct{}) {
 
 // tick is called once per block slot.
 func (e *Engine) tick() error {
+	e.productionMu.Lock()
+	defer e.productionMu.Unlock()
+
 	if e.halted.Load() {
 		return fmt.Errorf("consensus engine halted after persistent rollback failure")
 	}
@@ -602,6 +664,15 @@ func (e *Engine) tick() error {
 
 	nextHeight := tip.Header.Height + 1
 	nextRound := tip.Header.Round + 1
+	if e.cfg.StopProducingAtHeight > 0 && nextHeight >= e.cfg.StopProducingAtHeight {
+		if !e.barrierLogged {
+			e.log.Warn("block production paused by configured height barrier",
+				"next_height", nextHeight,
+				"stop_producing_at_height", e.cfg.StopProducingAtHeight)
+			e.barrierLogged = true
+		}
+		return nil
+	}
 
 	// Check if it's our turn to propose
 	proposer := e.proposerAt(nextRound)
@@ -775,6 +846,9 @@ func (e *Engine) tick() error {
 	if e.cfg.OnBlockAccepted != nil {
 		e.cfg.OnBlockAccepted(block)
 	}
+	// Votes may race a locally proposed block just as they may race a peer
+	// block. Replay only after the local canonical durability boundary.
+	e.replayFutureVotes(block)
 
 	// The proposal identity was durably prepared before AddBlock.  Run block
 	// persistence callbacks before publishing the completed mint outcome so a
@@ -801,10 +875,45 @@ func (e *Engine) tick() error {
 // explicit block reward nor staking-pool economics are configured.
 const DefaultBlockRewardNAPR uint64 = 500_000_000
 
-// AuthorizedBlockRewardNAPR is retained for compatibility with external code.
-// Authorization authenticates the active pool/tail amount; it does not define
-// a separate emission schedule.
-const AuthorizedBlockRewardNAPR uint64 = DefaultPoolBlockRewardNAPR
+// AuthorizedBlockRewardNAPR preserves the observed 0.1 APRO legacy era so
+// already-signed blocks remain verifiable. It is not the approved forward
+// staking-pool reward: LPoD activation switches to the configured 3 APRO
+// pool reward (and later the 1 APRO tail reward).
+// Historical authorized mainnet blocks before the cutover paid 3 APRO
+// without tips; transaction tips were added only under the later policy.
+const AuthorizedBlockRewardNAPR uint64 = 10_000_000
+
+// The accepted mainnet reward history did not switch from the pool-phase
+// 3 APRO amount to 0.1 APRO at reward-authorization activation. These fixed
+// boundaries are bound to the canonical genesis so they cannot change
+// consensus on another network using similar heights.
+const (
+	mainnetRewardAuthorizationHeight uint64 = 1_750_000
+	mainnetRewardCutoverHeight       uint64 = 2_394_572
+)
+
+var mainnetRewardGenesisHash = crypto.Hash32{
+	0xc8, 0xfd, 0xe8, 0x6c, 0x17, 0x64, 0xa5, 0x60,
+	0x3e, 0xab, 0xd6, 0xd9, 0xc5, 0x6c, 0x9e, 0x47,
+	0xb4, 0xcf, 0x06, 0xd8, 0x8d, 0x29, 0x9a, 0x55,
+	0x66, 0x56, 0x94, 0x47, 0x3e, 0x2c, 0x51, 0x2f,
+}
+
+func historicalMainnetReward(genesisHash crypto.Hash32, activation, height uint64) bool {
+	return genesisHash == mainnetRewardGenesisHash &&
+		activation == mainnetRewardAuthorizationHeight &&
+		height >= mainnetRewardAuthorizationHeight && height < mainnetRewardCutoverHeight
+}
+
+func (e *Engine) usesHistoricalMainnetReward(height uint64) bool {
+	if e.cfg.RewardAuthorizationActivationHeight != mainnetRewardAuthorizationHeight ||
+		height < mainnetRewardAuthorizationHeight || height >= mainnetRewardCutoverHeight {
+		return false
+	}
+	genesis := e.chain.Genesis()
+	return genesis != nil &&
+		historicalMainnetReward(genesis.Hash(), e.cfg.RewardAuthorizationActivationHeight, height)
+}
 
 // HalvingIntervalBlocks is the number of blocks between each block-reward
 // halving event. At a 3-second target interval, 21,024,000 blocks is about
@@ -858,13 +967,18 @@ func nextBaseFee(current uint64, blockSizeBytes int) uint64 {
 	return uint64(next)
 }
 
-// blockFeeStats computes the total nAPRO destroyed by a block's transactions.
-// Only the protocol base fee is burned.  A transaction that carries the signed
-// intentional-burn marker adds its public marker amount to that destroyed
-// total.  The marker amount is already included in tx.Fee for commitment
-// balance purposes, so it must be separated from (rather than added to) the
-// fee before calculating the validator priority tip.
+// blockFeeStats computes historical fee economics: only the protocol base fee
+// and signed intentional burns are destroyed. Keep this wrapper for callers
+// that need the pre-AVM-gas-burn policy.
 func blockFeeStats(txs []core.Transaction, baseFee uint64) (burned, tipTotal uint64) {
+	return blockFeeStatsWithAVMGasBurn(txs, baseFee, false)
+}
+
+// blockFeeStatsWithAVMGasBurn classifies mandatory AVM gas as burned only when
+// the coordinated AVMGasBurnActivationHeight rule is active. The required gas
+// fee is already part of tx.Fee and the balance commitment; it must be
+// subtracted from the priority-tip basis as well as included in the burn total.
+func blockFeeStatsWithAVMGasBurn(txs []core.Transaction, baseFee uint64, burnAVMGas bool) (burned, tipTotal uint64) {
 	for _, tx := range txs {
 		if tx.IsCoinbase() || tx.IsStake() {
 			continue
@@ -885,6 +999,16 @@ func blockFeeStats(txs []core.Transaction, baseFee uint64) (burned, tipTotal uin
 			burnForTx += intentionalBurn
 			requiredFee += intentionalBurn
 		}
+		if burnAVMGas && tx.IsAVM() {
+			gasFee, err := core.AVMGasFee(tx.AVM.GasLimit)
+			if err != nil ||
+				burnForTx > ^uint64(0)-gasFee ||
+				requiredFee > ^uint64(0)-gasFee {
+				return ^uint64(0), 0
+			}
+			burnForTx += gasFee
+			requiredFee += gasFee
+		}
 		if tx.Fee > requiredFee {
 			tipTotal += tx.Fee - requiredFee
 		}
@@ -896,11 +1020,33 @@ func blockFeeStats(txs []core.Transaction, baseFee uint64) (burned, tipTotal uin
 	return
 }
 
+// blockFeeStatsAtHeight is the common producer, validator, and accounting
+// policy selector. A zero activation keeps the deployed historical economics.
+func (e *Engine) blockFeeStatsAtHeight(txs []core.Transaction, baseFee, height uint64) (burned, tips uint64) {
+	burnAVMGas := e.cfg.AVMGasBurnActivationHeight > 0 &&
+		height >= e.cfg.AVMGasBurnActivationHeight
+	return blockFeeStatsWithAVMGasBurn(txs, baseFee, burnAVMGas)
+}
+
 // expectedAuthorizedRewardAmount is the exact amount an activated on-chain
 // reward authorization must mint. It uses only immutable protocol constants and
 // block data, so every validator derives the same value across restarts.
 func (e *Engine) expectedAuthorizedRewardAmount(block *core.Block) (uint64, error) {
-	return e.blockRewardNAPRAt(block.Header.Height), nil
+	return e.authorizedRewardAmount(block.Header.Height, block.Txs)
+}
+
+// authorizedRewardAmount is shared by block production and incoming-block
+// validation so both sides apply height-activated fee accounting identically.
+func (e *Engine) authorizedRewardAmount(height uint64, txs []core.Transaction) (uint64, error) {
+	if e.usesHistoricalMainnetReward(height) {
+		return DefaultPoolBlockRewardNAPR, nil // legacy 3 APRO excluded all fees, including AVM gas
+	}
+	base := blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
+	_, tips := e.blockFeeStatsAtHeight(txs, e.expectedBaseFeeAt(height), height)
+	if base > ^uint64(0)-tips {
+		return 0, fmt.Errorf("authorized block reward plus tips overflows uint64")
+	}
+	return base + tips, nil
 }
 
 // oraclePriceScale is the fixed-point scale factor for the OraclePrice field.
@@ -1549,28 +1695,18 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		txs = screened
 	}
 
-	// EIP-1559–style 100% base-fee burn: fees are NOT forwarded to the
-	// validator — they are destroyed upon block finalization by never
-	// appearing in any output.  Validators earn only the explicit coinbase
-	// mint reward below.  Log the burned amount for observability.
-	var burnedNAPR uint64
-	for _, tx := range txs {
-		if !tx.IsCoinbase() && !tx.IsStake() {
-			burnedNAPR += tx.Fee
-		}
-	}
+	// Burn only the protocol base fee, signed intentional burns, and AVM gas
+	// after its activation. The remaining fee is a validator priority tip.
+	currentBaseFee := e.expectedBaseFeeAt(height)
+	burnedNAPR, _ := e.blockFeeStatsAtHeight(txs, currentBaseFee, height)
 	if burnedNAPR > 0 {
-		e.log.Info("base fee burned (100%)",
+		e.log.Info("protocol fees burned",
 			"height", height,
 			"burned_napro", burnedNAPR,
 			"burned_apro", float64(burnedNAPR)/1e8,
 			"tx_count", len(txs),
 		)
 	}
-
-	// Every transaction fee is burned in full. Validator compensation comes
-	// only from the pool reward or tail emission.
-	currentBaseFee := e.expectedBaseFeeAt(height)
 
 	// Prepend queued admin mints, built at THIS block's height so every mint
 	// gets a unique one-time pub (spend_pub + height*G) and therefore a
@@ -1615,11 +1751,14 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 			return nil, fmt.Errorf("reward_address is required from reward authorization activation height %d",
 				rewardActivation)
 		}
-		rewardNAPR := e.blockRewardNAPRAt(height)
-		if rewardNAPR > 0 {
+		totalReward, err := e.authorizedRewardAmount(height, txs)
+		if err != nil {
+			return nil, err
+		}
+		if totalReward > 0 {
 			mintTx, err := core.BuildAuthorizedRewardTx(
 				crypto.Address(e.cfg.RewardAddress),
-				rewardNAPR,
+				totalReward,
 				height,
 				parent.Hash(),
 				e.cfg.MyKey.PrivKey(),
@@ -1952,7 +2091,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	if blockBaseFee == 0 {
 		blockBaseFee = e.expectedBaseFee()
 	}
-	burnedNAPR, _ := blockFeeStats(block.Txs, blockBaseFee)
+	burnedNAPR, _ := e.blockFeeStatsAtHeight(block.Txs, blockBaseFee, block.Header.Height)
 	newFee := nextBaseFee(blockBaseFee, block.Size())
 
 	e.mu.Lock()
@@ -2009,6 +2148,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	if e.cfg.MyKey != nil {
 		_ = e.castVote(block)
 	}
+	e.replayFutureVotes(block)
 
 	return nil
 }
@@ -2132,17 +2272,30 @@ func (e *Engine) castVote(block *core.Block) error {
 		Signature:    sig,
 	}
 	// Process our own vote immediately
-	return e.handleVote(vote)
+	if err := e.handleVote(vote); err != nil {
+		return err
+	}
+	if e.cfg.Store != nil {
+		if err := e.cfg.Store.SaveLocalFinalityVote(store.LocalFinalityVote{
+			Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
+			Validator: vote.ValidatorPub, Signature: append([]byte(nil), vote.Signature...),
+		}); err != nil {
+			e.halted.Store(true)
+			return fmt.Errorf("finality: persist local vote: %w", err)
+		}
+	}
+	e.mu.Lock()
+	copyVote := cloneFinalizeMsg(vote)
+	e.latestLocalVote = &copyVote
+	e.mu.Unlock()
+	if e.cfg.OnVoteCast != nil {
+		e.cfg.OnVoteCast(cloneFinalizeMsg(vote))
+	}
+	return nil
 }
 
 // handleVote processes a finalization vote from any validator.
 func (e *Engine) handleVote(vote FinalizeMsg) error {
-	// Height is not authenticated by legacy v1 signatures. Resolve the signed
-	// hash to the canonical block BEFORE recording a vote or pruning any state.
-	block := e.chain.GetByHeight(vote.Height)
-	if block == nil || block.Header.Height != vote.Height || block.Hash() != vote.BlockHash {
-		return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
-	}
 	if !e.isKnownValidator(vote.ValidatorPub) {
 		return fmt.Errorf("vote from unknown validator %s", vote.ValidatorPub.ID())
 	}
@@ -2151,6 +2304,38 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 	msg := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
 	if !vote.ValidatorPub.Verify(msg, vote.Signature) {
 		return fmt.Errorf("invalid vote signature from %s", vote.ValidatorPub.ID())
+	}
+
+	// A vote may race its block over P2P. Authenticate it before bounded staging;
+	// never infer finality until the exact block is accepted canonically.
+	block := e.chain.GetByHeight(vote.Height)
+	if block == nil {
+		tip := e.chain.Tip()
+		if tip == nil || vote.Height <= tip.Header.Height ||
+			tip.Header.Height > math.MaxUint64-futureVoteWindow ||
+			vote.Height > tip.Header.Height+futureVoteWindow {
+			return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+		}
+		// Legacy v1 vote messages do not bind height into the signature. Do not
+		// let a valid signature for an already-known block be rebound to a future
+		// height and staged as though it could identify a different block.
+		if e.chain.GetByHash(vote.BlockHash) != nil {
+			return fmt.Errorf("finality vote rebinds a known block hash to another height")
+		}
+		key := futureVoteKey{height: vote.Height, hash: vote.BlockHash, pub: vote.ValidatorPub.Hex()}
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if _, exists := e.futureVotes[key]; exists {
+			return fmt.Errorf("duplicate staged finality vote")
+		}
+		if len(e.futureVotes) >= futureVoteLimit {
+			return fmt.Errorf("future finality vote queue is full")
+		}
+		e.futureVotes[key] = cloneFinalizeMsg(vote)
+		return nil
+	}
+	if block.Header.Height != vote.Height || block.Hash() != vote.BlockHash {
+		return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
 	}
 
 	e.mu.Lock()
@@ -2165,7 +2350,11 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 		// Record the height for this block hash so we can prune by height.
 		e.pendingVoteHeight[vote.BlockHash] = vote.Height
 	}
-	e.votes[vote.BlockHash][vote.ValidatorPub.Hex()] = vote.Signature
+	validatorID := vote.ValidatorPub.Hex()
+	if _, exists := e.votes[vote.BlockHash][validatorID]; exists {
+		return nil
+	}
+	e.votes[vote.BlockHash][validatorID] = append([]byte(nil), vote.Signature...)
 
 	// Check if we've reached BFT threshold (2/3 of active validators)
 	needed := int(float64(len(e.activeValidators()))*e.cfg.BFTThreshold) + 1
@@ -2237,12 +2426,48 @@ func (e *Engine) restoreFinalityCertificate() error {
 		return err
 	}
 	tip := e.chain.Tip()
-	if tip == nil || tip.Header.Height != certificate.Height || tip.Hash() != certificate.BlockHash {
-		return fmt.Errorf("finality: only a certificate for the exact canonical tip can be restored")
+	if tip == nil || certificate.Height > tip.Header.Height {
+		return fmt.Errorf("finality: certificate is above the canonical tip")
 	}
-	block := e.chain.GetByHeight(certificate.Height)
-	if block == nil || block.Hash() != certificate.BlockHash || block.Header.Height != certificate.Height {
-		return fmt.Errorf("finality: certificate is not bound to the canonical chain")
+	if certificate.Height == tip.Header.Height {
+		if tip.Hash() != certificate.BlockHash {
+			return fmt.Errorf("finality: certificate does not match the canonical tip")
+		}
+	} else {
+		// A quorum certificate can legitimately lag behind the tip: blocks
+		// continue to be produced while votes are still being collected.
+		// The in-memory chain retains only recent blocks, so verify the
+		// historical binding against the strict durable height index and
+		// the serialized block body instead of treating a missing in-memory
+		// block as evidence of a fork.
+		storedTipHash, storedTipHeight, err := e.cfg.Store.GetTip()
+		if err != nil {
+			return fmt.Errorf("finality: read stored tip: %w", err)
+		}
+		if storedTipHeight != tip.Header.Height || storedTipHash != tip.Hash() {
+			return fmt.Errorf("finality: stored tip does not match the canonical chain")
+		}
+		indexedHash, found, err := e.cfg.Store.GetCanonicalHash(certificate.Height)
+		if err != nil {
+			return fmt.Errorf("finality: read canonical height index: %w", err)
+		}
+		if !found || indexedHash != certificate.BlockHash {
+			return fmt.Errorf("finality: certificate does not match the canonical height index")
+		}
+		raw, err := e.cfg.Store.GetRawBlock(certificate.BlockHash)
+		if err != nil {
+			return fmt.Errorf("finality: read certified canonical block body: %w", err)
+		}
+		if raw == nil {
+			return fmt.Errorf("finality: certified canonical block body unavailable")
+		}
+		var block core.Block
+		if err := json.Unmarshal(raw, &block); err != nil {
+			return fmt.Errorf("finality: decode certified canonical block: %w", err)
+		}
+		if block.Header.Height != certificate.Height || block.Hash() != certificate.BlockHash {
+			return fmt.Errorf("finality: certified block body does not match the canonical height index")
+		}
 	}
 	active := e.activeValidators()
 	committee := make(map[string]bool, len(active))
@@ -2270,6 +2495,138 @@ func (e *Engine) restoreFinalityCertificate() error {
 	}
 	e.lpodFinalizedHashes[certificate.Height] = certificate.BlockHash
 	return nil
+}
+
+func cloneFinalizeMsg(vote FinalizeMsg) FinalizeMsg {
+	vote.Signature = append([]byte(nil), vote.Signature...)
+	return vote
+}
+
+func (e *Engine) replayFutureVotes(block *core.Block) {
+	if block == nil {
+		return
+	}
+	var replay []FinalizeMsg
+	e.mu.Lock()
+	for key, vote := range e.futureVotes {
+		switch {
+		case key.height < block.Header.Height:
+			delete(e.futureVotes, key)
+		case key.height == block.Header.Height:
+			delete(e.futureVotes, key)
+			if key.hash == block.Hash() {
+				replay = append(replay, vote)
+			}
+		}
+	}
+	e.mu.Unlock()
+	for _, vote := range replay {
+		if err := e.handleVote(vote); err != nil {
+			e.log.Warn("staged finality vote rejected after canonical block arrival",
+				"height", vote.Height, "err", err)
+		}
+	}
+}
+
+func (e *Engine) restoreLocalFinalityVote() error {
+	if e.cfg.Store == nil {
+		return nil
+	}
+	vote, err := e.cfg.Store.LoadLocalFinalityVote()
+	if err != nil || vote == nil {
+		return err
+	}
+	if !e.isKnownValidator(vote.Validator) {
+		return fmt.Errorf("local vote signer is not a current validator")
+	}
+	message := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
+	if !vote.Validator.Verify(message, vote.Signature) {
+		return fmt.Errorf("local vote signature is invalid")
+	}
+	if err := e.verifyLocalVoteAncestry(vote.Height, vote.BlockHash); err != nil {
+		return err
+	}
+	restored := FinalizeMsg{
+		Height: vote.Height, BlockHash: vote.BlockHash,
+		ValidatorPub: vote.Validator, Signature: append([]byte(nil), vote.Signature...),
+	}
+	e.mu.Lock()
+	e.latestLocalVote = &restored
+	e.mu.Unlock()
+	return nil
+}
+
+// verifyLocalVoteAncestry uses the durable tip and block bodies, not a single
+// height-index lookup, to prove that the voted block is an ancestor of the
+// current durable tip. Height indexes can remain stale after a tip rollback.
+func (e *Engine) verifyLocalVoteAncestry(voteHeight uint64, voteHash crypto.Hash32) error {
+	if e.cfg.Store == nil {
+		return fmt.Errorf("local vote cannot be verified without durable storage")
+	}
+	tipHash, tipHeight, err := e.cfg.Store.GetTip()
+	if err != nil {
+		return fmt.Errorf("read durable tip for local vote: %w", err)
+	}
+	if tipHash == (crypto.Hash32{}) || tipHeight < voteHeight {
+		return fmt.Errorf("local vote is above the durable tip")
+	}
+	memoryTip := e.chain.Tip()
+	if memoryTip == nil || memoryTip.Header.Height != tipHeight || memoryTip.Hash() != tipHash {
+		return fmt.Errorf("durable tip does not match the in-memory canonical tip")
+	}
+
+	hash := tipHash
+	for height := tipHeight; ; height-- {
+		indexedHash, found, err := e.cfg.Store.GetCanonicalHash(height)
+		if err != nil {
+			return fmt.Errorf("read canonical height index %d for local vote ancestry: %w", height, err)
+		}
+		if !found || indexedHash != hash {
+			return fmt.Errorf("canonical height index %d conflicts with durable tip ancestry", height)
+		}
+		raw, err := e.cfg.Store.GetRawBlock(hash)
+		if err != nil {
+			return fmt.Errorf("read block %x in local vote ancestry: %w", hash[:8], err)
+		}
+		if raw == nil {
+			return fmt.Errorf("block %x in local vote ancestry is unavailable", hash[:8])
+		}
+		var block core.Block
+		if err := json.Unmarshal(raw, &block); err != nil {
+			return fmt.Errorf("decode block %x in local vote ancestry: %w", hash[:8], err)
+		}
+		if block.Header.Height != height || block.Hash() != hash {
+			return fmt.Errorf("block body at height %d conflicts with durable tip ancestry", height)
+		}
+		if height == voteHeight {
+			if hash != voteHash {
+				return fmt.Errorf("local vote block is not an ancestor of the durable tip")
+			}
+			return nil
+		}
+		if height == 0 {
+			return fmt.Errorf("local vote height is below durable genesis")
+		}
+		hash = block.Header.PrevHash
+	}
+}
+
+// LatestLocalVote returns the latest durable vote produced by this node, if
+// it still identifies a block in the canonical chain.
+func (e *Engine) LatestLocalVote() (FinalizeMsg, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.latestLocalVote == nil {
+		return FinalizeMsg{}, false
+	}
+	if err := e.verifyLocalVoteAncestry(e.latestLocalVote.Height, e.latestLocalVote.BlockHash); err != nil {
+		// A previously signed vote that is no longer on the durable chain is a
+		// signing-safety violation. Stop consensus until a safe restart/recovery;
+		// never rebroadcast it or sign over the same height on another fork.
+		e.halted.Store(true)
+		return FinalizeMsg{}, false
+	}
+	return cloneFinalizeMsg(*e.latestLocalVote), true
 }
 
 // proposerAt returns the validator that should propose at round r (round-robin).

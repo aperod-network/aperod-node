@@ -91,6 +91,9 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 
 func TestLPoDProducerCommitsRealAllocationAndSplit(t *testing.T) {
 	e, db, _, _ := lpodConsensusFixture(t)
+	if got := e.CurrentBlockRewardNAPR(); got != 3*lpod.Unit {
+		t.Fatalf("LPoD activation must restore the 3 APRO pool reward, got %d nAPRO", got)
+	}
 	if err := e.tick(); err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +119,42 @@ func TestLPoDProducerCommitsRealAllocationAndSplit(t *testing.T) {
 	if err := e.tick(); err != nil {
 		t.Fatal(err)
 	}
+	if got := e.CurrentBlockRewardNAPR(); got != 3*lpod.Unit {
+		t.Fatalf("legacy 0.1 APRO reward leaked into active LPoD, got %d nAPRO", got)
+	}
 	c, err = db.LoadLPoDCheckpoint()
 	if err != nil || c.State.FundingDebit != lpod.InitialNAPRO || c.State.RewardInflow != 6*lpod.Unit {
 		t.Fatal("duplicate allocation or lost income")
+	}
+}
+
+func TestNewEnginePreservesV2TrustAnchorAndConsensusValidatorSet(t *testing.T) {
+	e, _, _, _ := lpodConsensusFixture(t)
+	consensusValidator := append([]crypto.ValidatorPubKey(nil), e.cfg.Validators...)
+	_, checkpointAuthority, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := *e.cfg.LPoDMigration
+	m.Version = 2
+	m.Height = store.LPoDV2ActivationHeight
+	m.ParentHash = crypto.HashBytes([]byte("parent"))
+	m.SnapshotRoot = crypto.HashBytes([]byte("snapshot"))
+	m.TrustAssumption = store.LPoDV2TrustAssumption
+	m.HistoricalIssued = 1_000_000_000 * lpod.Unit
+	m.HistoricalSaleRemain = 3_000_000_000 * lpod.Unit
+	m.TrustedValidators = []crypto.ValidatorPubKey{checkpointAuthority}
+	m.ReconciliationRoot = m.Root()
+	config := e.cfg
+	config.LPoDMigration = &m
+	rebuilt := NewEngine(config, e.chain, e.pool, e.log)
+	if len(rebuilt.cfg.LPoDMigration.TrustedValidators) != 1 ||
+		!rebuilt.cfg.LPoDMigration.TrustedValidators[0].Equals(checkpointAuthority) {
+		t.Fatal("engine replaced the explicit v2 checkpoint trust anchor")
+	}
+	if len(rebuilt.cfg.Validators) != len(consensusValidator) ||
+		!rebuilt.cfg.Validators[0].Equals(consensusValidator[0]) {
+		t.Fatal("v2 checkpoint trust anchor changed the consensus validator list")
 	}
 }
 

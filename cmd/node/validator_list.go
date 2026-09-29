@@ -7,6 +7,7 @@ package main
 // of the full node startup sequence.
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 
@@ -43,6 +44,12 @@ func buildValidatorList(
 			pub, err := crypto.ValidatorPubKeyFromBytes(pubBytes)
 			if err != nil {
 				return nil, fmt.Errorf("invalid genesis validator key %q: %w", hexPub, err)
+			}
+			// The bundled testnet genesis file uses an all-zero placeholder.
+			// It cannot sign blocks or votes and must never become an active
+			// validator on a relay restoring a real network snapshot.
+			if bytes.Equal(pub, make([]byte, len(pub))) {
+				continue
 			}
 			validators = append(validators, pub)
 		}

@@ -33,16 +33,16 @@ type SnapshotConfig struct {
 	UTXOCountTolerancePct float64 `yaml:"utxo_count_tolerance_pct"`
 
 	// PeriodicSnapshotInterval is the number of blocks between periodic
-	// in-process UTXO snapshots.  Taking a snapshot creates a full deep copy
-	// of the UTXO set and briefly doubles node RSS; on production nodes with a
-	// 4-5 GB UTXO set this can push memory past the GOMEMLIMIT ceiling.  A
-	// higher value reduces the frequency of those spikes.
+	// in-process UTXO snapshots. Taking one deep-copies the UTXO set and
+	// serializes it while blocks continue, which can exceed GOMEMLIMIT and
+	// trigger a second snapshot during shutdown. Enable only after sizing
+	// the node for the peak memory of both operations.
 	//
 	// The shutdown snapshot (taken on clean exit) is unaffected by this
 	// setting; it remains the primary crash-recovery mechanism.
 	//
-	// Default: 10000.  Set to 0 to disable periodic snapshots entirely
-	// (shutdown snapshot only).
+	// Default: 0 (shutdown snapshot only). Set a positive interval only
+	// when there is sufficient memory for the full periodic snapshot.
 	PeriodicSnapshotInterval uint64 `yaml:"periodic_snapshot_interval"`
 
 	// ScanCheckpointInterval is the number of blocks between intermediate
@@ -321,6 +321,10 @@ type ConsensusConfig struct {
 	BlockTime          time.Duration `yaml:"block_time"`
 	OracleURL          string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
 	OracleMaxDeviation float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
+	// StopProducingAtHeight is an operator safety barrier: this validator will
+	// not propose blocks at or above this height. Zero disables the barrier.
+	// Relay/non-validator nodes should leave this unset.
+	StopProducingAtHeight uint64 `yaml:"stop_producing_at_height"`
 	// NonValidator, when true, disables block production on this node. The node
 	// still validates and relays all blocks, maintains a full chain copy, and
 	// participates in P2P gossip — it simply never proposes or signs blocks.
@@ -355,6 +359,11 @@ type ConsensusConfig struct {
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
 	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
+	// AVMGasBurnActivationHeight is the first block that burns the mandatory
+	// AVM gas fee instead of paying it as a validator tip. Zero disables the
+	// new rule and preserves historical block reward accounting. This is
+	// consensus-critical: coordinate the same future height on every validator.
+	AVMGasBurnActivationHeight uint64 `yaml:"avm_gas_burn_activation_height"`
 	// GuardianFundActivationHeight activates the one-off locked 1B APRO
 	// nominal-supply materialization. Zero disables it.
 	GuardianFundActivationHeight uint64 `yaml:"guardian_fund_activation_height"`
@@ -365,6 +374,14 @@ type ConsensusConfig struct {
 	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
 	// Empty disables the fork. Merely setting a target amount never funds the pool.
 	LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// LPoDV2TrustAuthorities is the explicit version-2 checkpoint trust anchor.
+	// Values are exact 32-byte Ed25519 public-key hex strings; empty disables v2.
+	// It is independent of genesis validators and never changes the consensus
+	// validator list. Private signing keys must not be placed in node config.
+	LPoDV2TrustAuthorities []string `yaml:"lpod_v2_trust_authorities"`
+	// LPoDV3TrustAuthorities explicitly authorize the trust-attested nominal
+	// reclassification. They do not change the consensus validator set.
+	LPoDV3TrustAuthorities []string `yaml:"lpod_v3_trust_authorities"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -435,7 +452,7 @@ func DefaultConfig() *Config {
 		},
 		Snapshot: SnapshotConfig{
 			UTXOCountTolerancePct:    1.0,
-			PeriodicSnapshotInterval: 500,
+			PeriodicSnapshotInterval: 0,
 			ScanCheckpointInterval:   50_000,
 		},
 		Pprof: PprofConfig{
@@ -598,6 +615,13 @@ func (c *Config) Validate() error {
 	if c.Consensus.BlockTime <= 0 {
 		return fmt.Errorf("block_time must be positive")
 	}
+	if c.Consensus.StopProducingAtHeight > uint64(1<<63-1) {
+		return fmt.Errorf("stop_producing_at_height (%d) exceeds the supported maximum (%d)",
+			c.Consensus.StopProducingAtHeight, uint64(1<<63-1))
+	}
+	if c.Consensus.StopProducingAtHeight > 0 && c.Consensus.NonValidator {
+		return fmt.Errorf("stop_producing_at_height is only valid for validator nodes")
+	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
@@ -614,6 +638,27 @@ func (c *Config) Validate() error {
 		)
 	}
 	avmActivation := c.Consensus.AVMActivationHeight
+	avmGasBurnActivation := c.Consensus.AVMGasBurnActivationHeight
+	if avmGasBurnActivation > 0 {
+		if avmActivation == 0 {
+			return fmt.Errorf("avm_gas_burn_activation_height requires avm_activation_height")
+		}
+		if avmGasBurnActivation <= avmActivation {
+			return fmt.Errorf(
+				"avm_gas_burn_activation_height (%d) must be strictly greater than avm_activation_height (%d)",
+				avmGasBurnActivation, avmActivation,
+			)
+		}
+		if rewardActivation == 0 {
+			return fmt.Errorf("avm_gas_burn_activation_height requires reward_authorization_activation_height")
+		}
+		if avmGasBurnActivation < rewardActivation {
+			return fmt.Errorf(
+				"avm_gas_burn_activation_height (%d) must be >= reward_authorization_activation_height (%d)",
+				avmGasBurnActivation, rewardActivation,
+			)
+		}
+	}
 	guardianActivation := c.Consensus.GuardianFundActivationHeight
 	guardianAnchor := c.Consensus.GuardianFundChainAnchor
 	if (guardianActivation == 0) != (guardianAnchor == "") {

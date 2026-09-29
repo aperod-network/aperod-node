@@ -26,12 +26,17 @@ func (s *Server) restLPoDPool(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]interface{}{
 		"version": 1, "protocol_version": 1, "state": "disabled",
-		"accounting_basis":              "canonical_protocol_ledger",
-		"initial_napro":                 strconv.FormatUint(lpod.InitialNAPRO, 10),
-		"guardian_membership_supported": true,
-		"immediate_exit_supported":      true,
-		"partial_exit_supported":        true,
-		"additional_deposits_supported": true,
+		"accounting_basis":                 "canonical_protocol_ledger",
+		"initial_napro":                    strconv.FormatUint(lpod.InitialNAPRO, 10),
+		"guardian_membership_supported":    true,
+		"immediate_exit_supported":         true,
+		"partial_exit_supported":           true,
+		"additional_deposits_supported":    true,
+		"migration_version":                nil,
+		"funding_basis":                    nil,
+		"eligible_nominal_napro":           nil,
+		"nominal_circulating_before_napro": nil,
+		"historical_issuance_proven":       nil,
 	}
 	for _, k := range []string{"balance_napro", "reward_inflow_napro", "leader_paid_napro", "angel_paid_napro",
 		"surplus_inflow_napro", "deficit_outflow_napro", "unfunded_liability_napro", "funding_debit_napro",
@@ -79,6 +84,17 @@ func (s *Server) restLPoDPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out["state"] = "active"
+	out["migration_version"] = a.Version
+	out["historical_issuance_proven"] = a.Version == 1
+	if a.Version == 3 && a.NominalSnapshot != nil {
+		out["funding_basis"] = "trusted_nominal_reclassification"
+		out["eligible_nominal_napro"] = strconv.FormatUint(a.NominalEligible, 10)
+		out["nominal_circulating_before_napro"] = strconv.FormatUint(a.NominalSnapshot.NominalCirculatingBefore, 10)
+	} else if a.Version == 2 {
+		out["funding_basis"] = "trusted_historical_checkpoint"
+	} else {
+		out["funding_basis"] = "historical_reconciliation"
+	}
 	for key, value := range map[string]uint64{
 		"balance_napro": c.State.Balance, "reward_inflow_napro": c.State.RewardInflow,
 		"leader_paid_napro": c.State.LeaderPaid, "angel_paid_napro": c.State.AngelPaid,

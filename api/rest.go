@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -71,6 +72,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
 	s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
 	s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
+	s.mux.HandleFunc("/api/v1/lpod/earnings-outputs", s.restLPoDEarningsOutputs)
 	s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
@@ -634,7 +636,16 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
 
 	// Disk fallback: the tx may be in an older block evicted from the
 	// in-memory sliding window.  Check the persisted tx-location index.
-	if diskTx, diskLoc, found, diskErr := s.getTransactionFromDisk(hash); diskErr == nil && found {
+	diskTx, diskLoc, found, diskErr := s.getTransactionFromDisk(hash)
+	if diskErr != nil {
+		if errors.Is(diskErr, errDiskTxIndexMismatch) {
+			writeJSONError(w, http.StatusInternalServerError, "transaction index inconsistent with canonical block")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, "transaction lookup failed")
+		}
+		return
+	}
+	if found {
 		bHash := diskLoc.Block.Hash()
 		writeJSON(w, http.StatusOK, TxResponse{
 			Hash:        hashStr,

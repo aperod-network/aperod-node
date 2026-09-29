@@ -17,6 +17,7 @@ package main
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
@@ -112,6 +113,21 @@ func TestBuildValidatorList_ValidatorMode_UsesOwnKey(t *testing.T) {
 	}
 	if !validators[0].Equals(nodePub) {
 		t.Errorf("validator mode: list must contain node's own key")
+	}
+}
+
+func TestBuildValidatorList_NonValidatorSkipsZeroPlaceholder(t *testing.T) {
+	_, realPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validators, err := buildValidatorList(true,
+		[]string{strings.Repeat("0", 64), hex.EncodeToString(realPub)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(validators) != 1 || !validators[0].Equals(realPub) {
+		t.Fatalf("placeholder was seeded or real key was lost: got %d validators", len(validators))
 	}
 }
 

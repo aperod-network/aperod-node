@@ -57,6 +57,14 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		if m.Root() != m.ReconciliationRoot {
 			return nil, nil, nil, fmt.Errorf("lpod: wrong reconciliation commitment")
 		}
+		if m.Version == 2 || m.Version == 3 {
+			if height == 0 {
+				return nil, nil, nil, fmt.Errorf("lpod: trusted checkpoint has no activation parent")
+			}
+			if err := e.requireLPoDParentFinalized(height-1, m.ParentHash); err != nil {
+				return nil, nil, nil, err
+			}
+		}
 		if err := e.cfg.Store.CheckLPoDConfig(m); err != nil {
 			return nil, nil, nil, err
 		}
@@ -172,6 +180,16 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 	}
 	c, payments, err := e.cfg.Store.PreviewLPoD(height, r)
 	return r, c, payments, err
+}
+
+// requireLPoDParentFinalized uses only consensus-restored/live finality state,
+// whose entries come from verified quorum certificates. A matching tip hash or
+// height alone is never evidence of finality.
+func (e *Engine) requireLPoDParentFinalized(height uint64, hash crypto.Hash32) error {
+	if !e.IsFinalizedHash(height, hash) {
+		return fmt.Errorf("lpod: trusted checkpoint requires a finalized canonical activation parent")
+	}
+	return nil
 }
 
 // Pre-screen stateful position requests without re-running O(n²) cryptographic

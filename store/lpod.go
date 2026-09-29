@@ -67,14 +67,44 @@ func (d *DB) lpodCheckpoint(hash crypto.Hash32) (*LPoDCheckpoint, error) {
 	}
 	if c.Allocation != nil {
 		a := c.Allocation
+		const publicAllocation = 9_000_000_000 * lpod.Unit
+		const validatorAllocation = 2_000_000_000 * lpod.Unit
+		if a.InitialValidatorRemaining > validatorAllocation ||
+			a.InitialValidatorRemaining > publicAllocation-lpod.InitialNAPRO {
+			return nil, fmt.Errorf("store: corrupt LPoD validator allocation bounds")
+		}
 		drawn := c.State.RewardInflow
 		if drawn > a.InitialValidatorRemaining {
 			drawn = a.InitialValidatorRemaining
 		}
-		if a.Version != 1 || a.PositionLifecycleVersion != 1 || a.InitialValidatorRemaining > 2_000_000_000*lpod.Unit ||
-			a.HistoricalIssued > 9_000_000_000*lpod.Unit-a.InitialValidatorRemaining-lpod.InitialNAPRO ||
-			a.Remaining != 9_000_000_000*lpod.Unit-a.InitialValidatorRemaining-a.HistoricalIssued-lpod.InitialNAPRO ||
+		validV1 := a.Version == 1 && a.DeclaredSaleRemaining == 0 &&
+			a.SnapshotRoot == (crypto.Hash32{}) && a.FundingParent == (crypto.Hash32{}) && a.TrustAssumption == "" &&
+			a.NominalEligible == 0 &&
+			a.NominalSnapshot == nil &&
+			a.HistoricalIssued <= publicAllocation-a.InitialValidatorRemaining-lpod.InitialNAPRO &&
+			a.Remaining == publicAllocation-a.InitialValidatorRemaining-a.HistoricalIssued-lpod.InitialNAPRO
+		validV2 := a.Version == 2 && a.DeclaredSaleRemaining >= lpod.InitialNAPRO &&
+			a.NominalEligible == 0 &&
+			a.NominalSnapshot == nil &&
+			a.HistoricalIssued <= publicAllocation-a.InitialValidatorRemaining &&
+			a.DeclaredSaleRemaining <= publicAllocation-a.InitialValidatorRemaining-a.HistoricalIssued &&
+			a.Remaining == a.DeclaredSaleRemaining-lpod.InitialNAPRO &&
+			a.SnapshotRoot != (crypto.Hash32{}) && a.FundingParent != (crypto.Hash32{}) &&
+			a.Genesis != (crypto.Hash32{}) &&
+			a.TrustAssumption == LPoDV2TrustAssumption
+		validV3 := a.Version == 3 && a.DeclaredSaleRemaining == 0 && a.HistoricalIssued == 0 &&
+			a.NominalEligible >= lpod.InitialNAPRO &&
+			a.NominalEligible <= LPoDV3NominalAllocationMaxNAPRO &&
+			a.NominalEligible <= publicAllocation-a.InitialValidatorRemaining &&
+			a.Remaining == a.NominalEligible-lpod.InitialNAPRO &&
+			a.SnapshotRoot != (crypto.Hash32{}) && a.FundingParent != (crypto.Hash32{}) &&
+			a.Genesis != (crypto.Hash32{}) &&
+			a.TrustAssumption == LPoDV3TrustAssumption &&
+			a.NominalSnapshot != nil &&
+			a.NominalSnapshot.valid(a.NominalEligible, a.InitialValidatorRemaining, a.SnapshotRoot)
+		if (!validV1 && !validV2 && !validV3) || a.PositionLifecycleVersion != 1 ||
 			a.FundingHeight == 0 || c.State.LastHeight < a.FundingHeight ||
+			c.State.FundingDebit != lpod.InitialNAPRO ||
 			a.ValidatorRemaining != a.InitialValidatorRemaining-drawn || a.TailIssued != c.State.RewardInflow-drawn {
 			return nil, fmt.Errorf("store: corrupt LPoD conserved allocation")
 		}
@@ -83,12 +113,40 @@ func (d *DB) lpodCheckpoint(hash crypto.Hash32) (*LPoDCheckpoint, error) {
 			return nil, err
 		}
 		var block core.Block
-		if json.Unmarshal(raw, &block) != nil || block.Hash() != hash || len(block.Txs) < 2 {
+		if json.Unmarshal(raw, &block) != nil || block.Hash() != hash ||
+			block.Header.Height != c.State.LastHeight || len(block.Txs) < 2 {
 			return nil, fmt.Errorf("store: funded checkpoint lacks its full committing block")
 		}
 		digest, err := block.Txs[1].LPoDCheckpointDigest()
 		if err != nil || digest != c.Digest() {
 			return nil, fmt.Errorf("store: checkpoint differs from signed block commitment")
+		}
+		if a.Version == 2 || a.Version == 3 {
+			// The funding parent belongs to the original allocation block, not
+			// every later checkpoint. Authenticate that original canonical block
+			// and its checkpoint separately; later blocks are checked against
+			// their own signed checkpoint above.
+			funding, err := d.readLPoDCanonicalBlock(a.FundingHeight)
+			if err != nil || funding.Hash() != a.FundingBlock || funding.Header.Height != a.FundingHeight ||
+				funding.Header.PrevHash != a.FundingParent || len(funding.Txs) < 2 {
+				return nil, fmt.Errorf("store: trusted checkpoint funding block is not canonical")
+			}
+			fundingCheckpoint := &c
+			if hash != a.FundingBlock {
+				fundingCheckpoint, err = d.lpodCheckpoint(a.FundingBlock)
+			}
+			if err != nil || fundingCheckpoint == nil || fundingCheckpoint.Allocation == nil ||
+				fundingCheckpoint.Allocation.Version != a.Version ||
+				fundingCheckpoint.Allocation.FundingBlock != a.FundingBlock ||
+				fundingCheckpoint.Allocation.FundingHeight != a.FundingHeight ||
+				fundingCheckpoint.Allocation.FundingParent != a.FundingParent ||
+				fundingCheckpoint.Allocation.ReconciliationRoot != a.ReconciliationRoot {
+				return nil, fmt.Errorf("store: trusted checkpoint funding record is unavailable or inconsistent")
+			}
+			fundingDigest, err := funding.Txs[1].LPoDCheckpointDigest()
+			if err != nil || fundingDigest != fundingCheckpoint.Digest() {
+				return nil, fmt.Errorf("store: trusted funding block differs from its signed allocation commitment")
+			}
 		}
 	}
 	// Validate persisted carries even when the next block has no vault income.
@@ -122,9 +180,49 @@ func (c LPoDCheckpoint) Digest() crypto.Hash32 {
 		a := *c.Allocation
 		a.FundingBlock = crypto.Hash32{}
 		c.Allocation = &a
+		if a.Version == 1 {
+			// Preserve the byte-for-byte legacy v1 checkpoint encoding. New v2
+			// allocation fields are not part of the historical v1 commitment.
+			legacy := struct {
+				State              lpod.State              `json:"state"`
+				Carries            map[string]lpod.Carry   `json:"carries"`
+				Allocation         *legacyLPoDAllocation   `json:"allocation,omitempty"`
+				Positions          map[string]LPoDPosition `json:"positions,omitempty"`
+				PrincipalDeposited uint64                  `json:"principal_deposited_napro,string"`
+				PrincipalLocked    uint64                  `json:"principal_locked_napro,string"`
+				PrincipalReturned  uint64                  `json:"principal_returned_napro,string"`
+			}{
+				State: c.State, Carries: c.Carries, Positions: c.Positions,
+				PrincipalDeposited: c.PrincipalDeposited, PrincipalLocked: c.PrincipalLocked,
+				PrincipalReturned: c.PrincipalReturned,
+				Allocation: &legacyLPoDAllocation{
+					Version: a.Version, PositionLifecycleVersion: a.PositionLifecycleVersion, Genesis: a.Genesis,
+					FundingHeight: a.FundingHeight, FundingBlock: a.FundingBlock,
+					ReconciliationRoot: a.ReconciliationRoot, HistoricalIssued: a.HistoricalIssued,
+					Remaining: a.Remaining, ValidatorRemaining: a.ValidatorRemaining,
+					InitialValidatorRemaining: a.InitialValidatorRemaining, TailIssued: a.TailIssued,
+				},
+			}
+			b, _ := json.Marshal(legacy)
+			return crypto.HashBytes([]byte("aperod/lpod/checkpoint/v1"), b)
+		}
 	}
 	b, _ := json.Marshal(c)
 	return crypto.HashBytes([]byte("aperod/lpod/checkpoint/v1"), b)
+}
+
+type legacyLPoDAllocation struct {
+	Version                   uint8         `json:"version"`
+	PositionLifecycleVersion  uint8         `json:"position_lifecycle_version"`
+	Genesis                   crypto.Hash32 `json:"genesis"`
+	FundingHeight             uint64        `json:"funding_height"`
+	FundingBlock              crypto.Hash32 `json:"funding_block"`
+	ReconciliationRoot        crypto.Hash32 `json:"reconciliation_root"`
+	HistoricalIssued          uint64        `json:"historical_issued_napro,string"`
+	Remaining                 uint64        `json:"remaining_napro,string"`
+	ValidatorRemaining        uint64        `json:"validator_remaining_napro,string"`
+	InitialValidatorRemaining uint64        `json:"initial_validator_remaining_napro,string"`
+	TailIssued                uint64        `json:"tail_issued_napro,string"`
 }
 
 func (d *DB) PreviewLPoD(height uint64, request *LPoDSettlement) (*LPoDCheckpoint, []lpod.Payment, error) {
@@ -202,10 +300,57 @@ func (d *DB) CheckLPoDConfig(m *LPoDMigration) error {
 	if err != nil {
 		return err
 	}
-	if bound == nil {
+	boundV2, err := d.get([]byte("lpod/activation/v2"))
+	if err != nil {
+		return err
+	}
+	boundV3, err := d.get([]byte("lpod/activation/v3"))
+	if err != nil {
+		return err
+	}
+	if (bound != nil && boundV2 != nil) ||
+		(bound != nil && boundV3 != nil) ||
+		(boundV2 != nil && boundV3 != nil) {
+		return fmt.Errorf("lpod: conflicting durable migration versions are bound")
+	}
+	if boundV3 != nil {
+		if m == nil || m.Version != 3 {
+			return fmt.Errorf("lpod: cannot disable or downgrade a bound version 3 activation")
+		}
+		root := m.Root()
+		if string(boundV3) != string(root[:]) {
+			return fmt.Errorf("lpod: cannot change a bound version 3 activation")
+		}
 		return nil
 	}
-	if m == nil {
+	if boundV2 != nil {
+		if m == nil || m.Version != 2 {
+			return fmt.Errorf("lpod: cannot disable or downgrade a bound version 2 activation")
+		}
+		root := m.Root()
+		if string(boundV2) != string(root[:]) {
+			return fmt.Errorf("lpod: cannot change a bound version 2 activation")
+		}
+		return nil
+	}
+	if bound == nil {
+		checkpoint, err := d.LoadLPoDCheckpoint()
+		if err != nil {
+			return err
+		}
+		if checkpoint != nil && checkpoint.Allocation != nil {
+			if m == nil || checkpoint.Allocation.Version != m.Version {
+				return fmt.Errorf("lpod: funded checkpoint has no matching durable activation binding")
+			}
+			root := m.Root()
+			if checkpoint.Allocation.ReconciliationRoot != root {
+				return fmt.Errorf("lpod: funded checkpoint has no matching durable activation binding")
+			}
+			return fmt.Errorf("lpod: funded checkpoint is missing its durable activation binding")
+		}
+		return nil
+	}
+	if m == nil || m.Version != 1 {
 		return fmt.Errorf("lpod: cannot disable a bound activation")
 	}
 	root := m.Root()

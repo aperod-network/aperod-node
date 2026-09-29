@@ -2,11 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 )
+
+var errDiskTxIndexMismatch = errors.New("disk tx index hash mismatch")
 
 // getTransactionFromDisk is the LevelDB disk fallback for Chain.GetTransaction.
 //
@@ -67,6 +70,13 @@ func (s *Server) getTransactionFromDisk(hash crypto.Hash32) (core.Transaction, c
 			fmt.Errorf("disk tx index out of range: height=%d txIdx=%d txCount=%d",
 				entry.Height, entry.TxIdx, len(b.Txs))
 	}
+	tx := b.Txs[entry.TxIdx]
+	if actualHash := tx.Hash(); actualHash != hash {
+		return core.Transaction{}, core.TxLocation{}, false,
+			fmt.Errorf("%w: height=%d txIdx=%d requested=%x actual=%x",
+				errDiskTxIndexMismatch,
+				entry.Height, entry.TxIdx, hash, actualHash)
+	}
 
 	// 4. Construct TxLocation using the full deserialized block so that
 	//    loc.Block.Hash() returns the correct block hash in the REST response.
@@ -76,5 +86,5 @@ func (s *Server) getTransactionFromDisk(hash crypto.Hash32) (core.Transaction, c
 		Block:   &b,
 		TxIndex: entry.TxIdx,
 	}
-	return b.Txs[entry.TxIdx], loc, true, nil
+	return tx, loc, true, nil
 }

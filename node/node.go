@@ -19,17 +19,18 @@ import (
 
 // Node is the complete Aperod node: chain + consensus + p2p + API.
 type Node struct {
-	cfg        *Config
-	log        *slog.Logger
-	chain      *core.Chain
-	utxos      *core.UTXOSet
-	txVerifier *core.TxVerifier
-	mempool    *core.Mempool
-	verifier   *core.BlockVerifier
-	engine     *consensus.Engine
-	host       *p2p.Host
-	db         *store.DB
-	stop       chan struct{}
+	cfg             *Config
+	log             *slog.Logger
+	chain           *core.Chain
+	utxos           *core.UTXOSet
+	txVerifier      *core.TxVerifier
+	mempool         *core.Mempool
+	verifier        *core.BlockVerifier
+	engine          *consensus.Engine
+	host            *p2p.Host
+	db              *store.DB
+	stop            chan struct{}
+	voteBroadcastCh chan consensus.FinalizeMsg
 }
 
 // Config holds all node configuration.
@@ -177,11 +178,13 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	}
 
 	// ── Consensus engine ──────────────────────────────────────────────────────
+	voteBroadcastCh := make(chan consensus.FinalizeMsg, 16)
 	engine := consensus.NewEngine(consensus.Config{
 		BlockTime:    cfg.BlockTime,
 		BFTThreshold: genesisCfg.BFTThreshold,
 		Validators:   validators,
 		MyKey:        myKey,
+		Store:        db,
 		// Persist every self-produced block synchronously inside tick()
 		// so the produced-block channel is only used for P2P broadcast.
 		OnBlockProduced: func(b *core.Block) error {
@@ -192,6 +195,14 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 				return err
 			}
 			return nil
+		},
+		OnVoteCast: func(vote consensus.FinalizeMsg) {
+			select {
+			case voteBroadcastCh <- vote:
+			default:
+				log.Warn("finality vote outbound queue full; periodic durable retry will recover",
+					"height", vote.Height)
+			}
 		},
 	}, chain, mempool, log)
 
@@ -214,17 +225,18 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	}, p2pHandler, log)
 
 	return &Node{
-		cfg:        cfg,
-		log:        log,
-		chain:      chain,
-		utxos:      utxos,
-		txVerifier: txV,
-		mempool:    mempool,
-		verifier:   blockV,
-		engine:     engine,
-		host:       host,
-		db:         db,
-		stop:       make(chan struct{}),
+		cfg:             cfg,
+		log:             log,
+		chain:           chain,
+		utxos:           utxos,
+		txVerifier:      txV,
+		mempool:         mempool,
+		verifier:        blockV,
+		engine:          engine,
+		host:            host,
+		db:              db,
+		stop:            make(chan struct{}),
+		voteBroadcastCh: voteBroadcastCh,
 	}, nil
 }
 
@@ -278,12 +290,27 @@ func (n *Node) Stop() error {
 // Block persistence is handled synchronously in the OnBlockProduced callback
 // inside tick(), so this loop is solely responsible for P2P propagation.
 func (n *Node) broadcastLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	broadcastVote := func(vote consensus.FinalizeMsg) {
+		n.host.BroadcastVote(p2p.VoteMsg{
+			BlockHash: vote.BlockHash, Height: vote.Height,
+			ValidatorPub: append([]byte(nil), vote.ValidatorPub[:]...),
+			Signature:    append([]byte(nil), vote.Signature...),
+		})
+	}
 	for {
 		select {
 		case <-n.stop:
 			return
 		case block := <-n.engine.ProducedCh():
 			n.host.BroadcastBlock(block)
+		case vote := <-n.voteBroadcastCh:
+			broadcastVote(vote)
+		case <-ticker.C:
+			if vote, ok := n.engine.LatestLocalVote(); ok {
+				broadcastVote(vote)
+			}
 		}
 	}
 }
@@ -325,14 +352,14 @@ func persistBlockToDB(db *store.DB, block *core.Block) error {
 		}
 		for i, out := range tx.Outputs {
 			su := &store.StoredUTXO{
-				TxHash:          txHash,
-				OutputIndex:     uint32(i),
-				OneTimePub:      out.OneTimePub,
-				TxPubKey:        out.TxPubKey,
-				AmountCommit:    out.AmountCommit,
-				EncAmount:       out.EncAmount,
-				BlockHeight:     block.Header.Height,
-ProtocolLocked: tx.IsGuardianFund(),
+				TxHash:         txHash,
+				OutputIndex:    uint32(i),
+				OneTimePub:     out.OneTimePub,
+				TxPubKey:       out.TxPubKey,
+				AmountCommit:   out.AmountCommit,
+				EncAmount:      out.EncAmount,
+				BlockHeight:    block.Header.Height,
+				ProtocolLocked: tx.IsGuardianFund(),
 			}
 			if err := db.PutUTXO(txHash, uint32(i), su); err != nil {
 				return fmt.Errorf("put utxo: %w", err)
@@ -390,14 +417,14 @@ func restoreChain(db *store.DB, chain *core.Chain, utxos *core.UTXOSet, tipHeigh
 	utxoCount := 0
 	if err := db.IterUTXOs(func(su *store.StoredUTXO) error {
 		utxos.Add(&core.UTXO{
-			TxHash:       su.TxHash,
-			OutputIndex:  su.OutputIndex,
-			OneTimePub:   su.OneTimePub,
-			TxPubKey:     su.TxPubKey,
-			AmountCommit: su.AmountCommit,
-			EncAmount:    su.EncAmount,
-			BlockHeight:  su.BlockHeight,
-ProtocolLocked: su.ProtocolLocked,
+			TxHash:         su.TxHash,
+			OutputIndex:    su.OutputIndex,
+			OneTimePub:     su.OneTimePub,
+			TxPubKey:       su.TxPubKey,
+			AmountCommit:   su.AmountCommit,
+			EncAmount:      su.EncAmount,
+			BlockHeight:    su.BlockHeight,
+			ProtocolLocked: su.ProtocolLocked,
 		})
 		utxoCount++
 		return nil

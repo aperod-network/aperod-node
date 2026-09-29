@@ -272,18 +272,23 @@ func buildSignedTransaction(_ js.Value, args []js.Value) any {
 	if err != nil {
 		return promiseResult(nil, err)
 	}
+	b = b.WithPaymentRecipientProof()
 	change := crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys)
 	result, err := b.Build(r.Amount, crypto.Address(r.ToAddress), change)
 	if err != nil {
 		return promiseResult(nil, err)
 	}
-	hash := result.Tx.Hash()
+	hashHex, err := verifyBuiltPayment(result, r.Amount, crypto.Address(r.ToAddress))
+	if err != nil {
+		return promiseResult(nil, err)
+	}
 	spent := make([]map[string]any, len(result.SelectedUTXOs))
 	for i, u := range result.SelectedUTXOs {
 		spent[i] = map[string]any{"tx_hash": hex.EncodeToString(u.TxHash[:]), "out_idx": u.OutputIndex, "key_image_hex": hex.EncodeToString(result.Tx.Inputs[i].KeyImage[:])}
 	}
 	return promiseResult(wasmValue(map[string]any{
-		"tx": result.Tx, "tx_hash": hex.EncodeToString(hash[:]), "total_fee_napr": result.TotalFee,
+		"tx": result.Tx, "tx_hash": hashHex, "total_fee_napr": result.TotalFee,
+		"payment_amount_napr": strconv.FormatUint(r.Amount, 10), "recipient_address": r.ToAddress,
 		"change_amount_napr": strconv.FormatUint(result.ChangeAmount, 10), "change_out_idx": result.ChangeOutIdx,
 		"change_blind_hex": hex.EncodeToString(result.ChangeBlind[:]), "payment_blind_hex": hex.EncodeToString(result.PayBlind[:]),
 		"payment_out_idx": result.PayOutIdx, "spent_key_images": spent,

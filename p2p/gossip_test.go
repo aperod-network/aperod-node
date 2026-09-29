@@ -571,6 +571,40 @@ func TestHost_BroadcastBlock_TransientFailure_RetriesOnce(t *testing.T) {
 	}
 }
 
+func TestHost_BroadcastVote_DeliversToConnectedPeer(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr: "127.0.0.1:0", MaxPeers: 10,
+		NodeID: "vote-host", UserAgent: "aperod/test",
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+	conn := rawConnect(t, host.ListenAddr())
+	defer conn.Close()
+	if !rawHandshake(t, conn) {
+		t.Skip("handshake failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	_, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vote := p2p.VoteMsg{
+		Height: 17, BlockHash: crypto.HashBytes([]byte("canonical test block")),
+		ValidatorPub: append([]byte(nil), pub[:]...), Signature: []byte("signed-vote"),
+	}
+	host.BroadcastVote(vote)
+	msgType, ok := tryReadMsg(conn, 2*time.Second)
+	if !ok {
+		t.Fatal("connected peer did not receive finality vote")
+	}
+	if msgType != p2p.MsgVote {
+		t.Fatalf("received message type %v, want MsgVote", msgType)
+	}
+}
+
 func TestHost_BroadcastBlock_PeerEvicted_NoRetry(t *testing.T) {
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:          "127.0.0.1:0",

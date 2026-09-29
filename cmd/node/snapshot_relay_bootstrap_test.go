@@ -192,8 +192,8 @@ func TestRelayBootstrap_RestorePopulatesRegistryAndUTXOs(t *testing.T) {
 	// ── Assert: ValidatorRegistry is populated (not zeroed).
 	snap2 := registry.TakeSnapshot()
 	if len(snap2.Validators) == 0 {
-		t.Errorf("ValidatorRegistry is empty after RestoreFromSnapshot; "+
-			"registry must carry the donor node's validator set so that "+
+		t.Errorf("ValidatorRegistry is empty after RestoreFromSnapshot; " +
+			"registry must carry the donor node's validator set so that " +
 			"incoming blocks pass the 'scheduled proposer' check")
 	}
 	if _, found := snap2.Validators[valPubHex]; !found {
@@ -246,24 +246,31 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLockedValidatorKey: %v", err)
 	}
-	defer lk.Destroy()
 
 	validatorUTXOs := core.NewUTXOSet()
 	validatorReg := core.NewValidatorRegistry()
 	validatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	validatorEng := consensus.NewEngine(consensus.Config{
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{valPub},
-		Registry:     validatorReg,
-		MyKey:        lk,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{valPub},
+		Registry:         validatorReg,
+		MyKey:            lk,
 		OnCanonicalBlock: noopCanonicalPersistence,
 	}, validatorChain, validatorMp, silentLog())
 	validatorEng.SetTxVerifier(core.NewTxVerifier(validatorUTXOs), validatorUTXOs)
 
 	validatorStop := make(chan struct{})
-	go validatorEng.Run(validatorStop)
-	defer close(validatorStop)
+	validatorDone := make(chan struct{})
+	go func() {
+		defer close(validatorDone)
+		validatorEng.Run(validatorStop)
+	}()
+	defer func() {
+		close(validatorStop)
+		<-validatorDone
+		lk.Destroy()
+	}()
 
 	var block1 *core.Block
 	select {
@@ -364,18 +371,25 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 	}
 	relayMp := core.NewMempool(core.DefaultMempoolConfig())
 	relayEng := consensus.NewEngine(consensus.Config{
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   restoredVals, // seeded from restored snapshot registry
-		Registry:     relayReg,
-		MyKey:        nil, // non-validator: never produces blocks
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       restoredVals, // seeded from restored snapshot registry
+		Registry:         relayReg,
+		MyKey:            nil, // non-validator: never produces blocks
 		OnCanonicalBlock: noopCanonicalPersistence,
 	}, relayChain, relayMp, silentLog())
 	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
 
 	relayStop := make(chan struct{})
-	go relayEng.Run(relayStop)
-	defer close(relayStop)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relayEng.Run(relayStop)
+	}()
+	defer func() {
+		close(relayStop)
+		<-relayDone
+	}()
 
 	// ── Steps 6–8: submit block 1 and assert relay chain advances ─────────────
 	// handleIncomingBlock exercises isKnownValidator() and proposerAt() against

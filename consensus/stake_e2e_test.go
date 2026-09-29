@@ -127,11 +127,11 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		MyKey:        lk,
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		MyKey:            lk,
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 
 	// Wire the UTXO set (needed for ApplyBlock in the self-produced path).
@@ -264,10 +264,10 @@ func TestStakeDeposit_IncomingBlock_BadSig(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -318,10 +318,10 @@ func TestStakeDeposit_IncomingBlock_UTXONotFound(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -377,10 +377,10 @@ func TestStakeDeposit_IncomingBlock_DuplicateBurnUTXO(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -430,10 +430,10 @@ func TestStakeDeposit_IncomingBlock_BelowMinimum(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -489,21 +489,28 @@ func TestStakeDeposit_SelfProduced_InvalidStakeEvicted(t *testing.T) {
 
 	chain := makeChainWithGenesis(t, proposerPriv, proposerPub)
 	lk, _ := crypto.NewLockedValidatorKey(proposerPriv.Bytes(), nil)
-	defer lk.Destroy()
 
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		MyKey:        lk,
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		MyKey:            lk,
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
 	stop := make(chan struct{})
-	go eng.Run(stop)
-	defer close(stop)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.Run(stop)
+	}()
+	defer func() {
+		close(stop)
+		<-done
+		lk.Destroy()
+	}()
 
 	// Give the engine enough time to attempt block production and evict.
 	// A produced block would advance chain height; a stalled engine would not.
@@ -559,10 +566,10 @@ func TestStakeDeposit_IncomingBlock_CommitMismatch(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -614,10 +621,10 @@ func TestStakeDeposit_IncomingBlock_TopupBelowMinimum(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -756,11 +763,11 @@ func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
 
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		MyKey:        lk,
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		MyKey:            lk,
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -835,11 +842,11 @@ func TestStakeDeposit_SelfProduced_ResumesAfterDuplicateEviction(t *testing.T) {
 
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
-		MyKey:        lk,
-		Registry:     registry,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
+		MyKey:            lk,
+		Registry:         registry,
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 

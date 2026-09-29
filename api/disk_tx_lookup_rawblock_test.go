@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,4 +201,25 @@ func TestGetTransactionFromDisk_FindsTxViaRawBlock(t *testing.T) {
 		"being evicted from in-memory window (windowSize=%d, fillers=%d); "+
 		"block_hash=%s (correct)",
 		mintHeight, windowSize, windowSize+1, wantBlockHash)
+
+	// A stale or corrupted t/ entry can point a different hash to the same
+	// canonical transaction. Never report that alias as confirmed in the block.
+	alias := crypto.HashBytes([]byte("noncanonical-tx-alias"))
+	if alias == mintTxHash {
+		t.Fatal("test alias unexpectedly equals the canonical transaction hash")
+	}
+	if err := db.PutTxIdx(alias, mintHeight, 1); err != nil {
+		t.Fatalf("PutTxIdx alias: %v", err)
+	}
+	aliasReq := httptest.NewRequest(http.MethodGet,
+		"/api/v1/transactions/"+hex.EncodeToString(alias[:]), nil)
+	aliasRR := httptest.NewRecorder()
+	srv.ServeHTTP(aliasRR, aliasReq)
+	if aliasRR.Code != http.StatusInternalServerError {
+		t.Fatalf("alias status = %d, want explicit index inconsistency (500): %s",
+			aliasRR.Code, aliasRR.Body.String())
+	}
+	if body := aliasRR.Body.String(); !strings.Contains(body, "transaction index inconsistent") {
+		t.Fatalf("alias response did not report the index inconsistency: %s", body)
+	}
 }

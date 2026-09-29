@@ -14,15 +14,16 @@ import (
 
 // TxBuilder constructs RingCT transactions.
 type TxBuilder struct {
-	spendPriv  crypto.Scalar32
-	viewPriv   crypto.Scalar32
-	spendPub   crypto.Point32
-	ownedUTXOs []OwnedUTXO
-	feePerByte uint64      // base-fee + optional tip per byte in nAPRO
-	utxoSet    *UTXOSet    // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
-	decoys     []DecoyUTXO // optional caller-supplied public chain decoys
-	txVersion  TxVersion
-	avmPayload *AVMPayload // optional signed AVM payload; forces TxVersionAVM
+	spendPriv             crypto.Scalar32
+	viewPriv              crypto.Scalar32
+	spendPub              crypto.Point32
+	ownedUTXOs            []OwnedUTXO
+	feePerByte            uint64      // base-fee + optional tip per byte in nAPRO
+	utxoSet               *UTXOSet    // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
+	decoys                []DecoyUTXO // optional caller-supplied public chain decoys
+	txVersion             TxVersion
+	avmPayload            *AVMPayload // optional signed AVM payload; forces TxVersionAVM
+	paymentRecipientProof bool
 }
 
 // NewTxBuilder creates a transaction builder for a wallet.
@@ -65,6 +66,15 @@ func (b *TxBuilder) WithDecoySet(utxos *UTXOSet) *TxBuilder {
 // a UTXOSet and are never treated as wallet-owned data.
 func (b *TxBuilder) WithDecoys(decoys []DecoyUTXO) *TxBuilder {
 	b.decoys = append([]DecoyUTXO(nil), decoys...)
+	return b
+}
+
+// WithPaymentRecipientProof asks Build to retain the payment output's
+// ephemeral scalar privately in BuildResult so the caller can independently
+// verify the serialized output against the recipient address. The caller must
+// call BuildResult.VerifyPaymentRecipient promptly; it zeroes the scalar.
+func (b *TxBuilder) WithPaymentRecipientProof() *TxBuilder {
+	b.paymentRecipientProof = true
 	return b
 }
 
@@ -127,6 +137,57 @@ type BuildResult struct {
 	// to the exact source UTXO (TxHash, OutputIndex) so wallets can skip
 	// only the failing candidate instead of discarding all of them.
 	SelectedUTXOs []OwnedUTXO
+
+	// These fields are intentionally private and omitted from JSON. They are
+	// only populated when WithPaymentRecipientProof is requested, and are
+	// zeroed by VerifyPaymentRecipient.
+	paymentEphemeralSecret crypto.Scalar32
+	hasPaymentProof        bool
+}
+
+// VerifyPaymentRecipient proves that the actual built payment output is the
+// one-time key derived from recipient's public keys and the ephemeral scalar
+// used to construct it. The scalar is wiped whether verification succeeds or
+// fails.
+func (r *BuildResult) VerifyPaymentRecipient(recipient crypto.Address) error {
+	if r == nil {
+		return fmt.Errorf("nil build result")
+	}
+	defer func() {
+		r.DiscardPaymentRecipientProof()
+	}()
+	if !r.hasPaymentProof {
+		return fmt.Errorf("payment recipient proof is unavailable or already consumed")
+	}
+	if r.PayOutIdx < 0 || r.PayOutIdx >= len(r.Tx.Outputs) {
+		return fmt.Errorf("payment output index %d is outside transaction outputs", r.PayOutIdx)
+	}
+	_, spendPub, viewPub, err := crypto.DecodeAddress(recipient)
+	if err != nil {
+		return fmt.Errorf("decode recipient address: %w", err)
+	}
+	expected, err := crypto.CreateStealthOutputFromEphemeralBytes(spendPub, viewPub, [32]byte(r.paymentEphemeralSecret))
+	if err != nil {
+		return fmt.Errorf("derive expected recipient output: %w", err)
+	}
+	actual := r.Tx.Outputs[r.PayOutIdx]
+	if actual.TxPubKey != expected.TxPubKey {
+		return fmt.Errorf("payment output transaction public key does not match recipient derivation")
+	}
+	if actual.OneTimePub != expected.OneTimePub {
+		return fmt.Errorf("payment output one-time key does not belong to recipient address")
+	}
+	return nil
+}
+
+// DiscardPaymentRecipientProof zeroes any transient ephemeral scalar retained
+// for recipient verification. Call this if a BuildResult will not be verified.
+func (r *BuildResult) DiscardPaymentRecipientProof() {
+	if r == nil {
+		return
+	}
+	crypto.ZeroBytes(r.paymentEphemeralSecret[:])
+	r.hasPaymentProof = false
 }
 
 // Build constructs a signed RingCT transaction.
@@ -299,12 +360,18 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 
 	// ── Build outputs ─────────────────────────────────────────────────────────
 	type outEntry struct {
-		output Output
-		blind  crypto.BlindFactor
-		amount uint64
+		output          Output
+		blind           crypto.BlindFactor
+		amount          uint64
+		ephemeralSecret crypto.Scalar32
 	}
 
 	var outEntries []outEntry
+	defer func() {
+		for i := range outEntries {
+			crypto.ZeroBytes(outEntries[i].ephemeralSecret[:])
+		}
+	}()
 	var changeBlindResult crypto.BlindFactor
 	var payBlindResult crypto.BlindFactor
 	changeOutIdx := -1
@@ -318,16 +385,16 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		if err != nil {
 			return nil, fmt.Errorf("build change output: %w", err)
 		}
-		outEntries = append(outEntries, outEntry{chOut, changeBlind, changeAmount})
+		outEntries = append(outEntries, outEntry{output: chOut, blind: changeBlind, amount: changeAmount})
 		changeBlindResult = changeBlind
 		changeOutIdx = 0
 	} else if hasChange {
 		// Payment blind: random (recipient cannot see our change balance)
-		payOut, payBlind, err := txBuildOutput(recipient, amount)
+		payOut, payBlind, ephemeral, err := txBuildOutputWithEphemeral(recipient, amount, nil)
 		if err != nil {
 			return nil, fmt.Errorf("build payment output: %w", err)
 		}
-		outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
+		outEntries = append(outEntries, outEntry{output: payOut, blind: payBlind, amount: amount, ephemeralSecret: ephemeral})
 		payBlindResult = payBlind
 
 		// Change blind: computed so that ΣC_in == C_pay + C_change + C_fee
@@ -339,7 +406,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		if err != nil {
 			return nil, fmt.Errorf("build change output: %w", err)
 		}
-		outEntries = append(outEntries, outEntry{chOut, changeBlind, changeAmount})
+		outEntries = append(outEntries, outEntry{output: chOut, blind: changeBlind, amount: changeAmount})
 		changeBlindResult = changeBlind
 		changeOutIdx = 1
 	} else if !isBurn {
@@ -349,11 +416,11 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		if err != nil {
 			return nil, fmt.Errorf("pay blind sum: %w", err)
 		}
-		payOut, err := txBuildOutputWithBlind(recipient, amount, payBlind)
+		payOut, _, ephemeral, err := txBuildOutputWithEphemeral(recipient, amount, &payBlind)
 		if err != nil {
 			return nil, fmt.Errorf("build payment output: %w", err)
 		}
-		outEntries = append(outEntries, outEntry{payOut, payBlind, amount})
+		outEntries = append(outEntries, outEntry{output: payOut, blind: payBlind, amount: amount, ephemeralSecret: ephemeral})
 		payBlindResult = payBlind
 	}
 
@@ -543,7 +610,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		tx.Inputs[i].KeyImage = sig.KeyImage
 	}
 
-	return &BuildResult{
+	result := &BuildResult{
 		Tx:           tx,
 		ChangeAmount: changeAmount,
 		TotalFee:     totalFee,
@@ -561,7 +628,12 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		RealDecoyCount:     totalRealDecoys,
 		FallbackDecoyCount: totalFallbackDecoys,
 		SelectedUTXOs:      selected,
-	}, nil
+	}
+	if b.paymentRecipientProof && !isBurn && result.PayOutIdx < len(outEntries) {
+		result.paymentEphemeralSecret = outEntries[result.PayOutIdx].ephemeralSecret
+		result.hasPaymentProof = true
+	}
+	return result, nil
 }
 
 func validateOwnedUTXOOpening(utxo OwnedUTXO) error {
@@ -602,6 +674,43 @@ func txBuildOutputWithBlind(addr crypto.Address, amount uint64, blind crypto.Bli
 		AmountCommit: commit,
 		EncAmount:    encAmount,
 	}, nil
+}
+
+// txBuildOutputWithEphemeral creates a payment output and returns the
+// ephemeral scalar required to verify the output's recipient derivation. The
+// caller owns the scalar and must either move it into a private proof result
+// or zero it.
+func txBuildOutputWithEphemeral(addr crypto.Address, amount uint64, blind *crypto.BlindFactor) (Output, crypto.BlindFactor, crypto.Scalar32, error) {
+	_, spendPub, viewPub, err := crypto.DecodeAddress(addr)
+	if err != nil {
+		return Output{}, crypto.BlindFactor{}, crypto.Scalar32{}, fmt.Errorf("decode address: %w", err)
+	}
+	so, ephemeral, err := crypto.CreateStealthOutputWithEphemeralSecret(spendPub, viewPub)
+	if err != nil {
+		return Output{}, crypto.BlindFactor{}, crypto.Scalar32{}, fmt.Errorf("stealth output: %w", err)
+	}
+	payBlind := crypto.BlindFactor{}
+	if blind == nil {
+		payBlind, err = crypto.DeterministicPaymentBlind(so.HsScalar, amount)
+		if err != nil {
+			crypto.ZeroBytes(ephemeral[:])
+			return Output{}, crypto.BlindFactor{}, crypto.Scalar32{}, err
+		}
+	} else {
+		payBlind = *blind
+	}
+	commit, err := crypto.Commit(amount, payBlind)
+	if err != nil {
+		crypto.ZeroBytes(ephemeral[:])
+		return Output{}, crypto.BlindFactor{}, crypto.Scalar32{}, err
+	}
+	encAmount := EncryptAmount(amount, &so.HsScalar)
+	return Output{
+		OneTimePub:   so.OneTimePub,
+		TxPubKey:     so.TxPubKey,
+		AmountCommit: commit,
+		EncAmount:    encAmount,
+	}, payBlind, ephemeral, nil
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────

@@ -400,8 +400,7 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	// checksum can later detect truncation or partial writes.  Task #964.
 	hasher := sha256.New()
 	gz := gzip.NewWriter(io.MultiWriter(f, hasher))
-	enc := json.NewEncoder(gz)
-	encErr := enc.Encode(snap)
+	encErr := writeStartupSnapshotJSON(gz, snap)
 	gzCloseErr := gz.Close()
 	fCloseErr := f.Close()
 	if encErr != nil {

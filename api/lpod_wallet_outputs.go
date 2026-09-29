@@ -4,11 +4,13 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/aperod/aperod/crypto"
 	"net/http"
+	"strings"
 )
 
 func (s *Server) restLPoDWalletOutputs(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +63,92 @@ func (s *Server) restLPoDWalletOutputs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"state": "active", "checkpoint_hash": fmt.Sprintf("%x", hash[:]), "outputs": outputs, "next_cursor": next})
+}
+
+func (s *Server) restLPoDEarningsOutputs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "GET only")
+		return
+	}
+	address := crypto.Address(r.URL.Query().Get("address"))
+	if _, _, _, err := crypto.DecodeAddress(address); err != nil {
+		writeJSONError(w, 400, "invalid address")
+		return
+	}
+	if s.lpodMigration == nil || s.lpodMigration.Version != 3 {
+		writeJSONError(w, 503, "v3 LPoD earnings are not active")
+		return
+	}
+	if s.blockStore == nil {
+		writeJSONError(w, 503, "canonical store unavailable")
+		return
+	}
+	hash, height, err := s.blockStore.GetTip()
+	if err != nil || s.lpodFinalized == nil || !s.lpodFinalized(height, hash) {
+		writeJSONError(w, 503, "finalized tip required")
+		return
+	}
+	c, err := s.blockStore.LoadLPoDCheckpointAt(hash)
+	if err != nil || c == nil || c.Allocation == nil || c.Allocation.Version != 3 ||
+		c.Allocation.Genesis != s.lpodMigration.Genesis ||
+		c.Allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
+		c.Allocation.FundingHeight != s.lpodMigration.Height || c.State.LastHeight != height {
+		writeJSONError(w, 503, "canonical v3 LPoD checkpoint required")
+		return
+	}
+	ready, err := s.blockStore.LPoDEarningsIndexReady(c.Allocation.FundingBlock, hash, height)
+	if err != nil || !ready {
+		writeJSONError(w, 503, "v2 earnings index is incomplete through the finalized tip")
+		return
+	}
+	cursor := r.URL.Query().Get("cursor")
+	if cursor != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			writeJSONError(w, 400, "invalid cursor")
+			return
+		}
+		parts := strings.SplitN(string(decoded), ":", 2)
+		bound, err := hex.DecodeString(parts[0])
+		if err != nil || len(parts) != 2 || len(bound) != 32 || !strings.EqualFold(parts[0], fmt.Sprintf("%x", hash[:])) {
+			writeJSONError(w, 409, "cursor is bound to a different finalized checkpoint")
+			return
+		}
+		cursor = parts[1]
+	}
+	rows, next, err := s.blockStore.LPoDEarningsOutputs(address, cursor, 128)
+	if err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	outputs := []map[string]interface{}{}
+	for _, u := range rows {
+		outputs = append(outputs, map[string]interface{}{
+			"tx_hash":       fmt.Sprintf("%x", u.TxHash[:]),
+			"out_idx":       u.OutputIndex,
+			"block_height":  u.BlockHeight,
+			"one_time_pub":  fmt.Sprintf("%x", u.OneTimePub[:]),
+			"tx_pub_key":    fmt.Sprintf("%x", u.TxPubKey[:]),
+			"amount_commit": fmt.Sprintf("%x", u.AmountCommit[:]),
+			"enc_amount":    fmt.Sprintf("%x", u.EncAmount[:]),
+			"amount_napro":  fmt.Sprintf("%d", u.AmountNAPRO),
+		})
+	}
+	after, h, err := s.blockStore.GetTip()
+	if err != nil || after != hash || h != height || s.lpodFinalized == nil || !s.lpodFinalized(h, after) {
+		writeJSONError(w, 409, "canonical finalized checkpoint changed")
+		return
+	}
+	nextCursor := ""
+	if next != "" {
+		token := fmt.Sprintf("%x:%s", hash[:], next)
+		nextCursor = base64.RawURLEncoding.EncodeToString([]byte(token))
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"state": "active", "checkpoint_hash": fmt.Sprintf("%x", hash[:]),
+		"outputs": outputs, "next_cursor": nextCursor,
+	})
 }
 
 // Public key images, not keys/blinds, identify locally scanned consumed outputs.

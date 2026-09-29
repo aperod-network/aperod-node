@@ -66,9 +66,23 @@ func appendLPoDIndices(batch *leveldb.Batch, b *core.Block, rollback bool) error
 // reserve/position selection. Alternate branches must first rewind to the common
 // parent and then use ordinary validated canonical commits, never jump a tip.
 func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, target crypto.Hash32, height uint64) error {
-	bound, err := d.get([]byte("lpod/activation/v1"))
-	if err != nil || bound == nil {
-		return err
+	bound := false
+	for _, key := range [][]byte{
+		[]byte("lpod/activation/v1"),
+		[]byte("lpod/activation/v2"),
+		[]byte("lpod/activation/v3"),
+	} {
+		raw, err := d.get(key)
+		if err != nil {
+			return err
+		}
+		if raw != nil {
+			bound = true
+			break
+		}
+	}
+	if !bound {
+		return nil
 	}
 	cursor, current, err := d.GetTip()
 	if err != nil {
@@ -77,6 +91,7 @@ func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, target crypto.Hash32, hei
 	if height > current {
 		return fmt.Errorf("lpod: advance branches using validated canonical commits")
 	}
+	rewound := current > height
 	for current > height {
 		raw, err := d.GetRawBlock(cursor)
 		if err != nil {
@@ -89,13 +104,19 @@ func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, target crypto.Hash32, hei
 		if err := appendLPoDIndices(batch, &block, true); err != nil {
 			return err
 		}
-if err := d.rollbackLPoDWalletIndex(batch, block.Hash()); err != nil { return err }
+		if err := d.rollbackLPoDWalletIndex(batch, block.Hash()); err != nil {
+			return err
+		}
 		batch.Delete(heightKey(current))
 		cursor = block.Header.PrevHash
 		current--
 	}
 	if cursor != target {
 		return fmt.Errorf("lpod: selected rollback tip is not an ancestor")
+	}
+	if rewound {
+		batch.Delete(lpodEarningsReadyKey)
+		batch.Delete(lpodEarningsProgressKey)
 	}
 	return nil
 }

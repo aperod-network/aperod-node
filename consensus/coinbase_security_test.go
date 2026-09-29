@@ -118,6 +118,17 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 	if err := engine.validateCoinbasePolicy(valid); err != nil {
 		t.Fatalf("valid authorized reward rejected: %v", err)
 	}
+	if AuthorizedBlockRewardNAPR != 10_000_000 {
+		t.Fatalf("deployed authorized reward changed: %d nAPRO", AuthorizedBlockRewardNAPR)
+	}
+	if got := engine.CurrentBlockRewardNAPR(); got != DefaultPoolBlockRewardNAPR {
+		t.Fatalf("pre-activation reward changed: %d", got)
+	}
+	initialPool := engine.StakingPoolRemaining()
+	engine.DecrementPool(activation)
+	if got := engine.StakingPoolRemaining(); got != initialPool {
+		t.Fatalf("authorization-era block debited the legacy pool: %d -> %d", initialPool, got)
+	}
 
 	// A restarted validator reconstructs the complete authorization decision
 	// from the block itself; no replay map or local reward settings are needed.
@@ -140,6 +151,33 @@ func TestAuthorizedValidatorRewardActivationAndConsensusAmount(t *testing.T) {
 	wrongAmountBlock.Txs = []core.Transaction{*wrongAmount}
 	if err := engine.validateCoinbasePolicy(&wrongAmountBlock); err == nil {
 		t.Fatal("proposer-signed reward above the consensus amount was accepted")
+	}
+	oldPoolAmount, err := core.BuildAuthorizedRewardTx(
+		rewardAddress, DefaultPoolBlockRewardNAPR, activation, parentHash, validatorPriv,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongAmountBlock.Txs = []core.Transaction{*oldPoolAmount}
+	if err := engine.validateCoinbasePolicy(&wrongAmountBlock); err == nil {
+		t.Fatal("legacy configured 3 APRO reward was accepted after 0.1 APRO activation")
+	}
+
+	transfer := core.Transaction{
+		Version: core.TxVersionCommitmentBinding,
+		Inputs:  []core.RingInput{{}},
+	}
+	transfer.Fee = transfer.MinFeeAt(engine.expectedBaseFeeAt(activation)) + 7
+	tippedReward, err := core.BuildAuthorizedRewardTx(
+		rewardAddress, 10_000_007, activation, parentHash, validatorPriv,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tipped := *valid
+	tipped.Txs = []core.Transaction{*tippedReward, transfer}
+	if err := engine.validateCoinbasePolicy(&tipped); err != nil {
+		t.Fatalf("authorized reward including a 7 nAPRO priority tip was rejected: %v", err)
 	}
 
 	missing := *valid
@@ -296,6 +334,9 @@ func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()),
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	engine.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+	if got := engine.CurrentBlockRewardNAPR(); got != 10_000_000 {
+		t.Fatalf("activated base reward = %d, want 0.1 APRO", got)
+	}
 
 	if err := engine.tick(); err != nil {
 		t.Fatalf("produce authorized reward block: %v", err)
@@ -316,12 +357,12 @@ func TestLocalProductionBuildsAuthorizedValidatorReward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("produced reward is not consensus-valid: %v", err)
 	}
-	if auth.Amount != DefaultPoolBlockRewardNAPR {
-		t.Fatalf("authorized reward = %d, want pool reward %d", auth.Amount, DefaultPoolBlockRewardNAPR)
+	if auth.Amount != AuthorizedBlockRewardNAPR {
+		t.Fatalf("authorized reward = %d, want protocol reward %d", auth.Amount, AuthorizedBlockRewardNAPR)
 	}
 	engine.DecrementPool(block.Header.Height)
-	if got, want := engine.StakingPoolRemaining(), DefaultPoolBlockRewardNAPR; got != want {
-		t.Fatalf("pool remaining after authorized reward = %d, want %d", got, want)
+	if got, want := engine.StakingPoolRemaining(), 2*DefaultPoolBlockRewardNAPR; got != want {
+		t.Fatalf("legacy pool changed after authorized reward: got %d, want %d", got, want)
 	}
 }
 

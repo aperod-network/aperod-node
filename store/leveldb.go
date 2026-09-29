@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -32,7 +34,8 @@ var (
 
 // DB wraps a LevelDB database with typed methods for blockchain data.
 type DB struct {
-	db *leveldb.DB
+	db   *leveldb.DB
+	path string
 }
 
 // Open opens or creates a LevelDB database at path.
@@ -46,22 +49,28 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open leveldb %s: %w", path, err)
 	}
-	return &DB{db: db}, nil
+	return &DB{db: db, path: path}, nil
+}
+
+// OpenReadOnly opens an existing LevelDB without recovery, compaction or writes.
+// The caller must close the returned handle.
+func OpenReadOnly(path string) (*DB, error) {
+	opts := &opt.Options{ReadOnly: true, ErrorIfMissing: true}
+	db, err := leveldb.OpenFile(path, opts)
+	if err != nil {
+		return nil, fmt.Errorf("open leveldb read-only %s: %w", path, err)
+	}
+	return &DB{db: db, path: path}, nil
 }
 
 // ReadTipOnly opens an existing LevelDB in read-only mode and returns its
 // canonical tip without running recovery, compaction, or creating files.
 // Maintenance commands use this to validate their target before any mutation.
 func ReadTipOnly(path string) (crypto.Hash32, uint64, error) {
-	opts := &opt.Options{
-		ReadOnly:       true,
-		ErrorIfMissing: true,
-	}
-	db, err := leveldb.OpenFile(path, opts)
+	wrapped, err := OpenReadOnly(path)
 	if err != nil {
-		return crypto.Hash32{}, 0, fmt.Errorf("open leveldb read-only %s: %w", path, err)
+		return crypto.Hash32{}, 0, err
 	}
-	wrapped := &DB{db: db}
 	defer wrapped.Close()
 
 	hashBytes, err := wrapped.GetMeta("tip/hash")
@@ -109,6 +118,26 @@ func ReadTipOnly(path string) (crypto.Hash32, uint64, error) {
 	return hash, height, nil
 }
 
+// OpenLPoDAuditReadOnly opens an existing database without allowing LevelDB
+// recovery, repair, writes, or creation. It is intended only for offline
+// historical-body audits of an explicitly supplied copied database.
+func OpenLPoDAuditReadOnly(path string) (*DB, error) {
+	if path == "" {
+		return nil, fmt.Errorf("lpod audit: copied database path is required")
+	}
+	if _, err := os.Stat(filepath.Join(path, "LOCK")); err != nil {
+		return nil, fmt.Errorf("lpod audit: copied database must already contain a LOCK file: %w", err)
+	}
+	db, err := leveldb.OpenFile(path, &opt.Options{
+		ReadOnly:       true,
+		ErrorIfMissing: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("lpod audit: open copied database read-only %s: %w", path, err)
+	}
+	return &DB{db: db, path: path}, nil
+}
+
 // Recover opens a LevelDB database using RecoverFile, which rebuilds the
 // on-disk SST files from the WAL and MANIFEST.  Use this when the normal
 // Open fails or when a startup integrity check detects that a putSync write
@@ -124,7 +153,7 @@ func Recover(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("recover leveldb %s: %w", path, err)
 	}
-	return &DB{db: db}, nil
+	return &DB{db: db, path: path}, nil
 }
 
 // Close closes the database.
@@ -230,13 +259,14 @@ func (d *DB) GetBlockByHeight(height uint64) (*StoredBlock, error) {
 
 // StoredUTXO is the persistent UTXO representation.
 type StoredUTXO struct {
-	TxHash          crypto.Hash32     `json:"tx_hash"`
-	OutputIndex     uint32            `json:"output_index"`
-	OneTimePub      crypto.Point32    `json:"one_time_pub"`
-	TxPubKey        crypto.Point32    `json:"tx_pub_key"`
-	AmountCommit    crypto.Commitment `json:"amount_commit"`
-	EncAmount       [8]byte           `json:"enc_amount"`
-	BlockHeight     uint64            `json:"block_height"`
+	TxHash         crypto.Hash32     `json:"tx_hash"`
+	OutputIndex    uint32            `json:"output_index"`
+	OneTimePub     crypto.Point32    `json:"one_time_pub"`
+	TxPubKey       crypto.Point32    `json:"tx_pub_key"`
+	AmountCommit   crypto.Commitment `json:"amount_commit"`
+	EncAmount      [8]byte           `json:"enc_amount"`
+	BlockHeight    uint64            `json:"block_height"`
+	AmountNAPRO    uint64            `json:"amount_napro,string,omitempty"`
 	ProtocolLocked bool              `json:"protocol_locked,omitempty"`
 }
 
@@ -756,8 +786,8 @@ func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
-	if err:=d.restoreLPoDPool(batch,hash,height);err!=nil {return err}
-	if err:=d.rollbackLPoDIndices(batch,hash,height);err!=nil{return err}
+if err:=d.restoreLPoDPool(batch,hash,height);err!=nil {return err}
+if err:=d.rollbackLPoDIndices(batch,hash,height);err!=nil{return err}
 	batch.Put(hashKey, hash[:])
 	batch.Put(heightKey2, hb[:])
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
@@ -828,22 +858,22 @@ func (d *DB) CommitRawBlockWithAVM(
 	data []byte,
 	writes []AVMWrite,
 	writeSetCommitment crypto.Hash32,
-lpodSettlement ...*LPoDSettlement,
+	lpodSettlement ...*LPoDSettlement,
 ) error {
-	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil { return err }
+if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil { return err }
 	batch, err := avmBatch(writes)
 	if err != nil {
 		return err
 	}
-// Reserve and carries share the same fsynced batch as the canonical tip.
-// With no approved source allocation there is no initial LPoD checkpoint.
-if err := d.appendLPoDSettlement(batch, hash, height, lpodSettlement); err != nil {
-return err
-}
-	if len(lpodSettlement)==1 && lpodSettlement[0]!=nil && lpodSettlement[0].PositionProtocol{
+	// Reserve and carries share the same fsynced batch as the canonical tip.
+	// With no approved source allocation there is no initial LPoD checkpoint.
+	if err := d.appendLPoDSettlement(batch, hash, height, lpodSettlement); err != nil {
+		return err
+	}
+if len(lpodSettlement)==1 && lpodSettlement[0]!=nil && lpodSettlement[0].PositionProtocol{
 		var block core.Block
-		if err:=json.Unmarshal(data,&block);err!=nil{return err}
-		if err:=appendLPoDIndices(batch,&block,false);err!=nil{return err}
+if err:=json.Unmarshal(data,&block);err!=nil{return err}
+if err:=appendLPoDIndices(batch,&block,false);err!=nil{return err}
 if err:=d.appendLPoDWalletIndex(batch,&block,lpodSettlement[0]);err!=nil{return err}
 	}
 	blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)

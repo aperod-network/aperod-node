@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -168,19 +170,29 @@ func (h *nodeHandler) OnTransaction(tx *core.Transaction) {
 
 // OnVote forwards a p2p vote to the consensus engine.
 func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
-	var pub crypto.ValidatorPubKey
-	copy(pub[:], vote.ValidatorPub)
-	fm := consensus.FinalizeMsg{
+fm, err := finalityMsgFromP2P(vote)
+if err != nil {
+h.log.Warn("p2p: invalid vote public key", "err", err)
+return
+}
+select {
+case h.engine.NewVoteCh() <- fm:
+default:
+h.log.Warn("p2p: vote channel full — dropped")
+}
+}
+
+func finalityMsgFromP2P(vote p2p.VoteMsg) (consensus.FinalizeMsg, error) {
+pub, err := crypto.ValidatorPubKeyFromBytes(vote.ValidatorPub)
+if err != nil {
+return consensus.FinalizeMsg{}, err
+}
+return consensus.FinalizeMsg{
 		BlockHash:    vote.BlockHash,
 		Height:       vote.Height,
 		ValidatorPub: pub,
 		Signature:    vote.Signature,
-	}
-	select {
-	case h.engine.NewVoteCh() <- fm:
-	default:
-		h.log.Warn("p2p: vote channel full — dropped")
-	}
+}, nil
 }
 
 // runCompactDB implements the --compact-db subcommand.
@@ -1051,6 +1063,12 @@ func run() error {
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
+	// A shutdown-intent marker only suppresses watchdog action for the process
+	// that created it. Consume any marker left by a previous start immediately
+	// so crashes and stale markers can never mask a later real hang.
+	if err := removeShutdownIntentMarker(cfg.DataDir); err != nil {
+		log.Warn("failed to remove stale shutdown intent marker", "err", err)
+	}
 
 	// Guard: refuse to start when join-network.sh left a .rsync-in-progress
 	// sentinel in the data directory.  The sentinel is written immediately
@@ -1096,6 +1114,15 @@ func run() error {
 		}
 	}
 	defer db.Close()
+
+	// Bind the private checkpoint trigger beside the exact chain.db opened
+	// above. It is a Unix socket only and never shares the public TCP API.
+	backupSrv, err := startBackupSocket(cfg.DataDir, db)
+	if err != nil {
+		return fmt.Errorf("start backup socket: %w", err)
+	}
+	defer backupSrv.Close()
+	log.Info("private backup socket started", "path", backupSrv.path)
 
 	// ── 4. Load or generate a persistent validator key ────────────────────────
 	myKey, err := loadOrGenerateValidatorKey(cfg, log)
@@ -1754,7 +1781,8 @@ func run() error {
 		// Otherwise a restart could not validate chain-bound v2 withdrawal
 		// nonces, and legacy withdrawals after activation would be replayed under
 		// obsolete rules.
-		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
+		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators,
+			genesisConfig.Validators, cfg.Consensus.LPoDV2TrustAuthorities, cfg.Consensus.LPoDV3TrustAuthorities)
 		if err != nil {
 			return err
 		}
@@ -2454,6 +2482,8 @@ func run() error {
 	// (assigned after engine creation; closure captures by reference).
 	// apiSrv was declared above and started in the early API server section.
 	var host *p2p.Host
+	var voteHost atomic.Pointer[p2p.Host]
+	voteBroadcastCh := make(chan consensus.FinalizeMsg, 16)
 
 	// engine is pre-declared with var so that the OnBlockProduced closure
 	// can reference it (e.g. engine.Registry()) via a captured pointer.
@@ -2469,6 +2499,9 @@ func run() error {
 	// Both the periodic-GC path and the post-snapshot cleanup path use
 	// this same gate so they cannot overlap each other either.
 	var gcInFlight atomic.Bool
+	// Only one periodic snapshot may be captured or written at a time. Shutdown
+	// waits for that writer before capturing its own final snapshot.
+	snapshotSaveGate := &sync.Mutex{}
 
 	// For the resume path, registry is already created and seeded inside the
 	// startup scan above.  For genesis, it is nil here; NewEngine creates it.
@@ -2528,7 +2561,8 @@ func run() error {
 	}
 
 	if lpodMigration == nil {
-		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators)
+		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators,
+			genesisConfig.Validators, cfg.Consensus.LPoDV2TrustAuthorities, cfg.Consensus.LPoDV3TrustAuthorities)
 		if err != nil {
 			return err
 		}
@@ -2553,6 +2587,7 @@ func run() error {
 		Registry:                            registry,
 		MyKey:                               consensusMyKey,
 		RewardAddress:                       cfg.Consensus.RewardAddress,
+		StopProducingAtHeight:               cfg.Consensus.StopProducingAtHeight,
 		BlockRewardNAPR:                     cfg.Consensus.BlockRewardNAPR,
 		StakingPoolNAPR:                     cfg.Consensus.StakingPoolNAPR,
 		TailRewardNAPR:                      cfg.Consensus.TailRewardNAPR,
@@ -2562,6 +2597,7 @@ func run() error {
 		RingCTV4ActivationHeight:            cfg.Consensus.RingCTV4ActivationHeight,
 		RingCTCLSAGActivationHeight:         cfg.Consensus.RingCTCLSAGActivationHeight,
 		AVMActivationHeight:                 cfg.Consensus.AVMActivationHeight,
+		AVMGasBurnActivationHeight:          cfg.Consensus.AVMGasBurnActivationHeight,
 		AVMExecutor:                         avm.NewBlockExecutor(avm.LevelStore{DB: db}),
 		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
 		GuardianFundActivationHeight:        cfg.Consensus.GuardianFundActivationHeight,
@@ -2624,6 +2660,14 @@ func run() error {
 				}
 			}
 			return nil
+		},
+		OnVoteCast: func(vote consensus.FinalizeMsg) {
+			select {
+			case voteBroadcastCh <- vote:
+			default:
+				log.Warn("finality vote outbound queue full; periodic durable retry will recover",
+					"height", vote.Height)
+			}
 		},
 		OnBlockProduced: func(block *core.Block) error {
 			// Broadcast only locally-produced blocks; relaying an incoming block
@@ -2724,6 +2768,10 @@ func run() error {
 			if interval == 0 || h == 0 || h%interval != 0 {
 				return
 			}
+			if !snapshotSaveGate.TryLock() {
+				log.Warn("periodic snapshot skipped — previous save still active", "height", h)
+				return
+			}
 			var txTot int64
 			if apiSrv != nil {
 				txTot = apiSrv.TxTotal()
@@ -2745,6 +2793,7 @@ func run() error {
 			filterSnapshotKeyImages(&periodicSnap, db, log)
 			periodicActive := len(periodicSnap.UTXOs.ActiveUTXOs)
 			go func(snap startupSnapshot, height uint64, activeCount int) {
+				defer snapshotSaveGate.Unlock()
 				periodicSaveStart := time.Now()
 				if saveErr := saveStartupSnapshot(cfg.DataDir, snap); saveErr != nil {
 					log.Warn("failed to save periodic snapshot",
@@ -2799,6 +2848,13 @@ func run() error {
 	if apiSrv != nil {
 		apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash)
 	}
+	if db != nil && lpodMigration != nil && lpodMigration.Version == 3 {
+		if err := db.BackfillLPoDEarningsIndex(lpodMigration); err != nil {
+			log.Warn("v3 LPoD earnings index backfill incomplete; read API remains fail-closed", "err", err)
+} else {
+log.Info("v3 LPoD earnings index backfill complete")
+		}
+	}
 
 	// ── 8. Wire TxVerifier BEFORE starting the engine goroutine ──────────────
 	// engine.Run launches handleIncomingBlock immediately on incoming P2P
@@ -2852,6 +2908,36 @@ func run() error {
 	go func() {
 		engine.Run(stop)
 		close(engineDone)
+	}()
+
+	// P2P writes run outside the consensus engine. Periodically rebroadcast only
+	// the latest durable, canonical local vote to cover loss and reconnects.
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		broadcast := func(vote consensus.FinalizeMsg) {
+			p2pHost := voteHost.Load()
+			if p2pHost == nil {
+				return
+			}
+			p2pHost.BroadcastVote(p2p.VoteMsg{
+				BlockHash: vote.BlockHash, Height: vote.Height,
+				ValidatorPub: append([]byte(nil), vote.ValidatorPub[:]...),
+				Signature:    append([]byte(nil), vote.Signature...),
+			})
+		}
+		for {
+			select {
+			case <-stop:
+				return
+			case vote := <-voteBroadcastCh:
+				broadcast(vote)
+			case <-ticker.C:
+				if vote, ok := engine.LatestLocalVote(); ok {
+					broadcast(vote)
+				}
+			}
+		}
 	}()
 
 	// Drain ProducedCh so the consensus engine never blocks on a full channel.
@@ -3030,6 +3116,7 @@ func run() error {
 			host = p2p.NewHost(
 				buildP2PConfig(cfg, tcpAddr, bootnodes, myKey.Public().ID(), tlsCfg, nodeFingerprint),
 				handler, log)
+			voteHost.Store(host)
 			if len(cfg.P2P.PeerWhitelist) > 0 {
 				log.Info("peer IP whitelist active — only listed IPs may connect inbound",
 					"entries", len(cfg.P2P.PeerWhitelist))
@@ -3359,7 +3446,13 @@ func run() error {
 
 	log.Info("shutting down...")
 
-	performShutdown(stop, engineDone, db, utxos, registry, cfg.DataDir, log, apiSrv)
+	if err := backupSrv.Close(); err != nil {
+		log.Warn("failed to close backup socket", "err", err)
+	}
+	if err := writeShutdownIntentMarker(cfg.DataDir); err != nil {
+		log.Warn("failed to publish shutdown intent marker; watchdog may trigger a duplicate restart", "err", err)
+	}
+	performShutdownWithGate(stop, engineDone, db, utxos, registry, cfg.DataDir, log, apiSrv, snapshotSaveGate)
 
 	// Persist pending mempool transactions so they survive the restart.
 	saveMempoolOnShutdown(mempool, cfg.DataDir, log)
@@ -3414,10 +3507,30 @@ func performShutdown(
 	log *slog.Logger,
 	apiSrv *api.Server,
 ) {
+	performShutdownWithGate(stop, engineDone, db, utxos, registry, dataDir, log, apiSrv, nil)
+}
+
+func performShutdownWithGate(
+	stop chan struct{},
+	engineDone <-chan struct{},
+	db *store.DB,
+	utxos *core.UTXOSet,
+	registry *core.ValidatorRegistry,
+	dataDir string,
+	log *slog.Logger,
+	apiSrv *api.Server,
+	snapshotSaveGate *sync.Mutex,
+) {
 	// Step 1 + 2: stop the engine and wait for full quiescence.
 	// GetTip MUST NOT be called before this point.
 	close(stop)
 	<-engineDone
+	// An older periodic writer must complete before the final tip is captured
+	// or published. This also prevents the two full-size copies coexisting.
+	if snapshotSaveGate != nil {
+		snapshotSaveGate.Lock()
+		defer snapshotSaveGate.Unlock()
+	}
 
 	// Step 3: reclaim as much memory as possible before the snapshot save so
 	// that TakeSnapshot() itself — which serialises the full UTXO set — does
@@ -3462,26 +3575,35 @@ func saveShutdownSnapshot(
 // written to the snapshot — if saved they permanently mark a valid UTXO as
 // spent, requiring a manual re-mint to recover the balance.
 //
-// Safe fallbacks:
-//   - If IterKeyImages fails, filtering is skipped (all KIs kept).
-//   - If the index is empty (genesis or index not yet built), filtering is
-//     skipped so genesis nodes don't lose their initial KI state.
+// Safe fallbacks: if the index is empty or any lookup fails, leave the
+// detached snapshot unchanged. Never load the entire historical KI index
+// into a Go map during a memory-sensitive snapshot save.
 func filterSnapshotKeyImages(snap *startupSnapshot, db *store.DB, log *slog.Logger) {
-	confirmed := make(map[crypto.KeyImage]bool)
-	if iterErr := db.IterKeyImages(func(ki crypto.KeyImage) error {
-		confirmed[ki] = true
-		return nil
-	}); iterErr != nil {
+	if len(snap.UTXOs.KeyImages) == 0 {
+		return
+	}
+	stopAfterFirst := errors.New("key-image index is present")
+	hasIndex := false
+	iterErr := db.IterKeyImages(func(crypto.KeyImage) error {
+		hasIndex = true
+		return stopAfterFirst
+	})
+	if iterErr != nil && !errors.Is(iterErr, stopAfterFirst) {
 		log.Warn("snapshot: could not read key-image index — snapshot KIs unfiltered", "err", iterErr)
 		return
 	}
-	if len(confirmed) == 0 {
+	if !hasIndex {
 		return // genesis node or index not yet built — nothing to filter
 	}
 	before := len(snap.UTXOs.KeyImages)
-	kept := snap.UTXOs.KeyImages[:0]
+	kept := make([]crypto.KeyImage, 0, before)
 	for _, ki := range snap.UTXOs.KeyImages {
-		if confirmed[ki] {
+		confirmed, lookupErr := db.IsKeyImageSpent(ki)
+		if lookupErr != nil {
+			log.Warn("snapshot: key-image lookup failed — snapshot KIs unfiltered", "err", lookupErr)
+			return
+		}
+		if confirmed {
 			kept = append(kept, ki)
 		}
 	}
