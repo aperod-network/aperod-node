@@ -45,6 +45,19 @@ fi
 TMPDIR_TEST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
+# Use a deterministic monotonic clock for the script under test. A fresh CI
+# host can have uptime <480s, making timestamp=0 still fall inside startup
+# grace. Never change the production clock or disable its grace protection.
+MOCK_UPTIME_FILE="$TMPDIR_TEST/uptime"
+printf '10000.00 0.00\n' > "$MOCK_UPTIME_FILE"
+if [[ $(grep -Fc 'read -r uptime _ < /proc/uptime;' "$WATCHDOG_SH") != 1 ]]; then
+  echo "Watchdog uptime reader changed; update the clock fixture." >&2
+  exit 1
+fi
+sed "s|read -r uptime _ < /proc/uptime;|read -r uptime _ < $MOCK_UPTIME_FILE;|" \
+  "$WATCHDOG_SH" > "$TMPDIR_TEST/watchdog-under-test.sh"
+WATCHDOG_SH="$TMPDIR_TEST/watchdog-under-test.sh"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1875,7 +1888,7 @@ T35_SC_LOG="$T35_DIR/systemctl.log"
 T35_OUTPUT="$T35_DIR/output.log"
 T35_FAKE_SC=$(make_fake_bin "systemctl" "$T35_SC_LOG")
 T35_CURL=$(make_fake_curl "$T35_DIR/curl.log" "000")
-T35_ACTIVE_ENTER_US=$(awk '{printf "%.0f", $1 * 1000000}' /proc/uptime)
+T35_ACTIVE_ENTER_US=$(awk '{printf "%.0f", $1 * 1000000}' "$MOCK_UPTIME_FILE")
 
 NODE_API_URL="http://127.0.0.1:19999" \
   STATE_DIR="$T35_DIR/state" \
