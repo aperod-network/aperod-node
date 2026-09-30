@@ -15,8 +15,39 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
+
+// Every scenario must isolate its mutable state, even when run as root in CI.
+// Otherwise an earlier scenario's alert cooldown suppresses later alerts and
+// the suite writes into the host's real /var/lib/aperod directory.
+func TestWatchdogScenarioStateIsolation(t *testing.T) {
+	raw, err := os.ReadFile("test-watchdog.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	calls := 0
+	for i, line := range lines {
+		if !strings.Contains(line, `bash "$WATCHDOG_SH"`) {
+			continue
+		}
+		calls++
+		isolated := false
+		for j := i - 1; j >= 0 && strings.HasSuffix(strings.TrimSpace(lines[j]), `\`); j-- {
+			if strings.Contains(lines[j], `STATE_DIR="`) {
+				isolated = true
+			}
+		}
+		if !isolated {
+			t.Errorf("watchdog invocation at line %d lacks an explicit isolated STATE_DIR", i+1)
+		}
+	}
+	if calls == 0 {
+		t.Fatal("no watchdog scenario invocations found")
+	}
+}
 
 // TestWatchdogSh runs test-watchdog.sh as a subprocess and fails if the
 // script exits with a non-zero status.

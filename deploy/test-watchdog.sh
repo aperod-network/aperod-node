@@ -206,6 +206,7 @@ LOG1="$TMPDIR_TEST/systemctl-t1.log"
 FAKE1=$(make_fake_bin "systemctl" "$LOG1")
 
 NODE_API_URL="http://127.0.0.1:${PORT1}" \
+  STATE_DIR="$TMPDIR_TEST/t1-state" \
   TIMEOUT_SECS="3" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
@@ -292,6 +293,7 @@ LOG3="$TMPDIR_TEST/systemctl-t3.log"
 FAKE3=$(make_fake_bin "systemctl" "$LOG3")
 
 NODE_API_URL="http://127.0.0.1:${PORT3}" \
+  STATE_DIR="$TMPDIR_TEST/t3-state" \
   TIMEOUT_SECS="2" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
@@ -348,6 +350,7 @@ LOG5="$TMPDIR_TEST/systemctl-t5.log"
 FAKE5=$(make_fake_bin "systemctl" "$LOG5")
 
 NODE_API_URL="http://127.0.0.1:${PORT5}" \
+  STATE_DIR="$TMPDIR_TEST/t5-state" \
   TIMEOUT_SECS="3" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
@@ -411,6 +414,7 @@ NODE_API_URL="http://127.0.0.1:19999" \
   TIMEOUT_SECS="3" \
   SUPPORT_BOT_TOKEN="test-bot-token" \
   SUPPORT_ADMIN_CHAT_ID="123456789" \
+  STATE_DIR="$TMPDIR_TEST/t6-state" \
   PATH="$FAKE6_CURL:$FAKE6_SC:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT6=$?
@@ -496,6 +500,7 @@ NODE_API_URL="http://127.0.0.1:19999" \
   TIMEOUT_SECS="3" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
+  STATE_DIR="$TMPDIR_TEST/t8-state" \
   PATH="$FAKE8_CURL:$FAKE8_SC:$PATH" \
   bash "$WATCHDOG_SH" >/dev/null 2>&1
 WDEXIT8=$?
