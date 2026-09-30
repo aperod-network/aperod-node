@@ -22,6 +22,10 @@ CONFIG_DIR="/etc/aperod"
 GO_VERSION="1.23.4"
 P2P_PORT=30303
 RPC_PORT=8545
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/source-safe-guard.sh"
+source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" ||
+  die "Установка остановлена защитой исходников; существующие данные и файлы не изменены"
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════════════════════╗

@@ -38,7 +38,113 @@ fi
 
 # ── Shared temp directory (cleaned on exit) ───────────────────────────────────
 TMPDIR_TEST=$(mktemp -d)
-trap 'rm -rf "$TMPDIR_TEST"' EXIT
+export TMPDIR_TEST
+SERVER_PIDS=()
+cleanup_test_files() {
+  local pid
+  for pid in "${SERVER_PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  rm -rf "$TMPDIR_TEST"
+}
+trap cleanup_test_files EXIT
+
+CHECKPOINT_NODE_DIR="$TMPDIR_TEST/node-data"
+CHECKPOINT_CHAIN_DIR="$CHECKPOINT_NODE_DIR/testnet"
+CHECKPOINT_STAGE_DIR="$CHECKPOINT_CHAIN_DIR/.backup-staging/checkpoint-test"
+CHECKPOINT_RESPONSE="$TMPDIR_TEST/checkpoint-response.json"
+export MOCK_REMOTE_DIR="$TMPDIR_TEST/remote-store"
+export APEROD_NODE_DATA_DIR_OVERRIDE="$CHECKPOINT_NODE_DIR"
+export APEROD_TEST_CHECKPOINT_RESPONSE="$CHECKPOINT_RESPONSE"
+mkdir -p "$MOCK_REMOTE_DIR"
+
+# The current backup path requires an executable archive verifier and pg_restore
+# before it requests a checkpoint. Provide deterministic test-only executables
+# while keeping the real tar/GPG path available to the crypto integration case.
+T_FAKE_VERIFY="$TMPDIR_TEST/aperod-backup-verify"
+cat >"$T_FAKE_VERIFY" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 2 && ( "$1" == "--stage" || "$1" == "--legacy-stage" ) && -d "$2" ]]
+printf 'verify %s\n' "$*" >> "${APEROD_TEST_VERIFY_LOG:?}"
+python3 - "$1" "$2" <<'PY'
+import json, os, sys
+mode, stage = sys.argv[1:]
+if mode == "--legacy-stage":
+    db = os.path.join(stage, "testnet", "chain.db")
+    if not os.path.isdir(db) or not os.path.isfile(os.path.join(db, "CURRENT")):
+        raise SystemExit("legacy stage has no LevelDB CURRENT")
+    if not os.path.isfile(os.path.join(stage, "explorer_db.dump")):
+        raise SystemExit("legacy stage has no explorer dump")
+    print(json.dumps({
+        "success": True, "legacy": True, "tip_height": 42,
+        "tip_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }))
+else:
+    with open(os.path.join(stage, "manifest.json"), encoding="utf-8") as source:
+        manifest = json.load(source)
+    db = os.path.join(stage, "chain.db")
+    if not os.path.isdir(db) or not os.path.isfile(os.path.join(db, "CURRENT")):
+        raise SystemExit("verified stage has no LevelDB CURRENT")
+    if manifest.get("success") is not True:
+        raise SystemExit("verified stage manifest is unsuccessful")
+    print(json.dumps({
+        "success": True,
+        "tip_height": manifest["tip_height"],
+        "tip_hash": manifest["tip_hash"],
+    }))
+PY
+STUB
+chmod +x "$T_FAKE_VERIFY"
+export APEROD_BACKUP_VERIFY_BIN="$T_FAKE_VERIFY"
+export APEROD_TEST_VERIFY_LOG="$TMPDIR_TEST/verifier.log"
+
+T_FAKE_PG_RESTORE_DIR="$TMPDIR_TEST/fake-pg-restore"
+mkdir -p "$T_FAKE_PG_RESTORE_DIR"
+cat >"$T_FAKE_PG_RESTORE_DIR/pg_restore" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 3 && "$1" == "--file" && "$2" == "/dev/null" && -f "$3" ]]
+printf 'pg_restore %s\n' "$*" >> "${APEROD_TEST_PG_RESTORE_LOG:?}"
+STUB
+chmod +x "$T_FAKE_PG_RESTORE_DIR/pg_restore"
+export APEROD_TEST_PG_RESTORE_LOG="$TMPDIR_TEST/pg-restore.log"
+export PATH="$T_FAKE_PG_RESTORE_DIR:$PATH"
+
+# The backup process now requires root and a live Unix socket that represents
+# the node's closed logical checkpoint.  The test runner supplies root (via a
+# user namespace in unprivileged CI); the socket listener itself is only an
+# inode because the curl mock supplies the deterministic response body.
+make_checkpoint_fixture() {
+  local node_dir="${1:-$CHECKPOINT_NODE_DIR}"
+  local chain_dir="$node_dir/testnet"
+  local active_db="$chain_dir/chain.db"
+  local stage_dir="$chain_dir/.backup-staging/checkpoint-test"
+  mkdir -p "$active_db"
+  printf '0000000000000001\n' > "$active_db/CURRENT"
+  printf 'leveldb-manifest\n' > "$active_db/MANIFEST-000001"
+  printf 'table data\n' > "$active_db/000003.ldb"
+  mkdir -p "$stage_dir/chain.db"
+  printf '0000000000000001\n' > "$stage_dir/chain.db/CURRENT"
+  printf 'leveldb-manifest\n' > "$stage_dir/chain.db/MANIFEST-000001"
+  printf 'table data\n' > "$stage_dir/chain.db/000003.ldb"
+  printf '{"success":true,"tip_height":42,"tip_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
+    > "$stage_dir/manifest.json"
+  printf '{"path":"%s","tip_height":42,"tip_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
+    "$stage_dir" > "$CHECKPOINT_RESPONSE"
+
+  mkdir -p "$chain_dir"
+  if [[ ! -S "$chain_dir/.aperod-backup.sock" ]]; then
+    python3 - "$chain_dir/.aperod-backup.sock" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+while True:
+    time.sleep(60)
+PY
+    SERVER_PIDS+=("$!")
+    for _ in {1..50}; do [[ -S "$chain_dir/.aperod-backup.sock" ]] && break; sleep 0.02; done
+  fi
+}
+make_checkpoint_fixture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,11 +177,134 @@ make_fake_curl() {
   fake_dir=$(mktemp -d "$TMPDIR_TEST/fake-curl-XXXXXXXX")
   cat >"$fake_dir/curl" <<STUB
 #!/usr/bin/env bash
+if [[ " \$* " == *" --unix-socket "* ]]; then
+  output=""
+  socket_path=""
+  while [[ \$# -gt 0 ]]; do
+    if [[ "\$1" == "--output" ]]; then
+      output="\$2"
+      shift 2
+    elif [[ "\$1" == "--unix-socket" ]]; then
+      socket_path="\$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  [[ -n "\$output" && -S "\$socket_path" ]]
+  echo "checkpoint \$socket_path" >> "$log_file"
+  chain_dir="\$(dirname "\$socket_path")"
+  stage_dir="\$chain_dir/.backup-staging/checkpoint-test"
+  mkdir -p "\$stage_dir/chain.db"
+  printf '0000000000000001\\n' > "\$stage_dir/chain.db/CURRENT"
+  printf 'leveldb-manifest\\n' > "\$stage_dir/chain.db/MANIFEST-000001"
+  printf 'table data\\n' > "\$stage_dir/chain.db/000003.ldb"
+  printf '%s\\n' '{"success":true,"tip_height":42,"tip_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
+    > "\$stage_dir/manifest.json"
+  printf '%s\\n' "{\"path\":\"\$stage_dir\",\"tip_height\":42,\"tip_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" \
+    > "\$output"
+  exit 0
+fi
 echo "curl \$*" >> "$log_file"
 exit 0
 STUB
   chmod +x "$fake_dir/curl"
   echo "$fake_dir"
+}
+
+# Minimal deterministic rclone/GPG mocks for a successful backup. The tar
+# stream is intentionally opaque in these tests; archive member validation is
+# exercised separately by Test 13 and the logical-checkpoint suite.
+make_fake_verified_rclone() {
+  local fake_dir="$1"
+  mkdir -p "$fake_dir"
+  cat >"$fake_dir/rclone" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+store="${MOCK_REMOTE_DIR:?remote fixture is required}"
+mkdir -p "$store"
+if [[ -n "${MOCK_RCLONE_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$MOCK_RCLONE_LOG"
+fi
+base_name() { printf '%s' "${1##*/}"; }
+case "$1" in
+  lsjson)
+    python3 - "$store" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+print(json.dumps([
+    {"Name": name, "Size": os.path.getsize(os.path.join(root, name)), "IsDir": False}
+    for name in sorted(os.listdir(root))
+    if os.path.isfile(os.path.join(root, name))
+]))
+PY
+    ;;
+  copyto)
+    src="$2"; dst="$3"
+    if [[ "$src" == s3backup:* && "$dst" == s3backup:* ]]; then
+      cp "$store/$(base_name "$src")" "$store/$(base_name "$dst")"
+    elif [[ "$src" == s3backup:* ]]; then
+      cp "$store/$(base_name "$src")" "$dst"
+    else
+      cp "$src" "$store/$(base_name "$dst")"
+    fi
+    ;;
+  size)
+    file="$store/$(base_name "$2")"
+    python3 - "$file" <<'PY'
+import json, os, sys
+print(json.dumps({"count": 1, "bytes": os.path.getsize(sys.argv[1])}))
+PY
+    ;;
+  deletefile)
+    rm -f "$store/$(base_name "$2")"
+    ;;
+  delete)
+    for file in "$store"/aperod_backup_*.tar.gpg; do
+      [[ -f "$file" ]] || continue
+      [[ "$(basename "$file")" == "aperod_backup.tar.gpg" ]] || rm -f "$file"
+    done
+    ;;
+  *)
+    echo "unexpected rclone command: $*" >&2
+    exit 2
+    ;;
+esac
+STUB
+  chmod +x "$fake_dir/rclone"
+}
+
+make_fake_verified_gpg() {
+  local fake_dir="$1"
+  mkdir -p "$fake_dir"
+  cat >"$fake_dir/gpg" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+input=""
+decrypt=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --decrypt) decrypt=1; shift ;;
+    -o|--output) output="$2"; shift 2 ;;
+    --*) shift ;;
+    *) input="$1"; shift ;;
+  esac
+done
+if [[ "$decrypt" -eq 1 ]]; then
+  if [[ -n "$output" ]]; then
+    if [[ "$input" == "-" ]]; then cat > "$output"; else cat "$input" > "$output"; fi
+  elif [[ "$input" == "-" ]]; then
+    cat
+  else
+    cat "$input"
+  fi
+else
+  [[ -n "$output" && "$input" == "-" ]]
+  cat > "$output"
+fi
+STUB
+  chmod +x "$fake_dir/gpg"
 }
 
 # Create a minimal integration-settings.json with valid S3 fields.
@@ -352,40 +581,19 @@ T9_FAKE_PGDUMP=$(make_fake_bin "pg_dump" "$T9_PGDUMP_LOG" 0)
 
 # gpg stub that creates the output file (script passes -o <outfile> arg)
 T9_FAKE_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t9-XXXXXXXX")
-cat >"$T9_FAKE_GPG_DIR/gpg" <<'STUB'
-#!/usr/bin/env bash
-# Parse -o <outfile> from args and create an empty file there
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-o" ]]; then
-    touch "$2"
-    shift 2
-  else
-    shift
-  fi
-done
-exit 0
-STUB
-chmod +x "$T9_FAKE_GPG_DIR/gpg"
+make_fake_verified_gpg "$T9_FAKE_GPG_DIR"
 
-# tar stub: streaming pipeline writes to stdout → gpg stub creates the output file
+# Use real tar in the successful mock runs so archive extraction validates actual members.
 T9_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t9-XXXXXXXX")
 cat >"$T9_FAKE_TAR_DIR/tar" <<'STUB'
 #!/usr/bin/env bash
-# In the streaming pipeline tar writes to stdout (-czf -); gpg handles the output.
-exit 0
+exec /bin/tar "$@"
 STUB
 chmod +x "$T9_FAKE_TAR_DIR/tar"
 
 # rclone stub that succeeds; for `rclone size` return minimal JSON
 T9_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t9-XXXXXXXX")
-cat >"$T9_FAKE_RCLONE_DIR/rclone" <<'STUB'
-#!/usr/bin/env bash
-if [[ "$1" == "size" ]]; then
-  echo '{"count":1,"bytes":1024}'
-fi
-exit 0
-STUB
-chmod +x "$T9_FAKE_RCLONE_DIR/rclone"
+make_fake_verified_rclone "$T9_FAKE_RCLONE_DIR"
 
 # df stub — return plenty of free space so disk preflight passes
 T9_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t9-XXXXXXXX")
@@ -416,6 +624,22 @@ if [[ ! -f "$T9_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T9_CURL_LOG" 2>/d
 else
   fail "Telegram failure alert was unexpectedly sent on a successful run (log: $(cat "$T9_CURL_LOG" 2>/dev/null))"
 fi
+if [[ ! -e "$CHECKPOINT_STAGE_DIR" ]]; then
+  pass "validated checkpoint stage is removed after a successful backup"
+else
+  fail "validated checkpoint stage remains after successful backup: $CHECKPOINT_STAGE_DIR"
+fi
+if [[ -d "$T9_BACKUP_DIR" ]] && [[ -z "$(find "$T9_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  pass "backup override remains as the parent; owned mktemp work directory is cleaned"
+else
+  fail "backup work directory cleanup changed or removed the override parent: $T9_BACKUP_DIR"
+fi
+if grep -q '^verify --stage ' "$APEROD_TEST_VERIFY_LOG" \
+  && grep -q '^pg_restore --file /dev/null .*/explorer_db.dump$' "$APEROD_TEST_PG_RESTORE_LOG"; then
+  pass "remote archive validation invokes the configured verifier and pg_restore"
+else
+  fail "archive verifier/pg_restore mock was not invoked as required"
+fi
 
 # =============================================================================
 # Test 10: Low-disk preflight → exits 0, aperod_backup_skipped_low_disk=1
@@ -430,12 +654,14 @@ T10_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t10-XXXXXXXX")
 T10_CURL_LOG="$T10_DIR/curl.log"
 T10_FAKE_CURL=$(make_fake_curl "$T10_CURL_LOG")
 
-# df stub: return only 1 MB free (far below 5 GB minimum)
+# df stub: node filesystem has enough checkpoint reserve, while the private
+# backup workdir filesystem has only 1 MB and must trigger the BACKUP_DIR alert.
 T10_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t10-XXXXXXXX")
 cat >"$T10_FAKE_DF_DIR/df" <<'STUB'
 #!/usr/bin/env bash
+path="${@: -1}"
 echo "Avail"
-echo "1024"
+if [[ "$path" == *aperod_backups_* ]]; then echo "1024"; else echo "20971520"; fi
 exit 0
 STUB
 chmod +x "$T10_FAKE_DF_DIR/df"
@@ -506,6 +732,11 @@ if [[ -f "$T10_CURL_LOG" ]] && grep -qE '[0-9]+\.[0-9]' "$T10_CURL_LOG"; then
 else
   fail "Telegram low-disk alert does NOT contain numeric free-space value (log: $(cat "$T10_CURL_LOG" 2>/dev/null || echo '<empty>'))"
 fi
+if [[ ! -e "$CHECKPOINT_STAGE_DIR" ]]; then
+  pass "validated checkpoint stage is removed after low-disk skip"
+else
+  fail "validated checkpoint stage remains after low-disk skip: $CHECKPOINT_STAGE_DIR"
+fi
 
 # =============================================================================
 # Test 11: Recovery — after space freed the next run succeeds (skipped_low_disk=0)
@@ -565,30 +796,17 @@ STUB
 chmod +x "$T11_FAKE_DF_OK/df"
 
 T11_FAKE_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t11-XXXXXXXX")
-cat >"$T11_FAKE_GPG_DIR/gpg" <<'STUB'
-#!/usr/bin/env bash
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-o" ]]; then touch "$2"; shift 2; else shift; fi
-done
-exit 0
-STUB
-chmod +x "$T11_FAKE_GPG_DIR/gpg"
+make_fake_verified_gpg "$T11_FAKE_GPG_DIR"
 
 T11_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t11-XXXXXXXX")
 cat >"$T11_FAKE_TAR_DIR/tar" <<'STUB'
 #!/usr/bin/env bash
-# In the streaming pipeline tar writes to stdout (-czf -); gpg stub creates output.
-exit 0
+exec /bin/tar "$@"
 STUB
 chmod +x "$T11_FAKE_TAR_DIR/tar"
 
 T11_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t11-XXXXXXXX")
-cat >"$T11_FAKE_RCLONE_DIR/rclone" <<'STUB'
-#!/usr/bin/env bash
-if [[ "$1" == "size" ]]; then echo '{"count":1,"bytes":2048}'; fi
-exit 0
-STUB
-chmod +x "$T11_FAKE_RCLONE_DIR/rclone"
+make_fake_verified_rclone "$T11_FAKE_RCLONE_DIR"
 
 # Re-create backup dir (previous run may have cleaned it up via EXIT trap)
 mkdir -p "$T11_BACKUP_DIR"
@@ -620,26 +838,31 @@ if [[ -f "$T11_PROM" ]] && grep -q "^aperod_backup_last_success 1" "$T11_PROM"; 
 else
   fail "Prometheus: aperod_backup_last_success=1 NOT found after recovery run"
 fi
-
-# =============================================================================
-# Test 12: Static — BACKUP_DIR preflight checks /opt/aperod partition, not /tmp
-# =============================================================================
-section "Test 12: static analysis — BACKUP_DIR preflight checks /opt/aperod, not /tmp"
-
-# The hardcoded default inside the variable expansion must point to /opt/aperod.
-# The assignment looks like: BACKUP_DIR="${APEROD_BACKUP_DIR_OVERRIDE:-/opt/aperod/...}"
-BACKUP_DIR_LINE=$(grep 'BACKUP_DIR=' "$BACKUP_SH" | grep -v '^\s*#' | head -1 || true)
-
-if echo "$BACKUP_DIR_LINE" | grep -q ':-/opt/aperod'; then
-  pass "BACKUP_DIR default (after :-) contains /opt/aperod (not /tmp)"
+T11_REMOTE_COUNT=$(find "$MOCK_REMOTE_DIR" -maxdepth 1 -type f | wc -l)
+if [[ "$T11_REMOTE_COUNT" -eq 2 ]] \
+  && [[ -s "$MOCK_REMOTE_DIR/aperod_backup.tar.gpg" ]] \
+  && [[ -s "$MOCK_REMOTE_DIR/aperod_backup_previous.tar.gpg" ]]; then
+  pass "second successful backup retains exactly the fixed and previous verified generations"
 else
-  fail "BACKUP_DIR default does NOT contain /opt/aperod: $BACKUP_DIR_LINE"
+  fail "two-generation retention mismatch after recovery backup (objects: $(find "$MOCK_REMOTE_DIR" -maxdepth 1 -type f -printf '%f ' 2>/dev/null || echo '<none>'))"
 fi
 
-if echo "$BACKUP_DIR_LINE" | grep -qv ':-/tmp'; then
-  pass "BACKUP_DIR default does not fall back to /tmp"
+# =============================================================================
+# Test 12: Static — backup workdir parent checks /opt/aperod partition, not /tmp
+# =============================================================================
+section "Test 12: static analysis — backup workdir parent checks /opt/aperod, not /tmp"
+
+BACKUP_ROOT_DEFAULT=$(grep 'BACKUP_ROOT_REQUESTED="/opt/aperod/' "$BACKUP_SH" | grep -v '^\s*#' | head -1 || true)
+if echo "$BACKUP_ROOT_DEFAULT" | grep -q '"/opt/aperod/'; then
+  pass "default backup workdir parent is under /opt/aperod"
 else
-  fail "BACKUP_DIR default uses /tmp — preflight would check the wrong partition"
+  fail "default backup workdir parent does NOT contain /opt/aperod: $BACKUP_ROOT_DEFAULT"
+fi
+
+if echo "$BACKUP_ROOT_DEFAULT" | grep -qv '"/tmp'; then
+  pass "default backup workdir parent does not fall back to /tmp"
+else
+  fail "default backup workdir parent uses /tmp — preflight would check the wrong partition"
 fi
 
 # The _disk_preflight call for BACKUP_DIR must pass a label containing opt/aperod
@@ -670,12 +893,12 @@ else
 
 T13_DIR=$(mktemp -d "$TMPDIR_TEST/run-t13-XXXXXXXX")
 T13_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t13-XXXXXXXX")
+make_checkpoint_fixture "$T13_DATA_DIR"
 T13_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t13-XXXXXXXX")
+T13_REMOTE_DIR="$T13_DIR/remote"
+mkdir -p "$T13_REMOTE_DIR"
 make_settings_json "$T13_DIR/data"
 mkdir -p "$T13_DIR/metrics"
-
-# Populate a small node data file so tar has real content to compress
-echo "blockdata" > "$T13_DATA_DIR/test_block.bin"
 
 # sudo stub: creates the DB dump file directly (bypasses pg_dump)
 T13_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t13-XXXXXXXX")
@@ -692,12 +915,7 @@ touch "$T13_BACKUP_DIR/explorer_db.dump"
 echo "pg_dump_placeholder" > "$T13_BACKUP_DIR/explorer_db.dump"
 
 T13_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t13-XXXXXXXX")
-cat >"$T13_FAKE_RCLONE_DIR/rclone" <<'STUB'
-#!/usr/bin/env bash
-if [[ "$1" == "size" ]]; then echo '{"count":1,"bytes":1024}'; fi
-exit 0
-STUB
-chmod +x "$T13_FAKE_RCLONE_DIR/rclone"
+make_fake_verified_rclone "$T13_FAKE_RCLONE_DIR"
 
 T13_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t13-XXXXXXXX")
 cat >"$T13_FAKE_DF_DIR/df" <<'STUB'
@@ -707,6 +925,7 @@ echo "20971520"
 exit 0
 STUB
 chmod +x "$T13_FAKE_DF_DIR/df"
+T13_FAKE_CURL=$(make_fake_curl "$T13_DIR/curl.log")
 
 # du stub for _disk_preflight_scaled (called with NODE_DATA_DIR)
 T13_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t13-XXXXXXXX")
@@ -725,8 +944,13 @@ APEROD_BACKUP_PASSWORD="t13-test-password" \
   APEROD_HISTORY_LOG="$T13_DIR/backup.log" \
   APEROD_BACKUP_DIR_OVERRIDE="$T13_BACKUP_DIR" \
   APEROD_NODE_DATA_DIR_OVERRIDE="$T13_DATA_DIR" \
-  PATH="$T13_FAKE_SUDO_DIR:$T13_FAKE_RCLONE_DIR:$T13_FAKE_DF_DIR:$T13_FAKE_DU_DIR:$PATH" \
+  MOCK_REMOTE_DIR="$T13_REMOTE_DIR" \
+  PATH="$T13_FAKE_CURL:$T13_FAKE_SUDO_DIR:$T13_FAKE_RCLONE_DIR:$T13_FAKE_DF_DIR:$T13_FAKE_DU_DIR:$PATH" \
   bash "$BACKUP_SH" >/dev/null 2>&1 || T13_EXIT=$?
+
+# The backup correctly removes its validated stage at exit. Recreate the
+# deterministic checkpoint fixture for the independent real tar|gpg roundtrip.
+make_checkpoint_fixture "$T13_DATA_DIR"
 
 # The BACKUP_DIR is cleaned by the script's EXIT trap; find the gpg file beforehand.
 # We can find it via rclone size call in the history log or re-run just the crypto step.
@@ -735,16 +959,13 @@ APEROD_BACKUP_PASSWORD="t13-test-password" \
 # Instead: run just the streaming step directly with known paths for verification.
 T13_VERIFY_DIR=$(mktemp -d "$TMPDIR_TEST/verify-t13-XXXXXXXX")
 echo "pg_dump_placeholder" > "$T13_VERIFY_DIR/explorer_db.dump"
-echo "blockdata" > "$T13_VERIFY_DIR/test_block.bin"
-T13_DATA_VERIFY=$(mktemp -d "$TMPDIR_TEST/nodedata-verify-t13-XXXXXXXX")
-echo "blockdata" > "$T13_DATA_VERIFY/test_block.bin"
 T13_PASS="direct-crypto-test-pw"
 T13_OUTFILE="$T13_VERIFY_DIR/direct.tar.gpg"
 
-# Run the streaming command directly (no stubs needed — real tar/gpg)
-TAR_ARGS_TEST=( --ignore-failed-read --warning=no-file-removed -czf -
-               -C "$T13_VERIFY_DIR" explorer_db.dump
-               -C "$T13_DATA_VERIFY" . )
+# Run the fail-closed streaming command against the immutable checkpoint stage.
+TAR_ARGS_TEST=( -czf -
+               -C "$T13_DATA_DIR/testnet/.backup-staging/checkpoint-test" chain.db manifest.json
+               -C "$T13_VERIFY_DIR" explorer_db.dump )
 tar "${TAR_ARGS_TEST[@]}" \
   | gpg --batch --yes --passphrase-fd 3 \
       --symmetric --cipher-algo AES256 \
@@ -758,7 +979,7 @@ else
   fail "Streaming pipeline failed (exit=$T13_CRYPTO_EXIT, file exists: $([ -f "$T13_OUTFILE" ] && echo yes || echo no))"
 fi
 
-# Decrypt and list — must contain explorer_db.dump
+# Decrypt and list — only the closed snapshot, its manifest, and pg_dump belong.
 T13_LISTING=$(gpg --batch --yes --passphrase "$T13_PASS" \
   --decrypt "$T13_OUTFILE" 2>/dev/null | tar -tzf - 2>/dev/null || true)
 
@@ -768,10 +989,20 @@ else
   fail "Decrypted archive listing does NOT contain explorer_db.dump (listing: $T13_LISTING)"
 fi
 
-if echo "$T13_LISTING" | grep -q "test_block.bin"; then
-  pass "Decrypted archive listing contains node data file (test_block.bin)"
+if echo "$T13_LISTING" | grep -qx "chain.db/CURRENT" \
+  && echo "$T13_LISTING" | grep -qx "chain.db/MANIFEST-000001" \
+  && echo "$T13_LISTING" | grep -qx "chain.db/000003.ldb" \
+  && echo "$T13_LISTING" | grep -qx "manifest.json"; then
+  pass "Decrypted archive contains the closed chain.db directory and checkpoint manifest"
 else
-  fail "Decrypted archive listing does NOT contain node data file (listing: $T13_LISTING)"
+  fail "Decrypted archive is missing closed checkpoint members (listing: $T13_LISTING)"
+fi
+
+if ! echo "$T13_LISTING" | grep -q "test_block.bin" \
+  && ! echo "$T13_LISTING" | grep -q "backup-staging"; then
+  pass "Archive excludes live node data and staging-path prefixes"
+else
+  fail "Archive unexpectedly contains live node data or staging path prefixes (listing: $T13_LISTING)"
 fi
 
 # Confirm no intermediate files were created (no .tar or .tar.gz alongside the .tar.gpg)
@@ -792,6 +1023,7 @@ section "Test 14: scaled preflight accepts when BACKUP_DIR has node-data + 1 GiB
 
 T14_DIR=$(mktemp -d "$TMPDIR_TEST/run-t14-XXXXXXXX")
 T14_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t14-XXXXXXXX")
+make_checkpoint_fixture "$T14_DATA_DIR"
 echo "blockdata" > "$T14_DATA_DIR/block.bin"
 make_settings_json "$T14_DIR/data"
 mkdir -p "$T14_DIR/metrics"
@@ -803,36 +1035,43 @@ T14_FAKE_CURL=$(make_fake_curl "$T14_CURL_LOG")
 T14_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t14-XXXXXXXX")
 cat >"$T14_FAKE_DU_DIR/du" <<'STUB'
 #!/usr/bin/env bash
-echo "2097152	$2"
+path="${@: -1}"
+if [[ "$path" == */chain.db ]]; then
+  echo "2097152	$path"
+else
+  echo "1	$path"
+fi
 exit 0
 STUB
 chmod +x "$T14_FAKE_DU_DIR/du"
 
-# df stub: 6 GiB free — clears the fixed 5 GiB floor AND the scaled 3 GiB threshold
-# (2 GiB node data + 1 GiB buffer = 3 GiB scaled requirement; 5 GiB absolute floor)
+# df stub: 8 GiB free — clears the 2 GiB chain.db + 5 GiB checkpoint reserve,
+# the fixed 5 GiB floor, and the scaled 3 GiB threshold.
 T14_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t14-XXXXXXXX")
 cat >"$T14_FAKE_DF_DIR/df" <<'STUB'
 #!/usr/bin/env bash
 echo "Avail"
-echo "6291456"
+echo "8388608"
 exit 0
 STUB
 chmod +x "$T14_FAKE_DF_DIR/df"
 
-# sudo stub: fails immediately so we don't need full tar/gpg stubs
+# sudo stub succeeds so the scaled preflight and verified-upload path run.
 T14_FAKE_SUDO_DIR=$(mktemp -d "$TMPDIR_TEST/fake-sudo-t14-XXXXXXXX")
 cat >"$T14_FAKE_SUDO_DIR/sudo" <<'STUB'
 #!/usr/bin/env bash
-exit 1
+exit 0
 STUB
 chmod +x "$T14_FAKE_SUDO_DIR/sudo"
 
-T14_RCLONE=$(make_fake_bin "rclone" "$T14_DIR/rclone.log" 0)
-T14_GPG=$(make_fake_bin "gpg"    "$T14_DIR/gpg.log"    0)
+T14_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t14-XXXXXXXX")
+make_fake_verified_rclone "$T14_RCLONE_DIR"
+T14_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t14-XXXXXXXX")
+make_fake_verified_gpg "$T14_GPG_DIR"
 T14_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t14-XXXXXXXX")
 cat >"$T14_FAKE_TAR_DIR/tar" <<'STUB'
 #!/usr/bin/env bash
-exit 0
+exec /bin/tar "$@"
 STUB
 chmod +x "$T14_FAKE_TAR_DIR/tar"
 
@@ -843,23 +1082,16 @@ APEROD_BACKUP_PASSWORD="test-pass-t14" \
   APEROD_HISTORY_LOG="$T14_DIR/backup.log" \
   APEROD_BACKUP_DIR_OVERRIDE="$T14_BACKUP_DIR" \
   APEROD_NODE_DATA_DIR_OVERRIDE="$T14_DATA_DIR" \
-  PATH="$T14_FAKE_CURL:$T14_FAKE_DU_DIR:$T14_FAKE_DF_DIR:$T14_FAKE_SUDO_DIR:$T14_RCLONE:$T14_GPG:$T14_FAKE_TAR_DIR:$PATH" \
+  PATH="$T14_FAKE_CURL:$T14_FAKE_DU_DIR:$T14_FAKE_DF_DIR:$T14_FAKE_SUDO_DIR:$T14_RCLONE_DIR:$T14_GPG_DIR:$T14_FAKE_TAR_DIR:$PATH" \
   bash "$BACKUP_SH" >/dev/null 2>&1 || T14_EXIT=$?
 
-# Script fails at pg_dump (sudo exits 1), but that's AFTER the preflight passed.
-# A non-zero exit here means preflight passed (it would have exited 0 if skipped).
-if [[ "$T14_EXIT" -ne 0 ]]; then
-  pass "Scaled preflight passed (script reached pg_dump stage and exited non-zero there)"
+T14_PROM="$T14_DIR/metrics/aperod_backup.prom"
+if [[ "$T14_EXIT" -eq 0 ]] && [[ -f "$T14_PROM" ]] \
+  && grep -q "^aperod_backup_skipped_low_disk 0" "$T14_PROM" \
+  && grep -q "^aperod_backup_last_success 1" "$T14_PROM"; then
+  pass "Scaled preflight accepted checkpoint size + 1 GiB buffer and backup succeeded"
 else
-  # Exit 0 could mean the preflight skipped it OR the success path ran — check prom
-  T14_PROM="$T14_DIR/metrics/aperod_backup.prom"
-  if [[ -f "$T14_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 0" "$T14_PROM"; then
-    pass "Scaled preflight passed (skipped_low_disk=0, exit 0 — success path or skipped for unrelated reason)"
-  elif [[ -f "$T14_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T14_PROM"; then
-    fail "Scaled preflight incorrectly triggered low-disk skip when BACKUP_DIR had 4 GiB free (data=2 GiB + 1 GiB buffer=3 GiB required)"
-  else
-    pass "Scaled preflight passed (exit 0, no skipped_low_disk=1 metric)"
-  fi
+  fail "Scaled preflight/success path failed (exit=$T14_EXIT; metrics: $(cat "$T14_PROM" 2>/dev/null || echo '<missing>'))"
 fi
 
 if [[ ! -f "$T14_CURL_LOG" ]] || ! grep -q "мало места\|low.disk\|low_disk" "$T14_CURL_LOG" 2>/dev/null; then
@@ -875,6 +1107,7 @@ section "Test 15: scaled preflight skips when BACKUP_DIR has less than node-data
 
 T15_DIR=$(mktemp -d "$TMPDIR_TEST/run-t15-XXXXXXXX")
 T15_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t15-XXXXXXXX")
+make_checkpoint_fixture "$T15_DATA_DIR"
 echo "blockdata" > "$T15_DATA_DIR/block.bin"
 make_settings_json "$T15_DIR/data"
 mkdir -p "$T15_DIR/metrics"
@@ -882,11 +1115,16 @@ T15_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t15-XXXXXXXX")
 T15_CURL_LOG="$T15_DIR/curl.log"
 T15_FAKE_CURL=$(make_fake_curl "$T15_CURL_LOG")
 
-# du stub: 3 GiB of node data
+# du stub: 3 GiB for the checkpoint DB and negligible manifest/dump files.
 T15_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t15-XXXXXXXX")
 cat >"$T15_FAKE_DU_DIR/du" <<'STUB'
 #!/usr/bin/env bash
-echo "3145728	$2"
+path="${@: -1}"
+if [[ "$path" == */chain.db ]]; then
+  echo "3145728	$path"
+else
+  echo "1	$path"
+fi
 exit 0
 STUB
 chmod +x "$T15_FAKE_DU_DIR/du"
@@ -895,8 +1133,19 @@ chmod +x "$T15_FAKE_DU_DIR/du"
 T15_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t15-XXXXXXXX")
 cat >"$T15_FAKE_DF_DIR/df" <<'STUB'
 #!/usr/bin/env bash
+count_file="${TMPDIR_TEST:-/tmp}/df-t15-call-count"
+count=0
+[[ -f "$count_file" ]] && count=$(cat "$count_file")
+count=$((count + 1))
+echo "$count" > "$count_file"
 echo "Avail"
-echo "3670016"
+if [[ "$count" -eq 1 ]]; then
+  echo "8388608"   # 8 GiB covers 3 GiB checkpoint DB + 5 GiB reserve.
+elif [[ "$count" -eq 2 || "$count" -eq 3 ]]; then
+  echo "6291456"   # Fixed 5 GiB backup/checkpoint checks pass.
+else
+  echo "3670016"   # 3.5 GiB, below 3 GiB snapshot + 1 GiB buffer.
+fi
 exit 0
 STUB
 chmod +x "$T15_FAKE_DF_DIR/df"
@@ -943,10 +1192,10 @@ else
   fail "Prometheus: aperod_backup_skipped_low_disk=1 NOT found on scaled-preflight skip (file: $(cat "$T15_PROM" 2>/dev/null || echo '<missing>'))"
 fi
 
-if [[ -f "$T15_CURL_LOG" ]] && grep -q "api.telegram.org" "$T15_CURL_LOG"; then
-  pass "Telegram low-disk alert fired on scaled-preflight skip"
+if [[ ! -f "$T15_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T15_CURL_LOG"; then
+  pass "Scaled archive-size preflight skip is recorded without a failure Telegram alert"
 else
-  fail "Telegram low-disk alert NOT fired on scaled-preflight skip (log: $(cat "$T15_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+  fail "Scaled archive-size preflight unexpectedly sent a failure Telegram alert"
 fi
 
 # Confirm the history log records skipReason=low_disk
@@ -958,12 +1207,13 @@ else
 fi
 
 # =============================================================================
-# Test 16: NODE_DATA_DIR low-disk → exits 0, skipped_low_disk=1, Telegram alert
+# Test 16: pre-export checkpoint reserve → skipped_low_disk=1, no export, Telegram alert
 # =============================================================================
-section "Test 16: NODE_DATA_DIR low-disk → exit 0, skipped_low_disk=1, Telegram alert sent"
+section "Test 16: pre-export checkpoint reserve → exit 0, skipped_low_disk=1, Telegram alert"
 
 T16_DIR=$(mktemp -d "$TMPDIR_TEST/run-t16-XXXXXXXX")
 T16_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t16-XXXXXXXX")
+make_checkpoint_fixture "$T16_NODE_DATA_DIR"
 echo "blockdata" > "$T16_NODE_DATA_DIR/block.bin"
 make_settings_json "$T16_DIR/data"
 mkdir -p "$T16_DIR/metrics"
@@ -972,8 +1222,8 @@ T16_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t16-XXXXXXXX")
 T16_CURL_LOG="$T16_DIR/curl.log"
 T16_FAKE_CURL=$(make_fake_curl "$T16_CURL_LOG")
 
-# df stub: first call (BACKUP_DIR) returns 20 GiB (passes the 5 GiB floor);
-# second call (NODE_DATA_DIR) returns 1 MB (below 5 GiB floor → triggers skip).
+# df stub: the node filesystem has only 1 MB, below chain.db size + the
+# mandatory 5 GiB reserve, so checkpoint export is not asked.
 # A counter file tracks invocation number.
 T16_DF_COUNTER="$T16_DIR/df-call-count"
 T16_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t16-XXXXXXXX")
@@ -984,11 +1234,7 @@ count=0
 count=\$(( count + 1 ))
 echo "\$count" > "$T16_DF_COUNTER"
 echo "Avail"
-if [[ "\$count" -le 1 ]]; then
-  echo "20971520"   # 20 GiB — BACKUP_DIR passes
-else
-  echo "1024"       # 1 MB — NODE_DATA_DIR fails
-fi
+echo "1024"
 exit 0
 STUB
 chmod +x "$T16_FAKE_DF_DIR/df"
@@ -1023,41 +1269,47 @@ APEROD_BACKUP_PASSWORD="test-pass-t16" \
 [[ "$T16_EXIT" -eq 99 ]] && T16_EXIT=0  # script exited 0
 
 if [[ "$T16_EXIT" -eq 0 ]]; then
-  pass "NODE_DATA_DIR low-disk preflight exits 0 (skipped, not failed)"
+  pass "pre-export checkpoint-space reserve exits 0 (skipped, not failed)"
 else
-  fail "NODE_DATA_DIR low-disk preflight exited $T16_EXIT — expected 0"
+  fail "pre-export checkpoint-space reserve exited $T16_EXIT — expected 0"
 fi
 
 T16_PROM="$T16_DIR/metrics/aperod_backup.prom"
 if [[ -f "$T16_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T16_PROM"; then
-  pass "Prometheus: aperod_backup_skipped_low_disk=1 written on NODE_DATA_DIR low-disk skip"
+  pass "Prometheus: aperod_backup_skipped_low_disk=1 written on checkpoint-reserve skip"
 else
-  fail "Prometheus: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T16_PROM" 2>/dev/null || echo '<missing>'))"
+  fail "Prometheus: checkpoint-reserve skip metric NOT found (file: $(cat "$T16_PROM" 2>/dev/null || echo '<missing>'))"
 fi
 
 if [[ -f "$T16_PROM" ]] && grep -q "^aperod_backup_last_success 0" "$T16_PROM"; then
-  pass "Prometheus: aperod_backup_last_success=0 on NODE_DATA_DIR low-disk skip"
+  pass "Prometheus: aperod_backup_last_success=0 on checkpoint-reserve skip"
 else
-  fail "Prometheus: aperod_backup_last_success=0 NOT found on NODE_DATA_DIR low-disk skip"
+  fail "Prometheus: aperod_backup_last_success=0 NOT found on checkpoint-reserve skip"
 fi
 
 if [[ -f "$T16_CURL_LOG" ]] && grep -q "api.telegram.org" "$T16_CURL_LOG"; then
-  pass "Telegram low-disk alert was sent when NODE_DATA_DIR has insufficient space"
+  pass "Telegram checkpoint-reserve alert was sent when node space is insufficient"
 else
-  fail "Telegram low-disk alert was NOT sent for NODE_DATA_DIR low-disk (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+  fail "Telegram checkpoint-reserve alert was NOT sent (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
 fi
 
-if [[ -f "$T16_CURL_LOG" ]] && grep -q "NODE_DATA_DIR" "$T16_CURL_LOG"; then
-  pass "Telegram low-disk alert contains partition label NODE_DATA_DIR"
+if [[ -f "$T16_CURL_LOG" ]] && grep -qi "checkpoint" "$T16_CURL_LOG"; then
+  pass "Telegram alert identifies the checkpoint-space reserve"
 else
-  fail "Telegram low-disk alert does NOT contain NODE_DATA_DIR label (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+  fail "Telegram alert does NOT identify the checkpoint-space reserve (log: $(cat "$T16_CURL_LOG" 2>/dev/null || echo '<empty>'))"
 fi
 
 T16_HIST="$T16_DIR/backup.log"
-if [[ -f "$T16_HIST" ]] && grep -q '"skipReason":"low_disk"' "$T16_HIST"; then
-  pass "History log records skipReason=low_disk for NODE_DATA_DIR skip"
+if [[ -f "$T16_HIST" ]] && grep -q '"skipReason":"low_checkpoint_space"' "$T16_HIST"; then
+  pass "History log records skipReason=low_checkpoint_space before export"
 else
-  fail "History log does NOT record skipReason=low_disk for NODE_DATA_DIR skip (log: $(cat "$T16_HIST" 2>/dev/null || echo '<missing>'))"
+  fail "History log does NOT record skipReason=low_checkpoint_space (log: $(cat "$T16_HIST" 2>/dev/null || echo '<missing>'))"
+fi
+
+if [[ ! -f "$T16_CURL_LOG" ]] || ! grep -q '^checkpoint ' "$T16_CURL_LOG"; then
+  pass "node checkpoint export was not requested before satisfying the reserve"
+else
+  fail "checkpoint export was requested despite insufficient pre-export reserve"
 fi
 
 # =============================================================================
@@ -1067,6 +1319,7 @@ section "Test 17: NODE_DATA_DIR recovery — next cycle with sufficient space re
 
 T17_DIR=$(mktemp -d "$TMPDIR_TEST/run-t17-XXXXXXXX")
 T17_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t17-XXXXXXXX")
+make_checkpoint_fixture "$T17_NODE_DATA_DIR"
 echo "blockdata" > "$T17_NODE_DATA_DIR/block.bin"
 make_settings_json "$T17_DIR/data"
 mkdir -p "$T17_DIR/metrics"
@@ -1130,29 +1383,17 @@ STUB
 chmod +x "$T17_FAKE_DF_OK/df"
 
 T17_FAKE_GPG_DIR=$(mktemp -d "$TMPDIR_TEST/fake-gpg-t17-XXXXXXXX")
-cat >"$T17_FAKE_GPG_DIR/gpg" <<'STUB'
-#!/usr/bin/env bash
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-o" ]]; then touch "$2"; shift 2; else shift; fi
-done
-exit 0
-STUB
-chmod +x "$T17_FAKE_GPG_DIR/gpg"
+make_fake_verified_gpg "$T17_FAKE_GPG_DIR"
 
 T17_FAKE_TAR_DIR=$(mktemp -d "$TMPDIR_TEST/fake-tar-t17-XXXXXXXX")
 cat >"$T17_FAKE_TAR_DIR/tar" <<'STUB'
 #!/usr/bin/env bash
-exit 0
+exec /bin/tar "$@"
 STUB
 chmod +x "$T17_FAKE_TAR_DIR/tar"
 
 T17_FAKE_RCLONE_DIR=$(mktemp -d "$TMPDIR_TEST/fake-rclone-t17-XXXXXXXX")
-cat >"$T17_FAKE_RCLONE_DIR/rclone" <<'STUB'
-#!/usr/bin/env bash
-if [[ "$1" == "size" ]]; then echo '{"count":1,"bytes":2048}'; fi
-exit 0
-STUB
-chmod +x "$T17_FAKE_RCLONE_DIR/rclone"
+make_fake_verified_rclone "$T17_FAKE_RCLONE_DIR"
 
 # Re-create backup dir (previous run cleaned it via EXIT trap)
 mkdir -p "$T17_BACKUP_DIR"
@@ -1400,23 +1641,21 @@ else
 fi
 
 # =============================================================================
-# Test 19: stale-backup-dir cleanup runs BEFORE NODE_DATA_DIR preflight
+# Test 19: pre-export checkpoint reserve gates the request and preserves its parent
 #
-# Scenario A — stale dir found + cleaned:
-#   df returns 4 GiB (below 5 GiB floor) for NODE_DATA_DIR UNTIL the rm -rf of
-#   the stale dir sets a marker file; after that it returns 6 GiB (above the
-#   floor).  Because _cleanup_stale_backup_dirs() runs before _disk_preflight(),
-#   the cleanup fires first → marker is set → df returns sufficient space →
-#   backup proceeds past the preflight and reaches pg_dump.
+# Scenario A — enough space for checkpoint export:
+#   df reports more than chain.db size + the 5 GiB reserve. The checkpoint is
+#   requested and the backup proceeds to the intentionally failing pg_dump.
 #
-# Scenario B — no stale dir (cleanup finds nothing, no space freed):
-#   df returns 4 GiB throughout → NODE_DATA_DIR preflight triggers → backup
-#   is skipped with skipped_low_disk=1 (confirms the A result is non-trivial).
+# Scenario B — insufficient reserve:
+#   df reports 4 GiB for a 2 GiB chain.db, so the run skips before requesting
+#   the checkpoint. This protects the source filesystem from export exhaustion.
 # =============================================================================
-section "Test 19: stale-backup-dir cleanup runs before NODE_DATA_DIR preflight (ordering guard)"
+section "Test 19: pre-export checkpoint reserve gates checkpoint request"
 
 T19_DIR=$(mktemp -d "$TMPDIR_TEST/run-t19-XXXXXXXX")
 T19_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t19-XXXXXXXX")
+make_checkpoint_fixture "$T19_NODE_DATA_DIR"
 echo "blockdata" > "$T19_NODE_DATA_DIR/block.bin"
 make_settings_json "$T19_DIR/data"
 mkdir -p "$T19_DIR/metrics"
@@ -1471,19 +1710,15 @@ fi
 STUB
 chmod +x "$T19_FAKE_RM_DIR/rm"
 
-# df stub: BACKUP_DIR always returns 20 GiB; NODE_DATA_DIR returns 4 GiB
-# (below 5 GiB floor) unless the rm marker exists, in which case 6 GiB (above).
+# df stub: BACKUP_DIR returns 20 GiB; the node filesystem returns 8 GiB, enough
+# for the 2 GiB chain.db fixture plus the 5 GiB reserve.
 T19_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t19-XXXXXXXX")
 cat >"$T19_FAKE_DF_DIR/df" <<STUB
 #!/usr/bin/env bash
 last_arg="\${@: -1}"
 echo "Avail"
 if [[ "\$last_arg" == "$T19_NODE_DATA_DIR"* ]]; then
-  if [[ -f "$T19_RM_MARKER" ]]; then
-    echo "6291456"   # 6 GiB — cleanup freed space, preflight passes
-  else
-    echo "4194304"   # 4 GiB — insufficient, preflight would skip
-  fi
+  echo "8388608"     # 8 GiB — covers the fixture DB plus reserve.
 else
   echo "20971520"    # 20 GiB — BACKUP_DIR always passes
 fi
@@ -1524,43 +1759,47 @@ APEROD_BACKUP_PASSWORD="test-pass-t19" \
   bash "$BACKUP_SH" >/dev/null 2>&1 || T19A_EXIT=$?
 
 # Scenario A checks
-if [[ -f "$T19_RM_MARKER" ]]; then
-  pass "Scenario A: cleanup ran — stale backup dir was removed (rm marker set)"
+if [[ ! -f "$T19_RM_MARKER" && -d "$T19_STALE_DIR" ]]; then
+  pass "Scenario A: unrelated preexisting backup directory remains untouched"
 else
-  fail "Scenario A: cleanup did NOT run — rm marker was never set"
+  fail "Scenario A: preexisting backup directory was unexpectedly removed"
 fi
 
-# pg_dump stage was reached (sudo stub exits 1 → script exits non-zero)
-# If preflight skipped the backup, script exits 0; non-zero means it proceeded.
+# Adequate reserve lets the backup reach its intentionally failing pg_dump stub.
 if [[ "$T19A_EXIT" -ne 0 ]]; then
-  pass "Scenario A: backup proceeded past NODE_DATA_DIR preflight (reached pg_dump, exited non-zero)"
+  pass "Scenario A: adequate reserve allowed export and reached pg_dump"
 else
-  # Exit 0 could mean skipped — check prom to distinguish success from skip
   T19_PROM="$T19_DIR/metrics/aperod_backup.prom"
   if [[ -f "$T19_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T19_PROM"; then
-    fail "Scenario A: backup was SKIPPED (skipped_low_disk=1) — cleanup did not free space before preflight ran"
+    fail "Scenario A: backup was skipped despite sufficient pre-export reserve"
   else
-    pass "Scenario A: backup proceeded past NODE_DATA_DIR preflight (exit 0, no low-disk skip metric)"
+    pass "Scenario A: no low-disk skip was recorded"
   fi
 fi
 
 T19_PROM="$T19_DIR/metrics/aperod_backup.prom"
 if [[ ! -f "$T19_PROM" ]] || ! grep -q "^aperod_backup_skipped_low_disk 1" "$T19_PROM"; then
-  pass "Scenario A: aperod_backup_skipped_low_disk NOT set to 1 — preflight passed after cleanup"
+  pass "Scenario A: sufficient reserve did not set skipped_low_disk"
 else
-  fail "Scenario A: aperod_backup_skipped_low_disk=1 found — preflight incorrectly skipped after cleanup freed space"
+  fail "Scenario A: sufficient reserve incorrectly set skipped_low_disk"
 fi
 
-if [[ ! -f "$T19_CURL_LOG" ]] || ! grep -q "мало места\|low.disk\|NODE_DATA_DIR" "$T19_CURL_LOG" 2>/dev/null; then
-  pass "Scenario A: no low-disk Telegram alert — NODE_DATA_DIR preflight passed"
+if [[ ! -f "$T19_CURL_LOG" ]] || ! grep -q "мало места\|low.disk" "$T19_CURL_LOG" 2>/dev/null; then
+  pass "Scenario A: no low-disk Telegram alert — reserve preflight passed"
 else
-  fail "Scenario A: low-disk Telegram alert fired — preflight triggered despite cleanup freeing space"
+  fail "Scenario A: low-disk Telegram alert fired despite sufficient reserve"
+fi
+if grep -q '^checkpoint ' "$T19_CURL_LOG"; then
+  pass "Scenario A: checkpoint was requested only after reserve preflight passed"
+else
+  fail "Scenario A: checkpoint was not requested despite sufficient reserve"
 fi
 
-# ── Scenario B: no stale dir found → no space freed → preflight skips ────────
+# ── Scenario B: insufficient reserve → skip before checkpoint export ─────────
 
 T19B_DIR=$(mktemp -d "$TMPDIR_TEST/run-t19b-XXXXXXXX")
 T19B_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t19b-XXXXXXXX")
+make_checkpoint_fixture "$T19B_NODE_DATA_DIR"
 make_settings_json "$T19B_DIR/data"
 mkdir -p "$T19B_DIR/metrics"
 T19B_BACKUP_PARENT=$(mktemp -d "$TMPDIR_TEST/backup-parent-t19b-XXXXXXXX")
@@ -1635,16 +1874,21 @@ APEROD_BACKUP_PASSWORD="test-pass-t19b" \
 [[ "$T19B_EXIT" -eq 99 ]] && T19B_EXIT=0  # script returned 0
 
 if [[ "$T19B_EXIT" -eq 0 ]]; then
-  pass "Scenario B: exits 0 (skipped) when no stale dir is cleaned and NODE_DATA_DIR has 4 GiB"
+  pass "Scenario B: exits 0 when 4 GiB cannot cover DB plus 5 GiB reserve"
 else
-  fail "Scenario B: exited $T19B_EXIT — expected 0 (skip)"
+  fail "Scenario B: exited $T19B_EXIT — expected pre-export skip"
 fi
 
 T19B_PROM="$T19B_DIR/metrics/aperod_backup.prom"
 if [[ -f "$T19B_PROM" ]] && grep -q "^aperod_backup_skipped_low_disk 1" "$T19B_PROM"; then
-  pass "Scenario B: aperod_backup_skipped_low_disk=1 — NODE_DATA_DIR preflight correctly triggered without cleanup"
+  pass "Scenario B: aperod_backup_skipped_low_disk=1 for insufficient pre-export reserve"
 else
-  fail "Scenario B: aperod_backup_skipped_low_disk=1 NOT found (file: $(cat "$T19B_PROM" 2>/dev/null || echo '<missing>'))"
+  fail "Scenario B: insufficient pre-export reserve did not set skipped_low_disk (file: $(cat "$T19B_PROM" 2>/dev/null || echo '<missing>'))"
+fi
+if [[ ! -f "$T19B_CURL_LOG" ]] || ! grep -q '^checkpoint ' "$T19B_CURL_LOG"; then
+  pass "Scenario B: Unix checkpoint export was not requested"
+else
+  fail "Scenario B: checkpoint export was requested despite insufficient reserve"
 fi
 
 # =============================================================================
@@ -2146,14 +2390,15 @@ else
 fi
 
 # =============================================================================
-# Test 25: native B2 version cleanup keeps newest upload and deletes old versions
+# Test 25: native B2 version cleanup retains the two newest uploads
 #
 # Python automatically imports sitecustomize from PYTHONPATH.  The fake module
 # below intercepts urllib.request.urlopen inside the real embedded cleanup code,
 # providing deterministic B2 API responses without touching a live bucket.
 # =============================================================================
-section "Test 25: Backblaze version cleanup keeps only the newest upload"
+section "Test 25: Backblaze version cleanup retains the two newest uploads"
 
+make_checkpoint_fixture "$CHECKPOINT_NODE_DIR"
 T25_DIR=$(mktemp -d "$TMPDIR_TEST/run-t25-XXXXXXXX")
 make_settings_json "$T25_DIR/data"
 sed -i 's#https://s3.example.com#https://s3.us-west-004.backblazeb2.com#' \
@@ -2219,6 +2464,9 @@ urllib.request.urlopen = _urlopen
 PY
 
 T25_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t25-XXXXXXXX")
+T25_REMOTE_DIR="$T25_DIR/remote"
+mkdir -p "$T25_REMOTE_DIR"
+cp "$MOCK_REMOTE_DIR/aperod_backup.tar.gpg" "$T25_REMOTE_DIR/aperod_backup.tar.gpg"
 T25_LOG="$T25_DIR/b2.log"
 T25_OUTPUT="$T25_DIR/output.log"
 T25_EXIT=0
@@ -2229,6 +2477,7 @@ APEROD_BACKUP_PASSWORD="test-pass-t25" \
   APEROD_BACKUP_DIR_OVERRIDE="$T25_BACKUP_DIR" \
   TELEGRAM_BOT_TOKEN="" \
   ADMIN_TELEGRAM_CHAT_ID="" \
+  MOCK_REMOTE_DIR="$T25_REMOTE_DIR" \
   PYTHONPATH="$T25_DIR/python" \
   B2_MOCK_LOG="$T25_LOG" \
   PATH="$T9_FAKE_CURL:$T9_FAKE_SUDO_DIR:$T9_FAKE_PGDUMP:$T9_FAKE_GPG_DIR:$T9_FAKE_TAR_DIR:$T9_FAKE_RCLONE_DIR:$T9_FAKE_DF_DIR:$PATH" \
@@ -2240,16 +2489,17 @@ else
   fail "backup exited $T25_EXIT during successful B2 cleanup simulation ($(cat "$T25_OUTPUT"))"
 fi
 
-if [[ "$(grep -c '^DELETE old-' "$T25_LOG" 2>/dev/null || true)" -eq 4 ]] \
+if [[ "$(grep -c '^DELETE old-' "$T25_LOG" 2>/dev/null || true)" -eq 3 ]] \
    && ! grep -q '^DELETE newest$' "$T25_LOG" 2>/dev/null \
+   && ! grep -q '^DELETE old-1$' "$T25_LOG" 2>/dev/null \
    && grep -q '^LIST count=5$' "$T25_LOG" \
-   && grep -q '^LIST count=1$' "$T25_LOG"; then
-  pass "cleanup deletes four old fileIds, preserves newest, and verifies one remains"
+   && grep -q '^LIST count=2$' "$T25_LOG"; then
+  pass "cleanup deletes older fileIds, retains the two newest, and verifies both remain"
 else
   fail "unexpected B2 cleanup calls (log: $(cat "$T25_LOG" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q 'reclaimed: 5.29 GiB' "$T25_OUTPUT"; then
+if grep -q 'reclaimed: 4.35 GiB' "$T25_OUTPUT"; then
   pass "cleanup accounts reclaimed storage from B2 contentLength"
 else
   fail "cleanup did not report expected reclaimed contentLength ($(cat "$T25_OUTPUT"))"
@@ -2266,6 +2516,9 @@ sed -i 's#https://s3.example.com#https://s3.us-west-004.backblazeb2.com#' \
   "$T26_DIR/data/integration-settings.json"
 mkdir -p "$T26_DIR/metrics"
 T26_BACKUP_DIR=$(mktemp -d "$TMPDIR_TEST/backup-t26-XXXXXXXX")
+T26_REMOTE_DIR="$T26_DIR/remote"
+mkdir -p "$T26_REMOTE_DIR"
+cp "$MOCK_REMOTE_DIR/aperod_backup.tar.gpg" "$T26_REMOTE_DIR/aperod_backup.tar.gpg"
 T26_LOG="$T26_DIR/b2.log"
 T26_EXIT=0
 APEROD_BACKUP_PASSWORD="test-pass-t26" \
@@ -2275,6 +2528,7 @@ APEROD_BACKUP_PASSWORD="test-pass-t26" \
   APEROD_BACKUP_DIR_OVERRIDE="$T26_BACKUP_DIR" \
   TELEGRAM_BOT_TOKEN="" \
   ADMIN_TELEGRAM_CHAT_ID="" \
+  MOCK_REMOTE_DIR="$T26_REMOTE_DIR" \
   PYTHONPATH="$T25_DIR/python" \
   B2_MOCK_LOG="$T26_LOG" \
   B2_MOCK_KEEP_DELETED=1 \
@@ -2283,10 +2537,162 @@ APEROD_BACKUP_PASSWORD="test-pass-t26" \
 
 if [[ "$T26_EXIT" -ne 0 ]] \
    && grep -q '^LIST count=5$' "$T26_LOG" \
-   && [[ "$(grep -c '^DELETE old-' "$T26_LOG" 2>/dev/null || true)" -eq 4 ]]; then
-  pass "backup fails when B2 still reports old versions after delete calls"
+   && [[ "$(grep -c '^DELETE old-' "$T26_LOG" 2>/dev/null || true)" -eq 3 ]]; then
+  pass "backup fails when B2 still reports old versions after preserving the newest two"
 else
   fail "cleanup verification did not fail closed (exit=$T26_EXIT log: $(cat "$T26_LOG" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 27: safely migrate the old fixed archive over two successful runs
+# =============================================================================
+section "Test 27: legacy fixed migration preserves ciphertext, degrades first run, then cleans up"
+
+T27_DIR=$(mktemp -d "$TMPDIR_TEST/run-t27-XXXXXXXX")
+T27_NODE_DATA_DIR="$T27_DIR/node-data"
+make_checkpoint_fixture "$T27_NODE_DATA_DIR"
+make_settings_json "$T27_DIR/data"
+mkdir -p "$T27_DIR/metrics"
+T27_BACKUP_ROOT=$(mktemp -d "$TMPDIR_TEST/backup-root-t27-XXXXXXXX")
+T27_REMOTE_DIR="$T27_DIR/remote"
+mkdir -p "$T27_REMOTE_DIR"
+
+# Historical format stores the DB below testnet/ and has no manifest.json.
+T27_LEGACY_INPUT="$T27_DIR/legacy-input"
+mkdir -p "$T27_LEGACY_INPUT/testnet/chain.db"
+printf '0000000000000001\n' > "$T27_LEGACY_INPUT/testnet/chain.db/CURRENT"
+printf 'legacy-leveldb-manifest\n' > "$T27_LEGACY_INPUT/testnet/chain.db/MANIFEST-000001"
+printf 'legacy table data\n' > "$T27_LEGACY_INPUT/testnet/chain.db/000003.ldb"
+printf 'legacy explorer dump\n' > "$T27_LEGACY_INPUT/explorer_db.dump"
+T27_LEGACY_CIPHERTEXT="$T27_DIR/original-legacy.tar.gpg"
+/bin/tar -czf "$T27_LEGACY_CIPHERTEXT" -C "$T27_LEGACY_INPUT" testnet explorer_db.dump
+cp "$T27_LEGACY_CIPHERTEXT" "$T27_REMOTE_DIR/aperod_backup.tar.gpg"
+T27_LEGACY_SHA=$(sha256sum "$T27_LEGACY_CIPHERTEXT" | awk '{print $1}')
+T27_RCLONE_LOG="$T27_DIR/rclone.log"
+T27_CURL_LOG="$T27_DIR/curl.log"
+T27_FAKE_CURL=$(make_fake_curl "$T27_CURL_LOG")
+T27_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t27-XXXXXXXX")
+cat >"$T27_FAKE_DF_DIR/df" <<'STUB'
+#!/usr/bin/env bash
+echo "Avail"
+echo "20971520"
+STUB
+chmod +x "$T27_FAKE_DF_DIR/df"
+
+run_t27_backup() {
+  local output="$1"
+  APEROD_BACKUP_PASSWORD="test-pass-t27" \
+    DATA_DIR="$T27_DIR/data" \
+    APEROD_NODE_DATA_DIR_OVERRIDE="$T27_NODE_DATA_DIR" \
+    APEROD_TEXTFILE_DIR="$T27_DIR/metrics" \
+    APEROD_HISTORY_LOG="$T27_DIR/backup.log" \
+    APEROD_BACKUP_DIR_OVERRIDE="$T27_BACKUP_ROOT" \
+    TELEGRAM_BOT_TOKEN="" \
+    ADMIN_TELEGRAM_CHAT_ID="" \
+    MOCK_REMOTE_DIR="$T27_REMOTE_DIR" \
+    MOCK_RCLONE_LOG="$T27_RCLONE_LOG" \
+    PATH="$T27_FAKE_CURL:$T9_FAKE_SUDO_DIR:$T9_FAKE_PGDUMP:$T9_FAKE_GPG_DIR:$T9_FAKE_TAR_DIR:$T9_FAKE_RCLONE_DIR:$T27_FAKE_DF_DIR:$PATH" \
+    bash "$BACKUP_SH" >"$output" 2>&1
+}
+
+T27A_OUTPUT="$T27_DIR/first-run.log"
+T27A_EXIT=0
+run_t27_backup "$T27A_OUTPUT" || T27A_EXIT=$?
+if [[ "$T27A_EXIT" -eq 0 ]]; then
+  pass "first legacy migration run completes successfully"
+else
+  fail "first legacy migration run exited $T27A_EXIT ($(cat "$T27A_OUTPUT"))"
+fi
+
+T27_PRESERVED_COUNT=$(find "$T27_REMOTE_DIR" -maxdepth 1 -type f -name 'aperod_backup_legacy_*.tar.gpg' | wc -l)
+T27_CANDIDATE_COUNT=$(find "$T27_REMOTE_DIR" -maxdepth 1 -type f -name 'aperod_backup_candidate_*.tar.gpg' | wc -l)
+T27_PRESERVED=$(find "$T27_REMOTE_DIR" -maxdepth 1 -type f -name 'aperod_backup_legacy_*.tar.gpg' -print -quit)
+if [[ "$T27_PRESERVED_COUNT" -eq 1 ]] \
+   && [[ "$(basename "$T27_PRESERVED")" == "aperod_backup_legacy_${T27_LEGACY_SHA}_"* ]] \
+   && cmp -s "$T27_LEGACY_CIPHERTEXT" "$T27_PRESERVED" \
+   && ! cmp -s "$T27_LEGACY_CIPHERTEXT" "$T27_REMOTE_DIR/aperod_backup.tar.gpg"; then
+  pass "legacy ciphertext is preserved byte-for-byte under its SHA-addressed immutable name"
+else
+  fail "legacy ciphertext was not safely preserved before fixed replacement"
+fi
+
+if [[ "$T27_CANDIDATE_COUNT" -eq 1 ]] \
+   && [[ -s "$T27_REMOTE_DIR/aperod_backup.tar.gpg" ]] \
+   && ! compgen -G "$T27_REMOTE_DIR/aperod_backup_previous.tar.gpg" >/dev/null; then
+  pass "non-B2 first migration retains the candidate and does not claim a previous generation"
+else
+  fail "non-B2 first migration did not retain the candidate / legacy predecessor safely"
+fi
+
+T27_PROM="$T27_DIR/metrics/aperod_backup.prom"
+if grep -q '^aperod_backup_legacy_migration 1$' "$T27_PROM"; then
+  pass "first migration sets the legacy-migration Prometheus gauge"
+else
+  fail "first migration did not set aperod_backup_legacy_migration=1"
+fi
+if python3 - "$T27_DIR/backup.log" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    entries = [json.loads(line) for line in source]
+raise SystemExit(0 if len(entries) == 1 and entries[0].get("status") == "ok"
+                 and entries[0].get("degraded") is True else 1)
+PY
+then
+  pass "first migration history entry records successful degraded status"
+else
+  fail "first migration history entry omitted successful degraded status"
+fi
+if grep -q "^verify --legacy-stage " "$APEROD_TEST_VERIFY_LOG"; then
+  pass "legacy archive used the required --legacy-stage read-only verifier mode"
+else
+  fail "legacy archive was not checked with --legacy-stage"
+fi
+if grep -Eq '^copyto s3backup:[^ ]+/aperod_backup\.tar\.gpg .*/previous-fixed\.tar\.gpg --ignore-times ' "$T27_RCLONE_LOG" \
+   && grep -Eq '^copyto s3backup:[^ ]+/aperod_backup_legacy_[^ ]+ .*/preserved-legacy-copy\.tar\.gpg --ignore-times ' "$T27_RCLONE_LOG"; then
+  pass "legacy fixed and preserved ciphertext are force-downloaded for verification"
+else
+  fail "migration verification did not force fresh downloads (rclone log: $(cat "$T27_RCLONE_LOG"))"
+fi
+
+T27_FIRST_FIXED="$T27_DIR/first-fixed.tar.gpg"
+cp "$T27_REMOTE_DIR/aperod_backup.tar.gpg" "$T27_FIRST_FIXED"
+make_checkpoint_fixture "$T27_NODE_DATA_DIR"
+T27B_OUTPUT="$T27_DIR/second-run.log"
+T27B_EXIT=0
+run_t27_backup "$T27B_OUTPUT" || T27B_EXIT=$?
+if [[ "$T27B_EXIT" -eq 0 ]]; then
+  pass "second migration run completes successfully"
+else
+  fail "second migration run exited $T27B_EXIT ($(cat "$T27B_OUTPUT"))"
+fi
+
+T27_FINAL_COUNT=$(find "$T27_REMOTE_DIR" -maxdepth 1 -type f | wc -l)
+if [[ "$T27_FINAL_COUNT" -eq 2 ]] \
+   && [[ -s "$T27_REMOTE_DIR/aperod_backup.tar.gpg" ]] \
+   && cmp -s "$T27_FIRST_FIXED" "$T27_REMOTE_DIR/aperod_backup_previous.tar.gpg" \
+   && [[ -z "$(find "$T27_REMOTE_DIR" -maxdepth 1 -type f \( -name 'aperod_backup_legacy_*.tar.gpg' -o -name 'aperod_backup_candidate_*.tar.gpg' \) -print -quit)" ]]; then
+  pass "second run promotes a verified previous generation and removes migration-only objects"
+else
+  fail "second-run cleanup did not leave exactly fixed and previous new-format generations"
+fi
+if grep -q '^aperod_backup_legacy_migration 0$' "$T27_PROM"; then
+  pass "second successful run clears the legacy-migration gauge"
+else
+  fail "second successful run did not clear aperod_backup_legacy_migration"
+fi
+if python3 - "$T27_DIR/backup.log" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    entries = [json.loads(line) for line in source]
+raise SystemExit(0 if len(entries) == 2
+                 and entries[0].get("degraded") is True
+                 and entries[1].get("status") == "ok"
+                 and "degraded" not in entries[1] else 1)
+PY
+then
+  pass "second history entry is successful and no longer degraded"
+else
+  fail "second migration history entry remained degraded or was not recorded"
 fi
 
 # =============================================================================

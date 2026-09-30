@@ -645,6 +645,12 @@ func (d *DB) PutMeta(key string, value []byte) error {
 	return d.put(k, value)
 }
 
+// PutMetaSync durably replaces an auxiliary job and its progress atomically.
+func (d *DB) PutMetaSync(key string, value []byte) error {
+k := append(prefixMeta, []byte(key)...)
+return d.putSync(k, value)
+}
+
 // GetMeta retrieves a metadata value. Returns nil if not found.
 func (d *DB) GetMeta(key string) ([]byte, error) {
 	k := append(prefixMeta, []byte(key)...)

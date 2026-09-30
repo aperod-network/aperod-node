@@ -200,7 +200,10 @@ mkdir -p /etc/systemd/system/aperod-node.service.d
 
 # Config directory
 mkdir -p /etc/aperod
-echo "network: testnet" > /etc/aperod/node.yaml
+cat > /etc/aperod/node.yaml << 'CONFIG'
+network: testnet
+data_dir: /var/lib/aperod
+CONFIG
 echo "  [seed] /etc/aperod/node.yaml"
 
 # Data directory
@@ -223,6 +226,82 @@ if systemctl is-active --quiet aperod-node; then
 else
   echo "  [seed] WARNING: service did NOT appear active before uninstall"
 fi
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  Verifying the uninstaller refuses embedded chain data"
+echo "══════════════════════════════════════════════════"
+mkdir -p /opt/aperod/data/testnet
+printf 'preserve this chain\n' > /opt/aperod/data/testnet/chain.db
+set +e
+APEROD_UNINSTALL_CONFIRM=YES bash /deploy/uninstall-validator.sh \
+  > /tmp/uninstall-source-guard.log 2>&1
+GUARD_EXIT=$?
+if [[ $GUARD_EXIT -ne 0 ]] &&
+   grep -q 'Source safety guard refused removal' /tmp/uninstall-source-guard.log &&
+   [[ "$(cat /opt/aperod/data/testnet/chain.db)" == "preserve this chain" ]] &&
+   [[ -f /etc/systemd/system/aperod-node.service ]] &&
+   [[ -f /usr/local/bin/aperod-node ]] &&
+   systemctl is-active --quiet aperod-node; then
+  pass_assert "A0: uninstaller refuses embedded chain data before stopping or deleting anything"
+else
+  fail_assert "A0: uninstaller did not preserve the embedded chain and running service"
+  cat /tmp/uninstall-source-guard.log >&2 || true
+  exit 1
+fi
+rm -rf /opt/aperod/data
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  Verifying external chain data survives confirmed uninstall"
+echo "══════════════════════════════════════════════════"
+mkdir -p /var/lib/aperod/testnet/chain.db /var/lib/aperod/testnet/snapshots
+printf 'preserve external chain\n' > /var/lib/aperod/testnet/chain.db/CURRENT
+printf 'preserve external snapshot\n' > /var/lib/aperod/testnet/snapshots/snapshot-v2-sentinel.json
+printf 'preserve external key\n' > /var/lib/aperod/testnet/validator.key
+set +e
+APEROD_UNINSTALL_CONFIRM=YES bash /deploy/uninstall-validator.sh \
+  > /tmp/uninstall-external-data-guard.log 2>&1
+EXTERNAL_GUARD_EXIT=$?
+if [[ $EXTERNAL_GUARD_EXIT -ne 0 ]] &&
+   grep -q 'Refusing uninstall: data directory is not empty' /tmp/uninstall-external-data-guard.log &&
+   [[ "$(cat /var/lib/aperod/testnet/chain.db/CURRENT)" == "preserve external chain" ]] &&
+   [[ "$(cat /var/lib/aperod/testnet/snapshots/snapshot-v2-sentinel.json)" == "preserve external snapshot" ]] &&
+   [[ "$(cat /var/lib/aperod/testnet/validator.key)" == "preserve external key" ]] &&
+   [[ -f /etc/systemd/system/aperod-node.service ]] &&
+   [[ -f /usr/local/bin/aperod-node ]] &&
+   systemctl is-active --quiet aperod-node &&
+   ! grep -q 'stop aperod-node' /tmp/fake-systemctl.log; then
+  pass_assert "A1: external chain, snapshot and key survive YES; service is not stopped"
+else
+  fail_assert "A1: uninstaller did not preserve external runtime data and running service"
+  cat /tmp/uninstall-external-data-guard.log >&2 || true
+  exit 1
+fi
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  Verifying data directory is not removed without source checkout"
+echo "══════════════════════════════════════════════════"
+rm -rf /var/lib/aperod/testnet
+rm -rf /opt/aperod
+set +e
+APEROD_UNINSTALL_CONFIRM=YES bash /deploy/uninstall-validator.sh \
+  > /tmp/uninstall-missing-checkout-guard.log 2>&1
+MISSING_CHECKOUT_EXIT=$?
+if [[ $MISSING_CHECKOUT_EXIT -ne 0 ]] &&
+   grep -q 'data path exists but the source checkout is absent' /tmp/uninstall-missing-checkout-guard.log &&
+   [[ -d /var/lib/aperod ]] &&
+   [[ -f /etc/systemd/system/aperod-node.service ]] &&
+   systemctl is-active --quiet aperod-node &&
+   ! grep -q 'stop aperod-node' /tmp/fake-systemctl.log; then
+  pass_assert "A2: data directory is preserved when source checkout is absent"
+else
+  fail_assert "A2: uninstall did not fail closed for data without checkout"
+  cat /tmp/uninstall-missing-checkout-guard.log >&2 || true
+  exit 1
+fi
+mkdir -p /opt/aperod
 
 echo ""
 echo "══════════════════════════════════════════════════"

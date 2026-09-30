@@ -43,10 +43,11 @@ type wsClient struct {
 
 // Hub manages all active WebSocket connections.
 type Hub struct {
-	mu        sync.RWMutex
-	clients   map[*wsClient]struct{}
-	connPerIP map[string]int // per-IP connection count for F-006 cap
-	log       *slog.Logger
+	mu                         sync.RWMutex
+	clients                    map[*wsClient]struct{}
+	connPerIP                  map[string]int // per-IP connection count for F-006 cap
+	log                        *slog.Logger
+	avmGasBurnActivationHeight uint64
 }
 
 // NewHub creates a Hub and starts the heartbeat goroutine.
@@ -61,8 +62,22 @@ func NewHub(log *slog.Logger) *Hub {
 }
 
 // BroadcastBlock sends a new_block event to all connected clients.
-func (h *Hub) BroadcastBlock(b *core.Block) {
-	h.broadcast(WSEvent{Topic: "new_block", Data: blockToResponse(b)})
+func (h *Hub) BroadcastBlock(b *core.Block) error {
+	h.mu.RLock()
+	activationHeight := h.avmGasBurnActivationHeight
+	h.mu.RUnlock()
+	response, err := blockToResponse(b, activationHeight)
+	if err != nil {
+		return err
+	}
+	h.broadcast(WSEvent{Topic: "new_block", Data: response})
+	return nil
+}
+
+func (h *Hub) SetAVMGasBurnActivationHeight(height uint64) {
+	h.mu.Lock()
+	h.avmGasBurnActivationHeight = height
+	h.mu.Unlock()
 }
 
 // BroadcastTx sends a new_transaction event to all clients.

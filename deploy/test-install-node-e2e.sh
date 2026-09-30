@@ -389,6 +389,27 @@ fail_assert() { echo -e "${RED}  FAIL${NC}  $*"; ((FAIL++)); }
 export PATH="/stubs:$PATH"
 
 echo "══════════════════════════════════════════════════"
+echo "  Verifying the installer refuses live data under source"
+echo "══════════════════════════════════════════════════"
+mkdir -p /opt/aperod/data/testnet
+printf 'preserve this chain\n' > /opt/aperod/data/testnet/chain.db
+set +e
+timeout 30 bash /deploy/install-node.sh --primary-ip 10.0.0.1 \
+  > /tmp/install-node-source-guard.log 2>&1
+GUARD_EXIT=$?
+if [[ $GUARD_EXIT -ne 0 ]] &&
+   grep -q '\[source-safety\] REFUSED' /tmp/install-node-source-guard.log &&
+   [[ "$(cat /opt/aperod/data/testnet/chain.db)" == "preserve this chain" ]] &&
+   [[ ! -f /etc/systemd/system/aperod-node.service ]]; then
+  pass_assert "A0: install-node.sh refuses embedded chain data before installer side effects"
+else
+  fail_assert "A0: install-node.sh did not safely refuse an existing chain-data path"
+  cat /tmp/install-node-source-guard.log >&2 || true
+  exit 1
+fi
+rm -rf /opt/aperod/data
+
+echo "══════════════════════════════════════════════════"
 echo "  Running install-node.sh (non-interactive)"
 echo "══════════════════════════════════════════════════"
 

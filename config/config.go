@@ -382,6 +382,20 @@ type ConsensusConfig struct {
 	// LPoDV3TrustAuthorities explicitly authorize the trust-attested nominal
 	// reclassification. They do not change the consensus validator set.
 	LPoDV3TrustAuthorities []string `yaml:"lpod_v3_trust_authorities"`
+// RegistryBootstrap is an explicit operator-attested offline recovery anchor.
+// It is not independent historical committee authentication.
+RegistryBootstrap *RegistryBootstrapConfig `yaml:"registry_bootstrap"`
+}
+
+type RegistryBootstrapConfig struct {
+Trust string `yaml:"trust"`
+SnapshotFile string `yaml:"snapshot_file"`
+SHA256 string `yaml:"sha256"`
+Height uint64 `yaml:"height"`
+// Optional separately pinned public KI export from a DB at this exact anchor.
+// Old DB-backed snapshots intentionally omit historical key images.
+KeyImageFile string `yaml:"key_image_file"`
+KeyImageSHA256 string `yaml:"key_image_sha256"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -603,6 +617,19 @@ func (c *Config) Warnings() []string {
 
 // Validate checks that required fields are present and valid.
 func (c *Config) Validate() error {
+if anchor := c.Consensus.RegistryBootstrap; anchor != nil {
+if anchor.KeyImageFile != "" || anchor.KeyImageSHA256 != "" {
+digest,err:=hex.DecodeString(anchor.KeyImageSHA256)
+if anchor.KeyImageFile=="" || err!=nil || len(digest)!=32 {
+return fmt.Errorf("registry_bootstrap key-image file requires a SHA-256 digest")
+}
+}
+digest, err := hex.DecodeString(anchor.SHA256)
+if !c.Consensus.NonValidator || anchor.Trust != "operator_attested" ||
+anchor.Height == 0 || anchor.SnapshotFile == "" || err != nil || len(digest) != 32 {
+return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_attested, snapshot_file, height > 0 and a SHA-256 digest")
+}
+}
 	if c.Network == "" {
 		return fmt.Errorf("network must be set")
 	}

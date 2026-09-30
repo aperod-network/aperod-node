@@ -3,12 +3,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"mime"
 	"net"
 	"net/http"
@@ -62,6 +64,8 @@ type Server struct {
 	// /api/v1/admin/utxo-audit.  Guarded by utxoAuditMu.
 	utxoAuditMu             sync.Mutex
 	utxoAudit               *UTXOAuditResult
+	lpodAuditDailyMu        sync.Mutex
+dailyJobs              dailyJobService
 	peerCounter             func() int   // optional; wired to p2p.Host.PeerCount by cmd/node
 	pendingHandshakeCounter func() int64 // optional; wired to p2p.Host.PendingHandshakes by cmd/node
 	reconnectBackoffFlag    func() bool  // optional; wired to p2p.Host.ReconnectBackoffActive by cmd/node
@@ -301,6 +305,7 @@ type Server struct {
 	// read-only contract API. It never receives private signing material.
 	avmStore                     avm.Store
 	avmActivationHeight          uint64
+	avmGasBurnActivationHeight   uint64
 	guardianFundActivationHeight uint64
 	guardianFundChainAnchor      crypto.Hash32
 	broadcastTxMu                sync.RWMutex
@@ -445,7 +450,13 @@ func (s *Server) SetRegistry(r *core.ValidatorRegistry) { s.registry = r }
 // server so the /api/v1/admin/partial-unstake endpoint can create properly
 // signed StakeAdminWithdraw transactions.  Optional — endpoint returns 503
 // when no key is configured.
-func (s *Server) SetValidatorKey(key *crypto.LockedValidatorKey) { s.myKey = key }
+func (s *Server) SetValidatorKey(key *crypto.LockedValidatorKey) {
+// Early HTTP startup may overlap key wiring. Daily job authentication reads
+// this pointer under the same mutex and never falls back to unsigned state.
+s.dailyJobs.mu.Lock()
+defer s.dailyJobs.mu.Unlock()
+s.myKey = key
+}
 
 // APIKeyConfig optionally sets the required API key for write operations.
 // Call before Start(). Empty string disables key enforcement (dev mode).
@@ -473,6 +484,13 @@ func (s *Server) SetGuardianFundConfig(height uint64, anchor crypto.Hash32) {
 func (s *Server) SetAVMStore(activationHeight uint64, state avm.Store) {
 	s.avmActivationHeight = activationHeight
 	s.avmStore = state
+}
+
+// SetAVMGasBurnActivationHeight wires the consensus height from which AVM gas
+// fees are included in burned-fee projections. Zero keeps the historical rule.
+func (s *Server) SetAVMGasBurnActivationHeight(height uint64) {
+	s.avmGasBurnActivationHeight = height
+	s.hub.SetAVMGasBurnActivationHeight(height)
 }
 
 // SetTransactionBroadcaster wires accepted locally-submitted transactions to
@@ -839,6 +857,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Start binds and serves. Blocks until server returns.
 // The full middleware chain is: CORS → RateLimit → routes.
 func (s *Server) Start() error {
+defer s.StopDailyAuditWorker()
 	cors := CORSConfig{AllowedOrigins: s.corsOrigins}
 	handler := cors.Middleware(s.rateLimiter.Middleware(s.mux))
 	srv := &http.Server{
@@ -1184,45 +1203,111 @@ type BlockResponse struct {
 	OraclePrice uint64 `json:"oracle_price"`
 	// FeesBurnedNAPRO includes both protocol base fees and explicit
 	// intentional burns, expressed in nAPRO.
-	FeesBurnedNAPRO string `json:"fees_burned_napro"`
+	FeesBurnedNAPRO *string `json:"fees_burned_napro"`
+	// ProtocolFeeBurnedNAPRO and IntentionalBurnNAPRO separate the two
+	// components included in FeesBurnedNAPRO.
+	ProtocolFeeBurnedNAPRO *string `json:"protocol_fee_burned_napro"`
+	IntentionalBurnNAPRO   *string `json:"intentional_burn_napro"`
+	AVMGasBurnedNAPRO      *string `json:"avm_gas_burned_napro"`
+	BurnEvidenceStatus     string  `json:"burn_evidence_status,omitempty"`
 }
 
-func blockToResponse(b *core.Block) BlockResponse {
+func stringPointer(value string) *string { return &value }
+
+func blockToResponse(b *core.Block, avmGasBurnActivationHeight uint64) (BlockResponse, error) {
 	h := b.Hash()
 	baseFee := b.Header.BaseFee
+	baseFeeUnproven := false
 	if baseFee == 0 {
-		baseFee = core.InitialBaseFeePerByte
+		// Historical blocks may omit BaseFee. Consensus then derives it from
+		// the parent; substituting the initial fee would fabricate burn
+		// evidence. This converter has no canonical-parent proof, so mark
+		// financial evidence unavailable when ordinary transactions paid a fee.
+		for i := range b.Txs {
+			tx := &b.Txs[i]
+			if !tx.IsCoinbase() && !tx.IsStake() && tx.Fee > 0 {
+				baseFeeUnproven = true
+				break
+			}
+		}
 	}
-	var burned uint64
+	response := BlockResponse{
+		Hash:         fmt.Sprintf("%x", h[:]),
+		Height:       b.Header.Height,
+		PrevHash:     fmt.Sprintf("%x", b.Header.PrevHash[:]),
+		MerkleRoot:   fmt.Sprintf("%x", b.Header.MerkleRoot[:]),
+		Timestamp:    time.Unix(0, b.Header.Timestamp).UTC().Format(time.RFC3339),
+		Round:        b.Header.Round,
+		ValidatorPub: b.Header.ValidatorPub.Hex(),
+		TxCount:      len(b.Txs),
+		Size:         b.Size(),
+		OraclePrice:  b.Header.OraclePrice,
+	}
+	protocolBurned := new(big.Int)
+	intentionalBurned := new(big.Int)
+	avmGasBurned := new(big.Int)
+	burnAVMGas := avmGasBurnActivationHeight > 0 && b.Header.Height >= avmGasBurnActivationHeight
+	burnMarker := []byte("APRO-BURN\x01")
+	for i := range b.Txs {
+		tx := &b.Txs[i]
+		// BurnAmount intentionally hides malformed marker details from its
+		// bool-only API. Detect a recognized marker here so the read-only
+		// financial summary fails closed rather than silently omitting it.
+		hasBurnMarker := bytes.HasPrefix(tx.Extra, burnMarker)
+		_, isBurn := tx.BurnAmount()
+		if hasBurnMarker && !isBurn {
+			return BlockResponse{}, fmt.Errorf("block %d transaction %d has invalid intentional burn marker", b.Header.Height, i)
+		}
+		if tx.IsCoinbase() || tx.IsStake() {
+			if hasBurnMarker {
+				return BlockResponse{}, fmt.Errorf("block %d transaction %d carries an invalid intentional burn marker", b.Header.Height, i)
+			}
+			continue
+		}
+		if burnAVMGas && tx.IsAVM() {
+			if tx.AVM == nil {
+				return BlockResponse{}, fmt.Errorf("block %d transaction %d has missing AVM payload", b.Header.Height, i)
+			}
+			if _, err := core.AVMGasFee(tx.AVM.GasLimit); err != nil {
+				return BlockResponse{}, fmt.Errorf("block %d transaction %d has invalid AVM gas fee: %w", b.Header.Height, i, err)
+			}
+		}
+	}
+	if baseFeeUnproven {
+		response.BurnEvidenceStatus = "unavailable: zero header base fee and canonical parent-derived fee is not available"
+		return response, nil
+	}
 	for i := range b.Txs {
 		tx := &b.Txs[i]
 		if tx.IsCoinbase() || tx.IsStake() {
 			continue
 		}
-		minFee := tx.MinFeeAt(baseFee)
-		if tx.Fee < minFee {
-			burned += tx.Fee
+		intentionalBurn, isBurn := tx.BurnAmount()
+		minFee := new(big.Int).Mul(new(big.Int).SetUint64(baseFee), big.NewInt(int64(tx.Size())))
+		if minFee.Cmp(new(big.Int).SetUint64(tx.Fee)) > 0 {
+			protocolBurned.Add(protocolBurned, new(big.Int).SetUint64(tx.Fee))
 		} else {
-			burned += minFee
-			if intentionalBurn, isBurn := tx.BurnAmount(); isBurn &&
-				burned <= ^uint64(0)-intentionalBurn {
-				burned += intentionalBurn
+			protocolBurned.Add(protocolBurned, minFee)
+			if isBurn {
+				intentionalBurned.Add(intentionalBurned, new(big.Int).SetUint64(intentionalBurn))
 			}
 		}
+		if burnAVMGas && tx.IsAVM() {
+			gasFee, err := core.AVMGasFee(tx.AVM.GasLimit)
+			if err != nil {
+				return BlockResponse{}, err // validated above
+			}
+			avmGasBurned.Add(avmGasBurned, new(big.Int).SetUint64(gasFee))
+		}
 	}
-	return BlockResponse{
-		Hash:            fmt.Sprintf("%x", h[:]),
-		Height:          b.Header.Height,
-		PrevHash:        fmt.Sprintf("%x", b.Header.PrevHash[:]),
-		MerkleRoot:      fmt.Sprintf("%x", b.Header.MerkleRoot[:]),
-		Timestamp:       time.Unix(0, b.Header.Timestamp).UTC().Format(time.RFC3339),
-		Round:           b.Header.Round,
-		ValidatorPub:    b.Header.ValidatorPub.Hex(),
-		TxCount:         len(b.Txs),
-		Size:            b.Size(),
-		OraclePrice:     b.Header.OraclePrice,
-		FeesBurnedNAPRO: strconv.FormatUint(burned, 10),
-	}
+	totalBurned := new(big.Int).Add(new(big.Int).Set(protocolBurned), intentionalBurned)
+	totalBurned.Add(totalBurned, avmGasBurned)
+	response.FeesBurnedNAPRO = stringPointer(totalBurned.String())
+	response.ProtocolFeeBurnedNAPRO = stringPointer(protocolBurned.String())
+	response.IntentionalBurnNAPRO = stringPointer(intentionalBurned.String())
+	response.AVMGasBurnedNAPRO = stringPointer(avmGasBurned.String())
+	response.BurnEvidenceStatus = "available"
+	return response, nil
 }
 
 func (s *Server) aprGetBlockByHeight(params json.RawMessage) (interface{}, error) {
@@ -1236,7 +1321,7 @@ func (s *Server) aprGetBlockByHeight(params json.RawMessage) (interface{}, error
 	if block == nil {
 		return nil, fmt.Errorf("block not found at height %d", args.Height)
 	}
-	return blockToResponse(block), nil
+	return blockToResponse(block, s.avmGasBurnActivationHeight)
 }
 
 func (s *Server) aprGetBlockByHash(params json.RawMessage) (interface{}, error) {
@@ -1256,7 +1341,7 @@ func (s *Server) aprGetBlockByHash(params json.RawMessage) (interface{}, error) 
 	if block == nil {
 		return nil, fmt.Errorf("block not found: %s", args.Hash[:16])
 	}
-	return blockToResponse(block), nil
+	return blockToResponse(block, s.avmGasBurnActivationHeight)
 }
 
 func (s *Server) aprGetMempoolInfo() (interface{}, error) {

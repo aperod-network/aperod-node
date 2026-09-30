@@ -25,6 +25,8 @@
 #    MOCK_HEIGHT            — inject fake block height for testing
 #    MOCK_PEER_COUNT        — inject fake peer count for testing
 #    MOCK_DISK_FREE_PCT     — inject fake disk-free percentage for testing
+#    NODE_DATA_DIR          — node data directory (default: /opt/aperod/data/testnet)
+#    SHUTDOWN_INTENT_FILE   — override the shutdown-intent marker path
 # =============================================================================
 set -euo pipefail
 
@@ -40,12 +42,16 @@ ALERT_COOLDOWN_SECS="${ALERT_COOLDOWN_SECS:-3600}"
 # State files written every run so the Admin Panel can show watchdog status
 # STATE_DIR may be overridden by tests via the environment variable.
 STATE_DIR="${STATE_DIR:-/var/lib/aperod}"
+NODE_DATA_DIR="${NODE_DATA_DIR:-/opt/aperod/data/testnet}"
 LAST_CHECK_FILE="${STATE_DIR}/watchdog-last-check"
 LAST_RESTART_FILE="${STATE_DIR}/watchdog-last-restart"
 RESTART_COUNT_FILE="${STATE_DIR}/watchdog-restarts"
 LAST_ALERT_FILE="${STATE_DIR}/watchdog-last-alert"
 # Individual restart timestamps for the 24-h crash-loop counter (one Unix-ms per line)
 RESTART_EVENTS_FILE="${STATE_DIR}/watchdog-restart-events"
+# This must match cfg.DataDir used by aperod-node; it is deliberately separate
+# from STATE_DIR, which stores watchdog/admin-panel state.
+SHUTDOWN_INTENT_FILE="${SHUTDOWN_INTENT_FILE:-${NODE_DATA_DIR}/shutdown-intent}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -99,6 +105,166 @@ append_restart_event() {
   fi
 }
 
+# Convert systemd's TimeoutStopUSec display value to whole seconds. `systemctl
+# show` commonly renders this property as e.g. "15min"; support integral
+# composite units too. A bare integer is interpreted as microseconds. Invalid,
+# infinite, fractional, or excessively large values fail closed.
+systemd_timeout_seconds() {
+  local value="$1" rest qty unit tail factor total_ms=0 token_count=0
+  if [[ "${value}" =~ ^[0-9]+$ ]]; then
+    ((${#value} <= 15)) || return 1
+    echo $(( 10#${value} / 1000000 ))
+    return 0
+  fi
+  ((${#value} > 0 && ${#value} <= 128)) || return 1
+  rest="${value}"
+  while [[ -n "${rest//[[:space:]]/}" ]]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ "${rest}" =~ ^([0-9]+)(weeks|week|w|days|day|d|hours|hour|hr|h|minutes|minute|min|m|seconds|second|sec|s|msec|ms|usec|us|nsec|ns)(.*)$ ]] || return 1
+    qty="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    tail="${BASH_REMATCH[3]}"
+    ((${#qty} <= 9)) || return 1
+    qty=$(( 10#${qty} ))
+    case "${unit}" in
+      w|week|weeks) factor=604800000 ;;
+      d|day|days) factor=86400000 ;;
+      h|hr|hour|hours) factor=3600000 ;;
+      m|min|minute|minutes) factor=60000 ;;
+      s|sec|second|seconds) factor=1000 ;;
+      ms|msec) factor=1 ;;
+      us|usec|ns|nsec) factor=0 ;;
+    esac
+    if (( total_ms <= 900000 )); then
+      if (( factor > 0 && qty > (900000 - total_ms) / factor )); then
+        total_ms=900001
+      else
+        total_ms=$(( total_ms + qty * factor ))
+      fi
+    fi
+    (( token_count += 1 ))
+    (( token_count <= 16 )) || return 1
+    rest="${tail}"
+  done
+  (( total_ms > 0 )) || return 1
+  echo $(( total_ms / 1000 ))
+}
+
+# Return success only when the node's shutdown marker belongs to a still-live
+# process with the same Linux start-time tick and is no older than the node's
+# effective systemd TimeoutStopSec. Missing, malformed, stale, or unverifiable
+# markers never suppress a watchdog restart.
+valid_shutdown_intent() {
+  [[ -f "${SHUTDOWN_INTENT_FILE}" ]] || return 1
+  local pid="" start_id="" created="" extra="" node_timeout max_age now stat_line actual_start
+  read -r pid start_id created extra < "${SHUTDOWN_INTENT_FILE}" || return 1
+  [[ -z "${extra:-}" && "${pid}" =~ ^[1-9][0-9]*$ &&
+     "${start_id}" =~ ^[0-9]+$ && "${created}" =~ ^[0-9]+$ ]] || return 1
+
+  # If timeout cannot be verified, fail open to normal watchdog behavior.
+  node_timeout=$(systemctl show aperod-node --property=TimeoutStopUSec --value 2>/dev/null || true)
+  max_age=$(systemd_timeout_seconds "${node_timeout}") || return 1
+  # Keep the marker short-lived even if the unit is configured with an
+  # unusually long stop timeout; this cap is still <= TimeoutStopSec.
+  (( max_age > 900 )) && max_age=900
+  (( max_age > 0 )) || return 1
+
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  stat_line=$(cat "/proc/${pid}/stat" 2>/dev/null) || return 1
+  # /proc stat's comm field may contain spaces and parentheses. Strip through
+  # its final ')' so the 20th remaining field is starttime (field 22).
+  actual_start=$(printf '%s\n' "${stat_line}" | sed 's/^.*) //' | awk '{print $20}')
+  [[ "${actual_start}" =~ ^[0-9]+$ && "${actual_start}" == "${start_id}" ]] || return 1
+
+  now=$(date +%s)
+  (( created <= now && now - created <= max_age ))
+}
+
+skip_for_shutdown_intent() {
+  if valid_shutdown_intent; then
+    log "valid graceful-shutdown intent for node PID $(awk '{print $1}' "${SHUTDOWN_INTENT_FILE}") — skipping watchdog restart"
+    exit 0
+  fi
+  return 1
+}
+
+# Do not queue a second restart while systemd is already stopping, starting, or
+# otherwise unable to confirm that the node is fully active. This is important
+# after startup consumes the shutdown-intent marker but the API is not ready yet.
+restart_aperod_node_if_active() {
+  local active_state sub_state
+  if ! active_state=$(systemctl show aperod-node --property=ActiveState --value 2>/dev/null); then
+    log "cannot read aperod-node ActiveState — skipping watchdog restart (fail closed)"
+    exit 0
+  fi
+  if ! sub_state=$(systemctl show aperod-node --property=SubState --value 2>/dev/null); then
+    log "cannot read aperod-node SubState — skipping watchdog restart (fail closed)"
+    exit 0
+  fi
+  if [[ "${active_state}" != "active" || "${sub_state}" != "running" ]]; then
+    log "aperod-node is not confirmed active/running (ActiveState=${active_state:-unknown}, SubState=${sub_state:-unknown}) — skipping watchdog restart"
+    exit 0
+  fi
+  systemctl restart aperod-node
+}
+
+# The Go node may report HTTP 000 briefly after systemd has started it, while
+# chain state and listeners are still initializing. For failed API probes only,
+# allow a bounded startup window before alerting or restarting.
+skip_for_api_startup_grace() {
+  local active_state sub_state active_enter_us uptime uptime_seconds uptime_fraction
+  local uptime_us active_age_us
+
+  if ! active_state=$(systemctl show aperod-node --property=ActiveState --value 2>/dev/null); then
+    log "cannot read aperod-node ActiveState after failed API probe — skipping restart (fail closed)"
+    exit 0
+  fi
+  if ! sub_state=$(systemctl show aperod-node --property=SubState --value 2>/dev/null); then
+    log "cannot read aperod-node SubState after failed API probe — skipping restart (fail closed)"
+    exit 0
+  fi
+  if [[ "${active_state}" != "active" || "${sub_state}" != "running" ]]; then
+    log "aperod-node is not confirmed active/running after failed API probe (ActiveState=${active_state:-unknown}, SubState=${sub_state:-unknown}) — skipping restart"
+    exit 0
+  fi
+
+  if ! active_enter_us=$(systemctl show aperod-node --property=ActiveEnterTimestampMonotonic --value 2>/dev/null); then
+    log "cannot read aperod-node ActiveEnterTimestampMonotonic — skipping restart (fail closed)"
+    exit 0
+  fi
+  if [[ ! "${active_enter_us}" =~ ^[0-9]{1,18}$ ]]; then
+    log "invalid aperod-node ActiveEnterTimestampMonotonic — skipping restart (fail closed)"
+    exit 0
+  fi
+
+  if ! IFS=' ' read -r uptime _ < /proc/uptime; then
+    log "cannot read /proc/uptime — skipping restart after failed API probe (fail closed)"
+    exit 0
+  fi
+  if [[ ! "${uptime}" =~ ^([0-9]{1,12})(\.([0-9]{1,6}))?$ ]]; then
+    log "invalid /proc/uptime value — skipping restart after failed API probe (fail closed)"
+    exit 0
+  fi
+  uptime_seconds="${BASH_REMATCH[1]}"
+  uptime_fraction="${BASH_REMATCH[3]:-}"
+  uptime_fraction="${uptime_fraction}000000"
+  uptime_fraction="${uptime_fraction:0:6}"
+
+  uptime_us=$(( 10#${uptime_seconds} * 1000000 + 10#${uptime_fraction} ))
+  active_enter_us=$(( 10#${active_enter_us} ))
+  if (( active_enter_us > uptime_us )); then
+    log "aperod-node ActiveEnterTimestampMonotonic is ahead of /proc/uptime — skipping restart (fail closed)"
+    exit 0
+  fi
+
+  active_age_us=$(( uptime_us - active_enter_us ))
+  if (( active_age_us < 480000000 )); then
+    log "aperod-node has been active for less than 480 seconds — deferring failed-API restart during startup grace"
+    exit 0
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Record this check run (always — so Admin Panel can detect liveness)
 # ---------------------------------------------------------------------------
@@ -113,6 +279,10 @@ HTTP_CODE=$(curl -s -o "${_body_file}" -w "%{http_code}" \
   "${STATUS_URL}" 2>/dev/null || echo "000")
 RESPONSE_BODY=$(cat "${_body_file}" 2>/dev/null || echo "")
 rm -f "${_body_file}"
+
+# This catches the common in-flight snapshot-save window; repeat immediately
+# before each restart below to cover a shutdown that begins during other checks.
+skip_for_shutdown_intent || true
 
 if [[ "$HTTP_CODE" == "200" ]]; then
   log "API OK (HTTP ${HTTP_CODE})"
@@ -137,6 +307,7 @@ if [[ "$HTTP_CODE" == "200" ]]; then
     THRESHOLD_KB=$(( RAM_THRESHOLD_MB * 1024 ))
 
     if [[ "${RSS_KB}" -gt "${THRESHOLD_KB}" ]]; then
+      skip_for_shutdown_intent || true
       RSS_MB=$(( RSS_KB / 1024 ))
       log "RAM threshold exceeded: ${RSS_MB} MB > ${RAM_THRESHOLD_MB} MB — restarting aperod-node"
 
@@ -157,7 +328,7 @@ Action: <code>systemctl restart aperod-node</code>
         echo "${_now_r}" > "${LAST_RAM_ALERT_FILE}" || true
       fi
 
-      systemctl restart aperod-node
+      restart_aperod_node_if_active
       write_timestamp "${LAST_RESTART_FILE}"
       increment_restart_count
       append_restart_event
@@ -296,6 +467,7 @@ Install logrotate to prevent recurrence:
         log "Block height stalled at ${HEIGHT} (stall check ${STALL_COUNT}/${STALL_CHECKS_MAX})"
 
         if [[ "${STALL_COUNT}" -ge "${STALL_CHECKS_MAX}" ]]; then
+          skip_for_shutdown_intent || true
           _stall_secs=$(( STALL_COUNT * WATCHDOG_INTERVAL_SECS ))
           log "Stall threshold reached (~${_stall_secs}s at height ${HEIGHT}) — restarting aperod-node"
 
@@ -314,7 +486,7 @@ Action: <code>systemctl restart aperod-node</code>
           fi
 
           echo "0" > "${STALL_COUNT_FILE}" || true
-          systemctl restart aperod-node
+          restart_aperod_node_if_active
           write_timestamp "${LAST_RESTART_FILE}"
           increment_restart_count
           append_restart_event
@@ -421,6 +593,8 @@ fi
 # ---------------------------------------------------------------------------
 # Probe failed — restart the node
 # ---------------------------------------------------------------------------
+skip_for_shutdown_intent || true
+skip_for_api_startup_grace || true
 log "FAIL: ${STATUS_URL} returned HTTP ${HTTP_CODE} (timeout=${TIMEOUT_SECS}s) — restarting aperod-node"
 
 # Respect cooldown: only send Telegram alert if ALERT_COOLDOWN_SECS have passed
@@ -444,7 +618,7 @@ else
   log "Telegram alert suppressed (cooldown: ${_elapsed}s elapsed of ${ALERT_COOLDOWN_SECS}s required)"
 fi
 
-systemctl restart aperod-node
+restart_aperod_node_if_active
 
 # Record the restart event
 write_timestamp "${LAST_RESTART_FILE}"

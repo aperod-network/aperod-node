@@ -1,7 +1,11 @@
 package consensus_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -282,5 +286,198 @@ func TestFutureVoteQueueRejectsInvalidDuplicateAndFarFuture(t *testing.T) {
 	}
 	if engine.IsFinalized(1) || engine.IsFinalized(2) || engine.IsFinalized(4) {
 		t.Fatal("unaccepted future vote created phantom finality")
+	}
+}
+
+func TestLatestLocalVoteWaitsForCanonicalPersistenceAndFailsClosed(t *testing.T) {
+	priv, pub, genesis, _ := buildValidatorGenesisAndBlock(t)
+	chain := core.NewChain()
+	if err := chain.SetGenesis(genesis); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	locked, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Destroy()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	secondBlockReady := make(chan struct{})
+	releaseSecondBlock := make(chan struct{})
+	votes := make(chan consensus.FinalizeMsg, 8)
+	cfg := consensus.Config{
+		OnCanonicalBlock: func(block *core.Block, _ *avm.PreparedBlock) error {
+			if block.Header.Height == 2 {
+				close(secondBlockReady)
+				<-releaseSecondBlock
+			}
+			raw, err := json.Marshal(block)
+			if err != nil {
+				return err
+			}
+			if err := db.PutRawBlock(block.Hash(), block.Header.Height, raw); err != nil {
+				return err
+			}
+			return db.PutTip(block.Hash(), block.Header.Height)
+		},
+		OnVoteCast: func(vote consensus.FinalizeMsg) { votes <- vote },
+		BlockTime:  30 * time.Millisecond, BFTThreshold: 0.667,
+		Validators: []crypto.ValidatorPubKey{pub}, MyKey: locked, Store: db,
+		RingCTV4ActivationHeight: ^uint64(0),
+	}
+	engine := consensus.NewEngine(cfg, chain, core.NewMempool(core.DefaultMempoolConfig()), logger)
+	utxos := core.NewUTXOSet()
+	engine.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	stop := make(chan struct{})
+	runDone := make(chan struct{})
+	stopClosed, persistenceReleased := false, false
+	defer func() {
+		if !persistenceReleased {
+			close(releaseSecondBlock)
+		}
+		if !stopClosed {
+			close(stop)
+		}
+		<-runDone
+	}()
+	go func() {
+		engine.Run(stop)
+		close(runDone)
+	}()
+
+	select {
+	case vote := <-votes:
+		if vote.Height != 1 {
+			t.Fatalf("first local vote height = %d, want 1", vote.Height)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first local vote was not produced")
+	}
+	select {
+	case <-secondBlockReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second block did not reach canonical persistence")
+	}
+
+	memoryTip := chain.Tip()
+	durableHash, durableHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memoryTip == nil || memoryTip.Header.Height != 2 || durableHeight != 1 ||
+		durableHash == (crypto.Hash32{}) {
+		t.Fatalf("test did not reach the memory/disk boundary: memory=%v durable_height=%d",
+			memoryTip, durableHeight)
+	}
+
+	type voteResult struct {
+		vote consensus.FinalizeMsg
+		ok   bool
+	}
+	result := make(chan voteResult, 1)
+	callStarted := make(chan struct{})
+	go func() {
+		close(callStarted)
+		vote, ok := engine.LatestLocalVote()
+		result <- voteResult{vote: vote, ok: ok}
+	}()
+	<-callStarted
+	select {
+	case got := <-result:
+		t.Fatalf("LatestLocalVote returned before canonical persistence completed: %+v", got)
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	// Stop the run loop while its second tick is paused. This makes the
+	// post-persistence vote returned below deterministic instead of allowing a
+	// later ticker tick to advance it again before the test can inspect it.
+	close(stop)
+	stopClosed = true
+	close(releaseSecondBlock)
+	persistenceReleased = true
+	var secondVote consensus.FinalizeMsg
+	select {
+	case secondVote = <-votes:
+		if secondVote.Height != 2 {
+			t.Fatalf("second local vote height = %d, want 2", secondVote.Height)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second local vote was not produced after persistence completed")
+	}
+	var got voteResult
+	select {
+	case got = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("LatestLocalVote did not resume after the canonical transition")
+	}
+	if !got.ok || got.vote.Height < secondVote.Height {
+		t.Fatalf("LatestLocalVote = (%+v, %t), want a vote at or above height %d",
+			got.vote, got.ok, secondVote.Height)
+	}
+	indexedHash, found, err := db.GetCanonicalHash(got.vote.Height)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || indexedHash != got.vote.BlockHash {
+		t.Fatalf("LatestLocalVote returned a non-canonical durable vote at height %d",
+			got.vote.Height)
+	}
+
+	<-runDone
+	for {
+		select {
+		case <-engine.ProducedCh():
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	badVote, err := db.LoadLocalFinalityVote()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if badVote == nil {
+		t.Fatal("expected a durable local vote before simulating ancestry failure")
+	}
+	// A genuinely inconsistent durable tip must still prevent vote replay and
+	// halt subsequent production, while recording the precise verification
+	// failure for operators.
+	if err := db.PutTip(genesis.Hash(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.LatestLocalVote(); ok {
+		t.Fatal("LatestLocalVote accepted a vote above the durable tip")
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "local finality vote ancestry verification failed; consensus halted") ||
+		!strings.Contains(logged, fmt.Sprintf("vote_height=%d", badVote.Height)) ||
+		!strings.Contains(logged, fmt.Sprintf("vote_hash=%x", badVote.BlockHash[:])) ||
+		!strings.Contains(logged, `verification_error="local vote is above the durable tip"`) {
+		t.Fatalf("structured ancestry failure log missing fields or exact reason:\n%s", logged)
+	}
+
+	restarted := make(chan struct{})
+	restartDone := make(chan struct{})
+	go func() {
+		engine.Run(restarted)
+		close(restartDone)
+	}()
+	select {
+	case block := <-engine.ProducedCh():
+		close(restarted)
+		<-restartDone
+		t.Fatalf("producer continued after genuine vote ancestry failure at height %d",
+			block.Header.Height)
+	case <-time.After(120 * time.Millisecond):
+		close(restarted)
+		<-restartDone
 	}
 }

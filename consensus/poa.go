@@ -1876,6 +1876,12 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 const maxClockSkewNs = int64(15 * 1_000_000_000)
 
 func (e *Engine) handleIncomingBlock(block *core.Block) error {
+// An accepted peer block changes the in-memory tip before the durable
+// callback commits it. Keep that entire transition atomic with local-vote
+// ancestry checks, using the same lock order as tick: productionMu then mu.
+e.productionMu.Lock()
+defer e.productionMu.Unlock()
+
 	if e.halted.Load() {
 		return fmt.Errorf("consensus engine halted after persistent rollback failure")
 	}
@@ -2614,6 +2620,13 @@ func (e *Engine) verifyLocalVoteAncestry(voteHeight uint64, voteHash crypto.Hash
 // LatestLocalVote returns the latest durable vote produced by this node, if
 // it still identifies a block in the canonical chain.
 func (e *Engine) LatestLocalVote() (FinalizeMsg, bool) {
+	// Canonical transitions update the in-memory chain before the durability
+	// callback commits the matching tip. Serialize the ancestry check with that
+	// transition so a transient memory/disk mismatch cannot halt consensus.
+	// Match tick's lock order: productionMu before mu.
+	e.productionMu.Lock()
+	defer e.productionMu.Unlock()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.latestLocalVote == nil {
@@ -2623,6 +2636,10 @@ func (e *Engine) LatestLocalVote() (FinalizeMsg, bool) {
 		// A previously signed vote that is no longer on the durable chain is a
 		// signing-safety violation. Stop consensus until a safe restart/recovery;
 		// never rebroadcast it or sign over the same height on another fork.
+		e.log.Error("local finality vote ancestry verification failed; consensus halted",
+			"vote_height", e.latestLocalVote.Height,
+			"vote_hash", fmt.Sprintf("%x", e.latestLocalVote.BlockHash[:]),
+			"verification_error", err)
 		e.halted.Store(true)
 		return FinalizeMsg{}, false
 	}

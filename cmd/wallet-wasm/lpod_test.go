@@ -93,7 +93,32 @@ func TestNativeLPoDWASMFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	second, err := core.BuildLPoDPayoutOutput(crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys), 10000000001, 2,
+		crypto.HashBytes([]byte("second-parent")), crypto.HashBytes([]byte("second-digest")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Offline-only synthetic decoys exercise the ordinary local self-transfer
+	// builder; they are never presented to a live node.
+	decoys := make([]map[string]string, 0, 30)
+	for i := 0; i < 30; i++ {
+		d, err := core.BuildLPoDPayoutOutput(
+			crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys), uint64(200+i), uint64(2+i),
+			crypto.HashBytes([]byte{byte(i), 1}), crypto.HashBytes([]byte{byte(i), 2}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoys = append(decoys, map[string]string{
+			"one_time_pub": hex.EncodeToString(d.OneTimePub[:]),
+			"amount_commit": hex.EncodeToString(d.AmountCommit[:]),
+		})
+	}
 	data, err := json.Marshal(map[string]interface{}{"mnemonic": mnemonic, "genesis": strings.Repeat("11", 32), "vault": strings.Repeat("22", 32),
+		"decoys": decoys,
+		"second_output": map[string]interface{}{"tx_hash": strings.Repeat("44", 32), "out_idx": 0, "block_height": 2,
+			"one_time_pub": hex.EncodeToString(second.OneTimePub[:]), "tx_pub_key": hex.EncodeToString(second.TxPubKey[:]),
+			"amount_commit": hex.EncodeToString(second.AmountCommit[:]), "enc_amount": hex.EncodeToString(second.EncAmount[:])},
 		"output": map[string]interface{}{"tx_hash": strings.Repeat("33", 32), "out_idx": 0, "block_height": 1,
 			"one_time_pub": hex.EncodeToString(out.OneTimePub[:]), "tx_pub_key": hex.EncodeToString(out.TxPubKey[:]),
 			"amount_commit": hex.EncodeToString(out.AmountCommit[:]), "enc_amount": hex.EncodeToString(out.EncAmount[:])}})

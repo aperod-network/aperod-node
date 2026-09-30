@@ -16,6 +16,8 @@ APEROD_USER="aperod"
 INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/source-safe-guard.sh"
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════════════════════╗
@@ -27,6 +29,71 @@ if [[ $(id -u) -ne 0 ]]; then
   echo -e "${RED}Запустите от root: sudo bash uninstall-validator.sh${NC}"
   exit 1
 fi
+
+source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" || {
+  echo -e "${RED}[ERR]${NC} Source safety guard refused removal; source and chain data were not changed." >&2
+  exit 1
+}
+
+resolve_configured_data_dir() {
+  local config_file="${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}"
+  local config_count config_value
+  CONFIGURED_DATA_DIR="$DATA_DIR"
+  [[ -f "$config_file" ]] || return 0
+
+  config_count=$(grep -Ec '^[[:space:]]*data_dir[[:space:]]*:' "$config_file" || true)
+  (( config_count <= 1 )) || {
+    echo -e "${RED}[ERR]${NC} Refusing uninstall: duplicate data_dir entries in ${config_file}." >&2
+    return 1
+  }
+  (( config_count == 1 )) || return 0
+
+  config_value=$(sed -nE 's/^[[:space:]]*data_dir[[:space:]]*:[[:space:]]*([^#]*).*/\1/p' "$config_file")
+  config_value="${config_value%$'\r'}"
+  config_value="${config_value#\"}"; config_value="${config_value%\"}"
+  config_value="${config_value#\'}"; config_value="${config_value%\'}"
+  config_value="${config_value#"${config_value%%[![:space:]]*}"}"
+  config_value="${config_value%"${config_value##*[![:space:]]}"}"
+  [[ "$config_value" == /* ]] || {
+    echo -e "${RED}[ERR]${NC} Refusing uninstall: configured data_dir must be absolute (${config_file})." >&2
+    return 1
+  }
+  CONFIGURED_DATA_DIR="$config_value"
+}
+
+uninstall_runtime_data_guard() {
+  local data_path runtime_path
+  local -a checked_paths=()
+  resolve_configured_data_dir || return 1
+  checked_paths=("$DATA_DIR")
+  [[ "$CONFIGURED_DATA_DIR" == "$DATA_DIR" ]] || checked_paths+=("$CONFIGURED_DATA_DIR")
+
+  for data_path in "${checked_paths[@]}"; do
+    if [[ ! -e "$INSTALL_DIR" && ( -e "$data_path" || -L "$data_path" ) ]]; then
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data path exists but the source checkout is absent (${data_path}); preserve and inspect it first." >&2
+      return 1
+    fi
+    [[ -e "$data_path" || -L "$data_path" ]] || continue
+    [[ -d "$data_path" && ! -L "$data_path" ]] || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data path is not a real directory: ${data_path}" >&2
+      return 1
+    }
+
+    # Never guess which filenames contain a chain, a snapshot, or a key.
+    # Even an explicitly confirmed uninstall may remove only an empty data
+    # directory; the operator must archive/move any contents separately.
+    runtime_path=$(find "$data_path" -mindepth 1 -print -quit 2>/dev/null) || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: cannot inspect runtime data under ${data_path}." >&2
+      return 1
+    }
+    [[ -z "$runtime_path" ]] || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data directory is not empty (${runtime_path}); archive or move its contents before uninstalling." >&2
+      return 1
+    }
+  done
+}
+
+uninstall_runtime_data_guard || exit 1
 
 echo -e "${YELLOW}${BOLD}Это действие необратимо. Будут удалены:${NC}"
 echo -e "  • Сервис  aperod-node (systemd)"

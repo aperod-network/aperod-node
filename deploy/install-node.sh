@@ -27,6 +27,9 @@ RPC_PORT=8545
 # Resolve script directory early — referenced in step 8b (bootnode) and later
 # steps (watchdog, backup, etc.).  Must be set before any ${SCRIPT_DIR} use.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/source-safe-guard.sh"
+source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" ||
+  die "Установка остановлена защитой исходников; существующие данные и файлы не изменены"
 
 # ── Аргументы командной строки ────────────────────────────
 # --primary-ip <IP>   Публичный IP основного (primary) узла.

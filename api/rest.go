@@ -73,6 +73,9 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
 	s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
 	s.mux.HandleFunc("/api/v1/lpod/earnings-outputs", s.restLPoDEarningsOutputs)
+	// Administrative/internal only: this audit may scan tens of thousands of
+	// full block bodies and requires both loopback access and the configured API key.
+s.mux.HandleFunc("/api/v1/lpod/audit/daily", s.localOnly(s.requireAPIKey(s.restLPoDDailyJob)))
 	s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
@@ -248,7 +251,12 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 	for h := startHeight; h >= 0 && len(blocks) < limit; h-- {
 		b := s.chain.GetByHeight(uint64(h))
 		if b != nil {
-			blocks = append(blocks, blockToResponse(b))
+			response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			blocks = append(blocks, response)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -336,7 +344,12 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 
 	// Block detail endpoint
 	if b := s.lookupBlockMem(tail); b != nil {
-		writeJSON(w, http.StatusOK, blockToResponse(b))
+		response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	// Validate ID syntax before disk fallback.
@@ -348,7 +361,12 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 	if s.blockStore != nil {
 		fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(tail)
 		if fullBlock != nil {
-			writeJSON(w, http.StatusOK, blockToResponse(fullBlock))
+			response, err := blockToResponse(fullBlock, s.avmGasBurnActivationHeight)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
 			return
 		}
 		if prunedBlock != nil {
@@ -464,18 +482,22 @@ func (s *Server) writePrunedBlockTransactions(w http.ResponseWriter, sb *store.S
 // oracle_price) are empty/zero; pruned:true is always set.
 func prunedBlockDetailResponse(sb *store.StoredBlock) map[string]interface{} {
 	return map[string]interface{}{
-		"hash":              fmt.Sprintf("%x", sb.Hash[:]),
-		"height":            sb.Height,
-		"prev_hash":         fmt.Sprintf("%x", sb.PrevHash[:]),
-		"timestamp":         time.Unix(0, sb.Timestamp).UTC().Format(time.RFC3339),
-		"round":             sb.Round,
-		"tx_count":          sb.TxCount,
-		"validator_pub":     "",
-		"merkle_root":       "",
-		"size":              0,
-		"oracle_price":      0,
-		"fees_burned_napro": 0,
-		"pruned":            true,
+		"hash":                      fmt.Sprintf("%x", sb.Hash[:]),
+		"height":                    sb.Height,
+		"prev_hash":                 fmt.Sprintf("%x", sb.PrevHash[:]),
+		"timestamp":                 time.Unix(0, sb.Timestamp).UTC().Format(time.RFC3339),
+		"round":                     sb.Round,
+		"tx_count":                  sb.TxCount,
+		"validator_pub":             "",
+		"merkle_root":               "",
+		"size":                      0,
+		"oracle_price":              0,
+		"fees_burned_napro":         nil,
+		"protocol_fee_burned_napro": nil,
+		"intentional_burn_napro":    nil,
+		"avm_gas_burned_napro":      nil,
+		"burn_evidence_status":      "unavailable: block transactions pruned",
+		"pruned":                    true,
 	}
 }
 

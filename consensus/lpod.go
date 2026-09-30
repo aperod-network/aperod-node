@@ -71,7 +71,14 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 	}
 	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true, Timestamp: block.Header.Timestamp,
 		Proposer: block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
-		PreviousStake: map[string]store.LPoDValidatorStake{}}
+		PreviousStake:      map[string]store.LPoDValidatorStake{},
+		AuditPreviousStake: map[string]store.LPoDValidatorStake{},
+		AuditStake:         map[string]store.LPoDValidatorStake{}}
+	// TakeSnapshot returns an independent deep copy, including seeded entries
+	// and the dynamic minimum. Keep it before projecting any stake operation in
+	// this block; this evidence is optional and never affects consensus hashes.
+	registryBefore := e.cfg.Registry.TakeSnapshot()
+	r.RegistryBefore = &registryBefore
 	if height == m.Height {
 		r.Migration = m
 	}
@@ -124,25 +131,28 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 		r.Transactions = append(r.Transactions, tx)
 	}
-	// Snapshot every non-seeded validator, not only vaults already referenced by
-	// positions. Lifecycle routing must choose from the same canonical candidate
-	// set on every node and cannot depend on a local API/database inventory.
-	for _, entry := range e.cfg.Registry.AllEntries() {
-		if entry.Seeded {
+	// Preserve the exact full registry projection for audit replay, including
+	// seeded entries. The operational maps intentionally retain the historical
+	// non-seeded candidate set so optional evidence cannot change consensus.
+	for _, entry := range registryBefore.Validators {
+		if entry == nil {
 			continue
 		}
 		id := entry.PubKey.Hex()
 		stake := store.LPoDValidatorStake{Amount: entry.StakeNAPR, Active: entry.Status == core.ValidatorActive}
-		r.Stake[id], r.PreviousStake[id] = stake, stake
-		vaults[id] = true
+		r.AuditStake[id], r.AuditPreviousStake[id] = stake, stake
+		if !entry.Seeded {
+			r.Stake[id], r.PreviousStake[id] = stake, stake
+			vaults[id] = true
+		}
 	}
 	for id := range vaults {
 		raw, err := hex.DecodeString(id)
 		if err != nil || len(raw) != 32 {
 			return nil, nil, nil, fmt.Errorf("lpod: invalid vault identity")
 		}
-		entry, found := e.cfg.Registry.GetEntry(crypto.ValidatorPubKey(raw))
-		if found && !entry.Seeded {
+		entry := registryBefore.Validators[id]
+		if entry != nil && !entry.Seeded {
 			stake := store.LPoDValidatorStake{Amount: entry.StakeNAPR, Active: entry.Status == core.ValidatorActive}
 			r.Stake[id], r.PreviousStake[id] = stake, stake
 		}
@@ -150,6 +160,21 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 	// Stake operations become canonical in this block. Reflect their resulting
 	// eligibility in LPoD before previewing routes, while retaining the prior
 	// snapshot for this block's already-earned accrual and source ranking.
+	adjustWithdrawal := func(stake store.LPoDValidatorStake, action core.StakeAction, amount uint64) (store.LPoDValidatorStake, error) {
+		switch action {
+		case core.StakeWithdraw:
+			stake.Active = false
+		case core.StakePartialWithdraw:
+			if amount > stake.Amount {
+				return stake, fmt.Errorf("lpod: invalid validator stake transition")
+			}
+			stake.Amount -= amount
+			if stake.Amount < core.MinStakeNAPR {
+				stake.Active = false
+			}
+		}
+		return stake, nil
+	}
 	for i := start; i < len(block.Txs); i++ {
 		tx := &block.Txs[i]
 		action, pub, amount, withdrawal, err := lpodStakeOperation(tx)
@@ -159,22 +184,26 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		if !withdrawal {
 			continue
 		}
+		if action != core.StakeWithdraw && action != core.StakePartialWithdraw {
+			continue
+		}
 		id := pub.Hex()
+		auditStake, found := r.AuditStake[id]
+		if !found {
+			continue
+		}
+		auditStake, err = adjustWithdrawal(auditStake, action, amount)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		r.AuditStake[id] = auditStake
 		stake, found := r.Stake[id]
 		if !found {
 			continue
 		}
-		switch action {
-		case core.StakeWithdraw:
-			stake.Active = false
-		case core.StakePartialWithdraw:
-			if amount > stake.Amount {
-				return nil, nil, nil, fmt.Errorf("lpod: invalid validator stake transition")
-			}
-			stake.Amount -= amount
-			if stake.Amount < core.MinStakeNAPR {
-				stake.Active = false
-			}
+		stake, err = adjustWithdrawal(stake, action, amount)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 		r.Stake[id] = stake
 	}

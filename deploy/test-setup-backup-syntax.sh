@@ -52,8 +52,12 @@ IMAGE_TAG="aperod-backup-syntax-test:latest"
 CTX=$(mktemp -d)
 trap 'rm -rf "$CTX"; docker rmi -f "$IMAGE_TAG" >/dev/null 2>&1 || true' EXIT
 
-# Copy the real deploy directory (setup-backup.sh + aperod_backup.sh)
-cp -r "$SCRIPT_DIR" "$CTX/deploy"
+# Copy deploy and the minimal module layout used to locate backup-verify.
+mkdir -p "$CTX/blockchain"
+cp -r "$SCRIPT_DIR" "$CTX/blockchain/deploy"
+cp "$SCRIPT_DIR/../go.mod" "$SCRIPT_DIR/../go.sum" "$CTX/blockchain/"
+mkdir -p "$CTX/blockchain/cmd/backup-verify"
+cp "$SCRIPT_DIR/../cmd/backup-verify/main.go" "$CTX/blockchain/cmd/backup-verify/"
 
 # ── Stubs ─────────────────────────────────────────────────────────────────────
 mkdir -p "$CTX/stubs"
@@ -61,7 +65,30 @@ mkdir -p "$CTX/stubs"
 # systemctl — no-op (daemon-reload, enable, restart, is-active, enable --now …)
 cat > "$CTX/stubs/systemctl" << 'STUB'
 #!/usr/bin/env bash
+if [[ "$1" == "enable" && "$2" == "--now" && "$3" == "aperod-backup.path" ]]; then
+  [[ -x /usr/local/bin/aperod-backup-verify ]] \
+    && /usr/local/bin/aperod-backup-verify --help >/dev/null 2>&1 \
+    || exit 90
+  touch /tmp/backup-path-enabled
+fi
 exit 0
+STUB
+
+# go — emulate the static build without fetching dependencies in Docker.
+cat > "$CTX/stubs/go" << 'STUB'
+#!/usr/bin/env bash
+[[ "${GO_BUILD_FAIL:-0}" == "1" ]] && exit 1
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then output="$2"; break; fi
+  shift
+done
+[[ -n "${output:-}" ]] || exit 2
+cat > "$output" <<'BINARY'
+#!/usr/bin/env bash
+[[ "$1" == "--help" ]] && exit 0
+exit 2
+BINARY
+chmod +x "$output"
 STUB
 
 # systemd-tmpfiles — create the directory that setup-backup.sh expects
@@ -132,10 +159,9 @@ export PATH="/stubs:$PATH"
 # Create the aperod user so that check passes without a real system.
 useradd --system --no-create-home aperod 2>/dev/null || true
 
-# setup-backup.sh reads SCRIPT_DIR from its own location (BASH_SOURCE); it
-# installs /deploy/aperod_backup.sh from SCRIPT_DIR.  We keep the real
-# aperod_backup.sh in /deploy/ and swap it out per test case.
-REAL_BACKUP="/deploy/aperod_backup.sh"
+# setup-backup.sh reads SCRIPT_DIR from its own location (BASH_SOURCE); keep
+# the real backup script in its module-layout deploy directory.
+REAL_BACKUP="/blockchain/deploy/aperod_backup.sh"
 BACKUP_SRC_SAVE="/tmp/aperod_backup.sh.orig"
 cp "$REAL_BACKUP" "$BACKUP_SRC_SAVE"
 
@@ -157,7 +183,7 @@ TRUNCATED
 chmod +x "$REAL_BACKUP"
 
 T1_EXIT=0
-bash /deploy/setup-backup.sh 2>&1 || T1_EXIT=$?
+bash /blockchain/deploy/setup-backup.sh 2>&1 || T1_EXIT=$?
 
 echo ""
 echo "  setup-backup.sh exit code (truncated): $T1_EXIT"
@@ -178,7 +204,7 @@ cp "$BACKUP_SRC_SAVE" "$REAL_BACKUP"
 chmod +x "$REAL_BACKUP"
 
 T2_EXIT=0
-bash /deploy/setup-backup.sh 2>&1 || T2_EXIT=$?
+bash /blockchain/deploy/setup-backup.sh 2>&1 || T2_EXIT=$?
 
 echo ""
 echo "  setup-backup.sh exit code (valid): $T2_EXIT"
@@ -186,6 +212,40 @@ if [[ "$T2_EXIT" -eq 0 ]]; then
   pass_assert "T2: setup-backup.sh exited 0 for a valid script"
 else
   fail_assert "T2: setup-backup.sh exited $T2_EXIT for a valid script — unexpected failure"
+fi
+
+if [[ -x /usr/local/bin/aperod-backup-verify ]] \
+   && /usr/local/bin/aperod-backup-verify --help >/dev/null 2>&1 \
+   && [[ "$(stat -c '%U:%G:%a' /usr/local/bin/aperod-backup-verify)" == "root:root:755" ]]; then
+  pass_assert "T2: verifier installed root-owned mode 0755 before activation"
+else
+  fail_assert "T2: verifier missing, invalid, or has incorrect ownership/mode"
+fi
+if [[ -f /tmp/backup-path-enabled ]]; then
+  pass_assert "T2: backup path activation observed an available verifier"
+else
+  fail_assert "T2: backup path was not safely activated"
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo "  T3: Verifier build failure preserves previous binary"
+echo "════════════════════════════════════════════════════════"
+printf '#!/usr/bin/env bash\necho previous-verifier\n' > /usr/local/bin/aperod-backup-verify
+chmod 755 /usr/local/bin/aperod-backup-verify
+chown root:root /usr/local/bin/aperod-backup-verify
+rm -f /tmp/backup-path-enabled
+T3_EXIT=0
+GO_BUILD_FAIL=1 bash /blockchain/deploy/setup-backup.sh 2>&1 || T3_EXIT=$?
+if [[ "$T3_EXIT" -ne 0 ]] && grep -q 'previous-verifier' /usr/local/bin/aperod-backup-verify; then
+  pass_assert "T3: failed build exits non-zero and preserves the installed binary"
+else
+  fail_assert "T3: failed build did not preserve the previous binary"
+fi
+if [[ ! -f /tmp/backup-path-enabled ]]; then
+  pass_assert "T3: backup path was not enabled after verifier build failure"
+else
+  fail_assert "T3: backup path was enabled despite verifier build failure"
 fi
 
 echo ""
@@ -213,7 +273,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   coreutils — stat, install, etc.
 #   sed grep  — used inside setup-backup.sh
 #   python3   — (none required here, but aperod_backup.sh references it)
-# systemctl / systemd-tmpfiles / openssl / sudo / ufw are replaced by stubs.
+# go / systemctl / systemd-tmpfiles / openssl / sudo / ufw are replaced by stubs.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
       bash passwd coreutils sed grep \
@@ -221,8 +281,8 @@ RUN apt-get update -qq \
 
 # Stub commands — prepended to PATH in the test harness
 COPY stubs/       /stubs/
-# The real deploy directory — setup-backup.sh + aperod_backup.sh live here
-COPY deploy/      /deploy/
+# The module layout contains setup-backup.sh and cmd/backup-verify source.
+COPY blockchain/  /blockchain/
 # Test harness script
 COPY test-harness.sh /test-harness.sh
 

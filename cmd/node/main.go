@@ -1339,6 +1339,7 @@ func run() error {
 			cfg.Consensus.AVMActivationHeight,
 			avm.LevelStore{DB: db},
 		)
+		apiSrv.SetAVMGasBurnActivationHeight(cfg.Consensus.AVMGasBurnActivationHeight)
 		apiSrv.SetRSSStatsFn(readRSSBytes)
 		apiSrv.SetDataDir(cfg.DataDir)
 		apiSrv.SetPruningMode(cfg.Pruning.Mode)
@@ -1777,6 +1778,17 @@ func run() error {
 		// replay stake txs (including withdrawals by genesis validators).
 		registry = core.NewValidatorRegistry()
 		registry.SetUTXOSet(utxos)
+bootstrapSnap, bootstrapErr := loadOperatorRegistryBootstrap(cfg.Consensus.RegistryBootstrap, cfg.Consensus.NonValidator, db, tipHeight)
+if bootstrapErr != nil {
+return bootstrapErr
+}
+if bootstrapSnap != nil {
+registry.RestoreFromSnapshot(bootstrapSnap.Registry)
+registry.SetUTXOSet(utxos)
+validators = registry.GetActiveValidators()
+log.Warn("startup registry bootstrap trust=operator_attested; historical_committee_authenticated=false",
+"snapshot_height", bootstrapSnap.TipHeight, "snapshot_sha256", cfg.Consensus.RegistryBootstrap.SHA256)
+}
 		// Load and bind the quorum-attested lifecycle fork before stake replay.
 		// Otherwise a restart could not validate chain-bound v2 withdrawal
 		// nonces, and legacy withdrawals after activation would be replayed under
@@ -1832,7 +1844,21 @@ func run() error {
 		// scanning from block 1.
 		var rescueSnap *startupSnapshot
 		var rescueSnapHeight uint64
-		{
+if bootstrapSnap != nil {
+utxos.RestoreFromSnapshot(bootstrapSnap.UTXOs)
+if err := replayOperatorRegistryBootstrap(db, utxos, registry, bootstrapSnap, tipHeight, log); err != nil {
+return err
+}
+validators = registry.GetActiveValidators()
+snapLoaded = true
+log.Info("operator-attested snapshot registry and state replay complete",
+"snapshot_height", bootstrapSnap.TipHeight, "tip_height", tipHeight,
+"historical_committee_authenticated", false)
+bootstrapSnap = nil
+runtime.GC()
+debug.FreeOSMemory()
+}
+if !snapLoaded {
 			tipHashHex := fmt.Sprintf("%x", tipHash[:])
 			if snap, snapIsRelaxed, serr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
 				if apiSrv != nil {
@@ -2611,6 +2637,19 @@ func run() error {
 				log.Error("failed to persist block", "height", block.Header.Height, "err", err)
 				return err
 			}
+			if prepared.LPoD != nil {
+				// Capture the canonical registry after its block stake operations
+				// were applied. This auxiliary snapshot intentionally precedes the
+				// later epoch transition and never changes block/checkpoint digests.
+				registryAfter := registry.TakeSnapshot()
+				prepared.LPoD.RegistryAfter = &registryAfter
+				if err := db.PersistLPoDAuditAt(block, prepared.LPoD, cfg.Consensus.AVMGasBurnActivationHeight); err != nil {
+					// Audit evidence is derived after the canonical fsync. A failure
+					// leaves the day incomplete, but must not halt block acceptance.
+					log.Warn("canonical block committed without forward LPoD audit evidence",
+						"height", block.Header.Height, "err", err)
+				}
+			}
 			if err := storeBlockIndexes(db, block); err != nil {
 				// Canonical block+tip+AVM state already committed atomically.
 				// Secondary indexes are rebuildable; never report the canonical
@@ -3016,6 +3055,7 @@ log.Info("v3 LPoD earnings index backfill complete")
 		// Wire engine-dependent options now that the consensus engine exists.
 		apiSrv.SetRegistry(engine.Registry())
 		apiSrv.SetValidatorKey(myKey)
+apiSrv.StartDailyAuditWorker()
 		apiSrv.SetTxTotal(initialTxTotal)
 		apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
 		// Admin mints are built at block-production time so every mint gets a
@@ -3445,6 +3485,9 @@ log.Info("v3 LPoD earnings index backfill complete")
 	}
 
 	log.Info("shutting down...")
+if apiSrv != nil {
+apiSrv.StopDailyAuditWorker()
+}
 
 	if err := backupSrv.Close(); err != nil {
 		log.Warn("failed to close backup socket", "err", err)

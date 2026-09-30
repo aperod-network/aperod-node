@@ -137,8 +137,9 @@ sys.exit(0)
   return 1
 }
 
-# Build a fake-bin directory containing a stub for $1 that appends its
-# arguments to $2 and exits 0.  Prints the directory path.
+# Build a fake-bin directory containing a stub for $1. The systemctl stub
+# returns mock ActiveState/SubState values for watchdog tests, logs other calls
+# to $2, and exits 0. Prints the directory path.
 make_fake_bin() {
   local cmd="$1"
   local log_file="$2"
@@ -148,6 +149,25 @@ make_fake_bin() {
   # we substitute $log_file via sed after writing.
   cat >"$fake_dir/$cmd" <<STUB
 #!/usr/bin/env bash
+if [[ "$cmd" == "systemctl" && "\$1" == "show" && "\$2" == "aperod-node" ]]; then
+  case "\$3" in
+    --property=ActiveState)
+      [[ "\${MOCK_SYSTEMCTL_ACTIVE_SHOW_FAIL:-0}" != "1" ]] || exit 1
+      printf '%s\\n' "\${MOCK_SYSTEMCTL_ACTIVE_STATE-active}"
+      exit 0
+      ;;
+    --property=SubState)
+      [[ "\${MOCK_SYSTEMCTL_SUB_SHOW_FAIL:-0}" != "1" ]] || exit 1
+      printf '%s\\n' "\${MOCK_SYSTEMCTL_SUB_STATE-running}"
+      exit 0
+      ;;
+    --property=ActiveEnterTimestampMonotonic)
+      [[ "\${MOCK_SYSTEMCTL_ACTIVE_ENTER_SHOW_FAIL:-0}" != "1" ]] || exit 1
+      printf '%s\\n' "\${MOCK_SYSTEMCTL_ACTIVE_ENTER_TIMESTAMP_MONOTONIC-0}"
+      exit 0
+      ;;
+  esac
+fi
 echo "$cmd \$*" >> "$log_file"
 exit 0
 STUB
@@ -220,7 +240,12 @@ LOG2="$TMPDIR_TEST/systemctl-t2.log"
 FAKE2=$(make_fake_bin "systemctl" "$LOG2")
 
 NODE_API_URL="http://127.0.0.1:${PORT2}" \
+  STATE_DIR="$TMPDIR_TEST/t2-state" \
   TIMEOUT_SECS="3" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE2:$PATH" \
@@ -402,21 +427,27 @@ else
 fi
 
 # =============================================================================
-# Test 7: Telegram NOT called when probe returns 200
+# Test 7: API-failure alert NOT sent when probe returns 200
 # =============================================================================
-section "Test 7: Telegram is NOT called when probe returns 200"
+section "Test 7: API-failure alert is NOT sent when probe returns 200"
 
 LOG7_CURL="$TMPDIR_TEST/curl-t7.log"
 LOG7_SC="$TMPDIR_TEST/systemctl-t7.log"
 FAKE7_CURL=$(make_fake_curl "$LOG7_CURL" "200")
 FAKE7_SC=$(make_fake_bin "systemctl" "$LOG7_SC")
+T7_OUTPUT="$TMPDIR_TEST/t7-output.log"
 
 NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$TMPDIR_TEST/t7-state" \
   TIMEOUT_SECS="3" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
   SUPPORT_BOT_TOKEN="test-bot-token" \
   SUPPORT_ADMIN_CHAT_ID="123456789" \
   PATH="$FAKE7_CURL:$FAKE7_SC:$PATH" \
-  bash "$WATCHDOG_SH" >/dev/null 2>&1
+  bash "$WATCHDOG_SH" >"$T7_OUTPUT" 2>&1
 WDEXIT7=$?
 
 if [[ $WDEXIT7 -eq 0 ]]; then
@@ -425,10 +456,10 @@ else
   fail "watchdog exited $WDEXIT7 (expected 0)"
 fi
 
-if [[ ! -f "$LOG7_CURL" ]] || ! grep -q "api.telegram.org" "$LOG7_CURL" 2>/dev/null; then
-  pass "Telegram was NOT called for a healthy 200 response"
+if [[ ! -f "$TMPDIR_TEST/t7-state/watchdog-last-alert" ]]; then
+  pass "API-failure alert was NOT sent for a healthy 200 response"
 else
-  fail "Telegram was unexpectedly called for a 200 response"
+  fail "API-failure alert was unexpectedly sent for a 200 response (output: $(cat "$T7_OUTPUT"); curl: $(cat "$LOG7_CURL"))"
 fi
 
 if [[ ! -f "$LOG7_SC" ]] || ! grep -q "restart aperod-node" "$LOG7_SC" 2>/dev/null; then
@@ -1009,6 +1040,8 @@ echo "2" > "${T19_DIR}/watchdog-stall-count"  # +1 = 3 = STALL_CHECKS_MAX → fi
 NODE_API_URL="http://127.0.0.1:${PORT19}" \
   STATE_DIR="$T19_DIR" \
   TIMEOUT_SECS="3" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
   MOCK_HEIGHT="500" \
   STALL_CHECKS_MAX="3" \
   WATCHDOG_INTERVAL_SECS="45" \
@@ -1209,11 +1242,12 @@ else
   fail "zero-since file NOT created on first peer_count=0 probe"
 fi
 
-# No Telegram alert should have been sent (threshold not reached yet)
-if [[ ! -f "$T22_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T22_CURL_LOG" 2>/dev/null; then
-  pass "no Telegram alert sent before threshold is reached"
+# Other watchdog checks may alert independently; only the peer-zero alert is
+# under test here. Its cooldown marker is written after the alert is sent.
+if [[ ! -f "${T22_DIR}/watchdog-last-peer-alert" ]]; then
+  pass "no peer-zero alert sent before threshold is reached"
 else
-  fail "Telegram alert was sent before threshold — should wait ${PEER_WAIT_MINS} min"
+  fail "peer-zero alert was sent before the 10-minute threshold"
 fi
 
 # =============================================================================
@@ -1363,6 +1397,9 @@ echo "${T25_PAST}" > "${T25_DIR}/watchdog-peers-zero-since"
 NODE_API_URL="http://127.0.0.1:${PORT25}" \
   STATE_DIR="$T25_DIR" \
   TIMEOUT_SECS="3" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
   PEER_WAIT_MINS="1" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
@@ -1420,6 +1457,9 @@ echo "${T26_PAST}" > "${T26_DIR}/watchdog-peers-zero-since"
 NODE_API_URL="http://127.0.0.1:${PORT26}" \
   STATE_DIR="$T26_DIR" \
   TIMEOUT_SECS="3" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
   PEER_WAIT_MINS="1" \
   SUPPORT_BOT_TOKEN="test-token" \
   SUPPORT_ADMIN_CHAT_ID="123456" \
@@ -1443,11 +1483,11 @@ else
   fail "stale zero-since file was NOT removed for malformed stats body"
 fi
 
-# No Telegram alert should fire — malformed data is not a confirmed zero
-if [[ ! -f "$T26_CURL_LOG" ]] || ! grep -q "api.telegram.org" "$T26_CURL_LOG" 2>/dev/null; then
-  pass "no false Telegram alert when stats body is malformed (stale timer was present)"
+# Unrelated health checks may alert; malformed stats must not trigger a peer alert.
+if [[ ! -f "${T26_DIR}/watchdog-last-peer-alert" ]]; then
+  pass "no false peer-zero alert when stats body is malformed (stale timer was present)"
 else
-  fail "false Telegram alert was sent despite malformed stats — stale timer should have been reset"
+  fail "false peer-zero alert was sent despite malformed stats — stale timer should have been reset"
 fi
 
 # =============================================================================
@@ -1606,6 +1646,310 @@ if [[ ! -f "$T29_LAST_ALERT" ]]; then
   pass "alert cooldown cleared when PEER_WAIT_MINS=0"
 else
   fail "alert cooldown NOT cleared when feature is disabled"
+fi
+
+# =============================================================================
+# Test 30: valid graceful-shutdown intent suppresses a failing-API restart
+# =============================================================================
+section "Test 30: valid shutdown intent suppresses watchdog restart during snapshot save"
+
+T30_DIR=$(mktemp -d "$TMPDIR_TEST/t30-XXXXXXXX")
+T30_NODE_DATA_DIR="$T30_DIR/node-data"
+T30_STATE_DIR="$T30_DIR/watchdog-state"
+mkdir -p "$T30_NODE_DATA_DIR" "$T30_STATE_DIR"
+T30_CURL_LOG="$T30_DIR/curl.log"
+T30_SC_LOG="$T30_DIR/systemctl.log"
+T30_CURL=$(make_fake_curl "$T30_CURL_LOG" "503")
+T30_SC=$(mktemp -d "$TMPDIR_TEST/t30-sc-XXXXXXXX")
+cat >"$T30_SC/systemctl" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
+  echo 15min
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
+  echo active
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=SubState --value" ]]; then
+  echo running
+  exit 0
+fi
+echo "systemctl \$*" >> "$T30_SC_LOG"
+STUB
+chmod +x "$T30_SC/systemctl"
+
+sleep 30 &
+T30_NODE_PID=$!
+T30_START_ID=$(sed 's/^.*) //' "/proc/$T30_NODE_PID/stat" | awk '{print $20}')
+printf '%s %s %s\n' "$T30_NODE_PID" "$T30_START_ID" "$(date +%s)" >"$T30_NODE_DATA_DIR/shutdown-intent"
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T30_STATE_DIR" \
+  NODE_DATA_DIR="$T30_NODE_DATA_DIR" \
+  TIMEOUT_SECS="1" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T30_CURL:$T30_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+T30_EXIT=$?
+kill "$T30_NODE_PID" 2>/dev/null || true
+wait "$T30_NODE_PID" 2>/dev/null || true
+
+if [[ $T30_EXIT -eq 0 && ! -s "$T30_SC_LOG" ]]; then
+  pass "15min timeout and NODE_DATA_DIR marker suppress failed-API restart"
+else
+  fail "valid shutdown marker did not suppress restart (exit=$T30_EXIT, systemctl=$(cat "$T30_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+if [[ ! -e "$T30_STATE_DIR/shutdown-intent" ]] &&
+   grep -Fq 'NODE_DATA_DIR="${NODE_DATA_DIR:-/opt/aperod/data/testnet}"' "$WATCHDOG_SH"; then
+  pass "production node data directory is the marker default, separate from STATE_DIR"
+else
+  fail "shutdown marker path does not default to the documented production node data directory"
+fi
+
+# =============================================================================
+# Test 31: expired shutdown intent does not mask a genuine API outage
+# =============================================================================
+section "Test 31: stale shutdown intent does not suppress restart"
+
+T31_DIR=$(mktemp -d "$TMPDIR_TEST/t31-XXXXXXXX")
+T31_NODE_DATA_DIR="$T31_DIR/node-data"
+T31_STATE_DIR="$T31_DIR/watchdog-state"
+mkdir -p "$T31_NODE_DATA_DIR" "$T31_STATE_DIR"
+T31_SC_LOG="$T31_DIR/systemctl.log"
+T31_CURL=$(make_fake_curl "$T31_DIR/curl.log" "503")
+T31_SC=$(mktemp -d "$TMPDIR_TEST/t31-sc-XXXXXXXX")
+cat >"$T31_SC/systemctl" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
+  echo "10min 5min"
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
+  echo active
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=SubState --value" ]]; then
+  echo running
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=ActiveEnterTimestampMonotonic --value" ]]; then
+  echo 0
+  exit 0
+fi
+echo "systemctl \$*" >> "$T31_SC_LOG"
+STUB
+chmod +x "$T31_SC/systemctl"
+
+sleep 30 &
+T31_NODE_PID=$!
+T31_START_ID=$(sed 's/^.*) //' "/proc/$T31_NODE_PID/stat" | awk '{print $20}')
+printf '%s %s %s\n' "$T31_NODE_PID" "$T31_START_ID" "$(( $(date +%s) - 901 ))" >"$T31_NODE_DATA_DIR/shutdown-intent"
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T31_STATE_DIR" \
+  NODE_DATA_DIR="$T31_NODE_DATA_DIR" \
+  TIMEOUT_SECS="1" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T31_CURL:$T31_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+T31_EXIT=$?
+kill "$T31_NODE_PID" 2>/dev/null || true
+wait "$T31_NODE_PID" 2>/dev/null || true
+
+if [[ $T31_EXIT -eq 0 && -f "$T31_SC_LOG" ]] && grep -q "restart aperod-node" "$T31_SC_LOG"; then
+  pass "expired marker does not suppress restart for failed API"
+else
+  fail "stale marker incorrectly suppressed restart or watchdog failed (exit=$T31_EXIT, systemctl=$(cat "$T31_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 32: failed API probe while systemd is stopping does not queue restart
+# =============================================================================
+section "Test 32: API failure while node is deactivating skips restart"
+
+T32_DIR=$(mktemp -d "$TMPDIR_TEST/t32-XXXXXXXX")
+T32_SC_LOG="$T32_DIR/systemctl.log"
+T32_OUTPUT="$T32_DIR/output.log"
+T32_FAKE_SC=$(make_fake_bin "systemctl" "$T32_SC_LOG")
+T32_CURL=$(make_fake_curl "$T32_DIR/curl.log" "503")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T32_DIR/state" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_STATE="deactivating" \
+  MOCK_SYSTEMCTL_SUB_STATE="stop-sigterm" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T32_CURL:$T32_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T32_OUTPUT" 2>&1
+T32_EXIT=$?
+
+if [[ $T32_EXIT -eq 0 ]] &&
+   ! grep -q "systemctl restart aperod-node" "$T32_SC_LOG" 2>/dev/null &&
+   grep -q "skipping restart" "$T32_OUTPUT"; then
+  pass "deactivating node is not restarted and skip is logged"
+else
+  fail "deactivating node was not safely skipped (exit=$T32_EXIT, systemctl=$(cat "$T32_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T32_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 33: high RSS while systemd state is unknown also fails closed
+# =============================================================================
+section "Test 33: RAM threshold with unknown systemd state skips restart"
+
+T33_DIR=$(mktemp -d "$TMPDIR_TEST/t33-XXXXXXXX")
+T33_SC_LOG="$T33_DIR/systemctl.log"
+T33_OUTPUT="$T33_DIR/output.log"
+T33_FAKE_SC=$(make_fake_bin "systemctl" "$T33_SC_LOG")
+T33_PORT=$(find_free_port)
+T33_SRV_PID=$(start_mock_server "$T33_PORT" 200)
+if ! wait_for_server "$T33_PORT" 5; then
+  fail "mock HTTP server (200) did not start for RAM lifecycle test"
+fi
+
+NODE_API_URL="http://127.0.0.1:${T33_PORT}" \
+  STATE_DIR="$T33_DIR/state" \
+  TIMEOUT_SECS="1" \
+  RAM_THRESHOLD_MB="1000" \
+  MOCK_RSS_KB="2000000" \
+  MOCK_SYSTEMCTL_ACTIVE_STATE="active" \
+  MOCK_SYSTEMCTL_SUB_STATE="dead" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T33_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T33_OUTPUT" 2>&1
+T33_EXIT=$?
+kill "$T33_SRV_PID" 2>/dev/null || true
+wait "$T33_SRV_PID" 2>/dev/null || true
+
+if [[ $T33_EXIT -eq 0 ]] &&
+   ! grep -q "systemctl restart aperod-node" "$T33_SC_LOG" 2>/dev/null &&
+   grep -q "ActiveState=active, SubState=dead.*skipping watchdog restart" "$T33_OUTPUT"; then
+  pass "RAM-triggered restart is skipped unless SubState is running"
+else
+  fail "RAM branch did not fail closed for SubState=dead (exit=$T33_EXIT, systemctl=$(cat "$T33_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T33_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 34: missing ActiveState cannot trigger a restart
+# =============================================================================
+section "Test 34: systemctl show failure fails closed"
+
+T34_DIR=$(mktemp -d "$TMPDIR_TEST/t34-XXXXXXXX")
+T34_SC_LOG="$T34_DIR/systemctl.log"
+T34_OUTPUT="$T34_DIR/output.log"
+T34_FAKE_SC=$(make_fake_bin "systemctl" "$T34_SC_LOG")
+T34_CURL=$(make_fake_curl "$T34_DIR/curl.log" "503")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T34_DIR/state" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_SHOW_FAIL="1" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T34_CURL:$T34_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T34_OUTPUT" 2>&1
+T34_EXIT=$?
+
+if [[ $T34_EXIT -eq 0 ]] &&
+   ! grep -q "systemctl restart aperod-node" "$T34_SC_LOG" 2>/dev/null &&
+   grep -q "cannot read aperod-node ActiveState.*fail closed" "$T34_OUTPUT"; then
+  pass "failed systemctl ActiveState query skips restart"
+else
+  fail "failed systemctl show did not fail closed (exit=$T34_EXIT, systemctl=$(cat "$T34_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T34_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 35: newly active node with HTTP 000 gets startup grace
+# =============================================================================
+section "Test 35: just-started active node with API HTTP 000 gets startup grace"
+
+T35_DIR=$(mktemp -d "$TMPDIR_TEST/t35-XXXXXXXX")
+T35_SC_LOG="$T35_DIR/systemctl.log"
+T35_OUTPUT="$T35_DIR/output.log"
+T35_FAKE_SC=$(make_fake_bin "systemctl" "$T35_SC_LOG")
+T35_CURL=$(make_fake_curl "$T35_DIR/curl.log" "000")
+T35_ACTIVE_ENTER_US=$(awk '{printf "%.0f", $1 * 1000000}' /proc/uptime)
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T35_DIR/state" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_ENTER_TIMESTAMP_MONOTONIC="$T35_ACTIVE_ENTER_US" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T35_CURL:$T35_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T35_OUTPUT" 2>&1
+T35_EXIT=$?
+
+if [[ $T35_EXIT -eq 0 ]] &&
+   ! grep -q "systemctl restart aperod-node" "$T35_SC_LOG" 2>/dev/null &&
+   grep -q "less than 480 seconds.*startup grace" "$T35_OUTPUT"; then
+  pass "recently started active/running node is not restarted on HTTP 000"
+else
+  fail "startup grace did not defer restart (exit=$T35_EXIT, systemctl=$(cat "$T35_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T35_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 36: old active node with HTTP 503 still restarts
+# =============================================================================
+section "Test 36: old active/running node with API HTTP 503 still restarts"
+
+T36_DIR=$(mktemp -d "$TMPDIR_TEST/t36-XXXXXXXX")
+T36_SC_LOG="$T36_DIR/systemctl.log"
+T36_FAKE_SC=$(make_fake_bin "systemctl" "$T36_SC_LOG")
+T36_CURL=$(make_fake_curl "$T36_DIR/curl.log" "503")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T36_DIR/state" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_STATE="active" \
+  MOCK_SYSTEMCTL_SUB_STATE="running" \
+  MOCK_SYSTEMCTL_ACTIVE_ENTER_TIMESTAMP_MONOTONIC="0" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T36_CURL:$T36_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >/dev/null 2>&1
+T36_EXIT=$?
+
+if [[ $T36_EXIT -eq 0 ]] && grep -q "systemctl restart aperod-node" "$T36_SC_LOG"; then
+  pass "old active/running node is restarted after HTTP 503"
+else
+  fail "old active node restart was suppressed (exit=$T36_EXIT, systemctl=$(cat "$T36_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 37: malformed active-enter timestamp fails closed
+# =============================================================================
+section "Test 37: malformed active-enter timestamp skips failed-API restart"
+
+T37_DIR=$(mktemp -d "$TMPDIR_TEST/t37-XXXXXXXX")
+T37_SC_LOG="$T37_DIR/systemctl.log"
+T37_OUTPUT="$T37_DIR/output.log"
+T37_FAKE_SC=$(make_fake_bin "systemctl" "$T37_SC_LOG")
+T37_CURL=$(make_fake_curl "$T37_DIR/curl.log" "503")
+
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T37_DIR/state" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_ENTER_TIMESTAMP_MONOTONIC="not-a-timestamp" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T37_CURL:$T37_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T37_OUTPUT" 2>&1
+T37_EXIT=$?
+
+if [[ $T37_EXIT -eq 0 ]] &&
+   ! grep -q "systemctl restart aperod-node" "$T37_SC_LOG" 2>/dev/null &&
+   grep -q "invalid aperod-node ActiveEnterTimestampMonotonic.*fail closed" "$T37_OUTPUT"; then
+  pass "malformed active-enter timestamp is fail closed"
+else
+  fail "malformed active-enter timestamp did not fail closed (exit=$T37_EXIT, systemctl=$(cat "$T37_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T37_OUTPUT" 2>/dev/null || echo '<empty>'))"
 fi
 
 # =============================================================================

@@ -42,6 +42,7 @@ func (s *Server) restLPoDPool(w http.ResponseWriter, r *http.Request) {
 		"surplus_inflow_napro", "deficit_outflow_napro", "unfunded_liability_napro", "funding_debit_napro",
 		"total_guardian_stake_napro", "last_settled_height", "allocation_remaining_napro", "funding_height",
 		"funding_block_hash", "chain_anchor", "reconciliation_root", "finalized_height",
+		"accrued_liability_napro", "checkpoint_hash", "checkpoint_digest",
 		"principal_deposited_napro", "principal_locked_napro", "principal_returned_napro",
 		"validator_remaining_napro", "tail_issued_napro", "position_count"} {
 		out[k] = nil
@@ -83,6 +84,12 @@ func (s *Server) restLPoDPool(w http.ResponseWriter, r *http.Request) {
 	if err != nil || after != tip || afterHeight != height || c.State.LastHeight != height {
 		return
 	}
+	// Treat invalid accounting as unavailable, even if a store implementation
+	// or an alternate test backend returns a checkpoint without validating it.
+	if err := c.State.Validate(); err != nil {
+		out["state"] = "unavailable"
+		return
+	}
 	out["state"] = "active"
 	out["migration_version"] = a.Version
 	out["historical_issuance_proven"] = a.Version == 1
@@ -107,6 +114,10 @@ func (s *Server) restLPoDPool(w http.ResponseWriter, r *http.Request) {
 	} {
 		out[key] = strconv.FormatUint(value, 10)
 	}
+	out["accrued_liability_napro"] = strconv.FormatUint(c.State.AccruedLiability, 10)
+	out["checkpoint_hash"] = fmt.Sprintf("%x", tip[:])
+	digest := c.Digest()
+	out["checkpoint_digest"] = fmt.Sprintf("%x", digest[:])
 	out["last_settled_height"], out["finalized_height"] = height, height
 	openPositions := 0
 	for _, p := range c.Positions {

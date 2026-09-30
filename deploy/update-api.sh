@@ -41,6 +41,16 @@ APEROD_DIR="/opt/aperod"
 API_FILTER="@workspace/api-server"
 PM2_APP="aperod-api"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DEPLOY_DIR}/source-safe-guard.sh"
+source_checkout_guard "$APEROD_DIR" "" "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" ||
+  { echo "✗ Source safety guard refused the live checkout; no deploy changes were made." >&2; exit 1; }
+
+# This legacy PM2 updater has no ledger smoke check or rollback. On a
+# protected systemd installation, only the guarded API deploy may rebuild.
+if [[ -f "${APEROD_DIR}/artifacts/api-server/.api-require-protected-deploy" ]]; then
+  echo "Protected API installation: use /usr/local/bin/aperod-deploy instead of update-api.sh." >&2
+  exit 1
+fi
 
 # Health-check tunables (override via environment)
 RESTART_THRESHOLD="${RESTART_THRESHOLD:-5}"

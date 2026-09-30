@@ -4,6 +4,7 @@
 package store
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -13,6 +14,27 @@ import (
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
 )
+
+func testLPoDRegistrySnapshot(t *testing.T, stakes map[string]LPoDValidatorStake) core.RegistrySnapshot {
+	t.Helper()
+	snapshot := core.RegistrySnapshot{Validators: make(map[string]*core.ValidatorEntry, len(stakes))}
+	for id, stake := range stakes {
+		pubBytes, err := hex.DecodeString(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub, err := crypto.ValidatorPubKeyFromBytes(pubBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := core.ValidatorExited
+		if stake.Active {
+			status = core.ValidatorActive
+		}
+		snapshot.Validators[id] = &core.ValidatorEntry{PubKey: pub, StakeNAPR: stake.Amount, Status: status}
+	}
+	return snapshot
+}
 
 func lpodMigrationFixture(t *testing.T) (*DB, *LPoDMigration, crypto.ValidatorPrivKey, crypto.Address) {
 	t.Helper()
@@ -87,6 +109,14 @@ func lpodActivationBlock(t *testing.T, db *DB, m *LPoDMigration, priv crypto.Val
 	r := &LPoDSettlement{Parent: parent, Migration: m, PositionProtocol: true,
 		Timestamp: parentBlock.Header.Timestamp + 3_000_000_000, Proposer: priv.Public().Hex(), Leader: address,
 		Stake: map[string]LPoDValidatorStake{priv.Public().Hex(): {Amount: 100_000 * lpod.Unit, Active: true}}}
+	r.PreviousStake = make(map[string]LPoDValidatorStake, len(r.Stake))
+	for id, stake := range r.Stake {
+		r.PreviousStake[id] = stake
+	}
+	r.AuditPreviousStake, r.AuditStake = r.PreviousStake, r.Stake
+	registryBefore := testLPoDRegistrySnapshot(t, r.PreviousStake)
+	registryAfter := testLPoDRegistrySnapshot(t, r.Stake)
+	r.RegistryBefore, r.RegistryAfter = &registryBefore, &registryAfter
 	c, pay, err := db.PreviewLPoD(height+1, r)
 	if err != nil {
 		t.Fatal(err)

@@ -39,11 +39,20 @@ type LPoDSettlement struct {
 	Proposer         string
 	Leader           crypto.Address
 	Stake            map[string]LPoDValidatorStake
-	// PreviousStake is the registry snapshot before stake operations in this
-	// block. It is used only to rank deterministic destinations when a vault
-	// loses canonical eligibility; it is never a second source of funds.
-	PreviousStake map[string]LPoDValidatorStake
-	Transactions  []core.Transaction
+	// PreviousStake is the established non-seeded routing projection before
+	// stake operations. It is used only to rank destinations, never as a source
+	// of funds.
+	PreviousStake  map[string]LPoDValidatorStake
+	RegistryBefore *core.RegistrySnapshot
+	// RegistryAfter is captured after the canonical commit has applied block
+	// stake operations. Both snapshots are auxiliary audit evidence only.
+	RegistryAfter *core.RegistrySnapshot
+	// AuditStake maps retain the complete registry projection, including
+	// synthetic seeded entries. Stake/PreviousStake remain the established
+	// non-seeded routing basis and must not change consensus eligibility.
+	AuditPreviousStake map[string]LPoDValidatorStake
+	AuditStake         map[string]LPoDValidatorStake
+	Transactions       []core.Transaction
 }
 
 func lpodKey(hash crypto.Hash32) []byte {
@@ -51,10 +60,23 @@ func lpodKey(hash crypto.Hash32) []byte {
 }
 
 func (d *DB) lpodCheckpoint(hash crypto.Hash32) (*LPoDCheckpoint, error) {
+return d.lpodCheckpointBounded(hash, 0)
+}
+
+// LoadLPoDCheckpointAtBounded limits auxiliary decoding, without changing
+// consensus checkpoint loading. LevelDB still materializes one value.
+func (d *DB) LoadLPoDCheckpointAtBounded(hash crypto.Hash32, maxBytes int) (*LPoDCheckpoint, error) {
+return d.lpodCheckpointBounded(hash, maxBytes)
+}
+
+func (d *DB) lpodCheckpointBounded(hash crypto.Hash32, maxBytes int) (*LPoDCheckpoint, error) {
 	data, err := d.get(lpodKey(hash))
 	if err != nil || data == nil {
 		return nil, err
 	}
+if maxBytes > 0 && len(data) > maxBytes {
+return nil, fmt.Errorf("store: checkpoint exceeds auxiliary read budget")
+}
 	var c LPoDCheckpoint
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("store: corrupt LPoD checkpoint: %w", err)

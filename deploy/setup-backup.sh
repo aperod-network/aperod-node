@@ -35,6 +35,8 @@ DROPIN_FILE="${DROPIN_DIR}/backup-trigger.conf"
 BACKUP_DATA_DIR="${DATA_DIR:-/opt/aperod/data}"
 BACKUP_DROPIN_DIR="/etc/systemd/system/aperod-backup.service.d"
 BACKUP_DATA_DROPIN="${BACKUP_DROPIN_DIR}/data-dir.conf"
+BLOCKCHAIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BACKUP_VERIFY_BIN="/usr/local/bin/aperod-backup-verify"
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -45,6 +47,31 @@ fi
 if ! id "${APEROD_USER}" &>/dev/null; then
   die "Пользователь '${APEROD_USER}' не найден. Создайте его или задайте APEROD_USER=другой_пользователь"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+step "0. Сборка и атомарная установка aperod-backup-verify"
+
+VERIFY_TMP=$(mktemp /usr/local/bin/.aperod-backup-verify.XXXXXXXX)
+cleanup_verify_tmp() { rm -f "${VERIFY_TMP}"; }
+trap cleanup_verify_tmp EXIT
+
+if ! (
+  cd "${BLOCKCHAIN_DIR}"
+  CGO_ENABLED=0 GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.25.13+auto \
+    go build -o "${VERIFY_TMP}" ./cmd/backup-verify
+); then
+  die "Не удалось собрать aperod-backup-verify; существующий бинарный файл не изменён"
+fi
+
+chmod 755 "${VERIFY_TMP}"
+chown root:root "${VERIFY_TMP}"
+[[ -s "${VERIFY_TMP}" && -x "${VERIFY_TMP}" ]] \
+  || die "Собранный aperod-backup-verify пустой или не исполняемый"
+"${VERIFY_TMP}" --help >/dev/null 2>&1 \
+  || die "Собранный aperod-backup-verify не прошёл безопасную проверку --help"
+mv -f "${VERIFY_TMP}" "${BACKUP_VERIFY_BIN}"
+ok "aperod-backup-verify установлен атомарно: ${BACKUP_VERIFY_BIN} (root:root 0755)"
+trap - EXIT
 
 # ═══════════════════════════════════════════════════════════════════════════════
 step "1. Установка скрипта бэкапа"

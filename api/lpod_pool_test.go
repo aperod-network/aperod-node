@@ -111,15 +111,51 @@ func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {
 	}
 	finalized = true
 	code, body := restGet(t, srv, "/api/v1/lpod-pool")
+	digest := c.Digest()
 	if code != http.StatusOK || body["state"] != "active" || body["position_count"] != float64(0) ||
 		body["principal_locked_napro"] != "0" || body["total_guardian_stake_napro"] != "0" ||
 		body["principal_deposited_napro"] != fmt.Sprint(principal) || body["principal_returned_napro"] != fmt.Sprint(principal) ||
-		body["unfunded_liability_napro"] != fmt.Sprint(due) {
+		body["unfunded_liability_napro"] != fmt.Sprint(due) ||
+		body["accrued_liability_napro"] != fmt.Sprint(c.State.AngelPaid+c.State.UnfundedLiability) ||
+		c.State.AccruedLiability != c.State.AngelPaid+c.State.UnfundedLiability ||
+		body["checkpoint_hash"] != fmt.Sprintf("%x", hash[:]) ||
+		body["checkpoint_digest"] != fmt.Sprintf("%x", digest[:]) {
 		t.Fatalf("finalized exit projection: %#v", body)
 	}
 	persisted, err := db.LoadLPoDCheckpoint()
 	if err != nil || len(persisted.Positions) != 2 {
 		t.Fatal("API must not delete closed records to obtain zero open count")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the ledger conservation relation and ensure an invalid durable
+	// checkpoint never reaches the active response.
+	c.State.AccruedLiability++
+	badCheckpoint, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureDB, err = leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixtureDB.Put(append([]byte("lpod/checkpoint/v1/"), hash[:]...), badCheckpoint, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixtureDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	badDB, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badDB.Close()
+	srv.SetStore(badDB)
+	_, invalidBody := restGet(t, srv, "/api/v1/lpod-pool")
+	if invalidBody["state"] != "unavailable" || invalidBody["accrued_liability_napro"] != nil ||
+		invalidBody["checkpoint_hash"] != nil || invalidBody["checkpoint_digest"] != nil {
+		t.Fatalf("invalid checkpoint was exposed: %#v", invalidBody)
 	}
 }
 

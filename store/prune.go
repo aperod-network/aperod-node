@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 // PruneBlocksOlderThan strips the full transaction data (TxData) from all
@@ -28,6 +31,52 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 		cursor = binary.LittleEndian.Uint64(cursorBytes)
 	}
 
+	// Resolve the activation height once per call, rather than probing all
+	// version keys for every block in the pruning window.
+	var fundingHeight uint64
+	var fundingHash crypto.Hash32
+	hasFunding := false
+	for _, key := range []string{
+		"lpod/activation_height/v1",
+		"lpod/activation_height/v2",
+		"lpod/activation_height/v3",
+	} {
+		activation, err := d.GetMeta(key)
+		if err != nil {
+			return 0, fmt.Errorf("read %s: %w", key, err)
+		}
+		if activation == nil {
+			continue
+		}
+		if len(activation) != 8 {
+			return 0, fmt.Errorf("corrupt %s: expected 8-byte activation height", key)
+		}
+		height := binary.LittleEndian.Uint64(activation)
+		if hasFunding && height != fundingHeight {
+			return 0, fmt.Errorf("conflicting lpod activation heights")
+		}
+		fundingHeight = height
+		hasFunding = true
+	}
+
+	if hasFunding {
+		canonicalHash, err := d.get(heightKey(fundingHeight))
+		if err != nil {
+			return 0, fmt.Errorf("read canonical funding block at height %d: %w", fundingHeight, err)
+		}
+		if len(canonicalHash) != len(fundingHash) {
+			return 0, fmt.Errorf("missing canonical funding block at height %d", fundingHeight)
+		}
+		copy(fundingHash[:], canonicalHash)
+		fundingBody, err := d.GetRawBlock(fundingHash)
+		if err != nil {
+			return 0, fmt.Errorf("read funding block at height %d: %w", fundingHeight, err)
+		}
+		if fundingBody == nil {
+			return 0, fmt.Errorf("missing funding block at height %d", fundingHeight)
+		}
+	}
+
 	if cursor >= pruneBelow {
 		return 0, nil // nothing new to prune
 	}
@@ -42,6 +91,20 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 		raw, err := d.GetRawBlockByHeight(h)
 		if err != nil {
 			return pruned, fmt.Errorf("get block at height %d: %w", h, err)
+		}
+		if hasFunding && h == fundingHeight {
+			canonicalHash, err := d.get(heightKey(h))
+			if err != nil {
+				return pruned, fmt.Errorf("read canonical funding block at height %d: %w", h, err)
+			}
+			if !bytes.Equal(canonicalHash, fundingHash[:]) {
+				return pruned, fmt.Errorf("canonical funding block changed at height %d", h)
+			}
+			if raw == nil {
+				return pruned, fmt.Errorf("missing funding block at height %d", h)
+			}
+			// Keep the full canonical funding block body for checkpoint replay.
+			continue
 		}
 		if raw == nil {
 			// Gap in chain — skip, advance cursor past it.

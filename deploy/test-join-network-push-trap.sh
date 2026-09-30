@@ -464,6 +464,7 @@ esac
 #   rm -f p2p_identity   → 'removed', exit 0 (step 4)
 #   network/stats curl   → JSON with height > 0 (step 7 health check)
 #   enable --now         → touch count, echo 'started', exit 0 (step 6)
+#   MemTotal             → RAM value matching the expected 5.5 GiB cap
 #   systemctl show       → valid drop-in env output (verify-dropin.sh check)
 #   test -f drop-in      → 'yes' (verify-dropin.sh file existence check)
 #   systemctl start      → count if called by trap (should not happen)
@@ -489,6 +490,9 @@ elif echo \"\$CMD\" | grep -q 'enable --now'; then
   COUNT=\$((COUNT + 1))
   printf '%s' \"\$COUNT\" >'${S4_TARGET_START_COUNT}'
   echo 'started'
+  exit 0
+elif echo \"\$CMD\" | grep -q 'MemTotal'; then
+  echo '8388608'
   exit 0
 elif echo \"\$CMD\" | grep -q 'systemctl show aperod-node'; then
   # Return valid drop-in output so verify-dropin.sh passes its checks.

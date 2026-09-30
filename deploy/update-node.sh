@@ -62,6 +62,9 @@ BINARY_SRC="${BLOCKCHAIN_DIR}/build/aperod-node"
 HEALTH_URL="http://localhost:8545/api/v1/status"
 STATS_URL="http://localhost:8545/api/v1/network/stats"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DEPLOY_DIR}/source-safe-guard.sh"
+source_checkout_guard "$APEROD_DIR" "" "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" ||
+  { echo "✗ Source safety guard refused the live checkout; no deploy changes were made." >&2; exit 1; }
 
 # Health-check tunables (override via environment)
 HEALTH_MAX_ATTEMPTS="${HEALTH_MAX_ATTEMPTS:-15}"

@@ -164,6 +164,16 @@ func TestREST_BlockDetail_DiskFallback_Pruned(t *testing.T) {
 	if resp["tx_count"] != float64(2) {
 		t.Errorf("tx_count = %v, want 2", resp["tx_count"])
 	}
+	for _, field := range []string{
+		"fees_burned_napro",
+		"protocol_fee_burned_napro",
+		"intentional_burn_napro",
+		"avm_gas_burned_napro",
+	} {
+		if value, exists := resp[field]; !exists || value != nil {
+			t.Errorf("%s = %#v (present=%v), want null so financial catchup stops", field, value, exists)
+		}
+	}
 }
 
 // TestREST_BlockDetail_DiskFallback_NativeFormat verifies that the block
