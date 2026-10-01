@@ -66,6 +66,8 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 
 ## 🔐 Protocol Status
 
+The current public mainnet also has funded, active LPoD v3, activated at canonical height 2,493,218. The live [`GET /api/v1/lpod-pool`](https://aperod.com/api/v1/lpod-pool) response reports `state: "active"`, `funding_height: 2493218`, and `initial_napro: "100000000000000000"`. This production status is distinct from new-network defaults: an unconfigured chain remains disabled and needs its own authenticated migration witness.
+
 The current public source contains the complete **RingCT + CLSAG v5** transaction path:
 
 - compact linkable ring signatures over public-key/commitment pairs;

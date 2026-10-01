@@ -583,11 +583,7 @@ It becomes a spendable wallet output only through an authorized funded payout.
 
 ## 11. Historical reconciliation and activation
 
-Production funding and activation have not been performed by this work.
-An approved reconciliation, trusted-validator attestations, coordinated
-compatible upgrade, canonical activation block, and appropriate deployment
-authorization remain prerequisites. Code, wallet controls, API capabilities,
-and passing tests are not evidence of a funded production reserve.
+Mainnet LPoD v3 funding and activation are complete: the public network activated and funded it at canonical height 2,493,218. The current public `GET /api/v1/lpod-pool` response reports `state: "active"`, `funding_height: 2493218`, and `initial_napro: "100000000000000000"` (1B APRO). Earlier snapshots may predate activation; a new network or another chain remains disabled unless configured with its own authenticated migration witness. Exact-tip publication still requires matching canonical-checkpoint and finality evidence. This status does not claim a global-issuance audit or that a funded deposit/withdrawal cycle has been tested. The checklist below documents the historical mainnet activation workflow and remains a planning reference for a distinct future migration; it is not an outstanding mainnet prerequisite.
 Before enabling validator exit controls, verify that the deployed account
 gateway and CLI consume the exact node authorization fields below, require
 the active canonical proof, and obey the advertised expiry-height bounds.
@@ -686,7 +682,7 @@ JavaScript floating-point arithmetic.
 The response includes `version`, `protocol_version`, `state`,
 `accounting_basis: "canonical_protocol_ledger"`, and
 `initial_napro: "100000000000000000"`.
-The initial value is a protocol target, not evidence of funding.
+`initial_napro` is the protocol target, not standalone proof of funding. The independently checked current public-mainnet response reports `state: "active"` and `funding_height: 2493218`; a new/default-disabled network or a pre-activation snapshot does not inherit that state.
 
 | State | Interpretation |
 | --- | --- |
