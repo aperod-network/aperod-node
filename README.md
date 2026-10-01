@@ -27,8 +27,8 @@ LPoD is an Aperod protocol subsystem developed and owned by the web3
 canonical accounting and confirmed Guardian-principal refunds. LPoD v3 is **ACTIVE on mainnet from canonical height 2,493,218**. Its
 1B APRO Guardian reserve belongs within the existing 10B APRO nominal
 allocation; this is not additional issuance. The coordinated v3 migration
-is active on mainnet, with funding and finalized pool accounting visible at
-[`GET /api/v1/lpod-pool`](https://aperod.com/api/v1/lpod-pool).
+is active on mainnet, with funding and finalized pool accounting visible at this
+[address](https://aperod.com/vaults).
 Standalone nodes require an authenticated migration witness to follow this
 activated chain. The validator stake lock remains governed separately by the
 validator protocol.
