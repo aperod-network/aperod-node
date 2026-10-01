@@ -1676,11 +1676,11 @@ def scan(apply: bool = False, *, state_dir: Path | None = None,
                                      runtime=rt, manifest=mark_data["manifest"])
                     _receipt(settings_path, job, mark_data, runtime=rt, provider=provider)
                     _completed_job_unchanged(job, rt)
+                    size = _revalidate_artifact(mark_data, job, rt)
+                    # Hashing a large stopped database can take time. Inspect
+                    # references and live identity again after that read.
                     _proc_references(job["runtime_pid"], Path(mark_data["path"]), Path(origin["config"]),
                                      runtime=rt, manifest=mark_data["manifest"])
-                    size = _revalidate_artifact(mark_data, job, rt)
-                    # Hashing a large stopped database can take time. Do not
-                    # use the process/config identity sampled before that read.
                     _completed_job_unchanged(job, rt)
                     row["bytes"] = size
                     row["eligible"] = True
