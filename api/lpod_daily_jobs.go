@@ -24,6 +24,7 @@ const dailyJobMaxBytes = 16 << 20
 
 type dailyPositionProgress struct {
 	Vault, After             string
+Beneficiary              string
 	Accrued, Paid, Principal uint64
 }
 

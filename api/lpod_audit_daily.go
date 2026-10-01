@@ -32,6 +32,7 @@ const (
 
 type lpodDailyPosition struct {
 	ID                  string `json:"id"`
+Beneficiary         string `json:"beneficiary"`
 	EffectiveVault      string `json:"effective_vault"`
 	EffectiveVaultAfter string `json:"effective_vault_after"`
 	Accrued             string `json:"accrued_napro"`
@@ -48,12 +49,37 @@ type lpodDailyVault struct {
 }
 
 type lpodDailyPositionSum struct {
-	id, vault, vaultAfter    string
+id, beneficiary, vault, vaultAfter string
 	accrued, paid, principal uint64
 }
 type lpodDailyVaultSum struct {
 	id                                  string
 	accrued, leader, guardian, unfunded uint64
+}
+
+// The caller has already reconciled this row with the signed deposit opening
+// and both historical checkpoints. Closure must not erase its beneficiary.
+func accumulateDailyPosition(positions map[string]*lpodDailyPositionSum, p store.LPoDAuditPosition) error {
+if p.ID == "" || p.Beneficiary == "" {
+return fmt.Errorf("position beneficiary unavailable")
+}
+prior := positions[p.ID]
+a := lpodDailyPositionSum{id: p.ID, beneficiary: p.Beneficiary, vault: p.EffectiveVault}
+if prior != nil { a = *prior }
+if a.beneficiary != p.Beneficiary {
+return fmt.Errorf("position beneficiary changed")
+}
+a.vaultAfter = p.EffectiveVaultAfter
+if !sumDaily(&a.accrued, p.Accrued) || !sumDaily(&a.paid, p.Paid) || !sumDaily(&a.principal, p.PrincipalReturned) {
+return fmt.Errorf("position aggregate overflow")
+}
+positions[p.ID] = &a
+return nil
+}
+
+func dailyPositionOutput(p *lpodDailyPositionSum) lpodDailyPosition {
+return lpodDailyPosition{ID: p.id, Beneficiary: p.beneficiary, EffectiveVault: p.vault, EffectiveVaultAfter: p.vaultAfter,
+Accrued: strconv.FormatUint(p.accrued, 10), Paid: strconv.FormatUint(p.paid, 10), PrincipalReturned: strconv.FormatUint(p.principal, 10)}
 }
 
 func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +453,7 @@ for id, v := range progress.Vaults {
 vaults[id] = &lpodDailyVaultSum{id: id, accrued: v[0], leader: v[1], guardian: v[2], unfunded: v[3]}
 }
 for id, p := range progress.Positions {
-positions[id] = &lpodDailyPositionSum{id: id, vault: p.Vault, vaultAfter: p.After, accrued: p.Accrued, paid: p.Paid, principal: p.Principal}
+positions[id] = &lpodDailyPositionSum{id: id, beneficiary: p.Beneficiary, vault: p.Vault, vaultAfter: p.After, accrued: p.Accrued, paid: p.Paid, principal: p.Principal}
 }
 burnBase, burnIntentional, burnAVM, burnTotal = progress.Burns[0], progress.Burns[1], progress.Burns[2], progress.Burns[3]
 included, firstIncluded, lastIncluded = progress.Included, progress.First, progress.Last
@@ -442,7 +468,7 @@ progress.Next, progress.Previous, progress.PriorTS = next, prevHash, priorTS
 progress.Vaults = make(map[string][4]uint64, len(vaults))
 for id, v := range vaults { progress.Vaults[id] = [4]uint64{v.accrued, v.leader, v.guardian, v.unfunded} }
 progress.Positions = make(map[string]dailyPositionProgress, len(positions))
-for id, p := range positions { progress.Positions[id] = dailyPositionProgress{p.vault, p.vaultAfter, p.accrued, p.paid, p.principal} }
+for id, p := range positions { progress.Positions[id] = dailyPositionProgress{Vault: p.vault, After: p.vaultAfter, Beneficiary: p.beneficiary, Accrued: p.accrued, Paid: p.paid, Principal: p.principal} }
 progress.Burns = [4]uint64{burnBase, burnIntentional, burnAVM, burnTotal}
 progress.Included, progress.First, progress.Last = included, firstIncluded, lastIncluded
 progress.FirstTS, progress.LastTS = firstTimestamp, lastTimestamp
@@ -568,15 +594,8 @@ fail("block audit entry count exceeds bound"); return
 					fail(dailyAuditContextReason(err))
 					return
 				}
-				a := positions[p.ID]
-				if a == nil {
-					a = &lpodDailyPositionSum{id: p.ID, vault: p.EffectiveVault, vaultAfter: p.EffectiveVaultAfter}
-					positions[p.ID] = a
-				}
-				a.vaultAfter = p.EffectiveVaultAfter
-				if !sumDaily(&a.accrued, p.Accrued) || !sumDaily(&a.paid, p.Paid) ||
-					!sumDaily(&a.principal, p.PrincipalReturned) {
-					fail("position aggregate overflow")
+if err := accumulateDailyPosition(positions, p); err != nil {
+fail(err.Error())
 					return
 				}
 			}
@@ -671,11 +690,11 @@ lastAuditCheckpoint, lastAuditCPError := s.blockStore.LoadLPoDCheckpointAtBounde
 	sort.Slice(vaultList, func(i, j int) bool { return vaultList[i].ID < vaultList[j].ID })
 	positionList := make([]lpodDailyPosition, 0, len(positions))
 	for _, p := range positions {
-		positionList = append(positionList, lpodDailyPosition{p.id, p.vault, p.vaultAfter,
-			strconv.FormatUint(p.accrued, 10), strconv.FormatUint(p.paid, 10), strconv.FormatUint(p.principal, 10)})
+positionList = append(positionList, dailyPositionOutput(p))
 	}
 	sort.Slice(positionList, func(i, j int) bool { return positionList[i].ID < positionList[j].ID })
 	out["vaults"], out["positions"] = vaultList, positionList
+out["beneficiary_version"] = 1
 	out["burns_napro"] = map[string]string{
 		"protocol_base_fee": strconv.FormatUint(burnBase, 10), "signed_intentional": strconv.FormatUint(burnIntentional, 10),
 		"avm_gas": strconv.FormatUint(burnAVM, 10), "total": strconv.FormatUint(burnTotal, 10),
