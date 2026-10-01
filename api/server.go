@@ -64,8 +64,11 @@ type Server struct {
 	// /api/v1/admin/utxo-audit.  Guarded by utxoAuditMu.
 	utxoAuditMu             sync.Mutex
 	utxoAudit               *UTXOAuditResult
+	walletSnapshotCaptureMu sync.RWMutex
+	walletSnapshotCapture   func() (*store.WalletReadSnapshot, error)
+	walletSnapshots         *walletSnapshotManager
 	lpodAuditDailyMu        sync.Mutex
-dailyJobs              dailyJobService
+	dailyJobs               dailyJobService
 	peerCounter             func() int   // optional; wired to p2p.Host.PeerCount by cmd/node
 	pendingHandshakeCounter func() int64 // optional; wired to p2p.Host.PendingHandshakes by cmd/node
 	reconnectBackoffFlag    func() bool  // optional; wired to p2p.Host.ReconnectBackoffActive by cmd/node
@@ -315,17 +318,18 @@ dailyJobs              dailyJobService
 // NewServer creates a new API server.
 func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *core.UTXOSet, log *slog.Logger) *Server {
 	s := &Server{
-		addr:           addr,
-		chain:          chain,
-		mempool:        mempool,
-		utxos:          utxos,
-		log:            log,
-		mux:            http.NewServeMux(),
-		hub:            NewHub(log),
-		rateLimiter:    NewRateLimiter(),
-		syncing:        1, // syncing until SetReady() is called
-		utxoRebuilding: 1, // set until SetUTXOReady() is called ~90 s after startup
-		startupID:      strconv.FormatInt(time.Now().UnixNano(), 10),
+		addr:            addr,
+		chain:           chain,
+		mempool:         mempool,
+		utxos:           utxos,
+		log:             log,
+		mux:             http.NewServeMux(),
+		hub:             NewHub(log),
+		rateLimiter:     NewRateLimiter(),
+		syncing:         1, // syncing until SetReady() is called
+		utxoRebuilding:  1, // set until SetUTXOReady() is called ~90 s after startup
+		startupID:       strconv.FormatInt(time.Now().UnixNano(), 10),
+		walletSnapshots: newWalletSnapshotManager(),
 	}
 	s.registerRoutes()
 	return s
@@ -451,11 +455,11 @@ func (s *Server) SetRegistry(r *core.ValidatorRegistry) { s.registry = r }
 // signed StakeAdminWithdraw transactions.  Optional — endpoint returns 503
 // when no key is configured.
 func (s *Server) SetValidatorKey(key *crypto.LockedValidatorKey) {
-// Early HTTP startup may overlap key wiring. Daily job authentication reads
-// this pointer under the same mutex and never falls back to unsigned state.
-s.dailyJobs.mu.Lock()
-defer s.dailyJobs.mu.Unlock()
-s.myKey = key
+	// Early HTTP startup may overlap key wiring. Daily job authentication reads
+	// this pointer under the same mutex and never falls back to unsigned state.
+	s.dailyJobs.mu.Lock()
+	defer s.dailyJobs.mu.Unlock()
+	s.myKey = key
 }
 
 // APIKeyConfig optionally sets the required API key for write operations.
@@ -470,6 +474,15 @@ func (s *Server) SetAllowedOrigins(origins []string) { s.corsOrigins = origins }
 // when looking up old or pruned blocks that have been evicted from memory.
 // Optional — endpoints return 404 for old blocks when no store is wired.
 func (s *Server) SetStore(db *store.DB) { s.blockStore = db }
+
+// SetWalletSnapshotCapture installs the raw canonical LevelDB snapshot
+// capturer. Production callers serialize capture with block production; the
+// API validates and reads the captured view only after capture has returned.
+func (s *Server) SetWalletSnapshotCapture(capture func() (*store.WalletReadSnapshot, error)) {
+	s.walletSnapshotCaptureMu.Lock()
+	s.walletSnapshotCapture = capture
+	s.walletSnapshotCaptureMu.Unlock()
+}
 
 // SetGuardianFundConfig supplies the consensus parameters used by the
 // read-only Guardian allocation endpoint. It does not assert that funding
@@ -857,7 +870,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Start binds and serves. Blocks until server returns.
 // The full middleware chain is: CORS → RateLimit → routes.
 func (s *Server) Start() error {
-defer s.StopDailyAuditWorker()
+	defer s.StopDailyAuditWorker()
+	stopWalletSnapshotJanitor := make(chan struct{})
+	walletSnapshotJanitorDone := make(chan struct{})
+	go func() {
+		defer close(walletSnapshotJanitorDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if s.walletSnapshots != nil {
+					s.walletSnapshots.expire()
+				}
+			case <-stopWalletSnapshotJanitor:
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stopWalletSnapshotJanitor)
+		<-walletSnapshotJanitorDone
+		if s.walletSnapshots != nil {
+			s.walletSnapshots.closeAll()
+		}
+	}()
 	cors := CORSConfig{AllowedOrigins: s.corsOrigins}
 	handler := cors.Middleware(s.rateLimiter.Middleware(s.mux))
 	srv := &http.Server{

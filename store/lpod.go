@@ -6,6 +6,7 @@ package store
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/aperod/aperod/core"
@@ -60,23 +61,75 @@ func lpodKey(hash crypto.Hash32) []byte {
 }
 
 func (d *DB) lpodCheckpoint(hash crypto.Hash32) (*LPoDCheckpoint, error) {
-return d.lpodCheckpointBounded(hash, 0)
+	return d.lpodCheckpointBounded(hash, 0)
 }
 
 // LoadLPoDCheckpointAtBounded limits auxiliary decoding, without changing
 // consensus checkpoint loading. LevelDB still materializes one value.
 func (d *DB) LoadLPoDCheckpointAtBounded(hash crypto.Hash32, maxBytes int) (*LPoDCheckpoint, error) {
-return d.lpodCheckpointBounded(hash, maxBytes)
+	return d.lpodCheckpointBounded(hash, maxBytes)
 }
 
 func (d *DB) lpodCheckpointBounded(hash crypto.Hash32, maxBytes int) (*LPoDCheckpoint, error) {
-	data, err := d.get(lpodKey(hash))
+	return loadLPoDCheckpointBounded(
+		hash, maxBytes, d.get, d.GetRawBlock, d.readLPoDCanonicalBlock,
+		func(checkpointHash crypto.Hash32) (*LPoDCheckpoint, error) {
+			return d.lpodCheckpoint(checkpointHash)
+		},
+	)
+}
+
+func loadLPoDCheckpointBounded(
+	hash crypto.Hash32,
+	maxBytes int,
+	get func([]byte) ([]byte, error),
+	getRawBlock func(crypto.Hash32) ([]byte, error),
+	readCanonicalBlock func(uint64) (*core.Block, error),
+	loadCheckpoint func(crypto.Hash32) (*LPoDCheckpoint, error),
+) (*LPoDCheckpoint, error) {
+	return loadLPoDCheckpointWithReadBudget(
+		hash, maxBytes, nil, get, getRawBlock, readCanonicalBlock, loadCheckpoint,
+	)
+}
+
+var errLPoDCheckpointReadBudget = errors.New("store: checkpoint exceeds auxiliary read budget")
+
+type lpodCheckpointReadBudget struct {
+	maxBytes int
+	used     int
+}
+
+func (b *lpodCheckpointReadBudget) consume(size int) error {
+	if b == nil || b.maxBytes <= 0 {
+		return nil
+	}
+	if size > b.maxBytes-b.used {
+		return errLPoDCheckpointReadBudget
+	}
+	b.used += size
+	return nil
+}
+
+func loadLPoDCheckpointWithReadBudget(
+	hash crypto.Hash32,
+	maxBytes int,
+	budget *lpodCheckpointReadBudget,
+	get func([]byte) ([]byte, error),
+	getRawBlock func(crypto.Hash32) ([]byte, error),
+	readCanonicalBlock func(uint64) (*core.Block, error),
+	loadCheckpoint func(crypto.Hash32) (*LPoDCheckpoint, error),
+) (*LPoDCheckpoint, error) {
+	data, err := get(lpodKey(hash))
 	if err != nil || data == nil {
 		return nil, err
 	}
-if maxBytes > 0 && len(data) > maxBytes {
-return nil, fmt.Errorf("store: checkpoint exceeds auxiliary read budget")
-}
+	if budget != nil {
+		if err := budget.consume(len(data)); err != nil {
+			return nil, err
+		}
+	} else if maxBytes > 0 && len(data) > maxBytes {
+		return nil, fmt.Errorf("store: checkpoint exceeds auxiliary read budget")
+	}
 	var c LPoDCheckpoint
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("store: corrupt LPoD checkpoint: %w", err)
@@ -130,7 +183,7 @@ return nil, fmt.Errorf("store: checkpoint exceeds auxiliary read budget")
 			a.ValidatorRemaining != a.InitialValidatorRemaining-drawn || a.TailIssued != c.State.RewardInflow-drawn {
 			return nil, fmt.Errorf("store: corrupt LPoD conserved allocation")
 		}
-		raw, err := d.GetRawBlock(hash)
+		raw, err := getRawBlock(hash)
 		if err != nil {
 			return nil, err
 		}
@@ -148,14 +201,17 @@ return nil, fmt.Errorf("store: checkpoint exceeds auxiliary read budget")
 			// every later checkpoint. Authenticate that original canonical block
 			// and its checkpoint separately; later blocks are checked against
 			// their own signed checkpoint above.
-			funding, err := d.readLPoDCanonicalBlock(a.FundingHeight)
+			funding, err := readCanonicalBlock(a.FundingHeight)
 			if err != nil || funding.Hash() != a.FundingBlock || funding.Header.Height != a.FundingHeight ||
 				funding.Header.PrevHash != a.FundingParent || len(funding.Txs) < 2 {
 				return nil, fmt.Errorf("store: trusted checkpoint funding block is not canonical")
 			}
 			fundingCheckpoint := &c
 			if hash != a.FundingBlock {
-				fundingCheckpoint, err = d.lpodCheckpoint(a.FundingBlock)
+				fundingCheckpoint, err = loadCheckpoint(a.FundingBlock)
+			}
+			if errors.Is(err, errLPoDCheckpointReadBudget) {
+				return nil, err
 			}
 			if err != nil || fundingCheckpoint == nil || fundingCheckpoint.Allocation == nil ||
 				fundingCheckpoint.Allocation.Version != a.Version ||

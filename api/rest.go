@@ -65,6 +65,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/network/peers", s.localOnly(s.restNetworkPeers))
 	s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
 	s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
+	s.mux.HandleFunc("/api/v1/wallet/snapshot", s.restWalletSnapshot)
 	s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
 	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
@@ -75,7 +76,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/lpod/earnings-outputs", s.restLPoDEarningsOutputs)
 	// Administrative/internal only: this audit may scan tens of thousands of
 	// full block bodies and requires both loopback access and the configured API key.
-s.mux.HandleFunc("/api/v1/lpod/audit/daily", s.localOnly(s.requireAPIKey(s.restLPoDDailyJob)))
+	s.mux.HandleFunc("/api/v1/lpod/audit/daily", s.localOnly(s.requireAPIKey(s.restLPoDDailyJob)))
 	s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
@@ -2198,6 +2199,10 @@ func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Has("snapshot_id") {
+		s.restUTXOSnapshot(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
 		return
@@ -2351,6 +2356,78 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, resp)
 }
+
+func (s *Server) restUTXOSnapshot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	tail := pathSuffix("/api/v1/utxo/", r.URL.Path)
+	parts := strings.SplitN(tail, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		writeJSONError(w, http.StatusBadRequest, "path must be /api/v1/utxo/{txhash}/{idx}")
+		return
+	}
+	hashBytes, err := hex.DecodeString(parts[0])
+	if err != nil || len(hashBytes) != 32 {
+		writeJSONError(w, http.StatusBadRequest, "txhash must be 64 hex characters")
+		return
+	}
+	index, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "idx must be a non-negative integer")
+		return
+	}
+	address, err := validSnapshotAddress(r.URL.Query().Get("address"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "valid address required")
+		return
+	}
+	lease := s.acquireWalletSnapshot(w, r.URL.Query().Get("snapshot_id"), address)
+	if lease == nil {
+		return
+	}
+	defer lease.Release()
+
+	var txHash crypto.Hash32
+	copy(txHash[:], hashBytes)
+	outIndex := uint32(index)
+	utxo, err := lease.entry.read.GetUTXO(txHash, outIndex)
+	if err != nil {
+		writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "pinned output lookup unavailable")
+		return
+	}
+	spent, err := lease.entry.read.IsUTXOSpentChecked(txHash, outIndex)
+	if err != nil {
+		writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "pinned spent-output lookup unavailable")
+		return
+	}
+	if utxo == nil || spent {
+		writeJSONError(w, http.StatusNotFound, "source is not active at the pinned checkpoint")
+		return
+	}
+
+	spentStatus := "unspent"
+	if s.mempool != nil {
+		cfg := s.mempool.MempoolConfig()
+		if cfg.RingCTCLSAGActivationHeight > 0 &&
+			lease.entry.height+1 >= cfg.RingCTCLSAGActivationHeight {
+			spentStatus = "unknown_key_image_required"
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tx_hash": fmt.Sprintf("%x", txHash[:]), "out_idx": outIndex,
+		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
+		"one_time_pub_hex":  fmt.Sprintf("%x", utxo.OneTimePub[:]),
+		"tx_pub_key_hex":    fmt.Sprintf("%x", utxo.TxPubKey[:]),
+		"enc_amount_hex":    fmt.Sprintf("%x", utxo.EncAmount[:]),
+		"exists":            true, "block_height": utxo.BlockHeight, "spent_status": spentStatus,
+		"snapshot_id": lease.entry.id, "checkpoint_height": lease.entry.height,
+		"checkpoint_hash": fmt.Sprintf("%x", lease.entry.hash[:]),
+	})
+}
+
 func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")

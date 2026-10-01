@@ -595,15 +595,17 @@ func (d *DB) IterStakeBlockHeights(fn func(uint64) error) error {
 // key image is stored as a best-effort guard — consistent with the fallback
 // in UTXOSet.MarkSpent so that the two indexes never disagree.
 func (d *DB) MarkKeyImageSpent(ki crypto.KeyImage) error {
+	return d.put(keyImageSpentKey(ki), []byte{0x01})
+}
+
+func keyImageSpentKey(ki crypto.KeyImage) []byte {
 	canonical, err := crypto.CanonicalKeyImage(ki)
 	if err != nil {
 		// Store raw image; non-canonical torsion variants will
 		// still be caught because IsKeyImageSpent has the same fallback.
-		key := append(append([]byte{}, prefixKeyImage...), ki[:]...)
-		return d.put(key, []byte{0x01})
+		return append(append([]byte{}, prefixKeyImage...), ki[:]...)
 	}
-	key := append(append([]byte{}, prefixKeyImage...), canonical[:]...)
-	return d.put(key, []byte{0x01})
+	return append(append([]byte{}, prefixKeyImage...), canonical[:]...)
 }
 
 // DeleteKeyImage removes a key image from the spent index.  Both the
@@ -647,8 +649,8 @@ func (d *DB) PutMeta(key string, value []byte) error {
 
 // PutMetaSync durably replaces an auxiliary job and its progress atomically.
 func (d *DB) PutMetaSync(key string, value []byte) error {
-k := append(prefixMeta, []byte(key)...)
-return d.putSync(k, value)
+	k := append(prefixMeta, []byte(key)...)
+	return d.putSync(k, value)
 }
 
 // GetMeta retrieves a metadata value. Returns nil if not found.
@@ -792,8 +794,12 @@ func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
-if err:=d.restoreLPoDPool(batch,hash,height);err!=nil {return err}
-if err:=d.rollbackLPoDIndices(batch,hash,height);err!=nil{return err}
+	if err := d.restoreLPoDPool(batch, hash, height); err != nil {
+		return err
+	}
+	if err := d.rollbackLPoDIndices(batch, hash, height); err != nil {
+		return err
+	}
 	batch.Put(hashKey, hash[:])
 	batch.Put(heightKey2, hb[:])
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
@@ -866,7 +872,9 @@ func (d *DB) CommitRawBlockWithAVM(
 	writeSetCommitment crypto.Hash32,
 	lpodSettlement ...*LPoDSettlement,
 ) error {
-if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil { return err }
+	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil {
+		return err
+	}
 	batch, err := avmBatch(writes)
 	if err != nil {
 		return err
@@ -876,11 +884,30 @@ if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil { 
 	if err := d.appendLPoDSettlement(batch, hash, height, lpodSettlement); err != nil {
 		return err
 	}
-if len(lpodSettlement)==1 && lpodSettlement[0]!=nil && lpodSettlement[0].PositionProtocol{
+	if len(lpodSettlement) == 1 && lpodSettlement[0] != nil && lpodSettlement[0].PositionProtocol {
 		var block core.Block
-if err:=json.Unmarshal(data,&block);err!=nil{return err}
-if err:=appendLPoDIndices(batch,&block,false);err!=nil{return err}
-if err:=d.appendLPoDWalletIndex(batch,&block,lpodSettlement[0]);err!=nil{return err}
+		if err := json.Unmarshal(data, &block); err != nil {
+			return err
+		}
+		if err := appendLPoDIndices(batch, &block, false); err != nil {
+			return err
+		}
+		if err := d.appendLPoDWalletIndex(batch, &block, lpodSettlement[0]); err != nil {
+			return err
+		}
+	}
+	// Preserve the historical best-effort key-image normalization semantics,
+	// but commit these markers atomically with the canonical block and tip.
+	// Invalid/non-JSON raw bodies were historically accepted by this low-level
+	// storage method; leave their key-image index empty instead of introducing
+	// a new rejection path. Production canonical blocks are serialized JSON.
+	var committedBlock core.Block
+	if json.Unmarshal(data, &committedBlock) == nil {
+		for _, tx := range committedBlock.Txs {
+			for _, input := range tx.Inputs {
+				batch.Put(keyImageSpentKey(input.KeyImage), []byte{0x01})
+			}
+		}
 	}
 	blockKey := append(append([]byte{}, prefixBlock...), hash[:]...)
 	batch.Put(blockKey, data)

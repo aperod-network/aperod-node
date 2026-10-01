@@ -100,6 +100,10 @@ func lpodVaultProjection(c *store.LPoDCheckpoint, vault crypto.Point32) ([]lpodW
 }
 
 func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Has("snapshot_id") {
+		s.restLPoDPositionsSnapshot(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet {
 		writeJSONError(w, 405, "GET only")
@@ -201,4 +205,39 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 	out["checkpoint_hash"] = fmt.Sprintf("%x", hash[:])
 	out["finalized_height"] = height
 	out["position_lifecycle_version"] = a.PositionLifecycleVersion
+}
+
+func (s *Server) restLPoDPositionsSnapshot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	address, err := validSnapshotAddress(r.URL.Query().Get("address"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "valid wallet address required")
+		return
+	}
+	lease := s.acquireWalletSnapshot(w, r.URL.Query().Get("snapshot_id"), address)
+	if lease == nil {
+		return
+	}
+	defer lease.Release()
+
+	checkpoint := lease.entry.checkpoint
+	rows, reserved, err := lpodWalletProjection(checkpoint, address)
+	if err != nil {
+		writeWalletSnapshotError(w, http.StatusInternalServerError, "SNAPSHOT_QUERY_FAILED", err.Error())
+		return
+	}
+	allocation := checkpoint.Allocation
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version": 1, "state": "active", "address": address,
+		"reserved_napro": strconv.FormatUint(reserved, 10), "positions": rows,
+		"checkpoint_hash":   fmt.Sprintf("%x", lease.entry.hash[:]),
+		"checkpoint_height": lease.entry.height, "finalized_height": lease.entry.height,
+		"snapshot_id": lease.entry.id, "chain_anchor": fmt.Sprintf("%x", allocation.Genesis[:]),
+		"wallet_mutations_supported": true,
+		"position_lifecycle_version": allocation.PositionLifecycleVersion,
+	})
 }

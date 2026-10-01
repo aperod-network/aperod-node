@@ -170,29 +170,29 @@ func (h *nodeHandler) OnTransaction(tx *core.Transaction) {
 
 // OnVote forwards a p2p vote to the consensus engine.
 func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
-fm, err := finalityMsgFromP2P(vote)
-if err != nil {
-h.log.Warn("p2p: invalid vote public key", "err", err)
-return
-}
-select {
-case h.engine.NewVoteCh() <- fm:
-default:
-h.log.Warn("p2p: vote channel full — dropped")
-}
+	fm, err := finalityMsgFromP2P(vote)
+	if err != nil {
+		h.log.Warn("p2p: invalid vote public key", "err", err)
+		return
+	}
+	select {
+	case h.engine.NewVoteCh() <- fm:
+	default:
+		h.log.Warn("p2p: vote channel full — dropped")
+	}
 }
 
 func finalityMsgFromP2P(vote p2p.VoteMsg) (consensus.FinalizeMsg, error) {
-pub, err := crypto.ValidatorPubKeyFromBytes(vote.ValidatorPub)
-if err != nil {
-return consensus.FinalizeMsg{}, err
-}
-return consensus.FinalizeMsg{
+	pub, err := crypto.ValidatorPubKeyFromBytes(vote.ValidatorPub)
+	if err != nil {
+		return consensus.FinalizeMsg{}, err
+	}
+	return consensus.FinalizeMsg{
 		BlockHash:    vote.BlockHash,
 		Height:       vote.Height,
 		ValidatorPub: pub,
 		Signature:    vote.Signature,
-}, nil
+	}, nil
 }
 
 // runCompactDB implements the --compact-db subcommand.
@@ -1778,17 +1778,17 @@ func run() error {
 		// replay stake txs (including withdrawals by genesis validators).
 		registry = core.NewValidatorRegistry()
 		registry.SetUTXOSet(utxos)
-bootstrapSnap, bootstrapErr := loadOperatorRegistryBootstrap(cfg.Consensus.RegistryBootstrap, cfg.Consensus.NonValidator, db, tipHeight)
-if bootstrapErr != nil {
-return bootstrapErr
-}
-if bootstrapSnap != nil {
-registry.RestoreFromSnapshot(bootstrapSnap.Registry)
-registry.SetUTXOSet(utxos)
-validators = registry.GetActiveValidators()
-log.Warn("startup registry bootstrap trust=operator_attested; historical_committee_authenticated=false",
-"snapshot_height", bootstrapSnap.TipHeight, "snapshot_sha256", cfg.Consensus.RegistryBootstrap.SHA256)
-}
+		bootstrapSnap, bootstrapErr := loadOperatorRegistryBootstrap(cfg.Consensus.RegistryBootstrap, cfg.Consensus.NonValidator, db, tipHeight)
+		if bootstrapErr != nil {
+			return bootstrapErr
+		}
+		if bootstrapSnap != nil {
+			registry.RestoreFromSnapshot(bootstrapSnap.Registry)
+			registry.SetUTXOSet(utxos)
+			validators = registry.GetActiveValidators()
+			log.Warn("startup registry bootstrap trust=operator_attested; historical_committee_authenticated=false",
+				"snapshot_height", bootstrapSnap.TipHeight, "snapshot_sha256", cfg.Consensus.RegistryBootstrap.SHA256)
+		}
 		// Load and bind the quorum-attested lifecycle fork before stake replay.
 		// Otherwise a restart could not validate chain-bound v2 withdrawal
 		// nonces, and legacy withdrawals after activation would be replayed under
@@ -1844,21 +1844,21 @@ log.Warn("startup registry bootstrap trust=operator_attested; historical_committ
 		// scanning from block 1.
 		var rescueSnap *startupSnapshot
 		var rescueSnapHeight uint64
-if bootstrapSnap != nil {
-utxos.RestoreFromSnapshot(bootstrapSnap.UTXOs)
-if err := replayOperatorRegistryBootstrap(db, utxos, registry, bootstrapSnap, tipHeight, log); err != nil {
-return err
-}
-validators = registry.GetActiveValidators()
-snapLoaded = true
-log.Info("operator-attested snapshot registry and state replay complete",
-"snapshot_height", bootstrapSnap.TipHeight, "tip_height", tipHeight,
-"historical_committee_authenticated", false)
-bootstrapSnap = nil
-runtime.GC()
-debug.FreeOSMemory()
-}
-if !snapLoaded {
+		if bootstrapSnap != nil {
+			utxos.RestoreFromSnapshot(bootstrapSnap.UTXOs)
+			if err := replayOperatorRegistryBootstrap(db, utxos, registry, bootstrapSnap, tipHeight, log); err != nil {
+				return err
+			}
+			validators = registry.GetActiveValidators()
+			snapLoaded = true
+			log.Info("operator-attested snapshot registry and state replay complete",
+				"snapshot_height", bootstrapSnap.TipHeight, "tip_height", tipHeight,
+				"historical_committee_authenticated", false)
+			bootstrapSnap = nil
+			runtime.GC()
+			debug.FreeOSMemory()
+		}
+		if !snapLoaded {
 			tipHashHex := fmt.Sprintf("%x", tipHash[:])
 			if snap, snapIsRelaxed, serr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, tipHashHex, log); serr == nil {
 				if apiSrv != nil {
@@ -2676,18 +2676,8 @@ if !snapLoaded {
 					}
 				}
 			}
-			// Persist spent key images to the LevelDB key-image index so
-			// that future restarts can use db.IterKeyImages() instead of
-			// scanning every raw block.  Non-fatal on error — the block is
-			// already accepted; the index is a startup-performance optimisation.
-			for _, tx := range block.Txs {
-				for _, inp := range tx.Inputs {
-					if kiErr := db.MarkKeyImageSpent(inp.KeyImage); kiErr != nil {
-						log.Warn("failed to persist key image",
-							"height", block.Header.Height, "err", kiErr)
-					}
-				}
-			}
+			// Key-image markers are committed atomically with the canonical block
+			// by CommitRawBlockWithAVM.
 			// Index stake-bearing blocks for the db-index fast-path startup scan.
 			for _, tx := range block.Txs {
 				if tx.IsStake() {
@@ -2778,20 +2768,8 @@ if !snapLoaded {
 				}
 			}
 
-			// Persist spent key images and stake-block heights for every
-			// accepted canonical block.  OnBlockProduced does the same for
-			// locally-produced blocks; this call covers blocks received via
-			// P2P sync so that pure relay/sync nodes also populate the DB
-			// indexes required by the fast-path startup (IterKeyImages /
-			// HasStakeBlockIndex).  Non-fatal — the block is already committed.
-			for _, tx := range block.Txs {
-				for _, inp := range tx.Inputs {
-					if kiErr := db.MarkKeyImageSpent(inp.KeyImage); kiErr != nil {
-						log.Warn("failed to index key image",
-							"height", h, "err", kiErr)
-					}
-				}
-			}
+			// Key-image markers are part of the canonical CommitRawBlockWithAVM
+			// batch for local and inbound blocks.
 			for _, tx := range block.Txs {
 				if tx.IsStake() {
 					if sbErr := db.PutStakeBlockHeight(h); sbErr != nil {
@@ -2890,8 +2868,8 @@ if !snapLoaded {
 	if db != nil && lpodMigration != nil && lpodMigration.Version == 3 {
 		if err := db.BackfillLPoDEarningsIndex(lpodMigration); err != nil {
 			log.Warn("v3 LPoD earnings index backfill incomplete; read API remains fail-closed", "err", err)
-} else {
-log.Info("v3 LPoD earnings index backfill complete")
+		} else {
+			log.Info("v3 LPoD earnings index backfill complete")
 		}
 	}
 
@@ -3055,7 +3033,16 @@ log.Info("v3 LPoD earnings index backfill complete")
 		// Wire engine-dependent options now that the consensus engine exists.
 		apiSrv.SetRegistry(engine.Registry())
 		apiSrv.SetValidatorKey(myKey)
-apiSrv.StartDailyAuditWorker()
+		apiSrv.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+			var read *store.WalletReadSnapshot
+			err := engine.WithCanonicalRead(func() error {
+				var captureErr error
+				read, captureErr = db.NewWalletReadSnapshot()
+				return captureErr
+			})
+			return read, err
+		})
+		apiSrv.StartDailyAuditWorker()
 		apiSrv.SetTxTotal(initialTxTotal)
 		apiSrv.SetTimestampRejectedCounter(func() int64 { return engine.TimestampRejectedCount() })
 		// Admin mints are built at block-production time so every mint gets a
@@ -3485,9 +3472,9 @@ apiSrv.StartDailyAuditWorker()
 	}
 
 	log.Info("shutting down...")
-if apiSrv != nil {
-apiSrv.StopDailyAuditWorker()
-}
+	if apiSrv != nil {
+		apiSrv.StopDailyAuditWorker()
+	}
 
 	if err := backupSrv.Close(); err != nil {
 		log.Warn("failed to close backup socket", "err", err)

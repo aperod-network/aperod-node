@@ -14,6 +14,10 @@ import (
 )
 
 func (s *Server) restLPoDWalletOutputs(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("snapshot") == "1" || r.URL.Query().Has("snapshot_id") {
+		s.restLPoDWalletOutputsSnapshot(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet {
 		writeJSONError(w, 405, "GET only")
@@ -159,14 +163,20 @@ func (s *Server) restWalletKeyImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Images []string `json:"key_images"`
-		Refs   []struct {
+		Images     []string `json:"key_images"`
+		SnapshotID string   `json:"snapshot_id,omitempty"`
+		Address    string   `json:"address,omitempty"`
+		Refs       []struct {
 			Hash  string `json:"tx_hash"`
 			Index uint32 `json:"out_idx"`
 		} `json:"refs"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 80000)).Decode(&req) != nil || len(req.Images) > 256 || len(req.Images) != len(req.Refs) {
 		writeJSONError(w, 400, "bounded key_images and matching refs required")
+		return
+	}
+	if req.SnapshotID != "" {
+		s.restWalletKeyImagesSnapshot(w, req.Images, req.Refs, req.SnapshotID, req.Address)
 		return
 	}
 	if s.blockStore == nil {
