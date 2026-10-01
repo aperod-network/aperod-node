@@ -17,7 +17,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ProtectSystem=strict
 ReadOnlyPaths=/opt/aperod/data
 ReadWritePaths=/var/lib/aperod-rollout-cleanup /opt/aperod/releases
-ProtectHome=yes
+ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

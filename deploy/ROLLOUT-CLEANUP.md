@@ -88,6 +88,9 @@ that cannot prove version identity fail closed. The most recent working
 `/usr/local/bin/aperod-node.pre-update` is not a rollout cleanup artifact and
 is retained as migration/rollback evidence.
 
+Home directories remain read-only but visible to the scanner. Hiding them would
+prevent it from checking a recovery process's configuration references safely.
+
 The service runs as root because it must inspect host `/proc`, mount references,
 and root-owned releases. `ProtectSystem=strict` allows writes only to the
 rollout registry and `/opt/aperod/releases`; `/opt/aperod/data` is explicitly
