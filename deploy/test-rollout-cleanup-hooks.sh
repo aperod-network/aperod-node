@@ -3,6 +3,7 @@
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE_DIR="$(cd "${DEPLOY_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${DEPLOY_DIR}/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -10,21 +11,34 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
-bash -n "${ROOT_DIR}/scripts/production-node-verified-rollout.sh"
-bash -n "${DEPLOY_DIR}/update-node.sh"
-bash -n "${DEPLOY_DIR}/setup-rollout-cleanup.sh"
-python3 -c 'import pathlib,sys; [compile(pathlib.Path(p).read_text(), p, "exec") for p in sys.argv[1:]]' \
-  "${DEPLOY_DIR}/rollout_cleanup/__init__.py" "${DEPLOY_DIR}/rollout_cleanup/cli.py"
-python3 - "${PROD:-${ROOT_DIR}/scripts/production-node-verified-rollout.sh}" <<'PY'
+PROD_OVERRIDE="${PROD:-}"
+PROD="${PROD_OVERRIDE:-${ROOT_DIR}/scripts/production-node-verified-rollout.sh}"
+CHECK_PROD=1
+if [[ ! -f "$PROD" ]]; then
+  if [[ -n "$PROD_OVERRIDE" || -f "${ROOT_DIR}/pnpm-workspace.yaml" ]]; then
+    fail "required verified rollout script is missing"
+  fi
+  [[ -f "${NODE_DIR}/go.mod" ]] || fail "cannot identify standalone node source layout"
+  CHECK_PROD=0
+  echo "NOT_APPLICABLE: deployment-specific rollout script is not shipped in standalone node source; public updater and installer checks remain required"
+fi
+if (( CHECK_PROD )); then
+bash -n "$PROD"
+python3 - "$PROD" <<'PY'
 import pathlib,sys
 source=pathlib.Path(sys.argv[1]).read_text()
 marker = "python3 - \"$release/stopped-copy\" <<'PY'\n"
 body=source.split(marker,1)[1].split("\nPY\n",1)[0]
 compile(body, str(sys.argv[1]) + ":stopped-copy-mount-check", "exec")
 PY
+fi
+bash -n "${DEPLOY_DIR}/update-node.sh"
+bash -n "${DEPLOY_DIR}/setup-rollout-cleanup.sh"
+python3 -c 'import pathlib,sys; [compile(pathlib.Path(p).read_text(), p, "exec") for p in sys.argv[1:]]' \
+  "${DEPLOY_DIR}/rollout_cleanup/__init__.py" "${DEPLOY_DIR}/rollout_cleanup/cli.py"
 pass "rollout scripts and stdlib Python CLI pass syntax checks"
 
-PROD="${ROOT_DIR}/scripts/production-node-verified-rollout.sh"
+if (( CHECK_PROD )); then
 begin_call="$(grep -n '^rollout_begin$' "$PROD" | cut -d: -f1)"
 stop_call="$(grep -n '^systemctl stop aperod-node$' "$PROD" | cut -d: -f1)"
 copy_check="$(grep -n 'snapshot-check.txt' "$PROD" | cut -d: -f1)"
@@ -45,6 +59,7 @@ success_banner="$(grep -n '^echo "ROLLOUT_SUCCESS"$' "$PROD" | cut -d: -f1)"
   || fail "ownership normalization is broader than the isolated stopped-copy"
 [[ "$complete_call" -lt "$success_banner" ]] || fail "complete hook is not before success banner"
 pass "verified production rollout begins before stop, marks after the coherent copy, and completes before success"
+fi
 
 UPDATE="${DEPLOY_DIR}/update-node.sh"
 grep -Fq 'install -o root -g root -m 755 "${BINARY_SRC}" "${ROLLOUT_RELEASE}/node.candidate"' "$UPDATE" \
