@@ -54,6 +54,73 @@ if [[ -n "$DB_PREFLIGHT_LINE" && -n "$CHECKPOINT_POST_LINE" && "$DB_PREFLIGHT_LI
 else
   fail "checkpoint request can occur before the active-database disk preflight"
 fi
+AUTH_BEGIN_LINE=$(grep -n 'if "\$AUTH_HELPER" backup-begin' "$BACKUP_SH" | head -1 | cut -d: -f1)
+AUTH_PIN_LINE=$(grep -n '"$AUTH_HELPER" backup-pin' "$BACKUP_SH" | head -1 | cut -d: -f1)
+FIXED_UPLOAD_LINE=$(grep -n 'rclone copyto "$ARCHIVE_FILE" "$FIXED_REMOTE"' "$BACKUP_SH" | head -1 | cut -d: -f1)
+FIXED_READBACK_LINE=$(grep -n 'if ! _verify_remote_archive "$FIXED_REMOTE"' "$BACKUP_SH" | head -1 | cut -d: -f1)
+AUTH_PUBLISH_LINE=$(grep -n '"$AUTH_HELPER" backup-publish' "$BACKUP_SH" | head -1 | cut -d: -f1)
+RETENTION_END_LINE=$(grep -n 'done <<< "$PRESERVED_LEGACY_OBJECTS"' "$BACKUP_SH" | tail -1 | cut -d: -f1)
+if [[ -n "$AUTH_BEGIN_LINE" && "$AUTH_BEGIN_LINE" -lt "$CHECKPOINT_POST_LINE" ]]; then
+  pass "backup-begin captures authorization context and anchors before checkpoint request"
+else
+  fail "backup-begin is missing or runs after checkpoint request"
+fi
+if [[ -n "$AUTH_PIN_LINE" && -n "$FIXED_UPLOAD_LINE" && -n "$FIXED_READBACK_LINE" \
+  && "$FIXED_UPLOAD_LINE" -lt "$AUTH_PIN_LINE" && "$AUTH_PIN_LINE" -lt "$FIXED_READBACK_LINE" ]]; then
+  pass "B2 exact-object pin is ordered after fixed upload and before its fresh readback"
+else
+  fail "B2 pin is not ordered between fixed upload and fixed readback"
+fi
+if [[ -n "$AUTH_PUBLISH_LINE" && "$AUTH_PUBLISH_LINE" -gt "$FIXED_READBACK_LINE" \
+  && -n "$RETENTION_END_LINE" && "$AUTH_PUBLISH_LINE" -gt "$RETENTION_END_LINE" ]] \
+  && grep -q '_disable_backup_authorization "backup-pin-failed"' "$BACKUP_SH" \
+  && grep -q '_disable_backup_authorization "backup-proof-failed"' "$BACKUP_SH" \
+  && grep -q '_abort_backup_authorization' "$BACKUP_SH"; then
+  pass "authorization publishes only after fixed readback/retention and helper/proof failures disable with an abort hook"
+else
+  fail "authorization failure handling or post-retention publish ordering is incomplete"
+fi
+AUTH_FUNCTIONS="$TMPDIR_TEST/auth-functions.sh"
+for function_name in _disable_backup_authorization _abort_backup_authorization; do
+  awk -v name="$function_name" '
+    $0 ~ "^" name "\\(\\) \\{" { emit=1 }
+    emit { print }
+    emit && /^}$/ { exit }
+  ' "$BACKUP_SH" >> "$AUTH_FUNCTIONS"
+done
+AUTH_MOCK="$TMPDIR_TEST/auth-helper-mock"
+cat > "$AUTH_MOCK" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AUTH_HELPER_LOG"
+[[ "${MOCK_AUTH_ABORT_FAIL:-0}" != 1 ]]
+STUB
+chmod +x "$AUTH_MOCK"
+(
+  source "$AUTH_FUNCTIONS"
+  _auth_output_is_safe() { [[ "${MOCK_CONTEXT_SAFE:-0}" == 1 ]]; }
+  AUTH_HELPER_READY=1
+  AUTH_HELPER="$AUTH_MOCK"
+  AUTH_CONTEXT_FILE="$TMPDIR_TEST/auth-context.json"
+  AUTH_ATTEMPT_REGISTERED=1
+  AUTH_ENABLED=1
+  AUTH_PINNED=1
+  AUTH_HELPER_LOG="$TMPDIR_TEST/auth-helper.log"
+  MOCK_CONTEXT_SAFE=1
+  export AUTH_HELPER_LOG
+  export MOCK_CONTEXT_SAFE
+  _disable_backup_authorization "mock-proof-failure"
+  [[ "$AUTH_ENABLED" == 0 && "$AUTH_PINNED" == 0 ]]
+  AUTH_ATTEMPT_REGISTERED=1
+  _abort_backup_authorization
+  [[ "$AUTH_ATTEMPT_REGISTERED" == 0 ]]
+  MOCK_AUTH_ABORT_FAIL=1
+  export MOCK_AUTH_ABORT_FAIL
+  AUTH_ENABLED=1
+  _disable_backup_authorization "mock-helper-failure"
+  [[ "$AUTH_ENABLED" == 0 ]]
+  [[ "$(wc -l < "$AUTH_HELPER_LOG")" -eq 3 ]]
+) && pass "authorization proof failure aborts registered context and leaves backup flow non-fatal" \
+  || fail "authorization disable/abort failure did not leave independent backup flow non-fatal"
 VERIFY_LINE=$(grep -n 'if ! _verify_remote_archive "$FIXED_REMOTE"' "$BACKUP_SH" | head -1 | cut -d: -f1)
 CANDIDATE_DELETE_LINE=$(grep -n 'rclone deletefile "$CANDIDATE_REMOTE"' "$BACKUP_SH" | tail -1 | cut -d: -f1)
 if [[ -n "$VERIFY_LINE" && -n "$CANDIDATE_DELETE_LINE" && "$CANDIDATE_DELETE_LINE" -gt "$VERIFY_LINE" ]]; then
@@ -99,6 +166,7 @@ set +e
   BACKUP_DIR="$OWNED_CANONICAL"
   BACKUP_DIR_CANONICAL="$OWNED_CANONICAL"
   BACKUP_DIR_OWNED=1
+  AUTH_ATTEMPT_REGISTERED=0
   exit 23
 )
 CLEANUP_STATUS=$?
@@ -122,6 +190,7 @@ set +e
   BACKUP_DIR="$CLEANUP_ROOT/caller-work"
   BACKUP_DIR_CANONICAL="$CLEANUP_ROOT/caller-work"
   BACKUP_DIR_OWNED=0
+  AUTH_ATTEMPT_REGISTERED=0
   exit 19
 )
 UNOWNED_CLEANUP_STATUS=$?
@@ -144,6 +213,7 @@ ln -s real-stage "$CLEANUP_ROOT/staging/link-stage"
   BACKUP_DIR="$CLEANUP_ROOT/work-link"
   BACKUP_DIR_CANONICAL="$CLEANUP_ROOT/work-link"
   BACKUP_DIR_OWNED=0
+  AUTH_ATTEMPT_REGISTERED=0
   trap - EXIT
   if _cleanup_validated_snapshot 2>/dev/null; then exit 1; fi
   [[ -d "$CLEANUP_ROOT/staging/real-stage" ]]

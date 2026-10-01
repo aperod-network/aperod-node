@@ -750,6 +750,178 @@ if [[ "${SKIP_CONFIG_DRYRUN}" != "1" && -f "${NODE_YAML}" ]]; then
   fi
 fi
 
+# Register only an owned per-update candidate copy. BINARY_SRC is the shared
+# build output and must never become a cleanup target.
+ROLLOUT_CLI="/usr/local/bin/aperod-rollout-cleanup"
+ROLLOUT_RELEASE=""
+ROLLOUT_ID=""
+ROLLOUT_CANDIDATE_MARKED=0
+ROLLOUT_BEGIN_HEIGHT=""
+ROLLOUT_CANDIDATE_SHA256=""
+ROLLOUT_COMPLETED=0
+ROLLOUT_COMPLETION_REPORTED=0
+ROLLOUT_CONFIG="${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}"
+ROLLOUT_API_URL="${APEROD_ROLLOUT_API_URL:-http://127.0.0.1:8545}"
+ROLLOUT_DATA_DIR="${APEROD_NODE_DATA_DIR_OVERRIDE:-}"
+if [[ -z "${ROLLOUT_DATA_DIR}" && -f "${ROLLOUT_CONFIG}" ]]; then
+  _configured_data_dir=$(grep -E '^[[:space:]]*data_dir:' "${ROLLOUT_CONFIG}" 2>/dev/null \
+    | head -1 | sed -E 's/^[[:space:]]*data_dir:[[:space:]]*//' \
+    | sed -E 's/[[:space:]]*(#.*)?$//' | tr -d '"'"'"'' || true)
+  if [[ -n "${_configured_data_dir}" ]]; then
+    if [[ "${_configured_data_dir}" == /* ]]; then
+      ROLLOUT_DATA_DIR="${_configured_data_dir}"
+    fi
+  fi
+fi
+[[ "${ROLLOUT_DATA_DIR}" == /* ]] || ROLLOUT_DATA_DIR=""
+if [[ -z "${ROLLOUT_DATA_DIR}" ]]; then
+  echo "  [warn] Live data_dir could not be resolved unambiguously; cleanup registration skipped." >&2
+elif [[ -x "${ROLLOUT_CLI}" ]]; then
+  if ! mkdir -p /opt/aperod/releases 2>/dev/null \
+      || [[ -L /opt/aperod/releases ]] \
+      || [[ "$(stat -c '%u' /opt/aperod/releases 2>/dev/null || echo invalid)" != "0" ]]; then
+    echo "  [warn] Cannot establish a root-owned rollout release directory; cleanup registration skipped." >&2
+  elif ROLLOUT_RELEASE=$(mktemp -d /opt/aperod/releases/update-node-XXXXXXXXXX 2>/dev/null); then
+    chmod 700 "${ROLLOUT_RELEASE}"
+    if install -o root -g root -m 755 "${BINARY_SRC}" "${ROLLOUT_RELEASE}/node.candidate" \
+        && [[ "$(sha256sum "${BINARY_SRC}" | cut -d' ' -f1)" == \
+              "$(sha256sum "${ROLLOUT_RELEASE}/node.candidate" | cut -d' ' -f1)" ]]; then
+      _rollout_result=""
+      if _rollout_result=$("${ROLLOUT_CLI}" begin --release "${ROLLOUT_RELEASE}" \
+          --data-dir "${ROLLOUT_DATA_DIR}" --config "${ROLLOUT_CONFIG}" \
+          --service "${SERVICE_NAME}" --api-url "${ROLLOUT_API_URL}" 2>&1); then
+        ROLLOUT_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' \
+          <<<"${_rollout_result}" 2>/dev/null || true)
+      fi
+      if [[ "${ROLLOUT_ID}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+        _rollout_begin_status=$(curl --fail --silent --max-time 10 "${HEALTH_URL}" 2>/dev/null || true)
+        ROLLOUT_BEGIN_HEIGHT=$(python3 -c \
+          'import json,sys; s=json.load(sys.stdin); h=s.get("height"); assert type(h) is int and h >= 0; print(h)' \
+          <<<"${_rollout_begin_status}" 2>/dev/null || true)
+        if "${ROLLOUT_CLI}" mark --id "${ROLLOUT_ID}" \
+            --artifact "${ROLLOUT_RELEASE}/node.candidate" --kind candidate >/dev/null 2>&1; then
+          ROLLOUT_CANDIDATE_MARKED=1
+          ROLLOUT_CANDIDATE_SHA256=$(sha256sum "${ROLLOUT_RELEASE}/node.candidate" | cut -d' ' -f1)
+          echo "  [rollout] Owned candidate registered: ${ROLLOUT_ID}"
+        else
+          echo "  [warn] Rollout helper refused the candidate mark; it will remain preserved." >&2
+        fi
+        if [[ ! "${ROLLOUT_BEGIN_HEIGHT}" =~ ^[0-9]+$ ]]; then
+          echo "  [warn] Could not capture a valid begin height; cleanup job will remain incomplete." >&2
+        fi
+      else
+        ROLLOUT_ID=""
+        echo "  [warn] Rollout begin was refused; update continues without automatic cleanup: ${_rollout_result}" >&2
+      fi
+    else
+      echo "  [warn] Could not stage an owned rollout candidate; update continues without cleanup registration." >&2
+    fi
+  else
+    echo "  [warn] Could not create a unique rollout release; update continues without cleanup registration." >&2
+  fi
+else
+  echo "  [warn] ${ROLLOUT_CLI} is unavailable; no automatic cleanup registration." >&2
+fi
+
+# Complete only when the new process has a bounded, advancing /status proof and
+# its executable bytes match both installed copies. Failure is advisory: the
+# already-running update is never restarted or rolled back here.
+_rollout_complete_after_readiness() {
+  [[ -n "${ROLLOUT_ID}" ]] || return 0
+  local reason="" baseline="${ROLLOUT_BEGIN_HEIGHT:-}" candidate="${ROLLOUT_RELEASE}/node.candidate"
+  local candidate_hash installed_hash running_hash pid_before pid_after status height
+  local attempt=0 max_attempts="${ROLLOUT_READY_MAX_ATTEMPTS:-400}"
+  local timeout_secs="${ROLLOUT_READY_TIMEOUT_SECS:-1200}"
+  local wait_secs="${ROLLOUT_READY_WAIT_SECS:-3}" max_attempts_num timeout_num wait_num
+  local deadline ready=0 remaining pause
+  ROLLOUT_COMPLETION_REPORTED=1
+  if [[ "${ROLLOUT_CANDIDATE_MARKED}" != "1" ]]; then
+    reason="candidate mark was not successful"
+  elif [[ "${SKIP_HEALTH_CHECK}" == "1" ]]; then
+    reason="SKIP_HEALTH_CHECK=1 bypassed readiness proof"
+  elif [[ ! "${baseline}" =~ ^[0-9]+$ ]]; then
+    reason="no valid height captured immediately after begin"
+  elif [[ ! "${max_attempts}" =~ ^[0-9]+$ || ! "${timeout_secs}" =~ ^[0-9]+$ \
+      || ! "${wait_secs}" =~ ^[0-9]+$ || ${#max_attempts} -gt 4 \
+      || ${#timeout_secs} -gt 4 || ${#wait_secs} -gt 2 ]]; then
+    reason="invalid bounded readiness-check settings"
+  else
+    max_attempts_num=$((10#${max_attempts}))
+    timeout_num=$((10#${timeout_secs}))
+    wait_num=$((10#${wait_secs}))
+    if (( max_attempts_num < 1 || max_attempts_num > 1200 || timeout_num < 1 \
+        || timeout_num > 3600 || wait_num > 30 )); then
+      reason="readiness-check settings exceed bounded limits"
+    fi
+    candidate_hash=$(sha256sum "${candidate}" 2>/dev/null | cut -d' ' -f1 || true)
+    installed_hash=$(sha256sum "${BINARY_DST}" 2>/dev/null | cut -d' ' -f1 || true)
+    if [[ -n "${reason}" ]]; then
+      :
+    elif [[ ! "${candidate_hash}" =~ ^[0-9a-f]{64}$ || "${candidate_hash}" != "${ROLLOUT_CANDIDATE_SHA256}" \
+        || "${installed_hash}" != "${candidate_hash}" ]]; then
+      reason="candidate and installed binary SHA-256 do not match"
+    elif ! systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+      reason="node service is not active after update"
+    else
+      pid_before=$(systemctl show "${SERVICE_NAME}" -p MainPID --value 2>/dev/null || true)
+      if [[ ! "${pid_before}" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "${pid_before}" 2>/dev/null; then
+        reason="new node MainPID is unavailable"
+      else
+        running_hash=$(sha256sum "/proc/${pid_before}/exe" 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ "${running_hash}" != "${candidate_hash}" ]]; then
+          reason="running process executable SHA-256 differs from candidate"
+        else
+          deadline=$((SECONDS + timeout_num))
+          while (( attempt < max_attempts_num && SECONDS <= deadline )); do
+            attempt=$((attempt + 1))
+            status=$(curl --fail --silent --max-time 5 "${HEALTH_URL}" 2>/dev/null || true)
+            if height=$(python3 -c \
+                'import json,sys; s=json.load(sys.stdin); h=s.get("height"); assert s.get("ok") is True and s.get("syncing") is False and s.get("utxo_rebuilding") is False and type(h) is int and h >= 0; print(h)' \
+                <<<"${status}" 2>/dev/null) && (( height > baseline )); then
+              ready=1
+              break
+            fi
+            if (( attempt < max_attempts_num && SECONDS < deadline && wait_num > 0 )); then
+              remaining=$((deadline - SECONDS))
+              pause="${wait_num}"
+              (( pause > remaining )) && pause="${remaining}"
+              (( pause > 0 )) && sleep "${pause}"
+            fi
+          done
+          if (( ready )); then
+            pid_after=$(systemctl show "${SERVICE_NAME}" -p MainPID --value 2>/dev/null || true)
+            installed_hash=$(sha256sum "${BINARY_DST}" 2>/dev/null | cut -d' ' -f1 || true)
+            running_hash=""
+            if [[ "${pid_after}" =~ ^[1-9][0-9]*$ ]]; then
+              running_hash=$(sha256sum "/proc/${pid_after}/exe" 2>/dev/null | cut -d' ' -f1 || true)
+            fi
+            if [[ "${pid_after}" != "${pid_before}" ]]; then
+              reason="new node MainPID changed during readiness verification"
+            elif ! systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+              reason="node service stopped during readiness verification"
+            elif [[ "${installed_hash}" != "${candidate_hash}" || "${running_hash}" != "${candidate_hash}" ]]; then
+              reason="installed and running binary SHA-256 parity changed during readiness verification"
+            fi
+          else
+            reason="bounded /api/v1/status check did not prove ok, not syncing, not rebuilding, and height advancement"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if [[ -n "${reason}" ]]; then
+    echo "  [warn] Rollout registration ${ROLLOUT_ID} remains incomplete; artifacts are preserved: ${reason}." >&2
+    return 0
+  fi
+  if _rollout_result=$("${ROLLOUT_CLI}" complete --id "${ROLLOUT_ID}" \
+      --expected-binary-sha256 "${candidate_hash}" 2>&1); then
+    ROLLOUT_COMPLETED=1
+    echo "  [rollout] Completion verified by cleanup helper: ${_rollout_result}"
+  else
+    echo "  [warn] Rollout registration ${ROLLOUT_ID} remains incomplete; artifacts are preserved: ${_rollout_result}" >&2
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Step 3: Stop the service BEFORE copying.
 #
@@ -868,7 +1040,6 @@ if ! chmod +x "${BINARY_DST}"; then
 fi
 
 echo "  Installed: $(${BINARY_DST} --version 2>/dev/null || ls -lh "${BINARY_DST}" | awk '{print $5, $9}')"
-rm -f "${BINARY_BACKUP}" 2>/dev/null || true   # clean up backup on success
 
 # Start the service after the new binary is in place.
 systemctl start "${SERVICE_NAME}"
@@ -912,6 +1083,10 @@ else
   fi
 fi
 
+# A basic HTTP response is not enough to complete a rollout record. The
+# registered candidate is completed only after a bounded advancing-chain proof.
+_rollout_complete_after_readiness
+
 # ---------------------------------------------------------------------------
 # Step 5b: Peer connectivity check — warn if the node has no P2P peers.
 #
@@ -921,6 +1096,10 @@ fi
 # shellcheck source=peer-check.sh
 source "${DEPLOY_DIR}/peer-check.sh"
 aperod_peer_check
+
+if [[ -n "${ROLLOUT_ID}" && "${ROLLOUT_COMPLETED}" != "1" && "${ROLLOUT_COMPLETION_REPORTED}" != "1" ]]; then
+  echo "  [warn] Rollout registration ${ROLLOUT_ID} remains incomplete; candidate and ${BINARY_BACKUP} are preserved." >&2
+fi
 
 echo ""
 echo "✓ Update complete. New build is live."

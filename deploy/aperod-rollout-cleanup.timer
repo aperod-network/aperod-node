@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Aperod verified rollout cleanup scan
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+RandomizedDelaySec=5min
+Unit=aperod-rollout-cleanup.service
+
+[Install]
+WantedBy=timers.target

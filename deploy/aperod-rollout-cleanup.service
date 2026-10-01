@@ -1,0 +1,36 @@
+[Unit]
+Description=Aperod verified rollout artifact cleanup scan
+After=local-fs.target aperod-backup.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/aperod-rollout-cleanup scan
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Keep the host process table and mount table visible: the verifier must check
+# live process references and detect bind mounts beneath registered artifacts.
+# In particular, do not add PrivateTmp=, ProtectProc=, ProcSubset=, or
+# PrivateMounts=. The live data tree and backup settings remain read-only.
+ProtectSystem=strict
+ReadOnlyPaths=/opt/aperod/data
+ReadWritePaths=/var/lib/aperod-rollout-cleanup /opt/aperod/releases
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# CAP_SYS_PTRACE is needed to inspect ape-user /proc cwd, fd, and exe entries;
+# unreadable process references are a refusal, never treated as inactivity.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_PTRACE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aperod-rollout-cleanup
+TimeoutStartSec=15min

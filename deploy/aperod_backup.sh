@@ -66,6 +66,15 @@ _BACKUP_DISK_FREE_GB=""
 SNAPSHOT_DIR=""
 STAGING_ROOT=""
 SNAPSHOT_VALIDATED=0
+AUTH_HELPER="${APEROD_ROLLOUT_CLEANUP_BIN:-/usr/local/bin/aperod-rollout-cleanup}"
+AUTH_HELPER_READY=0
+AUTH_ENABLED=0
+AUTH_ATTEMPT_REGISTERED=0
+AUTH_BEGIN_INVOKED=0
+AUTH_CONTEXT_FILE=""
+AUTH_ANCHORS_FILE=""
+AUTH_PROOF_FILE=""
+AUTH_PINNED=0
 
 # Write one JSON line to the history log on every exit (success or failure).
 # Also sends a Telegram failure alert if TELEGRAM_BOT_TOKEN + ADMIN_TELEGRAM_CHAT_ID
@@ -169,9 +178,38 @@ _cleanup_owned_workdir() {
   BACKUP_DIR_OWNED=0
 }
 
+_disable_backup_authorization() {
+  local reason="${1:-backup-authorization-failed}"
+  AUTH_ENABLED=0
+  AUTH_PINNED=0
+  if [ "$AUTH_HELPER_READY" -eq 1 ]; then
+    if _auth_output_is_safe "$AUTH_CONTEXT_FILE"; then
+      if ! "$AUTH_HELPER" backup-abort --context "$AUTH_CONTEXT_FILE"; then
+        echo "ОШИБКА: authorization abort failed (${reason}); prior authorization may remain invalidated only by backup-begin." >&2
+      else
+        echo "  Rollout-cleanup authorization disabled: ${reason}."
+      fi
+    elif [ "$AUTH_BEGIN_INVOKED" -eq 1 ]; then
+      echo "  Rollout-cleanup authorization disabled: ${reason}; backup-begin invalidated prior attempts before source capture."
+    else
+      echo "ОШИБКА: authorization disabled (${reason}), but no registered backup context exists for backup-abort." >&2
+    fi
+  fi
+}
+
+_abort_backup_authorization() {
+  [ "$AUTH_ATTEMPT_REGISTERED" -eq 1 ] || return 0
+  AUTH_ATTEMPT_REGISTERED=0
+  if [ "$AUTH_HELPER_READY" -eq 1 ] && [ -n "$AUTH_CONTEXT_FILE" ]; then
+    "$AUTH_HELPER" backup-abort --context "$AUTH_CONTEXT_FILE" \
+      || echo "ОШИБКА: rollout-cleanup backup-abort failed; authorization must remain disabled." >&2
+  fi
+}
+
 _on_exit() {
   local original_status=$?
   trap - EXIT
+  _abort_backup_authorization || true
   _write_history_log || true
   _cleanup_validated_snapshot || true
   _cleanup_owned_workdir || true
@@ -571,6 +609,64 @@ if ! command -v pg_restore >/dev/null 2>&1; then
   exit 1
 fi
 
+_auth_output_is_safe() {
+  local path="$1" mode owner
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  owner=$(stat -c '%u' -- "$path") || return 1
+  mode=$(stat -c '%a' -- "$path") || return 1
+  [[ "$owner" = 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 077) == 0 ))
+}
+
+if [ ! -e "$AUTH_HELPER" ]; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: ${AUTH_HELPER} отсутствует; бэкап продолжится без rollout-cleanup authorization."
+elif [ -L "$AUTH_HELPER" ] || [ ! -f "$AUTH_HELPER" ] || [ ! -x "$AUTH_HELPER" ] \
+  || [ "$(stat -c '%u' -- "$AUTH_HELPER" 2>/dev/null || echo invalid)" != 0 ] \
+  || (( (8#$(stat -c '%a' -- "$AUTH_HELPER" 2>/dev/null || echo 777) & 022) != 0 )); then
+  echo "ПРЕДУПРЕЖДЕНИЕ: rollout-cleanup helper небезопасен или неисполняем; бэкап продолжится без authorization." >&2
+else
+  AUTH_HELPER=$(realpath -e -- "$AUTH_HELPER") || AUTH_HELPER_READY=0
+  if [ -f "$AUTH_HELPER" ] && [ -x "$AUTH_HELPER" ] && [ ! -L "$AUTH_HELPER" ]; then
+    AUTH_HELPER_READY=1
+  fi
+fi
+
+if [ "$AUTH_HELPER_READY" -eq 1 ]; then
+  AUTH_CONTEXT_FILE="${BACKUP_DIR}/rollout-context.json"
+  AUTH_ANCHORS_FILE="${BACKUP_DIR}/chain-anchors.json"
+  AUTH_PROOF_FILE="${BACKUP_DIR}/chain-proof.json"
+  if [ "$(stat -c '%u' -- "$BACKUP_DIR")" != 0 ]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: backup workdir не принадлежит root; rollout-cleanup authorization отключена."
+    _disable_backup_authorization "backup-workdir-owner-invalid"
+  else
+    AUTH_BEGIN_INVOKED=1
+    if "$AUTH_HELPER" backup-begin \
+      --data-dir "$CHAIN_DATA_DIR" \
+      --config /etc/aperod/node.yaml \
+      --service aperod-node \
+      --api-url http://127.0.0.1:8545 \
+      --anchors-output "$AUTH_ANCHORS_FILE" \
+      --context-output "$AUTH_CONTEXT_FILE"; then
+      if _auth_output_is_safe "$AUTH_CONTEXT_FILE"; then
+        AUTH_ATTEMPT_REGISTERED=1
+      fi
+      if [ "$AUTH_ATTEMPT_REGISTERED" -eq 1 ] && _auth_output_is_safe "$AUTH_ANCHORS_FILE"; then
+        AUTH_ENABLED=1
+        echo "  Rollout-cleanup authorization attempt registered with live chain anchors."
+      else
+        echo "ПРЕДУПРЕЖДЕНИЕ: backup-begin returned unsafe or missing root-owned context/anchors; authorization disabled." >&2
+        _disable_backup_authorization "backup-begin-output-invalid"
+      fi
+    else
+      if _auth_output_is_safe "$AUTH_CONTEXT_FILE"; then
+        AUTH_ATTEMPT_REGISTERED=1
+      fi
+      echo "ПРЕДУПРЕЖДЕНИЕ: backup-begin failed; бэкап продолжится без rollout-cleanup authorization." >&2
+      _disable_backup_authorization "backup-begin-failed"
+    fi
+  fi
+fi
+
 echo "=== [1/5] Запрашиваем закрытый логический checkpoint ноды ==="
 CHECKPOINT_RESPONSE="${BACKUP_DIR}/checkpoint-response.json"
 curl --fail --silent --show-error --max-time 900 \
@@ -768,6 +864,7 @@ _verify_archive_payload() (
   set -euo pipefail
   local encrypted="$1" expected_height="${2:-}" expected_hash="${3:-}"
   local payload_mode="${4:-new}"
+  local proof_anchors="${5:-}" proof_output="${6:-}"
   local verify_root verify_stage tar_file extractor encrypted_bytes encrypted_kb unpacked_bytes avail_kb need_kb verifier_output
   verify_root=$(mktemp -d -- "${BACKUP_DIR}/archive_verify_XXXXXX") || return 1
   trap '_cleanup_archive_verify_dir "$verify_root" || true' EXIT
@@ -968,6 +1065,17 @@ if sys.argv[3] and (str(manifest.get("tip_height")) != sys.argv[3]
 PY
   fi
   pg_restore --file /dev/null "$verify_stage/explorer_db.dump" || return 1
+  if [ -n "$proof_anchors" ] || [ -n "$proof_output" ]; then
+    if [ "$payload_mode" != "new" ] || [ -z "$proof_anchors" ] || [ -z "$proof_output" ]; then
+      echo "ОШИБКА: chain proof разрешен только для new-format archive с обоими capture путями." >&2
+      _disable_backup_authorization "backup-proof-mode-invalid" || true
+    elif ! "$BACKUP_VERIFY_BIN" --stage "$verify_stage" \
+      --anchors-file "$proof_anchors" --proof-output "$proof_output" >/dev/null; then
+      echo "ПРЕДУПРЕЖДЕНИЕ: genesis/anchor proof не подтвержден; auto-cleanup authorization отключена." >&2
+      rm -f -- "$proof_output"
+      _disable_backup_authorization "backup-proof-failed" || true
+    fi
+  fi
 )
 
 _verify_remote_archive() {
@@ -977,6 +1085,7 @@ _verify_remote_archive() {
   local expected_sha="${4:-$ARCHIVE_SHA256}"
   local expected_height="${5:-}" expected_hash="${6:-}"
   local payload_mode="${7:-new}"
+  local proof_anchors="${8:-}" proof_output="${9:-}"
   local remote_size remote_sha
   _require_download_space "$expected_size" || return 1
   _copy_remote_fresh "$remote" "$download" || return 1
@@ -995,7 +1104,8 @@ _verify_remote_archive() {
     echo "ОШИБКА: SHA256 удаленного архива не совпадает."
     return 1
   }
-  _verify_archive_payload "$download" "$expected_height" "$expected_hash" "$payload_mode"
+  _verify_archive_payload "$download" "$expected_height" "$expected_hash" "$payload_mode" \
+    "$proof_anchors" "$proof_output"
 }
 
 # A successful bucket listing is required to distinguish an absent fixed object
@@ -1107,6 +1217,10 @@ case "$S3_ENDPOINT" in
   *backblazeb2.com*) IS_B2=1 ;;
   *) IS_B2=0 ;;
 esac
+if [ "$AUTH_ENABLED" -eq 1 ] && [ "$IS_B2" -ne 1 ]; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: rollout-cleanup authorization поддерживает только immutable native B2 fileId; S3 backup будет продолжен без auto-cleanup." >&2
+  _disable_backup_authorization "backup-provider-unsupported"
+fi
 
 PREVIOUS_FIXED="${BACKUP_DIR}/previous-fixed.tar.gpg"
 PREVIOUS_REMOTE="${RCLONE_REMOTE}/${PREVIOUS_OBJECT}"
@@ -1268,10 +1382,29 @@ if ! rclone copyto "$ARCHIVE_FILE" "$FIXED_REMOTE" --s3-no-check-bucket; then
   _restore_previous_fixed || true
   exit 1
 fi
+AUTH_CAPTURE_ARGS=()
+if [ "$AUTH_ENABLED" -eq 1 ]; then
+  rm -f -- "$AUTH_PROOF_FILE"
+  if [ "$IS_B2" -eq 1 ] && "$AUTH_HELPER" backup-pin \
+    --context "$AUTH_CONTEXT_FILE" \
+    --settings "$SETTINGS_FILE" \
+    --remote-object "$FIXED_OBJECT"; then
+    AUTH_PINNED=1
+    AUTH_CAPTURE_ARGS=("$AUTH_ANCHORS_FILE" "$AUTH_PROOF_FILE")
+  else
+    echo "ПРЕДУПРЕЖДЕНИЕ: backup-pin не подтвердил immutable B2 object; verified backup продолжится без authorization." >&2
+    _disable_backup_authorization "backup-pin-failed"
+  fi
+fi
 if ! _verify_remote_archive "$FIXED_REMOTE" "$DOWNLOAD_FILE" \
-  "$ARCHIVE_SIZE" "$ARCHIVE_SHA256" "$CHECKPOINT_TIP_HEIGHT" "$CHECKPOINT_TIP_HASH"; then
+  "$ARCHIVE_SIZE" "$ARCHIVE_SHA256" "$CHECKPOINT_TIP_HEIGHT" "$CHECKPOINT_TIP_HASH" \
+  new "${AUTH_CAPTURE_ARGS[@]}"; then
   _restore_previous_fixed || true
   exit 1
+fi
+if [ "$AUTH_PINNED" -eq 1 ] && ! _auth_output_is_safe "$AUTH_PROOF_FILE"; then
+  echo "ПРЕДУПРЕЖДЕНИЕ: fixed archive verified, но atomically generated proof отсутствует или небезопасен; authorization отключена." >&2
+  _disable_backup_authorization "backup-proof-output-invalid"
 fi
 
 # Keep the prior fixed backup under an immutable distinct object on providers
@@ -1348,6 +1481,25 @@ else
   # B2-specific first-migration exception prunes only its redundant candidate;
   # its preserved exact-byte legacy object remains until the second generation.
   echo "Предыдущей new-format генерации пока нет; старые копии и verified candidate сохранены."
+fi
+
+if [ "$AUTH_ENABLED" -eq 1 ] && [ "$AUTH_PINNED" -eq 1 ]; then
+  if _auth_output_is_safe "$AUTH_PROOF_FILE" && "$AUTH_HELPER" backup-publish \
+    --context "$AUTH_CONTEXT_FILE" \
+    --proof "$AUTH_PROOF_FILE" \
+    --settings "$SETTINGS_FILE" \
+    --remote-object "$FIXED_OBJECT" \
+    --archive-sha256 "$ARCHIVE_SHA256" \
+    --archive-size "$ARCHIVE_SIZE" \
+    --tip-height "$CHECKPOINT_TIP_HEIGHT" \
+    --tip-hash "$CHECKPOINT_TIP_HASH"; then
+    echo "  Rollout-cleanup backup authorization published after verified B2 retention."
+    AUTH_ENABLED=0
+    AUTH_PINNED=0
+  else
+    echo "ПРЕДУПРЕЖДЕНИЕ: backup-publish failed after normal backup verification; cleanup authorization is disabled." >&2
+    _disable_backup_authorization "backup-publish-failed"
+  fi
 fi
 
 _BACKUP_FILE_NAME="$FIXED_OBJECT"

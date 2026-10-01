@@ -51,7 +51,19 @@ func runBackupShellTest(t *testing.T, scriptName string) {
 		t.Fatalf("%s not found at %s", scriptName, scriptPath)
 	}
 
-	cmd := exec.Command("bash", scriptPath)
+	command := []string{"bash", scriptPath}
+	if scriptName == "test-backup.sh" && os.Geteuid() != 0 {
+		unsharePath, err := exec.LookPath("unshare")
+		if err != nil {
+			t.Skipf("rootless %s requires unshare for its root-only checkpoint fixture", scriptName)
+		}
+		probe := exec.Command(unsharePath, "--user", "--map-root-user", "true")
+		if err := probe.Run(); err != nil {
+			t.Skipf("user namespaces are unavailable for root-only %s fixture: %v", scriptName, err)
+		}
+		command = []string{unsharePath, "--user", "--map-root-user", "bash", scriptPath}
+	}
+	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	toolsDir := t.TempDir()
@@ -94,13 +106,16 @@ else:
 		t.Fatalf("cannot create test pg_restore: %v", err)
 	}
 	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "APEROD_BACKUP_VERIFY_BIN=") || strings.HasPrefix(entry, "PATH=") {
+		if strings.HasPrefix(entry, "APEROD_BACKUP_VERIFY_BIN=") ||
+			strings.HasPrefix(entry, "APEROD_ROLLOUT_CLEANUP_BIN=") ||
+			strings.HasPrefix(entry, "PATH=") {
 			continue
 		}
 		cmd.Env = append(cmd.Env, entry)
 	}
 	cmd.Env = append(cmd.Env,
 		"APEROD_BACKUP_VERIFY_BIN="+verifierPath,
+		"APEROD_ROLLOUT_CLEANUP_BIN="+filepath.Join(toolsDir, "rollout-cleanup-helper-not-installed"),
 		"PATH="+toolsDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
 
