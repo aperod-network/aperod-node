@@ -19,6 +19,7 @@ from . import (
     scan,
     state_lock,
 )
+from .retirement import register as register_retirement, scan_retirements
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,7 +43,17 @@ def _parser() -> argparse.ArgumentParser:
     finish.add_argument("--expected-binary-sha256", required=True)
 
     check = commands.add_parser("scan")
-    check.add_argument("--apply", action="store_true", help="delete only artifacts proven safe for removal")
+    check_mode = check.add_mutually_exclusive_group()
+    check_mode.add_argument("--apply", action="store_true", help="delete only artifacts proven safe for removal")
+    check_mode.add_argument("--dry-run", action="store_true", help="override installed apply policy")
+
+    historical = commands.add_parser("retirement-register")
+    for name in ("release", "data-dir", "config", "service", "api-url"):
+        historical.add_argument("--" + name, required=True)
+    retirement_check = commands.add_parser("retirement-scan")
+    retirement_mode = retirement_check.add_mutually_exclusive_group()
+    retirement_mode.add_argument("--apply", action="store_true")
+    retirement_mode.add_argument("--dry-run", action="store_true")
 
     backup_start = commands.add_parser("backup-begin")
     backup_start.add_argument("--data-dir", required=True)
@@ -84,6 +95,10 @@ def _dispatch(args: argparse.Namespace) -> dict:
             return complete(args.id, args.expected_binary_sha256)
     if args.command == "scan":
         return scan(args.apply)
+    if args.command == "retirement-register":
+        return register_retirement(args.release, args.data_dir, args.config, args.service, args.api_url)
+    if args.command == "retirement-scan":
+        return scan_retirements(args.apply)
     if args.command == "backup-begin":
         return backup_begin(args.data_dir, args.config, args.service, args.api_url,
                             args.anchors_output, args.context_output)
@@ -106,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         result = _dispatch(args)
         sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
-        return 0
+        return 1 if result.get("refused") or result.get("status") == "refused" else 0
     except CleanupError as exc:
         sys.stdout.write(json.dumps({"error": str(exc)}, sort_keys=True, separators=(",", ":")) + "\n")
         return 1

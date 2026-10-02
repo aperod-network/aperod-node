@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily verified retirement of explicitly registered historical copies
+
+[Timer]
+OnCalendar=*-*-* 05:50:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=aperod-historical-retirement.service
+
+[Install]
+WantedBy=timers.target

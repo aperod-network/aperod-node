@@ -553,7 +553,8 @@ def _inside_artifact(path: Path, release: Path) -> bool:
 
 
 def _file_fingerprint(path: Path, root_device: int,
-                      runtime: Runtime | None = None) -> dict[str, Any]:
+                      runtime: Runtime | None = None, *,
+                      allow_current_bak: bool = False) -> dict[str, Any]:
     info = os.lstat(path)
     if (not _owns_root(info, runtime) or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
             or stat.S_ISLNK(info.st_mode)):
@@ -570,7 +571,7 @@ def _file_fingerprint(path: Path, root_device: int,
         raise CleanupError("artifact contains an unsafe file type or hard link")
     if PROTECTED_NAMES.search(path.name):
         raise CleanupError("artifact contains a protected key, migration, or archive name")
-    if not LEVELDB_NAME.fullmatch(path.name):
+    if not LEVELDB_NAME.fullmatch(path.name) and not (allow_current_bak and path.name == "CURRENT.bak"):
         raise CleanupError("artifact contains an unapproved filename")
     return {
         "type": "file", "device": info.st_dev, "inode": info.st_ino,
@@ -580,7 +581,10 @@ def _file_fingerprint(path: Path, root_device: int,
 
 
 def _manifest(artifact: Path, kind: str,
-              runtime: Runtime | None = None) -> tuple[list[dict[str, Any]], int]:
+              runtime: Runtime | None = None, *,
+              allow_current_bak: bool = False) -> tuple[list[dict[str, Any]], int]:
+    if allow_current_bak and (kind != "stopped-copy" or artifact.name != "chain.db"):
+        raise CleanupError("historical CURRENT.bak exception requires a chain.db target")
     root_info = os.lstat(artifact)
     if (not _owns_root(root_info, runtime) or root_info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
             or stat.S_ISLNK(root_info.st_mode)):
@@ -609,7 +613,8 @@ def _manifest(artifact: Path, kind: str,
                 raise CleanupError("invalid artifact entry name")
             child = directory / name
             rel = name if relative == "." else relative + "/" + name
-            item = _file_fingerprint(child, root_info.st_dev, runtime)
+            item = _file_fingerprint(child, root_info.st_dev, runtime,
+                                     allow_current_bak=allow_current_bak and child.parent == artifact)
             if item["type"] == "dir":
                 stack.append((child, rel))
             else:

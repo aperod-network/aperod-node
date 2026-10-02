@@ -182,7 +182,7 @@ cat > "${TMP}/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 case "$*" in
-  "daemon-reload"|"enable --now aperod-rollout-cleanup.timer") exit 0 ;;
+  "daemon-reload"|"enable --now aperod-rollout-cleanup.timer"|"enable --now aperod-historical-retirement.timer") exit 0 ;;
   *) echo "unexpected systemctl invocation: $*" >&2; exit 90 ;;
 esac
 STUB
@@ -193,7 +193,9 @@ SOURCE_DIR="${TMP}/source"
 mkdir -p "${SOURCE_DIR}/rollout_cleanup/future_package"
 cp "${DEPLOY_DIR}/setup-rollout-cleanup.sh" \
   "${DEPLOY_DIR}/aperod-rollout-cleanup.service" \
-  "${DEPLOY_DIR}/aperod-rollout-cleanup.timer" "$SOURCE_DIR/"
+  "${DEPLOY_DIR}/aperod-rollout-cleanup.timer" \
+  "${DEPLOY_DIR}/aperod-historical-retirement.service" \
+  "${DEPLOY_DIR}/aperod-historical-retirement.timer" "$SOURCE_DIR/"
 cp -R "${DEPLOY_DIR}/rollout_cleanup/." "${SOURCE_DIR}/rollout_cleanup/"
 printf '%s\n' '"""Additional module used to test bundle atomicity."""' > "${SOURCE_DIR}/rollout_cleanup/future_package/__init__.py"
 printf '%s\n' 'PACKAGE_GENERATION = "one"' > "${SOURCE_DIR}/rollout_cleanup/future_package/module.py"
@@ -220,7 +222,7 @@ SYSTEMCTL="${TMP}/systemctl" bash "${SOURCE_DIR}/setup-rollout-cleanup.sh" --des
 SYSTEMCTL="${TMP}/systemctl" bash "${SOURCE_DIR}/setup-rollout-cleanup.sh" --destdir "$DEST" >/dev/null
 [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$POLICY")" == apply ]] \
   || fail "ordinary reinstall silently changed the explicit apply policy"
-[[ "$(wc -l < "$SYSTEMCTL_LOG")" -eq 6 ]] || fail "installer used unexpected or real systemctl actions"
+[[ "$(wc -l < "$SYSTEMCTL_LOG")" -eq 9 ]] || fail "installer used unexpected or real systemctl actions"
 ! grep -Eq 'restart|start aperod-node|stop aperod-node' "$SYSTEMCTL_LOG" \
   || fail "installer attempted to restart or stop the node"
 pass "installer defaults to dry-run, opts into apply only explicitly, and uses only the systemctl stub"

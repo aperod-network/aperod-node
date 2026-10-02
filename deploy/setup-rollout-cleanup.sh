@@ -149,7 +149,7 @@ from rollout_cleanup.cli import main
 # The root-owned policy defaults to dry-run. --enable-apply is the only
 # installer switch that changes unattended service behavior to deletion.
 args = sys.argv[1:]
-if args and args[0] == "scan" and "--apply" not in args:
+if args and args[0] in ("scan", "retirement-scan") and "--apply" not in args and "--dry-run" not in args:
     policy_path = Path("${POLICY_FILE}")
     try:
         info = policy_path.lstat()
@@ -216,9 +216,14 @@ install "${INSTALL_OWNER[@]}" -m 644 "${SCRIPT_DIR}/aperod-rollout-cleanup.servi
   "$(target /etc/systemd/system/aperod-rollout-cleanup.service)"
 install "${INSTALL_OWNER[@]}" -m 644 "${SCRIPT_DIR}/aperod-rollout-cleanup.timer" \
   "$(target /etc/systemd/system/aperod-rollout-cleanup.timer)"
+install "${INSTALL_OWNER[@]}" -m 644 "${SCRIPT_DIR}/aperod-historical-retirement.service" \
+  "$(target /etc/systemd/system/aperod-historical-retirement.service)"
+install "${INSTALL_OWNER[@]}" -m 644 "${SCRIPT_DIR}/aperod-historical-retirement.timer" \
+  "$(target /etc/systemd/system/aperod-historical-retirement.timer)"
 
 "${SYSTEMCTL}" daemon-reload
 "${SYSTEMCTL}" enable --now aperod-rollout-cleanup.timer
+"${SYSTEMCTL}" enable --now aperod-historical-retirement.timer
 echo "Installed root-owned rollout cleanup CLI and daily timer."
 if (( ENABLE_APPLY )); then
   echo "Apply policy enabled explicitly; deletion still requires the core's verified B2 backup proof."
