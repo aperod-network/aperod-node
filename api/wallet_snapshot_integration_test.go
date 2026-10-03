@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,8 +152,51 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 	if len(snapshotID) != 64 {
 		t.Fatalf("snapshot id length=%d, want 64 hex chars", len(snapshotID))
 	}
+	if fixturePath := os.Getenv("APERO_NODE_WALLET_PAGE_FIXTURE"); fixturePath != "" {
+		firstCursor := stringField(t, first, "next_cursor")
+		secondURL := snapshotURL(
+			httpServer.URL,
+			"/api/v1/lpod/wallet-outputs",
+			address,
+			snapshotID,
+			firstCursor,
+		)
+		secondStatus, second := snapshotRequest(t, httpServer.Client(), http.MethodGet, secondURL, nil)
+		if secondStatus != http.StatusOK {
+			t.Fatalf("continue actual wallet output HTTP page: status=%d body=%#v", secondStatus, second)
+		}
+		if second["snapshot_id"] != snapshotID ||
+			second["checkpoint_hash"] != first["checkpoint_hash"] ||
+			second["checkpoint_height"] != first["checkpoint_height"] ||
+			second["through_height"] != first["through_height"] ||
+			second["through_hash"] != first["through_hash"] {
+			t.Fatalf("continuation page changed its pinned checkpoint metadata: first=%#v second=%#v", first, second)
+		}
+		for _, field := range []string{"resume_height", "resume_hash", "resume_event_index"} {
+			if _, found := second[field]; found {
+				t.Fatalf("native output page must expose its opaque raw resume cursor, not synthetic %s", field)
+			}
+		}
+		secondPage, err := json.Marshal(second)
+		if err != nil {
+			t.Fatalf("encode actual second wallet output HTTP page: %v", err)
+		}
+		fixture, err := json.Marshal(map[string]json.RawMessage{
+			"first_page":  successfulResponse.Body.Bytes(),
+			"second_page": secondPage,
+		})
+		if err != nil {
+			t.Fatalf("encode actual wallet output HTTP page pair: %v", err)
+		}
+		if err := os.WriteFile(fixturePath, fixture, 0o600); err != nil {
+			t.Fatalf("write actual wallet output HTTP page fixture: %v", err)
+		}
+		t.Skip("actual Go wallet output HTTP page pair exported for the Node adapter test")
+	}
 	if first["checkpoint_height"] != float64(initialHeight) ||
-		first["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) {
+		first["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		first["through_height"] != float64(initialHeight) ||
+		first["through_hash"] != fmt.Sprintf("%x", initialHash[:]) {
 		t.Fatalf("initial page checkpoint anchor: %#v", first)
 	}
 	firstRows := first["outputs"].([]interface{})
@@ -163,6 +207,63 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 	if cursor == "" {
 		t.Fatal("first page should return a continuation cursor")
 	}
+	resumeCursor := stringField(t, first, "resume_cursor")
+	if resumeCursor == "" {
+		t.Fatal("initial native page should return a lease-independent resume_cursor")
+	}
+	for _, field := range []string{"resume_height", "resume_hash", "resume_event_index"} {
+		if _, found := first[field]; found {
+			t.Fatalf("native output page must expose its opaque raw resume cursor, not synthetic %s", field)
+		}
+	}
+
+// A replacement lease must accept the real opaque address-index cursor
+// emitted by the prior HTTP page while keeping its original through anchor.
+resumeQuery := url.Values{
+"address":       {string(address)},
+"snapshot":      {"1"},
+"through_height": {fmt.Sprint(initialHeight)},
+"through_hash":   {fmt.Sprintf("%x", initialHash[:])},
+"resume_cursor":  {resumeCursor},
+}
+resumeURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + resumeQuery.Encode()
+resumeStatus, resumedPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, resumeURL, nil)
+if resumeStatus != http.StatusOK {
+t.Fatalf("resume native outputs from real raw index cursor: status=%d body=%#v", resumeStatus, resumedPage)
+}
+resumeSnapshotID := stringField(t, resumedPage, "snapshot_id")
+snapshotIDs = append(snapshotIDs, resumeSnapshotID)
+if resumedPage["through_height"] != float64(initialHeight) ||
+resumedPage["through_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+stringField(t, resumedPage, "resume_cursor") == "" {
+t.Fatalf("renewed native page changed its anchor or omitted its raw cursor: %#v", resumedPage)
+}
+priorRefs := make(map[string]struct{}, len(firstRows))
+for _, value := range firstRows {
+row := value.(map[string]interface{})
+priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])] = struct{}{}
+}
+renewedRows := resumedPage["outputs"].([]interface{})
+if len(renewedRows) == 0 {
+t.Fatal("renewed native page unexpectedly had no continuation outputs")
+}
+for _, value := range renewedRows {
+row := value.(map[string]interface{})
+if _, duplicated := priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])]; duplicated {
+t.Fatalf("raw-cursor renewal repeated prior native output: %#v", row)
+}
+}
+releaseStatus, releaseResponse := snapshotRequest(
+	t,
+	httpServer.Client(),
+	http.MethodDelete,
+	snapshotURL(httpServer.URL, "/api/v1/wallet/snapshot", address, resumeSnapshotID, ""),
+	nil,
+)
+if releaseStatus != http.StatusOK || releaseResponse["released"] != true {
+	t.Fatalf("release raw-cursor renewal snapshot: status=%d body=%#v", releaseStatus, releaseResponse)
+}
+snapshotIDs = snapshotIDs[:len(snapshotIDs)-1]
 
 	// A second independent session lets the test prove the opaque cursor is
 	// bound to its originating snapshot token.
@@ -246,6 +347,9 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 	}
 	if pageTwo["checkpoint_height"] != float64(initialHeight) ||
 		pageTwo["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		pageTwo["through_height"] != float64(initialHeight) ||
+		pageTwo["through_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		pageTwo["resume_cursor"] == "" ||
 		len(pageTwo["outputs"].([]interface{})) == 0 {
 		t.Fatalf("continuation mixed live tip with pinned page: %#v", pageTwo)
 	}
@@ -298,8 +402,11 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 		t.Fatalf("pinned spentness request: status=%d body=%#v", code, initialStatuses)
 	}
 	initialSpentMap := initialStatuses["spent"].(map[string]interface{})
+	initialCanonicalMap := initialStatuses["canonical_spent"].(map[string]interface{})
+	initialPendingMap := initialStatuses["pending_locked"].(map[string]interface{})
 	if initialSpentMap[spentKIHex] != true || initialSpentMap[unspentKIHex] != true ||
-		initialSpentMap[pendingKIHex] != false {
+		initialSpentMap[pendingKIHex] != false ||
+		initialCanonicalMap[pendingKIHex] != false || initialPendingMap[pendingKIHex] != false {
 		t.Fatalf("pinned KI/direct-spent statuses: %#v", initialSpentMap)
 	}
 	pendingTx := core.Transaction{
@@ -317,7 +424,9 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 		t.Fatalf("add structurally-valid test mempool transaction: %v", err)
 	}
 	code, freshStatuses := snapshotRequest(t, httpServer.Client(), http.MethodPost, postURL, statusRequest)
-	if code != http.StatusOK || freshStatuses["spent"].(map[string]interface{})[pendingKIHex] != true {
+	if code != http.StatusOK || freshStatuses["spent"].(map[string]interface{})[pendingKIHex] != true ||
+		freshStatuses["canonical_spent"].(map[string]interface{})[pendingKIHex] != false ||
+		freshStatuses["pending_locked"].(map[string]interface{})[pendingKIHex] != true {
 		t.Fatalf("pending key image did not refresh for pinned session: status=%d body=%#v", code, freshStatuses)
 	}
 
@@ -338,8 +447,8 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 	if code != http.StatusConflict || expired["code"] != "SNAPSHOT_EXPIRED" {
 		t.Fatalf("released session remained usable: status=%d body=%#v", code, expired)
 	}
-	if got := finalityCalls.Load(); got != 18 {
-		t.Fatalf("finality callback reran for pinned reads: calls=%d, want 18 creation checks", got)
+	if got := finalityCalls.Load(); got != 19 {
+		t.Fatalf("finality callback reran for pinned reads: calls=%d, want 19 creation checks including raw-cursor renewal", got)
 	}
 }
 
@@ -749,4 +858,142 @@ func stringField(t *testing.T, body map[string]interface{}, field string) string
 		t.Fatalf("response field %q is missing: %#v", field, body)
 	}
 	return value
+}
+
+func TestWalletOutputSnapshotRenewsFromRawResumeCursorAtFixedTarget(t *testing.T) {
+	db, migration, address, path, validator, validatorPub := syntheticWalletSnapshotLPoDV3Funding(t)
+	db, _, _, _, _, throughHash, throughHeight := seedWalletSnapshotAPIFixture(t, db, path, address)
+	finalized := map[uint64]crypto.Hash32{throughHeight: throughHash}
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(height uint64, hash crypto.Hash32) bool {
+		return finalized[height] == hash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	firstQuery := url.Values{
+		"address":        {string(address)},
+		"snapshot":       {"1"},
+		"through_height": {fmt.Sprint(throughHeight)},
+		"through_hash":   {fmt.Sprintf("%x", throughHash[:])},
+	}
+	firstURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + firstQuery.Encode()
+	status, first := snapshotRequest(t, httpServer.Client(), http.MethodGet, firstURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("initial native output page: status=%d body=%#v", status, first)
+	}
+	firstID := stringField(t, first, "snapshot_id")
+	firstRows := first["outputs"].([]interface{})
+	if len(firstRows) != 128 ||
+		first["through_height"] != float64(throughHeight) ||
+		first["through_hash"] != fmt.Sprintf("%x", throughHash[:]) ||
+		first["checkpoint_height"] != float64(throughHeight) ||
+		first["checkpoint_hash"] != fmt.Sprintf("%x", throughHash[:]) {
+		t.Fatalf("initial native page did not expose exact checkpoint/target metadata: %#v", first)
+	}
+	rawResumeCursor := stringField(t, first, "resume_cursor")
+	if rawResumeCursor == stringField(t, first, "next_cursor") {
+		t.Fatalf("raw native resume cursor was confused with lease cursor: %#v", first)
+	}
+	firstSeen := make(map[string]bool, len(firstRows))
+	outputIdentity := func(row interface{}) string {
+		output := row.(map[string]interface{})
+		return fmt.Sprintf("%s/%v", output["tx_hash"], output["out_idx"])
+	}
+	for _, row := range firstRows {
+		identity := outputIdentity(row)
+		if firstSeen[identity] {
+			t.Fatalf("initial native page duplicated output %s", identity)
+		}
+		firstSeen[identity] = true
+	}
+	firstNextCursor := stringField(t, first, "next_cursor")
+	expectedSuffixURL := snapshotURL(httpServer.URL, "/api/v1/lpod/wallet-outputs", address, firstID, firstNextCursor)
+	status, expectedSuffixPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, expectedSuffixURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("read original-lease suffix for renewal comparison: status=%d body=%#v", status, expectedSuffixPage)
+	}
+	expectedSuffix := expectedSuffixPage["outputs"].([]interface{})
+
+	// Expire the original short lease. Only the opaque native address-index
+	// position and immutable through anchor cross into the replacement lease.
+	server.walletSnapshots.mu.Lock()
+	oldEntry := server.walletSnapshots.entries[firstID]
+	oldEntry.expiresAt = time.Now().Add(-time.Second)
+	server.walletSnapshots.mu.Unlock()
+	server.walletSnapshots.expire()
+	if got := activeSnapshotSessions(server.walletSnapshots); got != 0 {
+		t.Fatalf("expired native lease retained %d active sessions", got)
+	}
+
+	advancedHash, advancedHeight := advanceSyntheticLPoDV3(t, db, address, validator, validatorPub)
+	finalized[advancedHeight] = advancedHash
+	reorgedCursorBytes, err := hex.DecodeString(rawResumeCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletPrefixLength := len("lpod/wallet/v1/") + len(crypto.Hash32{})
+	reorgedCursorBytes[walletPrefixLength+12] ^= 1
+	reorgedCursorQuery := url.Values{
+		"address":        {string(address)},
+		"snapshot":       {"1"},
+		"through_height": {fmt.Sprint(throughHeight)},
+		"through_hash":   {fmt.Sprintf("%x", throughHash[:])},
+		"resume_cursor":  {hex.EncodeToString(reorgedCursorBytes)},
+	}
+	reorgedCursorURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + reorgedCursorQuery.Encode()
+	status, reorgedCursor := snapshotRequest(t, httpServer.Client(), http.MethodGet, reorgedCursorURL, nil)
+	if status != http.StatusConflict || reorgedCursor["code"] != "REORG" {
+		t.Fatalf("noncanonical raw native resume cursor did not fail closed: status=%d body=%#v", status, reorgedCursor)
+	}
+	renewQuery := url.Values{
+		"address":        {string(address)},
+		"snapshot":       {"1"},
+		"through_height": {fmt.Sprint(throughHeight)},
+		"through_hash":   {fmt.Sprintf("%x", throughHash[:])},
+		"resume_cursor":  {rawResumeCursor},
+	}
+	renewURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + renewQuery.Encode()
+	status, renewed := snapshotRequest(t, httpServer.Client(), http.MethodGet, renewURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("renew native output page from raw cursor: status=%d body=%#v", status, renewed)
+	}
+	renewedID := stringField(t, renewed, "snapshot_id")
+	renewedRows := renewed["outputs"].([]interface{})
+	nextCursor, _ := renewed["next_cursor"].(string)
+	if renewedID == firstID || len(renewedRows) != len(expectedSuffix) ||
+		renewed["checkpoint_height"] != float64(advancedHeight) ||
+		renewed["checkpoint_hash"] != fmt.Sprintf("%x", advancedHash[:]) ||
+		renewed["through_height"] != float64(throughHeight) ||
+		renewed["through_hash"] != fmt.Sprintf("%x", throughHash[:]) || nextCursor != "" {
+		t.Fatalf("renewed page changed its fixed target or failed to return the exact suffix: %#v", renewed)
+	}
+	if len(renewedRows) != len(expectedSuffix) {
+		t.Fatalf("renewed native suffix duplicated or skipped an output: %#v", renewedRows)
+	}
+	for i, row := range renewedRows {
+		identity := outputIdentity(row)
+		if firstSeen[identity] || identity != outputIdentity(expectedSuffix[i]) {
+			t.Fatalf("renewed suffix row %d duplicated or changed identity: got=%s want=%s", i, identity, outputIdentity(expectedSuffix[i]))
+		}
+		firstSeen[identity] = true
+	}
+	wrongTargetQuery := url.Values{
+		"address":        {string(address)},
+		"snapshot_id":    {renewedID},
+		"through_height": {fmt.Sprint(advancedHeight)},
+		"through_hash":   {fmt.Sprintf("%x", advancedHash[:])},
+	}
+	wrongTargetURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + wrongTargetQuery.Encode()
+	status, wrongTarget := snapshotRequest(t, httpServer.Client(), http.MethodGet, wrongTargetURL, nil)
+	if status != http.StatusConflict || wrongTarget["code"] != "SNAPSHOT_CURSOR_MISMATCH" {
+		t.Fatalf("renewed lease silently expanded its original through target: status=%d body=%#v", status, wrongTarget)
+	}
 }

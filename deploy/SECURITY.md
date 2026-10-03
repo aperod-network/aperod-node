@@ -28,7 +28,7 @@ Include:
 
 Researchers repeating APD-2026 findings should first follow the
 [`APD Remediation Verification Guide`](../SECURITY-RESEARCHER-GUIDE.md). It
-identifies the current remediation baseline, activation-gated behavior, and
+identifies the current remediation baseline, coordinated activation behavior, and
 the exact regression suites for each finding.
 
 Response within **48 hours**. Critical issues patched within **7 days**.
@@ -80,7 +80,7 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 - **Transaction unlinkability**: one-time stealth addresses (per-height mint derivation: `mint_pub = spend_pub + height·G`)
 - **Amount confidentiality**: Pedersen commitments with Bulletproof range proofs
-- **Ring signatures**: CLSAG v5 proves ownership within a 16-member ring while binding every public key to its commitment; v5 is implemented but remains height-gated until coordinated activation
+- **Ring signatures**: CLSAG v5 proves ownership within a 16-member ring while binding every public key to its commitment and pseudo-output; v5 is active on the live network from coordinated activation block 1,769,500
 - **Historical compatibility**: legacy v1–v4 transactions remain replayable; activation does not rewrite chain history
 - **Spentness boundary**: public nodes cannot identify the real CLSAG ring member; wallets determine owned-output spentness from owner-derived key images
 - **Blind balancing**: transaction builder enforces `Σin_blinds = Σout_blinds + fee_blind`; unbalanced transactions are rejected at consensus

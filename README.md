@@ -24,14 +24,12 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 
 LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
-canonical accounting and confirmed Guardian-principal refunds. LPoD v3 is **ACTIVE on mainnet from canonical height 2,493,218**. Its
-1B APRO Guardian reserve belongs within the existing 10B APRO nominal
-allocation; this is not additional issuance. The coordinated v3 migration
-is active on mainnet, with funding and finalized pool accounting visible at this
-[address](https://aperod.com/vaults).
-Standalone nodes require an authenticated migration witness to follow this
-activated chain. The validator stake lock remains governed separately by the
-validator protocol.
+canonical accounting and confirmed Guardian-principal refunds. **Current public
+network status:** LPoD v3 is active on Aperod from canonical height **2493218**,
+and its pool is funded. This live status is distinct from the repository's
+fail-closed, default-disabled configuration and historical development/rehearsal
+snapshots; neither is a report that the current public network is inactive.
+The validator stake lock remains governed separately by the validator protocol.
 
 **Detailed functionality guide:** [LPOD.md — protocol behavior, status, and
 source scope](LPOD.md).
@@ -252,29 +250,34 @@ See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol sp
 
 Aperod starts with a fixed genesis allocation and uses a deflationary fee model:
 
-> **LPoD v3 activated at canonical height 2,493,218.** The 1B APRO
-> Guardian reserve is part of the existing 10B APRO nominal allocation,
-> not a new mint. Active funding and a finalized tip-bound checkpoint can
-> be checked through [`GET /api/v1/lpod-pool`](https://aperod.com/api/v1/lpod-pool).
-> The live response reports the funding height, finalized height, pool balance,
-> reward inflows and current position count.
+> **Historical development/rehearsal snapshot — not current Aperod public-network
+> status:** **Guardian Fund preparation is not active.** The documented nominal
+> allocations already total 10B APRO, and no allocation debit for the proposed
+> 1B APRO protocol lock has been approved. Node startup therefore rejects every
+> nonzero Guardian activation setting. The node API may report
+> `canonical_detected` when it sees the canonical transaction, but that is not
+> BFT finality and must not reduce circulating supply; finality wiring is still
+> incomplete. This preparation does not assert that the actual production
+> genesis is empty, nor that global UTXO supply has been proven.
 
-### Coordinated LPoD protocol — active from height 2,493,218
+### Coordinated LPoD protocol — repository/config default-disabled
 
 `consensus.lpod_migration_file` is an opt-in **coordinated consensus fork**, not
-an administrative mint switch. The mainnet v3 activation is canonically funded at
-height 2,493,218. A node without the authenticated migration configuration
-remains disabled; this repository does not contain private operator signing
-material and must never fabricate a witness.
+an administrative mint switch. The repository/config defaults remain
+fail-closed: no production reconciliation witness or approved activation is
+included in the repository's default configuration. This describes the
+repository and historical development/rehearsal snapshots, not the active
+Aperod public network. The legacy Guardian activation must remain disabled.
 
-A complete independent audit of historical issuance would require legacy
-coinbase commitment openings, unambiguous historical body coverage and
-validator attestations. Pruned or unattested history cannot be silently
-reconstructed or presented as audited global supply. The active v3 migration
-uses a trusted, signed nominal-budget reconciliation and a finalized
-canonical checkpoint; it does not itself establish a global-issuance audit.
-The validator budget remains tied to the existing durable pool balance: it is
-never reset or silently reduced.
+Activation on a new network requires the complete historical coinbase
+commitment openings and a strictly greater-than-two-thirds quorum of the
+**trusted genesis validator set** attesting the genesis, activation height,
+unambiguous full-body root, issued total, validator reserve remaining, and
+reconciliation witness root. Historical transaction hashes alone do not commit
+unambiguously to legacy bodies. Auditors must independently approve those
+bodies and budget; a self-hashed witness is not an audit. Missing, pruned,
+altered, or unattested history fails closed. The attested validator budget must
+equal the existing durable pool balance: it is never reset or silently reduced.
 
 Available funding is computed as 10B minus historical issuance, the attested
 **remaining** validator reserve, and an additional protected 1B development
@@ -316,14 +319,16 @@ reservation is conservative; this fork grants no authority to spend it.
   than the attested funding parent requires additional historical budget evidence
   and fails closed; it does not guess the old reserve.
 
-`GET /api/v1/lpod-pool` reports active monetary state only when the exact current
-canonical checkpoint hash has live finality evidence. Restart does not invent
-finality from height alone. Native position capability is reported separately
-from activation; pending/disabled balances remain null. The mainnet v3 activation occurred at canonical height 2,493,218; any
-future migration still requires source attestations, protocol review,
-coordinated node upgrades and explicit deployment authorization. Such activation is a
-protocol/governance event; availability under Apache License 2.0 does not itself
-activate LPoD on any chain.
+**Current public network:** LPoD v3 is active on Aperod from canonical height
+**2493218**, and the pool is funded. `GET /api/v1/lpod-pool` reports active
+monetary state only when the exact current canonical checkpoint hash has live
+finality evidence. Restart does not invent finality from height alone. Native
+position capability is reported separately from activation; pending/disabled
+balances remain null. For a new network, source attestations, protocol review,
+coordinated node upgrades and deployment authorization remain prerequisites
+before activation. Repository/config defaults stay fail-closed; activation is a
+protocol/governance event, and availability under Apache License 2.0 does not
+itself activate LPoD on any chain.
 
 ```
 Genesis supply:       10,000,000,000 APRO  (10B)

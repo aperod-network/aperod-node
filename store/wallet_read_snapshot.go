@@ -114,6 +114,51 @@ func (s *WalletReadSnapshot) readCanonicalBlock(height uint64) (*core.Block, err
 	return &block, nil
 }
 
+// ReadCanonicalBlockBounded returns and validates a full canonical block from
+// this pinned wallet snapshot. Header-only/pruned bodies and malformed bodies
+// are errors; callers must not interpret them as empty blocks.
+func (s *WalletReadSnapshot) ReadCanonicalBlockBounded(height uint64, maxBytes int) (*core.Block, error) {
+	block, _, err := s.ReadCanonicalBlockBoundedWithSize(height, maxBytes)
+	return block, err
+}
+
+// ReadCanonicalBlockBoundedWithSize also reports the serialized body size so
+// callers can enforce aggregate page decode budgets without charging the
+// maximum per block.
+func (s *WalletReadSnapshot) ReadCanonicalBlockBoundedWithSize(height uint64, maxBytes int) (*core.Block, int, error) {
+	if maxBytes < 1 {
+		return nil, 0, fmt.Errorf("invalid block decode limit")
+	}
+	hash, found, err := s.GetCanonicalHash(height)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !found {
+		return nil, 0, fmt.Errorf("missing canonical block %d", height)
+	}
+	raw, err := s.rawBlock(hash)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read canonical block %d: %w", height, err)
+	}
+	if len(raw) == 0 {
+		return nil, 0, fmt.Errorf("missing canonical block body at height %d", height)
+	}
+	if len(raw) > maxBytes {
+		return nil, 0, fmt.Errorf("canonical block %d exceeds decode limit", height)
+	}
+	var block core.Block
+	if err := json.Unmarshal(raw, &block); err != nil {
+		return nil, 0, fmt.Errorf("decode canonical block %d: %w", height, err)
+	}
+	if block.Hash() != hash || block.Header.Height != height {
+		return nil, 0, fmt.Errorf("noncanonical block at height %d", height)
+	}
+	if block.Header.MerkleRoot != core.MerkleRoot(block.Txs) {
+		return nil, 0, fmt.Errorf("canonical block body is missing or malformed at height %d", height)
+	}
+	return &block, len(raw), nil
+}
+
 // LoadLPoDCheckpointAt loads and validates the checkpoint at a specific hash
 // using only data from this snapshot.
 func (s *WalletReadSnapshot) LoadLPoDCheckpointAt(hash crypto.Hash32) (*LPoDCheckpoint, error) {
@@ -194,6 +239,123 @@ func (s *WalletReadSnapshot) LPoDWalletOutputs(
 		next = ""
 	}
 	return rows, next, iter.Error()
+}
+
+// WalletReconciliationError indicates that a resumable wallet-index position
+// cannot be safely interpreted against this pinned canonical view.
+type WalletReconciliationError struct {
+	Height uint64
+	Reason string
+}
+
+func (e *WalletReconciliationError) Error() string {
+	return fmt.Sprintf("wallet reconciliation required at height %d: %s", e.Height, e.Reason)
+}
+
+// WalletCursorReorgError reports that a previously issued native index cursor
+// no longer points at the same canonical block.
+type WalletCursorReorgError struct {
+	Height uint64
+}
+
+func (e *WalletCursorReorgError) Error() string {
+	return fmt.Sprintf("wallet resume cursor is noncanonical at height %d", e.Height)
+}
+
+// LPoDWalletOutputsAfterHeight returns a bounded page through an immutable
+// height ceiling. resumeCursor is the raw hex-encoded native address-index key
+// from the prior page; unlike a snapshot cursor, it survives lease renewal.
+func (s *WalletReadSnapshot) LPoDWalletOutputsAfterHeight(
+	address crypto.Address,
+	afterHeight uint64,
+	hasAfterHeight bool,
+	resumeCursor string,
+	throughHeight uint64,
+	limit int,
+) ([]StoredUTXO, string, string, error) {
+	if limit < 1 || limit > 128 {
+		return nil, "", "", fmt.Errorf("invalid page limit")
+	}
+	prefix := lpodWalletPrefix(address)
+	iter := s.snapshot.NewIterator(util.BytesPrefix(prefix), nil)
+	defer iter.Release()
+	ok := iter.First()
+	if hasAfterHeight {
+		if afterHeight == ^uint64(0) {
+			return []StoredUTXO{}, "", "", nil
+		}
+		start := make([]byte, len(prefix)+76)
+		copy(start, prefix)
+		binary.BigEndian.PutUint64(start[len(prefix):len(prefix)+8], afterHeight+1)
+		ok = iter.Seek(start)
+	}
+	if resumeCursor != "" {
+		key, err := hex.DecodeString(resumeCursor)
+		if err != nil || !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+76 {
+			return nil, "", "", fmt.Errorf("invalid resume_cursor")
+		}
+		height := binary.BigEndian.Uint64(key[len(prefix) : len(prefix)+8])
+		if height > throughHeight {
+			return nil, "", "", fmt.Errorf("resume_cursor is above through_height")
+		}
+		if hasAfterHeight && height <= afterHeight {
+			return nil, "", "", fmt.Errorf("resume_cursor is not after after_height")
+		}
+		canonical, found, err := s.GetCanonicalHash(height)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if !found {
+			return nil, "", "", &WalletReconciliationError{Height: height, Reason: "canonical height index is missing"}
+		}
+		blockHashOffset := len(prefix) + 12
+		if !bytes.Equal(key[blockHashOffset:blockHashOffset+32], canonical[:]) {
+			return nil, "", "", &WalletCursorReorgError{Height: height}
+		}
+		ok = iter.Seek(key)
+		if !ok || !bytes.Equal(iter.Key(), key) {
+			return nil, "", "", &WalletReconciliationError{Height: height, Reason: "resume cursor index row is missing"}
+		}
+		ok = iter.Next()
+	}
+	rows := make([]StoredUTXO, 0, limit)
+	lastExamined, next := "", ""
+	examined := 0
+	for ok && examined < limit {
+		key := iter.Key()
+		if len(key) != len(prefix)+76 {
+			return nil, "", "", fmt.Errorf("malformed native wallet index key")
+		}
+		height := binary.BigEndian.Uint64(key[len(prefix) : len(prefix)+8])
+		if height > throughHeight {
+			break
+		}
+		examined++
+		lastExamined = hex.EncodeToString(key)
+		var output StoredUTXO
+		if err := json.Unmarshal(iter.Value(), &output); err != nil {
+			return nil, "", "", fmt.Errorf("decode native wallet output at height %d: %w", height, err)
+		}
+		spent, err := s.get(spentUTXOKey(output.TxHash, output.OutputIndex))
+		if err != nil {
+			return nil, "", "", err
+		}
+		if spent == nil {
+			rows = append(rows, output)
+		}
+		ok = iter.Next()
+	}
+	if ok {
+		key := iter.Key()
+		if len(key) != len(prefix)+76 {
+			return nil, "", "", fmt.Errorf("malformed native wallet index key")
+		}
+		height := binary.BigEndian.Uint64(key[len(prefix) : len(prefix)+8])
+		if height <= throughHeight {
+			next = lastExamined
+		}
+	}
+	return rows, next, lastExamined, iter.Error()
 }
 
 // GetUTXO retrieves an output from the captured active-output namespace.

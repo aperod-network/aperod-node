@@ -111,6 +111,176 @@ func TestWalletReadSnapshotPinsWalletReadsAndReleases(t *testing.T) {
 	read.Release()
 }
 
+func TestReadCanonicalBlockBoundedRejectsMissingAndMalformedBodies(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	block := &core.Block{Header: core.BlockHeader{
+		Height: 0, MerkleRoot: core.MerkleRoot(nil), Timestamp: 1,
+	}}
+	hash := block.Hash()
+	raw, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(append(append([]byte{}, prefixBlock...), hash[:]...), raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(heightKey(0), hash[:]); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := read.ReadCanonicalBlockBounded(0, 1024)
+	if err != nil || got.Header.Height != 0 {
+		t.Fatalf("read valid empty canonical block: block=%+v err=%v", got, err)
+	}
+	if _, err := read.ReadCanonicalBlockBounded(0, 1); err == nil {
+		t.Fatal("accepted a canonical body above the decode-byte limit")
+	}
+	read.Release()
+
+	missingHash := crypto.Hash32{1}
+	if err := db.put(heightKey(1), missingHash[:]); err != nil {
+		t.Fatal(err)
+	}
+	read, err = db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := read.ReadCanonicalBlockBounded(1, 1024); err == nil {
+		t.Fatal("accepted a canonical height with no stored block body")
+	}
+	read.Release()
+
+	bad := *block
+	bad.Txs = []core.Transaction{{Version: core.TxVersionBase}}
+	badRaw, err := json.Marshal(&bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(append(append([]byte{}, prefixBlock...), hash[:]...), badRaw); err != nil {
+		t.Fatal(err)
+	}
+	read, err = db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := read.ReadCanonicalBlockBounded(0, 1024); err == nil {
+		t.Fatal("accepted block body that does not match its committed Merkle root")
+	}
+	read.Release()
+}
+
+func TestLPoDWalletOutputsResumeCursorSurvivesSnapshotRenewal(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	address := crypto.Address("resume-cursor-test")
+	var parent crypto.Hash32
+	blockHashes := make([]crypto.Hash32, 3)
+	for height := uint64(0); height < 3; height++ {
+		block := &core.Block{Header: core.BlockHeader{
+			Height: height, PrevHash: parent, MerkleRoot: core.MerkleRoot(nil), Timestamp: int64(height + 1),
+		}}
+		hash := block.Hash()
+		raw, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.CommitRawBlockWithAVM(hash, height, raw, nil, crypto.Hash32{}); err != nil {
+			t.Fatal(err)
+		}
+		parent, blockHashes[height] = hash, hash
+	}
+	for height, indexes := range map[uint64][]uint32{1: {0, 1}, 2: {0}} {
+		for _, index := range indexes {
+			txHash := crypto.HashBytes([]byte{byte(height), byte(index), 91})
+			output := StoredUTXO{TxHash: txHash, OutputIndex: index, BlockHeight: height}
+			key := lpodWalletPrefix(address)
+			var suffix [12]byte
+			binary.BigEndian.PutUint64(suffix[:8], height)
+			binary.BigEndian.PutUint32(suffix[8:], index)
+			key = append(key, suffix[:]...)
+			key = append(key, blockHashes[height][:]...)
+			key = append(key, txHash[:]...)
+			raw, err := json.Marshal(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.put(key, raw); err != nil {
+				t.Fatal(err)
+			}
+			if height == 1 && index == 0 {
+				if err := db.MarkUTXOSpent(txHash, index); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+
+	read, err := db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, next, resume, err := read.LPoDWalletOutputsAfterHeight(address, 0, false, "", 2, 1)
+	read.Release()
+	if err != nil || len(rows) != 0 || next == "" || resume != next {
+		t.Fatalf("first page rows=%d next=%q resume=%q err=%v", len(rows), next, resume, err)
+	}
+
+	// A new read snapshot models a renewed short lease. The native address key
+	// remains a valid continuation position independently of its old session.
+	read, err = db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, next, resume, err = read.LPoDWalletOutputsAfterHeight(address, 0, false, resume, 2, 1)
+	if err != nil || len(rows) != 1 || rows[0].BlockHeight != 1 || rows[0].OutputIndex != 1 || next == "" {
+		read.Release()
+		t.Fatalf("renewed page rows=%+v next=%q resume=%q err=%v", rows, next, resume, err)
+	}
+	rows, _, _, err = read.LPoDWalletOutputsAfterHeight(address, 0, false, resume, 1, 10)
+	read.Release()
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("through-height bound leaked later rows: rows=%+v err=%v", rows, err)
+	}
+
+	otherHash := crypto.Hash32{99}
+	if err := db.db.Put(heightKey(1), otherHash[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	read, err = db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = read.LPoDWalletOutputsAfterHeight(address, 0, false, resume, 2, 1)
+	read.Release()
+	if _, ok := err.(*WalletCursorReorgError); !ok {
+		t.Fatalf("noncanonical resume cursor error=%v, want WalletCursorReorgError", err)
+	}
+
+	if err := db.db.Delete(heightKey(1), nil); err != nil {
+		t.Fatal(err)
+	}
+	read, err = db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = read.LPoDWalletOutputsAfterHeight(address, 0, false, resume, 2, 1)
+	read.Release()
+	if _, ok := err.(*WalletReconciliationError); !ok {
+		t.Fatalf("missing canonical cursor height error=%v, want WalletReconciliationError", err)
+	}
+}
+
 func TestWalletReadSnapshotCheckpointBudgetBeforeDecode(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
