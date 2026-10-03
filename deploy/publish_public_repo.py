@@ -53,11 +53,13 @@ def prepare(root, candidate, gate_only=False):
     source = root / "blockchain" if (root / "blockchain/go.mod").exists() else root
     # Only runtime artifacts in the disposable clone are removed. This tool
     # never opens a production data directory or performs a server checkout.
-    for raw in git(candidate, "ls-files", "-z").split(b"\0"):
+    for raw in git(candidate, "ls-files", "-s", "-z").split(b"\0"):
         if not raw:
             continue
-        rel = raw.decode()
-        if path_problem(rel):
+        metadata, name = raw.split(b"\t", 1)
+        mode = metadata.decode().split()[0]
+        rel = name.decode()
+        if path_problem(rel, mode):
             (candidate / rel).unlink()
     if gate_only:
         selected = [source / "deploy" / name for name in (
