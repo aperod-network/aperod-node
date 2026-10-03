@@ -40,7 +40,13 @@ MESSAGE = ("chore: maintain verified source distribution\n\n"
 
 
 def run(*args, cwd=None):
-    subprocess.run(list(args), cwd=cwd, check=True)
+    # Repository-controlled tests/builds must not inherit publication tokens,
+    # SSH passwords, bot credentials or unrelated application secrets.
+    allowed = {"PATH", "HOME", "TMPDIR", "LANG", "TZ", "GOTOOLCHAIN",
+               "GOPATH", "GOMAXPROCS", "GOSUMDB", "GOCACHE", "GOPROXY",
+               "CGO_ENABLED", "GOROOT", "LD_LIBRARY_PATH", "NIX_LD"}
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+    subprocess.run(list(args), cwd=cwd, check=True, env=env)
 
 
 def prepare(root, candidate, gate_only=False):

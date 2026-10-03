@@ -66,6 +66,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/utxos/decoys", s.restUTXODecoys)
 	s.mux.HandleFunc("/api/v1/utxo/", s.restUTXO)
 	s.mux.HandleFunc("/api/v1/wallet/snapshot", s.restWalletSnapshot)
+	s.mux.HandleFunc("/api/v1/wallet/changes", s.restWalletChanges)
 	s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
 	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)

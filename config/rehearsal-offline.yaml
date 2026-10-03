@@ -1,0 +1,31 @@
+# Isolated rehearsal only. Never use this configuration for a live validator.
+# Its data directory is a disposable copy of an offline production backup.
+network: mainnet
+data_dir: /tmp/aperod-rehearsal-data
+memory_limit_bytes: 2684354560
+p2p:
+  listen_addr: "/ip4/127.0.0.1/tcp/0"
+  bootnodes: []
+  max_peers: 1
+  min_peers: 0
+consensus:
+  non_validator: true
+  block_time: "3s"
+  block_reward_napro: 300000000
+  staking_pool_napro: 200000000000000000
+  tail_reward_napro: 100000000
+  ringct_v4_activation_height: 1750000
+  ring_ct_clsag_activation_height: 1769500
+  reward_authorization_activation_height: 1750000
+  avm_activation_height: 1850000
+api:
+  enabled: false
+  listen_addr: ""
+genesis:
+  file: config/genesis-testnet.yaml
+pruning:
+  mode: light
+  keep_blocks: 200000
+snapshot:
+  periodic_snapshot_interval: 0
+  utxo_count_tolerance_pct: 100

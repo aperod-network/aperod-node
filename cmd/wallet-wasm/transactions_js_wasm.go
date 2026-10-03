@@ -17,17 +17,6 @@ import (
 	"github.com/aperod/aperod/wallet"
 )
 
-type wasmOutput struct {
-	TxHash       string `json:"tx_hash"`
-	OutIdx       uint32 `json:"out_idx"`
-	OneTimePub   string `json:"one_time_pub"`
-	TxPubKey     string `json:"tx_pub_key"`
-	AmountCommit string `json:"amount_commit"`
-	EncAmount    string `json:"enc_amount"`
-	BlockHeight  uint64 `json:"block_height"`
-	Amount       uint64 `json:"amount_napr,omitempty"`
-	BlindHex     string `json:"blind_hex,omitempty"`
-}
 type wasmDecoy struct {
 	OneTimePub   string `json:"one_time_pub"`
 	AmountCommit string `json:"amount_commit"`

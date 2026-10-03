@@ -18,6 +18,15 @@ def fixture(root):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_build_processes_do_not_receive_publication_credentials(self):
+        with patch.dict(publisher.os.environ, {"PUBLIC_GITHUB_TOKEN": "TEST_ONLY",
+                                              "SSH_PASSWORD": "TEST_ONLY"}), \
+             patch.object(publisher.subprocess, "run") as child:
+            publisher.run("go", "vet", "./...")
+        env = child.call_args.kwargs["env"]
+        self.assertNotIn("PUBLIC_GITHUB_TOKEN", env)
+        self.assertNotIn("SSH_PASSWORD", env)
+
     def test_failed_required_check_never_merges(self):
         methods = []
         def request(method, url, data=None):

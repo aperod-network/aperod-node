@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,16 +32,26 @@ const (
 var errWalletSnapshotExpired = errors.New("wallet snapshot expired or not found")
 
 type walletSnapshotEntry struct {
-	id         string
-	address    crypto.Address
-	read       *store.WalletReadSnapshot
-	checkpoint *store.LPoDCheckpoint
-	hash       crypto.Hash32
-	height     uint64
-	bytes      int
-	expiresAt  time.Time
-	inflight   int
-	closed     bool
+	id               string
+	address          crypto.Address
+	read             *store.WalletReadSnapshot
+	checkpoint       *store.LPoDCheckpoint
+	hash             crypto.Hash32
+	height           uint64
+	cursorKey        [32]byte
+	bytes            int
+	expiresAt        time.Time
+	inflight         int
+	closed           bool
+	pendingOnce      sync.Once
+	pendingKeyImages []string
+	pendingErr       error
+	outputTargetSet  bool
+	outputTarget     uint64
+	outputTargetHash crypto.Hash32
+	witnessSet       bool
+	witnessHeight    uint64
+	witnessHash      crypto.Hash32
 }
 
 type walletSnapshotManager struct {
@@ -160,6 +171,48 @@ func (m *walletSnapshotManager) close(id string, address crypto.Address) error {
 	return nil
 }
 
+func (m *walletSnapshotManager) bindOutputTarget(entry *walletSnapshotEntry, height uint64, hash crypto.Hash32) (uint64, crypto.Hash32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry.outputTargetSet {
+		if entry.outputTarget != height || entry.outputTargetHash != hash {
+			return 0, crypto.Hash32{}, errors.New("bootstrap target does not match snapshot")
+		}
+		return entry.outputTarget, entry.outputTargetHash, nil
+	}
+	entry.outputTargetSet = true
+	entry.outputTarget = height
+	entry.outputTargetHash = hash
+	return height, hash, nil
+}
+
+func (m *walletSnapshotManager) outputTargetFor(entry *walletSnapshotEntry) (uint64, crypto.Hash32, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return entry.outputTarget, entry.outputTargetHash, entry.outputTargetSet
+}
+
+func (m *walletSnapshotManager) bindWitness(entry *walletSnapshotEntry, height uint64, hash crypto.Hash32) (uint64, crypto.Hash32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry.witnessSet {
+		if entry.witnessHeight != height || entry.witnessHash != hash {
+			return 0, crypto.Hash32{}, errors.New("witness does not match snapshot")
+		}
+		return entry.witnessHeight, entry.witnessHash, nil
+	}
+	entry.witnessSet = true
+	entry.witnessHeight = height
+	entry.witnessHash = hash
+	return height, hash, nil
+}
+
+func (m *walletSnapshotManager) witnessFor(entry *walletSnapshotEntry) (uint64, crypto.Hash32, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return entry.witnessHeight, entry.witnessHash, entry.witnessSet
+}
+
 func (m *walletSnapshotManager) capture(ctx context.Context, s *Server, address crypto.Address) (*walletSnapshotLease, error) {
 	m.createMu.Lock()
 	defer m.createMu.Unlock()
@@ -270,10 +323,14 @@ func (m *walletSnapshotManager) capture(ctx context.Context, s *Server, address 
 	if _, err := rand.Read(randomID[:]); err != nil {
 		return fail(fmt.Errorf("generate wallet snapshot id: %w", err))
 	}
+	var cursorKey [32]byte
+	if _, err := rand.Read(cursorKey[:]); err != nil {
+		return fail(fmt.Errorf("generate wallet snapshot cursor key: %w", err))
+	}
 	id := hex.EncodeToString(randomID[:])
 	entry := &walletSnapshotEntry{
 		id: id, address: address, read: read, checkpoint: checkpoint,
-		hash: hash, height: height, bytes: checkpointSize,
+		hash: hash, height: height, cursorKey: cursorKey, bytes: checkpointSize,
 		expiresAt: time.Now().Add(walletSnapshotTTL), inflight: 1,
 	}
 
@@ -364,6 +421,7 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 	}
 	id := q.Get("snapshot_id")
 	cursor := q.Get("cursor")
+	resumeCursor := q.Get("resume_cursor")
 	creating := q.Get("snapshot") == "1"
 	var lease *walletSnapshotLease
 	if creating {
@@ -377,6 +435,10 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 		}
 		lease, err = s.walletSnapshots.capture(r.Context(), s, address)
 	} else if q.Has("snapshot_id") {
+		if cursor != "" && resumeCursor != "" {
+			writeJSONError(w, http.StatusBadRequest, "cursor and resume_cursor are mutually exclusive")
+			return
+		}
 		cursor, err = unwrapSnapshotCursor(id, cursor)
 		if err != nil {
 			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_CURSOR_MISMATCH", err.Error())
@@ -405,26 +467,132 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 		}
 		lease.Release()
 	}()
+	entry := lease.entry
+	throughHeight, throughHash, targetBound := s.walletSnapshots.outputTargetFor(entry)
+	if !targetBound {
+		throughHeight, throughHash = entry.height, entry.hash
+	}
+	if q.Has("through_height") != q.Has("through_hash") {
+		writeJSONError(w, http.StatusBadRequest, "through_height and through_hash must be supplied together")
+		return
+	}
+	if q.Has("through_height") {
+		requestedThroughHeight, parseErr := strconv.ParseUint(q.Get("through_height"), 10, 64)
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid through_height")
+			return
+		}
+		requestedThroughHash, parseErr := parseHash32(q.Get("through_hash"))
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "through_hash must be 64 hexadecimal characters")
+			return
+		}
+		if targetBound && (requestedThroughHeight != throughHeight || requestedThroughHash != throughHash) {
+			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_CURSOR_MISMATCH", "through target does not match the snapshot bootstrap")
+			return
+		}
+		throughHeight, throughHash = requestedThroughHeight, requestedThroughHash
+		if throughHeight > entry.height {
+			writeWalletSnapshotError(w, http.StatusConflict, "REORG", "through_height is above the captured checkpoint")
+			return
+		}
+		canonical, found, readErr := entry.read.GetCanonicalHash(throughHeight)
+		if readErr != nil || !found {
+			reconciliationError(w, throughHeight, throughHeight, "through_height canonical header is unavailable")
+			return
+		}
+		if canonical != throughHash {
+			reorgError(w, throughHeight, "through_hash is not canonical in the captured snapshot")
+			return
+		}
+		throughHeight, throughHash, err = s.walletSnapshots.bindOutputTarget(entry, throughHeight, throughHash)
+		if err != nil {
+			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_CURSOR_MISMATCH", err.Error())
+			return
+		}
+	} else {
+		throughHeight, throughHash, err = s.walletSnapshots.bindOutputTarget(entry, throughHeight, throughHash)
+		if err != nil {
+			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_CURSOR_MISMATCH", err.Error())
+			return
+		}
+	}
+	afterHeight, hasAfterHeight := uint64(0), q.Has("after_height")
+	if hasAfterHeight != q.Has("after_hash") {
+		writeJSONError(w, http.StatusBadRequest, "after_height and after_hash must be supplied together")
+		return
+	}
+	if hasAfterHeight {
+		afterHeight, err = strconv.ParseUint(q.Get("after_height"), 10, 64)
+		if err != nil || afterHeight > throughHeight {
+			writeJSONError(w, http.StatusBadRequest, "invalid after_height")
+			return
+		}
+		afterHash, parseErr := parseHash32(q.Get("after_hash"))
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, "after_hash must be 64 hexadecimal characters")
+			return
+		}
+		canonical, found, readErr := entry.read.GetCanonicalHash(afterHeight)
+		if readErr != nil || !found {
+			reconciliationError(w, afterHeight, afterHeight, "after_height canonical header is unavailable")
+			return
+		}
+		if canonical != afterHash {
+			reorgError(w, afterHeight, "after_hash is not canonical in the captured snapshot")
+			return
+		}
+	}
 	if r.Context().Err() != nil {
 		return
 	}
-	rows, next, err := lease.entry.read.LPoDWalletOutputs(address, cursor, 128)
+	if resumeCursor != "" {
+		if cursor != "" {
+			writeJSONError(w, http.StatusBadRequest, "cursor and resume_cursor are mutually exclusive")
+			return
+		}
+		cursor = resumeCursor
+	}
+	rows, next, lastExamined, err := entry.read.LPoDWalletOutputsAfterHeight(
+		address, afterHeight, hasAfterHeight, cursor, throughHeight, 128,
+	)
 	if err != nil {
+		var missing *store.WalletReconciliationError
+		if errors.As(err, &missing) {
+			reconciliationError(w, missing.Height, missing.Height, missing.Error())
+			return
+		}
+		var cursorReorg *store.WalletCursorReorgError
+		if errors.As(err, &cursorReorg) {
+			reorgError(w, cursorReorg.Height, cursorReorg.Error())
+			return
+		}
 		writeWalletSnapshotError(w, http.StatusBadRequest, "SNAPSHOT_QUERY_FAILED", err.Error())
 		return
 	}
 	outputs := make([]map[string]interface{}, 0, len(rows))
 	for _, u := range rows {
-		outputs = append(outputs, map[string]interface{}{
+		output := map[string]interface{}{
 			"tx_hash": fmt.Sprintf("%x", u.TxHash[:]), "out_idx": u.OutputIndex, "block_height": u.BlockHeight,
 			"one_time_pub": fmt.Sprintf("%x", u.OneTimePub[:]), "tx_pub_key": fmt.Sprintf("%x", u.TxPubKey[:]),
 			"amount_commit": fmt.Sprintf("%x", u.AmountCommit[:]), "enc_amount": fmt.Sprintf("%x", u.EncAmount[:]),
-		})
+		}
+		var zeroPoint crypto.Point32
+		if u.TxPubKey == zeroPoint {
+			if u.AmountNAPRO > 0 {
+				output["amount_napr"] = fmt.Sprintf("%d", u.AmountNAPRO)
+			} else {
+				output["opening_status"] = "OUTPUT_OPENING_UNAVAILABLE"
+			}
+		}
+		outputs = append(outputs, output)
 	}
 	response := map[string]interface{}{
 		"state": "active", "snapshot_id": id, "checkpoint_height": lease.entry.height,
 		"checkpoint_hash": fmt.Sprintf("%x", lease.entry.hash[:]),
-		"outputs":         outputs, "next_cursor": snapshotCursor(id, next),
+		"through_height":  throughHeight, "through_hash": fmt.Sprintf("%x", throughHash[:]),
+		"outputs": outputs, "next_cursor": snapshotCursor(id, next),
+		"resume_cursor": lastExamined,
 	}
 	if creating {
 		delivered = writeCreatedWalletSnapshot(w, r, response)
@@ -530,6 +698,8 @@ func (s *Server) restWalletKeyImagesSnapshot(
 	}
 
 	statuses := make(map[string]bool)
+	canonicalSpent := make(map[string]bool)
+	pendingLocked := make(map[string]bool)
 	for i, text := range images {
 		raw, err := hex.DecodeString(text)
 		if err != nil || len(raw) != 32 {
@@ -570,10 +740,13 @@ func (s *Server) restWalletKeyImagesSnapshot(
 			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_SOURCE_MISSING", "source is not indexed at the pinned checkpoint")
 			return
 		}
-		statuses[text] = spent || utxo == nil || directSpent || pending[hex.EncodeToString(ki[:])]
+		canonicalSpent[text] = spent || utxo == nil || directSpent
+		pendingLocked[text] = pending[hex.EncodeToString(ki[:])]
+		statuses[text] = canonicalSpent[text] || pendingLocked[text]
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"spent": statuses, "snapshot_id": lease.entry.id,
+		"spent": statuses, "canonical_spent": canonicalSpent, "pending_locked": pendingLocked,
+		"snapshot_id":       lease.entry.id,
 		"checkpoint_height": lease.entry.height,
 		"checkpoint_hash":   fmt.Sprintf("%x", lease.entry.hash[:]),
 	})

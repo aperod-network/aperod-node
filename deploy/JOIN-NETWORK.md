@@ -38,8 +38,36 @@ sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --api-key <ваш
 | 4 | Скачивает `chain.db` через `GET /api/v1/chaindb/export` (~1–2 ГБ) |
 | 5 | Скачивает UTXO-snapshot через `GET /api/v1/snapshot/export` |
 | 6 | Удаляет `p2p_identity.key` (нода генерирует новый при старте) |
-| 7 | Применяет drop-in конфиги systemd (TimeoutStopSec, GOMEMLIMIT) |
-| 8 | Запускает `aperod-node` и ждёт готовности API |
+| 7 | Прописывает `/ip4/<PRIMARY_IP>/tcp/30303` в `p2p.bootnodes` в `/etc/aperod/node.yaml` |
+| 8 | Применяет drop-in конфиги systemd (TimeoutStopSec, GOMEMLIMIT) |
+| 9 | Запускает `aperod-node` и ждёт готовности API |
+
+---
+
+## Рекомендуемый порядок установки
+
+Если IP основного (primary) узла известен заранее, передайте его флагом `--primary-ip`
+прямо при установке — это сразу пропишет bootnode и избавит от шага join:
+
+```bash
+# Установка + автоматическое добавление bootnode
+sudo bash /opt/aperod/deploy/install-node.sh --primary-ip 89.169.53.128
+```
+
+Если IP стал известен позже или нужна полная синхронизация chain.db — запустите
+`aperod-join.sh` отдельно (он заменит данные и пропишет bootnode сам):
+
+```bash
+# Сначала установка без флага (bootnode не прописан — нода не стартует в сеть)
+sudo bash /opt/aperod/deploy/install-node.sh
+
+# Затем, когда IP станет известен — подключение к сети:
+sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
+```
+
+> ⚠️ **Не запускайте ноду до выполнения одного из двух шагов выше.**
+> Нода без bootnode может сформировать блок с несовместимым genesis-хэшем,
+> после чего ре-join потребует полного удаления данных.
 
 ---
 
@@ -67,6 +95,7 @@ aperod-join.sh <PRIMARY_IP>:<PORT> [OPTIONS]
   --api-key  <key>   X-API-Key для аутентификации на основном узле
   --data-dir <path>  Директория данных (по умолчанию: /var/lib/aperod)
   --user     <name>  Пользователь-владелец данных (по умолчанию: aperod)
+  --p2p-port <port>  P2P-порт основного узла (по умолчанию: 30303)
   --skip-start       Не запускать ноду после загрузки (только данные)
   --no-chaindb       Пропустить загрузку chain.db (только snapshot)
 ```
@@ -174,7 +203,23 @@ rm -f /var/lib/aperod/p2p_identity.key
 
 > ⚠️ Без этого оба сервера используют одинаковый TLS-ключ и видят друг друга как self-connection. `peer_count` останется 0 навсегда.
 
-### Шаг 5: Настроить права и запустить
+### Шаг 5: Прописать bootnode в node.yaml
+
+```bash
+# Через node-config.sh (рекомендуется)
+sudo bash /opt/aperod/blockchain/deploy/node-config.sh \
+  add-bootnode /ip4/<PRIMARY_IP>/tcp/30303
+
+# Или вручную — добавить в /etc/aperod/node.yaml:
+# p2p:
+#   bootnodes:
+#     - /ip4/<PRIMARY_IP>/tcp/30303
+```
+
+> ⚠️ Без bootnode оба узла ждут **входящего** подключения и никогда не устанавливают соединение — `peer_count` остаётся 0 бесконечно.
+> Подробнее: [раздел «Bootnode — почему он обязателен»](#bootnode--почему-он-обязателен).
+
+### Шаг 6: Настроить права и запустить
 
 ```bash
 chown -R aperod:aperod /var/lib/aperod/
@@ -220,6 +265,43 @@ consensus:
 
 ---
 
+## Bootnode — почему он обязателен
+
+После копирования цепи у нового узла в `node.yaml` нет записей в `p2p.bootnodes`.
+Без хотя бы одного bootnode оба узла (основной и новый) ждут **входящего** подключения
+и никогда не устанавливают соединение — `peer_count` остаётся 0 бесконечно.
+
+**Оба скрипта** автоматически прописывают основной узел как bootnode:
+
+- `aperod-join.sh` — шаг 7/8, на новом сервере (использует IP из первого аргумента)
+- `join-network.sh` — шаг 5/7, по SSH с основного сервера
+
+Результирующий `node.yaml`:
+
+```yaml
+p2p:
+  bootnodes:
+    - /ip4/<PRIMARY_IP>/tcp/30303
+```
+
+Оба формата адреса — `host:port` и `/ip4/…/tcp/…` — принимаются `resolveBootnode()`
+в `p2p/dns.go`.
+
+**Если нестандартный P2P-порт** (не 30303), передайте его явно при вызове `aperod-join.sh`:
+
+```bash
+sudo bash aperod-join.sh 89.169.53.128:8545 --p2p-port 30304
+```
+
+**Для `join-network.sh`** (rsync-путь): если PRIMARY_IP определяется неверно (например,
+возвращается внутренний 10.x вместо внешнего адреса), переопределите его явно:
+
+```bash
+PRIMARY_IP=89.169.53.128 sudo bash join-network.sh <TARGET_IP>
+```
+
+---
+
 ## Частые ошибки
 
 | Ошибка | Причина | Решение |
@@ -228,7 +310,7 @@ consensus:
 | `connection refused` | Основной узел недоступен | Откройте порт 8545 в firewall основного узла |
 | `permission denied` при старте | Файлы принадлежат root | `chown -R aperod:aperod /var/lib/aperod/` |
 | `block at height N missing` | Неполная загрузка chain.db | Запустите скрипт заново (он очищает старые данные) |
-| `peer_count: 0` навсегда | Скопированный `p2p_identity.key` | `rm /var/lib/aperod/p2p_identity.key`, restart |
+| `peer_count: 0` навсегда | Нет bootnode **или** скопированный `p2p_identity.key` | Проверьте `p2p.bootnodes` в `/etc/aperod/node.yaml`; `rm /var/lib/aperod/p2p_identity.key`, restart |
 | Нода расходится с сетью | Нет `non_validator: true`, ключ не в validator set | Добавить `non_validator: true` в node.yaml |
 
 ---
@@ -273,6 +355,24 @@ sudo bash /opt/aperod/deploy/join-network.sh <IP_НОВОГО_СЕРВЕРА>
 ```
 
 Этот скрипт требует SSH-доступ с основного узла на новый. Используйте `aperod-join.sh` (HTTP) как предпочтительный метод.
+
+### ⚠ Кратковременный простой (~60 с)
+
+`join-network.sh` **останавливает `aperod-node` на основном узле** перед rsync и
+перезапускает его сразу после завершения.
+
+**Почему это необходимо:** LevelDB небезопасно копировать в работающем состоянии.
+Во время rsync движок непрерывно пишет WAL-записи и компактирует `.ldb`-файлы.
+Скопированная директория оказывается внутренне несогласованной: при старте LevelDB
+откатывается на меньшую высоту, чем источник, и блок на этой высоте имеет другой
+хэш. P2P-протокол не может автоматически устранить такое расхождение — нода
+застревает в цикле «подключиться → отвергнуть → отключиться».
+
+Если остановить основную ноду не удаётся (нет SSH-доступа, ошибка systemctl),
+скрипт **прерывается** вместо того, чтобы выполнять rsync поверх живой базы.
+
+**Типичное время простоя:** остановка (`TimeoutStopSec=300`, фактически ~5–15 с) +
+rsync (~30–60 с) + запуск (~5 с) = **≈60–90 с**.
 
 ---
 

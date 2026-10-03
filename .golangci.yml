@@ -1,57 +1,58 @@
 version: "2"
 
 linters:
+  default: none
   enable:
     - errcheck
     - govet
     - staticcheck
-    - gosimple
     - ineffassign
     - unused
-    - gofmt
-    - goimports
     - misspell
     - revive
     - gosec
     - unconvert
     - unparam
     - godot
-  disable:
-    - exhaustruct
-    - exhaustive
-    - wrapcheck
-
-linters-settings:
-  gofmt:
-    simplify: true
-  goimports:
-    local-prefixes: github.com/aperod/aperod
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+        - name: var-naming
+          severity: warning
+        - name: error-return
+          severity: warning
+    gosec:
+      excludes:
+        - G404
+    misspell:
+      locale: US
+    godot:
+      scope: declarations
+      period: true
+  exclusions:
     rules:
-      - name: exported
-        severity: warning
-      - name: var-naming
-        severity: warning
-      - name: error-return
-        severity: warning
-  gosec:
-    excludes:
-      - G404
-  misspell:
-    locale: US
-  godot:
-    scope: declarations
-    period: true
+      - path: "_test\\.go"
+        linters:
+          - gosec
+          - unparam
+          - godot
+      - path: "fuzz_test\\.go"
+        linters:
+          - godot
 
 issues:
-  exclude-rules:
-    - path: "_test\\.go"
-      linters:
-        - gosec
-        - unparam
-        - godot
-    - path: "fuzz_test\\.go"
-      linters:
-        - godot
   max-issues-per-linter: 50
   max-same-issues: 10
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/aperod/aperod

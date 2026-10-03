@@ -130,6 +130,8 @@ func main() {
 	api.Set("buildSignedTransaction", callbacks[6])
 	callbacks = append(callbacks, js.FuncOf(buildLPoDTransaction))
 	api.Set("buildLPoDTransaction", callbacks[7])
+	callbacks = append(callbacks, js.FuncOf(identifyOutputs))
+	api.Set("identifyOutputs", callbacks[8])
 	js.Global().Set("AperodWalletWasm", api)
 	select {}
 }

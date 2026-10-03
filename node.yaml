@@ -28,6 +28,10 @@ consensus:
   block_reward_napro: 300000000
   # 0 = disabled. Set the same future height on every validator.
   reward_authorization_activation_height: 0
+  # Guardian allocation hard fork remains disabled until an anchored validator
+  # rollout is approved. Both fields must be set together.
+  guardian_fund_activation_height: 0
+  guardian_fund_chain_anchor: ""
   block_time: "3s"
   staking_pool_napro: 200000000000000000
   tail_reward_napro: 100000000
