@@ -18,6 +18,23 @@ def fixture(root):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_candidate_symlink_cannot_overwrite_external_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source, candidate = base / "source", base / "candidate"
+            source.mkdir()
+            candidate.mkdir()
+            fixture(candidate)
+            (source / "go.mod").write_text("module example.invalid/test\n")
+            (source / "example.py").write_text("print('source')\n")
+            external = base / "protected.txt"
+            external.write_text("DO NOT MODIFY")
+            (candidate / "example.py").symlink_to(external)
+            subprocess.run(["git", "-C", str(candidate), "add", "."], check=True)
+            publisher.prepare(source, candidate)
+            self.assertEqual(external.read_text(), "DO NOT MODIFY")
+            self.assertFalse((candidate / "example.py").is_symlink())
+
     def test_build_processes_do_not_receive_publication_credentials(self):
         with patch.dict(publisher.os.environ, {"PUBLIC_GITHUB_TOKEN": "TEST_ONLY",
                                               "SSH_PASSWORD": "TEST_ONLY"}), \
