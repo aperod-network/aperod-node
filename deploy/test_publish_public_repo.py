@@ -18,6 +18,49 @@ def fixture(root):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_failed_required_check_never_merges(self):
+        methods = []
+        def request(method, url, data=None):
+            methods.append(method)
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            return {"check_runs": [{"name": "Whole-tree publication security",
+                                   "status": "completed", "conclusion": "failure",
+                                   "app": {"id": 15368}}]}
+        with self.assertRaisesRegex(RuntimeError, "check failed"):
+            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertNotIn("PUT", methods)
+
+    def test_untrusted_status_provider_cannot_authorize_merge(self):
+        methods = []
+        def request(method, url, data=None):
+            methods.append(method)
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            return {"check_runs": [{"name": name, "status": "completed",
+                                   "conclusion": "success", "app": {"id": 999}}
+                                  for name in ("Whole-tree publication security", "go build & vet & test")]}
+        with patch.object(publisher.time, "monotonic", side_effect=[0, 0, 2]), \
+             patch.object(publisher.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "did not complete"):
+                publisher.await_merge({"number": 1, "html_url": "test"}, request, timeout=1)
+        self.assertNotIn("PUT", methods)
+
+    def test_merge_is_bound_to_reviewed_head(self):
+        bodies = []
+        def request(method, url, data=None):
+            if method == "PUT":
+                bodies.append(data)
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            return {"check_runs": [{"name": name, "status": "completed",
+                                   "conclusion": "success", "app": {"id": 15368}}
+                                  for name in ("Whole-tree publication security", "go build & vet & test")]}
+        publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertEqual(bodies[0]["sha"], "reviewed")
+        self.assertNotIn("force", bodies[0])
+
     def test_policy_failure_prevents_every_network_request(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

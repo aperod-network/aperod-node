@@ -61,14 +61,17 @@ def prepare(root, candidate, gate_only=False):
         selected += [source / ".github/workflows/publication-security.yml"]
     else:
         selected = []
-        for file in source.rglob("*"):
-            rel = file.relative_to(source)
-            if (file.is_file() and not file.is_symlink()
-                    and not any(part in EXCLUDED for part in rel.parts)
-                    and file.suffix in EXTENSIONS
-                    and not path_problem(rel.as_posix())
-                    and rel.name not in ("README.md", "README-public.md")):
-                selected.append(file)
+        for directory, dirs, files in os.walk(source, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED
+                       and not (Path(directory) / d).is_symlink()]
+            for name in files:
+                file = Path(directory) / name
+                rel = file.relative_to(source)
+                if (file.is_file() and not file.is_symlink()
+                        and file.suffix in EXTENSIONS
+                        and not path_problem(rel.as_posix())
+                        and rel.name not in ("README.md", "README-public.md")):
+                    selected.append(file)
     for file in selected:
         if not file.is_file() or file.is_symlink():
             raise RuntimeError("Missing or unsafe required publication source")
@@ -181,7 +184,8 @@ def await_merge(pr, request, timeout=900):
             raise RuntimeError("Publication PR closed without merging")
         sha = pull["head"]["sha"]
         checks = request("GET", f"{API}/commits/{sha}/check-runs?per_page=100")["check_runs"]
-        trusted = {c["name"]: c for c in checks if c.get("app", {}).get("id") == 15368}
+        trusted = {c["name"]: c for c in sorted(checks, key=lambda c: c.get("id", 0))
+                   if c.get("app", {}).get("id") == 15368}
         for name in required:
             check = trusted.get(name)
             if check and check["status"] == "completed" and check["conclusion"] != "success":
@@ -207,9 +211,10 @@ def main():
     parser.add_argument("--gate-only", action="store_true")
     parser.add_argument("--with-tests", action="store_true")
     parser.add_argument("--no-wait", action="store_true")
+    parser.add_argument("--check-drift", action="store_true")
     args = parser.parse_args()
     token = os.environ.get("PUBLIC_GITHUB_TOKEN")
-    if not args.dry_run and not token:
+    if not args.dry_run and not args.check_drift and not token:
         raise SystemExit("PUBLIC_GITHUB_TOKEN must be provided through the environment")
     with tempfile.TemporaryDirectory(prefix="aperod-publication-") as temp:
         candidate = Path(temp) / "repo"
@@ -217,7 +222,12 @@ def main():
             "https://github.com/aperod-network/aperod-node", str(candidate))
         head = git(candidate, "rev-parse", "HEAD").decode().strip()
         tree = prepare(args.root.resolve(), candidate, args.gate_only)
-        if args.dry_run:
+        if args.check_drift:
+            changed = [x for x in git(candidate, "diff", "--cached", "--name-only", "-z").split(b"\0") if x]
+            print(f"Complete source-distribution drift: {len(changed)} files.")
+            if changed:
+                raise SystemExit(1)
+        elif args.dry_run:
             verify(candidate, tree, with_tests=args.with_tests)
             print("Dry-run verified; no objects uploaded.")
         else:
