@@ -1,0 +1,32 @@
+name: Publication Security
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  publication-security:
+    name: Whole-tree publication security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify publication guard regression tests
+        run: |
+          python3 deploy/test_publication_security.py
+          python3 deploy/test_publish_public_repo.py
+          python3 deploy/test_sync_public_repo.py
+      - name: Reject runtime artifacts and key material across the entire tree
+        run: python3 deploy/publication_security.py --tree HEAD
+      - name: Install pinned secret scanner
+        run: go install github.com/zricethezav/gitleaks/v8@v8.26.0
+      - name: Scan complete current source distribution for secrets
+        run: gitleaks dir . --redact=100 --no-banner
