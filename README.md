@@ -653,3 +653,7 @@ under their own terms.
     <a href="mailto:aperod-network@proton.me">Email</a>
   </sub>
 </div>
+
+## Reviewed source updates
+
+After the history transition, use the complete deployment-tools package and an explicitly reviewed revision. Do not force-reset old node clones. See [installation and update requirements](deploy/NODE-SOURCE-UPDATE.md). Clean source provenance is not proof of live chain compatibility.

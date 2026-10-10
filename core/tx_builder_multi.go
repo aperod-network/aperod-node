@@ -228,11 +228,11 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			excludePubs[u.OneTimePub] = true
 		}
 		need := len(selected) * (crypto.RingSize - 1)
-		if b.txVersion == TxVersionCLSAG {
-			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
-		} else {
-		allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
-	}
+		var err error
+		allDecoys, err = b.sampleChainDecoys(need, excludePubs, b.txVersion == TxVersionCLSAG)
+		if err != nil {
+			return nil, fmt.Errorf("sample chain decoys: %w", err)
+		}
 	}
 
 	// ── Build ring inputs ─────────────────────────────────────────────────────

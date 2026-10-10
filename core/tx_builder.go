@@ -7,6 +7,7 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/aperod/aperod/crypto"
@@ -21,6 +22,7 @@ type TxBuilder struct {
 	feePerByte            uint64      // base-fee + optional tip per byte in nAPRO
 	utxoSet               *UTXOSet    // optional; if set, real chain UTXOs are used as ring decoys (Phase 2)
 	decoys                []DecoyUTXO // optional caller-supplied public chain decoys
+	decoyEntropy          io.Reader   // nil uses crypto/rand.Reader; per-builder test injection
 	txVersion             TxVersion
 	avmPayload            *AVMPayload // optional signed AVM payload; forces TxVersionAVM
 	paymentRecipientProof bool
@@ -447,10 +449,10 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			excludePubs[u.OneTimePub] = true
 		}
 		need := len(selected) * (crypto.RingSize - 1)
-		if txVersionUsesCLSAG(b.txVersion) {
-			allDecoys = b.utxoSet.SampleCLSAGDecoys(need, excludePubs)
-		} else {
-			allDecoys = b.utxoSet.SampleDecoys(need, excludePubs)
+		var err error
+		allDecoys, err = b.sampleChainDecoys(need, excludePubs, txVersionUsesCLSAG(b.txVersion))
+		if err != nil {
+			return nil, fmt.Errorf("sample chain decoys: %w", err)
 		}
 	}
 

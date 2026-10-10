@@ -74,6 +74,9 @@ fi
   || die "ensure-dropin.sh not found at ${ENSURE_DROPIN_SH}"
 [[ -f "${UPDATE_NODE_SH}" ]] \
   || die "update-node.sh not found at ${UPDATE_NODE_SH}"
+source "${UPGRADE_DIR}/node-source-release.sh"
+node_source_baseline_guard /usr/local/bin/aperod-node ||
+  die "Explicit public source and running-binary baseline approval are required before changing drop-ins."
 
 # ── Guard: abort on fresh servers (update-node.sh checks too,
 #    but an early message here is more helpful for operators) ──
