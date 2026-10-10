@@ -1,0 +1,21 @@
+blockchain/aperod-node
+explorer-indexer
+aperod-explorer-indexer
+
+# Runtime state and credentials never belong in a source distribution.
+data/testnet/
+data/mainnet/
+data/devnet/
+snapshots/
+*.key
+*.keyfile
+*.pem
+.env
+.env.*
+!.env.example
+!.env.sample
+aperod
+cli
+aperod-node
+build/
+__pycache__/

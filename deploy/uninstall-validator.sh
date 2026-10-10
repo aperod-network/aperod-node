@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# ============================================================
+#  Aperod Validator Node — Uninstaller
+#  Полностью удаляет ноду с сервера
+#  Использование:  sudo bash uninstall-validator.sh
+# ============================================================
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+info() { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+
+APEROD_USER="aperod"
+INSTALL_DIR="/opt/aperod"
+DATA_DIR="/var/lib/aperod"
+CONFIG_DIR="/etc/aperod"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/source-safe-guard.sh"
+
+echo -e "
+${BOLD}╔════════════════════════════════════════════════════════════╗
+║        Aperod Validator Node — Uninstaller                 ║
+╚════════════════════════════════════════════════════════════╝${NC}
+"
+
+if [[ $(id -u) -ne 0 ]]; then
+  echo -e "${RED}Запустите от root: sudo bash uninstall-validator.sh${NC}"
+  exit 1
+fi
+
+source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" || {
+  echo -e "${RED}[ERR]${NC} Source safety guard refused removal; source and chain data were not changed." >&2
+  exit 1
+}
+
+resolve_configured_data_dir() {
+  local config_file="${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}"
+  local config_count config_value
+  CONFIGURED_DATA_DIR="$DATA_DIR"
+  [[ -f "$config_file" ]] || return 0
+
+  config_count=$(grep -Ec '^[[:space:]]*data_dir[[:space:]]*:' "$config_file" || true)
+  (( config_count <= 1 )) || {
+    echo -e "${RED}[ERR]${NC} Refusing uninstall: duplicate data_dir entries in ${config_file}." >&2
+    return 1
+  }
+  (( config_count == 1 )) || return 0
+
+  config_value=$(sed -nE 's/^[[:space:]]*data_dir[[:space:]]*:[[:space:]]*([^#]*).*/\1/p' "$config_file")
+  config_value="${config_value%$'\r'}"
+  config_value="${config_value#\"}"; config_value="${config_value%\"}"
+  config_value="${config_value#\'}"; config_value="${config_value%\'}"
+  config_value="${config_value#"${config_value%%[![:space:]]*}"}"
+  config_value="${config_value%"${config_value##*[![:space:]]}"}"
+  [[ "$config_value" == /* ]] || {
+    echo -e "${RED}[ERR]${NC} Refusing uninstall: configured data_dir must be absolute (${config_file})." >&2
+    return 1
+  }
+  CONFIGURED_DATA_DIR="$config_value"
+}
+
+uninstall_runtime_data_guard() {
+  local data_path runtime_path
+  local -a checked_paths=()
+  resolve_configured_data_dir || return 1
+  checked_paths=("$DATA_DIR")
+  [[ "$CONFIGURED_DATA_DIR" == "$DATA_DIR" ]] || checked_paths+=("$CONFIGURED_DATA_DIR")
+
+  for data_path in "${checked_paths[@]}"; do
+    if [[ ! -e "$INSTALL_DIR" && ( -e "$data_path" || -L "$data_path" ) ]]; then
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data path exists but the source checkout is absent (${data_path}); preserve and inspect it first." >&2
+      return 1
+    fi
+    [[ -e "$data_path" || -L "$data_path" ]] || continue
+    [[ -d "$data_path" && ! -L "$data_path" ]] || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data path is not a real directory: ${data_path}" >&2
+      return 1
+    }
+
+    # Never guess which filenames contain a chain, a snapshot, or a key.
+    # Even an explicitly confirmed uninstall may remove only an empty data
+    # directory; the operator must archive/move any contents separately.
+    runtime_path=$(find "$data_path" -mindepth 1 -print -quit 2>/dev/null) || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: cannot inspect runtime data under ${data_path}." >&2
+      return 1
+    }
+    [[ -z "$runtime_path" ]] || {
+      echo -e "${RED}[ERR]${NC} Refusing uninstall: data directory is not empty (${runtime_path}); archive or move its contents before uninstalling." >&2
+      return 1
+    }
+  done
+}
+
+uninstall_runtime_data_guard || exit 1
+
+echo -e "${YELLOW}${BOLD}Это действие необратимо. Будут удалены:${NC}"
+echo -e "  • Сервис  aperod-node (systemd)"
+echo -e "  • Бинарники  /usr/local/bin/aperod-node, /usr/local/bin/aperod"
+echo -e "  • Конфиг  ${CONFIG_DIR}/"
+echo -e "  • Данные  ${DATA_DIR}/  (блокчейн-данные, ключи!)"
+echo -e "  • Исходники  ${INSTALL_DIR}/"
+echo -e "  • Системный пользователь  ${APEROD_USER}"
+echo -e "  • Правила ufw для портов 30303"
+echo
+
+# Подтверждение
+HAS_TTY=false
+if { : </dev/tty; } 2>/dev/null; then
+  HAS_TTY=true
+fi
+
+if [[ "${HAS_TTY}" == "true" ]]; then
+  read -rp "Введите YES для подтверждения: " CONFIRM </dev/tty
+  if [[ "${CONFIRM^^}" != "YES" ]]; then
+    echo "Отменено."
+    exit 0
+  fi
+else
+  warn "Неинтерактивный режим — передайте APEROD_UNINSTALL_CONFIRM=YES"
+  if [[ "${APEROD_UNINSTALL_CONFIRM:-}" != "YES" ]]; then
+    echo "Отменено."
+    exit 1
+  fi
+fi
+
+echo
+
+# 1. Остановить и отключить сервис
+if systemctl is-active --quiet aperod-node 2>/dev/null; then
+  info "Останавливаем aperod-node…"
+  systemctl stop aperod-node
+  ok "Сервис остановлен"
+fi
+
+if systemctl is-enabled --quiet aperod-node 2>/dev/null; then
+  systemctl disable aperod-node
+  ok "Сервис отключён из автозапуска"
+fi
+
+if [[ -f /etc/systemd/system/aperod-node.service ]]; then
+  rm -f /etc/systemd/system/aperod-node.service
+  systemctl daemon-reload
+  ok "Unit-файл удалён"
+fi
+
+# 2. Бинарники
+for bin in /usr/local/bin/aperod-node /usr/local/bin/aperod; do
+  if [[ -f "${bin}" ]]; then
+    rm -f "${bin}"
+    ok "Удалён: ${bin}"
+  fi
+done
+
+# 3. Конфиг (включая ключи!)
+if [[ -d "${CONFIG_DIR}" ]]; then
+  rm -rf "${CONFIG_DIR}"
+  ok "Удалён конфиг: ${CONFIG_DIR}"
+fi
+
+# 4. Данные блокчейна
+if [[ -d "${DATA_DIR}" ]]; then
+  rm -rf "${DATA_DIR}"
+  ok "Удалены данные: ${DATA_DIR}"
+fi
+
+# 5. Исходники
+if [[ -d "${INSTALL_DIR}" ]]; then
+  rm -rf "${INSTALL_DIR}"
+  ok "Удалены исходники: ${INSTALL_DIR}"
+fi
+
+# 6. Системный пользователь
+if id "${APEROD_USER}" &>/dev/null; then
+  userdel "${APEROD_USER}" 2>/dev/null || true
+  ok "Удалён пользователь: ${APEROD_USER}"
+fi
+
+# 7. Go (опционально)
+if [[ -t 0 ]]; then
+  echo
+  read -rp "Удалить Go (/usr/local/go)? [y/N]: " DEL_GO
+  if [[ "${DEL_GO,,}" == "y" ]]; then
+    rm -rf /usr/local/go
+    rm -f /etc/profile.d/go.sh
+    ok "Go удалён"
+  else
+    info "Go оставлен"
+  fi
+fi
+
+# 8. Правила ufw
+if command -v ufw &>/dev/null; then
+  ufw delete allow 30303/tcp >/dev/null 2>&1 || true
+  ufw delete allow 30303/udp >/dev/null 2>&1 || true
+  ok "Правила ufw для порта 30303 удалены"
+fi
+
+echo
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}  ✓  Нода Aperod полностью удалена с сервера.${NC}"
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════════${NC}"
+echo
+echo -e "  Ваш Telegram-кошелёк (${CYAN}t.me/aperod_bot${NC}) не затронут."
+echo -e "  APR-адрес и средства в кошельке сохранены."
+echo

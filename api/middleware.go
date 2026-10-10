@@ -1,0 +1,321 @@
+package api
+
+// Middleware for the Aperod API server:
+//   - Per-IP rate limiting  (2.5.1): token bucket, 100 req/s, burst 200
+//   - Heavy-endpoint RL     (2.5.1b): O(N) UTXO-scan capped at 2 req/s per IP
+//   - API key auth          (2.5.2): X-API-Key header for write operations
+//   - CORS                  (2.5.3): configurable allowed origins
+//   - WS client cap         (2.2.5): max 1000 concurrent / 10 per IP
+
+import (
+	"crypto/subtle"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// ─── Rate Limiter ─────────────────────────────────────────────────────────────
+
+const (
+	rlRate  = 100 // tokens per second
+	rlBurst = 200 // bucket capacity
+)
+
+type tokenBucket struct {
+	tokens   float64
+	lastFill time.Time
+	mu       sync.Mutex
+}
+
+func (tb *tokenBucket) allow() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(tb.lastFill).Seconds()
+	tb.lastFill = now
+	tb.tokens += elapsed * rlRate
+	if tb.tokens > rlBurst {
+		tb.tokens = rlBurst
+	}
+	if tb.tokens < 1 {
+		return false
+	}
+	tb.tokens--
+	return true
+}
+
+// RateLimiter holds per-IP token buckets and prunes stale entries every minute.
+type RateLimiter struct {
+	mu      sync.RWMutex
+	buckets map[string]*tokenBucket
+}
+
+func NewRateLimiter() *RateLimiter {
+	rl := &RateLimiter{buckets: make(map[string]*tokenBucket)}
+	go rl.prune()
+	return rl
+}
+
+func (rl *RateLimiter) prune() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-2 * time.Minute)
+		rl.mu.Lock()
+		for ip, tb := range rl.buckets {
+			tb.mu.Lock()
+			stale := tb.lastFill.Before(cutoff)
+			tb.mu.Unlock()
+			if stale {
+				delete(rl.buckets, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+func (rl *RateLimiter) bucket(ip string) *tokenBucket {
+	rl.mu.RLock()
+	tb, ok := rl.buckets[ip]
+	rl.mu.RUnlock()
+	if ok {
+		return tb
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if tb, ok = rl.buckets[ip]; ok {
+		return tb
+	}
+	tb = &tokenBucket{tokens: rlBurst, lastFill: time.Now()}
+	rl.buckets[ip] = tb
+	return tb
+}
+
+// heavyRL is a stricter rate limiter for O(N) endpoints like the UTXO
+// address scan.  It uses a separate token bucket (2 req/s, burst 5) so a
+// single client cannot drive 100% CPU by hammering the endpoint.
+type heavyRL struct {
+	mu      sync.RWMutex
+	buckets map[string]*tokenBucket
+}
+
+func newHeavyRL() *heavyRL {
+	h := &heavyRL{buckets: make(map[string]*tokenBucket)}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-2 * time.Minute)
+			h.mu.Lock()
+			for ip, tb := range h.buckets {
+				tb.mu.Lock()
+				stale := tb.lastFill.Before(cutoff)
+				tb.mu.Unlock()
+				if stale {
+					delete(h.buckets, ip)
+				}
+			}
+			h.mu.Unlock()
+		}
+	}()
+	return h
+}
+
+const (
+	heavyRate  = 2 // tokens per second
+	heavyBurst = 5 // bucket capacity
+)
+
+func (h *heavyRL) allow(ip string) bool {
+	h.mu.RLock()
+	tb, ok := h.buckets[ip]
+	h.mu.RUnlock()
+	if !ok {
+		h.mu.Lock()
+		if tb, ok = h.buckets[ip]; !ok {
+			tb = &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
+			h.buckets[ip] = tb
+		}
+		h.mu.Unlock()
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(tb.lastFill).Seconds()
+	tb.lastFill = now
+	tb.tokens += elapsed * heavyRate
+	if tb.tokens > heavyBurst {
+		tb.tokens = heavyBurst
+	}
+	if tb.tokens < 1 {
+		return false
+	}
+	tb.tokens--
+	return true
+}
+
+// globalHeavyRL is shared across all rate-limiter middleware instances.
+var globalHeavyRL = newHeavyRL()
+
+// isHeavyPath returns true for endpoints whose response cost is O(N) in the
+// UTXO-set size.  These get the stricter heavyRL bucket (2 req/s, burst 5).
+func isHeavyPath(path string) bool {
+	// /api/v1/address/{addr}/utxos — full UTXO-set copy + per-UTXO point ops.
+	const pfx = "/api/v1/address/"
+	const sfx = "/utxos"
+	if len(path) > len(pfx)+len(sfx) {
+		if path[:len(pfx)] == pfx && path[len(path)-len(sfx):] == sfx {
+			return true
+		}
+	}
+	switch path {
+	case "/api/v1/avm/query", "/api/v1/avm/simulate", "/api/v1/avm/transactions":
+		return true
+	}
+	return false
+}
+
+// Middleware returns an http.Handler that enforces the rate limit.
+// rateLimitExempt lists paths that bypass the per-IP token bucket entirely.
+// Use sparingly — only for internal probes that must never be throttled.
+var rateLimitExempt = map[string]bool{
+	// Watchdog liveness probe: fired every 60 s from localhost by the
+	// aperod-node-watchdog.timer systemd unit.  Exempting it ensures the
+	// watchdog never triggers a spurious rate-limit 429, which would cause a
+	// false-positive node restart.
+	"/api/v1/status": true,
+	// Circuit-breaker health probe: the Node.js API server hits /health every
+	// 10 s to decide whether to open/close the circuit breaker.  A 429 here
+	// would be counted as a probe failure and keep the breaker open, blocking
+	// all wallet operations.
+	"/health": true,
+}
+
+func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rateLimitExempt[r.URL.Path] {
+			ip := realIP(r)
+			// Heavy endpoints (O(N) UTXO scan) get a stricter bucket first.
+			if isHeavyPath(r.URL.Path) && !globalHeavyRL.allow(ip) {
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
+			if !rl.bucket(ip).allow() {
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// realIP extracts the real client IP.
+// X-Forwarded-For is only trusted when the request comes from the loopback
+// interface (127.0.0.1 / ::1), i.e. from a local reverse proxy.  Accepting
+// XFF unconditionally lets any client spoof its IP and bypass rate-limiting.
+func realIP(r *http.Request) string {
+	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if remoteIP == "" {
+		remoteIP = r.RemoteAddr
+	}
+	// Only honour X-Forwarded-For from a trusted local proxy.
+	if remoteIP == "127.0.0.1" || remoteIP == "::1" {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Take only the first (leftmost) address.
+			for idx := 0; idx < len(xff); idx++ {
+				if xff[idx] == ',' {
+					xff = xff[:idx]
+					break
+				}
+			}
+			xff = trimSpace(xff)
+			if xff != "" {
+				return xff
+			}
+		}
+	}
+	return remoteIP
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
+// ─── API Key Auth ──────────────────────────────────────────────────────────────
+
+// APIKeyMiddleware requires X-API-Key to match key for the wrapped handler.
+// Used for write-operation endpoints (sendRawTransaction).
+func APIKeyMiddleware(key string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		candidate := r.Header.Get("X-API-Key")
+		if key == "" || candidate == "" || len(candidate) != len(key) ||
+			subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) != 1 {
+			http.Error(w, `{"error":"unauthorized: missing or invalid X-API-Key"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+
+// CORSConfig holds allowed origins. An empty slice grants no cross-origin
+// browser access; same-origin and non-browser callers do not need CORS headers.
+type CORSConfig struct {
+	AllowedOrigins []string // e.g. ["https://explorer.aperod.io"]
+}
+
+// Middleware adds CORS headers and handles preflight OPTIONS requests.
+func (c CORSConfig) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowed := ""
+		for _, o := range c.AllowedOrigins {
+			if o == origin {
+				allowed = origin
+				break
+			}
+		}
+		if allowed != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowed)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ─── WS client cap ────────────────────────────────────────────────────────────
+
+const (
+	// MaxWSClients is the global concurrent WebSocket connection limit.
+	MaxWSClients = 1000
+	// MaxWSClientsPerIP is the per-source-IP WebSocket connection limit.
+	// Prevents a single host from monopolising the hub (F-006 fix).
+	MaxWSClientsPerIP = 10
+)
+
+// CanAcceptClient reports whether the hub has global capacity for another WS client.
+func (h *Hub) CanAcceptClient() bool {
+	return h.ClientCount() < MaxWSClients
+}
+
+// CanAcceptFromIP reports whether the given IP is below its per-IP cap.
+func (h *Hub) CanAcceptFromIP(ip string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.connPerIP[ip] < MaxWSClientsPerIP
+}

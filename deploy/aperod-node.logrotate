@@ -1,0 +1,30 @@
+# /etc/logrotate.d/aperod-node
+#
+# Rotates the aperod-node log file at /var/log/aperod/node.log.
+#
+# This file applies ONLY if an operator has set up a persistent file sink
+# (e.g. ExecStart wrapper that tees stdout to /var/log/aperod/node.log).
+# If you rely purely on journald (StandardOutput=journal in the service file)
+# this file is harmless but unnecessary — journald manages its own store via
+# journald.conf (SystemMaxUse / MaxFileSec).
+#
+# The `copytruncate` option is used instead of move+signal because the Go node
+# does not implement a log-reopen signal handler. copytruncate atomically
+# copies the current log to the rotated file and then truncates the original
+# in place, so the node keeps writing to the same open file descriptor without
+# any signal or restart.
+#
+# Install:
+#   sudo cp aperod-node.logrotate /etc/logrotate.d/aperod-node
+#   sudo logrotate -d /etc/logrotate.d/aperod-node   # dry-run / syntax check
+
+/var/log/aperod/node.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 aperod adm
+}

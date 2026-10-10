@@ -1,0 +1,107 @@
+version: "3.9"
+
+# Local development network with 3 validator nodes + 1 bootnode.
+# Run: docker-compose -f deploy/docker-compose.yml up
+#
+# After startup, check sync status:
+#   curl -s http://localhost:8545 -d '{"jsonrpc":"2.0","method":"apr_getNodeInfo","id":1}'
+
+networks:
+  aperod-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+services:
+  bootnode:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aperod-bootnode
+    networks:
+      aperod-net:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - bootnode-data:/app/data
+    environment:
+      - APEROD_DATA_DIR=/app/data
+      - APEROD_LOG_LEVEL=info
+      - APEROD_P2P_ADDR=/ip4/0.0.0.0/tcp/30303
+    ports:
+      - "30300:30303"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "aperod", "node", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  validator1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aperod-validator1
+    networks:
+      aperod-net:
+        ipv4_address: 172.28.0.11
+    volumes:
+      - validator1-data:/app/data
+    environment:
+      - APEROD_DATA_DIR=/app/data
+      - APEROD_LOG_LEVEL=info
+      - APEROD_P2P_ADDR=/ip4/0.0.0.0/tcp/30303
+    ports:
+      - "30301:30303"
+      - "8545:8545"
+    depends_on:
+      - bootnode
+    restart: unless-stopped
+
+  validator2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aperod-validator2
+    networks:
+      aperod-net:
+        ipv4_address: 172.28.0.12
+    volumes:
+      - validator2-data:/app/data
+    environment:
+      - APEROD_DATA_DIR=/app/data
+      - APEROD_LOG_LEVEL=info
+      - APEROD_P2P_ADDR=/ip4/0.0.0.0/tcp/30303
+    ports:
+      - "30302:30303"
+      - "8546:8545"
+    depends_on:
+      - bootnode
+    restart: unless-stopped
+
+  validator3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aperod-validator3
+    networks:
+      aperod-net:
+        ipv4_address: 172.28.0.13
+    volumes:
+      - validator3-data:/app/data
+    environment:
+      - APEROD_DATA_DIR=/app/data
+      - APEROD_LOG_LEVEL=info
+      - APEROD_P2P_ADDR=/ip4/0.0.0.0/tcp/30303
+    ports:
+      - "30303:30303"
+      - "8547:8545"
+    depends_on:
+      - bootnode
+    restart: unless-stopped
+
+volumes:
+  bootnode-data:
+  validator1-data:
+  validator2-data:
+  validator3-data:

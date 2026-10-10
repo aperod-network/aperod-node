@@ -1,0 +1,36 @@
+name: Build Check
+
+on:
+  push:
+    branches: [main, "verified-history-cleanup", "verified-publication/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: go build & vet & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test application packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(go list ./... | grep -v '^github.com/aperod/aperod/deploy$')
+          test "${#packages[@]}" -gt 0
+          go test -timeout 600s "${packages[@]}"
+      - name: Test privileged deployment fixtures
+        # The backup socket requires root. Tests use temporary fixtures and
+        # mocked services; do not relax that requirement in production code.
+        run: sudo env "PATH=$PATH" go test -timeout 600s ./deploy

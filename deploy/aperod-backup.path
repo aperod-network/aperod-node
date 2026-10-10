@@ -1,0 +1,21 @@
+# ==========================================================
+# Aperod backup path unit — watches for trigger file written
+# by the aperod-api service (no sudo required for that user).
+#
+# See aperod-backup.service for full deploy instructions.
+# ==========================================================
+
+[Unit]
+Description=Watch for Aperod backup trigger
+
+[Path]
+# Fires when this file is created
+PathExists=/run/aperod/backup-trigger
+Unit=aperod-backup.service
+
+# Prevent runaway triggering (max 1 backup per 60 s)
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=1
+
+[Install]
+WantedBy=multi-user.target

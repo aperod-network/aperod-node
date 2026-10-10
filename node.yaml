@@ -1,0 +1,92 @@
+network: testnet
+data_dir: ./data/testnet
+log_level: info
+
+p2p:
+  listen_addr: "/ip4/0.0.0.0/tcp/30303"
+  bootnodes: []
+  max_peers: 50
+  min_peers: 4
+  # Peer IP whitelist (optional). When set, only inbound connections from
+  # the listed IPs / CIDR ranges are accepted. Outbound dials to bootnodes
+  # are not affected. Leave empty (default) for an open network.
+  # peer_whitelist:
+  #   - "1.2.3.4"          # single validator IP
+  #   - "10.0.0.0/8"       # private network range
+  # Rogue-peer / wrong-fork ban knobs.
+  # bad_block_height_lead:  how many blocks ahead of our tip a peer's height must be
+  #                         before it counts as a wrong-fork strike.
+  # bad_block_ban_threshold: strikes within the TTL window before the IP is banned.
+  # bad_block_ban_duration:  how long the ban lasts.
+  bad_block_height_lead: 1000
+  bad_block_ban_threshold: 5
+  bad_block_ban_duration: 24h
+
+consensus:
+  validator_key: "./data/testnet/validator.key"
+  reward_address: "aproegZMzXpwdq4q72SZ4Wih2Li9H8eXE5q71MUabckAfaXrnDCZvBuGp547ozRMNTFpUMnrW1DQzQb5kYUdRLnCHxWHYGTFnC"
+  block_reward_napro: 300000000
+  # 0 = disabled. Set the same future height on every validator.
+  reward_authorization_activation_height: 0
+  # Guardian allocation hard fork remains disabled until an anchored validator
+  # rollout is approved. Both fields must be set together.
+  guardian_fund_activation_height: 0
+  guardian_fund_chain_anchor: ""
+  block_time: "3s"
+  staking_pool_napro: 200000000000000000
+  tail_reward_napro: 100000000
+
+api:
+  enabled: true
+  listen_addr: "127.0.0.1:8545"
+  cors:
+    - "https://aperod.com"
+
+genesis:
+  file: "config/genesis-testnet.yaml"
+
+# Snapshot integrity-check settings.
+# utxo_count_tolerance_pct: maximum allowed percentage difference between the
+# UTXO count recorded in the snapshot and the count in the on-disk DB before
+# the snapshot is considered invalid and a full block scan is triggered.
+# Default: 1 (1%).
+#
+# IMPORTANT for relay nodes bootstrapped via rsync:
+#   The rsync'd snapshot was written against the validator's DB state.  After
+#   rsync the local DB may differ slightly, causing the node to reject the
+#   snapshot and fall back to an all-zeros validator registry → every incoming
+#   block is rejected with "producer X is not the scheduled proposer 00000000".
+#   Set this to 10 or higher when bootstrapping from rsync.  The join-network.sh
+#   --bootstrap-from mode sets this automatically.
+#
+# snapshot:
+#   utxo_count_tolerance_pct: 10   # relay/rsync bootstrap — raise from default 1
+
+# Pruning controls how much historical transaction data is kept on disk.
+# mode: "archive" keeps every byte forever (default — use for validator nodes
+#        that need to serve full historical data).
+# mode: "light"   strips RingCT/Bulletproof TxData from blocks older than
+#        keep_blocks, retaining only block headers and the height index.
+#        Fires automatically in the background every ~100 blocks.
+#        Safe for relay/observer nodes and reduces disk use by ~70 % over time.
+#
+# keep_blocks: 200000 ≈ 6.5 days at 3 s/block.  Adjust to taste.
+#
+pruning:
+  mode: light
+  keep_blocks: 200000
+
+# Memory tuning (optional — sensible defaults apply when omitted).
+#
+# max_in_memory_blocks: sliding-window of blocks kept in RAM for fast access
+#   (reorgs, header-sync, API requests).  Older blocks are evicted but remain
+#   on disk.  Default: 1000 (≈ 50 minutes at 3 s/block).  Lower this on nodes
+#   with very limited RAM; raise it on relay nodes that serve many GetBlock
+#   requests to reduce disk I/O.
+# max_in_memory_blocks: 1000
+#
+# mempool_evict_interval_sec: how often (in seconds) the background eviction
+#   pass removes expired transactions from the mempool.  Default: 300 (5 min).
+#   Lower this to keep a tighter mempool; raise it to reduce GC pressure on
+#   nodes with a small mempool load.
+# mempool_evict_interval_sec: 300
