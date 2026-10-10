@@ -433,34 +433,11 @@ bad_block_height_lead=${_height_lead:-&lt;не задано&gt;}  (безопа�
 fi
 
 # ---------------------------------------------------------------------------
-# Step 1b: Keep /usr/local/bin/aperod_backup.sh in sync with the repo.
-#
-# setup-backup.sh installs the script once and never updates it again.
-# When git pull brings in changes to blockchain/deploy/aperod_backup.sh the
-# running installed copy would silently stay at the old version.  This step
-# detects a mismatch and atomically replaces the installed copy (stage in the
-# same directory, then rename(2)) so the next scheduled backup always uses the
-# current code without ever exposing a partially written file.
-#
-# Security: this step runs as root (update-node.sh requires sudo) so it can
-# legitimately write to root-owned /usr/local/bin/.  The installed copy is
-# root-owned (mode 700, owner root) and is not writable by the aperod user,
-# preserving the privilege boundary between the unprivileged pull user and
-# the root-executed backup service.
-#
-# Logic lives in sync-backup-script.sh (same directory) so it can be sourced
-# and tested independently.  See that file for full documentation.
+# Step 1b: Preserve privileged tools.
+# A binary-source approval is not approval to replace root-executed tools.
+# Never source a tool synchronizer or copy tools from the old checkout here.
 # ---------------------------------------------------------------------------
-# shellcheck source=sync-backup-script.sh
-source "${DEPLOY_DIR}/sync-backup-script.sh"
-echo "==> [1b] Syncing aperod_backup.sh..."
-_sync_backup_script
-
-# Also keep /usr/local/bin/aperod-deploy (copy of deploy/aperod-api-deploy.sh
-# at the monorepo root) fresh — it was previously installed once and never
-# updated by git pull.  Non-fatal if either side is absent on this host.
-echo "==> [1b] Syncing aperod-deploy..."
-_sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-api-deploy.sh"
+echo "==> [1b] Privileged tools retained unchanged; node binary approval does not authorize tool replacement."
 
 # ---------------------------------------------------------------------------
 # Step 1c: Install/refresh the git post-merge hook.
@@ -470,7 +447,7 @@ _sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-ap
 # visibility gap: it detects a mismatch between the repo copy and the
 # installed copy and immediately alerts the operator on stderr (and via
 # Telegram when credentials are available), so they know to run
-# sudo update-node.sh to perform the privileged sync.
+# a separately reviewed tool release for any privileged tool update.
 #
 # We refresh the hook on every update-node.sh run so that changes to the
 # hook script itself are picked up automatically.

@@ -73,7 +73,7 @@ echo "# OLD STALE VERSION — should be replaced by sync" > "$A1_INSTALLED"
 chmod 700 "$A1_INSTALLED"
 
 # Run the sync with explicit paths (no root needed; chown is best-effort).
-_sync_backup_script "$A1_INSTALLED" "$REPO_BACKUP" >/dev/null 2>&1
+_sync_backup_script "$A1_INSTALLED" "$REPO_BACKUP" "$(sha256sum "$REPO_BACKUP" | cut -d' ' -f1)" >/dev/null 2>&1
 
 # Assert the installed copy now matches the repo copy by sha256sum.
 REPO_SUM=$(sha256sum "$REPO_BACKUP"  | awk '{print $1}')
@@ -108,7 +108,7 @@ A2_INODE_BEFORE=$(stat -c '%i' "$A2_INSTALLED" 2>/dev/null \
                || stat -f '%i' "$A2_INSTALLED" 2>/dev/null \
                || echo "unknown")
 
-_sync_backup_script "$A2_INSTALLED" "$REPO_BACKUP" >/dev/null 2>&1
+_sync_backup_script "$A2_INSTALLED" "$REPO_BACKUP" "$(sha256sum "$REPO_BACKUP" | cut -d' ' -f1)" >/dev/null 2>&1
 
 A2_INODE_AFTER=$(stat -c '%i' "$A2_INSTALLED" 2>/dev/null \
               || stat -f '%i' "$A2_INSTALLED" 2>/dev/null \
@@ -209,7 +209,7 @@ A5_INSTALLED="${A5_INST_DIR}/aperod_backup.sh"
 echo "# STALE" > "$A5_INSTALLED"
 chmod 644 "$A5_INSTALLED"
 
-_sync_backup_script "$A5_INSTALLED" "$REPO_BACKUP" >/dev/null 2>&1
+_sync_backup_script "$A5_INSTALLED" "$REPO_BACKUP" "$(sha256sum "$REPO_BACKUP" | cut -d' ' -f1)" >/dev/null 2>&1
 
 A5_MODE=$(stat -c '%a' "$A5_INSTALLED" 2>/dev/null \
         || stat -f '%OLp' "$A5_INSTALLED" 2>/dev/null \
