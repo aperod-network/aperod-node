@@ -149,7 +149,8 @@ fi
 info "Получаем проверенный публичный коммит в отдельном каталоге…"
 mkdir -p "${INSTALL_DIR}"
 node_source_prepare || die "Не удалось получить и проверить выбранный публичный коммит"
-chown -R aperod:aperod "$NODE_SOURCE_JOB"
+# Keep the disposable build tree root-owned and inaccessible to the service
+# account. Root must never stamp/build a repository writable by that account.
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"

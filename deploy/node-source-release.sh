@@ -100,12 +100,14 @@ node_source_prepare() {
     "$APEROD_NODE_SOURCE_COMMIT" "$APEROD_PUBLIC_NODE_ROOT" "$NODE_SOURCE_DIR" || return 1
 }
 
-# Root installers build a verified checkout owned by the service account.
-# Preserve real VCS stamping with one scoped safe.directory, never a global '*'.
+# Root installers retain a private, root-owned checkout for real VCS stamping.
+# Never whitelist a service-account-writable repository for a root build.
 node_source_build_context() {
   [[ "$1" == "${NODE_SOURCE_DIR:-}" && -d "$1/.git" ]] || return 1
+  [[ "$(stat -c %u "$NODE_SOURCE_JOB")" == "$EUID" &&
+     "$(stat -c %u "$1")" == "$EUID" &&
+     "$(stat -c %u "$1/.git")" == "$EUID" ]] || return 1
   _node_source_git_env || return 1
-  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$1"
 }
 
 node_source_candidate_guard() (

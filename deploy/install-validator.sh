@@ -147,7 +147,8 @@ fi
 info "Получаем исходный код Aperod…"
 mkdir -p "${INSTALL_DIR}"
 node_source_prepare || die "Не удалось получить и проверить выбранный публичный коммит"
-chown -R "${APEROD_USER}:${APEROD_USER}" "$NODE_SOURCE_JOB"
+# Build as root only in the private root-owned job, never an account-writable
+# checkout. Runtime directories are assigned to the service account separately.
 GENESIS_SOURCE="${NODE_SOURCE_DIR}/config/genesis-testnet.yaml"
 [[ -f "$GENESIS_SOURCE" && ! -L "$GENESIS_SOURCE" ]] ||
   die "В выбранном публичном коммите отсутствует genesis конфиг; установка остановлена до записи ключей и бинарников"
