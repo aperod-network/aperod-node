@@ -484,7 +484,11 @@ echo "==> [1c] Old checkout/hooks retained unchanged; isolated releases do not u
 # The old binary keeps running untouched.
 # ---------------------------------------------------------------------------
 echo "==> [2/5] Building aperod-node (Go)..."
-if ! sudo -u aperod env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 bash -c "export PATH=\$PATH:/usr/local/go/bin; cd '${BLOCKCHAIN_DIR}' && make CGO_ENABLED=0 build"; then
+if ! sudo -u aperod env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 \
+    GOCACHE="${NODE_SOURCE_JOB}/go-build-cache" \
+    GOPATH="${NODE_SOURCE_JOB}/go-path" \
+    GOMODCACHE="${NODE_SOURCE_JOB}/go-module-cache" \
+    bash -c "export PATH=\$PATH:/usr/local/go/bin; cd '${BLOCKCHAIN_DIR}' && make CGO_ENABLED=0 build"; then
   echo ""
   echo "✗ Build failed — service NOT stopped. The old binary is still running." >&2
 
@@ -928,6 +932,10 @@ _rollout_complete_after_readiness() {
 # Always stop first, install, then start — never the other way around.
 # ---------------------------------------------------------------------------
 echo "==> [3/5] Stopping ${SERVICE_NAME}..."
+node_source_baseline_guard "${BINARY_DST}" || {
+  echo "✗ Running-binary approval changed during the build — service NOT stopped." >&2
+  exit 1
+}
 systemctl stop "${SERVICE_NAME}" || true   # non-fatal if already stopped
 # Wait up to 120 s for the service to fully stop before we try to replace the
 # binary.  A single "sleep 1" is not enough: on shutdown the node flushes a
@@ -996,6 +1004,18 @@ fi
 _rollback_install() {
   local _restored=false _restarted=false _summary
   echo "✗ Binary installation failed — attempting rollback..." >&2
+  # A failed health check can leave the candidate alive and executable-mapped.
+  # Never copy a backup over that process (ETXTBSY) or race a still-running node.
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    if ! systemctl stop "${SERVICE_NAME}"; then
+      echo "✗ Cannot stop failed candidate; backup retained, no rollback copy attempted." >&2
+      return 1
+    fi
+  fi
+  if [[ "$(systemctl show "${SERVICE_NAME}" -p MainPID --value)" != "0" ]]; then
+    echo "✗ Candidate MainPID remains present; backup retained." >&2
+    return 1
+  fi
   if [[ "${_backed_up}" == "true" && -f "${BINARY_BACKUP}" ]]; then
     if /bin/cp "${BINARY_BACKUP}" "${BINARY_DST}" && chmod +x "${BINARY_DST}"; then
       _restored=true
@@ -1041,7 +1061,10 @@ fi
 echo "  Installed: $(${BINARY_DST} --version 2>/dev/null || ls -lh "${BINARY_DST}" | awk '{print $5, $9}')"
 
 # Start the service after the new binary is in place.
-systemctl start "${SERVICE_NAME}"
+if ! systemctl start "${SERVICE_NAME}"; then
+  _rollback_install
+  exit 1
+fi
 echo "  Service started."
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1101,7 @@ else
 Нода не ответила на <code>${HEALTH_URL}</code> за $(( HEALTH_MAX_ATTEMPTS * HEALTH_WAIT_SECS ))с.
 Проверьте логи: <code>journalctl -u ${SERVICE_NAME} -n 100</code>"
 
+    _rollback_install
     exit 1
   fi
 fi

@@ -155,6 +155,7 @@ GENESIS_SOURCE="${NODE_SOURCE_DIR}/config/genesis-testnet.yaml"
 # ── 5. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node (может занять 1–3 минуты)…"
 cd "${NODE_SOURCE_DIR}"
+node_source_build_context "${NODE_SOURCE_DIR}" || die "Не удалось изолировать Git-контекст сборки"
 export GOPATH="/root/go"
 export PATH="$PATH:/usr/local/go/bin"
 

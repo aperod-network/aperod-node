@@ -155,6 +155,7 @@ chown -R aperod:aperod "$NODE_SOURCE_JOB"
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
 cd "${NODE_SOURCE_DIR}"
 export GOPATH="/root/go"
+node_source_build_context "${NODE_SOURCE_DIR}" || die "Не удалось изолировать Git-контекст сборки"
 
 env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off make deps 2>&1 | tail -3
 env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 make CGO_ENABLED=0 build 2>&1 | tail -8
