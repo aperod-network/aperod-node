@@ -29,7 +29,7 @@ type Receipt struct {
 // durable state. Consensus must persist Writes atomically with the block body,
 // canonical height index and tip.
 type PreparedBlock struct {
-	LPoD *store.LPoDSettlement
+	LPoD               *store.LPoDSettlement
 	Height             uint64
 	BlockHash          crypto.Hash32
 	Receipts           []Receipt
@@ -197,6 +197,11 @@ func ValidateMempoolAdmission(store Store, payload *core.AVMPayload) error {
 		}
 	default:
 		return fmt.Errorf("unknown action %d", payload.Action)
+	}
+	// Bound compilation preflight for both submitted and previously stored code.
+	// Replay/consensus keeps ValidateModule's historical rules.
+	if _, err := validateModule(code, MaxAdmissionNestingDepth); err != nil {
+		return fmt.Errorf("module admission: %w", err)
 	}
 	accessList := make([]Access, len(payload.AccessList))
 	for i, access := range payload.AccessList {
