@@ -845,8 +845,14 @@ func snapshotRequest(
 	}
 	defer response.Body.Close()
 	var decoded map[string]interface{}
-	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
-		t.Fatalf("decode %s response: %v", target, err)
+	decoder := json.NewDecoder(response.Body)
+	if err := decoder.Decode(&decoded); err != nil {
+	t.Fatalf("decode %s response: %v", target, err)
+	}
+	// Finish the chunked response before asserting deferred lease accounting.
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+	t.Fatalf("finish %s response: expected EOF, got %v (extra=%#v)", target, err, extra)
 	}
 	return response.StatusCode, decoded
 }
