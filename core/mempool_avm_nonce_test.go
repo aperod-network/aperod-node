@@ -105,6 +105,33 @@ func TestMempoolAVMAdmissionCheckFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMempoolAVMFeePrecedesModuleAdmission(t *testing.T) {
+	pool := avmNonceMempool(t, func([32]byte) (uint64, error) { return 0, nil })
+	checks := 0
+	pool.cfg.AVMAdmissionCheck = func(*AVMPayload) error { checks++; return nil }
+	tx := mempoolAVMTx(t, 0, 1)
+	tx.Fee = 0
+	if err := pool.Add(tx); err == nil {
+		t.Fatal("underfunded transaction accepted")
+	}
+	if checks != 0 {
+		t.Fatal("module admission ran before fee validation")
+	}
+}
+
+func TestMempoolAVMAuthorizationPrecedesModuleAdmission(t *testing.T) {
+	pool := avmNonceMempool(t, func([32]byte) (uint64, error) { return 0, nil })
+	pool.cfg.Verifier = NewTxVerifier(NewUTXOSet())
+	checks := 0
+	pool.cfg.AVMAdmissionCheck = func(*AVMPayload) error { checks++; return nil }
+	if err := pool.Add(mempoolAVMTx(t, 0, 1)); err == nil {
+		t.Fatal("unfunded ring transaction accepted")
+	}
+	if checks != 0 {
+		t.Fatal("module admission ran before transaction authorization")
+	}
+}
+
 func TestMempoolAllowsOnlyOnePendingAVMTransactionPerSigner(t *testing.T) {
 	pool := avmNonceMempool(t, func([32]byte) (uint64, error) { return 0, nil })
 	first := mempoolAVMTx(t, 0, 1)

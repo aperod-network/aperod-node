@@ -9,6 +9,7 @@ package p2p_test
 //   - Strike map is capped (badBlockMaxTrackedIPs) to prevent memory exhaustion.
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -1172,11 +1175,27 @@ func (f *fixedHeightHandler) CurrentHeight() uint64 { return f.height }
 //  2. The test peer announces height = 980 000 in the Ping.
 //  3. The peer sends 20 blocks at height 980 001 (well above ourTip + 1000).
 //  4. After all 20 blocks the peer must NOT be banned, and PeerCount must stay 1.
+type trustedSyncHandler struct {
+	fixedHeightHandler
+	author crypto.ValidatorPubKey
+}
+
+func (h *trustedSyncHandler) ValidateSyncHeader(header core.BlockHeader) error {
+	if !bytes.Equal(header.ValidatorPub, h.author) || !header.VerifySignature() {
+		return fmt.Errorf("untrusted sync header")
+	}
+	return nil
+}
+
 func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 	// Relay node: local chain tip is at 1 000 (just loaded a snapshot).
 	const relayTip = 1_000
 	// Validator (peer) is 979 000 blocks ahead — a realistic post-snapshot gap.
 	const validatorHeight = 980_000
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	h := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
@@ -1186,7 +1205,7 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 		BadBlockBanThreshold: 10,
 		BadBlockHeightLead:   1000,
 		BadBlockBanDuration:  24 * time.Hour,
-	}, &fixedHeightHandler{height: relayTip}, newTestLogger())
+	}, &trustedSyncHandler{fixedHeightHandler: fixedHeightHandler{height: relayTip}, author: pub}, newTestLogger())
 	if err := h.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -1225,11 +1244,16 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 
 	// Send 20 blocks at height 980 001 (validator's next tip block arriving
 	// via gossip while the relay is still filling the 979 000-block gap).
-	// Under the old (broken) logic each block would score a rogue-fork strike.
-	// With the fix, none should: peer.height > ourTip + BadBlockHeightLead.
+	// Authenticated canonical authors remain eligible for synchronization.
 	for i := 0; i < 20; i++ {
+		header := core.BlockHeader{Height: validatorHeight + 1, ValidatorPub: pub,
+			Timestamp: time.Now().UnixNano(), MerkleRoot: core.MerkleRoot(nil)}
+		if err := header.Sign(priv); err != nil {
+			t.Fatal(err)
+		}
 		sb := p2p.SerializedBlock{
-			Header: p2p.SerializedHeader{Height: validatorHeight + 1},
+			Header: p2p.SerializedHeader{Height: header.Height, ValidatorPub: header.ValidatorPub[:],
+				Timestamp: header.Timestamp, MerkleRoot: header.MerkleRoot, Signature: header.Signature},
 		}
 		conn.SetWriteDeadline(time.Now().Add(time.Second))
 		if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
@@ -2298,7 +2322,9 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	// handshake completes or the connection is closed.
 	floodConns := make([]net.Conn, maxPending)
 	for i := 0; i < maxPending; i++ {
-		c, err := net.DialTimeout("tcp", hostAddr, 2*time.Second)
+		dialer := net.Dialer{Timeout: 2 * time.Second,
+			LocalAddr: &net.TCPAddr{IP: net.ParseIP(fmt.Sprintf("127.0.0.%d", i+2))}}
+		c, err := dialer.Dial("tcp", hostAddr)
 		if err != nil {
 			t.Fatalf("flood conn %d: dial: %v", i, err)
 		}
@@ -2488,7 +2514,9 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 				defer wg.Done()
 				readyCh <- struct{}{} // signal: I am at the gate
 				<-startCh             // wait for the simultaneous release
-				c, dialErr := net.DialTimeout("tcp", hostAddr, 3*time.Second)
+				dialer := net.Dialer{Timeout: 3 * time.Second,
+					LocalAddr: &net.TCPAddr{IP: net.ParseIP(fmt.Sprintf("127.0.0.%d", idx+2))}}
+				c, dialErr := dialer.Dial("tcp", hostAddr)
 				if dialErr != nil {
 					if mustSucceed {
 						// Non-fatal from here; caller checks the slice.

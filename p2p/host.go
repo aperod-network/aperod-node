@@ -210,6 +210,16 @@ type Handler interface {
 	GetBlock(hash crypto.Hash32) *core.Block
 }
 
+// BlockValidationHandler validates gossip without changing asynchronous
+// consensus admission or the wire protocol.
+type BlockValidationHandler interface {
+	ValidateBlock(*core.Block) error
+}
+
+type SyncHeaderValidationHandler interface {
+	ValidateSyncHeader(core.BlockHeader) error
+}
+
 // pendingBlockEntry records one outstanding MsgGetBlock request so the
 // stall-detection ticker can log actionable diagnostics if no MsgBlock arrives.
 type pendingBlockEntry struct {
@@ -507,7 +517,9 @@ type Host struct {
 	// executing the TLS handshake.  Guarded by MaxPendingHandshakes;
 	// uses atomic ops so acceptLoop and handleConn coordinate without
 	// holding h.mu.
-	pendingHandshakes atomic.Int64
+	pendingHandshakes   atomic.Int64
+	handshakeMu         sync.Mutex
+	pendingHandshakeIPs map[string]int
 
 	// badBlockCounts tracks out-of-range-block strikes per remote IP.
 	// Entries expire after badBlockStrikeTTL and the map is capped at
@@ -1994,10 +2006,8 @@ func (h *Host) acceptLoop() {
 		// hold one goroutine per connection for up to 10 s.
 		// MaxPendingHandshakes caps the total in-flight handshakes so
 		// the node cannot be goroutine-starved by a connect-flood.
-		if h.cfg.MaxPendingHandshakes > 0 && h.cfg.TLSConfig != nil {
-			cur := h.pendingHandshakes.Add(1)
-			if cur > int64(h.cfg.MaxPendingHandshakes) {
-				h.pendingHandshakes.Add(-1)
+		if h.cfg.TLSConfig != nil {
+			if !h.reserveInboundHandshake(connIP(conn.RemoteAddr().String())) {
 				h.log.Info("MaxPendingHandshakes reached — inbound connection rejected",
 					"limit", h.cfg.MaxPendingHandshakes)
 				conn.Close()
@@ -2652,14 +2662,16 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 	// below).  releaseHS is idempotent; calling it more than once is safe.
 	// We also call it explicitly right after a successful handshake so that
 	// the slot is freed as early as possible rather than at connection close.
-	hsSlotHeld := !outbound && h.cfg.MaxPendingHandshakes > 0 && h.cfg.TLSConfig != nil
+	hsSlotHeld := !outbound && h.cfg.TLSConfig != nil
 	releaseHS := func() {
 		if hsSlotHeld {
-			h.pendingHandshakes.Add(-1)
+			h.releaseInboundHandshake(connIP(conn.RemoteAddr().String()))
 			hsSlotHeld = false
 		}
 	}
 	defer releaseHS() // safety net: covers ban-check return and any other early exit
+	handshakeTimer := time.AfterFunc(h.cfg.HandshakeTimeout, func() { conn.Close() })
+	defer handshakeTimer.Stop()
 
 	// Reject banned peers immediately
 	if h.mgr.IsBanned(addr) {
@@ -2683,7 +2695,6 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 			conn.Close()
 			return
 		}
-		releaseHS()                      // handshake complete — free the slot early, before message loop
 		tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
 		fp := PeerFingerprint(conn)
 		h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)
@@ -2894,6 +2905,9 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 		"peer_height", peerHeight,
 		"direction", map[bool]string{true: "out", false: "in"}[outbound],
 	)
+	// Keep inbound reservations through TLS, identity and application handshake.
+	handshakeTimer.Stop()
+	releaseHS()
 
 	// Initiate header sync only when the peer is not known to be behind us.
 	// Requesting our tip locator from a lagging peer makes its unknown-locator
@@ -3189,6 +3203,9 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		if block != nil {
 			ourTip := h.handler.CurrentHeight()
 			peerIP := connIP(peer.addr)
+			blockValidated := false
+			var validationErr error
+			trustedSyncHeader := false
 
 			// A syncing peer may gossip canonical blocks back to the node that
 			// supplied them, especially when the same validators have parallel
@@ -3316,19 +3333,18 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 			// bare IP so a reconnect on a new source port does not bypass the
 			// enforcement.
 			//
-			// A strike is only warranted when the received block is far ahead of
-			// our tip AND the sending peer itself is NOT far ahead of us.  A peer
-			// that is genuinely further along (peer.height > ourTip+lead) is a
-			// node we are actively syncing from; the blocks it sends at its own
-			// tip arrive via gossip before our sync pipeline has applied the
-			// intermediate blocks.  Counting those as strikes would permanently
-			// ban the validator we are catching up to.
-			//
-			// Rogue peers that fabricate future-height blocks announce a
-			// peer.height at or below our tip (they pretend to be at the same
-			// height), so the second condition catches them.
-			if liveHeightLead := h.badBlockHeightLeadV.Load(); block.Header.Height > ourTip+liveHeightLead &&
-				peer.height <= ourTip+liveHeightLead {
+			// Fully verified data may proceed; remote height is informational only.
+			// Whitelist policy remains independent from verification and relay policy.
+			// Locally verified sync data, not advertised height, grants an exemption.
+			if validator, ok := h.handler.(BlockValidationHandler); ok {
+				validationErr = validator.ValidateBlock(block)
+				blockValidated = validationErr == nil
+			}
+			if validator, ok := h.handler.(SyncHeaderValidationHandler); ok {
+				trustedSyncHeader = validator.ValidateSyncHeader(block.Header) == nil
+			}
+			if liveHeightLead := h.badBlockHeightLeadV.Load(); block.Header.Height > ourTip &&
+				block.Header.Height-ourTip > liveHeightLead && !blockValidated && !trustedSyncHeader {
 				// Whitelisted peers are trusted validators; skip the
 				// strike counter entirely so a temporarily-ahead validator
 				// is never auto-banned for being on a longer fork.
@@ -3437,6 +3453,17 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 			h.badBlockMu.Unlock()
 
 		processBlock:
+			// Also validate branches that skipped directly here under whitelist policy.
+			if !blockValidated && validationErr == nil {
+				if validator, ok := h.handler.(BlockValidationHandler); ok {
+					validationErr = validator.ValidateBlock(block)
+					blockValidated = validationErr == nil
+				}
+			}
+			if validationErr != nil {
+				h.log.Debug("block admission rejected", "err", validationErr)
+				return nil
+			}
 			// Rate-limit block ingestion per peer.  The token bucket
 			// sleeps the dispatch goroutine (which is the only reader
 			// for this peer's conn) when tokens are exhausted, creating
@@ -3479,7 +3506,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					h.requestHeaders(peer)
 				}
 			}
-			if isNew {
+			if isNew && blockValidated {
 				sb := blockToMsg(block)
 				fromAddr := peer.addr
 				h.mu.RLock()

@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	MaxCodeSize     = 1 << 20
-	MaxMemoryPages  = 512 // 32 MiB at 64 KiB per Wasm page.
-	MaxInputSize    = 64 << 10
-	MaxStateKeySize = 64
-	MaxStateValue   = 64 << 10
+	MaxCodeSize              = 1 << 20
+	MaxMemoryPages           = 512 // 32 MiB at 64 KiB per Wasm page.
+	MaxInputSize             = 64 << 10
+	MaxStateKeySize          = 64
+	MaxStateValue            = 64 << 10
+	MaxAdmissionNestingDepth = 128 // Local pool policy; not a historical consensus limit.
 )
 
 var allowedImports = map[string]struct{}{
@@ -37,6 +38,10 @@ type ValidationReport struct {
 // indirect calls, WASI, imported memory, threads, SIMD, host pointers, time,
 // filesystem, network or random-number APIs.
 func ValidateModule(code []byte) (ValidationReport, error) {
+	return validateModule(code, 0)
+}
+
+func validateModule(code []byte, maxDepth int) (ValidationReport, error) {
 	var report ValidationReport
 	if len(code) == 0 {
 		return report, fmt.Errorf("avm: empty Wasm module")
@@ -85,7 +90,7 @@ func ValidateModule(code []byte) (ValidationReport, error) {
 		if hasFloatType(body.LocalTypes) {
 			return report, fmt.Errorf("avm: function %d has floating-point locals", functionIndex)
 		}
-		count, parseErr := validateInstructions(body.Body, importCount)
+		count, parseErr := validateInstructionsBounded(body.Body, importCount, maxDepth)
 		if parseErr != nil {
 			return report, fmt.Errorf("avm: function %d: %w", functionIndex, parseErr)
 		}
@@ -111,7 +116,12 @@ func isFloatType(valueType wasm.ValueType) bool {
 }
 
 func validateInstructions(body []byte, importCount uint32) (uint64, error) {
+	return validateInstructionsBounded(body, importCount, 0)
+}
+
+func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) (uint64, error) {
 	var count uint64
+	depth := 0
 	for offset := 0; offset < len(body); {
 		op := body[offset]
 		offset++
@@ -133,11 +143,19 @@ func validateInstructions(body []byte, importCount uint32) (uint64, error) {
 				return 0, fmt.Errorf("calls to local functions are forbidden in AVM v1")
 			}
 		case op == byte(wasm.OpcodeBlock), op == byte(wasm.OpcodeIf):
+			depth++
+			if maxDepth > 0 && depth > maxDepth {
+				return 0, fmt.Errorf("admission nesting exceeds %d", maxDepth)
+			}
 			n, err := skipBlockType(body[offset:])
 			if err != nil {
 				return 0, err
 			}
 			offset += n
+		case op == byte(wasm.OpcodeEnd):
+			if depth > 0 {
+				depth--
+			}
 		case op == byte(wasm.OpcodeLocalGet), op == byte(wasm.OpcodeLocalSet),
 			op == byte(wasm.OpcodeLocalTee), op == byte(wasm.OpcodeGlobalGet),
 			op == byte(wasm.OpcodeGlobalSet):

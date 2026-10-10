@@ -217,10 +217,6 @@ func (m *Mempool) Add(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
-	if err := m.validateAVMNonce(&tx); err != nil {
-		return err
-	}
-
 	// Full RingCT cryptographic verification (ring sigs, range proofs, Pedersen balance).
 	// C-0/C-1: prevents supply inflation via forged AmountCommit or unbound stake amount.
 	// Stake txs are included — they carry ring inputs whose proofs must be valid.
@@ -261,6 +257,10 @@ func (m *Mempool) Add(tx Transaction) error {
 		}
 	}
 
+	// Module preflight follows authorization, size and fee validation.
+	if err := m.validateAVMNonce(&tx); err != nil {
+		return err
+	}
 	hash := tx.Hash()
 
 	var stakeSenderKey string

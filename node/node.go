@@ -501,6 +501,29 @@ func (a *p2pAdapter) OnBlock(block *core.Block) {
 	}
 }
 
+func (a *p2pAdapter) ValidateBlock(block *core.Block) error {
+	return a.blockV.VerifyBlock(block)
+}
+
+func (a *p2pAdapter) ValidateSyncHeader(header core.BlockHeader) error {
+	registry := a.engine.Registry()
+	if registry == nil || !registry.IsActive(header.ValidatorPub) {
+		return fmt.Errorf("sync header author not active")
+	}
+	authority := header.ValidatorPub
+	if resolver, ok := any(registry).(interface {
+		SignatureAuthority(crypto.ValidatorPubKey, uint64) crypto.ValidatorPubKey
+	}); ok {
+		authority = resolver.SignatureAuthority(header.ValidatorPub, header.Height)
+	}
+	signature := header.Signature
+	header.Signature = nil
+	if !authority.Verify(header.Hash(), signature) {
+		return fmt.Errorf("sync header signature invalid")
+	}
+	return nil
+}
+
 func (a *p2pAdapter) OnTransaction(tx *core.Transaction) {
 	if err := a.mempool.Add(*tx); err != nil {
 		a.log.Debug("p2p: tx rejected", "err", err)
