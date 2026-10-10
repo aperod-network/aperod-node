@@ -149,12 +149,14 @@ fi
 info "Получаем проверенный публичный коммит в отдельном каталоге…"
 mkdir -p "${INSTALL_DIR}"
 node_source_prepare || die "Не удалось получить и проверить выбранный публичный коммит"
-chown -R aperod:aperod "$NODE_SOURCE_JOB"
+# Keep the disposable build tree root-owned and inaccessible to the service
+# account. Root must never stamp/build a repository writable by that account.
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
 cd "${NODE_SOURCE_DIR}"
 export GOPATH="/root/go"
+node_source_build_context "${NODE_SOURCE_DIR}" || die "Не удалось изолировать Git-контекст сборки"
 
 env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off make deps 2>&1 | tail -3
 env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 make CGO_ENABLED=0 build 2>&1 | tail -8
