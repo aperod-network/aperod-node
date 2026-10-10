@@ -32,23 +32,23 @@ section_guard() { printf '\n== %s ==\n' "$*"; }
 
 section_guard "destructive entrypoints call the shared guard before mutation"
 for pair in \
-  "blockchain/deploy/install-node.sh:source_checkout_guard \"\$INSTALL_DIR\"" \
-  "blockchain/deploy/uninstall-validator.sh:source_checkout_guard \"\$INSTALL_DIR\""; do
+  "install-node.sh:node_source_pin_guard" \
+  "uninstall-validator.sh:source_checkout_guard \"\$INSTALL_DIR\""; do
   script="${pair%%:*}"
   expected="${pair#*:}"
-  if grep -Fq "$expected" "$SCRIPT_DIR/../../$script"; then
+  if grep -Fq "$expected" "$SCRIPT_DIR/$script"; then
     pass "$script invokes the shared source guard"
   else
     fail "$script invokes the shared source guard"
   fi
 done
-INSTALL_GUARD_LINE=$(grep -nF 'source_checkout_guard "$INSTALL_DIR"' "$SCRIPT_DIR/install-node.sh" | head -1 | cut -d: -f1)
-INSTALL_PULL_LINE=$(grep -nF 'git -C "${INSTALL_DIR}" pull --ff-only' "$SCRIPT_DIR/install-node.sh" | head -1 | cut -d: -f1)
+INSTALL_GUARD_LINE=$(grep -nF 'node_source_pin_guard' "$SCRIPT_DIR/install-node.sh" | head -1 | cut -d: -f1)
+INSTALL_PULL_LINE=$(grep -nF 'node_source_prepare' "$SCRIPT_DIR/install-node.sh" | head -1 | cut -d: -f1)
 if [[ -n "$INSTALL_GUARD_LINE" && -n "$INSTALL_PULL_LINE" ]] &&
    (( INSTALL_GUARD_LINE < INSTALL_PULL_LINE )); then
-  pass "install-node guard runs before its git pull"
+  pass "install-node pin guard runs before isolated source acquisition"
 else
-  fail "install-node guard runs before its git pull"
+  fail "install-node pin guard runs before isolated source acquisition"
 fi
 UNINSTALL_GUARD_LINE=$(grep -nF 'source_checkout_guard "$INSTALL_DIR"' "$SCRIPT_DIR/uninstall-validator.sh" | head -1 | cut -d: -f1)
 UNINSTALL_DATA_GUARD_LINE=$(grep -nF 'uninstall_runtime_data_guard || exit 1' "$SCRIPT_DIR/uninstall-validator.sh" | head -1 | cut -d: -f1)
@@ -144,6 +144,7 @@ printf 'data_dir: %s\n  data_dir: %s\n' "$EXTERNAL" "$EXTERNAL" > "$CONFIG"
 assert_rejected "ambiguous duplicate data_dir entries are rejected" \
   source_checkout_guard "$CLEAN" "" "$CONFIG"
 
+if [[ -f "$SCRIPT_DIR/update-source-staging.sh" ]]; then
 section_guard "source-only sparse staging excludes both chain-data trees and fast-forwards"
 ORIGIN="$TMP/origin"
 git init -q --bare "$ORIGIN"
@@ -277,6 +278,12 @@ APEROD_SOURCE_STAGING_TEST_MODE=1 \
    -z "$(git -C "$STAGING" status --porcelain)" ]] &&
   pass "updated staging remains clean and excludes both chain-data trees" ||
   fail "updated staging remains clean and excludes both chain-data trees"
+elif [[ -f "$SCRIPT_DIR/../../blockchain/go.mod" ]]; then
+  fail "workspace source-staging helper is required"
+else
+  section_guard "private source staging is not part of the standalone node distribution"
+  printf 'NOT_APPLICABLE source-staging-only fixtures; all shared source/data guards ran\n'
+fi
 
 printf '\nResult: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

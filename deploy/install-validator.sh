@@ -19,13 +19,23 @@ APEROD_USER="aperod"
 INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
-GO_VERSION="1.23.4"
+GO_VERSION="1.26.9"
 P2P_PORT=30303
 RPC_PORT=8545
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/source-safe-guard.sh"
-source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" ||
-  die "Установка остановлена защитой исходников; существующие данные и файлы не изменены"
+source "${SCRIPT_DIR}/node-source-release.sh"
+node_source_pin_guard || die "Нужен явно выбранный публичный коммит"
+[[ ! -e /usr/local/bin/aperod-node && ! -e "${CONFIG_DIR}/node.yaml" ]] ||
+  die "Узел уже установлен: используйте update-node.sh с проверенным baseline"
+node_source_fresh_state_guard "$DATA_DIR" "$CONFIG_DIR" ||
+  die "Существующие данные/конфигурацию нельзя переустанавливать как новый узел"
+# A bootstrap package is independent of INSTALL_DIR and must be complete before
+# installing binaries or creating a validator identity/configuration.
+for bootstrap_file in ensure-dropin.sh gomemlimit-policy.sh aperod-node-watchdog.sh \
+  aperod-node-watchdog.service aperod-node-watchdog.timer; do
+  [[ -f "${SCRIPT_DIR}/${bootstrap_file}" && ! -L "${SCRIPT_DIR}/${bootstrap_file}" ]] ||
+    die "Неполный bootstrap package: отсутствует ${bootstrap_file}"
+done
 
 echo -e "
 ${BOLD}╔════════════════════════════════════════════════════════════╗
@@ -135,24 +145,23 @@ fi
 
 # ── 4. Клонирование репозитория ───────────────────────────
 info "Получаем исходный код Aperod…"
-TARBALL_URL="https://github.com/aperod-network/aperod-node/archive/refs/heads/main.tar.gz"
-rm -rf "${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
-info "Скачиваем архив исходного кода…"
-wget -q "${TARBALL_URL}" -O /tmp/aperod-src.tar.gz \
-  || die "Не удалось скачать ${TARBALL_URL}"
-tar -xzf /tmp/aperod-src.tar.gz -C "${INSTALL_DIR}" --strip-components=1
-rm -f /tmp/aperod-src.tar.gz
-ok "Исходный код получен в ${INSTALL_DIR}"
+node_source_prepare || die "Не удалось получить и проверить выбранный публичный коммит"
+chown -R "${APEROD_USER}:${APEROD_USER}" "$NODE_SOURCE_JOB"
+GENESIS_SOURCE="${NODE_SOURCE_DIR}/config/genesis-testnet.yaml"
+[[ -f "$GENESIS_SOURCE" && ! -L "$GENESIS_SOURCE" ]] ||
+  die "В выбранном публичном коммите отсутствует genesis конфиг; установка остановлена до записи ключей и бинарников"
 
 # ── 5. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node (может занять 1–3 минуты)…"
-cd "${INSTALL_DIR}"
+cd "${NODE_SOURCE_DIR}"
 export GOPATH="/root/go"
 export PATH="$PATH:/usr/local/go/bin"
 
-make deps 2>&1 | tail -5
-make build 2>&1 | tail -10
+env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off make deps 2>&1 | tail -5
+env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 make CGO_ENABLED=0 build 2>&1 | tail -10
+node_source_candidate_guard "$NODE_SOURCE_DIR" "$NODE_SOURCE_DIR/build/aperod-node" ||
+  die "Бинарник не соответствует чистому выбранному коммиту или не является portable"
 
 if [[ ! -f "build/aperod-node" ]]; then
   die "Сборка не удалась — файл build/aperod-node не найден. Проверьте вывод выше."
@@ -265,12 +274,8 @@ info "Внешний IP: ${MY_IP}"
 
 # ── 9. Копируем genesis конфиг ────────────────────────────
 mkdir -p "${CONFIG_DIR}"
-if [[ -f "${INSTALL_DIR}/config/genesis-testnet.yaml" ]]; then
-  cp "${INSTALL_DIR}/config/genesis-testnet.yaml" "${CONFIG_DIR}/genesis-testnet.yaml"
-  ok "Genesis конфиг скопирован: ${CONFIG_DIR}/genesis-testnet.yaml"
-else
-  warn "Файл genesis не найден. Нода не запустится без него."
-fi
+cp "$GENESIS_SOURCE" "${CONFIG_DIR}/genesis-testnet.yaml"
+ok "Genesis конфиг скопирован из проверенного коммита: ${CONFIG_DIR}/genesis-testnet.yaml"
 
 # ── 10. Конфигурация ноды ─────────────────────────────────
 command -v openssl >/dev/null 2>&1 || die "openssl необходим для генерации API-ключа"
@@ -363,7 +368,7 @@ chown -R "${APEROD_USER}:${APEROD_USER}" "${DATA_DIR}"
 
 # Write / verify memory-protection drop-ins (timeout.conf + gomemlimit.conf)
 # and call daemon-reload so the drop-ins are active before the service starts.
-bash "${INSTALL_DIR}/deploy/ensure-dropin.sh"
+bash "${SCRIPT_DIR}/ensure-dropin.sh"
 systemctl enable aperod-node
 systemctl start  aperod-node
 ok "Сервис aperod-node запущен"
@@ -373,10 +378,10 @@ ok "Сервис aperod-node запущен"
 # GET /api/v1/status every 60 s and calls `systemctl restart aperod-node`
 # if the probe does not return HTTP 200 within 5 s.
 info "Устанавливаем watchdog для aperod-node…"
-cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.sh" /usr/local/bin/aperod-node-watchdog.sh
+cp "${SCRIPT_DIR}/aperod-node-watchdog.sh" /usr/local/bin/aperod-node-watchdog.sh
 chmod +x /usr/local/bin/aperod-node-watchdog.sh
-cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.service" /etc/systemd/system/
-cp "${INSTALL_DIR}/deploy/aperod-node-watchdog.timer"   /etc/systemd/system/
+cp "${SCRIPT_DIR}/aperod-node-watchdog.service" /etc/systemd/system/
+cp "${SCRIPT_DIR}/aperod-node-watchdog.timer"   /etc/systemd/system/
 # Create optional env file for Telegram alerts (operator fills in credentials)
 mkdir -p /etc/aperod
 if [[ ! -f /etc/aperod/watchdog.env ]]; then

@@ -19,7 +19,7 @@ INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
 WALLET_DIR="/etc/aperod/wallet"
-GO_VERSION="1.23.4"
+GO_VERSION="1.26.9"
 REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
@@ -27,9 +27,12 @@ RPC_PORT=8545
 # Resolve script directory early — referenced in step 8b (bootnode) and later
 # steps (watchdog, backup, etc.).  Must be set before any ${SCRIPT_DIR} use.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/source-safe-guard.sh"
-source_checkout_guard "$INSTALL_DIR" "$DATA_DIR" "${APEROD_CONFIG_FILE:-${CONFIG_DIR}/node.yaml}" ||
-  die "Установка остановлена защитой исходников; существующие данные и файлы не изменены"
+source "${SCRIPT_DIR}/node-source-release.sh"
+node_source_pin_guard || die "Нужен явно выбранный публичный коммит"
+[[ ! -e /usr/local/bin/aperod-node && ! -e "${CONFIG_DIR}/node.yaml" ]] ||
+  die "Узел уже установлен: используйте update-node.sh с проверенным baseline"
+node_source_fresh_state_guard "$DATA_DIR" "$CONFIG_DIR" ||
+  die "Существующие данные/конфигурацию нельзя переустанавливать как новый узел"
 
 # ── Аргументы командной строки ────────────────────────────
 # --primary-ip <IP>   Публичный IP основного (primary) узла.
@@ -142,73 +145,21 @@ else
 fi
 
 # ── 3. Клонирование репозитория ───────────────────────────
-# We use `git clone` (not a tarball) so the install directory is a proper
-# git checkout.  This is required for two reasons:
-#
-#   a) `update-node.sh` later runs `git pull` to receive updates.
-#   b) The post-merge hook (step 12b) is installed into `.git/hooks/`.
-#      Without a git repo the hook directory does not exist and the hook
-#      cannot fire after bare `git pull` calls — which is the exact failure
-#      mode this task exists to prevent.
-#
-# Three cases handled explicitly:
-#   1. .git exists → pull (idempotent re-run or update).
-#   2. Directory is non-empty but has no .git → prior tarball install detected;
-#      print clear migration instructions and abort so the operator decides.
-#   3. Directory is absent or empty → fresh clone.
-info "Получаем исходный код Aperod (git clone)…"
-REPO_URL_GIT="https://github.com/aperod-network/aperod-node.git"
+# Old clones and runtime files in INSTALL_DIR are never checkout targets.
+info "Получаем проверенный публичный коммит в отдельном каталоге…"
 mkdir -p "${INSTALL_DIR}"
-
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  # ── Case 1: existing git repo — pull latest ──────────────────────────────
-  info "  Репозиторий уже существует — обновляем через git pull…"
-  chown -R aperod:aperod "${INSTALL_DIR}"
-  sudo -u aperod git -C "${INSTALL_DIR}" pull --ff-only \
-    || die "git pull не удался. Проверьте подключение к GitHub."
-  ok "Репозиторий обновлён в ${INSTALL_DIR}"
-
-elif [[ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]]; then
-  # ── Case 2: non-empty directory without .git → prior tarball install ─────
-  # git clone would fail on a non-empty target.  Require the operator to
-  # convert explicitly so we never silently overwrite production data.
-  echo ""
-  echo -e "${RED}═══════════════════════════════════════════════════${NC}"
-  echo -e "${RED}  Обнаружена существующая установка (не git-репо)  ${NC}"
-  echo -e "${RED}═══════════════════════════════════════════════════${NC}"
-  echo ""
-  echo "  ${INSTALL_DIR} содержит файлы, но не является git-репозиторием."
-  echo "  Вероятно, это старая установка через тарбол."
-  echo ""
-  echo "  ── Как конвертировать в git-репозиторий ──────────────"
-  echo "  cd ${INSTALL_DIR}"
-  echo "  git init"
-  echo "  git remote add origin ${REPO_URL_GIT}"
-  echo "  git fetch --depth=1 origin main"
-  echo "  git reset --hard origin/main"
-  echo "  sudo bash deploy/install-node.sh   # повторный запуск"
-  echo "  ──────────────────────────────────────────────────────"
-  echo ""
-  die "Прервано. Выполните конвертацию выше, затем повторите запуск."
-
-else
-  # ── Case 3: fresh install — clone as aperod ──────────────────────────────
-  # Clone as the aperod user so the working tree and .git directory are owned
-  # by the pull user from the start.  The aperod account was created at step
-  # 2b; `sudo -u aperod` is now safe to use.
-  chown aperod:aperod "${INSTALL_DIR}"
-  sudo -u aperod git clone --depth=1 "${REPO_URL_GIT}" "${INSTALL_DIR}" \
-    || die "git clone не удался. Проверьте подключение к GitHub."
-  ok "Репозиторий клонирован в ${INSTALL_DIR}"
-fi
+node_source_prepare || die "Не удалось получить и проверить выбранный публичный коммит"
+chown -R aperod:aperod "$NODE_SOURCE_JOB"
 
 # ── 4. Сборка бинарников ──────────────────────────────────
 info "Компилируем aperod-node и aperod CLI (1–3 минуты)…"
-cd "${INSTALL_DIR}"
+cd "${NODE_SOURCE_DIR}"
 export GOPATH="/root/go"
 
-make deps 2>&1 | tail -3
-make build 2>&1 | tail -8
+env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off make deps 2>&1 | tail -3
+env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 make CGO_ENABLED=0 build 2>&1 | tail -8
+node_source_candidate_guard "$NODE_SOURCE_DIR" "$NODE_SOURCE_DIR/build/aperod-node" ||
+  die "Бинарник не соответствует чистому выбранному коммиту или не является portable"
 
 if [[ ! -f "build/aperod-node" || ! -f "build/aperod" ]]; then
   die "Сборка не удалась — проверьте вывод выше"
@@ -739,16 +690,7 @@ fi
 # The actual privileged copy remains an explicit operator action (update-node.sh).
 #
 # Tarball installs have no .git directory — the step is a silent no-op.
-info "Устанавливаем git post-merge hook (оповещение о расхождении aperod_backup.sh)…"
-HOOK_SRC="${SCRIPT_DIR}/post-merge"
-GIT_HOOKS_DIR="${INSTALL_DIR}/.git/hooks"
-if [[ -d "${GIT_HOOKS_DIR}" && -f "${HOOK_SRC}" ]]; then
-  cp "${HOOK_SRC}" "${GIT_HOOKS_DIR}/post-merge"
-  chmod +x "${GIT_HOOKS_DIR}/post-merge"
-  ok "post-merge hook установлен: ${GIT_HOOKS_DIR}/post-merge"
-else
-  info "  .git/hooks не найден — пропускаем (установка через тарбол, без git)."
-fi
+info "Старый Git-клон и его hooks не изменяются. Обновления выполняются через проверенный update-node.sh."
 
 # Проверяем что стартовал (только если --primary-ip был передан)
 if [[ -n "${PRIMARY_NODE_IP}" ]]; then

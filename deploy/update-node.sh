@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update-node.sh — Pull latest source, rebuild the Go node binary, and restart
+# update-node.sh — Build an approved isolated public commit and restart
 #                  the aperod-node systemd service.
 #
 # Run this script instead of manually building and copying the binary after
@@ -62,9 +62,14 @@ BINARY_SRC="${BLOCKCHAIN_DIR}/build/aperod-node"
 HEALTH_URL="http://localhost:8545/api/v1/status"
 STATS_URL="http://localhost:8545/api/v1/network/stats"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${DEPLOY_DIR}/source-safe-guard.sh"
-source_checkout_guard "$APEROD_DIR" "" "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" ||
-  { echo "✗ Source safety guard refused the live checkout; no deploy changes were made." >&2; exit 1; }
+source "${DEPLOY_DIR}/node-source-release.sh"
+node_source_baseline_guard "$BINARY_DST" ||
+  { echo "✗ Public source/baseline approval refused; no deploy changes were made." >&2; exit 1; }
+node_source_prepare || exit 1
+chown -R aperod:aperod "$NODE_SOURCE_JOB"
+LIVE_BLOCKCHAIN_DIR="$BLOCKCHAIN_DIR"
+BLOCKCHAIN_DIR="$NODE_SOURCE_DIR"
+BINARY_SRC="${BLOCKCHAIN_DIR}/build/aperod-node"
 
 # Health-check tunables (override via environment)
 HEALTH_MAX_ATTEMPTS="${HEALTH_MAX_ATTEMPTS:-15}"
@@ -378,8 +383,8 @@ fi
 # ---------------------------------------------------------------------------
 # Step 1: Pull latest source
 # ---------------------------------------------------------------------------
-echo "==> [1/5] Pulling latest source as aperod..."
-sudo -u aperod git -C "$APEROD_DIR" pull
+echo "==> [1/5] Fetching the approved public commit in a clean independent directory..."
+echo "  Verified detached public source: ${APEROD_NODE_SOURCE_COMMIT}"
 
 # ---------------------------------------------------------------------------
 # Step 1a: Warn if node.yaml still carries dangerous ban-threshold defaults.
@@ -472,23 +477,14 @@ _sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-ap
 #
 # If .git/hooks does not exist (tarball install) the step is a no-op.
 # ---------------------------------------------------------------------------
-echo "==> [1c] Installing/refreshing git post-merge hook..."
-HOOK_SRC="${DEPLOY_DIR}/post-merge"
-GIT_HOOKS_DIR="${APEROD_DIR}/.git/hooks"
-if [[ -d "${GIT_HOOKS_DIR}" && -f "${HOOK_SRC}" ]]; then
-  cp "${HOOK_SRC}" "${GIT_HOOKS_DIR}/post-merge"
-  chmod +x "${GIT_HOOKS_DIR}/post-merge"
-  echo "  [hook] post-merge hook installed: ${GIT_HOOKS_DIR}/post-merge"
-else
-  echo "  [hook] ${GIT_HOOKS_DIR} not found — skipping post-merge hook install (tarball install)."
-fi
+echo "==> [1c] Old checkout/hooks retained unchanged; isolated releases do not use post-merge."
 
 # ---------------------------------------------------------------------------
 # Step 2: Rebuild Go binary — if this fails, abort before touching the service.
 # The old binary keeps running untouched.
 # ---------------------------------------------------------------------------
 echo "==> [2/5] Building aperod-node (Go)..."
-if ! sudo -u aperod bash -c "export PATH=\$PATH:/usr/local/go/bin; cd '${BLOCKCHAIN_DIR}' && make build"; then
+if ! sudo -u aperod env CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 bash -c "export PATH=\$PATH:/usr/local/go/bin; cd '${BLOCKCHAIN_DIR}' && make CGO_ENABLED=0 build"; then
   echo ""
   echo "✗ Build failed — service NOT stopped. The old binary is still running." >&2
 
@@ -504,6 +500,9 @@ if [[ ! -f "${BINARY_SRC}" ]]; then
   echo "✗ Build succeeded but binary not found at ${BINARY_SRC}" >&2
   exit 1
 fi
+node_source_candidate_guard "$NODE_SOURCE_DIR" "$BINARY_SRC" || {
+  echo "✗ Candidate provenance verification failed; running binary not replaced." >&2; exit 1;
+}
 
 # ---------------------------------------------------------------------------
 # Step 2b: Guard — abort if the fresh binary is dynamically linked.
@@ -630,7 +629,7 @@ _resolve_validator_key_path() {
   fi
 
   # Fallback 1: the standard production on-disk layout.
-  local prod_key="${BLOCKCHAIN_DIR}/data/testnet/validator.key"
+  local prod_key="${LIVE_BLOCKCHAIN_DIR}/data/testnet/validator.key"
   if [[ -f "${prod_key}" ]]; then
     printf '%s\n' "${prod_key}"
     return 0
@@ -638,7 +637,7 @@ _resolve_validator_key_path() {
 
   # Fallback 2: glob under the blockchain data tree (first match wins).
   local globbed
-  globbed=$(find "${BLOCKCHAIN_DIR}" -maxdepth 4 -name validator.key -type f 2>/dev/null | head -1 || true)
+  globbed=$(find "${LIVE_BLOCKCHAIN_DIR}" -maxdepth 4 -name validator.key -type f 2>/dev/null | head -1 || true)
   if [[ -n "${globbed}" ]]; then
     printf '%s\n' "${globbed}"
     return 0

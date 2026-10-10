@@ -174,8 +174,8 @@ SCEN
 
 # ── K1 / K7: path resolution from node.yaml and prod-layout fallback ──────────
 run_resolve() {
-    local node_yaml="$1" blockchain_dir="$2"
-    RESOLVE_SRC="$RESOLVE_SRC" BLOCKCHAIN_DIR="$blockchain_dir" \
+    local node_yaml="$1" live_dir="$2" build_dir="${3:-$2}"
+    RESOLVE_SRC="$RESOLVE_SRC" LIVE_BLOCKCHAIN_DIR="$live_dir" BLOCKCHAIN_DIR="$build_dir" \
         bash -s "$node_yaml" <<'SCEN'
 set -uo pipefail
 eval "$RESOLVE_SRC"
@@ -217,15 +217,36 @@ YAML
     fi
 }
 
-# K7: no node.yaml → falls back to the standard prod layout under BLOCKCHAIN_DIR
+# K7: no node.yaml → falls back to the standard live runtime layout
 {
     rt="$WORKDIR/k7"; mkdir -p "$rt/data/testnet"
     : > "$rt/data/testnet/validator.key"
     got="$(run_resolve "$rt/does-not-exist.yaml" "$rt")"
     if [[ "$got" == "$rt/data/testnet/validator.key" ]]; then
-        pass_test "K7: falls back to prod layout (BLOCKCHAIN_DIR/data/testnet/validator.key)"
+        pass_test "K7: falls back to prod layout (LIVE_BLOCKCHAIN_DIR/data/testnet/validator.key)"
     else
         fail_test "K7: expected prod-layout fallback, got '$got'"
+    fi
+}
+
+# K7b/c: an isolated source checkout must never become a runtime-key authority.
+{
+    live="$WORKDIR/k7b/live"; build="$WORKDIR/k7b/build"
+    mkdir -p "$live/data/testnet" "$build/data/testnet"
+    printf 'synthetic-live-key\n' > "$live/data/testnet/validator.key"
+    printf 'synthetic-build-key\n' > "$build/data/testnet/validator.key"
+    got="$(run_resolve "$live/missing.yaml" "$live" "$build")"
+    if [[ "$got" == "$live/data/testnet/validator.key" ]]; then
+        pass_test "K7b: runtime fallback ignores a key in isolated build source"
+    else
+        fail_test "K7b: isolated build source replaced runtime key authority"
+    fi
+    rm "$live/data/testnet/validator.key"
+    got="$(run_resolve "$live/missing.yaml" "$live" "$build")"
+    if [[ -z "$got" && "$(cat "$build/data/testnet/validator.key")" == "synthetic-build-key" ]]; then
+        pass_test "K7c: source-only key is neither selected nor changed"
+    else
+        fail_test "K7c: source-only key must not be selected"
     fi
 }
 

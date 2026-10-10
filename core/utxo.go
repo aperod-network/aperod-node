@@ -1,11 +1,11 @@
 package core
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
-	"math/rand"
+	"io"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/aperod/aperod/crypto"
 )
@@ -698,13 +698,13 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 		for i, out := range tx.Outputs {
 			key := UTXOKey{TxHash: txHash, OutputIndex: uint32(i)}
 			u := &UTXO{
-				TxHash:          txHash,
-				OutputIndex:     uint32(i),
-				OneTimePub:      out.OneTimePub,
-				TxPubKey:        out.TxPubKey,
-				AmountCommit:    out.AmountCommit,
-				EncAmount:       out.EncAmount,
-				BlockHeight:     block.Header.Height,
+				TxHash:         txHash,
+				OutputIndex:    uint32(i),
+				OneTimePub:     out.OneTimePub,
+				TxPubKey:       out.TxPubKey,
+				AmountCommit:   out.AmountCommit,
+				EncAmount:      out.EncAmount,
+				BlockHeight:    block.Header.Height,
 				ProtocolLocked: tx.IsGuardianFund(),
 			}
 			s.utxos[key] = u
@@ -908,11 +908,20 @@ func (s *UTXOSet) IsStaked(txHash crypto.Hash32, outIdx uint32) bool {
 // Any UTXO whose OneTimePub appears in exclude is omitted; callers use this to
 // prevent the real input from appearing as its own decoy.
 //
-// Selection is randomised with a time-seeded PRNG (decoys are public knowledge;
-// randomness serves privacy, not security).  If fewer than count candidates
+// Selection uses cryptographic entropy to protect the anonymity set.
+// If fewer than count candidates
 // remain after exclusions, all available candidates are returned — txBuildRing
 // fills the remaining ring slots with Phase 1 random keys.
 func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []DecoyUTXO {
+	out, _ := s.sampleDecoys(count, exclude, cryptorand.Reader)
+	return out
+}
+
+// The reader is scoped to one call so tests never replace process-wide entropy.
+func (s *UTXOSet) sampleDecoys(count int, exclude map[crypto.Point32]bool, entropy io.Reader) ([]DecoyUTXO, error) {
+	if count <= 0 {
+		return nil, nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -923,30 +932,7 @@ func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []Dec
 		}
 	}
 
-	n := len(candidates)
-	want := count
-	if want > n {
-		want = n
-	}
-	if want == 0 {
-		return nil
-	}
-
-	// Fisher-Yates partial shuffle to pick `want` items in random order.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // privacy, not security
-	for i := 0; i < want; i++ {
-		j := i + rng.Intn(n-i)
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	}
-
-	out := make([]DecoyUTXO, want)
-	for i := 0; i < want; i++ {
-		out[i] = DecoyUTXO{
-			OneTimePub:   candidates[i].OneTimePub,
-			AmountCommit: candidates[i].AmountCommit,
-		}
-	}
-	return out
+	return sampleDecoyCandidates(candidates, count, entropy)
 }
 
 // SampleCLSAGDecoys returns real on-chain decoys for v5. Unlike historical
@@ -954,23 +940,34 @@ func (s *UTXOSet) SampleDecoys(count int, exclude map[crypto.Point32]bool) []Dec
 // CLSAG validates the commitment paired with every ring key and does not reveal
 // which member is being spent.
 func (s *UTXOSet) SampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool) []DecoyUTXO {
+	out, err := s.sampleCLSAGDecoys(count, exclude, cryptorand.Reader)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+func (s *UTXOSet) sampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool, entropy io.Reader) ([]DecoyUTXO, error) {
+	if count <= 0 {
+		return nil, nil
+	}
 	s.mu.RLock()
 	store := s.ringMembers
 	s.mu.RUnlock()
 	if store != nil {
-		decoys, err := store.SampleRingMembers(count, exclude)
-		if err == nil {
-			return decoys
-		}
-		// Fail closed for v5 builders: returning too few members makes Build
-		// reject the transaction rather than silently using fabricated decoys.
-		return nil
+		// The persistent index owns its entropy; do not fall back to RAM on error.
+		return store.SampleRingMembers(count, exclude)
 	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	candidates := make([]*UTXO, 0, len(s.spentPubKeys)+len(s.byPubKey))
 	for pub, u := range s.spentPubKeys {
+		// Match in-memory ring lookup precedence if historical pools overlap.
+		// Never return two entries for one public key or its stale commitment.
+		if _, active := s.byPubKey[pub]; active {
+			continue
+		}
 		if !exclude[pub] && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
@@ -981,30 +978,7 @@ func (s *UTXOSet) SampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool) 
 		}
 	}
 
-	n := len(candidates)
-	want := count
-	if want > n {
-		want = n
-	}
-	if want == 0 {
-		return nil
-	}
-
-	// Fisher-Yates partial shuffle to pick `want` items in random order.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // privacy, not security
-	for i := 0; i < want; i++ {
-		j := i + rng.Intn(n-i)
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	}
-
-	out := make([]DecoyUTXO, want)
-	for i := 0; i < want; i++ {
-		out[i] = DecoyUTXO{
-			OneTimePub:   candidates[i].OneTimePub,
-			AmountCommit: candidates[i].AmountCommit,
-		}
-	}
-	return out
+	return sampleDecoyCandidates(candidates, count, entropy)
 }
 
 // ApplyBlockForSpentDecoys rebuilds the spentPubKeys pool during a node restart.
@@ -1047,8 +1021,10 @@ func (s *UTXOSet) ApplyBlockForSpentDecoys(block *Block) {
 }
 
 func stateTransitionRingMembers(tx Transaction, inp RingInput) []crypto.RingMember {
-	if tx.IsLPoDPosition(){
-		if len(inp.Ring)==0{return nil}
+	if tx.IsLPoDPosition() {
+		if len(inp.Ring) == 0 {
+			return nil
+		}
 		return inp.Ring[:1] // native proof authenticates exactly source index zero
 	}
 	if tx.Version != TxVersionCommitmentBinding {
