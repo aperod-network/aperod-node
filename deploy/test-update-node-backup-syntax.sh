@@ -78,7 +78,7 @@ seed_installed "$WS"
 
 T1_RC=0
 T1_ERR=$(
-  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" 2>&1 >/dev/null
+  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" "$(sha256sum "${WS}/repo/aperod_backup.sh" | cut -d' ' -f1)" 2>&1 >/dev/null
 ) || T1_RC=$?
 
 if [[ "$T1_RC" -ne 0 ]]; then
@@ -87,7 +87,7 @@ else
   fail_assert "T1: _sync_backup_script returned 0 for an empty repo copy — self-check did not fire"
 fi
 
-if echo "$T1_ERR" | grep -q "\[ERROR\].*empty"; then
+if echo "$T1_ERR" | grep -q "\[tool-trust\].*syntax"; then
   pass_assert "T1: stderr contains [ERROR] message about empty file"
 else
   fail_assert "T1: expected [ERROR] about empty file in stderr — got: $(echo "$T1_ERR" | head -3)"
@@ -118,7 +118,7 @@ chmod 755 "${WS}/repo/aperod_backup.sh"
 
 T2_RC=0
 T2_ERR=$(
-  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" 2>&1 >/dev/null
+  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" "$(sha256sum "${WS}/repo/aperod_backup.sh" | cut -d' ' -f1)" 2>&1 >/dev/null
 ) || T2_RC=$?
 
 if [[ "$T2_RC" -ne 0 ]]; then
@@ -127,7 +127,7 @@ else
   fail_assert "T2: _sync_backup_script returned 0 for a syntax-broken repo copy — bash -n guard did not fire"
 fi
 
-if echo "$T2_ERR" | grep -q "\[ERROR\].*syntax\|bash -n"; then
+if echo "$T2_ERR" | grep -q "\[tool-trust\].*syntax\|bash -n"; then
   pass_assert "T2: stderr contains [ERROR] message about bash -n / syntax"
 else
   fail_assert "T2: expected [ERROR] about bash -n in stderr — got: $(echo "$T2_ERR" | head -3)"
@@ -167,7 +167,7 @@ chmod 755 "${WS}/repo/aperod_backup.sh"
 
 T3_RC=0
 T3_OUT=$(
-  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" 2>&1
+  _sync_backup_script "${WS}/installed/aperod_backup.sh" "${WS}/repo/aperod_backup.sh" "$(sha256sum "${WS}/repo/aperod_backup.sh" | cut -d' ' -f1)" 2>&1
 ) || T3_RC=$?
 
 if [[ "$T3_RC" -eq 0 ]]; then

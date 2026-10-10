@@ -1931,16 +1931,16 @@ fi
 if [[ ! -f "$UPDATE_NODE_SH" ]]; then
   fail "update-node.sh not found at $UPDATE_NODE_SH"
 else
-  if grep -q 'source.*sync-backup-script\.sh' "$UPDATE_NODE_SH"; then
-    pass "update-node.sh sources sync-backup-script.sh"
+  if ! grep -q '^[[:space:]]*source.*sync-backup-script\.sh' "$UPDATE_NODE_SH"; then
+    pass "update-node.sh does not source the privileged tool sync helper"
   else
-    fail "update-node.sh does NOT source sync-backup-script.sh"
+    fail "update-node.sh still sources an unapproved privileged tool helper"
   fi
 
-  if grep -q '_sync_backup_script' "$UPDATE_NODE_SH"; then
-    pass "update-node.sh calls _sync_backup_script"
+  if ! grep -q '^[[:space:]]*_sync_backup_script' "$UPDATE_NODE_SH"; then
+    pass "update-node.sh does not automatically replace privileged tools"
   else
-    fail "update-node.sh does NOT call _sync_backup_script"
+    fail "update-node.sh still automatically replaces privileged tools"
   fi
 fi
 
@@ -1948,16 +1948,16 @@ fi
 if [[ ! -f "$UPDATE_API_SH" ]]; then
   fail "update-api.sh not found at $UPDATE_API_SH"
 else
-  if grep -q 'source.*sync-backup-script\.sh' "$UPDATE_API_SH"; then
-    pass "update-api.sh sources sync-backup-script.sh"
+  if ! grep -q '^[[:space:]]*source.*sync-backup-script\.sh' "$UPDATE_API_SH"; then
+    pass "update-api.sh does not source the privileged tool sync helper"
   else
-    fail "update-api.sh does NOT source sync-backup-script.sh"
+    fail "update-api.sh still sources an unapproved privileged tool helper"
   fi
 
-  if grep -q '_sync_backup_script' "$UPDATE_API_SH"; then
-    pass "update-api.sh calls _sync_backup_script"
+  if ! grep -q '^[[:space:]]*_sync_backup_script' "$UPDATE_API_SH"; then
+    pass "update-api.sh does not automatically replace privileged tools"
   else
-    fail "update-api.sh does NOT call _sync_backup_script"
+    fail "update-api.sh still automatically replaces privileged tools"
   fi
 fi
 
@@ -1979,7 +1979,7 @@ printf '#!/bin/bash\necho old\n' > "$T20A_INSTALLED"
 printf '#!/bin/bash\necho new\n' > "$T20A_REPO"
 chmod 700 "$T20A_INSTALLED" "$T20A_REPO"
 
-T20A_OUTPUT=$(_sync_backup_script "$T20A_INSTALLED" "$T20A_REPO" 2>&1 || true)
+T20A_OUTPUT=$(_sync_backup_script "$T20A_INSTALLED" "$T20A_REPO" "$(sha256sum "$T20A_REPO" | cut -d' ' -f1)" 2>&1 || true)
 
 if echo "$T20A_OUTPUT" | grep -q '\[sync\].*updated'; then
   pass "sync outputs 'updated' when versions differ"
@@ -2004,7 +2004,7 @@ chmod 700 "$T20B_INSTALLED" "$T20B_REPO"
 T20B_MTIME_BEFORE=$(stat -c '%Y' "$T20B_INSTALLED" 2>/dev/null || echo 0)
 sleep 1   # ensure a write would change mtime
 
-T20B_OUTPUT=$(_sync_backup_script "$T20B_INSTALLED" "$T20B_REPO" 2>&1 || true)
+T20B_OUTPUT=$(_sync_backup_script "$T20B_INSTALLED" "$T20B_REPO" "$(sha256sum "$T20B_REPO" | cut -d' ' -f1)" 2>&1 || true)
 T20B_MTIME_AFTER=$(stat -c '%Y' "$T20B_INSTALLED" 2>/dev/null || echo 1)
 
 if echo "$T20B_OUTPUT" | grep -q 'already up to date'; then
@@ -2053,7 +2053,7 @@ printf '#!/bin/bash\necho new\n' > "$T20D_REPO"
 T20D_CROSSFS_INSTALLED="/tmp/aperod_sync_test_$$.sh"
 printf '#!/bin/bash\necho old\n' > "$T20D_CROSSFS_INSTALLED"
 
-T20D_OUTPUT=$(_sync_backup_script "$T20D_CROSSFS_INSTALLED" "$T20D_REPO" 2>&1 || true)
+T20D_OUTPUT=$(_sync_backup_script "$T20D_CROSSFS_INSTALLED" "$T20D_REPO" "$(sha256sum "$T20D_REPO" | cut -d' ' -f1)" 2>&1 || true)
 rm -f "$T20D_CROSSFS_INSTALLED" 2>/dev/null || true
 
 # Cross-filesystem mv fails (EXDEV); function should print a warning and clean up.
@@ -2093,7 +2093,7 @@ cp "$BACKUP_SH" "$T20C2_REPO"
 chmod 700 "$T20C2_REPO"
 
 # Run the sync (already sourced above in Test 20b).
-_sync_backup_script "$T20C2_INSTALLED" "$T20C2_REPO" >/dev/null 2>&1 || true
+_sync_backup_script "$T20C2_INSTALLED" "$T20C2_REPO" "$(sha256sum "$T20C2_REPO" | cut -d' ' -f1)" >/dev/null 2>&1 || true
 
 # sha256sum comparison — the core of the acceptance criterion.
 if command -v sha256sum >/dev/null 2>&1; then
@@ -2143,17 +2143,17 @@ if [[ ! -f "$UPDATE_VALIDATOR_SH" ]]; then
 else
 
   # Static check 21a: sources sync-backup-script.sh
-  if grep -qE 'source\s.*sync-backup-script\.sh' "$UPDATE_VALIDATOR_SH"; then
-    pass "update-validator.sh sources sync-backup-script.sh"
+  if ! grep -qE '^[[:space:]]*source\s.*sync-backup-script\.sh' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh does not load the tool sync helper"
   else
-    fail "update-validator.sh does NOT source sync-backup-script.sh"
+    fail "update-validator.sh still loads the tool sync helper"
   fi
 
   # Static check 21b: calls _sync_backup_script
-  if grep -q '_sync_backup_script' "$UPDATE_VALIDATOR_SH"; then
-    pass "update-validator.sh calls _sync_backup_script"
+  if ! grep -q '^[[:space:]]*_sync_backup_script' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh does not replace installed tools"
   else
-    fail "update-validator.sh does NOT call _sync_backup_script"
+    fail "update-validator.sh still replaces installed tools"
   fi
 
   # Static check 21c: passes the repo aperod_backup.sh path explicitly
@@ -2167,18 +2167,18 @@ else
   # Static check 21d: remote validators also receive the backup script.
   # The SCP call uses BACKUP_SH_SRC (set to "${DEPLOY_DIR}/aperod_backup.sh"),
   # so match either the literal path or the variable name in an scp call.
-  if grep -qE 'scp.*BACKUP_SH_SRC|BACKUP_SH_SRC=.*aperod_backup' "$UPDATE_VALIDATOR_SH"; then
-    pass "update-validator.sh SCPs aperod_backup.sh to each validator (via BACKUP_SH_SRC)"
+  if ! grep -qE 'scp.*BACKUP_SH_SRC|BACKUP_SH_SRC=.*aperod_backup' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh does not upload unapproved backup tools"
   else
-    fail "update-validator.sh does NOT SCP aperod_backup.sh to validators"
+    fail "update-validator.sh uploads unapproved backup tools"
   fi
 
   # Static check 21e: remote install is conditional on backup being configured
   # (BACKUP_SH_SENT guard so validators without setup-backup.sh are skipped)
-  if grep -q 'BACKUP_SH_SENT' "$UPDATE_VALIDATOR_SH"; then
-    pass "update-validator.sh uses BACKUP_SH_SENT guard (remote install is conditional)"
+  if ! grep -q 'BACKUP_SH_SENT' "$UPDATE_VALIDATOR_SH"; then
+    pass "update-validator.sh has no legacy remote tool installation branch"
   else
-    fail "update-validator.sh does NOT have BACKUP_SH_SENT guard"
+    fail "update-validator.sh retains a remote tool installation branch"
   fi
 
   # Behavioral check 21f: remote backup install uses atomic stage-then-rename.
@@ -2189,17 +2189,17 @@ else
   REMOTE_HEREDOC=$(sed -n '/REMOTE_EOF/,/^REMOTE_EOF$/p' "$UPDATE_VALIDATOR_SH" || true)
 
   # Must use mv -f for the final install of the backup script.
-  if echo "$REMOTE_HEREDOC" | grep -q 'mv -f.*BACKUP'; then
-    pass "remote backup install uses mv -f (atomic rename, not direct cp to live path)"
+  if ! echo "$REMOTE_HEREDOC" | grep -q 'mv -f.*BACKUP'; then
+    pass "remote node update does not rename a new backup tool over the live tool"
   else
-    fail "remote backup install does NOT use mv -f — direct cp onto live path is not atomic"
+    fail "remote node update still renames backup tools"
   fi
 
   # Must stage into the install directory (same filesystem) via mktemp.
-  if echo "$REMOTE_HEREDOC" | grep -qE 'mktemp.*INSTALL_DIR|mktemp.*usr.local.bin'; then
-    pass "remote backup install stages into the install directory (same filesystem mktemp)"
+  if ! echo "$REMOTE_HEREDOC" | grep -qE 'mktemp.*INSTALL_DIR|mktemp.*usr.local.bin'; then
+    pass "remote node update does not stage privileged tool replacements"
   else
-    fail "remote backup install does NOT stage into the install directory — mv may cross filesystems"
+    fail "remote node update still stages privileged tool replacements"
   fi
 
   # Must NOT have a bare 'sudo cp ... BACKUP_INSTALLED' without a subsequent mv -f

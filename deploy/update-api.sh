@@ -122,10 +122,7 @@ sudo -u aperod git -C "$APEROD_DIR" pull
 # ---------------------------------------------------------------------------
 BLOCKCHAIN_DIR="${APEROD_DIR}/blockchain"
 DEPLOY_DIR_API="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=sync-backup-script.sh
-source "${DEPLOY_DIR_API}/sync-backup-script.sh"
-echo "==> [1b] Syncing aperod_backup.sh..."
-_sync_backup_script
+echo "==> [1b] Installed backup tool retained; API approval does not authorize privileged tool updates."
 
 # ---------------------------------------------------------------------------
 # Step 1c: Keep /usr/local/bin/aperod-deploy in sync with the repo.
@@ -137,8 +134,7 @@ _sync_backup_script
 # each time).  Reuse the same atomic stage-then-rename sync used for
 # aperod_backup.sh; non-fatal if either side is absent.
 # ---------------------------------------------------------------------------
-echo "==> [1c] Syncing aperod-deploy..."
-_sync_backup_script /usr/local/bin/aperod-deploy "${APEROD_DIR}/deploy/aperod-api-deploy.sh"
+echo "==> [1c] Installed deployment tool retained unchanged."
 
 # ---------------------------------------------------------------------------
 # Step 2: Rebuild TypeScript — if this fails, abort before touching pm2.
