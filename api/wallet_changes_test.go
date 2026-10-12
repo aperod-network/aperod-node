@@ -152,6 +152,63 @@ func TestWalletChangesCursorIsAuthenticatedAndSnapshotBound(t *testing.T) {
 	}
 }
 
+func TestWalletChangesRejectsOutOfRangePaginationInputs(t *testing.T) {
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroHash := hex.EncodeToString(make([]byte, 32))
+	base := url.Values{
+		"address":     {string(crypto.AddressFromKeys(crypto.MainnetByte, keys))},
+		"from_height": {"0"},
+		"from_hash":   {zeroHash},
+	}
+
+	tests := []struct {
+		name       string
+		field      string
+		value      string
+		withResume bool
+		wantStatus int
+	}{
+		{name: "negative limit", field: "limit", value: "-1", wantStatus: http.StatusBadRequest},
+		{name: "zero limit", field: "limit", value: "0", wantStatus: http.StatusBadRequest},
+		{name: "limit above page bound", field: "limit", value: "129", wantStatus: http.StatusBadRequest},
+		{name: "oversized limit integer", field: "limit", value: "18446744073709551615", wantStatus: http.StatusBadRequest},
+		{name: "negative resume index", field: "resume_event_index", value: "-1", withResume: true, wantStatus: http.StatusBadRequest},
+		{name: "resume index above bound", field: "resume_event_index", value: "16385", withResume: true, wantStatus: http.StatusBadRequest},
+		{name: "oversized resume index integer", field: "resume_event_index", value: "18446744073709551615", withResume: true, wantStatus: http.StatusBadRequest},
+		{name: "valid small limit reaches snapshot lookup", field: "limit", value: "1", wantStatus: http.StatusServiceUnavailable},
+		{name: "valid zero resume index reaches snapshot lookup", field: "resume_event_index", value: "0", withResume: true, wantStatus: http.StatusServiceUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query := make(url.Values, len(base))
+			for key, values := range base {
+				query[key] = append([]string(nil), values...)
+			}
+			query.Set(tt.field, tt.value)
+			if tt.withResume {
+				query.Set("witness_height", "0")
+				query.Set("witness_hash", zeroHash)
+				query.Set("resume_height", "0")
+				query.Set("resume_hash", zeroHash)
+			}
+			req := httptest.NewRequest(
+				http.MethodGet,
+				"/api/v1/wallet/changes?"+query.Encode(),
+				nil,
+			)
+			recorder := httptest.NewRecorder()
+			(&Server{}).restWalletChanges(recorder, req)
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%s", recorder.Code, tt.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestWalletChangesPagesAreIdempotentAndIncludeNativeStakeSpend(t *testing.T) {
 	db, migration, address, path, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
 	parent, height, err := db.GetTip()

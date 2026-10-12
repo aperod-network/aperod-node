@@ -278,7 +278,7 @@ func (s *Server) restWalletChanges(w http.ResponseWriter, r *http.Request) {
 	}
 	var resumeHeight uint64
 	var resumeHash crypto.Hash32
-	var resumeEventIndex uint64
+	var resumeEventIndex int
 	if resumeProvided {
 		if id != "" || !witnessProvided || q.Get("cursor") != "" {
 			writeJSONError(w, http.StatusBadRequest, "resume coordinates require a new snapshot and a witness")
@@ -294,8 +294,8 @@ func (s *Server) restWalletChanges(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "resume_hash must be 64 hexadecimal characters")
 			return
 		}
-		resumeEventIndex, err = strconv.ParseUint(q.Get("resume_event_index"), 10, 64)
-		if err != nil || resumeEventIndex > walletChangesMaxResumeEvents {
+		resumeEventIndex, err = strconv.Atoi(q.Get("resume_event_index"))
+		if err != nil || resumeEventIndex < 0 || resumeEventIndex > walletChangesMaxResumeEvents {
 			writeJSONError(w, http.StatusBadRequest, "resume_event_index exceeds the supported event index")
 			return
 		}
@@ -414,13 +414,13 @@ func (s *Server) restWalletChanges(w http.ResponseWriter, r *http.Request) {
 				reconciliationError(w, resumeHeight, resumeHeight, "resume block event list exceeds decode bounds")
 				return
 			}
-			if resumeEventIndex > uint64(len(resumeEvents)) {
+			if resumeEventIndex > len(resumeEvents) {
 				writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_CURSOR_MISMATCH", "resume event index is outside the canonical block")
 				return
 			}
 		}
 		cursor.Height = resumeHeight
-		cursor.EventIndex = int(resumeEventIndex)
+		cursor.EventIndex = resumeEventIndex
 	}
 	if token := q.Get("cursor"); token != "" {
 		cursor, err = parseWalletChangesCursor(entry.cursorKey[:], id, token)
@@ -452,7 +452,9 @@ func (s *Server) restWalletChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events := make([]map[string]interface{}, 0, limit)
+	// Use a fixed, protocol-bounded capacity; never size an allocation directly
+	// from a request parameter.
+	events := make([]map[string]interface{}, 0, walletChangesMaxEvents)
 	next := cursor
 	expectedParent := fromHash
 	if cursor.Height > fromHeight+1 {
