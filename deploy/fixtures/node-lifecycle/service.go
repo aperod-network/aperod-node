@@ -15,21 +15,52 @@ const version = "fixture-old"
 const unhealthy = false
 
 func main() {
+	args := os.Args[1:]
+	hasArg := func(want string) bool {
+		for _, arg := range args {
+			if arg == want {
+				return true
+			}
+		}
+		return false
+	}
+	validateConfig := func() bool {
+		for i, arg := range args {
+			if arg == "--config" && i+1 < len(args) {
+				data, err := os.ReadFile(args[i+1])
+				return err == nil && strings.Contains(string(data), "data_dir:")
+			}
+		}
+		return false
+	}
+	// Match the production node's read-only maintenance contract so lifecycle
+	// tests exercise the installer's pre-stop guard instead of rejecting the
+	// synthetic candidate as an unsupported legacy binary.
+	if hasArg("--sale-upgrade-preflight-capability") {
+		if !hasArg("--validate-config") || !validateConfig() {
+			os.Exit(3)
+		}
+		fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
+		return
+	}
+	if hasArg("--sale-upgrade-preflight") {
+		if !validateConfig() {
+			os.Exit(3)
+		}
+		fmt.Fprintf(os.Stdout,
+			`{"schema":1,"status":"ok","mode":"inactive","tip_height":100,"tip_hash":%q}`+"\n",
+			strings.Repeat("a", 64))
+		return
+	}
 	for i, arg := range os.Args[1:] {
 		if arg == "--version" {
 			fmt.Println(version)
 			return
 		}
 		if arg == "--validate-config" {
-			for j, value := range os.Args {
-				if value == "--config" && j+1 < len(os.Args) {
-					data, err := os.ReadFile(os.Args[j+1])
-					if err != nil || !strings.Contains(string(data), "data_dir:") {
-						os.Exit(3)
-					}
-					fmt.Println("fixture config accepted")
-					return
-				}
+			if validateConfig() {
+				fmt.Println("fixture config accepted")
+				return
 			}
 			fmt.Fprintln(os.Stderr, "missing fixture config", i)
 			os.Exit(3)

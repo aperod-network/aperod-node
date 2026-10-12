@@ -39,6 +39,14 @@ __pycache__/
 """
 MESSAGE = ("chore: maintain verified source distribution\n\n"
            "Co-authored-by: aperod-network <aperod-network@users.noreply.github.com>")
+REQUIRED_CHECKS = {
+    "Whole-tree publication security",
+    "go build & vet & test",
+    "install-node.sh e2e smoke test (install)",
+    "install-node.sh e2e smoke test (validator)",
+    "install-node.sh e2e smoke test (update)",
+    "install-node.sh e2e smoke test (upgrade)",
+}
 
 
 def run(*args, cwd=None, test_python_userbase=None):
@@ -223,7 +231,7 @@ def publish(candidate, tree, expected_head, request, with_tests=False):
 
 def await_merge(pr, request, timeout=900):
     deadline = time.monotonic() + timeout
-    required = {"Whole-tree publication security", "go build & vet & test"}
+    required = REQUIRED_CHECKS
     while time.monotonic() < deadline:
         pull = request("GET", f"{API}/pulls/{pr['number']}")
         if pull.get("merged"):
