@@ -29,6 +29,13 @@ type RingMemberStore interface {
 	SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]DecoyUTXO, error)
 }
 
+// RingMemberFilterStore can exclude retained ring records by canonical output
+// identity as well as public key. Output identity is needed for staked records
+// reconstructed from legacy payloads that do not carry the one-time public key.
+type RingMemberFilterStore interface {
+	SampleRingMembersExcluding(count int, exclude map[crypto.Point32]bool, excludeUTXOs map[UTXOKey]bool) ([]DecoyUTXO, error)
+}
+
 // compactKeyImageSet stores spent key images using a three-tier design:
 //
 //  1. recent map[crypto.KeyImage]struct{} — O(1) insert/lookup for key images
@@ -947,16 +954,62 @@ func (s *UTXOSet) SampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool) 
 	return out
 }
 
+func isStakedUTXOKey(staked map[UTXOKey]*UTXO, u *UTXO) bool {
+	if u == nil {
+		return false
+	}
+	_, ok := staked[UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}]
+	return ok
+}
+
 func (s *UTXOSet) sampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool, entropy io.Reader) ([]DecoyUTXO, error) {
 	if count <= 0 {
 		return nil, nil
 	}
 	s.mu.RLock()
 	store := s.ringMembers
+	filtered := make(map[crypto.Point32]bool, len(exclude)+len(s.stakedUTXOs))
+	stakedOutpoints := make(map[UTXOKey]bool, len(s.stakedUTXOs))
+	for pub, excluded := range exclude {
+		if excluded {
+			filtered[pub] = true
+		}
+	}
+	for key, u := range s.stakedUTXOs {
+		stakedOutpoints[key] = true
+		if u != nil && u.OneTimePub != (crypto.Point32{}) {
+			filtered[u.OneTimePub] = true
+		}
+	}
 	s.mu.RUnlock()
 	if store != nil {
 		// The persistent index owns its entropy; do not fall back to RAM on error.
-		return store.SampleRingMembers(count, exclude)
+		// Exclude staked outputs during sampling, not after it: CLSAG requires a
+		// complete ring of authentic on-chain members, so post-filtering can
+		// leave the transaction builder with too few decoys.
+		var sampled []DecoyUTXO
+		var err error
+		if filteredStore, ok := store.(RingMemberFilterStore); ok {
+			sampled, err = filteredStore.SampleRingMembersExcluding(count, exclude, stakedOutpoints)
+		} else {
+			for _, u := range s.stakedUTXOs {
+				if u == nil || u.OneTimePub == (crypto.Point32{}) {
+					return nil, fmt.Errorf("ring sampling: staked output identity unavailable")
+				}
+			}
+			sampled, err = store.SampleRingMembers(count, filtered)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// Defend against backends that do not honor public-key exclusions.
+		out := sampled[:0]
+		for _, candidate := range sampled {
+			if !filtered[candidate.OneTimePub] {
+				out = append(out, candidate)
+			}
+		}
+		return out, nil
 	}
 
 	s.mu.RLock()
@@ -968,12 +1021,12 @@ func (s *UTXOSet) sampleCLSAGDecoys(count int, exclude map[crypto.Point32]bool, 
 		if _, active := s.byPubKey[pub]; active {
 			continue
 		}
-		if !exclude[pub] && !isProtocolLockedUTXO(u) {
+		if !filtered[pub] && !isStakedUTXOKey(s.stakedUTXOs, u) && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
 	}
 	for pub, u := range s.byPubKey {
-		if !exclude[pub] && !isProtocolLockedUTXO(u) {
+		if !filtered[pub] && !isStakedUTXOKey(s.stakedUTXOs, u) && !isProtocolLockedUTXO(u) {
 			candidates = append(candidates, u)
 		}
 	}

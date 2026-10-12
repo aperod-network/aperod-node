@@ -37,12 +37,52 @@ class PublisherTests(unittest.TestCase):
 
     def test_build_processes_do_not_receive_publication_credentials(self):
         with patch.dict(publisher.os.environ, {"PUBLIC_GITHUB_TOKEN": "TEST_ONLY",
-                                              "SSH_PASSWORD": "TEST_ONLY"}), \
+                                              "SSH_PASSWORD": "TEST_ONLY",
+                                              "PYTHONPATH": "/untrusted/module/path"}), \
              patch.object(publisher.subprocess, "run") as child:
             publisher.run("go", "vet", "./...")
         env = child.call_args.kwargs["env"]
         self.assertNotIn("PUBLIC_GITHUB_TOKEN", env)
         self.assertNotIn("SSH_PASSWORD", env)
+        self.assertNotIn("PYTHONPATH", env)
+
+    def test_go_tests_receive_only_the_pyyaml_userbase(self):
+        python_userbase = Path("/trusted/python-userbase")
+        with patch.dict(publisher.os.environ, {"PUBLIC_GITHUB_TOKEN": "TEST_ONLY",
+                                               "SSH_PASSWORD": "TEST_ONLY",
+                                               "PYTHONPATH": "/untrusted/module/path"}), \
+             patch.object(publisher.subprocess, "run") as child:
+            publisher.run("go", "test", "./...",
+                          test_python_userbase=python_userbase)
+        env = child.call_args.kwargs["env"]
+        self.assertEqual(env["PYTHONUSERBASE"], str(python_userbase))
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertNotIn("PUBLIC_GITHUB_TOKEN", env)
+        self.assertNotIn("SSH_PASSWORD", env)
+
+    def test_test_python_userbase_copies_only_trusted_pyyaml(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp) / "installed"
+            package = base / "yaml"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("SOURCE = 'installed'\n")
+            (package / "scanner.py").write_text("SAFE = True\n")
+            userbase = Path(temp) / "isolated"
+            fake_distribution = Mock()
+            fake_distribution.locate_file.side_effect = (
+                lambda rel: base if str(rel) == "" else package
+            )
+            with patch.object(publisher, "distribution",
+                              return_value=fake_distribution):
+                publisher.prepare_test_python_userbase(userbase)
+            target = (
+                userbase / "lib"
+                / f"python{publisher.sys.version_info.major}.{publisher.sys.version_info.minor}"
+                / "site-packages" / "yaml"
+            )
+            self.assertEqual((target / "__init__.py").read_text(),
+                             "SOURCE = 'installed'\n")
+            self.assertTrue((target / "scanner.py").is_file())
 
     def test_failed_required_check_never_merges(self):
         methods = []

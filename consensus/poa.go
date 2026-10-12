@@ -33,9 +33,16 @@ type AdminMintRecordStore interface {
 
 // Config holds PoA consensus parameters.
 type Config struct {
-	LPoDMigration *store.LPoDMigration
-	BlockTime     time.Duration
-	BFTThreshold  float64 // fraction of validators needed to finalize (e.g. 0.667)
+	// ValidatorAuthorityFork separates collateral identity from future signing
+	// authority. Nil preserves the deployed protocol without any change.
+	ValidatorAuthorityFork *core.ValidatorAuthorityFork
+	LPoDMigration          *store.LPoDMigration
+	SaleMigration          *store.SaleMigration
+	// Approved durable purchase intents are built at the real slot and parent.
+	// Nil never enables the legacy admin-mint path.
+	SaleTransactions func(height uint64, parent crypto.Hash32) ([]core.Transaction, error)
+	BlockTime        time.Duration
+	BFTThreshold     float64 // fraction of validators needed to finalize (e.g. 0.667)
 	// Validators is the bootstrap list from genesis (used to seed the Registry).
 	// After startup the active set is managed by Registry.
 	Validators []crypto.ValidatorPubKey
@@ -120,6 +127,9 @@ type Config struct {
 	// RingCTCLSAGActivationHeight is the first height requiring v5; zero
 	// disables activation to avoid an accidental uncoordinated fork.
 	RingCTCLSAGActivationHeight uint64
+// StakedCollateralRingExclusionActivationHeight is the first height at which
+// CLSAG rings must exclude staked collateral. Zero disables this fork.
+StakedCollateralRingExclusionActivationHeight uint64
 	// AVMActivationHeight is the first height accepting v6 AVM transactions.
 	// Zero disables AVM consensus.
 	AVMActivationHeight uint64
@@ -140,6 +150,9 @@ type Config struct {
 	// is always the canonical genesis block hash, never the activation parent.
 	GuardianFundActivationHeight uint64
 	GuardianFundChainAnchor      crypto.Hash32
+	// A coordinated future fork earmarks the annual Development Fund reserve.
+	GenesisVestingActivationHeight uint64
+	GenesisVestingFunding          *store.GenesisVestingFunding
 }
 
 // FinalizeMsg is a vote by a validator to finalize a block.
@@ -323,6 +336,14 @@ const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
+	cfg.ValidatorAuthorityFork = cfg.ValidatorAuthorityFork.Clone()
+	if cfg.SaleTransactions == nil && cfg.SaleMigration != nil && cfg.Store != nil &&
+		cfg.MyKey != nil && cfg.MyKey.Public().Equals(cfg.SaleMigration.Checkpoint.SaleAuthority) {
+		cfg.SaleTransactions = func(height uint64, parent crypto.Hash32) ([]core.Transaction, error) {
+			return cfg.Store.PendingPaidSales(cfg.SaleMigration.Checkpoint.Genesis, height, parent,
+				cfg.SaleMigration.Checkpoint.Network, cfg.MyKey)
+		}
+	}
 	if cfg.LPoDMigration != nil {
 		m := *cfg.LPoDMigration
 		if m.Version == 1 {
@@ -362,6 +383,11 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		mintByKey:         make(map[string]*adminMintReq),
 		store:             cfg.Store,
 		adminMintStore:    adminMintStore,
+	}
+	if err := e.validateAuthorityFork(); err != nil {
+		e.halted.Store(true)
+		e.log.Error("validator authority fork invalid; consensus halted", "err", err)
+		return e
 	}
 	// Seed only a fresh registry. A restored snapshot is authoritative: adding
 	// missing static fallback keys after restore would invent active validators
@@ -570,6 +596,9 @@ func (e *Engine) TimestampRejectedCount() int64 {
 func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.txVerifier = v
 	e.utxos = utxos
+if v != nil {
+v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
+}
 }
 
 // activeValidators returns the current active validator set.
@@ -675,9 +704,17 @@ func (e *Engine) tick() error {
 	}
 
 	// Check if it's our turn to propose
+	if e.cfg.Registry != nil {
+		e.cfg.Registry.SetSignatureAdmissionHeight(nextHeight)
+	}
 	proposer := e.proposerAt(nextRound)
-	if e.cfg.MyKey == nil || !proposer.Equals(e.cfg.MyKey.Public()) {
+	if e.cfg.MyKey == nil || !proposer.Equals(e.localIdentity(nextHeight)) ||
+		!e.authority(proposer, nextHeight).Equals(e.cfg.MyKey.Public()) {
 		return nil // not our slot
+	}
+	if err := e.checkAuthorityParent(core.BlockHeader{Height: nextHeight, PrevHash: tip.Hash()}); err != nil {
+		e.halted.Store(true)
+		return err
 	}
 
 	e.log.Info("producing block", "height", nextHeight, "round", nextRound)
@@ -829,6 +866,9 @@ func (e *Engine) tick() error {
 	e.pool.SetBaseFee(newFee)
 
 	// Stake txs already applied above — no processStakeTxs call needed.
+	if e.cfg.Registry != nil {
+		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
+	}
 	if e.cfg.Registry != nil && block.Header.Height%core.EpochLength == 0 {
 		newSet := e.cfg.Registry.UpdateEpoch(block.Header.Height)
 		e.log.Info("epoch updated (self-produced)",
@@ -1252,7 +1292,7 @@ func (e *Engine) validateBlockEconomics(block *core.Block) error {
 	var totalAVMGas uint64
 	for i := range block.Txs {
 		tx := &block.Txs[i]
-		if tx.IsCoinbase() || tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() {
+		if tx.IsCoinbase() || tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() || tx.IsSale() {
 			continue
 		}
 		minFee := tx.MinFeeAt(expectedBaseFee)
@@ -1570,6 +1610,12 @@ func (e *Engine) resolveAdminMintsPersistenceFailed(err error) {
 	e.mintMu.Unlock()
 }
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
+	if e.cfg.MyKey == nil || !e.authority(e.localIdentity(height), height).Equals(e.cfg.MyKey.Public()) {
+		return nil, fmt.Errorf("configured key is not the signing authority at height %d", height)
+	}
+	if err := e.checkAuthorityParent(core.BlockHeader{Height: height, PrevHash: parent.Hash()}); err != nil {
+		return nil, err
+	}
 	if err := e.validateGuardianConfig(); err != nil {
 		return nil, err
 	}
@@ -1622,6 +1668,22 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		txs = append(txs, tx)
 	}
 
+	if e.cfg.SaleMigration != nil && height >= e.cfg.SaleMigration.Checkpoint.Height && e.cfg.SaleTransactions != nil {
+		sales, err := e.cfg.SaleTransactions(height, parent.Hash())
+		if err != nil {
+			return nil, fmt.Errorf("sale: approved intent construction failed: %w", err)
+		}
+		if len(sales) > 128 {
+			return nil, fmt.Errorf("sale: approved intent block limit exceeded")
+		}
+		for _, tx := range sales {
+			if !tx.IsSale() {
+				return nil, fmt.Errorf("sale: intent provider returned a non-sale transaction")
+			}
+		}
+		txs = append(txs, sales...)
+	}
+
 	// Pre-screen: re-verify each ring-sig tx against the current UTXO set
 	// BEFORE including it in the block.  A tx that passed Add() when it
 	// entered the mempool may now have an invalid ring sig if the UTXOSet
@@ -1644,13 +1706,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				screened = append(screened, *tx)
 				continue
 			}
-			if err := core.ValidateTxVersionAtHeight(
-				tx,
-				height,
-				e.cfg.RingCTV4ActivationHeight,
-				e.cfg.RingCTCLSAGActivationHeight,
-				e.cfg.AVMActivationHeight,
-			); err != nil {
+			if err := e.validateVersionWithSales(tx, height, e.cfg.RingCTV4ActivationHeight); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning tx rejected by RingCT activation policy",
 					"hash", hash,
@@ -1660,7 +1716,12 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				e.pool.BanTx(hash)
 				continue
 			}
-			if err := e.txVerifier.VerifyTx(tx); err != nil {
+			if tx.IsSale() {
+				// Full issuer/budget/replay validation runs against the assembled block.
+				screened = append(screened, *tx)
+				continue
+			}
+		if err := e.txVerifier.VerifyTxAtHeight(tx, height); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning mempool tx that failed re-verification",
 					"hash", hash,
@@ -1836,7 +1897,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		MerkleRoot:   core.MerkleRoot(txs),
 		Timestamp:    time.Now().UTC().UnixNano(),
 		Round:        uint32(round),
-		ValidatorPub: e.cfg.MyKey.Public(),
+		ValidatorPub: e.localIdentity(height),
 		OraclePrice:  oraclePrice,
 		BaseFee:      currentBaseFee,
 	}
@@ -1876,17 +1937,20 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 const maxClockSkewNs = int64(15 * 1_000_000_000)
 
 func (e *Engine) handleIncomingBlock(block *core.Block) error {
-// An accepted peer block changes the in-memory tip before the durable
-// callback commits it. Keep that entire transition atomic with local-vote
-// ancestry checks, using the same lock order as tick: productionMu then mu.
-e.productionMu.Lock()
-defer e.productionMu.Unlock()
+	// An accepted peer block changes the in-memory tip before the durable
+	// callback commits it. Keep that entire transition atomic with local-vote
+	// ancestry checks, using the same lock order as tick: productionMu then mu.
+	e.productionMu.Lock()
+	defer e.productionMu.Unlock()
 
 	if e.halted.Load() {
 		return fmt.Errorf("consensus engine halted after persistent rollback failure")
 	}
 	// Basic structural validation
-	if err := block.Validate(); err != nil {
+	if err := e.checkAuthorityParent(block.Header); err != nil {
+		return err
+	}
+	if err := block.Validate(e.authority(block.Header.ValidatorPub, block.Header.Height)); err != nil {
 		return fmt.Errorf("invalid block: %w", err)
 	}
 
@@ -2018,7 +2082,7 @@ defer e.productionMu.Unlock()
 		return fmt.Errorf("tx verifier not configured: refusing to accept block %d without cryptographic verification",
 			block.Header.Height)
 	}
-	if err := e.txVerifier.VerifyBlock(block); err != nil {
+	if err := e.verifyBlockWithSales(block); err != nil {
 		return fmt.Errorf("tx crypto verification failed: %w", err)
 	}
 
@@ -2091,6 +2155,9 @@ defer e.productionMu.Unlock()
 		return e.failCanonicalPersistence(block, stakeRollback, persistErr)
 	}
 	// Stake txs already applied above — no processStakeTxs call needed.
+	if e.cfg.Registry != nil {
+		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
+	}
 
 	// ── EIP-1559 base fee update ─────────────────────────────────────────────
 	blockBaseFee := block.Header.BaseFee
@@ -2168,13 +2235,7 @@ func (e *Engine) validateRingCTV4Activation(block *core.Block) error {
 	}
 	activation := e.cfg.RingCTV4ActivationHeight
 	for i := range block.Txs {
-		if err := core.ValidateTxVersionAtHeight(
-			&block.Txs[i],
-			block.Header.Height,
-			activation,
-			e.cfg.RingCTCLSAGActivationHeight,
-			e.cfg.AVMActivationHeight,
-		); err != nil {
+		if err := e.validateVersionWithSales(&block.Txs[i], block.Header.Height, activation); err != nil {
 			return fmt.Errorf("tx[%d]: %w", i, err)
 		}
 	}
@@ -2240,6 +2301,10 @@ func (e *Engine) prepareAVMBlock(block *core.Block) (*avm.PreparedBlock, error) 
 			return nil, err
 		}
 	}
+	prepared.Sale, err = e.prepareSale(block)
+	if err != nil {
+		return nil, err
+	}
 	return prepared, nil
 }
 
@@ -2274,7 +2339,7 @@ func (e *Engine) castVote(block *core.Block) error {
 	vote := FinalizeMsg{
 		BlockHash:    hash,
 		Height:       block.Header.Height,
-		ValidatorPub: e.cfg.MyKey.Public(),
+		ValidatorPub: e.localIdentity(block.Header.Height),
 		Signature:    sig,
 	}
 	// Process our own vote immediately
@@ -2308,7 +2373,7 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 
 	// Verify the vote signature
 	msg := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
-	if !vote.ValidatorPub.Verify(msg, vote.Signature) {
+	if !e.authority(vote.ValidatorPub, vote.Height).Verify(msg, vote.Signature) {
 		return fmt.Errorf("invalid vote signature from %s", vote.ValidatorPub.ID())
 	}
 
@@ -2485,7 +2550,7 @@ func (e *Engine) restoreFinalityCertificate() error {
 	message := crypto.HashBytes([]byte("aperod/finalize/v1"), certificate.BlockHash[:])
 	for _, vote := range certificate.Votes {
 		id := vote.Validator.Hex()
-		if !committee[id] || seen[id] || !vote.Validator.Verify(message, vote.Signature) {
+		if !committee[id] || seen[id] || !e.authority(vote.Validator, certificate.Height).Verify(message, vote.Signature) {
 			return fmt.Errorf("finality: invalid, duplicate, or non-committee certificate vote")
 		}
 		seen[id] = true
@@ -2546,7 +2611,7 @@ func (e *Engine) restoreLocalFinalityVote() error {
 		return fmt.Errorf("local vote signer is not a current validator")
 	}
 	message := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
-	if !vote.Validator.Verify(message, vote.Signature) {
+	if !e.authority(vote.Validator, vote.Height).Verify(message, vote.Signature) {
 		return fmt.Errorf("local vote signature is invalid")
 	}
 	if err := e.verifyLocalVoteAncestry(vote.Height, vote.BlockHash); err != nil {

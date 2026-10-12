@@ -163,6 +163,7 @@ func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
   non_validator: true
   ringct_v4_activation_height: 100
   ring_ct_clsag_activation_height: 101
+  staked_collateral_ring_exclusion_activation_height: 130
   avm_activation_height: 110
   reward_authorization_activation_height: 120
   avm_gas_burn_activation_height: 125
@@ -181,6 +182,19 @@ func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
 	if got := firstStart.Consensus.AVMGasBurnActivationHeight; got != 125 {
 		t.Fatalf("loaded activation height = %d, want 125", got)
 	}
+if got := firstStart.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
+	t.Fatalf("loaded staked-collateral activation height = %d, want 130", got)
+}
+firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 100
+if err := firstStart.Validate(); err == nil {
+	t.Fatal("staked-collateral activation before CLSAG activation was accepted")
+}
+firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 0
+firstStart.Network = "mainnet"
+firstStart.Consensus.NonValidator = true
+if err := firstStart.Validate(); err == nil {
+	t.Fatal("mainnet node without an explicit staked-collateral activation was accepted")
+}
 
 	restarted, err := Load(configPath)
 	if err != nil {
@@ -190,6 +204,9 @@ func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("activation after restart = %d, want %d",
 			got, firstStart.Consensus.AVMGasBurnActivationHeight)
 	}
+if got := restarted.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
+	t.Fatalf("staked-collateral activation after restart = %d, want 130", got)
+}
 	if err := restarted.Validate(); err != nil {
 		t.Fatalf("Validate() after restart: %v", err)
 	}

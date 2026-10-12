@@ -792,6 +792,27 @@ func checkStartupIntegrity(
 }
 
 func run() error {
+// Preflight must never dispatch a config-free mutating maintenance mode.
+preflightRequested := false
+preflightCapability := false
+for _, arg := range os.Args[1:] {
+if arg == "--sale-upgrade-preflight" { preflightRequested = true }
+if arg == "--sale-upgrade-preflight-capability" { preflightRequested = true; preflightCapability = true }
+}
+if preflightRequested {
+for _, arg := range os.Args[1:] {
+switch arg {
+case "--check-store", "--check-snapshot", "--compact-db", "--repair-height-index":
+return fmt.Errorf("sale preflight cannot be combined with other maintenance modes")
+}
+}
+}
+if preflightCapability {
+// --validate-config accompanies this probe so an older binary which ignores
+// unknown flags can only validate configuration, never start a live node.
+fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
+return nil
+}
 	// ── 0. config-free maintenance subcommands ────────────────────────────────
 	// Processed before config loading so operators can verify a chain.db that
 	// was just rsync'd without needing a fully-configured node.yaml.
@@ -813,6 +834,8 @@ func run() error {
 	configFlagExplicit := false
 	resetP2PIdentity := false
 	validateOnly := false
+saleUpgradePreflight := false
+saleUpgradeCopy := ""
 	strictMemLimit := false
 	resetTip := false
 	repairDB := false
@@ -830,6 +853,11 @@ func run() error {
 			resetP2PIdentity = true
 		case "--validate-config":
 			validateOnly = true
+case "--sale-upgrade-preflight":
+saleUpgradePreflight = true
+case "--sale-upgrade-copy":
+if i+2 >= len(os.Args) { return fmt.Errorf("--sale-upgrade-copy requires a completed backup directory") }
+saleUpgradeCopy = os.Args[i+2]
 		case "--strict-memlimit":
 			strictMemLimit = true
 		case "--reset-tip":
@@ -897,6 +925,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+// Read-only inspection does not activate any consensus configuration.
+if saleUpgradePreflight {
+if !configFlagExplicit || cfg.DataDir == "" { return fmt.Errorf("sale preflight requires explicit --config and data_dir") }
+if validateOnly || resetTip || repairDB || rebuildKeyImages || forcePurgeKIIndex || rebuildSpentIndex || resetP2PIdentity {
+return fmt.Errorf("sale preflight cannot be combined with mutation or validation shortcuts")
+}
+return runSaleUpgradePreflight(cfg, saleUpgradeCopy, os.Stdout)
+}
+if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sale-upgrade-preflight") }
 	if err := guardGuardianFundActivation(cfg); err != nil {
 		return err
 	}
@@ -916,7 +953,7 @@ func run() error {
 			absConfig, absDataDir)
 	}
 
-	// --validate-config: exit 0 after a successful parse+validate so
+// --validate-config: exit 0 after a successful parse+validate so
 	// operators (and node-config.sh) can verify node.yaml without starting
 	// the node.  Prints the config path and network name so the caller can
 	// confirm which file was checked.
@@ -938,7 +975,7 @@ func run() error {
 		return nil
 	}
 
-	// ── 2. Setup logger ───────────────────────────────────────────────────────
+// ── 2. Setup logger ───────────────────────────────────────────────────────
 	level := slog.LevelInfo
 	switch cfg.LogLevel {
 	case "debug":
@@ -1315,6 +1352,15 @@ func run() error {
 	// The resume path initialises it inside the startup scan below.
 	var registry *core.ValidatorRegistry
 	var lpodMigration *store.LPoDMigration
+	saleMigration, err := db.LoadSaleMigrationFile(cfg.Consensus.SaleMigrationFile)
+	if err != nil {
+		log.Error("protocol sale startup validation failed", "err", err)
+		os.Exit(1)
+	}
+	authorityFork, err := loadValidatorAuthorityFork(cfg.Consensus)
+	if err != nil {
+		return err
+	}
 
 	// ── Early API server (syncing phase) ─────────────────────────────────────
 	// Create and start the API server before the startup block scan so that
@@ -1327,6 +1373,9 @@ func run() error {
 	var apiSrv *api.Server
 	if cfg.API.Enabled && cfg.API.ListenAddr != "" {
 		apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
+apiSrv.SetStakedCollateralRingExclusionActivationHeight(
+	cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
+)
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
 		apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
 		apiSrv.SetStore(db)
@@ -1808,6 +1857,11 @@ func run() error {
 			}
 		}
 		// InitFromGenesis is idempotent (!exists guard), so NewEngine's later
+		if authorityFork != nil {
+			if err := registry.ConfigureSignatureAuthority(authorityFork, tipHeight+1); err != nil {
+				return err
+			}
+		}
 		// call is a safe no-op for genesis validators already in the registry.
 		genesisStakeForReplay := core.MinStakeNAPR * 10 // must match consensus.NewEngine
 		registry.InitFromGenesis(validators, genesisStakeForReplay)
@@ -2605,8 +2659,23 @@ func run() error {
 	mempool.SetStakeAdmissionCheck(func(tx core.Transaction, height uint64) error {
 		return registry.ValidateBlockStakeTxs([]core.Transaction{tx}, height)
 	})
+	var genesisVestingFunding *store.GenesisVestingFunding
+	if cfg.Consensus.GenesisVestingActivationHeight > 0 {
+		var err error
+		genesisVestingFunding, err = store.LoadGenesisVestingFunding(cfg.Consensus.GenesisVestingFundingFile, cfg.Consensus.GenesisVestingActivationHeight)
+		if err != nil {
+			return fmt.Errorf("load Development Fund authorization: %w", err)
+		}
+	}
+	if err := db.CheckGenesisVestingConfig(cfg.Consensus.GenesisVestingActivationHeight, genesisVestingFunding); err != nil {
+		return fmt.Errorf("Development Fund startup safety: %w", err)
+	}
 	engine = consensus.NewEngine(consensus.Config{
+		ValidatorAuthorityFork:              authorityFork,
 		LPoDMigration:                       lpodMigration,
+		SaleMigration:                       saleMigration,
+		GenesisVestingActivationHeight:      cfg.Consensus.GenesisVestingActivationHeight,
+		GenesisVestingFunding:               genesisVestingFunding,
 		BlockTime:                           cfg.Consensus.BlockTime,
 		BFTThreshold:                        genesisConfig.BFTThreshold,
 		Validators:                          validators,
@@ -2622,6 +2691,7 @@ func run() error {
 		OracleMaxDeviation:                  cfg.Consensus.OracleMaxDeviation,
 		RingCTV4ActivationHeight:            cfg.Consensus.RingCTV4ActivationHeight,
 		RingCTCLSAGActivationHeight:         cfg.Consensus.RingCTCLSAGActivationHeight,
+StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 		AVMActivationHeight:                 cfg.Consensus.AVMActivationHeight,
 		AVMGasBurnActivationHeight:          cfg.Consensus.AVMGasBurnActivationHeight,
 		AVMExecutor:                         avm.NewBlockExecutor(avm.LevelStore{DB: db}),
@@ -2864,6 +2934,8 @@ func run() error {
 	}, chain, mempool, log)
 	if apiSrv != nil {
 		apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash)
+apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalizedHash)
+		apiSrv.SetGenesisVestingConfig(cfg.Consensus.GenesisVestingActivationHeight)
 	}
 	if db != nil && lpodMigration != nil && lpodMigration.Version == 3 {
 		if err := db.BackfillLPoDEarningsIndex(lpodMigration); err != nil {
@@ -2879,6 +2951,9 @@ func run() error {
 	// where blocks are accepted without cryptographic verification (nil verifier
 	// = fail-open).  Wiring first closes that window entirely.
 	txVerifier := core.NewTxVerifier(utxos)
+txVerifier.SetStakedCollateralRingExclusionActivationHeight(
+	cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
+)
 	// Wire vesting enforcement so the verifier rejects spending of still-locked
 	// genesis allocations at the protocol level (not just display-only).
 	// Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather
@@ -3033,6 +3108,10 @@ func run() error {
 		// Wire engine-dependent options now that the consensus engine exists.
 		apiSrv.SetRegistry(engine.Registry())
 		apiSrv.SetValidatorKey(myKey)
+		if err := apiSrv.SetAuditValidatorAuthorityFork(authorityFork); err != nil {
+			log.Error("daily audit authority binding failed", "err", err)
+			os.Exit(1)
+		}
 		apiSrv.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
 			var read *store.WalletReadSnapshot
 			err := engine.WithCanonicalRead(func() error {

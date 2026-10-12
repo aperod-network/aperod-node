@@ -5,8 +5,10 @@ import base64
 import json
 import os
 from pathlib import Path
+from importlib.metadata import PackageNotFoundError, distribution
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -39,14 +41,44 @@ MESSAGE = ("chore: maintain verified source distribution\n\n"
            "Co-authored-by: aperod-network <aperod-network@users.noreply.github.com>")
 
 
-def run(*args, cwd=None):
+def run(*args, cwd=None, test_python_userbase=None):
     # Repository-controlled tests/builds must not inherit publication tokens,
     # SSH passwords, bot credentials or unrelated application secrets.
     allowed = {"PATH", "HOME", "TMPDIR", "LANG", "TZ", "GOTOOLCHAIN",
                "GOPATH", "GOMAXPROCS", "GOSUMDB", "GOCACHE", "GOPROXY",
                "CGO_ENABLED", "GOROOT", "LD_LIBRARY_PATH", "NIX_LD"}
     env = {k: v for k, v in os.environ.items() if k in allowed}
+    if test_python_userbase is not None:
+        if args[:2] != ("go", "test"):
+            raise ValueError("isolated Python test dependencies are only for Go tests")
+        # Do not overwrite PYTHONPATH: Go test fixtures may provide their own
+        # isolated stubs. Python's user-site path supplies PyYAML as a fallback.
+        env["PYTHONUSERBASE"] = str(test_python_userbase)
     subprocess.run(list(args), cwd=cwd, check=True, env=env)
+
+
+def prepare_test_python_userbase(destination):
+    """Expose only the trusted PyYAML package to candidate Go tests."""
+    try:
+        dist = distribution("PyYAML")
+        package = Path(dist.locate_file("yaml")).resolve()
+        dist_root = Path(dist.locate_file("")).resolve()
+    except (PackageNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            "PyYAML is required for exported deployment tests; "
+            "refusing to treat incomplete coverage as a pass"
+        ) from exc
+    if (not package.is_dir() or not (package / "__init__.py").is_file()
+            or not package.is_relative_to(dist_root)):
+        raise RuntimeError("PyYAML resolved outside its installed distribution")
+    site_packages = (
+        Path(destination) / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    site_packages.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(package, site_packages / "yaml")
+    return Path(destination)
 
 
 def prepare(root, candidate, gate_only=False):
@@ -132,7 +164,10 @@ def verify(candidate, tree, go_checks=True, with_tests=False):
             run("go", "vet", "./...", cwd=export)
             run("go", "run", "golang.org/x/vuln/cmd/govulncheck@v1.1.4", "./...", cwd=export)
             if with_tests:
-                run("go", "test", "./...", cwd=export)
+                with tempfile.TemporaryDirectory(prefix="aperod-test-python-") as python_temp:
+                    python_userbase = prepare_test_python_userbase(python_temp)
+                    run("go", "test", "./...", cwd=export,
+                        test_python_userbase=python_userbase)
     if git(candidate, "write-tree").decode().strip() != tree:
         raise RuntimeError("Candidate changed during verification")
     print(f"Verified immutable candidate: {checked} files.")

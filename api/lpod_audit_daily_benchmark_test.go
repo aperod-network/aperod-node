@@ -399,6 +399,16 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 	preludeBlocks, positionCount, tailBlocks int,
 	misorderFirstIncluded ...bool,
 ) (*store.DB, *Server, string, int64) {
+misorder := len(misorderFirstIncluded) > 0 && misorderFirstIncluded[0]
+return makeDailyAuditBenchmarkFixtureWithOptions(b, includedBlocks, fillerCount, extraBytes, vaultCount,
+preludeBlocks, positionCount, tailBlocks, misorder, false)
+}
+
+func makeDailyAuditBenchmarkFixtureWithOptions(
+b testing.TB, includedBlocks, fillerCount, extraBytes, vaultCount int,
+preludeBlocks, positionCount, tailBlocks int, misorderFirstIncluded, rotateAuthority bool,
+retiredOutput ...*crypto.ValidatorPrivKey,
+) (*store.DB, *Server, string, int64) {
 	b.Helper()
 	if preludeBlocks < 0 || tailBlocks < 0 {
 		b.Fatal("prelude block count cannot be negative")
@@ -424,12 +434,19 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 	if err != nil {
 		b.Fatal(err)
 	}
+if len(retiredOutput) > 0 { *retiredOutput[0] = priv }
 	walletKeys, err := crypto.GenerateWalletKeys()
 	if err != nil {
 		rawDB.Close()
 		b.Fatal(err)
 	}
 	leader := crypto.AddressFromKeys(crypto.MainnetByte, walletKeys)
+var fork *core.ValidatorAuthorityFork
+var successor crypto.ValidatorPrivKey
+if rotateAuthority {
+successor, _, err = crypto.GenerateValidatorKey()
+if err != nil { b.Fatal(err) }
+}
 	location, err := time.LoadLocation("Europe/Moscow")
 	if err != nil {
 		b.Fatal(err)
@@ -447,7 +464,8 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 	registryAfter := core.RegistrySnapshot{Validators: make(map[string]*core.ValidatorEntry, vaultCount)}
 	previousStake := make(map[string]store.LPoDValidatorStake, vaultCount)
 	stake := make(map[string]store.LPoDValidatorStake, vaultCount)
-	const validatorStake = uint64(100_000_000) * lpod.Unit
+validatorStake := uint64(100_000_000) * lpod.Unit
+if rotateAuthority { validatorStake = uint64(99_000_000) * lpod.Unit }
 	const guardianStake = uint64(0)
 	totalStake := validatorStake + guardianStake
 	if vaultCount > 0 {
@@ -544,7 +562,7 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 			// common benchmark scenario.
 			timestamp = start.Add(-3 * time.Second)
 		}
-		if len(misorderFirstIncluded) > 0 && misorderFirstIncluded[0] {
+if misorderFirstIncluded {
 			if height == firstIncludedHeight {
 				timestamp = start.Add(2 * time.Hour)
 			} else if height == firstIncludedHeight+1 {
@@ -638,6 +656,12 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 			}
 		}
 		checkpointDigest := checkpoint.Digest()
+if rotateAuthority && height == 2 {
+fork = &core.ValidatorAuthorityFork{Version: 1, Height: height, Identity: pub, Replacement: successor.Public(),
+Genesis: genesisHash, Parent: parentHash, RegistrySHA256: crypto.HashBytes([]byte("operator-attested-fixture"))}
+fork.Possession, err = successor.Sign(fork.Message())
+if err != nil { b.Fatal(err) }
+}
 		txs := make([]core.Transaction, 0, 2+fillerCount+len(positionTxs))
 		if height > 0 {
 			// An empty-output payout remains a valid zero-settlement commitment.
@@ -650,6 +674,15 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 				core.Transaction{Version: core.TxVersionLPoDPayout, Extra: auth},
 				core.LPoDCheckpointTx(checkpointDigest))
 			txs = append(txs, positionTxs...)
+if rotateAuthority && height == 3 {
+for _, action := range []core.StakeAction{core.StakeDeposit, core.StakePartialWithdraw} {
+signature, signErr := successor.Sign(core.StakeSignMsg(action, pub, core.MinStakeNAPR))
+if signErr != nil { b.Fatal(signErr) }
+extra, encodeErr := core.EncodeStakeExtra(action, pub, core.MinStakeNAPR, signature)
+if encodeErr != nil { b.Fatal(encodeErr) }
+txs = append(txs, core.Transaction{Version: core.TxVersionStake, Extra: extra})
+}
+}
 			for n := 0; n < fillerCount; n++ {
 				txs = append(txs, core.Transaction{Version: core.TxVersionBase, Extra: make([]byte, extraBytes)})
 			}
@@ -658,7 +691,9 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 			Height: height, PrevHash: parentHash, Timestamp: timestamp.UnixNano(),
 			ValidatorPub: pub, MerkleRoot: core.MerkleRoot(txs),
 		}, Txs: txs}
-		if err := block.Header.Sign(priv); err != nil {
+signer := priv
+if fork != nil && height >= fork.Height { signer = successor }
+if err := block.Header.Sign(signer); err != nil {
 			rawDB.Close()
 			b.Fatal(err)
 		}
@@ -689,8 +724,28 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 		}
 		batch.Put(append([]byte("lpod/checkpoint/v1/"), hash[:]...), checkpointRaw)
 		if height >= firstIncludedHeight && height < closingHeight {
+if rotateAuthority {
+beforeRaw, _ := json.Marshal(registryAfter)
+registryBefore = core.RegistrySnapshot{}
+if err := json.Unmarshal(beforeRaw, &registryBefore); err != nil { b.Fatal(err) }
+replay := core.NewValidatorRegistry()
+var replayStart core.RegistrySnapshot
+if err := json.Unmarshal(beforeRaw, &replayStart); err != nil { b.Fatal(err) }
+replay.RestoreFromSnapshot(replayStart)
+if err := replay.ConfigureSignatureAuthority(fork, height); err != nil { b.Fatal(err) }
+if err := replay.ReplayBlockStakeTxs(txs, height); err != nil { b.Fatal(err) }
+registryAfter = replay.TakeSnapshot()
+previousStake = map[string]store.LPoDValidatorStake{pub.Hex(): {Amount: validatorStake, Active: true}}
+stake = map[string]store.LPoDValidatorStake{pub.Hex(): {Amount: validatorStake, Active: true}}
+if height == 3 { stake[pub.Hex()] = store.LPoDValidatorStake{Amount: validatorStake-core.MinStakeNAPR, Active: true} }
+}
 			recordVaults := append([]store.LPoDAuditVault(nil), vaultRows...)
 			for i := range recordVaults {
+if rotateAuthority && height == 3 && recordVaults[i].ID == pub.Hex() {
+recordVaults[i].ValidatorStake -= core.MinStakeNAPR
+recordVaults[i].TotalStake -= core.MinStakeNAPR
+recordVaults[i].TierStake -= core.MinStakeNAPR
+}
 				recordVaults[i].Accrued = blockAccruedByVault[recordVaults[i].ID]
 				recordVaults[i].Unfunded = recordVaults[i].Accrued
 			}
@@ -796,6 +851,13 @@ func makeDailyAuditBenchmarkFixtureWithTail(
 	server.SetAPIKey(dailyAuditBenchmarkAPIKey)
 	server.SetLPoDConfig(nil, func(uint64, crypto.Hash32) bool { return true })
 	benchmarkDailySigningKey(b, server)
+if rotateAuthority {
+key, keyErr := crypto.NewLockedValidatorKey(successor.Bytes(), nil)
+if keyErr != nil { b.Fatal(keyErr) }
+b.Cleanup(key.Destroy)
+server.SetValidatorKey(key)
+if err := server.SetAuditValidatorAuthorityFork(fork); err != nil { b.Fatal(err) }
+}
 	return db, server, path, blockBodyBytes
 }
 

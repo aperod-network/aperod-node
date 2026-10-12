@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import (
     CleanupError, _assert_not_mountpoint, _assert_root_dir, _capture_origin,
@@ -30,6 +30,22 @@ SNAPSHOT_FILE = re.compile(r"^snapshot[^/]*\.gz(?:\.sha256)?$")
 MAX_ARCHIVE_SIZE = 8 * 1024 * 1024 * 1024
 MAX_MEMBER_SIZE = 4 * 1024 * 1024 * 1024
 MIN_FREE_SPACE = 5 * 1024 * 1024 * 1024
+
+
+class _StagingHeadroomError(CleanupError):
+    """Only this typed refusal is eligible for a bounded space-progress retry."""
+
+    def __init__(self, required: int, available: int):
+        super().__init__("insufficient staging disk headroom for historical archive")
+        self.required, self.available = required, available
+
+
+def _staging_free_bytes(state_dir: Path) -> int | None:
+    try:
+        return shutil.disk_usage(state_dir).free
+    except OSError:
+        # Space telemetry never overrides a successful durable deletion receipt.
+        return None
 
 
 def _retirement_path(state_dir: Path, retirement_id: str) -> Path:
@@ -134,8 +150,9 @@ def _ensure_staging_headroom(work: Path, targets: list[dict[str, Any]]) -> None:
     if any(type(target.get("bytes")) is not int or target["bytes"] < 0 for target in targets):
         raise CleanupError("invalid historical source size")
     required = source_bytes * 4 + MIN_FREE_SPACE
-    if shutil.disk_usage(work).free < required:
-        raise CleanupError("insufficient staging disk headroom for historical archive")
+    available = shutil.disk_usage(work).free
+    if available < required:
+        raise _StagingHeadroomError(required, available)
 
 
 def _safe_tar_name(name: str) -> bool:
@@ -657,7 +674,8 @@ def _target_current_manifest(target: dict[str, Any], runtime: Any) -> list[dict[
 
 
 def _delete_targets(record: dict[str, Any], targets: list[dict[str, Any]],
-                    runtime: Any, settings: dict[str, Any]) -> int:
+                    runtime: Any, settings: dict[str, Any], *,
+                    on_space_freed: Callable[[], None] | None = None) -> int:
     removed = 0
     config = Path(record["origin"]["config"])
     for target in targets:
@@ -684,13 +702,19 @@ def _delete_targets(record: dict[str, Any], targets: list[dict[str, Any]],
             raise CleanupError("historical target changed immediately before deletion")
         _proc_references(record["origin"]["pid"], path, config, runtime=runtime,
                          manifest=target["manifest"])
-        removed += _delete_manifest(target, runtime)
+        free_before = _staging_free_bytes(Path(runtime.state_dir)) if on_space_freed else None
+        target_removed = _delete_manifest(target, runtime)
+        removed += target_removed
         record.setdefault("receipts", []).append({
             "path": target["path"], "manifest_sha256": _target_manifest_hash(target),
             "deleted_at": int(runtime.clock()),
         })
         record["status"] = "archived"
         atomic_json(_retirement_path(Path(runtime.state_dir), record["id"]), record)
+        if on_space_freed and target_removed > 0 and free_before is not None:
+            free_after = _staging_free_bytes(Path(runtime.state_dir))
+            if free_after is not None and free_after > free_before:
+                on_space_freed()
     return removed
 
 
@@ -715,11 +739,16 @@ def scan_retirements(apply: bool = False, runtime: Any = None) -> dict[str, Any]
             except (OSError, ValueError, KeyError, TypeError):
                 outcomes.append({"id": entry.name[11:-5], "status": "refused",
                                  "error": "operation refused: unsafe record or host I/O failure"})
-        for record in records:
-            if record["status"] == "completed":
-                outcomes.append({"id": record["id"], "status": "completed", "removed_bytes": 0})
-                continue
+        space_freed = False
+
+        def note_space_freed() -> None:
+            nonlocal space_freed
+            space_freed = True
+
+        def attempt(record: dict[str, Any]) -> tuple[dict[str, Any], _StagingHeadroomError | None]:
             try:
+                if record["status"] == "completed":
+                    return {"id": record["id"], "status": "completed", "removed_bytes": 0}, None
                 stopped, targets = _revalidate_record(record, rt)
                 _origin_unchanged(record["origin"], rt)
                 for target in targets:
@@ -727,9 +756,8 @@ def scan_retirements(apply: bool = False, runtime: Any = None) -> dict[str, Any]
                                      Path(record["origin"]["config"]), runtime=rt,
                                      manifest=target["manifest"])
                 if not apply:
-                    outcomes.append({"id": record["id"], "status": "ready",
-                                     "targets": len(targets), "bytes": sum(t["bytes"] for t in targets)})
-                    continue
+                    return {"id": record["id"], "status": "ready",
+                            "targets": len(targets), "bytes": sum(t["bytes"] for t in targets)}, None
                 settings = _settings(rt)
                 if record.get("archive") is None:
                     record["archive"] = _archive_and_verify(record, stopped, targets, rt, settings)
@@ -743,17 +771,49 @@ def scan_retirements(apply: bool = False, runtime: Any = None) -> dict[str, Any]
                 # verification; no backup chain coverage is inferred here.
                 _origin_unchanged(record["origin"], rt)
                 _revalidate_record(record, rt)
-                removed_bytes = _delete_targets(record, targets, rt, settings)
+                removed_bytes = _delete_targets(record, targets, rt, settings,
+                                                on_space_freed=note_space_freed)
                 record["status"] = "completed"
                 record["completed_at"] = int(rt.clock())
                 atomic_json(_retirement_path(state_dir, record["id"]), record)
-                outcomes.append({"id": record["id"], "status": "completed",
-                                 "removed_bytes": removed_bytes})
+                return {"id": record["id"], "status": "completed",
+                        "removed_bytes": removed_bytes}, None
+            except _StagingHeadroomError as exc:
+                return {"id": record.get("id"), "status": "refused", "error": str(exc)}, exc
             except CleanupError as exc:
-                outcomes.append({"id": record.get("id"), "status": "refused", "error": str(exc)})
+                return {"id": record.get("id"), "status": "refused", "error": str(exc)}, None
             except (OSError, ValueError, KeyError, TypeError):
-                outcomes.append({"id": record.get("id"), "status": "refused",
-                                 "error": "operation refused: unsafe record or host I/O failure"})
+                return {"id": record.get("id"), "status": "refused",
+                        "error": "operation refused: unsafe record or host I/O failure"}, None
+
+        deferred: list[tuple[int, str, _StagingHeadroomError]] = []
+        for record in records:
+            outcome, headroom = attempt(record)
+            if headroom is not None:
+                deferred.append((len(outcomes), record["id"], headroom))
+            outcomes.append(outcome)
+
+        # One additional pass, at most one retry per space-refused record.
+        # Smallest staging requirement first so a later eligible copy can make
+        # room for a larger one without needing another loop or timer launch.
+        if apply and space_freed:
+            for index, retirement_id, failure in sorted(deferred, key=lambda item: item[2].required):
+                available = _staging_free_bytes(state_dir)
+                if (available is None or available <= failure.available
+                        or available < failure.required):
+                    continue
+                try:
+                    fresh = _safe_record(_retirement_path(state_dir, retirement_id), rt)
+                    if fresh.get("type") != "historical-retirement" or fresh.get("id") != retirement_id:
+                        raise CleanupError("invalid historical retirement record")
+                    # Reload durable archive/partial receipts; never reuse an
+                    # earlier in-memory authorization or skip archive readback.
+                    outcomes[index], _ = attempt(fresh)
+                except CleanupError as exc:
+                    outcomes[index] = {"id": retirement_id, "status": "refused", "error": str(exc)}
+                except (OSError, ValueError, KeyError, TypeError):
+                    outcomes[index] = {"id": retirement_id, "status": "refused",
+                                       "error": "operation refused: unsafe record or host I/O failure"}
         return {
             "apply": bool(apply), "status": "refused" if any(
                 row.get("status") == "refused" for row in outcomes

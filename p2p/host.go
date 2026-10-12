@@ -39,11 +39,11 @@ type Config struct {
 	MinOutbound int
 	NodeID      string // hex-encoded public key or random ID
 	UserAgent   string
-// TLSConfig enables authenticated encrypted transport.
+	// TLSConfig enables authenticated encrypted transport.
 	// When non-nil, the listener is wrapped with tls.NewListener and
 	// outbound dials use tls.DialWithDialer.  Both sides must present a
-// certificate; AllowedPeers is mandatory and each peer fingerprint is
-// checked during the TLS handshake.
+	// certificate; AllowedPeers is mandatory and each peer fingerprint is
+	// checked during the TLS handshake.
 	// nil = plain TCP (unit tests only — never use nil in production).
 	TLSConfig *tls.Config
 	// SelfFingerprint is the hex-encoded SHA-256 SPKI fingerprint of this
@@ -54,10 +54,10 @@ type Config struct {
 	// present identical certificates and silently fail to peer.
 	// Set by main.go from the fingerprint returned by LoadOrSaveP2PIdentity.
 	SelfFingerprint string
-// AllowedPeers is the required list of hex-encoded SHA-256 SPKI
-// fingerprints permitted to connect when TLSConfig is enabled.
-// The list is enforced during the TLS handshake; an empty or malformed
-// list prevents Start from opening the listener.
+	// AllowedPeers is the required list of hex-encoded SHA-256 SPKI
+	// fingerprints permitted to connect when TLSConfig is enabled.
+	// The list is enforced during the TLS handshake; an empty or malformed
+	// list prevents Start from opening the listener.
 	AllowedPeers []string
 	// PeerWhitelist is an optional list of IP addresses and/or CIDR
 	// ranges (e.g. "1.2.3.4", "10.0.0.0/8") that are allowed to
@@ -1520,13 +1520,13 @@ func (h *Host) banTxFlooder(peerIP string, peer *Peer, violations int) {
 
 // Start binds the listener and begins accepting connections.
 func (h *Host) Start() error {
-if h.cfg.TLSConfig != nil {
-pinnedConfig, err := TLSConfigWithAllowedPeerFingerprints(h.cfg.TLSConfig, h.cfg.AllowedPeers)
-if err != nil {
-return fmt.Errorf("p2p TLS peer verification: %w", err)
-}
-h.cfg.TLSConfig = pinnedConfig
-}
+	if h.cfg.TLSConfig != nil {
+		pinnedConfig, err := TLSConfigWithAllowedPeerFingerprints(h.cfg.TLSConfig, h.cfg.AllowedPeers)
+		if err != nil {
+			return fmt.Errorf("p2p TLS peer verification: %w", err)
+		}
+		h.cfg.TLSConfig = pinnedConfig
+	}
 
 	// Restore persisted bans from disk before accepting any connections so
 	// previously-banned peers are blocked immediately on restart — without
@@ -2726,12 +2726,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 			return
 		}
 
-// Defense in depth: the same allow-list is enforced in VerifyConnection
-// during the TLS handshake, before application traffic is accepted.
-if h.cfg.TLSConfig != nil {
+		// Defense in depth: the same allow-list is enforced in VerifyConnection
+		// during the TLS handshake, before application traffic is accepted.
+		if h.cfg.TLSConfig != nil {
 			allowed := false
 			for _, a := range h.cfg.AllowedPeers {
-if strings.EqualFold(strings.TrimSpace(a), fp) {
+				if strings.EqualFold(strings.TrimSpace(a), fp) {
 					allowed = true
 					break
 				}

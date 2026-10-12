@@ -196,10 +196,10 @@ type P2PConfig struct {
 	// under an inbound flood can always gossip produced blocks to the network.
 	// Recommended: 4.  0 = feature disabled.
 	MinOutbound int `yaml:"min_outbound"`
-// AllowedPeers is the required list of hex-encoded SHA-256 SPKI fingerprints
-// permitted to join a TLS-enabled P2P network. Each peer is authenticated
-// against this list during the TLS handshake; an empty or malformed list
-// prevents the TLS host from starting.
+	// AllowedPeers is the required list of hex-encoded SHA-256 SPKI fingerprints
+	// when P2P TLS is enabled. Any peer whose TLS fingerprint is not on the list
+	// is rejected during the TLS handshake; an empty or malformed list prevents
+	// the TLS listener from starting.
 	AllowedPeers []string `yaml:"allowed_peers"`
 	// PeerWhitelist is an optional list of IP addresses and/or CIDR ranges
 	// (e.g. "1.2.3.4", "10.0.0.0/8") whose inbound connections are accepted.
@@ -314,13 +314,15 @@ type P2PConfig struct {
 
 // ConsensusConfig holds PoA settings.
 type ConsensusConfig struct {
-	ValidatorKey       string        `yaml:"validator_key"`      // path to ED25519 key file
-	ViewKey            string        `yaml:"view_key"`           // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
-	RewardAddress      string        `yaml:"reward_address"`     // APRO wallet address for block rewards
-	BlockRewardNAPR    uint64        `yaml:"block_reward_napro"` // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
-	BlockTime          time.Duration `yaml:"block_time"`
-	OracleURL          string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
-	OracleMaxDeviation float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
+	ValidatorAuthorityForkFile   string        `yaml:"validator_authority_fork_file"`
+	ValidatorAuthorityForkSHA256 string        `yaml:"validator_authority_fork_sha256"`
+	ValidatorKey                 string        `yaml:"validator_key"`      // path to ED25519 key file
+	ViewKey                      string        `yaml:"view_key"`           // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
+	RewardAddress                string        `yaml:"reward_address"`     // APRO wallet address for block rewards
+	BlockRewardNAPR              uint64        `yaml:"block_reward_napro"` // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
+	BlockTime                    time.Duration `yaml:"block_time"`
+	OracleURL                    string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
+	OracleMaxDeviation           float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
 	// StopProducingAtHeight is an operator safety barrier: this validator will
 	// not propose blocks at or above this height. Zero disables the barrier.
 	// Relay/non-validator nodes should leave this unset.
@@ -352,6 +354,9 @@ type ConsensusConfig struct {
 	// RingCTCLSAGActivationHeight is the first height requiring RingCT v5.
 	// Zero deliberately disables v5 rather than activating it immediately.
 	RingCTCLSAGActivationHeight uint64 `yaml:"ring_ct_clsag_activation_height"`
+	// StakedCollateralRingExclusionActivationHeight is the first block height
+	// whose CLSAG rings must exclude staked collateral. Zero disables this fork.
+	StakedCollateralRingExclusionActivationHeight uint64 `yaml:"staked_collateral_ring_exclusion_activation_height"`
 	// RewardAuthorizationActivationHeight is the first block height whose
 	// validator reward must carry an on-chain authorization. Zero disables the
 	// post-RingCT reward path; set the same future value on every validator.
@@ -374,6 +379,12 @@ type ConsensusConfig struct {
 	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
 	// Empty disables the fork. Merely setting a target amount never funds the pool.
 	LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// SaleMigrationFile is a local signed checkpoint and disjoint allocation
+	// witness. Empty disables sales; it is not an amount or payment-server flag.
+	SaleMigrationFile string `yaml:"sale_migration_file"`
+	// Future, coordinated activation of the fixed annual Development Fund schedule.
+	GenesisVestingActivationHeight uint64 `yaml:"genesis_vesting_activation_height"`
+	GenesisVestingFundingFile      string `yaml:"genesis_vesting_funding_file"`
 	// LPoDV2TrustAuthorities is the explicit version-2 checkpoint trust anchor.
 	// Values are exact 32-byte Ed25519 public-key hex strings; empty disables v2.
 	// It is independent of genesis validators and never changes the consensus
@@ -382,20 +393,20 @@ type ConsensusConfig struct {
 	// LPoDV3TrustAuthorities explicitly authorize the trust-attested nominal
 	// reclassification. They do not change the consensus validator set.
 	LPoDV3TrustAuthorities []string `yaml:"lpod_v3_trust_authorities"`
-// RegistryBootstrap is an explicit operator-attested offline recovery anchor.
-// It is not independent historical committee authentication.
-RegistryBootstrap *RegistryBootstrapConfig `yaml:"registry_bootstrap"`
+	// RegistryBootstrap is an explicit operator-attested offline recovery anchor.
+	// It is not independent historical committee authentication.
+	RegistryBootstrap *RegistryBootstrapConfig `yaml:"registry_bootstrap"`
 }
 
 type RegistryBootstrapConfig struct {
-Trust string `yaml:"trust"`
-SnapshotFile string `yaml:"snapshot_file"`
-SHA256 string `yaml:"sha256"`
-Height uint64 `yaml:"height"`
-// Optional separately pinned public KI export from a DB at this exact anchor.
-// Old DB-backed snapshots intentionally omit historical key images.
-KeyImageFile string `yaml:"key_image_file"`
-KeyImageSHA256 string `yaml:"key_image_sha256"`
+	Trust        string `yaml:"trust"`
+	SnapshotFile string `yaml:"snapshot_file"`
+	SHA256       string `yaml:"sha256"`
+	Height       uint64 `yaml:"height"`
+	// Optional separately pinned public KI export from a DB at this exact anchor.
+	// Old DB-backed snapshots intentionally omit historical key images.
+	KeyImageFile   string `yaml:"key_image_file"`
+	KeyImageSHA256 string `yaml:"key_image_sha256"`
 }
 
 // APIConfig holds RPC/REST settings.
@@ -617,19 +628,19 @@ func (c *Config) Warnings() []string {
 
 // Validate checks that required fields are present and valid.
 func (c *Config) Validate() error {
-if anchor := c.Consensus.RegistryBootstrap; anchor != nil {
-if anchor.KeyImageFile != "" || anchor.KeyImageSHA256 != "" {
-digest,err:=hex.DecodeString(anchor.KeyImageSHA256)
-if anchor.KeyImageFile=="" || err!=nil || len(digest)!=32 {
-return fmt.Errorf("registry_bootstrap key-image file requires a SHA-256 digest")
-}
-}
-digest, err := hex.DecodeString(anchor.SHA256)
-if !c.Consensus.NonValidator || anchor.Trust != "operator_attested" ||
-anchor.Height == 0 || anchor.SnapshotFile == "" || err != nil || len(digest) != 32 {
-return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_attested, snapshot_file, height > 0 and a SHA-256 digest")
-}
-}
+	if anchor := c.Consensus.RegistryBootstrap; anchor != nil {
+		if anchor.KeyImageFile != "" || anchor.KeyImageSHA256 != "" {
+			digest, err := hex.DecodeString(anchor.KeyImageSHA256)
+			if anchor.KeyImageFile == "" || err != nil || len(digest) != 32 {
+				return fmt.Errorf("registry_bootstrap key-image file requires a SHA-256 digest")
+			}
+		}
+		digest, err := hex.DecodeString(anchor.SHA256)
+		if !c.Consensus.NonValidator || anchor.Trust != "operator_attested" ||
+			anchor.Height == 0 || anchor.SnapshotFile == "" || err != nil || len(digest) != 32 {
+			return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_attested, snapshot_file, height > 0 and a SHA-256 digest")
+		}
+	}
 	if c.Network == "" {
 		return fmt.Errorf("network must be set")
 	}
@@ -652,10 +663,23 @@ return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_at
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
+	stakedRingActivation := c.Consensus.StakedCollateralRingExclusionActivationHeight
+	if c.Network == "mainnet" && stakedRingActivation == 0 {
+		return fmt.Errorf("mainnet nodes must configure staked_collateral_ring_exclusion_activation_height")
+	}
 	if clsagActivation > 0 && ringCTActivation > 0 && clsagActivation < ringCTActivation {
 		return fmt.Errorf(
 			"ring_ct_clsag_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
 			clsagActivation, ringCTActivation,
+		)
+	}
+	if stakedRingActivation > 0 && clsagActivation == 0 {
+		return fmt.Errorf("staked_collateral_ring_exclusion_activation_height requires ring_ct_clsag_activation_height")
+	}
+	if stakedRingActivation > 0 && stakedRingActivation < clsagActivation {
+		return fmt.Errorf(
+			"staked_collateral_ring_exclusion_activation_height (%d) must be >= ring_ct_clsag_activation_height (%d)",
+			stakedRingActivation, clsagActivation,
 		)
 	}
 	if rewardActivation > 0 && ringCTActivation > 0 && rewardActivation < ringCTActivation {
@@ -687,6 +711,12 @@ return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_at
 		}
 	}
 	guardianActivation := c.Consensus.GuardianFundActivationHeight
+	if c.Consensus.GenesisVestingActivationHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
+		return fmt.Errorf("genesis_vesting_activation_height requires a canonical LPoD migration")
+	}
+	if (c.Consensus.GenesisVestingActivationHeight > 0) != (c.Consensus.GenesisVestingFundingFile != "") {
+		return fmt.Errorf("genesis vesting activation height and purpose-bound funding file must be set together")
+	}
 	guardianAnchor := c.Consensus.GuardianFundChainAnchor
 	if (guardianActivation == 0) != (guardianAnchor == "") {
 		return fmt.Errorf("guardian_fund_activation_height and guardian_fund_chain_anchor must be set together")

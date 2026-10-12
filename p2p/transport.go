@@ -25,7 +25,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-"strings"
+	"strings"
 	"time"
 )
 
@@ -98,38 +98,38 @@ func NodeTLSConfigFromKey(priv ed25519.PrivateKey, pub ed25519.PublicKey) (*tls.
 // authenticates the remote certificate against an explicit SPKI pin set.
 // An empty or malformed list is rejected; there is no open-network fallback.
 func TLSConfigWithAllowedPeerFingerprints(base *tls.Config, allowedPeers []string) (*tls.Config, error) {
-if base == nil {
-return nil, fmt.Errorf("p2p TLS config is required")
-}
-if len(allowedPeers) == 0 {
-return nil, fmt.Errorf("p2p TLS requires at least one allowed peer fingerprint")
-}
+	if base == nil {
+		return nil, fmt.Errorf("p2p TLS config is required")
+	}
+	if len(allowedPeers) == 0 {
+		return nil, fmt.Errorf("p2p TLS requires at least one allowed peer fingerprint")
+	}
 
-pinned := make(map[string]struct{}, len(allowedPeers))
-for _, value := range allowedPeers {
-fingerprint := strings.ToLower(strings.TrimSpace(value))
-decoded, err := hex.DecodeString(fingerprint)
-if err != nil || len(decoded) != sha256.Size {
-return nil, fmt.Errorf("invalid allowed peer fingerprint")
-}
-pinned[fingerprint] = struct{}{}
-}
+	pinned := make(map[string]struct{}, len(allowedPeers))
+	for _, value := range allowedPeers {
+		fingerprint := strings.ToLower(strings.TrimSpace(value))
+		decoded, err := hex.DecodeString(fingerprint)
+		if err != nil || len(decoded) != sha256.Size {
+			return nil, fmt.Errorf("invalid allowed peer fingerprint")
+		}
+		pinned[fingerprint] = struct{}{}
+	}
 
-cfg := base.Clone()
-cfg.VerifyConnection = func(state tls.ConnectionState) error {
-if len(state.PeerCertificates) == 0 {
-return fmt.Errorf("p2p TLS peer did not present a certificate")
-}
-fingerprint, err := spkiFingerprint(state.PeerCertificates[0].PublicKey)
-if err != nil {
-return fmt.Errorf("p2p TLS peer fingerprint: %w", err)
-}
-if _, ok := pinned[fingerprint]; !ok {
-return fmt.Errorf("p2p TLS peer fingerprint is not in allowed_peers")
-}
-return nil
-}
-return cfg, nil
+	cfg := base.Clone()
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return fmt.Errorf("p2p TLS peer did not present a certificate")
+		}
+		fingerprint, err := spkiFingerprint(state.PeerCertificates[0].PublicKey)
+		if err != nil {
+			return fmt.Errorf("p2p TLS peer fingerprint: %w", err)
+		}
+		if _, ok := pinned[fingerprint]; !ok {
+			return fmt.Errorf("p2p TLS peer fingerprint is not in allowed_peers")
+		}
+		return nil
+	}
+	return cfg, nil
 }
 
 func nodeConfigFromKey(priv ed25519.PrivateKey, pub ed25519.PublicKey) (*tls.Config, string, error) {
@@ -147,13 +147,13 @@ func nodeConfigFromKey(priv ed25519.PrivateKey, pub ed25519.PublicKey) (*tls.Con
 		// RequireAnyClientCert means the cert must be sent but the chain is
 		// not verified — appropriate for self-signed peer certs.
 		ClientAuth: tls.RequireAnyClientCert,
-// Self-signed certificates have no CA chain. The callback rejects all
-// peers until an explicit pin set is installed by the P2P host.
+		// Self-signed certificates have no CA chain. The callback rejects all
+		// peers until an explicit pin set is installed by the P2P host.
 		InsecureSkipVerify: true, //nolint:gosec // intentional — fingerprint auth
-MinVersion: tls.VersionTLS13,
-VerifyConnection: func(tls.ConnectionState) error {
-return fmt.Errorf("p2p TLS peer pins are not configured")
-},
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection: func(tls.ConnectionState) error {
+			return fmt.Errorf("p2p TLS peer pins are not configured")
+		},
 	}
 	return cfg, fingerprint, nil
 }

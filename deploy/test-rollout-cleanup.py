@@ -22,6 +22,7 @@ sys.path.insert(0, str(DEPLOY))
 import rollout_cleanup as cleanup  # noqa: E402
 from rollout_cleanup import cli  # noqa: E402
 from rollout_cleanup import runtime as cleanup_runtime  # noqa: E402
+from rollout_cleanup.transition import reconcile  # noqa: E402
 
 
 def root_stat(real):
@@ -660,6 +661,85 @@ class RolloutLifecycleTests(unittest.TestCase):
             str(next_anchors), str(next_context), runtime=fixture.runtime,
         )
         self.assertEqual(cleanup.read_json(next_anchors)["anchors"], [])
+
+    def prepare_config_transition(self):
+        fixture = self.fixture
+        fixture.begin_and_mark()
+        previous = fixture.release / "baseline.yaml"
+        shutil.copyfile(fixture.config, previous)
+        previous.chmod(0o600)
+        fixture.config.write_text('{"network":"fixture","authority":"replacement"}')
+        fixture.current_pid[0] = 202
+        fixture.add_process(202)
+        fixture.height[0] = 105
+        fixture.runtime.sleep = lambda _seconds: fixture.height.__setitem__(0, fixture.height[0] + 1)
+        return (str(previous), cleanup._config_hash(fixture.config),
+                hashlib.sha256(fixture.installed.read_bytes()).hexdigest())
+
+    def test_config_transition_preserves_old_origin_and_completes_a_fresh_registration(self):
+        fixture = self.fixture
+        args = self.prepare_config_transition()
+        before = cleanup.read_json(fixture.state / (fixture.job_id + ".json"))
+        with self.assertRaisesRegex(cleanup.CleanupError, "live config"):
+            cleanup.complete(fixture.job_id, args[2], runtime=fixture.runtime)
+        result = reconcile(fixture.job_id, *args, runtime=fixture.runtime)
+        old = cleanup.read_json(fixture.state / (fixture.job_id + ".json"))
+        new = cleanup.read_json(fixture.state / (result["replacement_id"] + ".json"))
+        self.assertEqual(old["origin"], before["origin"])
+        self.assertEqual(old["marks"], before["marks"])
+        self.assertEqual(old["status"], "superseded")
+        self.assertEqual(new["status"], "completed")
+        self.assertEqual(new["origin"]["config_sha256"], args[1])
+        self.assertTrue(fixture.candidate.exists())
+        self.assertTrue(fixture.stopped.exists())
+        self.assertEqual(reconcile(fixture.job_id, *args, runtime=fixture.runtime)["replacement_id"],
+                         result["replacement_id"])
+
+    def test_config_transition_fails_closed_on_each_invalid_binding(self):
+        cases = ("old_config", "approved_hash", "binary", "artifact", "chain", "symlink", "permissions")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                self.fixture = LifecycleFixture(Path(tmp))
+                fixture = self.fixture
+                previous, approved, binary = self.prepare_config_transition()
+                if case == "old_config":
+                    Path(previous).write_text("substituted")
+                elif case == "approved_hash":
+                    approved = "a" * 64
+                elif case == "binary":
+                    binary = "b" * 64
+                elif case == "artifact":
+                    fixture.candidate.write_bytes(b"changed")
+                elif case == "chain":
+                    fixture.genesis[0] = "c" * 64
+                elif case == "symlink":
+                    Path(previous).unlink()
+                    Path(previous).symlink_to(fixture.config)
+                else:
+                    Path(previous).chmod(0o644)
+                before = (fixture.state / (fixture.job_id + ".json")).read_bytes()
+                with self.assertRaises(cleanup.CleanupError):
+                    reconcile(fixture.job_id, previous, approved, binary, runtime=fixture.runtime)
+                self.assertEqual((fixture.state / (fixture.job_id + ".json")).read_bytes(), before)
+                self.assertTrue(fixture.candidate.exists())
+                self.assertEqual(len(list(fixture.state.glob("*.json"))), 1)
+
+    def test_config_transition_resumes_after_interrupted_terminal_write(self):
+        fixture = self.fixture
+        args = self.prepare_config_transition()
+        real_write = cleanup.atomic_json
+        original_path = fixture.state / (fixture.job_id + ".json")
+        def interrupted(path, document):
+            if path == original_path and document.get("status") == "superseded":
+                raise OSError("simulated power loss")
+            return real_write(path, document)
+        with mock.patch.object(cleanup, "atomic_json", side_effect=interrupted):
+            with self.assertRaises(OSError):
+                reconcile(fixture.job_id, *args, runtime=fixture.runtime)
+        self.assertEqual(cleanup.read_json(original_path)["status"], "begun")
+        self.assertEqual(len(list(fixture.state.glob("*.json"))), 2)
+        self.assertEqual(reconcile(fixture.job_id, *args, runtime=fixture.runtime)["status"], "superseded")
+        self.assertEqual(len(list(fixture.state.glob("*.json"))), 2)
 
     def test_missing_stale_and_malformed_receipts_refuse_cleanup(self):
         fixture = self.fixture

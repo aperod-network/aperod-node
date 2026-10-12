@@ -290,7 +290,8 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 
 	// ── 5. Cryptographic verification ────────────────────────────────────────
 	verifier := core.NewTxVerifier(s.utxos)
-	if err := verifier.VerifyTx(&result.Tx); err != nil {
+verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
+if err := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight()); err != nil {
 		return nil, fmt.Errorf("verify: %w", err)
 	}
 

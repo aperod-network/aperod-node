@@ -17,6 +17,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+"sync/atomic"
 
 	"github.com/aperod/aperod/crypto"
 )
@@ -470,6 +471,8 @@ type ValidatorRegistry struct {
 	utxos                     *UTXOSet                   // required for C-1 UTXO-backed deposit check
 	stakeWithdrawalGenesis    crypto.Hash32
 	stakeWithdrawalActivation uint64
+signatureFork             atomic.Pointer[ValidatorAuthorityFork]
+signatureAdmissionHeight  atomic.Uint64
 }
 
 // ConfigureStakeWithdrawalV2 binds the registry to the quorum-attested LPoD
@@ -620,7 +623,7 @@ func (r *ValidatorRegistry) validateWithdrawalV2Locked(a StakeWithdrawalAuthoriz
 	if a.StakeRef != wantRef {
 		return nil, fmt.Errorf("stake withdrawal v2: current stake reference mismatch")
 	}
-	if !a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+if !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 		return nil, fmt.Errorf("stake withdrawal v2: invalid validator signature")
 	}
 	return entry, nil
@@ -682,7 +685,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 			return fmt.Errorf("registry: legacy stake withdrawal disabled after attested v2 activation")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
 		}
 		r.mu.Lock()
@@ -719,7 +722,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 		// Verify self-signature — binds the deposit to a specific burn UTXO,
 		// preventing replay attacks with a different UTXO at the same amount.
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
 		}
 
@@ -775,7 +778,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 
 		// Verify validator self-signature (same signing msg as v2).
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
 		}
 
@@ -866,7 +869,7 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 			return nil, fmt.Errorf("legacy stake withdrawal disabled after attested v2 activation")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid stake signature from %s", pub.ID())
 		}
 		key := pub.Hex()
@@ -895,7 +898,7 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 			return nil, fmt.Errorf("v2 payload only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid v2 stake signature from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -942,7 +945,7 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 			return nil, fmt.Errorf("v3 payload only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid v3 stake signature from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -1126,7 +1129,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 				return fmt.Errorf("stake tx[%d]: legacy withdrawal disabled after attested v2 activation", i)
 			}
 			msg := StakeSignMsg(action, pub, amount)
-			if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid signature from %s", i, pub.ID())
 			}
 			key := pub.Hex()
@@ -1172,7 +1175,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 			}
 			if withdrawalActivation == 0 || height < withdrawalActivation || a.Genesis != withdrawalGenesis ||
 				a.ExpiryHeight < height || a.ExpiryHeight-height > StakeWithdrawalMaxExpiryBlocks ||
-				!a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+!r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 				return fmt.Errorf("stake tx[%d]: invalid, expired, cross-chain, or pre-activation v2 withdrawal", i)
 			}
 			key := a.PubKey.Hex()
@@ -1210,7 +1213,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 				return fmt.Errorf("stake tx[%d]: v2 payload only valid for StakeDeposit, got action=%d", i, action)
 			}
 			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-			if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid v2 signature from %s", i, pub.ID())
 			}
 			// Within-block duplicate burn UTXO.
@@ -1285,7 +1288,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 				return fmt.Errorf("stake tx[%d]: v3 payload only valid for StakeDeposit, got action=%d", i, action)
 			}
 			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-			if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid v3 signature from %s", i, pub.ID())
 			}
 			// Within-block duplicate burn UTXO.
@@ -1371,6 +1374,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 //   - Pedersen commitment match: Commit(amount, blind) == UTXO.AmountCommit (C-1)
 //   - For v3: one-time-key ownership proof verified (F-049 fix)
 func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
+height := r.signatureAdmissionHeight.Load()
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
 	}
@@ -1385,7 +1389,7 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 			return fmt.Errorf("registry: StakeDeposit requires v2 payload (173 bytes) with UTXO burn proof — v1 deposits no longer accepted (C-1 fix)")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
 		}
 		return nil
@@ -1399,7 +1403,7 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 		genesis := r.stakeWithdrawalGenesis
 		enabled := r.stakeWithdrawalActivation != 0
 		r.mu.RUnlock()
-		if !enabled || a.Genesis != genesis || !a.PubKey.Verify(StakeWithdrawalSignMsgV2(a), a.Signature) {
+if !enabled || a.Genesis != genesis || !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 			return fmt.Errorf("registry: invalid or unconfigured stake withdrawal v2 authorization")
 		}
 		return nil
@@ -1413,7 +1417,7 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 			return fmt.Errorf("registry: v2 payload (173 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -1450,7 +1454,7 @@ func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
 			return fmt.Errorf("registry: v3 payload (237 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -1540,7 +1544,7 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 			return fmt.Errorf("replay: legacy withdrawal after attested v2 activation at height %d", height)
 		}
 		msg := StakeSignMsg(action, pub, amount)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid stake sig from %s at height %d", pub.ID(), height)
 		}
 		key := pub.Hex()
@@ -1576,7 +1580,7 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 			return fmt.Errorf("replay: v2 payload with non-deposit action=%d at height %d", action, height)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid v2 stake sig from %s at height %d", pub.ID(), height)
 		}
 		// Reconstruct the burn-UTXO descriptor from payload data so MarkStakedKnown
@@ -1606,7 +1610,7 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 			return fmt.Errorf("replay: v3 payload with non-deposit action=%d at height %d", action, height)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-		if !pub.Verify(msg, sig) {
+if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid v3 stake sig from %s at height %d", pub.ID(), height)
 		}
 		expectedCommit, _ := crypto.Commit(amount, burnBlind)

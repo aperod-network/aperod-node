@@ -42,6 +42,20 @@ func (s *WalletReadSnapshot) Release() {
 	s.release.Do(s.snapshot.Release)
 }
 
+// LookupTxIdx is only a locator in this pinned view, not confirmation. The
+// caller must still check the real transaction in the canonical block body.
+func (s *WalletReadSnapshot) LookupTxIdx(hash crypto.Hash32) (*TxIdxEntry, error) {
+	value, err := s.get(append(append([]byte{}, prefixTxIdx...), hash[:]...))
+	if err != nil || len(value) == 0 {
+		return nil, err
+	}
+	if len(value) != 12 {
+		return nil, fmt.Errorf("malformed pinned transaction locator")
+	}
+	return &TxIdxEntry{Height: binary.BigEndian.Uint64(value[:8]),
+		TxIdx: int(binary.BigEndian.Uint32(value[8:]))}, nil
+}
+
 func (s *WalletReadSnapshot) get(key []byte) ([]byte, error) {
 	value, err := s.snapshot.Get(key, nil)
 	if err == leveldb.ErrNotFound {

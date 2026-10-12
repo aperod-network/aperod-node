@@ -913,6 +913,8 @@ node_source_baseline_guard "${BINARY_DST}" || {
   echo "✗ Running-binary approval changed during the build — service NOT stopped." >&2
   exit 1
 }
+source "${DEPLOY_DIR}/sale-upgrade-guard.sh"
+sale_upgrade_guard "${BINARY_SRC}" "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" || exit 1
 systemctl stop "${SERVICE_NAME}" || true   # non-fatal if already stopped
 # Wait up to 120 s for the service to fully stop before we try to replace the
 # binary.  A single "sleep 1" is not enough: on shutdown the node flushes a

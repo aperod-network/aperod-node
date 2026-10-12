@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from . import (
@@ -20,6 +21,40 @@ from . import (
     state_lock,
 )
 from .retirement import register as register_retirement, scan_retirements
+from .transition import reconcile
+
+_SENSITIVE_OUTPUT_KEY = re.compile(
+    r"(?:password|passphrase|secret|token|credential|authorization|"
+    r"api[_-]?key|private[_-]?key|mnemonic|seed|bearer)",
+    re.IGNORECASE,
+)
+_INLINE_CREDENTIAL = re.compile(
+    r"(?i)\b(password|passphrase|secret(?:[_ -]?access[_ -]?key)?|token|"
+    r"api[_ -]?key|authorization|bearer|private[_ -]?key|"
+    r"mnemonic(?:\s+phrase)?|seed(?:\s+phrase)?)\b(\s*[:=]\s*|\s+)"
+    r'("[^"]*"|\'[^\']*\'|[^,;\r\n]+)'
+)
+_URL_CREDENTIALS = re.compile(r"(?i)(https?://)[^/\s@]+:[^/\s@]+@")
+
+
+def _redact_text(value: str) -> str:
+    value = _URL_CREDENTIALS.sub(r"\1[REDACTED]@", value)
+    return _INLINE_CREDENTIAL.sub(r"\1\2[REDACTED]", value)
+
+
+def _safe_output(value):
+    """Remove credential-shaped fields before emitting operator JSON."""
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_output(item)
+            for key, item in value.items()
+            if not _SENSITIVE_OUTPUT_KEY.search(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_output(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,6 +76,12 @@ def _parser() -> argparse.ArgumentParser:
     finish = commands.add_parser("complete")
     finish.add_argument("--id", required=True)
     finish.add_argument("--expected-binary-sha256", required=True)
+
+    transition = commands.add_parser("reconcile-config-transition")
+    transition.add_argument("--id", required=True)
+    transition.add_argument("--previous-config", required=True)
+    transition.add_argument("--expected-config-sha256", required=True)
+    transition.add_argument("--expected-binary-sha256", required=True)
 
     check = commands.add_parser("scan")
     check_mode = check.add_mutually_exclusive_group()
@@ -93,6 +134,10 @@ def _dispatch(args: argparse.Namespace) -> dict:
     if args.command == "complete":
         with state_lock():
             return complete(args.id, args.expected_binary_sha256)
+    if args.command == "reconcile-config-transition":
+        with state_lock():
+            return reconcile(args.id, args.previous_config, args.expected_config_sha256,
+                             args.expected_binary_sha256)
     if args.command == "scan":
         return scan(args.apply)
     if args.command == "retirement-register":
@@ -120,10 +165,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         result = _dispatch(args)
-        sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(_safe_output(result), sort_keys=True, separators=(",", ":")) + "\n")
         return 1 if result.get("refused") or result.get("status") == "refused" else 0
     except CleanupError as exc:
-        sys.stdout.write(json.dumps({"error": str(exc)}, sort_keys=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps({"error": _redact_text(str(exc))}, sort_keys=True, separators=(",", ":")) + "\n")
         return 1
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # Deliberately avoid emitting exception details from credential/network code.

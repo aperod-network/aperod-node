@@ -57,7 +57,7 @@ trap cleanup_verify_tmp EXIT
 
 if ! (
   cd "${BLOCKCHAIN_DIR}"
-  CGO_ENABLED=0 GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.25.13+auto \
+  CGO_ENABLED=0 GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.26.9+auto \
     go build -o "${VERIFY_TMP}" ./cmd/backup-verify
 ); then
   die "Не удалось собрать aperod-backup-verify; существующий бинарный файл не изменён"

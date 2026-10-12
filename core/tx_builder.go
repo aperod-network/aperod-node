@@ -866,13 +866,13 @@ func (b *TxBuilder) MaxSpendable() MaxSpendableResult {
 		prefixSums[k] = prefix
 	}
 	for k := 1; k <= limit; k++ {
-		fee := txEstimateFee(k, 2, b.feePerByte)
+fee := txEstimateFeeVersion(b.txVersion, k, 2, b.feePerByte)
 		if prefixSums[k] <= fee {
 			continue
 		}
 		amount := prefixSums[k] - fee
-		selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte)
-		finalFee := txEstimateFee(selCount, 2, b.feePerByte)
+selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
+finalFee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
 		if selTotal >= amount+finalFee && amount > res.MaxAmount {
 			res.MaxAmount = amount
 			res.Fee = finalFee
@@ -931,15 +931,15 @@ func (b *TxBuilder) EstimateFeeForAmount(amount uint64) FeeEstimateResult {
 		res.SpendableTotal += u.Amount
 	}
 
-	selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte)
+selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
 	if selCount < 1 {
 		selCount = 1 // a tx always has ≥1 input
 	}
-	fee := txEstimateFee(selCount, 2, b.feePerByte)
+fee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
 	res.Fee = fee
 	res.InputCount = selCount
-	res.TxSizeBytes = txOverheadBytes + selCount*txBytesPerInput + 2*txBytesPerOutput
-	res.Sufficient = selTotal >= amount+fee
+res.TxSizeBytes = txEstimatedSize(b.txVersion, selCount, 2)
+res.Sufficient = amount <= ^uint64(0)-fee && selTotal >= amount+fee
 	return res
 }
 
@@ -947,9 +947,14 @@ func (b *TxBuilder) EstimateFeeForAmount(amount uint64) FeeEstimateResult {
 // for a given payment amount and returns the number of inputs it would pick
 // and their total.  available must already be sorted largest-first and
 // deduplicated by OneTimePub.
-func simulateGreedySelection(available []OwnedUTXO, amount, feePerByte uint64) (int, uint64) {
+func simulateGreedySelection(available []OwnedUTXO, amount, feePerByte uint64, version TxVersion) (int, uint64) {
 	const maxInputs = 8
-	needed := amount + txEstimateFee(1, 2, feePerByte)
+fee := txEstimateFeeVersion(version, 1, 2, feePerByte)
+// Build rejects an amount that overflows once the initial fee is added.
+if amount > ^uint64(0)-fee {
+return 0, 0
+}
+needed := amount + fee
 	var (
 		count   int
 		totalIn uint64

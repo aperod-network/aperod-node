@@ -18,7 +18,9 @@ import (
 )
 
 const dailyJobKey = "lpod/daily-job/v1"
-const dailyBatchBlocks = 32
+// A full day must fit between light-pruning epochs. Keep the 250ms cooperative
+// CPU budget and single worker; a block-count cap must not force a 15min scan.
+const dailyBatchBlocks = 256
 const dailyBatchTime = 250 * time.Millisecond
 const dailyJobMaxBytes = 16 << 20
 
@@ -39,12 +41,20 @@ type dailyProgress struct {
 	PriorTS                     int64
 	Vaults                      map[string][4]uint64
 	Positions                   map[string]dailyPositionProgress
+Rewards                     *dailyRewardProgress `json:",omitempty"`
 	Burns                       [4]uint64
 	Included, First, Last       uint64
 	FirstTS, LastTS             int64
 	Digest                      crypto.Hash32
 	HaveDigest                  bool
 	Registry                    *core.RegistrySnapshot
+}
+
+// Older authenticated jobs contain payout aggregates but no recipient/tier
+// accumulator. Replay their bounded read-only audit instead of preserving an
+// incomplete financial report forever. Never create or replay a payout here.
+func dailyRewardsNeedReplay(p *dailyProgress) bool {
+	return p != nil && p.Next > 0 && p.Rewards == nil
 }
 type dailyJob struct {
 	ID       int64
@@ -211,12 +221,13 @@ writeJSON(w, http.StatusOK, dailyPending(date, err.Error()))
 return
 }
 	if j != nil && j.Date == date {
-		if (j.State == "failed" && time.Now().Unix()-j.Updated >= 30) ||
+missingRewards := dailyRewardsNeedReplay(j.Progress)
+if missingRewards || (j.State == "failed" && time.Now().Unix()-j.Updated >= 30) ||
 			(j.State == "complete" && (!s.dailyBindingValid(j.Progress) ||
 				!s.lpodFinalized(j.Progress.Certificate.Height, j.Progress.Certificate.BlockHash))) {
 			// Re-attest an older complete report by verifying only its unprocessed
 			// descendant tail. Invalidated/failed progress is never reused.
-			if j.State == "failed" || !s.dailyBindingValid(j.Progress) {
+if missingRewards || j.State == "failed" || !s.dailyBindingValid(j.Progress) {
 				j.Progress = &dailyProgress{}
 			}
 			j.ID, j.State, j.Result = time.Now().UnixNano(), "queued", nil

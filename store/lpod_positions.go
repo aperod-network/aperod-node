@@ -461,6 +461,9 @@ func (d *DB) previewPositions(before *LPoDCheckpoint, height uint64, r *LPoDSett
 	if err := next.validatePositions(); err != nil {
 		return nil, nil, err
 	}
+if err := previewGenesisVesting(before, next, r, height); err != nil {
+return nil, nil, err
+}
 	return next, payments, nil
 }
 
@@ -524,7 +527,20 @@ func (d *DB) PayoutLPoD(height uint64, r *LPoDSettlement, after *LPoDCheckpoint,
 			return core.Transaction{}, err
 		}
 	}
-	addresses := make([]string, 0, len(amounts))
+if after.GenesisVesting != nil {
+if err := after.GenesisVesting.Validate(after.Allocation.Genesis, height); err != nil {
+return core.Transaction{}, err
+}
+if err := add(after.GenesisVesting.Recipient, after.GenesisVesting.paymentAt(height)); err != nil {
+return core.Transaction{}, err
+}
+if height == after.GenesisVesting.FundingHeight && after.GenesisVesting.LiquidityPaid > 0 {
+if err := add(after.GenesisVesting.LiquidityRecipient, after.GenesisVesting.LiquidityPaid); err != nil {
+return core.Transaction{}, err
+}
+}
+}
+addresses := make([]string, 0, len(amounts))
 	for a, n := range amounts {
 		if n > 0 {
 			addresses = append(addresses, string(a))

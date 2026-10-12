@@ -93,8 +93,9 @@ func (vl *VestingLock) lockedAt(pub crypto.Point32, now int64) uint64 {
 // TxVerifier validates the cryptographic integrity of transactions.
 // Separate from Validate() (structural) — this checks ring sigs and range proofs.
 type TxVerifier struct {
-	utxos       *UTXOSet
-	vestingLock *VestingLock // nil = vesting enforcement disabled
+	utxos                                       *UTXOSet
+	vestingLock                                 *VestingLock // nil = vesting enforcement disabled
+	stakedCollateralRingExclusionActivationHeight uint64
 }
 
 // NewTxVerifier creates a verifier backed by the given UTXO set.
@@ -109,7 +110,16 @@ func (v *TxVerifier) SetVestingLock(vl *VestingLock) {
 	v.vestingLock = vl
 }
 
-// VerifyTx performs full cryptographic verification of a non-coinbase transaction.
+// SetStakedCollateralRingExclusionActivationHeight configures the first block
+// height at which CLSAG rings may not reference staked collateral. Zero leaves
+// the rule disabled so validators cannot activate it accidentally.
+func (v *TxVerifier) SetStakedCollateralRingExclusionActivationHeight(height uint64) {
+	v.stakedCollateralRingExclusionActivationHeight = height
+}
+
+// VerifyTx performs full cryptographic verification of a transaction when no
+// height-gated rules are configured. Call VerifyTxAtHeight for block/mempool
+// validation whenever a height-dependent consensus rule is active.
 //
 // Checks performed:
 //  1. Structural validity (Validate)
@@ -119,6 +129,23 @@ func (v *TxVerifier) SetVestingLock(vl *VestingLock) {
 //  5. Range proofs are valid for each output
 //  6. Pedersen commitment balance: ΣC_in = ΣC_out + C_fee
 func (v *TxVerifier) VerifyTx(tx *Transaction) error {
+if v.stakedCollateralRingExclusionActivationHeight > 0 {
+return fmt.Errorf("height-aware transaction verification required")
+}
+	return v.VerifyTxAtHeight(tx, 0)
+}
+
+// VerifyTxAtHeight applies height-dependent transaction rules for the block
+// that would include tx. Callers admitting transactions to a mempool must pass
+// the next candidate block height.
+func (v *TxVerifier) VerifyTxAtHeight(tx *Transaction, height uint64) error {
+if v.stakedCollateralRingExclusionActivationHeight > 0 && height == 0 {
+return fmt.Errorf("height-aware transaction verification requires a nonzero candidate height")
+}
+	return v.verifyTx(tx, nil, height)
+}
+
+func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struct{}, height uint64) error {
 	// 1. Structural check
 	if err := tx.Validate(); err != nil {
 		return err
@@ -245,6 +272,13 @@ if tx.IsLPoDPosition() {
 					}
 					if utxo.AmountCommit != inp.RingCommitments[j] {
 						return fmt.Errorf("tx %x: input %d ring member %d commitment mismatch", txHashPrefix[:8], i, j)
+					}
+			if activation := v.stakedCollateralRingExclusionActivationHeight; activation > 0 && height >= activation {
+				_, stakedInBlock := blockStakeBurns[UTXOKey{TxHash: utxo.TxHash, OutputIndex: utxo.OutputIndex}]
+				if stakedInBlock || v.utxos.IsStaked(utxo.TxHash, utxo.OutputIndex) {
+					return fmt.Errorf("tx %x: input %d ring member %d is staked collateral",
+						txHashPrefix[:8], i, j)
+				}
 					}
 				}
 				continue
@@ -423,11 +457,39 @@ if tx.IsLPoDPosition() {
 // reward) are enforced by validateCoinbasePolicy in the consensus engine before
 // this function is called.
 func (v *TxVerifier) VerifyBlock(block *Block) error {
+if block == nil {
+return fmt.Errorf("tx verifier: nil block")
+}
+if v.stakedCollateralRingExclusionActivationHeight > 0 && block.Header.Height == 0 {
+return fmt.Errorf("height-aware block verification requires a nonzero block height")
+}
+	blockStakeBurns := make(map[UTXOKey]struct{})
+	enforceStakedCollateralRule := v.stakedCollateralRingExclusionActivationHeight > 0 &&
+		block.Header.Height >= v.stakedCollateralRingExclusionActivationHeight
+	if enforceStakedCollateralRule {
+	for _, tx := range block.Txs {
+		if !tx.IsStake() {
+			continue
+		}
+		switch len(tx.Extra) {
+		case StakePayloadSizeV2:
+			action, _, _, _, burnTxHash, burnOutIdx, _, err := DecodeStakeExtraV2(tx.Extra)
+			if err == nil && action == StakeDeposit {
+				blockStakeBurns[UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}] = struct{}{}
+			}
+		case StakePayloadSizeV3:
+			action, _, _, _, burnTxHash, burnOutIdx, _, _, err := DecodeStakeExtraV3(tx.Extra)
+			if err == nil && action == StakeDeposit {
+				blockStakeBurns[UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}] = struct{}{}
+			}
+		}
+	}
+	}
 	for i, tx := range block.Txs {
 if tx.IsCoinbase() || tx.IsGuardianFund() || tx.IsLPoD() || tx.IsLPoDPayout() {
 			continue // no crypto proofs on coinbase; policy checked separately
 		}
-		if err := v.VerifyTx(&tx); err != nil {
+		if err := v.verifyTx(&tx, blockStakeBurns, block.Header.Height); err != nil {
 			h := tx.Hash()
 			return fmt.Errorf("block %d tx[%d] %x: %w",
 				block.Header.Height, i, h[:8], err)

@@ -198,11 +198,8 @@ func (m *Mempool) Add(tx Transaction) error {
 		return fmt.Errorf("mempool: coinbase (zero-input) transactions are not accepted from external sources")
 	}
 
-	if m.cfg.CurrentHeight != nil {
-		nextHeight := m.cfg.CurrentHeight()
-		if nextHeight < ^uint64(0) {
-			nextHeight++
-		}
+nextHeight := m.nextBlockHeight()
+if m.cfg.CurrentHeight != nil {
 		if err := ValidateTxVersionAtHeight(
 			&tx,
 			nextHeight,
@@ -221,7 +218,7 @@ func (m *Mempool) Add(tx Transaction) error {
 	// C-0/C-1: prevents supply inflation via forged AmountCommit or unbound stake amount.
 	// Stake txs are included — they carry ring inputs whose proofs must be valid.
 	if m.cfg.Verifier != nil {
-		if err := m.cfg.Verifier.VerifyTx(&tx); err != nil {
+if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
 			return fmt.Errorf("mempool: crypto verification failed: %w", err)
 		}
 	}
@@ -393,6 +390,17 @@ func (m *Mempool) Add(tx Transaction) error {
 	return nil
 }
 
+func (m *Mempool) nextBlockHeight() uint64 {
+	if m.cfg.CurrentHeight == nil {
+		return 0
+	}
+	height := m.cfg.CurrentHeight()
+	if height < ^uint64(0) {
+		height++
+	}
+	return height
+}
+
 // Remove removes a transaction from the mempool (called after block inclusion).
 func (m *Mempool) Remove(hash crypto.Hash32) {
 	m.mu.Lock()
@@ -506,13 +514,14 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := m.validateAVMNonce(&tx); err != nil {
 		return err
 	}
+nextHeight := m.nextBlockHeight()
 	// C1 fix: run full cryptographic verification even for privileged transactions,
 	// EXCEPT for coinbase (zero-input) transactions.  VerifyTx explicitly rejects
 	// coinbase txs to prevent external inflation attacks; engine-synthesized mints
 	// are trusted by construction and must not be re-verified through that path.
 	// Any non-coinbase tx routed through AddPrivileged is still fully verified.
 	if m.cfg.Verifier != nil && !tx.IsCoinbase() {
-		if err := m.cfg.Verifier.VerifyTx(&tx); err != nil {
+if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
 			return fmt.Errorf("mempool: crypto verification failed (privileged): %w", err)
 		}
 	}

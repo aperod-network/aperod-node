@@ -43,21 +43,26 @@ const utxoCacheTTL = 90 * time.Second
 
 // Server is the JSON-RPC 2.0 HTTP server.
 type Server struct {
-	lpodMigration *store.LPoDMigration
-	lpodFinalized func(uint64, crypto.Hash32) bool
-	addr          string
-	chain         *core.Chain
-	mempool       *core.Mempool
-	utxos         *core.UTXOSet
-	registry      *core.ValidatorRegistry    // live PoS validator registry (optional)
-	myKey         *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
-	blockStore    *store.DB                  // optional: LevelDB store for pruned-block fallback
-	log           *slog.Logger
-	mux           *http.ServeMux
-	hub           *Hub
-	apiKey        string   // empty fails closed for privileged operations
-	corsOrigins   []string // empty = do not grant cross-origin browser access
-	rateLimiter   *RateLimiter
+	saleMigration          *store.SaleMigration
+	saleProducerReady      func() bool
+saleFinalized          func(uint64, crypto.Hash32) bool
+	lpodMigration          *store.LPoDMigration
+	genesisVestingHeight   uint64
+	validatorAuthorityFork *core.ValidatorAuthorityFork
+	lpodFinalized          func(uint64, crypto.Hash32) bool
+	addr                   string
+	chain                  *core.Chain
+	mempool                *core.Mempool
+	utxos                  *core.UTXOSet
+	registry               *core.ValidatorRegistry    // live PoS validator registry (optional)
+	myKey                  *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
+	blockStore             *store.DB                  // optional: LevelDB store for pruned-block fallback
+	log                    *slog.Logger
+	mux                    *http.ServeMux
+	hub                    *Hub
+	apiKey                 string   // empty fails closed for privileged operations
+	corsOrigins            []string // empty = do not grant cross-origin browser access
+	rateLimiter            *RateLimiter
 
 	// utxoAudit holds the latest background UTXO-store audit result,
 	// pushed by cmd/node via SetUTXOAuditResult and served on
@@ -309,6 +314,7 @@ type Server struct {
 	avmStore                     avm.Store
 	avmActivationHeight          uint64
 	avmGasBurnActivationHeight   uint64
+stakedCollateralRingExclusionActivationHeight uint64
 	guardianFundActivationHeight uint64
 	guardianFundChainAnchor      crypto.Hash32
 	broadcastTxMu                sync.RWMutex
@@ -504,6 +510,23 @@ func (s *Server) SetAVMStore(activationHeight uint64, state avm.Store) {
 func (s *Server) SetAVMGasBurnActivationHeight(height uint64) {
 	s.avmGasBurnActivationHeight = height
 	s.hub.SetAVMGasBurnActivationHeight(height)
+}
+
+// SetStakedCollateralRingExclusionActivationHeight wires the consensus
+// activation height into wallet-side transaction verification.
+func (s *Server) SetStakedCollateralRingExclusionActivationHeight(height uint64) {
+	s.stakedCollateralRingExclusionActivationHeight = height
+}
+
+func (s *Server) nextBlockHeight() uint64 {
+	if s.chain == nil {
+		return 0
+	}
+	height := s.chain.Height()
+	if height < ^uint64(0) {
+		height++
+	}
+	return height
 }
 
 // SetTransactionBroadcaster wires accepted locally-submitted transactions to

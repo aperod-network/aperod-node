@@ -173,14 +173,15 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 	// ── 6. Cryptographic verification ────────────────────────────────────────
 	// Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
 	verifier := core.NewTxVerifier(s.utxos)
-	verifyErr := verifier.VerifyTx(&result.Tx)
+verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
+verifyErr := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
 	if isKeyImageConflictErr(verifyErr) {
 		repaired, repairErr := s.repairPhantomKeyImages(result)
 		if repairErr != nil {
 			return nil, fmt.Errorf("verify: %w", repairErr)
 		}
 		if repaired {
-			verifyErr = verifier.VerifyTx(&result.Tx)
+verifyErr = verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
 		}
 	}
 	if verifyErr != nil {

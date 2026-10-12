@@ -69,8 +69,17 @@ func TestLPoDEarningsOutputsServesOnlyIndexedPureRewards(t *testing.T) {
 }
 
 func syntheticLPoDV3Funding(t *testing.T) (*store.DB, *store.LPoDMigration, crypto.Address) {
+db, m, address, _ := syntheticLPoDV3FundingWithSigner(t)
+return db, m, address
+}
+
+func syntheticLPoDV3FundingWithSigner(t *testing.T) (*store.DB, *store.LPoDMigration, crypto.Address, crypto.ValidatorPrivKey) {
+return syntheticLPoDV3FundingAt(t, t.TempDir())
+}
+
+func syntheticLPoDV3FundingAt(t *testing.T, path string, withLiquidity ...bool) (*store.DB, *store.LPoDMigration, crypto.Address, crypto.ValidatorPrivKey) {
 	t.Helper()
-	db, err := store.Open(t.TempDir())
+	db, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +144,9 @@ func syntheticLPoDV3Funding(t *testing.T) (*store.DB, *store.LPoDMigration, cryp
 		ValidatorRemaining:       migration.ValidatorRemaining,
 	}
 	migration.NominalSnapshot = &snapshot
+if len(withLiquidity) > 0 && withLiquidity[0] {
+snapshot.NominalCirculatingBefore += store.GenesisLiquidityAmount
+}
 	migration.SnapshotRoot = snapshot.Root()
 	migration.ReconciliationRoot = migration.Root()
 	signature, err := validator.Sign(migration.AttestationMessage())
@@ -177,5 +189,5 @@ func syntheticLPoDV3Funding(t *testing.T) (*store.DB, *store.LPoDMigration, cryp
 	if err := db.CommitRawBlockWithAVM(block.Hash(), block.Header.Height, raw, nil, crypto.Hash32{}, request); err != nil {
 		t.Fatalf("commit synthetic v3 funding: %v", err)
 	}
-	return db, migration, leader
+return db, migration, leader, validator
 }
