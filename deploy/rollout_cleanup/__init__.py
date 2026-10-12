@@ -695,6 +695,15 @@ def complete(job_id: str, expected_binary_sha256: str, *, state_dir: Path | None
     job = _safe_record(job_path, rt)
     if job.get("id") != job_id or job.get("status") != "begun":
         raise CleanupError("job is not incomplete")
+    proof = _completion_proof(job, expected_binary_sha256, rt)
+    job.update(proof)
+    atomic_json(job_path, job)
+    return {"id": job_id, "status": "completed", "height": proof["completion_height"]}
+
+
+def _completion_proof(job: dict[str, Any], expected_binary_sha256: str,
+                      rt: Runtime) -> dict[str, Any]:
+    """The same strict completion checks for normal and reconciled registrations."""
     _registered_release(job, rt)
     origin = job["origin"]
     # A rollout intentionally restarts the node. Bind completion to one stable
@@ -721,12 +730,10 @@ def complete(job_id: str, expected_binary_sha256: str, *, state_dir: Path | None
             or _sha_live_exe(live_pid, rt) != installed_hash):
         raise CleanupError("post-rollout process changed during completion validation")
     _verify_process_binding(live_pid, Path(origin["data_dir"]), Path(origin["config"]), rt)
-    job.update({"status": "completed", "completed_at": int(rt.clock()),
+    return {"status": "completed", "completed_at": int(rt.clock()),
                 "completion_height": height, "completion_hash": tip,
                 "binary_sha256": installed_hash, "runtime_pid": live_pid,
-                "runtime_start_ticks": live_ticks, "runtime_exe": str(live_exe)})
-    atomic_json(job_path, job)
-    return {"id": job_id, "status": "completed", "height": height}
+                "runtime_start_ticks": live_ticks, "runtime_exe": str(live_exe)}
 
 
 def _source_current(context: dict[str, Any], runtime: Runtime | None = None) -> None:

@@ -386,9 +386,20 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 	for address := range principal {
 		addressSet[address] = true
 	}
+var vestingAddress crypto.Address
+var vestingAmount uint64
+if after.GenesisVesting != nil {
+vestingAddress = after.GenesisVesting.Recipient
+vestingAmount = after.GenesisVesting.paymentAt(block.Header.Height)
+if vestingAmount > 0 { addressSet[vestingAddress] = true }
+if after.GenesisVesting.FundingHeight == block.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
+addressSet[after.GenesisVesting.LiquidityRecipient] = true
+}
+}
 	addresses := make([]string, 0, len(addressSet))
 	for address := range addressSet {
-		if rewards[address] > 0 || principal[address] > 0 {
+ if rewards[address] > 0 || principal[address] > 0 || (address == vestingAddress && vestingAmount > 0) ||
+ (after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			addresses = append(addresses, string(address))
 		}
 	}
@@ -401,6 +412,10 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 	for _, text := range addresses {
 		address := crypto.Address(text)
 		total, err := lpodAdd(rewards[address], principal[address])
+if err == nil && address == vestingAddress { total, err = lpodAdd(total, vestingAmount) }
+if err == nil && after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient {
+total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
+}
 		if err != nil {
 			return nil, err
 		}
@@ -416,7 +431,8 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 	refs := make([]lpodEarningsRef, 0, len(addresses))
 	for i, text := range addresses {
 		address := crypto.Address(text)
-		if !isLPoDPureReward(rewards[address], principal[address]) {
+ if !isLPoDPureReward(rewards[address], principal[address]) || (address == vestingAddress && vestingAmount > 0) ||
+ (after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			continue
 		}
 		output := block.Txs[0].Outputs[i]

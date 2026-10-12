@@ -288,7 +288,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                 INSERT INTO blocks (height, hash, prev_hash, timestamp_ns, validator_pub, merkle_root, tx_count)
                 VALUES ($1,$2,$3,$4,$5,$6,$7)
                 ON CONFLICT (height) DO NOTHING`,
-				blockHeight, block.Hash, block.PrevHash,
+		blockHeight, block.Hash, block.PrevHash,
 		block.TimestampNs, block.ValidatorPub, block.MerkleRoot, block.TxCount,
 	)
 	if err != nil {
@@ -313,8 +313,8 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                         ON CONFLICT (hash) DO NOTHING
                         RETURNING 1`,
-				tx.Hash, tx.BlockHash, txBlockHeight, tx.TxIndex,
-				tx.IsCoinbase, tx.Inputs, tx.Outputs, txFee, tx.SizeBytes, tx.Version,
+			tx.Hash, tx.BlockHash, txBlockHeight, tx.TxIndex,
+			tx.IsCoinbase, tx.Inputs, tx.Outputs, txFee, tx.SizeBytes, tx.Version,
 			tx.IsBurn, tx.BurnedNAPRO, tx.BurnAddress,
 		).Scan(&inserted)
 		if err == nil {
@@ -346,7 +346,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                         INSERT INTO address_txs (address, tx_hash, block_height, tx_index, output_index)
                         VALUES ($1,$2,$3,$4,$5)
                         ON CONFLICT (address, tx_hash, block_height, tx_index, output_index) DO NOTHING`,
-				a.Address, a.TxHash, addressBlockHeight, a.TxIndex, a.OutputIndex,
+			a.Address, a.TxHash, addressBlockHeight, a.TxIndex, a.OutputIndex,
 		)
 		if err != nil {
 			return fmt.Errorf("indexer: insert addr_tx: %w", err)
@@ -362,7 +362,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                         total_txs           = total_txs + $2,
                         updated_at          = NOW()
                 WHERE id = 1`,
-				blockHeight, newlyInsertedTxs,
+		blockHeight, newlyInsertedTxs,
 	)
 	if err != nil {
 		return fmt.Errorf("indexer: update stats: %w", err)

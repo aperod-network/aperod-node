@@ -30,6 +30,7 @@ type Receipt struct {
 // canonical height index and tip.
 type PreparedBlock struct {
 	LPoD               *store.LPoDSettlement
+	Sale               *store.SaleSettlement
 	Height             uint64
 	BlockHash          crypto.Hash32
 	Receipts           []Receipt

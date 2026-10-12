@@ -145,12 +145,23 @@ type samplingStore struct {
 	result []DecoyUTXO
 	err    error
 	calls  int
+	exclude map[crypto.Point32]bool
 }
 
 func (*samplingStore) LookupRingMember(crypto.Point32) (*UTXO, error) { return nil, nil }
-func (s *samplingStore) SampleRingMembers(_ int, _ map[crypto.Point32]bool) ([]DecoyUTXO, error) {
+func (s *samplingStore) SampleRingMembers(_ int, exclude map[crypto.Point32]bool) ([]DecoyUTXO, error) {
 	s.calls++
-	return s.result, s.err
+	s.exclude = exclude
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make([]DecoyUTXO, 0, len(s.result))
+	for _, candidate := range s.result {
+		if !exclude[candidate.OneTimePub] {
+			out = append(out, candidate)
+		}
+	}
+	return out, nil
 }
 
 func TestDecoySamplingPersistentStoreNoMemoryFallback(t *testing.T) {
@@ -168,6 +179,30 @@ func TestDecoySamplingPersistentStoreNoMemoryFallback(t *testing.T) {
 	backend.result = []DecoyUTXO{{OneTimePub: crypto.Point32{8}, AmountCommit: crypto.Commitment{9}}}
 	if got := set.SampleCLSAGDecoys(2, nil); !reflect.DeepEqual(got, backend.result) {
 		t.Fatal("persistent canonical pairs changed")
+	}
+}
+
+func TestDecoySamplingExcludesStakedOutputsBeforeSampling(t *testing.T) {
+	set := NewUTXOSet()
+	staked := samplingFixture(8)
+	eligible := samplingFixture(9)
+	set.Add(staked)
+	if err := set.MarkStaked(staked.TxHash, staked.OutputIndex); err != nil {
+		t.Fatalf("MarkStaked: %v", err)
+	}
+
+	backend := &samplingStore{result: []DecoyUTXO{
+		{OneTimePub: staked.OneTimePub, AmountCommit: staked.AmountCommit},
+		{OneTimePub: eligible.OneTimePub, AmountCommit: eligible.AmountCommit},
+	}}
+	set.ringMembers = backend
+
+	got := set.SampleCLSAGDecoys(1, nil)
+	if len(got) != 1 || got[0].OneTimePub != eligible.OneTimePub {
+		t.Fatalf("sampled ring members = %v, want the one eligible decoy", got)
+	}
+	if !backend.exclude[staked.OneTimePub] {
+		t.Fatal("sampler backend did not receive the staked-output exclusion")
 	}
 }
 

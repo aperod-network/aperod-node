@@ -20,6 +20,7 @@ import (
 // carry, rather than an independently persisted mutable "remaining" counter.
 // Initial funding requires a fully reconciled, quorum-attested allocation debit.
 type LPoDCheckpoint struct {
+GenesisVesting *GenesisVestingState `json:"genesis_vesting,omitempty"`
 	State              lpod.State              `json:"state"`
 	Carries            map[string]lpod.Carry   `json:"carries"`
 	Allocation         *LPoDAllocation         `json:"allocation,omitempty"`
@@ -32,6 +33,8 @@ type LPoDCheckpoint struct {
 // LPoDSettlement is prepared from canonical registry/position state by consensus.
 // Store commits verify its clock, operations, checkpoint and actual payout plan.
 type LPoDSettlement struct {
+GenesisVestingActivationHeight uint64
+GenesisVestingFunding *GenesisVestingFunding
 	Parent           crypto.Hash32
 	Vaults           []lpod.Vault
 	Migration        *LPoDMigration
@@ -142,6 +145,9 @@ func loadLPoDCheckpointWithReadBudget(
 	}
 	if c.Allocation != nil {
 		a := c.Allocation
+if c.GenesisVesting != nil {
+if err := c.GenesisVesting.validateSource(a, c.State.LastHeight); err != nil { return nil, err }
+}
 		const publicAllocation = 9_000_000_000 * lpod.Unit
 		const validatorAllocation = 2_000_000_000 * lpod.Unit
 		if a.InitialValidatorRemaining > validatorAllocation ||
@@ -171,7 +177,7 @@ func loadLPoDCheckpointWithReadBudget(
 			a.NominalEligible >= lpod.InitialNAPRO &&
 			a.NominalEligible <= LPoDV3NominalAllocationMaxNAPRO &&
 			a.NominalEligible <= publicAllocation-a.InitialValidatorRemaining &&
-			a.Remaining == a.NominalEligible-lpod.InitialNAPRO &&
+a.Remaining == a.NominalEligible-lpod.InitialNAPRO &&
 			a.SnapshotRoot != (crypto.Hash32{}) && a.FundingParent != (crypto.Hash32{}) &&
 			a.Genesis != (crypto.Hash32{}) &&
 			a.TrustAssumption == LPoDV3TrustAssumption &&
@@ -304,6 +310,9 @@ type legacyLPoDAllocation struct {
 }
 
 func (d *DB) PreviewLPoD(height uint64, request *LPoDSettlement) (*LPoDCheckpoint, []lpod.Payment, error) {
+if err := d.checkSaleGenesisFundingTransition(height, request, false); err != nil {
+return nil, nil, err
+}
 	tip, _, err := d.GetTip()
 	if err != nil || request == nil || request.Parent != tip {
 		return nil, nil, fmt.Errorf("lpod: invalid preview parent")
@@ -321,8 +330,11 @@ func (d *DB) PreviewLPoD(height uint64, request *LPoDSettlement) (*LPoDCheckpoin
 		return nil, nil, fmt.Errorf("lpod: duplicate migration")
 	}
 	if request.PositionProtocol {
-		return d.previewPositions(before, height, request)
+return d.previewPositions(before, height, request)
 	}
+if request.GenesisVestingActivationHeight != 0 || before.GenesisVesting != nil {
+return nil, nil, fmt.Errorf("genesis vesting: position protocol required")
+}
 	next, carries, payments, err := lpod.Settle(before.State, before.Carries, height, request.Vaults)
 	if err != nil {
 		return nil, nil, err

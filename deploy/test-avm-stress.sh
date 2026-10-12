@@ -21,5 +21,5 @@ APEROD_RUN_AVM_STRESS=1 \
 APEROD_AVM_STRESS_DURATION="${duration}" \
 APEROD_AVM_STRESS_WORKERS="${workers}" \
 GOSUMDB=sum.golang.org \
-GOTOOLCHAIN=go1.25.13+auto \
+GOTOOLCHAIN=go1.26.9+auto \
 go test ./consensus -run '^TestAVMSpamDoesNotDelayBlockProduction$' -count=1 -v -timeout=7m

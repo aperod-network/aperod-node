@@ -8,7 +8,7 @@
 
 RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
 
-[![Go](https://img.shields.io/badge/Go-1.26.9-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.26)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
 [![License](https://img.shields.io/badge/License-Mixed-blue.svg)](#-license)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
 [![Explorer](https://img.shields.io/badge/Explorer-explorer.aperod.com-informational)](https://explorer.aperod.com)
@@ -447,7 +447,7 @@ aperod-node/
 
 ### Prerequisites
 
-- **Go 1.26.9+** — [install](https://go.dev/doc/install)
+- **Go 1.25+** — [install](https://go.dev/doc/install)
 - `make`, `git`
 
 ### Clone & build
@@ -653,7 +653,3 @@ under their own terms.
     <a href="mailto:aperod-network@proton.me">Email</a>
   </sub>
 </div>
-
-## Reviewed source updates
-
-After the history transition, use the complete deployment-tools package and an explicitly reviewed revision. Do not force-reset old node clones. See [installation and update requirements](deploy/NODE-SOURCE-UPDATE.md). Clean source provenance is not proof of live chain compatibility.

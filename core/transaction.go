@@ -179,7 +179,7 @@ func (tx *Transaction) Hash() crypto.Hash32 {
 // replay, except for the explicitly distinct Guardian protocol allocation.
 // Coinbase transactions skip ring signature and range proof requirements.
 func (tx *Transaction) IsCoinbase() bool {
-	return tx != nil && len(tx.Inputs) == 0 && !tx.IsGuardianFund() && !tx.IsLPoD() && !tx.IsLPoDPosition() && !tx.IsLPoDPayout()
+	return tx != nil && len(tx.Inputs) == 0 && !tx.IsGuardianFund() && !tx.IsLPoD() && !tx.IsLPoDPosition() && !tx.IsLPoDPayout() && !tx.IsSale()
 }
 
 // IsStake returns true if this is a validator stake deposit or withdrawal.
@@ -207,13 +207,17 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("tx version 0 is invalid")
 	}
 	switch tx.Version {
-	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout:
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout, TxVersionSale:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
 
 	if tx.IsLPoD() {
 		return tx.validateLPoD()
+	}
+	if tx.IsSale() {
+		_, err := tx.SaleAuthorization()
+		return err
 	}
 	if tx.IsLPoDPosition() {
 		_, err := tx.LPoDPositionAction()

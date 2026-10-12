@@ -243,6 +243,7 @@ echo ""
 # Process each validator.
 # ---------------------------------------------------------------------------
 FAILED=()
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sale-upgrade-guard.sh"
 
 for TARGET in "${VALIDATORS[@]}"; do
   # Normalise: if no '@' in target, prepend the default SSH user.
@@ -286,6 +287,10 @@ HEALTH_WAIT_SECS="__HEALTH_WAIT_SECS__"
 SKIP_HEALTH_CHECK="__SKIP_HEALTH_CHECK__"
 HEALTH_URL="http://127.0.0.1:8545/api/v1/status"
 
+echo "  [preflight] Checking this validator's own completed copy and signed configuration..."
+# Run as the node's account (the documented default SSH_USER=aperod). Its
+# config and private socket are owned by that account. No root shell required.
+sale_upgrade_guard "${BINARY_SRC}" "__NODE_CONFIG__" || exit 1
 echo "  [2/5] Stopping ${SERVICE_NAME}..."
 sudo systemctl stop "${SERVICE_NAME}" || true
 sleep 1
@@ -329,6 +334,9 @@ REMOTE_EOF
   )
 
   # Substitute the configuration values into the remote script.
+  REMOTE_SCRIPT="$(declare -f sale_upgrade_guard)
+${REMOTE_SCRIPT}"
+  REMOTE_SCRIPT="${REMOTE_SCRIPT//__NODE_CONFIG__/${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__BINARY_DST__/${BINARY_DST}}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__SERVICE_NAME__/${SERVICE_NAME}}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__HEALTH_MAX_ATTEMPTS__/${HEALTH_MAX_ATTEMPTS}}"

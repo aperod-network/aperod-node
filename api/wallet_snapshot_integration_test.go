@@ -404,10 +404,11 @@ snapshotIDs = snapshotIDs[:len(snapshotIDs)-1]
 	initialSpentMap := initialStatuses["spent"].(map[string]interface{})
 	initialCanonicalMap := initialStatuses["canonical_spent"].(map[string]interface{})
 	initialPendingMap := initialStatuses["pending_locked"].(map[string]interface{})
-	if initialSpentMap[spentKIHex] != true || initialSpentMap[unspentKIHex] != true ||
+if initialSpentMap[spentKIHex] != true || initialSpentMap[unspentKIHex] != false ||
 		initialSpentMap[pendingKIHex] != false ||
-		initialCanonicalMap[pendingKIHex] != false || initialPendingMap[pendingKIHex] != false {
-		t.Fatalf("pinned KI/direct-spent statuses: %#v", initialSpentMap)
+initialCanonicalMap[unspentKIHex] != false ||
+initialCanonicalMap[pendingKIHex] != false || initialPendingMap[pendingKIHex] != false {
+t.Fatalf("public output marker must not turn an unspent owner key image into spent: %#v", initialSpentMap)
 	}
 	pendingTx := core.Transaction{
 		Version: core.TxVersionCommitmentBinding,
@@ -752,6 +753,7 @@ func advanceSyntheticLPoDV3(
 	leader crypto.Address,
 	validator crypto.ValidatorPrivKey,
 	validatorPub crypto.ValidatorPubKey,
+	extraTransactions ...core.Transaction,
 ) (crypto.Hash32, uint64) {
 	t.Helper()
 	parentHash, parentHeight, err := db.GetTip()
@@ -768,6 +770,7 @@ func advanceSyntheticLPoDV3(
 	}
 	request := &store.LPoDSettlement{
 		Parent: parentHash, PositionProtocol: true,
+		Transactions: extraTransactions,
 		Timestamp: parent.Header.Timestamp + 3_000_000_000,
 		Proposer:  validatorPub.Hex(), Leader: leader,
 		Stake: map[string]store.LPoDValidatorStake{
@@ -790,6 +793,7 @@ func advanceSyntheticLPoDV3(
 		},
 		Txs: []core.Transaction{payout, core.LPoDCheckpointTx(checkpoint.Digest())},
 	}
+	block.Txs = append(block.Txs, extraTransactions...)
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
 	if err := block.Header.Sign(validator); err != nil {
 		t.Fatal(err)
@@ -847,12 +851,14 @@ func snapshotRequest(
 	var decoded map[string]interface{}
 	decoder := json.NewDecoder(response.Body)
 	if err := decoder.Decode(&decoded); err != nil {
-	t.Fatalf("decode %s response: %v", target, err)
+		t.Fatalf("decode %s response: %v", target, err)
 	}
-	// Finish the chunked response before asserting deferred lease accounting.
+	// A complete JSON value can arrive before the handler's deferred reader
+	// release. Consume the HTTP response through EOF before asserting lease
+	// accounting. Also reject transport errors and extra JSON values.
 	var extra interface{}
 	if err := decoder.Decode(&extra); err != io.EOF {
-	t.Fatalf("finish %s response: expected EOF, got %v (extra=%#v)", target, err, extra)
+		t.Fatalf("finish %s response: expected EOF, got %v (extra=%#v)", target, err, extra)
 	}
 	return response.StatusCode, decoded
 }

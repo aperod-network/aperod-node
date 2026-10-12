@@ -75,13 +75,17 @@ func (h *BlockHeader) Sign(priv crypto.ValidatorPrivKey) error {
 }
 
 // VerifySignature checks that the header's Signature is valid for ValidatorPub.
-func (h *BlockHeader) VerifySignature() bool {
+func (h *BlockHeader) VerifySignature(authority ...crypto.ValidatorPubKey) bool {
 	// Temporarily clear signature to recompute hash
 	sig := h.Signature
 	h.Signature = nil
 	hash := h.Hash()
 	h.Signature = sig
-	return h.ValidatorPub.Verify(hash, sig)
+pub := h.ValidatorPub
+if len(authority) == 1 {
+pub = authority[0]
+}
+return pub.Verify(hash, sig)
 }
 
 // Hash returns the hash of the full block (= header hash, since txs are in MerkleRoot).
@@ -101,14 +105,14 @@ func (b *Block) IsGenesis() bool {
 
 // Validate performs structural validation of the block.
 // It does NOT check consensus rules (done in consensus.Engine).
-func (b *Block) Validate() error {
+func (b *Block) Validate(authority ...crypto.ValidatorPubKey) error {
 	if b.Header.Timestamp <= 0 {
 		return fmt.Errorf("block %d: invalid timestamp", b.Header.Height)
 	}
 	if len(b.Header.ValidatorPub) == 0 {
 		return fmt.Errorf("block %d: missing validator public key", b.Header.Height)
 	}
-	if !b.Header.VerifySignature() {
+if !b.Header.VerifySignature(authority...) {
 		return fmt.Errorf("block %d: invalid validator signature", b.Header.Height)
 	}
 	expectedRoot := MerkleRoot(b.Txs)

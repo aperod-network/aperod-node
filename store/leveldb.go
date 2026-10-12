@@ -3,13 +3,13 @@
 package store
 
 import (
-	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -34,8 +34,10 @@ var (
 
 // DB wraps a LevelDB database with typed methods for blockchain data.
 type DB struct {
-	db   *leveldb.DB
-	path string
+	db          *leveldb.DB
+	path        string
+	canonicalMu sync.Mutex
+ringMu      sync.Mutex // serializes canonical rm/ and dense sampling-index writes
 }
 
 // Open opens or creates a LevelDB database at path.
@@ -272,12 +274,20 @@ type StoredUTXO struct {
 
 // PutUTXO persists a UTXO.
 func (d *DB) PutUTXO(txHash crypto.Hash32, outIdx uint32, u *StoredUTXO) error {
+if u == nil {
+return fmt.Errorf("nil UTXO")
+}
+d.ringMu.Lock()
+defer d.ringMu.Unlock()
 	data, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
 	batch := new(leveldb.Batch)
 	batch.Put(utxoKey(txHash, outIdx), data)
+if err := d.stageRingSamplingChange(batch, u.OneTimePub, !u.ProtocolLocked); err != nil {
+return err
+}
 	batch.Put(ringMemberKey(u.OneTimePub), data)
 	return d.db.Write(batch, nil)
 }
@@ -295,8 +305,11 @@ func (d *DB) GetUTXO(txHash crypto.Hash32, outIdx uint32) (*StoredUTXO, error) {
 	return &u, nil
 }
 
-// DeleteUTXO removes a UTXO (when spent).
+// DeleteUTXO removes a rolled-back canonical output. Spending uses su/ markers,
+// not this method: spent outputs must remain in the CLSAG anonymity set.
 func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
+d.ringMu.Lock()
+defer d.ringMu.Unlock()
 	u, err := d.GetUTXO(txHash, outIdx)
 	if err != nil {
 		return err
@@ -305,6 +318,9 @@ func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
 	batch.Delete(utxoKey(txHash, outIdx))
 	batch.Delete(spentUTXOKey(txHash, outIdx))
 	if u != nil {
+if err := d.stageRingSamplingChange(batch, u.OneTimePub, false); err != nil {
+return err
+}
 		batch.Delete(ringMemberKey(u.OneTimePub))
 	}
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
@@ -335,13 +351,18 @@ func (d *DB) LookupRingMember(pub crypto.Point32) (*core.UTXO, error) {
 
 // EnsureRingMemberIndex backfills rm/ exactly once from the authoritative u/
 // output store. New PutUTXO writes update both namespaces atomically.
-func (d *DB) EnsureRingMemberIndex() error {
+func (d *DB) ensureLegacyRingMemberIndex() error {
 	marker := []byte("ring-member-index-v1")
 	if ready, err := d.get(append(prefixMeta, marker...)); err != nil {
 		return err
 	} else if ready != nil {
 		return nil
 	}
+// An unfinished legacy backfill must not leave an apparently ready ordinal
+// index. Sampling stays unavailable until the complete rm/ store is indexed.
+if err := d.db.Delete(ringSamplingCountKey, &opt.WriteOptions{Sync: true}); err != nil {
+return err
+}
 	iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
 	defer iter.Release()
 	batch := new(leveldb.Batch)
@@ -367,56 +388,6 @@ func (d *DB) EnsureRingMemberIndex() error {
 	}
 	batch.Put(append(prefixMeta, marker...), []byte{0x01})
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
-}
-
-// SampleRingMembers performs bounded-cost random seeks in the disk index.
-// It does not materialize the complete historical output set in memory.
-func (d *DB) SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]core.DecoyUTXO, error) {
-	if count <= 0 {
-		return nil, nil
-	}
-const maxRingSampleCount = 4096
-if count > maxRingSampleCount {
-return nil, fmt.Errorf("ring sample count exceeds maximum of %d", maxRingSampleCount)
-}
-	out := make([]core.DecoyUTXO, 0, count)
-	seen := make(map[crypto.Point32]struct{}, count)
-	iter := d.db.NewIterator(util.BytesPrefix(prefixRingMember), nil)
-	defer iter.Release()
-	attempts := count * 8
-	for len(out) < count && attempts > 0 {
-		attempts--
-		var random [32]byte
-		if _, err := cryptorand.Read(random[:]); err != nil {
-			return nil, err
-		}
-		seek := append(append([]byte(nil), prefixRingMember...), random[:]...)
-		if !iter.Seek(seek) {
-			if !iter.First() {
-				break
-			}
-		}
-		var u StoredUTXO
-		if err := json.Unmarshal(iter.Value(), &u); err != nil {
-			return nil, err
-		}
-		if exclude[u.OneTimePub] {
-			continue
-		}
-		if _, duplicate := seen[u.OneTimePub]; duplicate {
-			continue
-		}
-		seen[u.OneTimePub] = struct{}{}
-		// Permanently locked consensus allocations are retained for audit but must
-		// never enter the CLSAG anonymity set.
-		if !u.ProtocolLocked {
-			out = append(out, core.DecoyUTXO{OneTimePub: u.OneTimePub, AmountCommit: u.AmountCommit})
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func storedToCoreUTXO(u *StoredUTXO) *core.UTXO {
@@ -793,11 +764,16 @@ func (d *DB) LoadTxTotal() (int64, error) {
 // that a SIGKILL cannot leave tip/hash and tip/height out of sync with
 // each other or with the block data written by PutBlock/PutRawBlock.
 func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
+	d.canonicalMu.Lock()
+	defer d.canonicalMu.Unlock()
 	var hb [8]byte
 	binary.LittleEndian.PutUint64(hb[:], height)
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
+	if err := d.restoreSale(batch, hash, height); err != nil {
+		return err
+	}
 	if err := d.restoreLPoDPool(batch, hash, height); err != nil {
 		return err
 	}
@@ -876,11 +852,32 @@ func (d *DB) CommitRawBlockWithAVM(
 	writeSetCommitment crypto.Hash32,
 	lpodSettlement ...*LPoDSettlement,
 ) error {
+	return d.commitRawBlock(hash, height, data, writes, writeSetCommitment, nil, lpodSettlement)
+}
+
+func (d *DB) CommitRawBlockWithSale(hash crypto.Hash32, height uint64, data []byte, writes []AVMWrite,
+	writeSetCommitment crypto.Hash32, saleSettlement *SaleSettlement, lpodSettlement ...*LPoDSettlement) error {
+	return d.commitRawBlock(hash, height, data, writes, writeSetCommitment, saleSettlement, lpodSettlement)
+}
+
+func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writes []AVMWrite,
+	writeSetCommitment crypto.Hash32, saleSettlement *SaleSettlement, lpodSettlement []*LPoDSettlement) error {
+	d.canonicalMu.Lock()
+	defer d.canonicalMu.Unlock()
 	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil {
 		return err
 	}
+if len(lpodSettlement) == 1 {
+if err := d.checkSaleGenesisFundingTransition(height, lpodSettlement[0],
+saleSettlement != nil && saleSettlement.Before == nil); err != nil {
+return err
+}
+}
 	batch, err := avmBatch(writes)
 	if err != nil {
+		return err
+	}
+	if err := d.appendSaleSettlement(batch, data, hash, height, saleSettlement); err != nil {
 		return err
 	}
 	// Reserve and carries share the same fsynced batch as the canonical tip.

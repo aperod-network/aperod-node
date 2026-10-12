@@ -164,6 +164,7 @@ func (s *Server) restWalletKeyImages(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Images     []string `json:"key_images"`
+IncludeHistory bool `json:"include_history,omitempty"`
 		SnapshotID string   `json:"snapshot_id,omitempty"`
 		Address    string   `json:"address,omitempty"`
 		Refs       []struct {
@@ -176,7 +177,7 @@ func (s *Server) restWalletKeyImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.SnapshotID != "" {
-		s.restWalletKeyImagesSnapshot(w, req.Images, req.Refs, req.SnapshotID, req.Address)
+s.restWalletKeyImagesSnapshot(w, req.Images, req.Refs, req.SnapshotID, req.Address, req.IncludeHistory)
 		return
 	}
 	if s.blockStore == nil {

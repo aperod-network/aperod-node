@@ -70,6 +70,8 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 	}
 	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true, Timestamp: block.Header.Timestamp,
+GenesisVestingActivationHeight: e.cfg.GenesisVestingActivationHeight,
+GenesisVestingFunding: e.cfg.GenesisVestingFunding,
 		Proposer: block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
 		PreviousStake:      map[string]store.LPoDValidatorStake{},
 		AuditPreviousStake: map[string]store.LPoDValidatorStake{},
@@ -78,6 +80,9 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 	// and the dynamic minimum. Keep it before projecting any stake operation in
 	// this block; this evidence is optional and never affects consensus hashes.
 	registryBefore := e.cfg.Registry.TakeSnapshot()
+if height == e.cfg.GenesisVestingActivationHeight && height > 0 {
+if err := e.requireLPoDParentFinalized(height-1, block.Header.PrevHash); err != nil { return nil, nil, nil, err }
+}
 	r.RegistryBefore = &registryBefore
 	if height == m.Height {
 		r.Migration = m
@@ -125,7 +130,7 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 			if e.txVerifier == nil || e.utxos == nil {
 				return nil, nil, nil, fmt.Errorf("lpod: position input verifier unavailable")
 			}
-			if err := e.txVerifier.VerifyTx(&tx); err != nil {
+if err := e.txVerifier.VerifyTxAtHeight(&tx, block.Header.Height); err != nil {
 				return nil, nil, nil, err
 			}
 		}

@@ -202,7 +202,7 @@ if len(raw) > dailyJobMaxBytes { return nil, crypto.Hash32{}, fmt.Errorf("block 
 			return nil, crypto.Hash32{}, fmt.Errorf("invalid block body at height %d", height)
 		}
 		if block.Header.Height != height || block.Hash() != hash || block.Header.MerkleRoot != core.MerkleRoot(block.Txs) ||
-			!block.Header.VerifySignature() {
+!s.verifyAuditHeader(&block.Header) {
 			return nil, crypto.Hash32{}, fmt.Errorf("canonical block identity or Merkle proof invalid at height %d", height)
 		}
 		return &block, hash, nil
@@ -220,7 +220,7 @@ if len(raw) > dailyJobMaxBytes { return 0, fmt.Errorf("timestamp probe exceeds d
 		var block core.Block
 		if err := json.Unmarshal(raw, &block); err == nil &&
 			block.Header.Height == height && block.Hash() == hash &&
-			block.Header.MerkleRoot == core.MerkleRoot(block.Txs) && block.Header.VerifySignature() {
+block.Header.MerkleRoot == core.MerkleRoot(block.Txs) && s.verifyAuditHeader(&block.Header) {
 			return block.Header.Timestamp, nil
 		}
 		// Pruned StoredBlock metadata is unsigned and is only a binary-search
@@ -427,6 +427,7 @@ AnchorHeight: anchorHeight, WitnessHeight: witnessHeight, Marker: markerDigest, 
 	checkpointCache := make(map[crypto.Hash32]*store.LPoDCheckpoint, 2)
 	vaults := make(map[string]*lpodDailyVaultSum)
 	positions := make(map[string]*lpodDailyPositionSum)
+rewards := newDailyRewardProgress()
 	var burnBase, burnIntentional, burnAVM, burnTotal uint64
 	var included uint64
 	var lastAuditDigest crypto.Hash32
@@ -447,6 +448,7 @@ fail("saved progress predecessor is no longer canonical")
 return
 }
 nextHeight, prevHash, priorTS = progress.Next, progress.Previous, progress.PriorTS
+rewards = progress.Rewards.clone() // Old authenticated progress cannot invent new report evidence.
 previousBlock, _, err = readBlock(nextHeight-1)
 if err != nil { fail("saved predecessor body unavailable"); return }
 for id, v := range progress.Vaults {
@@ -465,6 +467,7 @@ progress.Certificate, progress.Anchor, progress.Witness = cert, anchorHash, witn
 progress.AnchorHeight, progress.WitnessHeight, progress.Marker = anchorHeight, witnessHeight, markerDigest
 progress.Prune = append([]byte(nil), pruneCursorRaw...)
 progress.Next, progress.Previous, progress.PriorTS = next, prevHash, priorTS
+progress.Rewards = rewards.clone()
 progress.Vaults = make(map[string][4]uint64, len(vaults))
 for id, v := range vaults { progress.Vaults[id] = [4]uint64{v.accrued, v.leader, v.guardian, v.unfunded} }
 progress.Positions = make(map[string]dailyPositionProgress, len(positions))
@@ -569,6 +572,9 @@ fail("block audit entry count exceeds bound"); return
 				return
 			}
 			lastAuditDigest, haveLastAuditDigest = record.AfterCheckpointDigest, true
+if rewards != nil {
+if err := rewards.accumulate(block, record); err != nil { fail(err.Error()); return }
+}
 			if len(vaults)+len(positions)+len(record.Vaults)+len(record.Positions) > lpodDailyMaxEntries {
 				fail("response entry count exceeds bound")
 				return
@@ -695,6 +701,13 @@ positionList = append(positionList, dailyPositionOutput(p))
 	sort.Slice(positionList, func(i, j int) bool { return positionList[i].ID < positionList[j].ID })
 	out["vaults"], out["positions"] = vaultList, positionList
 out["beneficiary_version"] = 1
+if rewards != nil {
+openingCheckpoint, openingErr := s.blockStore.LoadLPoDCheckpointAtBounded(anchorHash, dailyJobMaxBytes)
+if openingErr == nil {
+summary, summaryErr := rewards.result(openingCheckpoint, lastAuditCheckpoint)
+if summaryErr == nil { out["daily_rewards"] = summary } else { out["daily_rewards_unavailable"] = summaryErr.Error() }
+} else { out["daily_rewards_unavailable"] = "opening reward funds unavailable" }
+}
 	out["burns_napro"] = map[string]string{
 		"protocol_base_fee": strconv.FormatUint(burnBase, 10), "signed_intentional": strconv.FormatUint(burnIntentional, 10),
 		"avm_gas": strconv.FormatUint(burnAVM, 10), "total": strconv.FormatUint(burnTotal, 10),
@@ -873,6 +886,9 @@ func (s *Server) verifyDailyRegistryEvidence(
 	}
 	replay := core.NewValidatorRegistry()
 	replay.RestoreFromSnapshot(replayStart)
+if err := replay.ConfigureSignatureAuthority(s.validatorAuthorityFork, block.Header.Height); err != nil {
+return fail(fmt.Errorf("configure pinned signature authority replay: %w", err))
+}
 	if withdrawalV2 {
 		if err := replay.ConfigureStakeWithdrawalV2(withdrawalGenesis, withdrawalActivation); err != nil {
 			return fail(fmt.Errorf("configure v2 withdrawal replay: %w", err))
@@ -1172,7 +1188,7 @@ func (s *Server) verifyDailyPositionRowsWithParent(
 		parentRaw, readErr := s.blockStore.GetRawBlock(parentHash)
 		var decoded core.Block
 		if readErr != nil || len(parentRaw) == 0 || json.Unmarshal(parentRaw, &decoded) != nil ||
-			decoded.Hash() != parentHash || !decoded.Header.VerifySignature() ||
+decoded.Hash() != parentHash || !s.verifyAuditHeader(&decoded.Header) ||
 			decoded.Header.MerkleRoot != core.MerkleRoot(decoded.Txs) {
 			return fail(fmt.Errorf("position accrual parent body or timestamp unavailable"))
 		}

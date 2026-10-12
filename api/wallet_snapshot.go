@@ -668,7 +668,7 @@ func (s *Server) restWalletKeyImagesSnapshot(
 		Hash  string `json:"tx_hash"`
 		Index uint32 `json:"out_idx"`
 	},
-	id, addressText string,
+	id, addressText string, history ...bool,
 ) {
 	address, err := validSnapshotAddress(addressText)
 	if err != nil {
@@ -731,21 +731,29 @@ func (s *Server) restWalletKeyImagesSnapshot(
 			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "pinned output index unavailable")
 			return
 		}
-		directSpent, err := lease.entry.read.IsUTXOSpentChecked(txHash, ref.Index)
-		if err != nil {
-			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "pinned source index unavailable")
-			return
-		}
-		if utxo == nil && !spent && !directSpent {
+		if utxo == nil && !spent {
 			writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_SOURCE_MISSING", "source is not indexed at the pinned checkpoint")
 			return
 		}
-		canonicalSpent[text] = spent || utxo == nil || directSpent
+		// A public per-output marker cannot identify the hidden real CLSAG
+		// input. Only the owner's locally derived image establishes spentness.
+		canonicalSpent[text] = spent
 		pendingLocked[text] = pending[hex.EncodeToString(ki[:])]
 		statuses[text] = canonicalSpent[text] || pendingLocked[text]
 	}
+	var confirmedRefs map[string]bool
+	var canonicalOutputs map[string]*walletCanonicalEvidence
+	if len(history) > 0 && history[0] {
+		canonicalOutputs = walletHistoryOutputEvidence(lease.entry.read, refs)
+		confirmedRefs = make(map[string]bool, len(canonicalOutputs))
+		for id, proof := range canonicalOutputs {
+			confirmedRefs[id] = proof != nil
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"spent": statuses, "canonical_spent": canonicalSpent, "pending_locked": pendingLocked,
+		"confirmed_refs":    confirmedRefs,
+		"canonical_outputs": canonicalOutputs,
 		"snapshot_id":       lease.entry.id,
 		"checkpoint_height": lease.entry.height,
 		"checkpoint_hash":   fmt.Sprintf("%x", lease.entry.hash[:]),

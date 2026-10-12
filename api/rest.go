@@ -46,6 +46,13 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/validators", s.restValidators)
 	s.mux.HandleFunc("/api/v1/validators/", s.restValidatorUnbonding)
 	s.mux.HandleFunc("/api/v1/admin/mint", s.localOnly(s.requireAPIKey(s.restAdminMint)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/status", s.localOnly(s.requireAPIKey(s.restSaleStatus)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/readiness", s.localOnly(s.requireAPIKey(s.restSaleReadiness)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/reserve", s.localOnly(s.requireAPIKey(s.restSaleReserve)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/paid", s.localOnly(s.requireAPIKey(s.restSalePaid)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/invoice", s.localOnly(s.requireAPIKey(s.restSaleInvoice)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/receipt", s.localOnly(s.requireAPIKey(s.restSaleReceipt)))
+	s.mux.HandleFunc("/api/v1/admin/protocol-sales/recover", s.localOnly(s.requireAPIKey(s.restSaleRecover)))
 	s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.requireAPIKey(s.restAdminPartialUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.requireAPIKey(s.restAdminFullUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.requireAPIKey(s.restAdminStakeDeposit)))
@@ -72,6 +79,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
 	s.mux.HandleFunc("/api/v1/guardian-fund", s.restGuardianFund)
 	s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
+	s.mux.HandleFunc("/api/v1/genesis-vesting", s.restGenesisVesting)
 	s.mux.HandleFunc("/api/v1/lpod/positions", s.restLPoDPositions)
 	s.mux.HandleFunc("/api/v1/lpod/wallet-outputs", s.restLPoDWalletOutputs)
 	s.mux.HandleFunc("/api/v1/lpod/earnings-outputs", s.restLPoDEarningsOutputs)
@@ -79,6 +87,7 @@ func (s *Server) registerRESTRoutes() {
 	// full block bodies and requires both loopback access and the configured API key.
 	s.mux.HandleFunc("/api/v1/lpod/audit/daily", s.localOnly(s.requireAPIKey(s.restLPoDDailyJob)))
 	s.mux.HandleFunc("/api/v1/wallet/key-images", s.restWalletKeyImages)
+	s.mux.HandleFunc("/api/v1/wallet/history-transactions", s.restWalletHistoryTransactions)
 	s.mux.HandleFunc("/api/v1/avm/status", s.restAVMStatus)
 	s.mux.HandleFunc("/api/v1/avm/contracts/", s.restAVMContract)
 	s.mux.HandleFunc("/api/v1/avm/receipts/", s.restAVMReceipt)
@@ -243,32 +252,32 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 	total := tip.Header.Height + 1 // heights 0..tip
 
 	// Return blocks from offset upward (most-recent-first when no offset given)
-if offset > tip.Header.Height {
+	if offset > tip.Header.Height {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"blocks": []interface{}{}, "total": total})
 		return
 	}
-startHeight := tip.Header.Height - offset
-if startHeight > uint64(1<<63-1) {
-writeJSON(w, http.StatusOK, map[string]interface{}{"blocks": []interface{}{}, "total": total})
-return
-}
+	startHeight := tip.Header.Height - offset
+	if startHeight > uint64(1<<63-1) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"blocks": []interface{}{}, "total": total})
+		return
+	}
 
 	blocks := make([]BlockResponse, 0, limit)
-for h := startHeight; len(blocks) < limit; {
-b := s.chain.GetByHeight(h)
+	for h := startHeight; len(blocks) < limit; {
+		b := s.chain.GetByHeight(h)
 		if b != nil {
 			response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
 			if err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-blocks = append(blocks, response)
-}
-if h == 0 {
-break
-}
-h--
-}
+			blocks = append(blocks, response)
+		}
+		if h == 0 {
+			break
+		}
+		h--
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"blocks": blocks,
 		"total":  total,
@@ -1921,11 +1930,14 @@ func (s *Server) restAdminPartialUnstake(w http.ResponseWriter, r *http.Request)
 	}
 	targetPub := crypto.ValidatorPubKey(pubBytes)
 
-	// Security: this endpoint can only unstake the LOCAL node's own validator.
-	// StakePartialWithdraw requires pub.Verify(sig) — only the key holder can
-	// authorize their own withdrawal.  Cross-validator admin unstake is not
+	// Security: this endpoint can only unstake the local collateral identity,
+	// using its height-authorized signer. Cross-validator admin unstake is not
 	// supported via REST; validators must submit their own signed tx.
-	myPub := s.myKey.Public()
+	myPub, identityErr := s.localValidatorIdentity(true)
+	if identityErr != nil {
+		writeJSONError(w, http.StatusForbidden, identityErr.Error())
+		return
+	}
 	if !myPub.Equals(targetPub) {
 		writeJSONError(w, http.StatusForbidden,
 			"this endpoint can only unstake the local node's own validator; connect to the target validator's node to initiate its withdrawal")
@@ -1953,9 +1965,8 @@ func (s *Server) restAdminPartialUnstake(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Sign with the node's own key (which IS the target validator's key).
-	// pub.Verify(StakeSignMsg(StakePartialWithdraw, pub, amount), sig) will pass
-	// because myKey.Public() == targetPub.
+	// Sign the collateral-identity payload with its authorized local key.
+	// After rotation, the signing public key differs from targetPub.
 	msg := core.StakeSignMsg(core.StakePartialWithdraw, targetPub, req.AmountNAPR)
 	sig, err := s.myKey.Sign(msg)
 	if err != nil {
@@ -2025,13 +2036,17 @@ func (s *Server) restAdminFullUnstake(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Accept an optional JSON body with pub_key for consistency with the
-	// partial-unstake endpoint, but it must equal the local node's key.
+	// partial-unstake endpoint, but it must equal the local collateral identity.
 	var req struct {
 		PubKey string `json:"pub_key"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
 
-	myPub := s.myKey.Public()
+	myPub, identityErr := s.localValidatorIdentity(true)
+	if identityErr != nil {
+		writeJSONError(w, http.StatusForbidden, identityErr.Error())
+		return
+	}
 	myPubHex := fmt.Sprintf("%x", []byte(myPub))
 
 	// If the caller supplied a pub_key, verify it matches this node.
@@ -2108,7 +2123,11 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"pub_key": nil})
 		return
 	}
-	pub := s.myKey.Public()
+	pub, identityErr := s.localValidatorIdentity(false)
+	if identityErr != nil {
+		writeJSONError(w, http.StatusForbidden, identityErr.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"pub_key": pub.Hex(),
 	})
@@ -2465,9 +2484,13 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	targetPub := crypto.ValidatorPubKey(pubBytes)
 
-	// Only the local node's own key can be used — the signature is over (pub, amount, utxo)
-	// and must verify against pub itself.
-	myPub := s.myKey.Public()
+	// Only the local collateral identity can be used. Its height-authorized key
+	// signs the identity-bound (pub, amount, utxo) payload.
+	myPub, identityErr := s.localValidatorIdentity(true)
+	if identityErr != nil {
+		writeJSONError(w, http.StatusForbidden, identityErr.Error())
+		return
+	}
 	if !myPub.Equals(targetPub) {
 		writeJSONError(w, http.StatusForbidden,
 			"pub_key must match this node's configured validator key")

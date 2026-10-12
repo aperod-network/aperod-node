@@ -47,6 +47,7 @@ type Config struct {
 	BlockTime        time.Duration
 	APIAddr          string
 	APIEnabled       bool
+StakedCollateralRingExclusionActivationHeight uint64
 }
 
 // New creates a fully initialized (but not yet started) node.
@@ -66,7 +67,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	utxos.OnUTXODeleted = func(txHash crypto.Hash32, outIdx uint32) error {
 		return db.DeleteUTXO(txHash, outIdx)
 	}
-	mempool := core.NewMempool(core.DefaultMempoolConfig())
+mempoolCfg := core.DefaultMempoolConfig()
+mempoolCfg.CurrentHeight = chain.Height
+mempool := core.NewMempool(mempoolCfg)
 
 	// ── Genesis ───────────────────────────────────────────────────────────────
 	genesisCfg, err := core.LoadGenesis(cfg.GenesisFile)
@@ -123,6 +126,7 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 
 	// ── Block/Tx verifiers ────────────────────────────────────────────────────
 	txV := core.NewTxVerifier(utxos)
+txV.SetStakedCollateralRingExclusionActivationHeight(cfg.StakedCollateralRingExclusionActivationHeight)
 	// Wire vesting enforcement using the actual genesis block timestamp.
 	// chain.Genesis() is always non-nil here because both fresh-start and resume
 	// paths above call chain.SetGenesis before this point.

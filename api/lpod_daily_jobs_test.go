@@ -31,7 +31,7 @@ func enqueueDailyTest(t *testing.T, s *Server) *dailyJob {
 }
 
 func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
-	db, s, path, _ := makeDailyAuditBenchmarkFixture(t, 70, 1, 128, 4, 0, 8)
+	db, s, path, _ := makeDailyAuditBenchmarkFixture(t, dailyBatchBlocks+70, 1, 128, 4, 0, 8)
 	enqueueDailyTest(t, s)
 	other := authenticatedDailyAuditRequest()
 	other.URL.RawQuery = "date=2024-01-03"
@@ -104,7 +104,7 @@ restarted.SetValidatorKey(reloadedKey)
 func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 	for _, change := range []string{"predecessor", "certificate", "finality", "prune"} {
 		t.Run(change, func(t *testing.T) {
-			db, s, path, _ := makeDailyAuditBenchmarkFixture(t, 40, 0, 0, 1, 0, 1)
+			db, s, path, _ := makeDailyAuditBenchmarkFixture(t, dailyBatchBlocks+40, 0, 0, 1, 0, 1)
 			enqueueDailyTest(t, s)
 			s.runDailyJobBatch(context.Background())
 			j, err := s.loadDailyJob()
@@ -155,7 +155,7 @@ func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 }
 
 func TestDailyJobCancellationAndShutdown(t *testing.T) {
-	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, 40, 0, 0, 1, 0, 0)
+	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, dailyBatchBlocks+40, 0, 0, 1, 0, 0)
 	defer db.Close()
 	enqueueDailyTest(t, s)
 	s.runDailyJobBatch(context.Background())
@@ -217,7 +217,8 @@ if err != nil { t.Fatal(err) }
 // retain only the latest one. Require forward progress when EVERY previously
 // saved certificate disappears from the oracle, not merely after 256 heights.
 func TestDailyJobAdvancingCertificateOracleDoesNotResetCursor(t *testing.T) {
-db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, 512, 1, 128, 4, 0, 4, 512)
+const intervalBlocks = 4 * dailyBatchBlocks
+db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, intervalBlocks, 1, 128, 4, 0, 4, intervalBlocks)
 defer db.Close()
 certificate, err := db.LoadFinalityCertificate()
 if err != nil { t.Fatal(err) }
@@ -232,7 +233,7 @@ return height == oracleHeight && hash == oracleHash
 enqueueDailyTest(t, s)
 var priorNext uint64
 for batch := 0; batch < 100; batch++ {
-height := initialHeight + uint64(batch)*32
+height := initialHeight + uint64(batch)*uint64(dailyBatchBlocks/2)
 if height > tipHeight { height = tipHeight }
 hash, found, err := db.GetCanonicalHash(height)
 if err != nil || !found { t.Fatal("missing tail certificate hash") }
@@ -264,7 +265,7 @@ Status string `json:"status"`
 Coverage struct { Blocks int `json:"blocks"`; Positions int `json:"positions"` } `json:"coverage"`
 }
 if err := json.Unmarshal(j.Result, &result); err != nil { t.Fatal(err) }
-if result.Status != "complete" || result.Coverage.Blocks != 512 || result.Coverage.Positions != 4 {
+if result.Status != "complete" || result.Coverage.Blocks != intervalBlocks || result.Coverage.Positions != 4 {
 t.Fatalf("unexpected report after advancing certificates: %s", j.Result)
 }
 t.Logf("completed after %d batches; certificate advanced %d heights; cursor=%d; only latest certificate accepted by oracle", batch+1, oracleHeight-initialHeight, priorNext)
