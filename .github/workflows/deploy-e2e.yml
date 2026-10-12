@@ -10,6 +10,9 @@ on:
     paths:
       - 'deploy/**'
 
+permissions:
+  contents: read
+
 jobs:
   install-node-e2e:
     name: install-node.sh e2e smoke test
