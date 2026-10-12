@@ -116,6 +116,25 @@ class PublisherTests(unittest.TestCase):
             publisher.await_merge({"number": 1, "html_url": "test"}, request)
         self.assertNotIn("PUT", methods)
 
+    def test_failed_codeql_check_never_merges(self):
+        methods = []
+        failed = "Analyze (go)"
+
+        def request(method, url, data=None):
+            methods.append(method)
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            return {"check_runs": [
+                {"name": name, "status": "completed",
+                 "conclusion": "failure" if name == failed else "success",
+                 "app": {"id": 15368}}
+                for name in publisher.REQUIRED_CHECKS
+            ]}
+
+        with self.assertRaisesRegex(RuntimeError, "check failed"):
+            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertNotIn("PUT", methods)
+
     def test_untrusted_status_provider_cannot_authorize_merge(self):
         methods = []
         def request(method, url, data=None):

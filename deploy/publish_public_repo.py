@@ -46,6 +46,10 @@ REQUIRED_CHECKS = {
     "install-node.sh e2e smoke test (validator)",
     "install-node.sh e2e smoke test (update)",
     "install-node.sh e2e smoke test (upgrade)",
+    "Analyze (actions)",
+    "Analyze (go)",
+    "Analyze (javascript-typescript)",
+    "Analyze (python)",
 }
 
 
