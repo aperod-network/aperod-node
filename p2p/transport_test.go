@@ -14,6 +14,7 @@ package p2p_test
 import (
 	"crypto/tls"
 	"net"
+"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,17 @@ import (
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/p2p"
 )
+
+const testUnmatchedPeerFingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
+
+func pinTLSConfig(t *testing.T, cfg *tls.Config, fingerprints ...string) *tls.Config {
+t.Helper()
+pinned, err := p2p.TLSConfigWithAllowedPeerFingerprints(cfg, fingerprints)
+if err != nil {
+t.Fatalf("TLSConfigWithAllowedPeerFingerprints: %v", err)
+}
+return pinned
+}
 
 // ─── T-1: Config generation ───────────────────────────────────────────────────
 
@@ -59,23 +71,25 @@ func TestTLS_MutualAuth_HostAndRawPeer(t *testing.T) {
 		t.Fatalf("gen config A: %v", err)
 	}
 
-	hostA := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   5,
-		NodeID:     "node-a",
-		UserAgent:  "aperod/test",
-		TLSConfig:  cfgA,
-	}, &stubHandler{}, newTestLogger())
-	if err := hostA.Start(); err != nil {
-		t.Fatalf("hostA.Start: %v", err)
-	}
-	t.Cleanup(hostA.Stop)
-
 	// Raw peer identity — a second independent TLS certificate.
 	cfgB, fpB, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("gen config B: %v", err)
 	}
+cfgB = pinTLSConfig(t, cfgB, fpA)
+
+hostA := p2p.NewHost(p2p.Config{
+ListenAddr:   "127.0.0.1:0",
+MaxPeers:     5,
+NodeID:       "node-a",
+UserAgent:    "aperod/test",
+TLSConfig:    cfgA,
+AllowedPeers: []string{fpB},
+}, &stubHandler{}, newTestLogger())
+if err := hostA.Start(); err != nil {
+t.Fatalf("hostA.Start: %v", err)
+}
+t.Cleanup(hostA.Stop)
 
 	// Dial using the raw TLS dialer so the full TLS handshake (including
 	// mutual certificate exchange) completes before we send any Aperod data.
@@ -132,12 +146,17 @@ func TestTLS_PlaintextClientRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen config: %v", err)
 	}
+_, peerFingerprint, err := p2p.GenerateNodeTLSConfig()
+if err != nil {
+t.Fatalf("gen peer fingerprint: %v", err)
+}
 	host := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   5,
-		NodeID:     "tls-node",
-		UserAgent:  "aperod/test",
-		TLSConfig:  tlsCfg,
+ListenAddr:   "127.0.0.1:0",
+MaxPeers:     5,
+NodeID:       "tls-node",
+UserAgent:    "aperod/test",
+TLSConfig:    tlsCfg,
+AllowedPeers: []string{peerFingerprint},
 	}, &stubHandler{}, newTestLogger())
 	if err := host.Start(); err != nil {
 		t.Fatalf("host.Start: %v", err)
@@ -197,10 +216,9 @@ func TestTLS_DifferentIdentities(t *testing.T) {
 // ─── T-6: AllowedPeers — unlisted fingerprint is rejected ────────────────────
 //
 // Start a TLS host with AllowedPeers set to a known good fingerprint (fpGood).
-// Connect with a different identity (fpBad) and verify:
-//   - The TLS handshake itself completes (mutual auth works).
-//   - The host closes the connection before the Aperod application handshake
-//     (peer is never registered in h.peers).
+// Connect with a different identity (fpBad) and verify its pinned TLS
+// handshake is rejected. The allowed identity completes the application
+// handshake and is registered in h.peers.
 //
 // Then connect with the allowed identity (fpGood) and verify the peer IS
 // registered — confirming the allow-list only blocks unknown fingerprints.
@@ -212,8 +230,8 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 		t.Fatalf("gen config good: %v", err)
 	}
 
-	// Host identity.
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+// Host identity.
+cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("gen config host: %v", err)
 	}
@@ -238,6 +256,7 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen config bad: %v", err)
 	}
+cfgBad = pinTLSConfig(t, cfgBad, fpHost)
 	badConn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second},
 		"tcp", addr, cfgBad,
@@ -268,7 +287,7 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 	// ── Attempt 2: connect with the LISTED identity ───────────────────────────
 	goodConn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second},
-		"tcp", addr, cfgGood,
+"tcp", addr, pinTLSConfig(t, cfgGood, fpHost),
 	)
 	if err != nil {
 		t.Fatalf("T-6: allowed peer TLS dial failed: %v", err)
@@ -297,63 +316,38 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 	}
 }
 
-// ─── T-7: AllowedPeers empty = open network ───────────────────────────────────
-//
-// When AllowedPeers is empty (nil), all peers with valid TLS credentials
-// should be accepted — existing default behaviour is preserved.
+// ─── T-7: An empty pin list fails closed ──────────────────────────────────────
 
-func TestTLS_AllowedPeers_EmptyMeansOpen(t *testing.T) {
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
-	if err != nil {
-		t.Fatalf("gen config peer: %v", err)
-	}
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+func TestTLS_AllowedPeers_EmptyRejectedAtStartup(t *testing.T) {
+cfgHost, _, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("gen config host: %v", err)
 	}
-
-	// No AllowedPeers set — open network.
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
 		MaxPeers:   5,
-		NodeID:     "open-node",
+		NodeID:     "unpinned-node",
 		UserAgent:  "aperod/test",
 		TLSConfig:  cfgHost,
-		// AllowedPeers intentionally omitted
 	}, &stubHandler{}, newTestLogger())
-	if err := host.Start(); err != nil {
-		t.Fatalf("host.Start: %v", err)
-	}
-	t.Cleanup(host.Stop)
 
-	conn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: 2 * time.Second},
-		"tcp", host.ListenAddr(), cfgPeer,
-	)
+	err = host.Start()
+	if err == nil {
+		host.Stop()
+		t.Fatal("TLS host started without an allowed peer fingerprint")
+	}
+	if !strings.Contains(err.Error(), "at least one allowed peer fingerprint") {
+		t.Fatalf("unexpected startup error: %v", err)
+	}
+}
+
+func TestTLS_AllowedPeers_InvalidFingerprintRejected(t *testing.T) {
+	cfg, _, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
-		t.Fatalf("T-7: tls dial: %v", err)
+		t.Fatalf("gen TLS config: %v", err)
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
-
-	// Asymmetric handshake: dialer sends MsgPing, host replies MsgPong.
-	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
-		NodeID: "any-peer", Height: 0, UserAgent: "test",
-		Timestamp: time.Now().Unix(),
-	}); err != nil {
-		t.Fatalf("T-7: write ping: %v", err)
-	}
-	msgType, _, err := p2p.ReadMsg(conn)
-	if err != nil || msgType != p2p.MsgPong {
-		t.Fatalf("T-7: expected MsgPong, got %v err=%v", msgType, err)
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	if host.PeerCount() != 1 {
-		t.Errorf("T-7: open-network peer was NOT accepted (peer count = %d, want 1)", host.PeerCount())
-	} else {
-		t.Log("T-7 ✓ empty AllowedPeers = open network; arbitrary TLS peer accepted")
+	if _, err := p2p.TLSConfigWithAllowedPeerFingerprints(cfg, []string{"not-a-fingerprint"}); err == nil {
+		t.Fatal("expected malformed peer fingerprint to be rejected")
 	}
 }
 
@@ -449,10 +443,11 @@ func TestTLS_BannedIPRejectedDespiteValidCert(t *testing.T) {
 	}
 
 	// Host identity.
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("T-10: gen host config: %v", err)
 	}
+cfgAttacker = pinTLSConfig(t, cfgAttacker, fpHost)
 
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:   "127.0.0.1:0",
@@ -531,6 +526,7 @@ func TestTLS_HandshakeFlood(t *testing.T) {
 		NodeID:               "flood-test-node",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{testUnmatchedPeerFingerprint},
 		MaxPendingHandshakes: limit,
 	}, &stubHandler{}, newTestLogger())
 	if err := host.Start(); err != nil {
@@ -610,21 +606,22 @@ func TestTLS_HandshakeFlood(t *testing.T) {
 // sides.  At t = 12 s both hosts must still report PeerCount == 1.
 
 func TestTLS_ConnectionSurvivesIdleSilence(t *testing.T) {
-	cfgA, _, err := p2p.GenerateNodeTLSConfig()
+	cfgA, fpA, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("T-12: gen config A: %v", err)
 	}
-	cfgB, _, err := p2p.GenerateNodeTLSConfig()
+	cfgB, fpB, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("T-12: gen config B: %v", err)
 	}
 
 	hostA := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   5,
-		NodeID:     "silence-node-a",
-		UserAgent:  "aperod/test",
-		TLSConfig:  cfgA,
+		ListenAddr:   "127.0.0.1:0",
+		MaxPeers:     5,
+		NodeID:       "silence-node-a",
+		UserAgent:    "aperod/test",
+		TLSConfig:    cfgA,
+		AllowedPeers: []string{fpB},
 	}, &stubHandler{}, newTestLogger())
 	if err := hostA.Start(); err != nil {
 		t.Fatalf("T-12: hostA.Start: %v", err)
@@ -632,11 +629,12 @@ func TestTLS_ConnectionSurvivesIdleSilence(t *testing.T) {
 	t.Cleanup(hostA.Stop)
 
 	hostB := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   5,
-		NodeID:     "silence-node-b",
-		UserAgent:  "aperod/test",
-		TLSConfig:  cfgB,
+		ListenAddr:   "127.0.0.1:0",
+		MaxPeers:     5,
+		NodeID:       "silence-node-b",
+		UserAgent:    "aperod/test",
+		TLSConfig:    cfgB,
+		AllowedPeers: []string{fpA},
 	}, &stubHandler{}, newTestLogger())
 	if err := hostB.Start(); err != nil {
 		t.Fatalf("T-12: hostB.Start: %v", err)
@@ -828,6 +826,7 @@ func TestTLS_HandshakeTimeout_SlotFreedOnDeadline(t *testing.T) {
 		NodeID:               "hs-timeout-node",
 		UserAgent:            "aperod/test",
 		TLSConfig:            tlsCfg,
+		AllowedPeers:         []string{testUnmatchedPeerFingerprint},
 		MaxPendingHandshakes: 1,
 		HandshakeTimeout:     hsTimeout,
 	}, &stubHandler{}, newTestLogger())

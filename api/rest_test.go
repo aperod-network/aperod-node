@@ -128,6 +128,21 @@ func TestREST_Blocks_OffsetPastEnd(t *testing.T) {
 	}
 }
 
+func TestREST_Blocks_RejectsOffsetThatWouldOverflowSignedHeight(t *testing.T) {
+srv, _ := buildChainServer(t, 0)
+code, resp := restGet(t, srv, "/api/v1/blocks?offset=9223372036854775809")
+if code != http.StatusOK {
+t.Errorf("status = %d, want 200", code)
+}
+blocks, ok := resp["blocks"].([]interface{})
+if !ok {
+t.Fatalf("blocks not an array: %T", resp["blocks"])
+}
+if len(blocks) != 0 {
+t.Errorf("expected empty blocks slice, got %d", len(blocks))
+}
+}
+
 func TestREST_Blocks_MethodNotAllowed(t *testing.T) {
 	srv, _ := buildChainServer(t, 0)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/blocks", nil)
