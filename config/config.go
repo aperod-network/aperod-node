@@ -196,10 +196,10 @@ type P2PConfig struct {
 	// under an inbound flood can always gossip produced blocks to the network.
 	// Recommended: 4.  0 = feature disabled.
 	MinOutbound int `yaml:"min_outbound"`
-	// AllowedPeers is an optional list of hex-encoded SHA-256 SPKI fingerprints
-	// that are permitted to join the network.  When non-empty, any peer whose
-	// TLS fingerprint is not on the list is disconnected immediately after the
-	// TLS handshake.  An empty list means open network (default behaviour).
+// AllowedPeers is the required list of hex-encoded SHA-256 SPKI fingerprints
+// permitted to join a TLS-enabled P2P network. Each peer is authenticated
+// against this list during the TLS handshake; an empty or malformed list
+// prevents the TLS host from starting.
 	AllowedPeers []string `yaml:"allowed_peers"`
 	// PeerWhitelist is an optional list of IP addresses and/or CIDR ranges
 	// (e.g. "1.2.3.4", "10.0.0.0/8") whose inbound connections are accepted.

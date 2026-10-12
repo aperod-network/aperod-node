@@ -556,6 +556,7 @@ func TestDuplicateP2PIdentity_Rejected(t *testing.T) {
                 NodeID:          "host-node",
                 UserAgent:       "aperod/test",
                 TLSConfig:       sharedCfg,
+                AllowedPeers:    []string{sharedFP},
                 SelfFingerprint: sharedFP,
         }, &stubHandler{}, newTestLogger())
         if err := host.Start(); err != nil {
@@ -568,7 +569,7 @@ func TestDuplicateP2PIdentity_Rejected(t *testing.T) {
         // data directory without regenerating its p2p_identity.key.
         conn, err := tls.DialWithDialer(
                 &net.Dialer{Timeout: 2 * time.Second},
-                "tcp", host.ListenAddr(), sharedCfg,
+                "tcp", host.ListenAddr(), pinTLSConfig(t, sharedCfg, sharedFP),
         )
         if err != nil {
                 // Host closed the connection at the TLS layer — also acceptable.
@@ -673,6 +674,7 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
                 NodeID:          "outbound-host",
                 UserAgent:       "aperod/test",
                 TLSConfig:       sharedCfg,
+                AllowedPeers:    []string{sharedFP},
                 SelfFingerprint: sharedFP,
         }, &stubHandler{}, logger)
         if err := host.Start(); err != nil {
@@ -681,7 +683,7 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
         t.Cleanup(host.Stop)
 
         // Remote "clone" node: a bare TLS listener presenting the SAME cert.
-        ln, err := tls.Listen("tcp", "127.0.0.1:0", sharedCfg)
+        ln, err := tls.Listen("tcp", "127.0.0.1:0", pinTLSConfig(t, sharedCfg, sharedFP))
         if err != nil {
                 t.Fatalf("tls.Listen: %v", err)
         }

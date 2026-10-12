@@ -72,3 +72,11 @@ func TestRingMemberIndexPersistsSamplesAndDeletesCanonicalOutputs(t *testing.T) 
 		t.Fatal("rolled-back output remains in ring-member index")
 	}
 }
+
+func TestSampleRingMembersRejectsExcessiveCount(t *testing.T) {
+db := openTestDB(t)
+_, err := db.SampleRingMembers(int(^uint(0)>>1), nil)
+if err == nil {
+t.Fatal("expected excessive sample count to be rejected")
+}
+}

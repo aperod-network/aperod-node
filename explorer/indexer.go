@@ -25,6 +25,15 @@ import (
 	_ "github.com/lib/pq"
 )
 
+const maxPostgresBigInt = uint64(1<<63 - 1)
+
+func checkedInt64FromUint64(field string, value uint64) (int64, error) {
+	if value > maxPostgresBigInt {
+		return 0, fmt.Errorf("indexer: %s exceeds PostgreSQL BIGINT range", field)
+	}
+	return int64(value), nil
+}
+
 // ─── Data-transfer types ──────────────────────────────────────────────────────
 
 // BlockData is a flat representation of a block suitable for indexing.
@@ -260,6 +269,11 @@ func (idx *Indexer) migrate(ctx context.Context) error {
 // If the block already exists (same height) the call is a no-op for that block.
 // addr allows optional address→tx mappings (may be nil/empty).
 func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData) error {
+	blockHeight, err := checkedInt64FromUint64("block height", block.Height)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -274,7 +288,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                 INSERT INTO blocks (height, hash, prev_hash, timestamp_ns, validator_pub, merkle_root, tx_count)
                 VALUES ($1,$2,$3,$4,$5,$6,$7)
                 ON CONFLICT (height) DO NOTHING`,
-		int64(block.Height), block.Hash, block.PrevHash,
+				blockHeight, block.Hash, block.PrevHash,
 		block.TimestampNs, block.ValidatorPub, block.MerkleRoot, block.TxCount,
 	)
 	if err != nil {
@@ -285,14 +299,22 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
 	// updates for burn metadata must not inflate total_txs on a reindex.
 	newlyInsertedTxs := 0
 	for _, tx := range txs {
+		txBlockHeight, err := checkedInt64FromUint64("transaction block height", tx.BlockHeight)
+		if err != nil {
+			return err
+		}
+		txFee, err := checkedInt64FromUint64("transaction fee", tx.Fee)
+		if err != nil {
+			return err
+		}
 		var inserted int
 		err = dbTx.QueryRowContext(ctx, `
                         INSERT INTO transactions (hash, block_hash, block_height, tx_index, is_coinbase, inputs, outputs, fee, size, version, is_burn, burned_napro, burn_address)
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                         ON CONFLICT (hash) DO NOTHING
                         RETURNING 1`,
-			tx.Hash, tx.BlockHash, int64(tx.BlockHeight), tx.TxIndex,
-			tx.IsCoinbase, tx.Inputs, tx.Outputs, int64(tx.Fee), tx.SizeBytes, tx.Version,
+				tx.Hash, tx.BlockHash, txBlockHeight, tx.TxIndex,
+				tx.IsCoinbase, tx.Inputs, tx.Outputs, txFee, tx.SizeBytes, tx.Version,
 			tx.IsBurn, tx.BurnedNAPRO, tx.BurnAddress,
 		).Scan(&inserted)
 		if err == nil {
@@ -316,11 +338,15 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
 
 	// Insert address→tx mappings
 	for _, a := range addr {
+		addressBlockHeight, err := checkedInt64FromUint64("address transaction block height", a.BlockHeight)
+		if err != nil {
+			return err
+		}
 		_, err = dbTx.ExecContext(ctx, `
                         INSERT INTO address_txs (address, tx_hash, block_height, tx_index, output_index)
                         VALUES ($1,$2,$3,$4,$5)
                         ON CONFLICT (address, tx_hash, block_height, tx_index, output_index) DO NOTHING`,
-			a.Address, a.TxHash, int64(a.BlockHeight), a.TxIndex, a.OutputIndex,
+				a.Address, a.TxHash, addressBlockHeight, a.TxIndex, a.OutputIndex,
 		)
 		if err != nil {
 			return fmt.Errorf("indexer: insert addr_tx: %w", err)
@@ -336,7 +362,7 @@ func (idx *Indexer) IndexBlock(block BlockData, txs []TxData, addr []AddrTxData)
                         total_txs           = total_txs + $2,
                         updated_at          = NOW()
                 WHERE id = 1`,
-		int64(block.Height), newlyInsertedTxs,
+				blockHeight, newlyInsertedTxs,
 	)
 	if err != nil {
 		return fmt.Errorf("indexer: update stats: %w", err)

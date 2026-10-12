@@ -243,24 +243,32 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 	total := tip.Header.Height + 1 // heights 0..tip
 
 	// Return blocks from offset upward (most-recent-first when no offset given)
-	startHeight := int64(tip.Header.Height) - int64(offset)
-	if startHeight < 0 {
+if offset > tip.Header.Height {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"blocks": []interface{}{}, "total": total})
 		return
 	}
+startHeight := tip.Header.Height - offset
+if startHeight > uint64(1<<63-1) {
+writeJSON(w, http.StatusOK, map[string]interface{}{"blocks": []interface{}{}, "total": total})
+return
+}
 
 	blocks := make([]BlockResponse, 0, limit)
-	for h := startHeight; h >= 0 && len(blocks) < limit; h-- {
-		b := s.chain.GetByHeight(uint64(h))
+for h := startHeight; len(blocks) < limit; {
+b := s.chain.GetByHeight(h)
 		if b != nil {
 			response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
 			if err != nil {
 				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			blocks = append(blocks, response)
-		}
-	}
+blocks = append(blocks, response)
+}
+if h == 0 {
+break
+}
+h--
+}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"blocks": blocks,
 		"total":  total,

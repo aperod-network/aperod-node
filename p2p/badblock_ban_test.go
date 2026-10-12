@@ -1824,11 +1824,11 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 
 	// ── Step 1: generate independent TLS identities for host and peer ────────
 
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate host TLS config: %v", err)
 	}
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate peer TLS config: %v", err)
 	}
@@ -1839,6 +1839,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 		NodeID:               "test-tls-ban",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
 		BadBlockBanThreshold: threshold,
 		BadBlockHeightLead:   1000,
 		BadBlockBanDuration:  24 * time.Hour,
@@ -1852,6 +1853,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 
 	// ── Step 2: TLS dial + Aperod Ping/Pong handshake ─────────────────────────
 
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 	tlsConn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second},
 		"tcp", hostAddr, cfgPeer,
@@ -2022,11 +2024,11 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 	const threshold = 10
 
 	// Generate independent TLS identities for host and peer.
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate host TLS config: %v", err)
 	}
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate peer TLS config: %v", err)
 	}
@@ -2037,6 +2039,7 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 		NodeID:               "test-tls-evict-all",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
 		BadBlockBanThreshold: threshold,
 		BadBlockHeightLead:   1000,
 		BadBlockBanDuration:  24 * time.Hour,
@@ -2050,6 +2053,7 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 
 	// dialTLS opens a TLS connection, completes the Aperod Ping/Pong handshake,
 	// and returns the open *tls.Conn.
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 	dialTLS := func(nodeID string) *tls.Conn {
 		t.Helper()
 		c, err := tls.DialWithDialer(
@@ -2153,11 +2157,11 @@ func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
 
 	// ── Step 1: generate independent TLS identities for host and peer ────────
 
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate host TLS config: %v", err)
 	}
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate peer TLS config: %v", err)
 	}
@@ -2168,6 +2172,7 @@ func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
 		NodeID:               "test-tls-wl-not-banned",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
 		BadBlockBanThreshold: threshold,
 		BadBlockHeightLead:   1000,
 		BadBlockBanDuration:  24 * time.Hour,
@@ -2183,6 +2188,7 @@ func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
 
 	// ── Step 2: TLS dial + Aperod Ping/Pong handshake ────────────────────────
 
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 	tlsConn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second},
 		"tcp", hostAddr, cfgPeer,
@@ -2291,11 +2297,11 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	const maxPending = 3
 	const extraFlood = 2
 
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate host TLS config: %v", err)
 	}
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate peer TLS config: %v", err)
 	}
@@ -2306,6 +2312,7 @@ func TestSlowHandshakeFlood(t *testing.T) {
 		NodeID:               "test-handshake-flood",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
 		MaxPendingHandshakes: maxPending,
 	}, &stubHandler{}, newTestLogger())
 	if err := h.Start(); err != nil {
@@ -2314,6 +2321,7 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	defer h.Stop()
 
 	hostAddr := h.ListenAddr()
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 
 	// ── Step 1: open maxPending raw TCP connections — hold all pending slots ──
 	// The host wraps the TCP listener with tls.NewListener, so each accepted
@@ -2473,11 +2481,11 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 		extraFlood = 8 // connections beyond the cap sent simultaneously
 	)
 
-	cfgHost, _, err := p2p.GenerateNodeTLSConfig()
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate host TLS config: %v", err)
 	}
-	cfgPeer, _, err := p2p.GenerateNodeTLSConfig()
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
 	if err != nil {
 		t.Fatalf("generate peer TLS config: %v", err)
 	}
@@ -2488,6 +2496,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 		NodeID:               "test-concurrent-flood",
 		UserAgent:            "aperod/test",
 		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
 		MaxPendingHandshakes: maxPending,
 	}, &stubHandler{}, newTestLogger())
 	if err := h.Start(); err != nil {
@@ -2496,6 +2505,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 	defer h.Stop()
 
 	hostAddr := h.ListenAddr()
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 
 	// concurrentDial launches n goroutines that all dial hostAddr at the same
 	// instant.  Each goroutine signals readyCh when it is blocked at the start

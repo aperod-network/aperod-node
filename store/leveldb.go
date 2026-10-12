@@ -375,6 +375,10 @@ func (d *DB) SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]co
 	if count <= 0 {
 		return nil, nil
 	}
+const maxRingSampleCount = 4096
+if count > maxRingSampleCount {
+return nil, fmt.Errorf("ring sample count exceeds maximum of %d", maxRingSampleCount)
+}
 	out := make([]core.DecoyUTXO, 0, count)
 	seen := make(map[crypto.Point32]struct{}, count)
 	iter := d.db.NewIterator(util.BytesPrefix(prefixRingMember), nil)
