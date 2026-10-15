@@ -404,6 +404,88 @@ func TestREST_AddressTxsUsesNewestRetainedBlocks(t *testing.T) {
 	}
 }
 
+func TestREST_AddressTxsBoundsScanAndPaginates(t *testing.T) {
+	priv, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	targetKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	targetSpend := targetKeys.Spend.Public
+	otherSpend := crypto.Point32(validatorPub)
+	makeBlock := func(height uint64, prev crypto.Hash32) *core.Block {
+		recipient := otherSpend
+		if height == 0 {
+			recipient = targetSpend
+		}
+		txs := []core.Transaction{core.CoinbaseTx(recipient, 1_000_000+height)}
+		header := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prev,
+			Timestamp:    time.Now().UnixNano() + int64(height),
+			ValidatorPub: validatorPub,
+			MerkleRoot:   core.MerkleRoot(txs),
+		}
+		if err := header.Sign(priv); err != nil {
+			t.Fatalf("Sign block %d: %v", height, err)
+		}
+		return &core.Block{Header: header, Txs: txs}
+	}
+
+	chain := core.NewChain(1_200)
+	prev := makeBlock(0, crypto.Hash32{})
+	if err := chain.SetGenesis(prev); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	for height := uint64(1); height <= 1_000; height++ {
+		block := makeBlock(height, prev.Hash())
+		if err := chain.AddBlock(block); err != nil {
+			t.Fatalf("AddBlock(%d): %v", height, err)
+		}
+		prev = block
+	}
+	srv := api.NewServer(":0", chain, core.NewMempool(core.DefaultMempoolConfig()), core.NewUTXOSet(), testLogger())
+	address := crypto.EncodeAddress(crypto.MainnetByte, targetSpend, targetSpend)
+	path := "/api/v1/address/" + string(address) + "/transactions"
+
+	code, first := restGet(t, srv, path)
+	if code != http.StatusOK {
+		t.Fatalf("first-page status = %d, want 200", code)
+	}
+	if first["scan_limited"] != true {
+		t.Fatalf("first-page scan_limited = %v, want true", first["scan_limited"])
+	}
+	if txs, ok := first["transactions"].([]interface{}); !ok || len(txs) != 0 {
+		t.Fatalf("first-page transactions = %v, want empty page", first["transactions"])
+	}
+	next, ok := first["next_start_height"].(float64)
+	if !ok || next != 0 {
+		t.Fatalf("first-page next_start_height = %v, want the genesis cursor 0", first["next_start_height"])
+	}
+
+	code, second := restGet(t, srv, fmt.Sprintf("%s?start_height=%.0f", path, next))
+	if code != http.StatusOK {
+		t.Fatalf("second-page status = %d, want 200", code)
+	}
+	if second["scan_limited"] != false {
+		t.Fatalf("second-page scan_limited = %v, want false", second["scan_limited"])
+	}
+	txs, ok := second["transactions"].([]interface{})
+	if !ok || len(txs) != 1 {
+		t.Fatalf("second-page transactions = %v, want one matching transaction", second["transactions"])
+	}
+	tx, ok := txs[0].(map[string]interface{})
+	if !ok || tx["block_height"] != float64(0) {
+		t.Fatalf("second-page transaction = %v, want genesis block_height 0", txs[0])
+	}
+
+	if code, _ := restGet(t, srv, path+"?start_height=not-a-height"); code != http.StatusBadRequest {
+		t.Fatalf("invalid start_height status = %d, want 400", code)
+	}
+}
+
 func TestREST_AddressTxs_MethodNotAllowed(t *testing.T) {
 	srv, _ := buildChainServer(t, 0)
 	wk, _ := crypto.GenerateWalletKeys()

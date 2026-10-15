@@ -136,6 +136,54 @@ func (c *Chain) BlocksNewestFirst() []*Block {
         return blocks
 }
 
+// BlocksNewestFirstPage returns at most maxHeightScan retained block heights,
+// newest first. startHeight is inclusive when startAtTip is false. The
+// returned nextStartHeight is an inclusive cursor for the next page.
+func (c *Chain) BlocksNewestFirstPage(startHeight uint64, startAtTip bool, maxHeightScan int) (
+        blocks []*Block,
+        nextStartHeight uint64,
+        hasMore bool,
+        oldestRetainedHeight uint64,
+) {
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+
+        if c.tip == nil || len(c.byHeight) == 0 || maxHeightScan <= 0 {
+                return nil, 0, false, 0
+        }
+
+        tipHeight := c.tip.Header.Height
+        if c.maxInMemoryBlocks > 0 && tipHeight >= c.maxInMemoryBlocks {
+                oldestRetainedHeight = tipHeight - c.maxInMemoryBlocks + 1
+        }
+        if startAtTip || startHeight > tipHeight {
+                startHeight = tipHeight
+        }
+        if startHeight < oldestRetainedHeight {
+                return nil, 0, false, oldestRetainedHeight
+        }
+
+        firstHeight := oldestRetainedHeight
+        if scannedHeights := startHeight - oldestRetainedHeight + 1; scannedHeights > uint64(maxHeightScan) {
+                firstHeight = startHeight - uint64(maxHeightScan) + 1
+                hasMore = firstHeight > oldestRetainedHeight
+                if hasMore {
+                        nextStartHeight = firstHeight - 1
+                }
+        }
+
+        blocks = make([]*Block, 0, int(startHeight-firstHeight+1))
+        for height := startHeight; ; height-- {
+                if block := c.byHeight[height]; block != nil {
+                        blocks = append(blocks, block)
+                }
+                if height == firstHeight {
+                        break
+                }
+        }
+        return blocks, nextStartHeight, hasMore, oldestRetainedHeight
+}
+
 // HasBlock returns true if the block with this hash is already known.
 func (c *Chain) HasBlock(h crypto.Hash32) bool {
         c.mu.RLock()

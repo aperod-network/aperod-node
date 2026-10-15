@@ -98,12 +98,12 @@ class PublisherTests(unittest.TestCase):
         def request(method, url, data=None):
             methods.append(method)
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             return {"check_runs": [{"name": "Whole-tree publication security",
                                    "status": "completed", "conclusion": "failure",
                                    "app": {"id": 15368}}]}
         with self.assertRaisesRegex(RuntimeError, "check failed"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertNotIn("PUT", methods)
 
     def test_failed_lifecycle_matrix_check_never_merges(self):
@@ -113,7 +113,7 @@ class PublisherTests(unittest.TestCase):
         def request(method, url, data=None):
             methods.append(method)
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
@@ -123,7 +123,7 @@ class PublisherTests(unittest.TestCase):
             ]}
 
         with self.assertRaisesRegex(RuntimeError, "check failed"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertNotIn("PUT", methods)
 
     def test_failed_codeql_check_never_merges(self):
@@ -133,7 +133,7 @@ class PublisherTests(unittest.TestCase):
         def request(method, url, data=None):
             methods.append(method)
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
@@ -143,7 +143,7 @@ class PublisherTests(unittest.TestCase):
             ]}
 
         with self.assertRaisesRegex(RuntimeError, "check failed"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertNotIn("PUT", methods)
 
     def test_neutral_codeql_requires_completed_go_analysis_and_no_open_pr_alerts(self):
@@ -154,7 +154,7 @@ class PublisherTests(unittest.TestCase):
             if method == "PUT":
                 return {"merged": True}
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             if url.endswith("/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"):
                 return []
             checks = []
@@ -174,7 +174,7 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": checks}
 
         with patch.object(publisher.time, "sleep"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertIn(
             ("GET", f"{publisher.API}/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"),
             methods,
@@ -191,7 +191,7 @@ class PublisherTests(unittest.TestCase):
             if method == "PUT":
                 return {"merged": True}
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             check_reads += 1
             checks = []
             for name in publisher.REQUIRED_CHECKS:
@@ -213,7 +213,7 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": checks}
 
         with patch.object(publisher.time, "sleep"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertEqual(check_reads, 2)
         self.assertFalse(any("/code-scanning/alerts?" in url for _, url in methods))
         self.assertIn(("PUT", f"{publisher.API}/pulls/1/merge"), methods)
@@ -224,7 +224,7 @@ class PublisherTests(unittest.TestCase):
         def request(method, url, data=None):
             methods.append((method, url))
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             if url.endswith("/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"):
                 return [{"number": 7, "state": "open"}]
             checks = []
@@ -244,7 +244,7 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": checks}
 
         with self.assertRaisesRegex(RuntimeError, "open pull-request alerts"):
-            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+            publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertNotIn(("PUT", f"{publisher.API}/pulls/1/merge"), methods)
 
     def test_untrusted_status_provider_cannot_authorize_merge(self):
@@ -252,7 +252,7 @@ class PublisherTests(unittest.TestCase):
         def request(method, url, data=None):
             methods.append(method)
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             return {"check_runs": [
                 {"name": name, "status": "completed", "conclusion": "success",
                  "app": {"id": publisher.GITHUB_ACTIONS_APP_ID if name == "CodeQL"
@@ -263,7 +263,10 @@ class PublisherTests(unittest.TestCase):
         with patch.object(publisher.time, "monotonic", side_effect=[0, 0, 2]), \
              patch.object(publisher.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "did not complete"):
-                publisher.await_merge({"number": 1, "html_url": "test"}, request, timeout=1)
+                publisher.await_merge(
+                    {"number": 1, "html_url": "test"}, request,
+                    timeout=1, expected_head_sha="reviewed",
+                )
         self.assertNotIn("PUT", methods)
 
     def test_merge_is_bound_to_reviewed_head(self):
@@ -273,15 +276,96 @@ class PublisherTests(unittest.TestCase):
                 bodies.append(data)
                 return {"merged": True}
             if url.endswith("/pulls/1"):
-                return {"state": "open", "head": {"sha": "reviewed"}}
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
             return {"check_runs": [{"name": name, "status": "completed",
                                    "conclusion": "success",
                                    "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
                                        name, publisher.GITHUB_ACTIONS_APP_ID)}}
                                    for name in publisher.REQUIRED_CHECKS]}
-        publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertEqual(bodies[0]["sha"], "reviewed")
         self.assertNotIn("force", bodies[0])
+
+    def test_await_merge_waits_for_uploaded_head_before_reading_checks(self):
+        heads = ["stale", "reviewed", "reviewed"]
+        pull_reads = 0
+        events = []
+
+        def request(method, url, data=None):
+            nonlocal pull_reads
+            if method == "PUT":
+                events.append(("merge", pull_reads))
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                pull_reads += 1
+                return {
+                    "state": "open",
+                    "head": {"sha": heads.pop(0)},
+                    "base": {"ref": "main"},
+                }
+            if "/check-runs?" in url:
+                events.append(("checks", pull_reads))
+                return {"check_runs": [
+                    {"name": name, "status": "completed", "conclusion": "success",
+                     "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                         name, publisher.GITHUB_ACTIONS_APP_ID)}}
+                    for name in publisher.REQUIRED_CHECKS
+                ]}
+            raise AssertionError(f"unexpected request: {method} {url}")
+
+        with patch.object(publisher.time, "sleep"):
+            publisher.await_merge(
+                {"number": 1, "html_url": "test"}, request,
+                expected_head_sha="reviewed",
+            )
+        self.assertEqual(events[0], ("checks", 2))
+        self.assertEqual(events[1], ("merge", 3))
+
+    def test_await_merge_refuses_head_changed_after_checks(self):
+        heads = ["reviewed", "changed"]
+        methods = []
+
+        def request(method, url, data=None):
+            methods.append((method, url))
+            if method == "PUT":
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                return {
+                    "state": "open",
+                    "head": {"sha": heads.pop(0)},
+                    "base": {"ref": "main"},
+                }
+            return {"check_runs": [
+                {"name": name, "status": "completed", "conclusion": "success",
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
+                for name in publisher.REQUIRED_CHECKS
+            ]}
+
+        with self.assertRaisesRegex(RuntimeError, "head or base changed"):
+            publisher.await_merge(
+                {"number": 1, "html_url": "test"}, request,
+                expected_head_sha="reviewed",
+            )
+        self.assertFalse(any(method == "PUT" for method, _ in methods))
+
+    def test_await_merge_refuses_non_main_base(self):
+        methods = []
+
+        def request(method, url, data=None):
+            methods.append(method)
+            return {
+                "state": "open",
+                "head": {"sha": "reviewed"},
+                "base": {"ref": "release"},
+            }
+
+        with self.assertRaisesRegex(RuntimeError, "base is not main"):
+            publisher.await_merge(
+                {"number": 1, "html_url": "test"}, request,
+                expected_head_sha="reviewed",
+            )
+        self.assertNotIn("PUT", methods)
 
     def test_policy_failure_prevents_every_network_request(self):
         with tempfile.TemporaryDirectory() as temp:

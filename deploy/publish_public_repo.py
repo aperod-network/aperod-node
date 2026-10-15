@@ -236,11 +236,15 @@ def publish(candidate, tree, expected_head, request, with_tests=False):
         "body": "Complete immutable source tree passed artifact policy, redacted secret scanning, "
                 "Go build, vet and dependency vulnerability checks before object upload. "
                 "No production runtime state is changed."})
+    pr["_verified_head_sha"] = commit["sha"]
     print("Verified publication awaiting required checks:", pr["html_url"])
     return pr
 
 
-def await_merge(pr, request, timeout=900):
+def await_merge(pr, request, timeout=900, expected_head_sha=None):
+    expected_head_sha = expected_head_sha or pr.get("_verified_head_sha")
+    if not expected_head_sha:
+        raise RuntimeError("Verified uploaded PR head SHA is required")
     deadline = time.monotonic() + timeout
     required = REQUIRED_CHECKS
     while time.monotonic() < deadline:
@@ -250,7 +254,12 @@ def await_merge(pr, request, timeout=900):
             return
         if pull["state"] != "open":
             raise RuntimeError("Publication PR closed without merging")
-        sha = pull["head"]["sha"]
+        if pull.get("base", {}).get("ref") != "main":
+            raise RuntimeError("Publication PR base is not main")
+        if pull.get("head", {}).get("sha") != expected_head_sha:
+            time.sleep(10)
+            continue
+        sha = expected_head_sha
         checks = request("GET", f"{API}/commits/{sha}/check-runs?per_page=100")["check_runs"]
         trusted = {
             c["name"]: c for c in sorted(checks, key=lambda c: c.get("id", 0))
@@ -300,8 +309,13 @@ def await_merge(pr, request, timeout=900):
                  or (name == "CodeQL" and trusted[name]["conclusion"] == "neutral"))
             for name in required
         ):
+            latest = request("GET", f"{API}/pulls/{pr['number']}")
+            if (latest.get("state") != "open"
+                    or latest.get("base", {}).get("ref") != "main"
+                    or latest.get("head", {}).get("sha") != expected_head_sha):
+                raise RuntimeError("Publication PR head or base changed after checks")
             result = request("PUT", f"{API}/pulls/{pr['number']}/merge", {
-                "sha": sha, "merge_method": "merge",
+                "sha": expected_head_sha, "merge_method": "merge",
                 "commit_title": "chore: maintain verified source distribution",
                 "commit_message": MERGE_MESSAGE})
             if not result.get("merged"):
@@ -346,7 +360,7 @@ def main():
             request = make_request(token)
             pr = publish(candidate, tree, head, request, args.with_tests)
             if pr and not args.no_wait:
-                await_merge(pr, request)
+                await_merge(pr, request, expected_head_sha=pr["_verified_head_sha"])
 
 
 if __name__ == "__main__":

@@ -155,6 +155,76 @@ func TestChain_BlocksNewestFirstReturnsStableRetainedWindow(t *testing.T) {
 	}
 }
 
+func TestChain_BlocksNewestFirstPageBoundsHeightScan(t *testing.T) {
+	c := core.NewChain(30)
+	prev := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(prev); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	for height := uint64(1); height <= 20; height++ {
+		block := makeMinimalBlock(height, prev.Hash())
+		if err := c.AddBlock(block); err != nil {
+			t.Fatalf("AddBlock(%d): %v", height, err)
+		}
+		prev = block
+	}
+
+	first, next, more, oldest := c.BlocksNewestFirstPage(0, true, 5)
+	if len(first) != 5 || !more || next != 15 || oldest != 0 {
+		t.Fatalf("first page = (len=%d, next=%d, more=%t, oldest=%d), want (5, 15, true, 0)",
+			len(first), next, more, oldest)
+	}
+	for i, want := range []uint64{20, 19, 18, 17, 16} {
+		if got := first[i].Header.Height; got != want {
+			t.Errorf("first[%d].Height = %d, want %d", i, got, want)
+		}
+	}
+
+	second, next, more, oldest := c.BlocksNewestFirstPage(next, false, 5)
+	if len(second) != 5 || !more || next != 10 || oldest != 0 {
+		t.Fatalf("second page = (len=%d, next=%d, more=%t, oldest=%d), want (5, 10, true, 0)",
+			len(second), next, more, oldest)
+	}
+	if got := second[0].Header.Height; got != 15 {
+		t.Errorf("second page starts at height %d, want 15", got)
+	}
+
+	last, next, more, oldest := c.BlocksNewestFirstPage(3, false, 5)
+	if len(last) != 4 || more || next != 0 || oldest != 0 {
+		t.Fatalf("last page = (len=%d, next=%d, more=%t, oldest=%d), want (4, 0, false, 0)",
+			len(last), next, more, oldest)
+	}
+	for i, want := range []uint64{3, 2, 1, 0} {
+		if got := last[i].Header.Height; got != want {
+			t.Errorf("last[%d].Height = %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestChain_BlocksNewestFirstPageCanContinueAtGenesis(t *testing.T) {
+	c := core.NewChain(10)
+	prev := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(prev); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	for height := uint64(1); height <= 5; height++ {
+		block := makeMinimalBlock(height, prev.Hash())
+		if err := c.AddBlock(block); err != nil {
+			t.Fatalf("AddBlock(%d): %v", height, err)
+		}
+		prev = block
+	}
+
+	first, next, more, _ := c.BlocksNewestFirstPage(0, true, 5)
+	if len(first) != 5 || !more || next != 0 {
+		t.Fatalf("first page = (len=%d, next=%d, more=%t), want (5, 0, true)", len(first), next, more)
+	}
+	last, _, more, _ := c.BlocksNewestFirstPage(next, false, 5)
+	if len(last) != 1 || more || last[0].Header.Height != 0 {
+		t.Fatalf("genesis page = (len=%d, more=%t), want one block at height 0", len(last), more)
+	}
+}
+
 // TestChain_FastForwardMemoryCap (#462) — bulk-loading more blocks than the
 // window via FastForward (the startup / P2P catch-up path) must apply the
 // same eviction so memory stays bounded.

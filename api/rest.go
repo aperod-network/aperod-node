@@ -737,6 +737,8 @@ type AddressUTXO struct {
 	IsCoinbase bool `json:"is_coinbase"`
 }
 
+const maxAddressHistoryScanBlocks = 1_000
+
 // restAddressUTXOs handles GET /api/v1/address/{addr}/utxos.
 //
 // Without a view key: returns transparent / mint outputs (OneTimePub matches
@@ -939,16 +941,6 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Scan the currently retained canonical chain window for outputs matching
-	// the spend pub key (transparent match only). Older block bodies are no
-	// longer available through Chain.GetByHeight.
-	// Full privacy scanning requires a view key — that is a Phase 2+ feature.
-	blocks := s.chain.BlocksNewestFirst()
-	if len(blocks) == 0 {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"transactions": []AddressTx{}, "address": addrStr})
-		return
-	}
-
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
@@ -956,7 +948,35 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Each request scans only a fixed number of retained block heights. Older
+	// pages can be requested with start_height; this keeps an address query from
+	// scaling with the configured in-memory chain window.
+	var startHeight uint64
+	startAtTip := true
+	if raw := r.URL.Query().Get("start_height"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid start_height")
+			return
+		}
+		startHeight = parsed
+		startAtTip = false
+	}
+	blocks, pageNextStart, pageHasMore, oldestRetainedHeight :=
+		s.chain.BlocksNewestFirstPage(startHeight, startAtTip, maxAddressHistoryScanBlocks)
+	if len(blocks) == 0 {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"transactions": []AddressTx{},
+			"address":      addrStr,
+			"scan_limited": false,
+		})
+		return
+	}
+
 	results := make([]AddressTx, 0, 16)
+	scanLimited := false
+	var nextStartHeight uint64
+	hasNextPage := false
 	for _, b := range blocks {
 		if len(results) >= limit {
 			break
@@ -989,13 +1009,30 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if len(results) >= limit {
+			if h > oldestRetainedHeight {
+				nextStartHeight = h - 1
+				hasNextPage = true
+			}
+			break
+		}
+	}
+	if len(results) < limit && pageHasMore {
+		scanLimited = true
+		nextStartHeight = pageNextStart
+		hasNextPage = true
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	response := map[string]interface{}{
 		"address":      addrStr,
 		"transactions": results,
 		"note":         "shows transparent (non-stealth) outputs only; full privacy scanning requires view key",
-	})
+		"scan_limited": scanLimited,
+	}
+	if hasNextPage {
+		response["next_start_height"] = nextStartHeight
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // ─── POST /api/v1/address/{addr}/scan ────────────────────────────────────────
