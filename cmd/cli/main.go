@@ -225,7 +225,7 @@ var walletCreateCmd = &cobra.Command{
 				return fmt.Errorf("password must be at least 8 characters")
 			}
 
-			ks, err := wallet.EncryptMnemonic(phrase, pw, string(addr))
+			ks, err := wallet.EncryptMnemonicWithDerivation(phrase, pw, string(addr), accountIdx, 0)
 			if err != nil {
 				return fmt.Errorf("encrypt keystore: %w", err)
 			}
@@ -306,7 +306,7 @@ var walletRestoreCmd = &cobra.Command{
 				return fmt.Errorf("password must be at least 8 characters")
 			}
 
-			ks, err := wallet.EncryptMnemonic(phrase, pw, string(addr))
+			ks, err := wallet.EncryptMnemonicWithDerivation(phrase, pw, string(addr), accountIdx, 0)
 			if err != nil {
 				return fmt.Errorf("encrypt keystore: %w", err)
 			}
@@ -351,7 +351,17 @@ var walletUnlockCmd = &cobra.Command{
 		}
 
 		accountIdx, _ := cmd.Flags().GetUint32("account")
-		dk, err := wallet.DeriveFromMnemonic(phrase, "", accountIdx, 0)
+		if ks.AccountIndex != nil {
+			if cmd.Flags().Changed("account") && accountIdx != *ks.AccountIndex {
+				return fmt.Errorf("keystore account index is %d; refusing requested index %d", *ks.AccountIndex, accountIdx)
+			}
+			accountIdx = *ks.AccountIndex
+		}
+		addressIdx := uint32(0)
+		if ks.AddressIndex != nil {
+			addressIdx = *ks.AddressIndex
+		}
+		dk, err := wallet.DeriveFromMnemonic(phrase, "", accountIdx, addressIdx)
 		if err != nil {
 			return fmt.Errorf("derive keys: %w", err)
 		}
@@ -362,11 +372,14 @@ var walletUnlockCmd = &cobra.Command{
 		}
 
 		addr := crypto.AddressFromKeys(net, dk.Keys)
+		if err := ks.VerifyDerivation(accountIdx, addressIdx, string(addr)); err != nil {
+			return fmt.Errorf("keystore derivation check failed: %w", err)
+		}
 
 		fmt.Println()
 		fmt.Println("  ✓ Keystore unlocked")
 		fmt.Printf("  Address:       %s\n", addr)
-		fmt.Printf("  Derivation:    m/44'/7777'/%d'/0/0\n", accountIdx)
+		fmt.Printf("  Derivation:    %s\n", dk.Path)
 		fmt.Printf("  Spend Private: %s\n", hex.EncodeToString(dk.Keys.Spend.Private[:]))
 		fmt.Printf("  Spend Public:  %s\n", hex.EncodeToString(dk.Keys.Spend.Public[:]))
 		fmt.Printf("  View Private:  %s\n", hex.EncodeToString(dk.Keys.View.Private[:]))

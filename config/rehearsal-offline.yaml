@@ -16,7 +16,7 @@ consensus:
   tail_reward_napro: 100000000
   ringct_v4_activation_height: 1750000
   ring_ct_clsag_activation_height: 1769500
-  staked_collateral_ring_exclusion_activation_height: 2880000
+  staked_collateral_ring_exclusion_activation_height: 2950000
   reward_authorization_activation_height: 1750000
   avm_activation_height: 1850000
 api:

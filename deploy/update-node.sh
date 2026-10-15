@@ -915,6 +915,27 @@ node_source_baseline_guard "${BINARY_DST}" || {
 }
 source "${DEPLOY_DIR}/sale-upgrade-guard.sh"
 sale_upgrade_guard "${BINARY_SRC}" "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" || exit 1
+
+# Only independently installed/approved root tooling may authorize index
+# compatibility. Missing policy/tool or a legacy writer is not a warning.
+# No checkout helper, runtime override or source manifest substitutes for it.
+_ring_index_gate() {
+  local candidate="$1" current="$2"
+  local tool="/usr/local/libexec/aperod-ring-index-maintenance"
+  if [[ ! -x "$tool" ]]; then
+    echo "✗ Independently approved ring-index maintenance tool missing; node left unchanged." >&2
+    return 1
+  fi
+  "$tool" --phase guard-update --candidate "$candidate" --current "$current" \
+    --config "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" || return 1
+}
+
+_ring_index_start() {
+  _ring_index_gate "${BINARY_DST}" "${BINARY_DST}" || return 1
+  systemctl start "${SERVICE_NAME}"
+}
+
+_ring_index_gate "${BINARY_SRC}" "${BINARY_DST}" || exit 1
 systemctl stop "${SERVICE_NAME}" || true   # non-fatal if already stopped
 # Wait up to 120 s for the service to fully stop before we try to replace the
 # binary.  A single "sleep 1" is not enough: on shutdown the node flushes a
@@ -968,11 +989,14 @@ if [[ -f "${BINARY_DST}" ]]; then
     echo ""
     echo "✗ Could not create backup at ${BINARY_BACKUP} — aborting install to protect the running service." >&2
     echo "  The service was stopped; restarting it now." >&2
-    systemctl start "${SERVICE_NAME}" || true
+    local_restart_status="Оставлен остановленным: проверка совместимости или запуск не прошли."
+    if _ring_index_start; then
+      local_restart_status="Сервис перезапущен со старым совместимым бинарником."
+    fi
     send_telegram_alert "⚠️ <b>aperod-node: установка ПРЕРВАНА</b>
 Сервер: $(hostname)
 Не удалось создать резервную копию <code>${BINARY_BACKUP}</code> (диск заполнен или ошибка прав).
-Установка прервана; сервис перезапущен со старым бинарником.
+Установка прервана. ${local_restart_status}
 Устраните проблему и запустите <code>update-node.sh</code> повторно."
     exit 1
   fi
@@ -998,13 +1022,13 @@ _rollback_install() {
   if [[ "${_backed_up}" == "true" && -f "${BINARY_BACKUP}" ]]; then
     if /bin/cp "${BINARY_BACKUP}" "${BINARY_DST}" && chmod +x "${BINARY_DST}"; then
       _restored=true
-      if systemctl start "${SERVICE_NAME}" 2>/dev/null; then
+      if _ring_index_start 2>/dev/null; then
         _restarted=true
         echo "  Rolled back to previous binary; service restarted." >&2
         echo "  Service state: $(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo unknown)" >&2
       else
         echo "  Old binary restored but 'systemctl start' failed — service may be down." >&2
-        echo "  Manual recovery: systemctl start ${SERVICE_NAME}" >&2
+        echo "  Keep stopped; complete independently approved offline index recovery before restart." >&2
       fi
     else
       echo "  Rollback copy also failed — service remains stopped." >&2
@@ -1040,7 +1064,7 @@ fi
 echo "  Installed: $(${BINARY_DST} --version 2>/dev/null || ls -lh "${BINARY_DST}" | awk '{print $5, $9}')"
 
 # Start the service after the new binary is in place.
-if ! systemctl start "${SERVICE_NAME}"; then
+if ! _ring_index_start; then
   _rollback_install
   exit 1
 fi
