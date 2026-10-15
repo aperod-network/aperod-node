@@ -238,6 +238,27 @@ func TestDeriveKeysAccountIndex(t *testing.T) {
 	}
 }
 
+func TestDeriveKeysRejectsIndicesWithHardenedBitSet(t *testing.T) {
+	seed := make([]byte, 64)
+	for _, tc := range []struct {
+		name    string
+		account uint32
+		index   uint32
+	}{
+		{name: "account hardened bit", account: hardenedOffset, index: 0},
+		{name: "account max uint32", account: ^uint32(0), index: 0},
+		{name: "address hardened bit", account: 0, index: hardenedOffset},
+		{name: "address max uint32", account: 0, index: ^uint32(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if derived, err := DeriveKeys(seed, tc.account, tc.index); err == nil || derived != nil {
+				t.Fatalf("DeriveKeys(%d, %d) = (%v, %v), want an error and no keys",
+					tc.account, tc.index, derived, err)
+			}
+		})
+	}
+}
+
 // ─── Keystore encrypt / decrypt round-trip ────────────────────────────────
 
 func TestKeystoreRoundTrip(t *testing.T) {
@@ -293,6 +314,110 @@ func TestKeystoreMarshalUnmarshal(t *testing.T) {
 	}
 	if decrypted != mnemonic {
 		t.Errorf("mnemonic mismatch after JSON round-trip")
+	}
+}
+
+func TestKeystoreDerivationMetadataRoundTripAndVerification(t *testing.T) {
+	const (
+		account = uint32(17)
+		index   = uint32(4)
+		address = "apro-test-derived-address"
+	)
+	ks, err := EncryptMnemonicWithDerivation("test mnemonic", "pass", address, account, index)
+	if err != nil {
+		t.Fatalf("EncryptMnemonicWithDerivation: %v", err)
+	}
+	if ks.Version != 2 {
+		t.Fatalf("version = %d, want 2 for authenticated derivation metadata", ks.Version)
+	}
+	data, err := ks.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	decoded, err := UnmarshalKeystore(data)
+	if err != nil {
+		t.Fatalf("UnmarshalKeystore: %v", err)
+	}
+	if decoded.AccountIndex == nil || *decoded.AccountIndex != account {
+		t.Fatalf("account_index = %v, want %d", decoded.AccountIndex, account)
+	}
+	if decoded.AddressIndex == nil || *decoded.AddressIndex != index {
+		t.Fatalf("address_index = %v, want %d", decoded.AddressIndex, index)
+	}
+	if err := decoded.VerifyDerivation(account, index, address); err != nil {
+		t.Fatalf("VerifyDerivation matching path: %v", err)
+	}
+	if err := decoded.VerifyDerivation(account+1, index, address); err == nil {
+		t.Fatal("VerifyDerivation accepted a different account")
+	}
+	if err := decoded.VerifyDerivation(account, index+1, address); err == nil {
+		t.Fatal("VerifyDerivation accepted a different address index")
+	}
+	if err := decoded.VerifyDerivation(account, index, "different-address"); err == nil {
+		t.Fatal("VerifyDerivation accepted an address mismatch")
+	}
+	if _, err := DecryptMnemonic(decoded, "pass"); err != nil {
+		t.Fatalf("DecryptMnemonic with intact metadata: %v", err)
+	}
+
+	tamperedIndex := *decoded
+	otherAccount := account + 1
+	tamperedIndex.AccountIndex = &otherAccount
+	if _, err := DecryptMnemonic(&tamperedIndex, "pass"); err == nil {
+		t.Fatal("DecryptMnemonic accepted modified derivation metadata")
+	}
+	tamperedAddress := *decoded
+	tamperedAddress.Address = "modified-address"
+	if _, err := DecryptMnemonic(&tamperedAddress, "pass"); err == nil {
+		t.Fatal("DecryptMnemonic accepted a modified stored address")
+	}
+	strippedMetadata := *decoded
+	strippedMetadata.AccountIndex = nil
+	strippedMetadata.AddressIndex = nil
+	if _, err := DecryptMnemonic(&strippedMetadata, "pass"); err == nil {
+		t.Fatal("DecryptMnemonic accepted derivation metadata stripped from a new keystore")
+	}
+	if err := strippedMetadata.VerifyDerivation(account, index, address); err == nil {
+		t.Fatal("VerifyDerivation accepted derivation metadata stripped from a version 2 keystore")
+	}
+	downgraded := strippedMetadata
+	downgraded.Version = 1
+	if _, err := DecryptMnemonic(&downgraded, "pass"); err == nil {
+		t.Fatal("DecryptMnemonic accepted a version downgrade with stripped metadata")
+	}
+}
+
+func TestLegacyKeystoreWithoutDerivationMetadataRemainsReadable(t *testing.T) {
+	ks, err := EncryptMnemonic("legacy mnemonic", "pass", "legacy-address")
+	if err != nil {
+		t.Fatalf("EncryptMnemonic: %v", err)
+	}
+	if ks.Version != 1 {
+		t.Fatalf("legacy version = %d, want 1", ks.Version)
+	}
+	if ks.AccountIndex != nil || ks.AddressIndex != nil {
+		t.Fatal("legacy EncryptMnemonic unexpectedly added derivation metadata")
+	}
+	data, err := ks.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	decoded, err := UnmarshalKeystore(data)
+	if err != nil {
+		t.Fatalf("UnmarshalKeystore: %v", err)
+	}
+	phrase, err := DecryptMnemonic(decoded, "pass")
+	if err != nil {
+		t.Fatalf("DecryptMnemonic: %v", err)
+	}
+	if phrase != "legacy mnemonic" {
+		t.Fatalf("decrypted phrase = %q, want legacy mnemonic", phrase)
+	}
+	if err := decoded.VerifyDerivation(0, 0, "legacy-address"); err != nil {
+		t.Fatalf("legacy address verification: %v", err)
+	}
+	if err := decoded.VerifyDerivation(1, 0, "different-address"); err == nil {
+		t.Fatal("legacy keystore accepted an address inconsistent with the selected account")
 	}
 }
 
