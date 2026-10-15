@@ -323,7 +323,7 @@ fi
 # ── Assertion P6: source node was restarted after rsync ──────────────────────
 # "Перезапускаем aperod-node на источнике" must appear and the start call must
 # happen — we verify the message in the output.
-if echo "${LAST_OUTPUT}" | grep -q "источнике"; then
+if [[ "${LAST_OUTPUT}" == *"источнике"* ]]; then
   pass "P6: output confirms source node was restarted after rsync"
 else
   fail "P6: no source-restart confirmation found in output. Got:\n${LAST_OUTPUT}"
@@ -570,7 +570,7 @@ fi
 
 # ── Assertion RI4: trap confirmed source-node restart attempt ─────────────────
 # The trap message contains "источнике" (Russian for "on the source").
-if echo "${LAST_OUTPUT}" | grep -q "источнике"; then
+if [[ "${LAST_OUTPUT}" == *"источнике"* ]]; then
   pass "RI4: trap confirmed source-node restart attempt ('источнике' present)"
 else
   fail "RI4: expected 'источнике' in trap output. Got:\n${LAST_OUTPUT}"
@@ -1368,7 +1368,7 @@ else
   fail "PF3: target was NOT restarted by trap — node left stopped unnecessarily. Output:\n${LAST_OUTPUT}"
 fi
 
-if echo "${LAST_OUTPUT}" | grep -q "источнике"; then
+if [[ "${LAST_OUTPUT}" == *"источнике"* ]]; then
   pass "PF4: source node restart attempt confirmed in trap output"
 else
   fail "PF4: expected source-restart message ('источнике') in trap output. Got:\n${LAST_OUTPUT}"
