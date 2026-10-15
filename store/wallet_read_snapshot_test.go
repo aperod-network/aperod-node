@@ -7,6 +7,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestWalletReadSnapshotPinsWalletReadsAndReleases(t *testing.T) {
@@ -109,6 +110,354 @@ func TestWalletReadSnapshotPinsWalletReadsAndReleases(t *testing.T) {
 
 	read.Release()
 	read.Release()
+}
+
+func TestWalletReadSnapshotPinsLPoDEarningsPagesAndReadiness(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	address := crypto.Address("earnings-snapshot-address")
+	funding := crypto.Hash32{1}
+	firstBlock := crypto.Hash32{2}
+	secondBlock := crypto.Hash32{3}
+	oldTip := secondBlock
+	putEarning := func(blockHash, txHash crypto.Hash32, height uint64, amount uint64) {
+		t.Helper()
+		output := StoredUTXO{
+			TxHash: txHash, OutputIndex: 0, BlockHeight: height, AmountNAPRO: amount,
+		}
+		raw, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := append([]byte{}, lpodEarningsPrefix(address)...)
+		var suffix [76]byte
+		binary.BigEndian.PutUint64(suffix[:8], height)
+		copy(suffix[12:44], blockHash[:])
+		copy(suffix[44:], txHash[:])
+		key = append(key, suffix[:]...)
+		if err := db.put(key, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putEarning(firstBlock, crypto.Hash32{4}, 10, 100)
+	putEarning(secondBlock, crypto.Hash32{5}, 11, 200)
+	if err := db.put(lpodEarningsReadyKey, earningsReadyValue(funding, oldTip, 11)); err != nil {
+		t.Fatal(err)
+	}
+
+	read, err := db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Release()
+
+	newTip := crypto.Hash32{6}
+	putEarning(newTip, crypto.Hash32{7}, 12, 300)
+	if err := db.put(lpodEarningsReadyKey, earningsReadyValue(funding, newTip, 12)); err != nil {
+		t.Fatal(err)
+	}
+
+	ready, err := read.LPoDEarningsIndexReady(funding, oldTip, 11)
+	if err != nil || !ready {
+		t.Fatalf("pinned earnings readiness=(%v,%v), want ready at captured tip", ready, err)
+	}
+	ready, err = read.LPoDEarningsIndexReady(funding, newTip, 12)
+	if err != nil || ready {
+		t.Fatalf("pinned earnings readiness=(%v,%v), want false for live tip", ready, err)
+	}
+
+	firstPage, cursor, err := read.LPoDEarningsOutputs(address, "", 1)
+	if err != nil || len(firstPage) != 1 || firstPage[0].TxHash != (crypto.Hash32{4}) || cursor == "" {
+		t.Fatalf("first pinned earnings page=%+v cursor=%q err=%v", firstPage, cursor, err)
+	}
+	secondPage, next, err := read.LPoDEarningsOutputs(address, cursor, 1)
+	if err != nil || len(secondPage) != 1 || secondPage[0].TxHash != (crypto.Hash32{5}) || next != "" {
+		t.Fatalf("second pinned earnings page=%+v next=%q err=%v", secondPage, next, err)
+	}
+	liveRows, _, err := db.LPoDEarningsOutputs(address, "", 128)
+	if err != nil || len(liveRows) != 3 {
+		t.Fatalf("live earnings index rows=%d err=%v, want newly-added third row", len(liveRows), err)
+	}
+}
+
+func TestWalletReadSnapshotLPoDEarningsJoinUsesOnlyExactUnspentOutputs(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	address := crypto.Address("earnings-join-address")
+	blockHash := crypto.Hash32{9}
+	reward := StoredUTXO{
+		TxHash: crypto.Hash32{1}, OutputIndex: 0, BlockHeight: 7,
+		OneTimePub: crypto.Point32{1}, TxPubKey: crypto.Point32{2},
+		AmountCommit: crypto.Commitment{3}, EncAmount: [8]byte{4},
+	}
+	spentReward := StoredUTXO{
+		TxHash: crypto.Hash32{5}, OutputIndex: 1, BlockHeight: 7,
+		OneTimePub: crypto.Point32{6}, TxPubKey: crypto.Point32{7},
+		AmountCommit: crypto.Commitment{8}, EncAmount: [8]byte{9},
+	}
+	ordinary := StoredUTXO{
+		TxHash: crypto.Hash32{10}, OutputIndex: 2, BlockHeight: 7,
+		OneTimePub: crypto.Point32{11}, TxPubKey: crypto.Point32{12},
+		AmountCommit: crypto.Commitment{13}, EncAmount: [8]byte{14},
+	}
+	batch := new(leveldb.Batch)
+	addWalletRow := func(output StoredUTXO, earningsAmount uint64, spent bool) {
+		t.Helper()
+		key := append([]byte{}, lpodWalletPrefix(address)...)
+		var suffix [76]byte
+		binary.BigEndian.PutUint64(suffix[:8], output.BlockHeight)
+		binary.BigEndian.PutUint32(suffix[8:12], output.OutputIndex)
+		copy(suffix[12:44], blockHash[:])
+		copy(suffix[44:], output.TxHash[:])
+		key = append(key, suffix[:]...)
+		raw, err := json.Marshal(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch.Put(key, raw)
+		batch.Put(heightKey(output.BlockHeight), blockHash[:])
+		if earningsAmount > 0 {
+			earning := output
+			earning.AmountNAPRO = earningsAmount
+			earningKey, err := lpodEarningsKeyForWalletIndexKey(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			earningRaw, err := json.Marshal(earning)
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch.Put(earningKey, earningRaw)
+		}
+		if spent {
+			batch.Put(spentUTXOKey(output.TxHash, output.OutputIndex), []byte{1})
+		}
+	}
+	addWalletRow(reward, 45000000, false)
+	addWalletRow(spentReward, 36000000, true)
+	addWalletRow(ordinary, 0, false)
+	if err := db.db.Write(batch, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	read, err := db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Release()
+
+	rows, next, _, err := read.LPoDWalletOutputsAfterHeightWithEarnings(
+		address, 0, false, "", 7, 128,
+	)
+	if err != nil || next != "" || len(rows) != 2 {
+		t.Fatalf("snapshot earnings join rows=%d next=%q err=%v; want two unspent outputs", len(rows), next, err)
+	}
+	got := make(map[crypto.Hash32]uint64, len(rows))
+	for _, row := range rows {
+		got[row.TxHash] = row.AmountNAPRO
+	}
+	if got[reward.TxHash] != 45000000 {
+		t.Fatalf("exact reward amount=%d, want 45000000", got[reward.TxHash])
+	}
+	if got[ordinary.TxHash] != 0 {
+		t.Fatalf("ordinary wallet output was classified as reward: %d", got[ordinary.TxHash])
+	}
+	if _, found := got[spentReward.TxHash]; found {
+		t.Fatal("spent reward was returned or enriched")
+	}
+}
+
+func TestWalletReadSnapshotLPoDEarningsJoinRejectsConflictingIndexRow(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	address := crypto.Address("earnings-join-conflict-address")
+	blockHash := crypto.Hash32{3}
+	output := StoredUTXO{
+		TxHash: crypto.Hash32{4}, OutputIndex: 0, BlockHeight: 2,
+		OneTimePub: crypto.Point32{5}, TxPubKey: crypto.Point32{6},
+		AmountCommit: crypto.Commitment{7}, EncAmount: [8]byte{8},
+	}
+	key := append([]byte{}, lpodWalletPrefix(address)...)
+	var suffix [76]byte
+	binary.BigEndian.PutUint64(suffix[:8], output.BlockHeight)
+	copy(suffix[12:44], blockHash[:])
+	copy(suffix[44:], output.TxHash[:])
+	key = append(key, suffix[:]...)
+	raw, err := json.Marshal(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(key, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(heightKey(output.BlockHeight), blockHash[:]); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := output
+	conflicting.OneTimePub = crypto.Point32{99}
+	conflicting.AmountNAPRO = 45000000
+	earningKey, err := lpodEarningsKeyForWalletIndexKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = json.Marshal(conflicting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.put(earningKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.NewWalletReadSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Release()
+
+	if _, _, _, err := read.LPoDWalletOutputsAfterHeightWithEarnings(
+		address, 0, false, "", 2, 128,
+	); err == nil {
+		t.Fatal("conflicting reward-index output was accepted")
+	}
+}
+
+func BenchmarkLPoDWalletOutputRewardJoin30kSpentHistory(b *testing.B) {
+	const total = 30000
+	const active = 10
+	const pageSize = 128
+
+	db, err := Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	address := crypto.Address("benchmark-large-reward-wallet")
+	walletPrefix := lpodWalletPrefix(address)
+	earningsPrefix := lpodEarningsPrefix(address)
+	batch := new(leveldb.Batch)
+	for i := 1; i <= total; i++ {
+		height := uint64(i)
+		var blockHash, txHash crypto.Hash32
+		binary.BigEndian.PutUint64(blockHash[:8], height)
+		binary.BigEndian.PutUint64(txHash[:8], height)
+		txHash[31] = 1
+		output := StoredUTXO{
+			TxHash: txHash, OutputIndex: 0, BlockHeight: height,
+			OneTimePub: crypto.Point32{1}, TxPubKey: crypto.Point32{2},
+			AmountCommit: crypto.Commitment{3}, EncAmount: [8]byte{4},
+		}
+		var suffix [76]byte
+		binary.BigEndian.PutUint64(suffix[:8], height)
+		copy(suffix[12:44], blockHash[:])
+		copy(suffix[44:], txHash[:])
+		walletKey := append(append([]byte{}, walletPrefix...), suffix[:]...)
+		walletRaw, err := json.Marshal(output)
+		if err != nil {
+			b.Fatal(err)
+		}
+		batch.Put(walletKey, walletRaw)
+		earning := output
+		earning.AmountNAPRO = 1
+		earningKey := append(append([]byte{}, earningsPrefix...), suffix[:]...)
+		earningRaw, err := json.Marshal(earning)
+		if err != nil {
+			b.Fatal(err)
+		}
+		batch.Put(earningKey, earningRaw)
+		batch.Put(heightKey(height), blockHash[:])
+		if i <= total-active {
+			batch.Put(spentUTXOKey(txHash, 0), []byte{1})
+		}
+	}
+	if err := db.db.Write(batch, nil); err != nil {
+		b.Fatal(err)
+	}
+
+	walletPages := (total + pageSize - 1) / pageSize
+	earningsPages := (total + pageSize - 1) / pageSize
+	b.Run("legacy-sequential-index-scan", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.ReportMetric(float64(walletPages), "wallet_pages/op")
+		b.ReportMetric(float64(earningsPages), "earnings_pages/op")
+		for i := 0; i < b.N; i++ {
+			read, err := db.NewWalletReadSnapshot()
+			if err != nil {
+				b.Fatal(err)
+			}
+			cursor := ""
+			for {
+				_, next, _, err := read.LPoDWalletOutputsAfterHeight(address, 0, false, cursor, total, pageSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if next == "" {
+					break
+				}
+				cursor = next
+			}
+			cursor = ""
+			for {
+				_, next, err := read.LPoDEarningsOutputs(address, cursor, pageSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if next == "" {
+					break
+				}
+				cursor = next
+			}
+			read.Release()
+		}
+	})
+	b.Run("inline-active-output-join", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.ReportMetric(float64(walletPages), "wallet_pages/op")
+		b.ReportMetric(float64(active), "reward_gets/op")
+		b.ReportMetric(0, "earnings_pages/op")
+		for i := 0; i < b.N; i++ {
+			read, err := db.NewWalletReadSnapshot()
+			if err != nil {
+				b.Fatal(err)
+			}
+			cursor := ""
+			var returned int
+			for {
+				rows, next, _, err := read.LPoDWalletOutputsAfterHeightWithEarnings(
+					address, 0, false, cursor, total, pageSize,
+				)
+				if err != nil {
+					b.Fatal(err)
+				}
+				returned += len(rows)
+				for _, row := range rows {
+					if row.AmountNAPRO != 1 {
+						b.Fatalf("inline reward amount=%d, want 1", row.AmountNAPRO)
+					}
+				}
+				if next == "" {
+					break
+				}
+				cursor = next
+			}
+			if returned != active {
+				b.Fatalf("inline wallet output count=%d, want %d", returned, active)
+			}
+			read.Release()
+		}
+	})
 }
 
 func TestReadCanonicalBlockBoundedRejectsMissingAndMalformedBodies(t *testing.T) {

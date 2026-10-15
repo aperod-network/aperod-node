@@ -26,6 +26,11 @@ cleanup() {
 trap cleanup EXIT
 cp -R "$DIR" "$JOB/deploy"
 cp "$DIR/fixtures/node-lifecycle/Dockerfile" "$JOB/Dockerfile"
+(
+  cd "$DIR/.."
+  CGO_ENABLED=0 GOWORK=off GOFLAGS= GOENV=off GOAMD64=v1 \
+    go build -o "$JOB/aperod-ring-index-maintenance" ./cmd/ring-index-maintenance
+)
 docker build -t "$IMAGE" "$JOB"
 CONTAINER="$(docker run -d --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /run/lock "$IMAGE")"

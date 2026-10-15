@@ -51,35 +51,60 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 	e.pool.SetVerifier(e.txVerifier)
 	acceptPositionBlock(t, e, priv, 3_000_000_000, *deposit)
 	// These are consensus-authorized payout outputs, not UTXO/decoy mocks.
-	for i := 0; i < 20; i++ {
+manyRewards := os.Getenv("NATIVE_CHROME_MANY_REWARDS") == "1"
+rewardBlocks := 20
+if manyRewards {
+rewardBlocks = 160
+}
+for i := 0; i < rewardBlocks; i++ {
 		acceptPositionBlock(t, e, priv, 3_000_000_000)
 	}
 	exit := action
-	// Keep each JSON-wire monetary value below the frozen signer's safe integer
-	// boundary. This is a real partial canonical withdrawal, not a rounded value.
-	exit.Action, exit.Nonce, exit.WithdrawAmount = core.LPoDWithdraw, 1, 1_000_000*100_000_000
+	// Exercise the full canonical withdrawal above JavaScript's safe integer
+	// boundary with the unchanged frozen signer, including large change outputs.
+	exit.Action, exit.Nonce, exit.WithdrawAmount = core.LPoDWithdraw, 1, 0
 	withdrawal, err := core.BuildLPoDPositionTx(exit, keys.Spend.Private, crypto.Scalar32{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	acceptPositionBlock(t, e, priv, 1, *withdrawal)
+if !manyRewards {
+acceptPositionBlock(t, e, priv, 1, *withdrawal)
+}
 	tip := e.chain.Tip()
 	if !e.IsFinalizedHash(tip.Header.Height, tip.Hash()) {
 		t.Fatal("fixture lacks real finality")
 	}
-	outputs, _, err := db.LPoDWalletOutputs(action.Beneficiary, "", 128)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var starting uint64
-	for _, u := range outputs {
-		hs, err := crypto.ScanForOutput(keys.View.Private, keys.Spend.Public, u.TxPubKey, u.OneTimePub)
-		if err != nil || hs == nil {
-			t.Fatal("fixture output is not owned")
-		}
-		starting += core.DecryptAmount(u.EncAmount, hs)
-	}
-	if len(outputs) < 16 || starting == 0 {
+readAmounts := func() (uint64, int, error) {
+var total uint64
+count := 0
+cursor := ""
+for {
+rows, next, err := db.LPoDWalletOutputs(action.Beneficiary, cursor, 128)
+if err != nil {
+return 0, 0, err
+}
+for _, u := range rows {
+hs, err := crypto.ScanForOutput(keys.View.Private, keys.Spend.Public, u.TxPubKey, u.OneTimePub)
+if err != nil || hs == nil {
+return 0, 0, fmt.Errorf("fixture output is not owned")
+}
+total += core.DecryptAmount(u.EncAmount, hs)
+count++
+}
+if next == "" {
+return total, count, nil
+}
+if next == cursor {
+return 0, 0, fmt.Errorf("fixture cursor did not advance")
+}
+cursor = next
+}
+}
+starting, count, err := readAmounts()
+if err != nil {
+t.Fatal(err)
+}
+if count < 16 || starting == 0 {
 		t.Fatal("fixture funding/decoy prerequisites not met")
 	}
 	server := api.NewServer(":0", e.chain, e.pool, e.utxos, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -93,19 +118,10 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 	server.SetUTXOReady()
 	var mu sync.Mutex
 	issuedToOwner := func() uint64 {
-		rows, _, err := db.LPoDWalletOutputs(action.Beneficiary, "", 128)
+total, _, err := readAmounts()
 		if err != nil {
 			t.Error(err)
 			return 0
-		}
-		var total uint64
-		for _, u := range rows {
-			hs, err := crypto.ScanForOutput(keys.View.Private, keys.Spend.Public, u.TxPubKey, u.OneTimePub)
-			if err != nil || hs == nil {
-				t.Error("unowned canonical funding output")
-				return 0
-			}
-			total += core.DecryptAmount(u.EncAmount, hs)
 		}
 		return total
 	}
@@ -166,7 +182,15 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 		})
 	})
 	mux.Handle("/", server)
-	httpServer := httptest.NewServer(mux)
+httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+diagnostic := &nativeChromeResponseDiagnostic{ResponseWriter: w, status: http.StatusOK}
+mux.ServeHTTP(diagnostic, r)
+if diagnostic.status >= http.StatusBadRequest {
+// Log only fixture responses and the path, never credentials, request bodies,
+// seeds or query parameters. Preserve the underlying response unchanged.
+t.Logf("isolated node: %s %s -> %d: %s", r.Method, r.URL.Path, diagnostic.status, diagnostic.failure)
+}
+}))
 	defer httpServer.Close()
 	fixtureDir := t.TempDir()
 	input := filepath.Join(fixtureDir, "private-input.json")
@@ -174,6 +198,7 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 		"senderPhrase": senderPhrase, "recipientPhrase": recipientPhrase,
 		"sender": string(action.Beneficiary), "recipient": string(crypto.AddressFromKeys(crypto.MainnetByte, recipient.Keys)),
 		"starting": fmt.Sprint(starting), "nodeURL": httpServer.URL, "rpcKey": rpcKey,
+"manyRewards": manyRewards,
 	})
 	if err := os.WriteFile(input, raw, 0600); err != nil {
 		t.Fatal(err)
@@ -182,7 +207,7 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 		"src/routes/wallet-native-chrome.integration.test.ts", "--maxWorkers=1")
 	cmd.Dir = "../.."
 	// No workspace credentials may be inherited by the fixture or browser.
-for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "NATIVE_CHROME_ARCHIVE", "NATIVE_CHROME_EXECUTABLE", "NATIVE_WALLET_SCREENSHOT"} {
+for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "NATIVE_CHROME_ARCHIVE", "NATIVE_CHROME_FROZEN_SIGNER_DIR", "NATIVE_CHROME_EXECUTABLE", "NATIVE_WALLET_SCREENSHOT"} {
 		if value, ok := os.LookupEnv(name); ok {
 			cmd.Env = append(cmd.Env, name+"="+value)
 		}
@@ -194,4 +219,26 @@ for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LI
 		t.Fatalf("native transfer fixture failed: %v\n%s", err, result)
 	}
 	t.Log(string(result))
+}
+
+type nativeChromeResponseDiagnostic struct {
+http.ResponseWriter
+status int
+failure []byte
+}
+
+func (w *nativeChromeResponseDiagnostic) WriteHeader(status int) {
+w.status = status
+w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *nativeChromeResponseDiagnostic) Write(body []byte) (int, error) {
+if w.status >= http.StatusBadRequest && len(w.failure) < 512 {
+remaining := 512-len(w.failure)
+if len(body) < remaining {
+remaining = len(body)
+}
+w.failure = append(w.failure, body[:remaining]...)
+}
+return w.ResponseWriter.Write(body)
 }

@@ -18,6 +18,15 @@ def fixture(root):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_publication_uses_only_aperod_network_as_author(self):
+        self.assertEqual(
+            publisher.AUTHOR,
+            {"name": "aperod-network", "email": "aperod-network@users.noreply.github.com"},
+        )
+        self.assertEqual(publisher.MESSAGE, "chore: maintain verified source distribution")
+        self.assertNotIn("Co-authored-by:", publisher.MESSAGE)
+        self.assertNotIn("Co-authored-by:", publisher.MERGE_MESSAGE)
+
     def test_candidate_symlink_cannot_overwrite_external_file(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -108,7 +117,8 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
-                 "app": {"id": 15368}}
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
                 for name in publisher.REQUIRED_CHECKS
             ]}
 
@@ -118,7 +128,7 @@ class PublisherTests(unittest.TestCase):
 
     def test_failed_codeql_check_never_merges(self):
         methods = []
-        failed = "Analyze (go)"
+        failed = "CodeQL"
 
         def request(method, url, data=None):
             methods.append(method)
@@ -127,7 +137,8 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
-                 "app": {"id": 15368}}
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
                 for name in publisher.REQUIRED_CHECKS
             ]}
 
@@ -135,15 +146,120 @@ class PublisherTests(unittest.TestCase):
             publisher.await_merge({"number": 1, "html_url": "test"}, request)
         self.assertNotIn("PUT", methods)
 
+    def test_neutral_codeql_requires_completed_go_analysis_and_no_open_pr_alerts(self):
+        methods = []
+
+        def request(method, url, data=None):
+            methods.append((method, url))
+            if method == "PUT":
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            if url.endswith("/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"):
+                return []
+            checks = []
+            for name in publisher.REQUIRED_CHECKS:
+                neutral = name == "CodeQL"
+                checks.append({
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": "neutral" if neutral else "success",
+                    "output": {
+                        "title": publisher.CODEQL_NEUTRAL_ALLOWED_TITLE,
+                        "summary": "Default setup: /language:go",
+                    } if neutral else {},
+                    "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                        name, publisher.GITHUB_ACTIONS_APP_ID)},
+                })
+            return {"check_runs": checks}
+
+        with patch.object(publisher.time, "sleep"):
+            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertIn(
+            ("GET", f"{publisher.API}/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"),
+            methods,
+        )
+        self.assertIn(("PUT", f"{publisher.API}/pulls/1/merge"), methods)
+
+    def test_neutral_codeql_waits_for_go_analysis_before_evaluating(self):
+        methods = []
+        check_reads = 0
+
+        def request(method, url, data=None):
+            nonlocal check_reads
+            methods.append((method, url))
+            if method == "PUT":
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            check_reads += 1
+            checks = []
+            for name in publisher.REQUIRED_CHECKS:
+                neutral = name == "CodeQL" and check_reads == 1
+                pending_go = name == "Analyze (go)" and check_reads == 1
+                checks.append({
+                    "name": name,
+                    "status": "in_progress" if pending_go else "completed",
+                    "conclusion": None if pending_go else (
+                        "neutral" if neutral else "success"
+                    ),
+                    "output": {
+                        "title": publisher.CODEQL_NEUTRAL_ALLOWED_TITLE,
+                        "summary": "Default setup: /language:go",
+                    } if neutral else {},
+                    "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                        name, publisher.GITHUB_ACTIONS_APP_ID)},
+                })
+            return {"check_runs": checks}
+
+        with patch.object(publisher.time, "sleep"):
+            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertEqual(check_reads, 2)
+        self.assertFalse(any("/code-scanning/alerts?" in url for _, url in methods))
+        self.assertIn(("PUT", f"{publisher.API}/pulls/1/merge"), methods)
+
+    def test_neutral_codeql_with_open_alerts_never_merges(self):
+        methods = []
+
+        def request(method, url, data=None):
+            methods.append((method, url))
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}}
+            if url.endswith("/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"):
+                return [{"number": 7, "state": "open"}]
+            checks = []
+            for name in publisher.REQUIRED_CHECKS:
+                neutral = name == "CodeQL"
+                checks.append({
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": "neutral" if neutral else "success",
+                    "output": {
+                        "title": publisher.CODEQL_NEUTRAL_ALLOWED_TITLE,
+                        "summary": "Default setup: /language:go",
+                    } if neutral else {},
+                    "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                        name, publisher.GITHUB_ACTIONS_APP_ID)},
+                })
+            return {"check_runs": checks}
+
+        with self.assertRaisesRegex(RuntimeError, "open pull-request alerts"):
+            publisher.await_merge({"number": 1, "html_url": "test"}, request)
+        self.assertNotIn(("PUT", f"{publisher.API}/pulls/1/merge"), methods)
+
     def test_untrusted_status_provider_cannot_authorize_merge(self):
         methods = []
         def request(method, url, data=None):
             methods.append(method)
             if url.endswith("/pulls/1"):
                 return {"state": "open", "head": {"sha": "reviewed"}}
-            return {"check_runs": [{"name": name, "status": "completed",
-                                   "conclusion": "success", "app": {"id": 999}}
-                                  for name in ("Whole-tree publication security", "go build & vet & test")]}
+            return {"check_runs": [
+                {"name": name, "status": "completed", "conclusion": "success",
+                 "app": {"id": publisher.GITHUB_ACTIONS_APP_ID if name == "CodeQL"
+                         else publisher.TRUSTED_CHECK_APP_IDS.get(
+                             name, publisher.GITHUB_ACTIONS_APP_ID)}}
+                for name in publisher.REQUIRED_CHECKS
+            ]}
         with patch.object(publisher.time, "monotonic", side_effect=[0, 0, 2]), \
              patch.object(publisher.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "did not complete"):
@@ -159,7 +275,9 @@ class PublisherTests(unittest.TestCase):
             if url.endswith("/pulls/1"):
                 return {"state": "open", "head": {"sha": "reviewed"}}
             return {"check_runs": [{"name": name, "status": "completed",
-                                   "conclusion": "success", "app": {"id": 15368}}
+                                   "conclusion": "success",
+                                   "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                                       name, publisher.GITHUB_ACTIONS_APP_ID)}}
                                    for name in publisher.REQUIRED_CHECKS]}
         publisher.await_merge({"number": 1, "html_url": "test"}, request)
         self.assertEqual(bodies[0]["sha"], "reviewed")

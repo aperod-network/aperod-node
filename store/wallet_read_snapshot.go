@@ -64,6 +64,26 @@ func (s *WalletReadSnapshot) get(key []byte) ([]byte, error) {
 	return value, err
 }
 
+// LookupRingMember reads the exact pair through the wallet snapshot rather
+// than mixing the captured page with a newer point-in-time ring index.
+func (s *WalletReadSnapshot) LookupRingMember(pub crypto.Point32) (*core.UTXO, error) {
+	if s == nil || s.snapshot == nil {
+		return nil, fmt.Errorf("wallet snapshot unavailable")
+	}
+	data, err := s.get(ringMemberKey(pub))
+	if err != nil || data == nil {
+		return nil, err
+	}
+	member, err := decodeRingRecord(ringMemberKey(pub), data)
+	if err != nil {
+		return nil, err
+	}
+	if member.OneTimePub != pub {
+		return nil, fmt.Errorf("pinned ring member identity mismatch")
+	}
+	return storedToCoreUTXO(member), nil
+}
+
 // GetTip returns the tip metadata captured by this snapshot.
 func (s *WalletReadSnapshot) GetTip() (hash crypto.Hash32, height uint64, err error) {
 	hashBytes, err := s.get(append(append([]byte{}, prefixMeta...), []byte("tip/hash")...))
@@ -206,6 +226,64 @@ func (s *WalletReadSnapshot) LPoDWalletIndexReady(funding crypto.Hash32) (bool, 
 	return string(value) == string(funding[:]), err
 }
 
+// LPoDEarningsIndexReady reports whether the earnings index was complete at
+// this snapshot's exact finalized checkpoint.
+func (s *WalletReadSnapshot) LPoDEarningsIndexReady(
+	funding, tip crypto.Hash32,
+	height uint64,
+) (bool, error) {
+	value, err := s.get(lpodEarningsReadyKey)
+	return bytes.Equal(value, earningsReadyValue(funding, tip, height)), err
+}
+
+// LPoDEarningsOutputs returns a bounded page from the earnings index captured
+// by this snapshot. Unlike wallet outputs, historical spent rewards remain in
+// this metadata index and are filtered by the caller's spendability-checked
+// wallet page.
+func (s *WalletReadSnapshot) LPoDEarningsOutputs(
+	address crypto.Address,
+	cursor string,
+	limit int,
+) ([]StoredUTXO, string, error) {
+	if limit < 1 || limit > 128 {
+		return nil, "", fmt.Errorf("invalid page limit")
+	}
+	prefix := lpodEarningsPrefix(address)
+	iter := s.snapshot.NewIterator(util.BytesPrefix(prefix), nil)
+	defer iter.Release()
+	ok := iter.First()
+	if cursor != "" {
+		key, err := hex.DecodeString(cursor)
+		if err != nil || !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+76 {
+			return nil, "", fmt.Errorf("invalid cursor")
+		}
+		ok = iter.Seek(key)
+		if ok && bytes.Equal(iter.Key(), key) {
+			ok = iter.Next()
+		}
+	}
+	rows := []StoredUTXO{}
+	next := ""
+	examined := 0
+	for ok && examined < limit {
+		examined++
+		var output StoredUTXO
+		if err := json.Unmarshal(iter.Value(), &output); err != nil {
+			return nil, "", err
+		}
+		rows = append(rows, output)
+		next = hex.EncodeToString(iter.Key())
+		ok = iter.Next()
+	}
+	if !ok {
+		next = ""
+	}
+	if err := iter.Error(); err != nil {
+		return nil, "", err
+	}
+	return rows, next, nil
+}
+
 // LPoDWalletOutputs returns one bounded page from the captured wallet index,
 // filtering spend markers from the same LevelDB snapshot.
 func (s *WalletReadSnapshot) LPoDWalletOutputs(
@@ -287,6 +365,35 @@ func (s *WalletReadSnapshot) LPoDWalletOutputsAfterHeight(
 	throughHeight uint64,
 	limit int,
 ) ([]StoredUTXO, string, string, error) {
+	return s.lpodWalletOutputsAfterHeight(
+		address, afterHeight, hasAfterHeight, resumeCursor, throughHeight, limit, false,
+	)
+}
+
+// LPoDWalletOutputsAfterHeightWithEarnings enriches only unspent wallet-index
+// outputs with an exact matching row from the snapshot-pinned earnings index.
+func (s *WalletReadSnapshot) LPoDWalletOutputsAfterHeightWithEarnings(
+	address crypto.Address,
+	afterHeight uint64,
+	hasAfterHeight bool,
+	resumeCursor string,
+	throughHeight uint64,
+	limit int,
+) ([]StoredUTXO, string, string, error) {
+	return s.lpodWalletOutputsAfterHeight(
+		address, afterHeight, hasAfterHeight, resumeCursor, throughHeight, limit, true,
+	)
+}
+
+func (s *WalletReadSnapshot) lpodWalletOutputsAfterHeight(
+	address crypto.Address,
+	afterHeight uint64,
+	hasAfterHeight bool,
+	resumeCursor string,
+	throughHeight uint64,
+	limit int,
+	includeEarnings bool,
+) ([]StoredUTXO, string, string, error) {
 	if limit < 1 || limit > 128 {
 		return nil, "", "", fmt.Errorf("invalid page limit")
 	}
@@ -355,6 +462,11 @@ func (s *WalletReadSnapshot) LPoDWalletOutputsAfterHeight(
 			return nil, "", "", err
 		}
 		if spent == nil {
+			if includeEarnings {
+				if err := s.attachLPoDEarningsAmount(key, &output); err != nil {
+					return nil, "", "", err
+				}
+			}
 			rows = append(rows, output)
 		}
 		ok = iter.Next()
@@ -370,6 +482,57 @@ func (s *WalletReadSnapshot) LPoDWalletOutputsAfterHeight(
 		}
 	}
 	return rows, next, lastExamined, iter.Error()
+}
+
+func lpodEarningsKeyForWalletIndexKey(walletKey []byte) ([]byte, error) {
+	const walletPrefixText = "lpod/wallet/v1/"
+	const earningsPrefixText = "lpod/earnings-output/v2/"
+	walletPrefix := []byte(walletPrefixText)
+	if !bytes.HasPrefix(walletKey, walletPrefix) ||
+		len(walletKey) != len(walletPrefix)+32+76 {
+		return nil, fmt.Errorf("malformed native wallet index key")
+	}
+	key := make([]byte, 0, len(earningsPrefixText)+len(walletKey)-len(walletPrefix))
+	key = append(key, earningsPrefixText...)
+	key = append(key, walletKey[len(walletPrefix):]...)
+	return key, nil
+}
+
+func (s *WalletReadSnapshot) attachLPoDEarningsAmount(walletKey []byte, output *StoredUTXO) error {
+	key, err := lpodEarningsKeyForWalletIndexKey(walletKey)
+	if err != nil {
+		return err
+	}
+	const walletPrefixText = "lpod/wallet/v1/"
+	suffix := walletKey[len(walletPrefixText)+32:]
+	if binary.BigEndian.Uint64(suffix[:8]) != output.BlockHeight ||
+		binary.BigEndian.Uint32(suffix[8:12]) != output.OutputIndex ||
+		!bytes.Equal(suffix[44:76], output.TxHash[:]) {
+		return fmt.Errorf("wallet index key conflicts with its output metadata")
+	}
+	raw, err := s.get(key)
+	if err != nil || raw == nil {
+		return err
+	}
+	var reward StoredUTXO
+	if err := json.Unmarshal(raw, &reward); err != nil {
+		return fmt.Errorf("decode pinned LPoD earnings output: %w", err)
+	}
+	if reward.TxHash != output.TxHash ||
+		reward.OutputIndex != output.OutputIndex ||
+		reward.BlockHeight != output.BlockHeight ||
+		reward.OneTimePub != output.OneTimePub ||
+		reward.TxPubKey != output.TxPubKey ||
+		reward.AmountCommit != output.AmountCommit ||
+		reward.EncAmount != output.EncAmount ||
+		reward.AmountNAPRO == 0 {
+		return fmt.Errorf("pinned LPoD earnings metadata conflicts with wallet output")
+	}
+	if output.AmountNAPRO != 0 && output.AmountNAPRO != reward.AmountNAPRO {
+		return fmt.Errorf("pinned LPoD earnings amount conflicts with wallet output")
+	}
+	output.AmountNAPRO = reward.AmountNAPRO
+	return nil
 }
 
 // GetUTXO retrieves an output from the captured active-output namespace.

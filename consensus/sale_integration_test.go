@@ -20,15 +20,21 @@ import (
 // LPoD funding. This is an offline forward-anchor rehearsal, not a claim of
 // historical body coverage or a live network rollout.
 func TestSaleTwoValidatorCanonicalDelivery(t *testing.T) {
-	testSaleTwoValidatorCanonicalDelivery(t, false)
+	testSaleTwoValidatorCanonicalDelivery(t, "forward")
 }
 
 func TestSaleTwoValidatorNetAllocationCanonicalDelivery(t *testing.T) {
-	testSaleTwoValidatorCanonicalDelivery(t, true)
+	testSaleTwoValidatorCanonicalDelivery(t, "net")
 }
 
-func testSaleTwoValidatorCanonicalDelivery(t *testing.T, netBasis bool) {
+func TestSaleTwoValidatorOperatorEpochCanonicalDelivery(t *testing.T) {
+	testSaleTwoValidatorCanonicalDelivery(t, "epoch")
+}
+
+func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 	t.Helper()
+	netBasis := basis == "net"
+	epochBasis := basis == "epoch"
 	keys := []crypto.ValidatorPrivKey{validatorKey(t, 91), validatorKey(t, 92)}
 	pubs := []crypto.ValidatorPubKey{keys[0].Public(), keys[1].Public()}
 	buyer, err := wallet.DeriveFromMnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", 0, 0)
@@ -137,11 +143,27 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, netBasis bool) {
 		reconciliation.GuardianReserved = lp.State.Balance
 		reconciliation.LPoDReserved = lp.Allocation.Remaining + lp.PrincipalLocked
 	}
+	if epochBasis {
+		epoch := &sale.AllocationEpochBasis{
+			FundingHeight: lp.Allocation.FundingHeight, FundingHash: lp.Allocation.FundingBlock,
+			Burned: 13745052310704501, ProtectedLPoDPrincipal: lp.PrincipalLocked,
+			LegacyHoldingsUnverified: true,
+		}
+		reconciliation.AllocationEpoch = epoch
+		reconciliation.HistoricIssued = epoch.Burned
+		reconciliation.GuardianReserved = lp.State.Balance
+		reconciliation.LPoDReserved = lp.Allocation.Remaining
+		epoch.Available = sale.CapNAPRO - epoch.Burned - reconciliation.ValidatorReserved -
+			reconciliation.GuardianReserved - reconciliation.LPoDReserved
+	}
 	cp := sale.Checkpoint{Genesis: g.Hash(), Parent: funding.Hash(), Height: funding.Header.Height + 1,
 		Network: crypto.MainnetByte, SnapshotRoot: reconciliation.Digest(),
 		HistoricIssued: reconciliation.HistoricIssued,
 		OtherReserved:  reconciliation.ValidatorReserved + reconciliation.GuardianReserved + reconciliation.LPoDReserved,
 		SaleRemaining:  100_000 * lpod.Unit, SaleAuthority: pubs[0]}
+	if epochBasis {
+		cp.SaleRemaining = reconciliation.AllocationEpoch.Available
+	}
 	for i, k := range keys {
 		sig, err := k.Sign(cp.Message())
 		if err != nil {
@@ -157,7 +179,13 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, netBasis bool) {
 		t.Fatal("funded control must include post-declaration reward issuance")
 	}
 	stale := *migration
-	if netBasis {
+	if epochBasis {
+		// A nominal epoch must never masquerade as historically verified issuance,
+		// even if both validators genuinely re-sign the changed declaration.
+		altered := *reconciliation.AllocationEpoch
+		altered.LegacyHoldingsUnverified = false
+		stale.Reconciliation.AllocationEpoch = &altered
+	} else if netBasis {
 		if reconciliation.NetAllocation.WalletNet == 0 {
 			t.Fatal("funded net control has no known reward payment")
 		}
@@ -260,16 +288,62 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, netBasis bool) {
 	if producer == nil {
 		t.Fatal("scheduled producer missing")
 	}
-	producer.cfg.SaleTransactions = func(h uint64, parent crypto.Hash32) ([]core.Transaction, error) {
-		tx, err := core.BuildSaleTransaction(core.SaleAuthorization{Genesis: cp.Genesis, Height: h, Parent: parent,
-			Order: crypto.HashBytes([]byte("paid offline order")), Payment: crypto.HashBytes([]byte("verified offline payment")),
-			Amount: 100 * lpod.Unit}, buyer.Address, cp.Network, keys[0])
+	var httpRehearsal *saleHTTPRehearsal
+	slot := uint64(2)
+	if epochBasis {
+		httpRehearsal = newSaleHTTPRehearsal(t, producer, migration, buyer.Address)
+		// Do not accept even a fixture invoice until the checkpoint itself has
+		// become a canonical, quorum-finalized block.
+		httpRehearsal.request("reserve", httpRehearsal.reserveBody(), 503)
+		activation, err := producer.produceBlock(cp.Height, slot, funding)
 		if err != nil {
-			return nil, err
+			t.Fatal(err)
 		}
-		return []core.Transaction{*tx}, nil
+		for _, e := range engines {
+			if err := e.handleIncomingBlock(activation); err != nil {
+				t.Fatal(err)
+			}
+		}
+		finalizeSaleRehearsal(t, engines, keys, activation)
+		funding = activation
+		slot = 4
+		httpRehearsal.enqueue()
+		// The authority only produces in its own scheduled rounds. Preserve the paid
+		// obligation through the other validator's normal intervening block.
+		var intervening *Engine
+		for _, e := range engines {
+			if e.proposerAt(3).Equals(e.cfg.MyKey.Public()) {
+				intervening = e
+			}
+		}
+		if intervening == nil {
+			t.Fatal("intervening proposer missing")
+		}
+		waiting, err := intervening.produceBlock(funding.Header.Height+1, 3, funding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range engines {
+			if err := e.handleIncomingBlock(waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+		finalizeSaleRehearsal(t, engines, keys, waiting)
+		funding = waiting
+		httpRehearsal.receipt("payment_confirmed")
+		// Keep the real durable pending-order builder installed by NewEngine.
+	} else {
+		producer.cfg.SaleTransactions = func(h uint64, parent crypto.Hash32) ([]core.Transaction, error) {
+			tx, err := core.BuildSaleTransaction(core.SaleAuthorization{Genesis: cp.Genesis, Height: h, Parent: parent,
+				Order: crypto.HashBytes([]byte("paid offline order")), Payment: crypto.HashBytes([]byte("verified offline payment")),
+				Amount: 100 * lpod.Unit}, buyer.Address, cp.Network, keys[0])
+			if err != nil {
+				return nil, err
+			}
+			return []core.Transaction{*tx}, nil
+		}
 	}
-	block, err := producer.produceBlock(cp.Height, 2, funding)
+	block, err := producer.produceBlock(funding.Header.Height+1, slot, funding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,23 +377,24 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, netBasis bool) {
 		if !e.IsFinalizedHash(block.Header.Height, block.Hash()) {
 			t.Fatal("buyer delivery lacks actual quorum finality")
 		}
-restoredFinality := &Engine{cfg: e.cfg, lpodFinalizedHashes: map[uint64]crypto.Hash32{
-block.Header.Height: block.Hash(),
-}}
-if !restoredFinality.IsSaleFinalizedHash(parent.Header.Height, parent.Hash()) {
-t.Fatal("canonical sale ancestor lost finality after certificate-only restoration")
-}
-if restoredFinality.IsSaleFinalizedHash(block.Header.Height+1, block.Hash()) {
-t.Fatal("unfinalized future sale block accepted")
-}
-wrongHash := parent.Hash(); wrongHash[0] ^= 1
-if restoredFinality.IsSaleFinalizedHash(parent.Header.Height, wrongHash) {
-t.Fatal("noncanonical sale ancestor accepted")
-}
-restoredFinality.lpodFinalizedHashes[block.Header.Height] = wrongHash
-if restoredFinality.IsSaleFinalizedHash(parent.Header.Height, parent.Hash()) {
-t.Fatal("unbound certificate anchor accepted")
-}
+		restoredFinality := &Engine{cfg: e.cfg, lpodFinalizedHashes: map[uint64]crypto.Hash32{
+			block.Header.Height: block.Hash(),
+		}}
+		if !restoredFinality.IsSaleFinalizedHash(parent.Header.Height, parent.Hash()) {
+			t.Fatal("canonical sale ancestor lost finality after certificate-only restoration")
+		}
+		if restoredFinality.IsSaleFinalizedHash(block.Header.Height+1, block.Hash()) {
+			t.Fatal("unfinalized future sale block accepted")
+		}
+		wrongHash := parent.Hash()
+		wrongHash[0] ^= 1
+		if restoredFinality.IsSaleFinalizedHash(parent.Header.Height, wrongHash) {
+			t.Fatal("noncanonical sale ancestor accepted")
+		}
+		restoredFinality.lpodFinalizedHashes[block.Header.Height] = wrongHash
+		if restoredFinality.IsSaleFinalizedHash(parent.Header.Height, parent.Hash()) {
+			t.Fatal("unbound certificate anchor accepted")
+		}
 	}
 	for _, d := range dbs {
 		if _, err := d.LoadSaleMigrationFile(""); err == nil {
@@ -332,19 +407,19 @@ t.Fatal("unbound certificate anchor accepted")
 	if !engines[0].CanSettleSale() || engines[1].CanSettleSale() {
 		t.Fatal("invoice admission does not match the eligible sale authority")
 	}
-rotated := &Engine{cfg: engines[0].cfg}
-rotated.cfg.Registry = core.NewValidatorRegistry()
-rotated.cfg.Registry.InitFromGenesis([]crypto.ValidatorPubKey{pubs[1]}, 100_000*lpod.Unit)
-rotated.cfg.ValidatorAuthorityFork = &core.ValidatorAuthorityFork{
-Height: block.Header.Height+1, Identity: pubs[1], Replacement: pubs[0],
-}
-if !rotated.CanSettleSale() {
-t.Fatal("authorized successor is not admitted under its active collateral identity")
-}
-rotated.cfg.ValidatorAuthorityFork.Height++
-if rotated.CanSettleSale() {
-t.Fatal("future authority rule admitted an unfunded signing identity early")
-}
+	rotated := &Engine{cfg: engines[0].cfg}
+	rotated.cfg.Registry = core.NewValidatorRegistry()
+	rotated.cfg.Registry.InitFromGenesis([]crypto.ValidatorPubKey{pubs[1]}, 100_000*lpod.Unit)
+	rotated.cfg.ValidatorAuthorityFork = &core.ValidatorAuthorityFork{
+		Height: block.Header.Height + 1, Identity: pubs[1], Replacement: pubs[0],
+	}
+	if !rotated.CanSettleSale() {
+		t.Fatal("authorized successor is not admitted under its active collateral identity")
+	}
+	rotated.cfg.ValidatorAuthorityFork.Height++
+	if rotated.CanSettleSale() {
+		t.Fatal("future authority rule admitted an unfunded signing identity early")
+	}
 	engines[0].halted.Store(true)
 	if engines[0].CanSettleSale() {
 		t.Fatal("halted producer still admits invoices")
@@ -367,55 +442,59 @@ t.Fatal("future authority rule admitted an unfunded signing identity early")
 	if delivered != 100*lpod.Unit {
 		t.Fatal("owner did not discover exact canonical sale output")
 	}
-if a.Remaining != cp.SaleRemaining-delivered {
-t.Fatal("purchase did not debit the available allocation by its credited amount")
-}
-// Purchases must exist as actual active outputs in the node snapshot, not
-// merely as a payment callback or an incremented display total.
-verifyPurchaseSnapshot := func(snapshot core.UTXOSnapshot) {
-t.Helper()
-var total uint64
-seen := make(map[crypto.Hash32]bool)
-for _, output := range snapshot.ActiveUTXOs {
-for _, tx := range block.Txs {
-if !tx.IsSale() || output.TxHash != tx.Hash() {
-continue
-}
-authorization, err := tx.SaleAuthorization()
-if err != nil || seen[output.TxHash] || output.OutputIndex != 0 ||
-output.BlockHeight != block.Header.Height || output.ProtocolLocked ||
-output.AmountCommit != tx.Outputs[0].AmountCommit {
-t.Fatal("snapshot contains invalid or duplicate purchase output", err)
-}
-seen[output.TxHash] = true
-total += authorization.Amount
-}
-}
-if total != delivered {
-t.Fatal("UTXO snapshot does not contain the exact credited purchase amount")
-}
-}
-for _, e := range engines {
-snapshot := e.utxos.TakeSnapshot()
-verifyPurchaseSnapshot(snapshot)
-encoded, err := json.Marshal(snapshot)
-if err != nil {
-t.Fatal(err)
-}
-var decoded core.UTXOSnapshot
-if err := json.Unmarshal(encoded, &decoded); err != nil {
-t.Fatal(err)
-}
-restored := core.NewUTXOSet()
-restored.RestoreFromSnapshot(decoded)
-verifyPurchaseSnapshot(restored.TakeSnapshot())
-}
+	if a.Remaining != cp.SaleRemaining-delivered {
+		t.Fatal("purchase did not debit the available allocation by its credited amount")
+	}
+	if httpRehearsal != nil {
+		// Sign only after the actual owner scanner found the exact credited output.
+		httpRehearsal.acknowledge(buyer.Keys)
+	}
+	// Purchases must exist as actual active outputs in the node snapshot, not
+	// merely as a payment callback or an incremented display total.
+	verifyPurchaseSnapshot := func(snapshot core.UTXOSnapshot) {
+		t.Helper()
+		var total uint64
+		seen := make(map[crypto.Hash32]bool)
+		for _, output := range snapshot.ActiveUTXOs {
+			for _, tx := range block.Txs {
+				if !tx.IsSale() || output.TxHash != tx.Hash() {
+					continue
+				}
+				authorization, err := tx.SaleAuthorization()
+				if err != nil || seen[output.TxHash] || output.OutputIndex != 0 ||
+					output.BlockHeight != block.Header.Height || output.ProtocolLocked ||
+					output.AmountCommit != tx.Outputs[0].AmountCommit {
+					t.Fatal("snapshot contains invalid or duplicate purchase output", err)
+				}
+				seen[output.TxHash] = true
+				total += authorization.Amount
+			}
+		}
+		if total != delivered {
+			t.Fatal("UTXO snapshot does not contain the exact credited purchase amount")
+		}
+	}
+	for _, e := range engines {
+		snapshot := e.utxos.TakeSnapshot()
+		verifyPurchaseSnapshot(snapshot)
+		encoded, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded core.UTXOSnapshot
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		restored := core.NewUTXOSet()
+		restored.RestoreFromSnapshot(decoded)
+		verifyPurchaseSnapshot(restored.TakeSnapshot())
+	}
 	for _, e := range engines {
 		tip := e.chain.Tip().Hash()
 		if e.handleIncomingBlock(block) == nil || e.chain.Tip().Hash() != tip {
 			t.Fatal("replayed block changed canonical state")
 		}
-verifyPurchaseSnapshot(e.utxos.TakeSnapshot())
+		verifyPurchaseSnapshot(e.utxos.TakeSnapshot())
 	}
 	for i, d := range dbs {
 		if err := d.Close(); err != nil {
@@ -432,6 +511,15 @@ verifyPurchaseSnapshot(e.utxos.TakeSnapshot())
 		}
 		if _, err := reopened.LoadSaleMigrationFile(configPath); err != nil {
 			t.Fatal("reopened ledger rejected its signed configuration", err)
+		}
+		engines[i].cfg.Store = reopened
+		if httpRehearsal != nil && producer == engines[i] {
+			httpRehearsal.server.SetStore(reopened)
+			httpRehearsal.receipt("completed")
+			pending, err := reopened.PendingPaidSales(cp.Genesis, block.Header.Height+1, block.Hash(), cp.Network, keys[0])
+			if err != nil || len(pending) != 0 {
+				t.Fatal("restart requeued an already delivered payment", err)
+			}
 		}
 	}
 }
