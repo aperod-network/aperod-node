@@ -730,7 +730,7 @@ type AddressUTXO struct {
 	// AmountNapr is the decrypted output amount in nAPRO. Populated when a
 	// view key is available (via X-View-Key header or node.yaml view_key).
 	// Null when no view key is configured.
-	AmountNapr *uint64 `json:"amount_napr"`
+	AmountNapr *uint64 `json:"amount_napr,string"`
 	// IsCoinbase is true when this UTXO belongs to a per-block validator
 	// reward (coinbase) transaction.  Wallet history displays must filter
 	// these out so +0 APRO block-reward entries never pollute user history.
@@ -939,10 +939,12 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Scan canonical chain for outputs matching the spend pub key (transparent match only).
+	// Scan the currently retained canonical chain window for outputs matching
+	// the spend pub key (transparent match only). Older block bodies are no
+	// longer available through Chain.GetByHeight.
 	// Full privacy scanning requires a view key — that is a Phase 2+ feature.
-	tip := s.chain.Tip()
-	if tip == nil {
+	blocks := s.chain.BlocksNewestFirst()
+	if len(blocks) == 0 {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"transactions": []AddressTx{}, "address": addrStr})
 		return
 	}
@@ -955,11 +957,11 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := make([]AddressTx, 0, 16)
-	for h := int64(tip.Header.Height); h >= 0 && len(results) < limit; h-- {
-		b := s.chain.GetByHeight(uint64(h))
-		if b == nil {
-			continue
+	for _, b := range blocks {
+		if len(results) >= limit {
+			break
 		}
+		h := b.Header.Height
 		txHash := func(i int) string {
 			hh := b.Txs[i].Hash()
 			return fmt.Sprintf("%x", hh[:])
@@ -968,7 +970,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		// (see core.BuildMintTx). Recompute the expected key for this height
 		// so per-block coinbase rewards are still discoverable by address scan.
 		expectedMintPub := spendPub
-		if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(uint64(h))); hErr == nil {
+		if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h)); hErr == nil {
 			if shifted, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
 				expectedMintPub = shifted
 			}
@@ -979,7 +981,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 				if out.OneTimePub == spendPub || out.OneTimePub == expectedMintPub {
 					results = append(results, AddressTx{
 						TxHash:      txHash(i),
-						BlockHeight: uint64(h),
+						BlockHeight: h,
 						TxIndex:     i,
 						OutputIndex: j,
 						IsCoinbase:  isCoinbase,
@@ -2184,15 +2186,34 @@ func (s *Server) restKeyImageIsSpent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
-		return
-	}
-
+	w.Header().Set("Cache-Control", "no-store")
 	const defaultCount = 120
 	const maxCount = 512
 	count := defaultCount
-	if raw := r.URL.Query().Get("count"); raw != "" {
+	rawID, rawAddress := "", ""
+	snapshotScoped := false
+	if r.Method == http.MethodPost {
+		var request struct {
+			Count      int    `json:"count"`
+			Address    string `json:"address"`
+			SnapshotID string `json:"snapshot_id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid snapshot decoy request")
+			return
+		}
+		if request.Count <= 0 || request.Count > maxCount || request.Address == "" || request.SnapshotID == "" {
+			writeJSONError(w, http.StatusBadRequest, "count, address, and snapshot_id are required")
+			return
+		}
+		count, rawID, rawAddress, snapshotScoped = request.Count, request.SnapshotID, request.Address, true
+	} else if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET or snapshot-scoped POST only")
+		return
+	} else if r.URL.Query().Get("address") != "" || r.URL.Query().Get("snapshot_id") != "" {
+		writeJSONError(w, http.StatusBadRequest, "snapshot-bound decoys require POST")
+		return
+	} else if raw := r.URL.Query().Get("count"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n <= 0 {
 			writeJSONError(w, http.StatusBadRequest, "count must be a positive integer")
@@ -2203,16 +2224,84 @@ func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
 		}
 		count = n
 	}
+	if s.utxos == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "ring members unavailable")
+		return
+	}
 
 	// Browser-local signers build v5 CLSAG transactions, whose ring commits
 	// bind every member to the canonical on-chain commitment. Sample from the
 	// persistent ring-member store rather than the legacy spent-only pool.
-	decoys := s.utxos.SampleCLSAGDecoys(count, nil)
-
 	type decoyEntry struct {
 		OneTimePubHex   string `json:"one_time_pub_hex"`
 		AmountCommitHex string `json:"amount_commit_hex"`
 	}
+	if snapshotScoped {
+		address, err := validSnapshotAddress(rawAddress)
+		if err != nil || rawID == "" {
+			writeJSONError(w, http.StatusBadRequest, "valid address and snapshot_id are required")
+			return
+		}
+		if s.walletSnapshots == nil {
+			writeSnapshotLeaseError(w, errWalletSnapshotExpired)
+			return
+		}
+		lease := s.acquireWalletSnapshot(w, rawID, address)
+		if lease == nil {
+			return
+		}
+		defer lease.Release()
+		if s.utxos == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "ring members unavailable")
+			return
+		}
+		type snapshotDecoy struct {
+			TxHash      string `json:"tx_hash"`
+			OutputIndex uint32 `json:"out_idx"`
+			BlockHeight uint64 `json:"block_height"`
+			OneTimePub  string `json:"one_time_pub"`
+			TxPubKey    string `json:"tx_pub_key"`
+			AmountCommit string `json:"amount_commit"`
+			EncAmount   string `json:"enc_amount"`
+		}
+		excluded := make(map[crypto.Point32]bool, count*8)
+		outputs := make([]snapshotDecoy, 0, count)
+		for attempt := 0; attempt < 8 && len(outputs) < count; attempt++ {
+			candidates := s.utxos.SampleCLSAGDecoys(count-len(outputs), excluded)
+			if len(candidates) == 0 {
+				break
+			}
+			for _, d := range candidates {
+				excluded[d.OneTimePub] = true
+				member, err := lease.entry.read.LookupRingMember(d.OneTimePub)
+				if err != nil {
+					writeJSONError(w, http.StatusInternalServerError, "pinned ring member lookup failed")
+					return
+				}
+				// The sampler reads the live ring index. A block may have
+				// landed after this wallet pin, or a rollback may have changed
+				// the index, so keep only exact pairs present in the pin.
+				// Retry a bounded number of times rather than mixing snapshots.
+				if member == nil || member.OneTimePub != d.OneTimePub ||
+					member.AmountCommit != d.AmountCommit || member.ProtocolLocked ||
+					member.BlockHeight > lease.entry.height {
+					continue
+				}
+				outputs = append(outputs, snapshotDecoy{
+					TxHash: fmt.Sprintf("%x", member.TxHash[:]), OutputIndex: member.OutputIndex,
+					BlockHeight: member.BlockHeight, OneTimePub: fmt.Sprintf("%x", member.OneTimePub[:]),
+					TxPubKey: fmt.Sprintf("%x", member.TxPubKey[:]), AmountCommit: fmt.Sprintf("%x", member.AmountCommit[:]),
+					EncAmount: fmt.Sprintf("%x", member.EncAmount[:]),
+				})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"snapshot_id": rawID, "checkpoint_hash": fmt.Sprintf("%x", lease.entry.hash[:]),
+			"checkpoint_height": lease.entry.height, "count": len(outputs), "outputs": outputs,
+		})
+		return
+	}
+	decoys := s.utxos.SampleCLSAGDecoys(count, nil)
 	entries := make([]decoyEntry, len(decoys))
 	for i, d := range decoys {
 		entries[i] = decoyEntry{

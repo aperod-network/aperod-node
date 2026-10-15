@@ -78,6 +78,13 @@ type DerivedKeys struct {
 // DeriveKeys derives Aperod spend+view keys from a 64-byte BIP39 seed.
 // BIP44 path: m/44'/7777'/account'/0'/index'
 func DeriveKeys(seed []byte, account, index uint32) (*DerivedKeys, error) {
+	// The hardened bit is part of the encoded child index, not part of the
+	// caller's index. Reject it up front so distinct uint32 inputs cannot
+	// collapse to the same child when the path is constructed below.
+	if account >= hardenedOffset || index >= hardenedOffset {
+		return nil, fmt.Errorf("hd: account and index must be less than %d", hardenedOffset)
+	}
+
 	master, err := masterFromSeed(seed)
 	if err != nil {
 		return nil, err

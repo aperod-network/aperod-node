@@ -472,6 +472,27 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 	if !targetBound {
 		throughHeight, throughHash = entry.height, entry.hash
 	}
+	includeEarnings := q.Get("include_earnings") == "1"
+	earningsIndexReady := false
+	if includeEarnings &&
+		entry.read != nil &&
+		entry.checkpoint != nil &&
+		entry.checkpoint.Allocation != nil &&
+		s.lpodMigration != nil &&
+		entry.checkpoint.Allocation.Version == 3 &&
+		entry.checkpoint.Allocation.Genesis == s.lpodMigration.Genesis &&
+		entry.checkpoint.Allocation.ReconciliationRoot == s.lpodMigration.ReconciliationRoot &&
+		entry.checkpoint.Allocation.FundingHeight == s.lpodMigration.Height &&
+		entry.checkpoint.State.LastHeight == entry.height {
+		ready, readyErr := entry.read.LPoDEarningsIndexReady(
+			entry.checkpoint.Allocation.FundingBlock, entry.hash, entry.height,
+		)
+		if readyErr != nil {
+			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "EARNINGS_INDEX_NOT_READY", "LPoD earnings index is unavailable at the pinned wallet snapshot")
+			return
+		}
+		earningsIndexReady = ready
+	}
 	if q.Has("through_height") != q.Has("through_hash") {
 		writeJSONError(w, http.StatusBadRequest, "through_height and through_hash must be supplied together")
 		return
@@ -553,9 +574,17 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 		}
 		cursor = resumeCursor
 	}
-	rows, next, lastExamined, err := entry.read.LPoDWalletOutputsAfterHeight(
-		address, afterHeight, hasAfterHeight, cursor, throughHeight, 128,
-	)
+	var rows []store.StoredUTXO
+	var next, lastExamined string
+	if earningsIndexReady {
+		rows, next, lastExamined, err = entry.read.LPoDWalletOutputsAfterHeightWithEarnings(
+			address, afterHeight, hasAfterHeight, cursor, throughHeight, 128,
+		)
+	} else {
+		rows, next, lastExamined, err = entry.read.LPoDWalletOutputsAfterHeight(
+			address, afterHeight, hasAfterHeight, cursor, throughHeight, 128,
+		)
+	}
 	if err != nil {
 		var missing *store.WalletReconciliationError
 		if errors.As(err, &missing) {
@@ -578,12 +607,10 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 			"amount_commit": fmt.Sprintf("%x", u.AmountCommit[:]), "enc_amount": fmt.Sprintf("%x", u.EncAmount[:]),
 		}
 		var zeroPoint crypto.Point32
-		if u.TxPubKey == zeroPoint {
-			if u.AmountNAPRO > 0 {
-				output["amount_napr"] = fmt.Sprintf("%d", u.AmountNAPRO)
-			} else {
-				output["opening_status"] = "OUTPUT_OPENING_UNAVAILABLE"
-			}
+		if u.AmountNAPRO > 0 && (earningsIndexReady || u.TxPubKey == zeroPoint) {
+			output["amount_napr"] = fmt.Sprintf("%d", u.AmountNAPRO)
+		} else if u.TxPubKey == zeroPoint {
+			output["opening_status"] = "OUTPUT_OPENING_UNAVAILABLE"
 		}
 		outputs = append(outputs, output)
 	}
@@ -593,6 +620,9 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 		"through_height":  throughHeight, "through_hash": fmt.Sprintf("%x", throughHash[:]),
 		"outputs": outputs, "next_cursor": snapshotCursor(id, next),
 		"resume_cursor": lastExamined,
+	}
+	if includeEarnings {
+		response["earnings_index_ready"] = earningsIndexReady
 	}
 	if creating {
 		delivered = writeCreatedWalletSnapshot(w, r, response)

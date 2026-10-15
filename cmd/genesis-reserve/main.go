@@ -52,7 +52,7 @@ func run() error {
 			keys, err := wallet.DeriveFromMnemonic(mnemonic, "", 0, 0)
 			if err != nil { return err }
 			address := crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys)
-			keystore, err := wallet.EncryptMnemonic(mnemonic, password, string(address))
+			keystore, err := wallet.EncryptMnemonicWithDerivation(mnemonic, password, string(address), 0, 0)
 			if err != nil { return err }
 			if err = writeExclusive(*path, keystore); err != nil { return err }
 			return json.NewEncoder(os.Stdout).Encode(map[string]string{"address": string(address), "custody": "encrypted_operator_keystore"})
@@ -75,7 +75,7 @@ func run() error {
 		if err != nil || string(crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys)) != keystore.Address { return fmt.Errorf("keystore address integrity failed") }
 		newPassword := os.Getenv("TREASURY_EXPORT_PASSWORD")
 		if len(newPassword) < 12 { return fmt.Errorf("export password must have at least 12 characters") }
-		rekeyed, err := wallet.EncryptMnemonic(mnemonic, newPassword, keystore.Address)
+		rekeyed, err := wallet.EncryptMnemonicWithDerivation(mnemonic, newPassword, keystore.Address, 0, 0)
 		if err != nil { return err }
 		return json.NewEncoder(os.Stdout).Encode(rekeyed)
 	}

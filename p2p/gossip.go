@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"container/list"
 	"sync"
 	"time"
 
@@ -13,21 +14,23 @@ const (
 	gossipCacheTTL  = 5 * time.Minute
 )
 
-// gossipEntry records when a hash was first seen for TTL-based eviction.
+// gossipEntry records a hash and its insertion time in FIFO order.
 type gossipEntry struct {
+	hash crypto.Hash32
 	at time.Time
 }
 
 // GossipFilter is a bounded seen-set that prevents a block or transaction from
 // being relayed more than once.  Thread-safe.
 type GossipFilter struct {
-	mu   sync.Mutex
-	seen map[crypto.Hash32]gossipEntry
+	mu    sync.Mutex
+	seen  map[crypto.Hash32]*list.Element
+	order list.List
 }
 
 // NewGossipFilter creates an empty GossipFilter.
 func NewGossipFilter() *GossipFilter {
-	return &GossipFilter{seen: make(map[crypto.Hash32]gossipEntry)}
+	return &GossipFilter{seen: make(map[crypto.Hash32]*list.Element)}
 }
 
 // MarkAndCheck returns true if h was NOT seen before (new message) and marks
@@ -36,14 +39,16 @@ func (gf *GossipFilter) MarkAndCheck(h crypto.Hash32) bool {
 	gf.mu.Lock()
 	defer gf.mu.Unlock()
 
+	now := time.Now()
+	gf.evictExpiredLocked(now)
 	if _, exists := gf.seen[h]; exists {
 		return false
 	}
-	// Evict stale entries before inserting to keep memory bounded.
 	if len(gf.seen) >= gossipCacheSize {
-		gf.evictLocked()
+		gf.evictOldestLocked()
 	}
-	gf.seen[h] = gossipEntry{at: time.Now()}
+	element := gf.order.PushBack(gossipEntry{hash: h, at: now})
+	gf.seen[h] = element
 	return true
 }
 
@@ -51,6 +56,7 @@ func (gf *GossipFilter) MarkAndCheck(h crypto.Hash32) bool {
 func (gf *GossipFilter) HasSeen(h crypto.Hash32) bool {
 	gf.mu.Lock()
 	defer gf.mu.Unlock()
+	gf.evictExpiredLocked(time.Now())
 	_, ok := gf.seen[h]
 	return ok
 }
@@ -62,15 +68,30 @@ func (gf *GossipFilter) Size() int {
 	return len(gf.seen)
 }
 
-// evictLocked removes all entries older than gossipCacheTTL.
+// evictExpiredLocked removes expired entries from the FIFO head.
 // Caller must hold gf.mu.
-func (gf *GossipFilter) evictLocked() {
-	cutoff := time.Now().Add(-gossipCacheTTL)
-	for h, e := range gf.seen {
-		if e.at.Before(cutoff) {
-			delete(gf.seen, h)
+func (gf *GossipFilter) evictExpiredLocked(now time.Time) {
+	cutoff := now.Add(-gossipCacheTTL)
+	for front := gf.order.Front(); front != nil; front = gf.order.Front() {
+		entry := front.Value.(gossipEntry)
+		if !entry.at.Before(cutoff) {
+			return
 		}
+		delete(gf.seen, entry.hash)
+		gf.order.Remove(front)
 	}
+}
+
+// evictOldestLocked removes exactly one oldest entry.
+// Caller must hold gf.mu.
+func (gf *GossipFilter) evictOldestLocked() {
+	front := gf.order.Front()
+	if front == nil {
+		return
+	}
+	entry := front.Value.(gossipEntry)
+	delete(gf.seen, entry.hash)
+	gf.order.Remove(front)
 }
 
 // ─── Gossip ───────────────────────────────────────────────────────────────────

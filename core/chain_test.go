@@ -130,6 +130,31 @@ func TestChain_MemoryCapConfigurableWindow(t *testing.T) {
 	}
 }
 
+func TestChain_BlocksNewestFirstReturnsStableRetainedWindow(t *testing.T) {
+	c := core.NewChain(3)
+	prev := makeMinimalBlock(0, crypto.Hash32{})
+	if err := c.SetGenesis(prev); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	for height := uint64(1); height <= 5; height++ {
+		block := makeMinimalBlock(height, prev.Hash())
+		if err := c.AddBlock(block); err != nil {
+			t.Fatalf("AddBlock(%d): %v", height, err)
+		}
+		prev = block
+	}
+
+	blocks := c.BlocksNewestFirst()
+	if len(blocks) != 3 {
+		t.Fatalf("BlocksNewestFirst returned %d blocks, want 3", len(blocks))
+	}
+	for i, wantHeight := range []uint64{5, 4, 3} {
+		if got := blocks[i].Header.Height; got != wantHeight {
+			t.Errorf("blocks[%d].Height = %d, want %d", i, got, wantHeight)
+		}
+	}
+}
+
 // TestChain_FastForwardMemoryCap (#462) — bulk-loading more blocks than the
 // window via FastForward (the startup / P2P catch-up path) must apply the
 // same eviction so memory stays bounded.

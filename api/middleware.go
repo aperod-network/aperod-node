@@ -158,15 +158,18 @@ func (h *heavyRL) allow(ip string) bool {
 // globalHeavyRL is shared across all rate-limiter middleware instances.
 var globalHeavyRL = newHeavyRL()
 
-// isHeavyPath returns true for endpoints whose response cost is O(N) in the
-// UTXO-set size.  These get the stricter heavyRL bucket (2 req/s, burst 5).
+// isHeavyPath returns true for endpoints with chain- or UTXO-sized scan costs.
+// These get the stricter heavyRL bucket (2 req/s, burst 5).
 func isHeavyPath(path string) bool {
-	// /api/v1/address/{addr}/utxos — full UTXO-set copy + per-UTXO point ops.
+	// Address history scans retained blocks; address UTXOs scan the full UTXO set.
 	const pfx = "/api/v1/address/"
-	const sfx = "/utxos"
-	if len(path) > len(pfx)+len(sfx) {
-		if path[:len(pfx)] == pfx && path[len(path)-len(sfx):] == sfx {
-			return true
+	if len(path) > len(pfx) {
+		if path[:len(pfx)] == pfx {
+			for _, suffix := range [...]string{"/utxos", "/transactions"} {
+				if len(path) > len(pfx)+len(suffix) && path[len(path)-len(suffix):] == suffix {
+					return true
+				}
+			}
 		}
 	}
 	switch path {
