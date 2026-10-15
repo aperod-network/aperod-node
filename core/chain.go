@@ -2,6 +2,7 @@ package core
 
 import (
         "fmt"
+        "sort"
         "sync"
 
         "github.com/aperod/aperod/crypto"
@@ -117,6 +118,22 @@ func (c *Chain) GetByHeight(h uint64) *Block {
         c.mu.RLock()
         defer c.mu.RUnlock()
         return c.byHeight[h]
+}
+
+// BlocksNewestFirst returns a stable snapshot of the blocks currently retained
+// in memory, ordered from the canonical tip backwards. Older bodies have
+// already been evicted and cannot be returned by GetByHeight.
+func (c *Chain) BlocksNewestFirst() []*Block {
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        blocks := make([]*Block, 0, len(c.byHeight))
+        for _, block := range c.byHeight {
+                blocks = append(blocks, block)
+        }
+        sort.Slice(blocks, func(i, j int) bool {
+                return blocks[i].Header.Height > blocks[j].Header.Height
+        })
+        return blocks
 }
 
 // HasBlock returns true if the block with this hash is already known.

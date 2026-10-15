@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/aperod/aperod/crypto"
 	"net/http"
 	"strings"
+
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/store"
 )
 
 func (s *Server) restLPoDWalletOutputs(w http.ResponseWriter, r *http.Request) {
@@ -88,40 +90,79 @@ func (s *Server) restLPoDEarningsOutputs(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, 503, "canonical store unavailable")
 		return
 	}
-	hash, height, err := s.blockStore.GetTip()
-	if err != nil || s.lpodFinalized == nil || !s.lpodFinalized(height, hash) {
-		writeJSONError(w, 503, "finalized tip required")
-		return
-	}
-	c, err := s.blockStore.LoadLPoDCheckpointAt(hash)
-	if err != nil || c == nil || c.Allocation == nil || c.Allocation.Version != 3 ||
-		c.Allocation.Genesis != s.lpodMigration.Genesis ||
-		c.Allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
-		c.Allocation.FundingHeight != s.lpodMigration.Height || c.State.LastHeight != height {
-		writeJSONError(w, 503, "canonical v3 LPoD checkpoint required")
-		return
-	}
-	ready, err := s.blockStore.LPoDEarningsIndexReady(c.Allocation.FundingBlock, hash, height)
-	if err != nil || !ready {
-		writeJSONError(w, 503, "v2 earnings index is incomplete through the finalized tip")
-		return
-	}
-	cursor := r.URL.Query().Get("cursor")
-	if cursor != "" {
-		decoded, err := base64.RawURLEncoding.DecodeString(cursor)
-		if err != nil {
-			writeJSONError(w, 400, "invalid cursor")
+	query := r.URL.Query()
+	hash := crypto.Hash32{}
+	var height uint64
+	var rows []store.StoredUTXO
+	var next string
+	var err error
+	var pinnedSnapshotID string
+
+	if query.Has("snapshot_id") {
+		pinnedSnapshotID = query.Get("snapshot_id")
+		lease := s.acquireWalletSnapshot(w, pinnedSnapshotID, address)
+		if lease == nil {
 			return
 		}
-		parts := strings.SplitN(string(decoded), ":", 2)
-		bound, err := hex.DecodeString(parts[0])
-		if err != nil || len(parts) != 2 || len(bound) != 32 || !strings.EqualFold(parts[0], fmt.Sprintf("%x", hash[:])) {
-			writeJSONError(w, 409, "cursor is bound to a different finalized checkpoint")
+		defer lease.Release()
+
+		entry := lease.entry
+		checkpoint := entry.checkpoint
+		if entry.read == nil || checkpoint == nil || checkpoint.Allocation == nil ||
+			checkpoint.Allocation.Version != 3 ||
+			checkpoint.Allocation.Genesis != s.lpodMigration.Genesis ||
+			checkpoint.Allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
+			checkpoint.Allocation.FundingHeight != s.lpodMigration.Height ||
+			checkpoint.State.LastHeight != entry.height {
+			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_UNAVAILABLE", "pinned v3 LPoD checkpoint is unavailable")
 			return
 		}
-		cursor = parts[1]
+		ready, readyErr := entry.read.LPoDEarningsIndexReady(
+			checkpoint.Allocation.FundingBlock, entry.hash, entry.height,
+		)
+		if readyErr != nil || !ready {
+			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "EARNINGS_INDEX_NOT_READY", "LPoD earnings index is incomplete at the pinned wallet snapshot")
+			return
+		}
+		hash, height = entry.hash, entry.height
+		cursor, ok := unwrapLPoDEarningsCursor(w, query.Get("cursor"), hash)
+		if !ok {
+			return
+		}
+		rows, next, err = entry.read.LPoDEarningsOutputs(address, cursor, 128)
+	} else {
+		hash, height, err = s.blockStore.GetTip()
+		if err != nil || s.lpodFinalized == nil || !s.lpodFinalized(height, hash) {
+			writeJSONError(w, 503, "finalized tip required")
+			return
+		}
+		checkpoint, checkpointErr := s.blockStore.LoadLPoDCheckpointAt(hash)
+		if checkpointErr != nil || checkpoint == nil || checkpoint.Allocation == nil || checkpoint.Allocation.Version != 3 ||
+			checkpoint.Allocation.Genesis != s.lpodMigration.Genesis ||
+			checkpoint.Allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
+			checkpoint.Allocation.FundingHeight != s.lpodMigration.Height || checkpoint.State.LastHeight != height {
+			writeJSONError(w, 503, "canonical v3 LPoD checkpoint required")
+			return
+		}
+		ready, readyErr := s.blockStore.LPoDEarningsIndexReady(checkpoint.Allocation.FundingBlock, hash, height)
+		if readyErr != nil || !ready {
+			writeJSONError(w, 503, "v2 earnings index is incomplete through the finalized tip")
+			return
+		}
+		cursor, ok := unwrapLPoDEarningsCursor(w, query.Get("cursor"), hash)
+		if !ok {
+			return
+		}
+		rows, next, err = s.blockStore.LPoDEarningsOutputs(address, cursor, 128)
+		if err == nil {
+			after, afterHeight, tipErr := s.blockStore.GetTip()
+			if tipErr != nil || after != hash || afterHeight != height ||
+				s.lpodFinalized == nil || !s.lpodFinalized(afterHeight, after) {
+				writeJSONError(w, 409, "canonical finalized checkpoint changed")
+				return
+			}
+		}
 	}
-	rows, next, err := s.blockStore.LPoDEarningsOutputs(address, cursor, 128)
 	if err != nil {
 		writeJSONError(w, 400, err.Error())
 		return
@@ -139,20 +180,54 @@ func (s *Server) restLPoDEarningsOutputs(w http.ResponseWriter, r *http.Request)
 			"amount_napro":  fmt.Sprintf("%d", u.AmountNAPRO),
 		})
 	}
-	after, h, err := s.blockStore.GetTip()
-	if err != nil || after != hash || h != height || s.lpodFinalized == nil || !s.lpodFinalized(h, after) {
-		writeJSONError(w, 409, "canonical finalized checkpoint changed")
-		return
-	}
 	nextCursor := ""
 	if next != "" {
 		token := fmt.Sprintf("%x:%s", hash[:], next)
 		nextCursor = base64.RawURLEncoding.EncodeToString([]byte(token))
 	}
-	writeJSON(w, 200, map[string]interface{}{
+	response := map[string]interface{}{
 		"state": "active", "checkpoint_hash": fmt.Sprintf("%x", hash[:]),
 		"outputs": outputs, "next_cursor": nextCursor,
-	})
+	}
+	if pinnedSnapshotID != "" {
+		response["snapshot_id"] = pinnedSnapshotID
+		response["checkpoint_height"] = height
+	}
+	writeJSON(w, 200, response)
+}
+
+func unwrapLPoDEarningsCursor(
+	w http.ResponseWriter,
+	cursor string,
+	checkpointHash crypto.Hash32,
+) (string, bool) {
+	if cursor == "" {
+		return "", true
+	}
+	if len(cursor) > 512 {
+		writeJSONError(w, 400, "invalid cursor")
+		return "", false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		writeJSONError(w, 400, "invalid cursor")
+		return "", false
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		writeJSONError(w, 400, "invalid cursor")
+		return "", false
+	}
+	bound, err := hex.DecodeString(parts[0])
+	if err != nil || len(bound) != 32 {
+		writeJSONError(w, 400, "invalid cursor")
+		return "", false
+	}
+	if !strings.EqualFold(parts[0], fmt.Sprintf("%x", checkpointHash[:])) {
+		writeJSONError(w, 409, "cursor is bound to a different finalized checkpoint")
+		return "", false
+	}
+	return parts[1], true
 }
 
 // Public key images, not keys/blinds, identify locally scanned consumed outputs.

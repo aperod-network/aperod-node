@@ -6,6 +6,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -16,7 +17,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-"os"
+	"os"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,53 +219,53 @@ func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {
 		}
 	}
 
-// A replacement lease must accept the real opaque address-index cursor
-// emitted by the prior HTTP page while keeping its original through anchor.
-resumeQuery := url.Values{
-"address":       {string(address)},
-"snapshot":      {"1"},
-"through_height": {fmt.Sprint(initialHeight)},
-"through_hash":   {fmt.Sprintf("%x", initialHash[:])},
-"resume_cursor":  {resumeCursor},
-}
-resumeURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + resumeQuery.Encode()
-resumeStatus, resumedPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, resumeURL, nil)
-if resumeStatus != http.StatusOK {
-t.Fatalf("resume native outputs from real raw index cursor: status=%d body=%#v", resumeStatus, resumedPage)
-}
-resumeSnapshotID := stringField(t, resumedPage, "snapshot_id")
-snapshotIDs = append(snapshotIDs, resumeSnapshotID)
-if resumedPage["through_height"] != float64(initialHeight) ||
-resumedPage["through_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
-stringField(t, resumedPage, "resume_cursor") == "" {
-t.Fatalf("renewed native page changed its anchor or omitted its raw cursor: %#v", resumedPage)
-}
-priorRefs := make(map[string]struct{}, len(firstRows))
-for _, value := range firstRows {
-row := value.(map[string]interface{})
-priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])] = struct{}{}
-}
-renewedRows := resumedPage["outputs"].([]interface{})
-if len(renewedRows) == 0 {
-t.Fatal("renewed native page unexpectedly had no continuation outputs")
-}
-for _, value := range renewedRows {
-row := value.(map[string]interface{})
-if _, duplicated := priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])]; duplicated {
-t.Fatalf("raw-cursor renewal repeated prior native output: %#v", row)
-}
-}
-releaseStatus, releaseResponse := snapshotRequest(
-	t,
-	httpServer.Client(),
-	http.MethodDelete,
-	snapshotURL(httpServer.URL, "/api/v1/wallet/snapshot", address, resumeSnapshotID, ""),
-	nil,
-)
-if releaseStatus != http.StatusOK || releaseResponse["released"] != true {
-	t.Fatalf("release raw-cursor renewal snapshot: status=%d body=%#v", releaseStatus, releaseResponse)
-}
-snapshotIDs = snapshotIDs[:len(snapshotIDs)-1]
+	// A replacement lease must accept the real opaque address-index cursor
+	// emitted by the prior HTTP page while keeping its original through anchor.
+	resumeQuery := url.Values{
+		"address":        {string(address)},
+		"snapshot":       {"1"},
+		"through_height": {fmt.Sprint(initialHeight)},
+		"through_hash":   {fmt.Sprintf("%x", initialHash[:])},
+		"resume_cursor":  {resumeCursor},
+	}
+	resumeURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + resumeQuery.Encode()
+	resumeStatus, resumedPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, resumeURL, nil)
+	if resumeStatus != http.StatusOK {
+		t.Fatalf("resume native outputs from real raw index cursor: status=%d body=%#v", resumeStatus, resumedPage)
+	}
+	resumeSnapshotID := stringField(t, resumedPage, "snapshot_id")
+	snapshotIDs = append(snapshotIDs, resumeSnapshotID)
+	if resumedPage["through_height"] != float64(initialHeight) ||
+		resumedPage["through_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		stringField(t, resumedPage, "resume_cursor") == "" {
+		t.Fatalf("renewed native page changed its anchor or omitted its raw cursor: %#v", resumedPage)
+	}
+	priorRefs := make(map[string]struct{}, len(firstRows))
+	for _, value := range firstRows {
+		row := value.(map[string]interface{})
+		priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])] = struct{}{}
+	}
+	renewedRows := resumedPage["outputs"].([]interface{})
+	if len(renewedRows) == 0 {
+		t.Fatal("renewed native page unexpectedly had no continuation outputs")
+	}
+	for _, value := range renewedRows {
+		row := value.(map[string]interface{})
+		if _, duplicated := priorRefs[fmt.Sprintf("%v:%v", row["tx_hash"], row["out_idx"])]; duplicated {
+			t.Fatalf("raw-cursor renewal repeated prior native output: %#v", row)
+		}
+	}
+	releaseStatus, releaseResponse := snapshotRequest(
+		t,
+		httpServer.Client(),
+		http.MethodDelete,
+		snapshotURL(httpServer.URL, "/api/v1/wallet/snapshot", address, resumeSnapshotID, ""),
+		nil,
+	)
+	if releaseStatus != http.StatusOK || releaseResponse["released"] != true {
+		t.Fatalf("release raw-cursor renewal snapshot: status=%d body=%#v", releaseStatus, releaseResponse)
+	}
+	snapshotIDs = snapshotIDs[:len(snapshotIDs)-1]
 
 	// A second independent session lets the test prove the opaque cursor is
 	// bound to its originating snapshot token.
@@ -404,11 +406,11 @@ snapshotIDs = snapshotIDs[:len(snapshotIDs)-1]
 	initialSpentMap := initialStatuses["spent"].(map[string]interface{})
 	initialCanonicalMap := initialStatuses["canonical_spent"].(map[string]interface{})
 	initialPendingMap := initialStatuses["pending_locked"].(map[string]interface{})
-if initialSpentMap[spentKIHex] != true || initialSpentMap[unspentKIHex] != false ||
+	if initialSpentMap[spentKIHex] != true || initialSpentMap[unspentKIHex] != false ||
 		initialSpentMap[pendingKIHex] != false ||
-initialCanonicalMap[unspentKIHex] != false ||
-initialCanonicalMap[pendingKIHex] != false || initialPendingMap[pendingKIHex] != false {
-t.Fatalf("public output marker must not turn an unspent owner key image into spent: %#v", initialSpentMap)
+		initialCanonicalMap[unspentKIHex] != false ||
+		initialCanonicalMap[pendingKIHex] != false || initialPendingMap[pendingKIHex] != false {
+		t.Fatalf("public output marker must not turn an unspent owner key image into spent: %#v", initialSpentMap)
 	}
 	pendingTx := core.Transaction{
 		Version: core.TxVersionCommitmentBinding,
@@ -450,6 +452,672 @@ t.Fatalf("public output marker must not turn an unspent owner key image into spe
 	}
 	if got := finalityCalls.Load(); got != 19 {
 		t.Fatalf("finality callback reran for pinned reads: calls=%d, want 19 creation checks including raw-cursor renewal", got)
+	}
+}
+
+func TestLPoDEarningsOutputPagesStayPinnedToWalletSnapshot(t *testing.T) {
+	db, migration, address, _, validator, validatorPub := syntheticWalletSnapshotLPoDV3Funding(t)
+	initialHash, initialHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	var finalityCalls atomic.Int32
+	server.SetLPoDConfig(migration, func(height uint64, hash crypto.Hash32) bool {
+		finalityCalls.Add(1)
+		return height == initialHeight && hash == initialHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":  {string(address)},
+		"snapshot": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK ||
+		walletPage["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		walletPage["checkpoint_height"] != float64(initialHeight) {
+		t.Fatalf("create wallet snapshot: status=%d body=%#v", status, walletPage)
+	}
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+
+	earningsURL := httpServer.URL + "/api/v1/lpod/earnings-outputs?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	status, before := snapshotRequest(t, httpServer.Client(), http.MethodGet, earningsURL, nil)
+	if status != http.StatusOK ||
+		before["snapshot_id"] != snapshotID ||
+		before["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		before["checkpoint_height"] != float64(initialHeight) {
+		t.Fatalf("initial snapshot-pinned earnings page: status=%d body=%#v", status, before)
+	}
+	beforeRows, ok := before["outputs"].([]interface{})
+	if !ok || len(beforeRows) == 0 {
+		t.Fatalf("synthetic canonical reward missing from pinned earnings page: %#v", before)
+	}
+	expectedReward := beforeRows[0].(map[string]interface{})
+	expectedRef := fmt.Sprintf("%s:%v", expectedReward["tx_hash"], expectedReward["out_idx"])
+	expectedAmount := expectedReward["amount_napro"]
+	ordinaryWalletRows, ok := walletPage["outputs"].([]interface{})
+	if !ok {
+		t.Fatalf("ordinary wallet output page malformed: %#v", walletPage["outputs"])
+	}
+	for _, raw := range ordinaryWalletRows {
+		row := raw.(map[string]interface{})
+		if fmt.Sprintf("%s:%v", row["tx_hash"], row["out_idx"]) == expectedRef && row["amount_napr"] != nil {
+			t.Fatal("ordinary wallet page exposed confidential reward amount without earnings enrichment")
+		}
+	}
+	inlineWalletURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":          {string(address)},
+		"snapshot_id":      {snapshotID},
+		"include_earnings": {"1"},
+	}.Encode()
+	status, inlineWalletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, inlineWalletURL, nil)
+	if status != http.StatusOK || inlineWalletPage["earnings_index_ready"] != true {
+		t.Fatalf("inline earnings wallet page not pinned/ready: status=%d body=%#v", status, inlineWalletPage)
+	}
+	inlineRows, ok := inlineWalletPage["outputs"].([]interface{})
+	if !ok {
+		t.Fatalf("inline earnings wallet outputs malformed: %#v", inlineWalletPage["outputs"])
+	}
+	foundInlineReward := false
+	for _, raw := range inlineRows {
+		row := raw.(map[string]interface{})
+		if fmt.Sprintf("%s:%v", row["tx_hash"], row["out_idx"]) == expectedRef {
+			foundInlineReward = true
+			if row["amount_napr"] != expectedAmount {
+				t.Fatalf("inline reward amount=%v, want earnings-index amount %v", row["amount_napr"], expectedAmount)
+			}
+		}
+	}
+	if !foundInlineReward {
+		t.Fatalf("inline snapshot wallet page omitted the active indexed reward %s", expectedRef)
+	}
+
+	advancedHash, advancedHeight := advanceSyntheticLPoDV3(t, db, address, validator, validatorPub)
+	if advancedHeight != initialHeight+1 || advancedHash == initialHash {
+		t.Fatalf("live chain did not advance: height=%d hash=%x", advancedHeight, advancedHash[:])
+	}
+	legacyURL := httpServer.URL + "/api/v1/lpod/earnings-outputs?address=" + url.QueryEscape(string(address))
+	status, legacy := snapshotRequest(t, httpServer.Client(), http.MethodGet, legacyURL, nil)
+	if status != http.StatusServiceUnavailable || legacy["error"] != "finalized tip required" {
+		t.Fatalf("unpinned live earnings endpoint should reject the non-finalized tip: status=%d body=%#v", status, legacy)
+	}
+
+	status, after := snapshotRequest(t, httpServer.Client(), http.MethodGet, earningsURL, nil)
+	if status != http.StatusOK ||
+		after["snapshot_id"] != snapshotID ||
+		after["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		after["checkpoint_height"] != float64(initialHeight) ||
+		!reflect.DeepEqual(after["outputs"], before["outputs"]) {
+		t.Fatalf("earnings page changed with the live tip instead of staying pinned: status=%d body=%#v", status, after)
+	}
+
+	first := beforeRows[0].(map[string]interface{})
+	txHash, err := hex.DecodeString(first["tx_hash"].(string))
+	if err != nil || len(txHash) != 32 {
+		t.Fatalf("synthetic reward transaction hash malformed: %v", err)
+	}
+	addressHash := crypto.HashBytes([]byte(address))
+	indexKey := append([]byte("lpod/earnings-output/v2/"), addressHash[:]...)
+	var suffix [76]byte
+	binary.BigEndian.PutUint64(suffix[:8], uint64(first["block_height"].(float64)))
+	binary.BigEndian.PutUint32(suffix[8:12], uint32(first["out_idx"].(float64)))
+	copy(suffix[12:44], initialHash[:])
+	copy(suffix[44:], txHash)
+	indexKey = append(indexKey, suffix[:]...)
+	cursor := base64.RawURLEncoding.EncodeToString([]byte(
+		fmt.Sprintf("%x:%x", initialHash[:], indexKey),
+	))
+	continuationURL := snapshotURL(httpServer.URL, "/api/v1/lpod/earnings-outputs", address, snapshotID, cursor)
+	status, continuation := snapshotRequest(t, httpServer.Client(), http.MethodGet, continuationURL, nil)
+	if status != http.StatusOK ||
+		continuation["snapshot_id"] != snapshotID ||
+		continuation["checkpoint_hash"] != fmt.Sprintf("%x", initialHash[:]) ||
+		continuation["checkpoint_height"] != float64(initialHeight) {
+		t.Fatalf("snapshot-bound earnings cursor failed after live-tip change: status=%d body=%#v", status, continuation)
+	}
+	wrongBoundCursor := base64.RawURLEncoding.EncodeToString([]byte(
+		fmt.Sprintf("%x:%x", advancedHash[:], indexKey),
+	))
+	wrongBoundURL := snapshotURL(httpServer.URL, "/api/v1/lpod/earnings-outputs", address, snapshotID, wrongBoundCursor)
+	status, wrongBound := snapshotRequest(t, httpServer.Client(), http.MethodGet, wrongBoundURL, nil)
+	if status != http.StatusConflict ||
+		wrongBound["error"] != "cursor is bound to a different finalized checkpoint" ||
+		wrongBound["outputs"] != nil || wrongBound["next_cursor"] != nil {
+		t.Fatalf("earnings cursor from a different checkpoint was accepted: status=%d body=%#v", status, wrongBound)
+	}
+	server.walletSnapshots.mu.Lock()
+	entry := server.walletSnapshots.entries[snapshotID]
+	inflight, active := -1, server.walletSnapshots.active
+	if entry != nil {
+		inflight = entry.inflight
+	}
+	server.walletSnapshots.mu.Unlock()
+	if entry == nil || inflight != 0 || active != 1 {
+		t.Fatalf("checkpoint-mismatched cursor leaked or retired snapshot lease: entry=%v inflight=%d active=%d",
+			entry != nil, inflight, active)
+	}
+
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAddress := crypto.AddressFromKeys(crypto.MainnetByte, keys)
+	wrongAddressURL := snapshotURL(httpServer.URL, "/api/v1/lpod/earnings-outputs", otherAddress, snapshotID, "")
+	status, wrongAddress := snapshotRequest(t, httpServer.Client(), http.MethodGet, wrongAddressURL, nil)
+	if status != http.StatusConflict || wrongAddress["code"] != "SNAPSHOT_ADDRESS_MISMATCH" {
+		t.Fatalf("earnings endpoint accepted another address for the snapshot: status=%d body=%#v", status, wrongAddress)
+	}
+	if got := finalityCalls.Load(); got != 2 {
+		t.Fatalf("pinned earnings reads rechecked live finality: callback calls=%d, want 2 (capture and unpinned request)", got)
+	}
+	releaseURL := httpServer.URL + "/api/v1/wallet/snapshot?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	releaseStatus, released := snapshotRequest(t, httpServer.Client(), http.MethodDelete, releaseURL, nil)
+	if releaseStatus != http.StatusOK || released["released"] != true || activeSnapshotSessions(server.walletSnapshots) != 0 {
+		t.Fatalf("snapshot could not be released after checkpoint-mismatched cursor: status=%d body=%#v active=%d",
+			releaseStatus, released, activeSnapshotSessions(server.walletSnapshots))
+	}
+}
+
+func TestPinnedLPoDEarningsRejectMalformedCursorsWithoutPartialResults(t *testing.T) {
+	db, migration, address, _, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	tipHash, height, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(candidateHeight uint64, candidateHash crypto.Hash32) bool {
+		return candidateHeight == height && candidateHash == tipHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":  {string(address)},
+		"snapshot": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("create wallet snapshot: status=%d body=%#v", status, walletPage)
+	}
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+
+	validURL := snapshotURL(httpServer.URL, "/api/v1/lpod/earnings-outputs", address, snapshotID, "")
+	validStatus, validPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, validURL, nil)
+	validOutputs, outputsOK := validPage["outputs"].([]interface{})
+	if validStatus != http.StatusOK || !outputsOK || len(validOutputs) == 0 {
+		t.Fatalf("synthetic earnings snapshot has no valid page to protect: status=%d body=%#v", validStatus, validPage)
+	}
+
+	invalidHash := append(bytes.Repeat([]byte("0"), 63), 'g')
+	addressHash := crypto.HashBytes([]byte(address))
+	validAddressPrefix := append([]byte("lpod/earnings-output/v2/"), addressHash[:]...)
+	oversizedEnvelope := append(
+		[]byte(fmt.Sprintf("%x:", tipHash[:])),
+		bytes.Repeat([]byte("a"), 320)...,
+	)
+	oversizedCursor := base64.RawURLEncoding.EncodeToString(oversizedEnvelope)
+	nonHexRawKeyCursor := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%x:zz", tipHash[:])))
+	shortRawKeyCursor := base64.RawURLEncoding.EncodeToString(
+		[]byte(fmt.Sprintf("%x:%x", tipHash[:], validAddressPrefix)),
+	)
+	if len(oversizedCursor) <= 512 {
+		t.Fatalf("test cursor length=%d, want more than the handler's 512-byte limit", len(oversizedCursor))
+	}
+	cases := []struct {
+		name   string
+		cursor string
+	}{
+		{name: "invalid-base64", cursor: "%%%not-base64%%%"},
+		{name: "missing-key-separator", cursor: base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%x", tipHash[:])))},
+		{name: "invalid-checkpoint-hash-bytes", cursor: base64.RawURLEncoding.EncodeToString(append(append(invalidHash, ':'), 'a'))},
+		{name: "oversized-valid-base64-envelope", cursor: oversizedCursor},
+		{name: "non-hex-raw-leveldb-key", cursor: nonHexRawKeyCursor},
+		{name: "valid-hex-key-with-invalid-length", cursor: shortRawKeyCursor},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requestURL := snapshotURL(
+				httpServer.URL,
+				"/api/v1/lpod/earnings-outputs",
+				address,
+				snapshotID,
+				tc.cursor,
+			)
+			status, body := snapshotRequest(t, httpServer.Client(), http.MethodGet, requestURL, nil)
+			if status != http.StatusBadRequest || body["error"] != "invalid cursor" ||
+				body["outputs"] != nil || body["next_cursor"] != nil {
+				t.Fatalf("malformed cursor was not rejected without partial results: status=%d body=%#v", status, body)
+			}
+
+			server.walletSnapshots.mu.Lock()
+			entry := server.walletSnapshots.entries[snapshotID]
+			inflight, active := -1, server.walletSnapshots.active
+			if entry != nil {
+				inflight = entry.inflight
+			}
+			server.walletSnapshots.mu.Unlock()
+			if entry == nil || inflight != 0 || active != 1 {
+				t.Fatalf("malformed cursor request leaked or retired snapshot lease: entry=%v inflight=%d active=%d",
+					entry != nil, inflight, active)
+			}
+		})
+	}
+
+	releaseURL := httpServer.URL + "/api/v1/wallet/snapshot?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	releaseStatus, released := snapshotRequest(t, httpServer.Client(), http.MethodDelete, releaseURL, nil)
+	if releaseStatus != http.StatusOK || released["released"] != true || activeSnapshotSessions(server.walletSnapshots) != 0 {
+		t.Fatalf("snapshot could not be released after malformed cursor requests: status=%d body=%#v active=%d",
+			releaseStatus, released, activeSnapshotSessions(server.walletSnapshots))
+	}
+}
+
+func TestPinnedLPoDEarningsCorruptStoredRowIsAllOrNothingAndReleasable(t *testing.T) {
+	db, migration, address, dbPath, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	validRows, validNext, err := db.LPoDEarningsOutputs(address, "", 128)
+	if err != nil || len(validRows) == 0 || len(validRows) >= 128 || validNext != "" {
+		t.Fatalf("fixture needs a complete page of fewer than 128 valid indexed rewards: rows=%d next=%q err=%v",
+			len(validRows), validNext, err)
+	}
+	for _, row := range validRows {
+		if row.BlockHeight == ^uint64(0) {
+			t.Fatal("fixture reward height leaves no later LevelDB key for the malformed row")
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rawDB, err := leveldb.OpenFile(dbPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addressHash := crypto.HashBytes([]byte(address))
+	prefix := append([]byte("lpod/earnings-output/v2/"), addressHash[:]...)
+	corruptKey := make([]byte, len(prefix)+76)
+	copy(corruptKey, prefix)
+	for i := len(prefix); i < len(prefix)+8; i++ {
+		corruptKey[i] = 0xff
+	}
+	if err := rawDB.Put(corruptKey, []byte("{"), nil); err != nil {
+		_ = rawDB.Close()
+		t.Fatal(err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if rows, next, err := db.LPoDEarningsOutputs(address, "", 128); err == nil || rows != nil || next != "" {
+		t.Fatalf("corrupt stored row returned a partial unpinned page: rows=%d next=%q err=%v", len(rows), next, err)
+	}
+	tipHash, height, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(candidateHeight uint64, candidateHash crypto.Hash32) bool {
+		return candidateHeight == height && candidateHash == tipHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":  {string(address)},
+		"snapshot": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("create pinned wallet snapshot: status=%d body=%#v", status, walletPage)
+	}
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+
+	earningsURL := snapshotURL(httpServer.URL, "/api/v1/lpod/earnings-outputs", address, snapshotID, "")
+	status, page := snapshotRequest(t, httpServer.Client(), http.MethodGet, earningsURL, nil)
+	if status < http.StatusBadRequest || page["error"] == nil ||
+		page["outputs"] != nil || page["next_cursor"] != nil {
+		t.Fatalf("corrupt indexed row leaked a partial pinned page: status=%d body=%#v", status, page)
+	}
+
+	server.walletSnapshots.mu.Lock()
+	entry := server.walletSnapshots.entries[snapshotID]
+	inflight, active := -1, server.walletSnapshots.active
+	if entry != nil {
+		inflight = entry.inflight
+	}
+	server.walletSnapshots.mu.Unlock()
+	if entry == nil || inflight != 0 || active != 1 {
+		t.Fatalf("corrupt-row read leaked its reader lease: entry=%v inflight=%d active=%d",
+			entry != nil, inflight, active)
+	}
+
+	releaseURL := httpServer.URL + "/api/v1/wallet/snapshot?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	releaseStatus, released := snapshotRequest(t, httpServer.Client(), http.MethodDelete, releaseURL, nil)
+	if releaseStatus != http.StatusOK || released["released"] != true ||
+		activeSnapshotSessions(server.walletSnapshots) != 0 {
+		t.Fatalf("snapshot could not be deleted after corrupt-row response: status=%d body=%#v active=%d",
+			releaseStatus, released, activeSnapshotSessions(server.walletSnapshots))
+	}
+}
+
+func TestPinnedLPoDEarningsReleasesReaderAfterResponseWriteFailure(t *testing.T) {
+	db, migration, address, _, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	tipHash, height, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := db.LPoDEarningsOutputs(address, "", 128)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("synthetic wallet has no earnings output: rows=%d err=%v", len(rows), err)
+	}
+
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(candidateHeight uint64, candidateHash crypto.Hash32) bool {
+		return candidateHeight == height && candidateHash == tipHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":  {string(address)},
+		"snapshot": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK {
+		t.Fatalf("create wallet snapshot: status=%d body=%#v", status, walletPage)
+	}
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+
+	requestURL := "/api/v1/lpod/earnings-outputs?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	requestContext, cancel := context.WithCancel(context.Background())
+	failedWriter := &failedSnapshotResponseWriter{cancel: cancel}
+	server.ServeHTTP(
+		failedWriter,
+		httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(requestContext),
+	)
+	cancel()
+	if failedWriter.status != http.StatusOK || failedWriter.writeErr == nil {
+		t.Fatalf("pinned earnings response did not reach the failing writer: %#v", failedWriter)
+	}
+	if !bytes.Contains(failedWriter.attempted, []byte(fmt.Sprintf("%x", rows[0].TxHash[:]))) {
+		t.Fatal("failed response did not attempt to write the synthetic earnings row")
+	}
+
+	server.walletSnapshots.mu.Lock()
+	entry := server.walletSnapshots.entries[snapshotID]
+	inflight, active := -1, server.walletSnapshots.active
+	if entry != nil {
+		inflight = entry.inflight
+	}
+	server.walletSnapshots.mu.Unlock()
+	if entry == nil || inflight != 0 || active != 1 {
+		t.Fatalf("failed response changed snapshot lease state: entry=%v inflight=%d active=%d",
+			entry != nil, inflight, active)
+	}
+
+	releaseURL := httpServer.URL + "/api/v1/wallet/snapshot?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	releaseStatus, released := snapshotRequest(t, httpServer.Client(), http.MethodDelete, releaseURL, nil)
+	if releaseStatus != http.StatusOK || released["released"] != true || activeSnapshotSessions(server.walletSnapshots) != 0 {
+		t.Fatalf("snapshot could not be explicitly released after response failure: status=%d body=%#v active=%d",
+			releaseStatus, released, activeSnapshotSessions(server.walletSnapshots))
+	}
+}
+
+func TestPinnedLPoDEarningsRejectsCursorFromDifferentAddress(t *testing.T) {
+	db, migration, addressA, dbPath, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	keysB, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addressB := crypto.AddressFromKeys(crypto.MainnetByte, keysB)
+	if addressA == addressB {
+		t.Fatal("synthetic wallets unexpectedly share an address")
+	}
+
+	tipHash, height, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addressARows, _, err := db.LPoDEarningsOutputs(addressA, "", 128)
+	if err != nil || len(addressARows) == 0 {
+		t.Fatalf("synthetic wallet A has no earnings output to seed from: rows=%d err=%v", len(addressARows), err)
+	}
+	foreignRow := addressARows[0]
+	foreignRow.TxHash = crypto.HashBytes([]byte("synthetic-wallet-b-earnings-output"))
+	foreignRow.AmountNAPRO++
+	if err := db.Close(); err != nil {
+		t.Fatalf("close synthetic store before seeding wallet B earnings row: %v", err)
+	}
+	rawDB, err := leveldb.OpenFile(dbPath, nil)
+	if err != nil {
+		t.Fatalf("open synthetic LevelDB to seed wallet B earnings row: %v", err)
+	}
+	addressBHash := crypto.HashBytes([]byte(addressB))
+	foreignKey := append([]byte("lpod/earnings-output/v2/"), addressBHash[:]...)
+	var foreignSuffix [76]byte
+	binary.BigEndian.PutUint64(foreignSuffix[:8], foreignRow.BlockHeight)
+	binary.BigEndian.PutUint32(foreignSuffix[8:12], foreignRow.OutputIndex)
+	copy(foreignSuffix[12:44], tipHash[:])
+	copy(foreignSuffix[44:], foreignRow.TxHash[:])
+	foreignKey = append(foreignKey, foreignSuffix[:]...)
+	foreignValue, err := json.Marshal(foreignRow)
+	if err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("marshal synthetic wallet B earnings row: %v", err)
+	}
+	if err := rawDB.Put(foreignKey, foreignValue, nil); err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("seed synthetic wallet B earnings row: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close synthetic LevelDB after seeding wallet B earnings row: %v", err)
+	}
+	db, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen synthetic store after seeding wallet B earnings row: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	addressBRows, _, err := db.LPoDEarningsOutputs(addressB, "", 128)
+	if err != nil || len(addressBRows) != 1 || addressBRows[0].TxHash != foreignRow.TxHash {
+		t.Fatalf("synthetic wallet B earnings row unavailable: rows=%d err=%v", len(addressBRows), err)
+	}
+
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(candidateHeight uint64, candidateHash crypto.Hash32) bool {
+		return candidateHeight == height && candidateHash == tipHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":  {string(addressA)},
+		"snapshot": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK ||
+		walletPage["checkpoint_hash"] != fmt.Sprintf("%x", tipHash[:]) ||
+		walletPage["checkpoint_height"] != float64(height) {
+		t.Fatalf("create wallet A snapshot: status=%d body=%#v", status, walletPage)
+	}
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+
+	var cursorAddressSuffix [76]byte
+	binary.BigEndian.PutUint64(cursorAddressSuffix[:8], foreignRow.BlockHeight)
+	binary.BigEndian.PutUint32(cursorAddressSuffix[8:12], foreignRow.OutputIndex)
+	copy(cursorAddressSuffix[12:44], tipHash[:])
+	copy(cursorAddressSuffix[44:], foreignRow.TxHash[:])
+	foreignCursorKey := append([]byte("lpod/earnings-output/v2/"), addressBHash[:]...)
+	foreignCursorKey = append(foreignCursorKey, cursorAddressSuffix[:]...)
+	cursor := base64.RawURLEncoding.EncodeToString([]byte(
+		fmt.Sprintf("%x:%x", tipHash[:], foreignCursorKey),
+	))
+	foreignCursorURL := snapshotURL(
+		httpServer.URL,
+		"/api/v1/lpod/earnings-outputs",
+		addressA,
+		snapshotID,
+		cursor,
+	)
+	status, rejected := snapshotRequest(t, httpServer.Client(), http.MethodGet, foreignCursorURL, nil)
+	if status != http.StatusBadRequest || rejected["error"] != "invalid cursor" ||
+		rejected["outputs"] != nil || rejected["next_cursor"] != nil {
+		t.Fatalf("snapshot earnings endpoint accepted another wallet's index cursor: status=%d body=%#v", status, rejected)
+	}
+
+	server.walletSnapshots.mu.Lock()
+	entry := server.walletSnapshots.entries[snapshotID]
+	inflight := -1
+	if entry != nil {
+		inflight = entry.inflight
+	}
+	server.walletSnapshots.mu.Unlock()
+	if entry == nil || inflight != 0 {
+		t.Fatalf("failed cursor request leaked a snapshot reader lease: entry=%v inflight=%d", entry != nil, inflight)
+	}
+
+	releaseURL := httpServer.URL + "/api/v1/wallet/snapshot?" + url.Values{
+		"address":     {string(addressA)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	releaseStatus, released := snapshotRequest(t, httpServer.Client(), http.MethodDelete, releaseURL, nil)
+	if releaseStatus != http.StatusOK || released["released"] != true || activeSnapshotSessions(server.walletSnapshots) != 0 {
+		t.Fatalf("snapshot lease could not be released after invalid cursor: status=%d body=%#v active=%d",
+			releaseStatus, released, activeSnapshotSessions(server.walletSnapshots))
+	}
+}
+
+func TestWalletSnapshotUsesLegacyWalletPagesButRejectsUnreadyEarningsIndex(t *testing.T) {
+	db, migration, address, dbPath, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rawDB, err := leveldb.OpenFile(dbPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rawDB.Delete([]byte("lpod/earnings-ready/v2"), nil); err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("remove only the earnings readiness marker: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen test chain without earnings readiness: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	initialHash, initialHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(height uint64, hash crypto.Hash32) bool {
+		return height == initialHeight && hash == initialHash
+	})
+	server.SetWalletSnapshotCapture(func() (*store.WalletReadSnapshot, error) {
+		return db.NewWalletReadSnapshot()
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	createURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + url.Values{
+		"address":          {string(address)},
+		"snapshot":         {"1"},
+		"include_earnings": {"1"},
+	}.Encode()
+	status, walletPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, createURL, nil)
+	if status != http.StatusOK || walletPage["earnings_index_ready"] != false {
+		t.Fatalf("unready earnings index should select the pinned legacy wallet path: status=%d body=%#v", status, walletPage)
+	}
+	rows, ok := walletPage["outputs"].([]interface{})
+	if !ok || len(rows) == 0 {
+		t.Fatalf("pinned legacy wallet page omitted spendability-checked outputs: %#v", walletPage)
+	}
+	for _, raw := range rows {
+		row, ok := raw.(map[string]interface{})
+		if !ok || row["amount_napr"] != nil {
+			t.Fatalf("unready earnings metadata leaked into legacy wallet row: %#v", raw)
+		}
+	}
+
+	snapshotID := stringField(t, walletPage, "snapshot_id")
+	earningsURL := httpServer.URL + "/api/v1/lpod/earnings-outputs?" + url.Values{
+		"address":     {string(address)},
+		"snapshot_id": {snapshotID},
+	}.Encode()
+	status, earningsPage := snapshotRequest(t, httpServer.Client(), http.MethodGet, earningsURL, nil)
+	if status != http.StatusServiceUnavailable || earningsPage["code"] != "EARNINGS_INDEX_NOT_READY" {
+		t.Fatalf("unready earnings index must fail closed, not return a partial page: status=%d body=%#v", status, earningsPage)
+	}
+	if earningsPage["outputs"] != nil || earningsPage["next_cursor"] != nil {
+		t.Fatalf("unready earnings response exposed partial index rows or a continuation cursor: %#v", earningsPage)
 	}
 }
 
@@ -618,10 +1286,11 @@ func syntheticWalletSnapshotLPoDV3Funding(t *testing.T) (
 }
 
 type failedSnapshotResponseWriter struct {
-	header   http.Header
-	status   int
-	writeErr error
-	cancel   context.CancelFunc
+	header    http.Header
+	status    int
+	writeErr  error
+	attempted []byte
+	cancel    context.CancelFunc
 }
 
 func (w *failedSnapshotResponseWriter) Header() http.Header {
@@ -633,10 +1302,11 @@ func (w *failedSnapshotResponseWriter) Header() http.Header {
 
 func (w *failedSnapshotResponseWriter) WriteHeader(status int) { w.status = status }
 
-func (w *failedSnapshotResponseWriter) Write([]byte) (int, error) {
+func (w *failedSnapshotResponseWriter) Write(p []byte) (int, error) {
 	if w.cancel != nil {
 		w.cancel()
 	}
+	w.attempted = append(w.attempted, p...)
 	w.writeErr = errors.New("simulated disconnected client")
 	return 0, w.writeErr
 }
@@ -651,6 +1321,7 @@ func seedWalletSnapshotAPIFixture(
 	db *store.DB,
 	path string,
 	address crypto.Address,
+	additionalAddresses ...crypto.Address,
 ) (*store.DB, snapshotRef, snapshotRef, crypto.KeyImage, crypto.KeyImage, crypto.Hash32, uint64) {
 	t.Helper()
 	tipHash, height, err := db.GetTip()
@@ -690,25 +1361,34 @@ func seedWalletSnapshotAPIFixture(
 		t.Fatal(err)
 	}
 
-	addrHash := crypto.HashBytes([]byte(address))
-	prefix := append([]byte("lpod/wallet/v1/"), addrHash[:]...)
 	type walletOutput struct {
-		hash  crypto.Hash32
-		index uint32
-		value store.StoredUTXO
+		prefix []byte
+		hash   crypto.Hash32
+		index  uint32
+		value  store.StoredUTXO
 	}
-	indexed := make([]walletOutput, 129)
-	for i := range indexed {
-		hash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-indexed-output-%03d", i)))
-		value := store.StoredUTXO{TxHash: hash, OutputIndex: uint32(i), BlockHeight: height}
-		keyHash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-one-time-pub-%03d", i)))
-		copy(value.OneTimePub[:], keyHash[:])
-		txPubHash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-tx-pub-%03d", i)))
-		copy(value.TxPubKey[:], txPubHash[:])
-		if err := db.PutUTXO(hash, uint32(i), &value); err != nil {
-			t.Fatal(err)
+	indexed := make([]walletOutput, 0, 129*(1+len(additionalAddresses)))
+	owners := append([]crypto.Address{address}, additionalAddresses...)
+	for ownerIndex, owner := range owners {
+		addrHash := crypto.HashBytes([]byte(owner))
+		prefix := append([]byte("lpod/wallet/v1/"), addrHash[:]...)
+		ownerTag := ""
+		if ownerIndex > 0 {
+			ownerHash := crypto.HashBytes([]byte(owner))
+			ownerTag = fmt.Sprintf("%x-", ownerHash[:4])
 		}
-		indexed[i] = walletOutput{hash: hash, index: uint32(i), value: value}
+		for i := 0; i < 129; i++ {
+			hash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-indexed-output-%s%03d", ownerTag, i)))
+			value := store.StoredUTXO{TxHash: hash, OutputIndex: uint32(i), BlockHeight: height}
+			keyHash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-one-time-pub-%s%03d", ownerTag, i)))
+			copy(value.OneTimePub[:], keyHash[:])
+			txPubHash := crypto.HashBytes([]byte(fmt.Sprintf("wallet-snapshot-tx-pub-%s%03d", ownerTag, i)))
+			copy(value.TxPubKey[:], txPubHash[:])
+			if err := db.PutUTXO(hash, uint32(i), &value); err != nil {
+				t.Fatal(err)
+			}
+			indexed = append(indexed, walletOutput{prefix: prefix, hash: hash, index: uint32(i), value: value})
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -721,7 +1401,7 @@ func seedWalletSnapshotAPIFixture(
 		var suffix [12]byte
 		binary.BigEndian.PutUint64(suffix[:8], height)
 		binary.BigEndian.PutUint32(suffix[8:], row.index)
-		key := append([]byte(nil), prefix...)
+		key := append([]byte(nil), row.prefix...)
 		key = append(key, suffix[:]...)
 		key = append(key, tipHash[:]...)
 		key = append(key, row.hash[:]...)
@@ -771,8 +1451,8 @@ func advanceSyntheticLPoDV3(
 	request := &store.LPoDSettlement{
 		Parent: parentHash, PositionProtocol: true,
 		Transactions: extraTransactions,
-		Timestamp: parent.Header.Timestamp + 3_000_000_000,
-		Proposer:  validatorPub.Hex(), Leader: leader,
+		Timestamp:    parent.Header.Timestamp + 3_000_000_000,
+		Proposer:     validatorPub.Hex(), Leader: leader,
 		Stake: map[string]store.LPoDValidatorStake{
 			validatorPub.Hex(): {Amount: 100_000 * 100_000_000, Active: true},
 		},
@@ -1007,5 +1687,87 @@ func TestWalletOutputSnapshotRenewsFromRawResumeCursorAtFixedTarget(t *testing.T
 	status, wrongTarget := snapshotRequest(t, httpServer.Client(), http.MethodGet, wrongTargetURL, nil)
 	if status != http.StatusConflict || wrongTarget["code"] != "SNAPSHOT_CURSOR_MISMATCH" {
 		t.Fatalf("renewed lease silently expanded its original through target: status=%d body=%#v", status, wrongTarget)
+	}
+}
+
+func TestLegacyWalletOutputsRejectCursorFromDifferentAddress(t *testing.T) {
+	db, migration, addressA, dbPath, _, _ := syntheticWalletSnapshotLPoDV3Funding(t)
+	otherKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addressB := crypto.AddressFromKeys(crypto.MainnetByte, otherKeys)
+	if addressA == addressB {
+		t.Fatal("synthetic wallets unexpectedly share an address")
+	}
+	db, _, _, _, _, tipHash, height := seedWalletSnapshotAPIFixture(t, db, dbPath, addressA, addressB)
+	server := snapshotTestServer(snapshotTestChain(t), core.NewMempool(core.DefaultMempoolConfig()))
+	server.SetStore(db)
+	server.SetLPoDConfig(migration, func(candidateHeight uint64, candidateHash crypto.Hash32) bool {
+		return candidateHeight == height && candidateHash == tipHash
+	})
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.walletSnapshots.closeAll()
+		httpServer.Close()
+	})
+
+	addressAQuery := url.Values{"address": {string(addressA)}}
+	firstAURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + addressAQuery.Encode()
+	firstAStatus, firstA := snapshotRequest(
+		t,
+		httpServer.Client(),
+		http.MethodGet,
+		firstAURL,
+		nil,
+	)
+	firstARows, ok := firstA["outputs"].([]interface{})
+	cursorA, cursorOK := firstA["next_cursor"].(string)
+	if firstAStatus != http.StatusOK || !ok || len(firstARows) != 128 || !cursorOK || cursorA == "" {
+		t.Fatalf("wallet A first output page: status=%d body=%#v", firstAStatus, firstA)
+	}
+	firstARow, ok := firstARows[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("wallet A first output is malformed: %#v", firstARows[0])
+	}
+
+	reusedQuery := url.Values{
+		"address": {string(addressB)},
+		"cursor":  {cursorA},
+	}
+	reusedURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + reusedQuery.Encode()
+	reusedStatus, reused := snapshotRequest(
+		t,
+		httpServer.Client(),
+		http.MethodGet,
+		reusedURL,
+		nil,
+	)
+	if reusedStatus != http.StatusBadRequest || reused["error"] != "invalid cursor" || reused["outputs"] != nil {
+		t.Fatalf("wallet A cursor was not rejected for wallet B: status=%d body=%#v", reusedStatus, reused)
+	}
+
+	addressBQuery := url.Values{"address": {string(addressB)}}
+	firstBURL := httpServer.URL + "/api/v1/lpod/wallet-outputs?" + addressBQuery.Encode()
+	firstBStatus, firstB := snapshotRequest(
+		t,
+		httpServer.Client(),
+		http.MethodGet,
+		firstBURL,
+		nil,
+	)
+	firstBRows, ok := firstB["outputs"].([]interface{})
+	if firstBStatus != http.StatusOK || !ok || len(firstBRows) != 128 || firstB["next_cursor"] == "" {
+		t.Fatalf("wallet B first output page: status=%d body=%#v", firstBStatus, firstB)
+	}
+	firstBRow, ok := firstBRows[0].(map[string]interface{})
+	if !ok || firstBRow["tx_hash"] == firstARow["tx_hash"] {
+		t.Fatalf("wallet B page exposed wallet A's first output: A=%#v B=%#v", firstARow, firstBRow)
+	}
+	for i, value := range firstBRows {
+		row, ok := value.(map[string]interface{})
+		if !ok || row["out_idx"] != float64(i) {
+			t.Fatalf("wallet B's own page is out of order at index %d: %#v", i, value)
+		}
 	}
 }

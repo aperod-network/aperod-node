@@ -405,5 +405,8 @@ func (d *DB) LPoDEarningsOutputs(address crypto.Address, cursor string, limit in
 	if !ok {
 		next = ""
 	}
-	return rows, next, iter.Error()
+	if err := iter.Error(); err != nil {
+		return nil, "", err
+	}
+	return rows, next, nil
 }

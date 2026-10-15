@@ -141,7 +141,7 @@ func TestRingCTV5RejectsStakedCollateralAcrossRestartAndRollback(t *testing.T) {
 	set := core.NewUTXOSetWithDB(db)
 	set.SetCLSAGActivationHeight(1)
 	set.Add(&owned[0].UTXO)
-const stakedCollateralActivationHeight = uint64(2_880_000)
+const stakedCollateralActivationHeight = uint64(2_950_000)
 verifier := core.NewTxVerifier(set)
 verifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActivationHeight)
 

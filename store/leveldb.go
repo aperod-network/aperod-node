@@ -42,6 +42,7 @@ ringMu      sync.Mutex // serializes canonical rm/ and dense sampling-index writ
 
 // Open opens or creates a LevelDB database at path.
 func Open(path string) (*DB, error) {
+	if err := CheckRingMaintenanceFence(path); err != nil { return nil, err }
 	opts := &opt.Options{
 		BlockCacheCapacity:  32 * opt.MiB,
 		WriteBuffer:         16 * opt.MiB,
@@ -57,6 +58,7 @@ func Open(path string) (*DB, error) {
 // OpenReadOnly opens an existing LevelDB without recovery, compaction or writes.
 // The caller must close the returned handle.
 func OpenReadOnly(path string) (*DB, error) {
+	if err := CheckRingMaintenanceFence(path); err != nil { return nil, err }
 	opts := &opt.Options{ReadOnly: true, ErrorIfMissing: true}
 	db, err := leveldb.OpenFile(path, opts)
 	if err != nil {
