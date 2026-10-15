@@ -8,6 +8,7 @@ package api_test
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -74,12 +75,12 @@ func TestREST_AddressUTXOs_StealthDiscoveredByViewKeyHeader(t *testing.T) {
 	}
 
 	// amount_napr must be populated and correct.
-	gotAmt, ok := entry["amount_napr"].(float64)
+	gotAmt, ok := entry["amount_napr"].(string)
 	if !ok || entry["amount_napr"] == nil {
 		t.Fatalf("amount_napr = %v (type %T), want %d (must be populated when view key provided)", entry["amount_napr"], entry["amount_napr"], wantAmount)
 	}
-	if uint64(gotAmt) != wantAmount {
-		t.Errorf("amount_napr = %d, want %d", uint64(gotAmt), wantAmount)
+	if gotAmt != fmt.Sprint(wantAmount) {
+		t.Errorf("amount_napr = %s, want %d", gotAmt, wantAmount)
 	}
 }
 
@@ -113,12 +114,36 @@ func TestREST_AddressUTXOs_StealthDiscoveredByNodeViewKey(t *testing.T) {
 	}
 	entry := list[0].(map[string]interface{})
 
-	gotAmt, ok := entry["amount_napr"].(float64)
+	gotAmt, ok := entry["amount_napr"].(string)
 	if !ok || entry["amount_napr"] == nil {
 		t.Fatalf("amount_napr = %v, want %d (node-configured view key must decode amount)", entry["amount_napr"], wantAmount)
 	}
-	if uint64(gotAmt) != wantAmount {
-		t.Errorf("amount_napr = %d, want %d", uint64(gotAmt), wantAmount)
+	if gotAmt != fmt.Sprint(wantAmount) {
+		t.Errorf("amount_napr = %s, want %d", gotAmt, wantAmount)
+	}
+}
+
+// Wire-boundary test, not a claim that uint64-max issuance is permitted by
+// consensus. The real canonical large-wallet funding witness is in consensus.
+func TestREST_AddressUTXOs_ExactUint64Strings(t *testing.T) {
+	for _, amount := range []uint64{1<<53 - 1, 1 << 53, 1<<53 + 1, 9_990_000_000_000_000, ^uint64(0)} {
+		t.Run(fmt.Sprint(amount), func(t *testing.T) {
+			srv, utxos := buildUTXOServer(t)
+			wk, err := crypto.GenerateWalletKeys()
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+			makeStealthUTXO(t, utxos, wk.Spend.Public, wk.View.Public, amount, 0x42)
+			code, resp := restGetHeader(t, srv, "/api/v1/address/"+string(addr)+"/utxos", "X-View-Key", hex.EncodeToString(wk.View.Private[:]))
+			if code != http.StatusOK {
+				t.Fatalf("HTTP %d", code)
+			}
+			rows := resp["utxos"].([]interface{})
+			if len(rows) != 1 || rows[0].(map[string]interface{})["amount_napr"] != fmt.Sprint(amount) {
+				t.Fatalf("uint64 not serialized as exact decimal string: %v", rows)
+			}
+		})
 	}
 }
 

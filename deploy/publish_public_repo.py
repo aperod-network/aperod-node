@@ -37,8 +37,10 @@ aperod-node
 build/
 __pycache__/
 """
-MESSAGE = ("chore: maintain verified source distribution\n\n"
-           "Co-authored-by: aperod-network <aperod-network@users.noreply.github.com>")
+MESSAGE = "chore: maintain verified source distribution"
+MERGE_MESSAGE = "Verified source distribution through protected pull request."
+GITHUB_ACTIONS_APP_ID = 15368
+TRUSTED_CHECK_APP_IDS = {"CodeQL": 57789}
 REQUIRED_CHECKS = {
     "Whole-tree publication security",
     "go build & vet & test",
@@ -46,6 +48,7 @@ REQUIRED_CHECKS = {
     "install-node.sh e2e smoke test (validator)",
     "install-node.sh e2e smoke test (update)",
     "install-node.sh e2e smoke test (upgrade)",
+    "CodeQL",
     "Analyze (actions)",
     "Analyze (go)",
     "Analyze (javascript-typescript)",
@@ -245,8 +248,11 @@ def await_merge(pr, request, timeout=900):
             raise RuntimeError("Publication PR closed without merging")
         sha = pull["head"]["sha"]
         checks = request("GET", f"{API}/commits/{sha}/check-runs?per_page=100")["check_runs"]
-        trusted = {c["name"]: c for c in sorted(checks, key=lambda c: c.get("id", 0))
-                   if c.get("app", {}).get("id") == 15368}
+        trusted = {
+            c["name"]: c for c in sorted(checks, key=lambda c: c.get("id", 0))
+            if c.get("app", {}).get("id") ==
+            TRUSTED_CHECK_APP_IDS.get(c["name"], GITHUB_ACTIONS_APP_ID)
+        }
         for name in required:
             check = trusted.get(name)
             if check and check["status"] == "completed" and check["conclusion"] != "success":
@@ -256,7 +262,7 @@ def await_merge(pr, request, timeout=900):
             result = request("PUT", f"{API}/pulls/{pr['number']}/merge", {
                 "sha": sha, "merge_method": "merge",
                 "commit_title": "chore: maintain verified source distribution",
-                "commit_message": "Co-authored-by: aperod-network <aperod-network@users.noreply.github.com>"})
+                "commit_message": MERGE_MESSAGE})
             if not result.get("merged"):
                 raise RuntimeError("Required branch policy refused the verified merge")
             print("Verified publication merged:", pr["html_url"])

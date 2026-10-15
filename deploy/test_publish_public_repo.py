@@ -18,6 +18,15 @@ def fixture(root):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_publication_uses_only_aperod_network_as_author(self):
+        self.assertEqual(
+            publisher.AUTHOR,
+            {"name": "aperod-network", "email": "aperod-network@users.noreply.github.com"},
+        )
+        self.assertEqual(publisher.MESSAGE, "chore: maintain verified source distribution")
+        self.assertNotIn("Co-authored-by:", publisher.MESSAGE)
+        self.assertNotIn("Co-authored-by:", publisher.MERGE_MESSAGE)
+
     def test_candidate_symlink_cannot_overwrite_external_file(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -108,7 +117,8 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
-                 "app": {"id": 15368}}
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
                 for name in publisher.REQUIRED_CHECKS
             ]}
 
@@ -118,7 +128,7 @@ class PublisherTests(unittest.TestCase):
 
     def test_failed_codeql_check_never_merges(self):
         methods = []
-        failed = "Analyze (go)"
+        failed = "CodeQL"
 
         def request(method, url, data=None):
             methods.append(method)
@@ -127,7 +137,8 @@ class PublisherTests(unittest.TestCase):
             return {"check_runs": [
                 {"name": name, "status": "completed",
                  "conclusion": "failure" if name == failed else "success",
-                 "app": {"id": 15368}}
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
                 for name in publisher.REQUIRED_CHECKS
             ]}
 
@@ -141,9 +152,13 @@ class PublisherTests(unittest.TestCase):
             methods.append(method)
             if url.endswith("/pulls/1"):
                 return {"state": "open", "head": {"sha": "reviewed"}}
-            return {"check_runs": [{"name": name, "status": "completed",
-                                   "conclusion": "success", "app": {"id": 999}}
-                                  for name in ("Whole-tree publication security", "go build & vet & test")]}
+            return {"check_runs": [
+                {"name": name, "status": "completed", "conclusion": "success",
+                 "app": {"id": publisher.GITHUB_ACTIONS_APP_ID if name == "CodeQL"
+                         else publisher.TRUSTED_CHECK_APP_IDS.get(
+                             name, publisher.GITHUB_ACTIONS_APP_ID)}}
+                for name in publisher.REQUIRED_CHECKS
+            ]}
         with patch.object(publisher.time, "monotonic", side_effect=[0, 0, 2]), \
              patch.object(publisher.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "did not complete"):
@@ -159,7 +174,9 @@ class PublisherTests(unittest.TestCase):
             if url.endswith("/pulls/1"):
                 return {"state": "open", "head": {"sha": "reviewed"}}
             return {"check_runs": [{"name": name, "status": "completed",
-                                   "conclusion": "success", "app": {"id": 15368}}
+                                   "conclusion": "success",
+                                   "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                                       name, publisher.GITHUB_ACTIONS_APP_ID)}}
                                    for name in publisher.REQUIRED_CHECKS]}
         publisher.await_merge({"number": 1, "html_url": "test"}, request)
         self.assertEqual(bodies[0]["sha"], "reviewed")

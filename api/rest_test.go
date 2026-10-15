@@ -346,6 +346,64 @@ func TestREST_AddressTxs_IsCoinbaseFlagged(t *testing.T) {
 	}
 }
 
+func TestREST_AddressTxsUsesNewestRetainedBlocks(t *testing.T) {
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatalf("GenerateValidatorKey: %v", err)
+	}
+	spendPub := crypto.Point32(pub)
+	makeBlock := func(height uint64, prev crypto.Hash32) *core.Block {
+		txs := []core.Transaction{core.CoinbaseTx(spendPub, 1_000_000+height)}
+		header := core.BlockHeader{
+			Height:       height,
+			PrevHash:     prev,
+			Timestamp:    time.Now().UnixNano() + int64(height),
+			ValidatorPub: pub,
+			MerkleRoot:   core.MerkleRoot(txs),
+		}
+		if err := header.Sign(priv); err != nil {
+			t.Fatalf("Sign block %d: %v", height, err)
+		}
+		return &core.Block{Header: header, Txs: txs}
+	}
+
+	chain := core.NewChain(3)
+	prev := makeBlock(0, crypto.Hash32{})
+	if err := chain.SetGenesis(prev); err != nil {
+		t.Fatalf("SetGenesis: %v", err)
+	}
+	for height := uint64(1); height <= 5; height++ {
+		block := makeBlock(height, prev.Hash())
+		if err := chain.AddBlock(block); err != nil {
+			t.Fatalf("AddBlock(%d): %v", height, err)
+		}
+		prev = block
+	}
+
+	srv := api.NewServer(":0", chain, core.NewMempool(core.DefaultMempoolConfig()), core.NewUTXOSet(), testLogger())
+	addr := crypto.EncodeAddress(crypto.MainnetByte, spendPub, spendPub)
+	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/transactions?limit=10")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	txs, ok := resp["transactions"].([]interface{})
+	if !ok {
+		t.Fatalf("transactions = %T, want array", resp["transactions"])
+	}
+	if len(txs) != 3 {
+		t.Fatalf("got %d transactions, want only the 3 retained blocks", len(txs))
+	}
+	for i, wantHeight := range []float64{5, 4, 3} {
+		tx, ok := txs[i].(map[string]interface{})
+		if !ok {
+			t.Fatalf("transactions[%d] = %T, want object", i, txs[i])
+		}
+		if got := tx["block_height"]; got != wantHeight {
+			t.Errorf("transactions[%d].block_height = %v, want %v", i, got, wantHeight)
+		}
+	}
+}
+
 func TestREST_AddressTxs_MethodNotAllowed(t *testing.T) {
 	srv, _ := buildChainServer(t, 0)
 	wk, _ := crypto.GenerateWalletKeys()
@@ -872,7 +930,7 @@ func TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey(t *testing.T) {
 	}
 	if entry["amount_napr"] == nil {
 		t.Error("with view key: amount_napr must be decoded (non-null) for stealth output")
-	} else if uint64(entry["amount_napr"].(float64)) != testAmountNapr {
+	} else if entry["amount_napr"] != fmt.Sprint(testAmountNapr) {
 		t.Errorf("with view key: amount_napr = %v, want %d", entry["amount_napr"], testAmountNapr)
 	}
 }
@@ -1226,7 +1284,7 @@ func TestREST_AddressScan_PostViewKey(t *testing.T) {
 	entry := list[0].(map[string]interface{})
 	if entry["amount_napr"] == nil {
 		t.Error("amount_napr must be non-null when view key is provided via POST body")
-	} else if uint64(entry["amount_napr"].(float64)) != testAmt {
+	} else if entry["amount_napr"] != fmt.Sprint(testAmt) {
 		t.Errorf("amount_napr = %v, want %d", entry["amount_napr"], testAmt)
 	}
 }

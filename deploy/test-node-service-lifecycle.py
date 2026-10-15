@@ -68,9 +68,9 @@ def source(name):
                                "require github.com/syndtr/goleveldb v1.0.0\n")
     (path / "Makefile").write_text(
         "deps:\n\tgo mod download\nbuild:\n\tmkdir -p build\n"
-        "\tgo build -o build/aperod-node ./cmd/node\n"
-        "\tgo build -o build/aperod ./cmd/aperod\n"
-        "\tgo build -o build/store ./cmd/store\n")
+        "\tgo build -trimpath -o build/aperod-node ./cmd/node\n"
+        "\tgo build -trimpath -o build/aperod ./cmd/aperod\n"
+        "\tgo build -trimpath -o build/store ./cmd/store\n")
     (path / ".gitignore").write_text("/build/\n")
     run("go", "-C", path, "mod", "tidy")
     run("git", "init", "-qb", "main", path)
@@ -93,11 +93,39 @@ bad_pin = git(new, "rev-parse", "HEAD")
 assert root_sha != pin != bad_pin
 node_source.write_text(node_source.read_text().replace("const unhealthy = true", "const unhealthy = false"))
 makefile = new / "Makefile"
-makefile.write_text(makefile.read_text() + "\ttouch /fixture/build-control/build-ready\n"
-                    "\twhile [ ! -f /fixture/build-control/build-release ]; do sleep 0.1; done\n")
+makefile.write_text(
+    makefile.read_text()
+    + '\t@if [ "$(LIFECYCLE_SKIP_BUILD_BARRIER)" = "1" ]; then :; else '
+      "touch /fixture/build-control/build-ready; "
+      "while [ ! -f /fixture/build-control/build-release ]; do sleep 0.1; done; fi\n"
+)
 git(new, "add", ".")
 git(new, "commit", "-qm", "Synthetic approval-race build barrier")
 race_pin = git(new, "rev-parse", "HEAD")
+
+
+def approved_candidate_hash(commit, *, skip_build_barrier=False):
+    worktree = ROOT / ("approved-source-" + commit[:12])
+    run("git", "-C", new, "worktree", "add", "--detach", worktree, commit)
+    build_env = {**env, "CGO_ENABLED": "0", "GOWORK": "off", "GOFLAGS": "",
+                 "GOENV": "off", "GOAMD64": "v1"}
+    try:
+        make_args = ["make", "-C", worktree, "CGO_ENABLED=0"]
+        if skip_build_barrier:
+            make_args.append("LIFECYCLE_SKIP_BUILD_BARRIER=1")
+        make_args.append("build")
+        run(*make_args, custom=build_env)
+        binary = worktree / "build/aperod-node"
+        info = run("go", "version", "-m", binary, custom=build_env).stdout
+        assert f"vcs.revision={commit}" in info, "fixture binary lost selected-commit provenance"
+        assert "vcs.modified=false" in info, "fixture binary was built from a modified worktree"
+        return digest(binary)
+    finally:
+        subprocess.run(["git", "-C", str(new), "worktree", "remove", "--force",
+                        str(worktree)], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.STDOUT, timeout=30)
+
+
 # Modify trusted fixture identities in a COPIED bootstrap helper only. Every
 # production origin/root/pin/baseline/provenance guard is otherwise executed.
 bootstrap = ROOT / "bootstrap"
@@ -192,6 +220,12 @@ if MODE in ("install", "validator"):
 # hooks. Never use it as the build source or mutate its Git metadata.
 old_repo = source("old")
 run("go", "-C", old_repo, "build", "-o", ROOT / "old-binary", "./cmd/node")
+ring_index_approved_hashes = [
+    digest(ROOT / "old-binary"),
+    approved_candidate_hash(pin),
+    approved_candidate_hash(bad_pin),
+    approved_candidate_hash(race_pin, skip_build_barrier=True),
+]
 run("systemctl", "stop", "aperod-node")
 shutil.copy2(ROOT / "old-binary", BINARY)
 run("systemctl", "start", "aperod-node")
@@ -216,8 +250,44 @@ run("chown", "-R", "aperod:aperod", data)
 config = Path("/etc/aperod/node.yaml")
 config.write_text("data_dir: /var/lib/aperod/data\nconsensus:\n"
                   "  validator_key: /var/lib/aperod/data/validator.key\n")
+ring_tool = Path("/usr/local/libexec/aperod-ring-index-maintenance")
+ring_policy = Path("/etc/aperod/ring-index-maintenance/policy.json")
+ring_policy.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+ring_policy.parent.chmod(0o755)
+unit_hash = hashlib.sha256(b"synthetic lifecycle unit fixture").hexdigest()
+policy = {
+    "schema": 1,
+    "approval_id": "lifecycle-fixture",
+    "tool_sha256": digest(ring_tool),
+    "operation": "repair",
+    "data_dir": str(data),
+    "db_path": str(data / "chain.db"),
+    "backup_root": "/var/lib/aperod/ring-index-maintenance-backups",
+    "config_path": str(config),
+    "config_sha256": digest(config),
+    "node_binary": str(BINARY),
+    "index_aware_binaries": sorted(set(ring_index_approved_hashes)),
+    "clients": [{
+        "name": "fixture-client.service",
+        "files": {"/etc/systemd/system/fixture-client.service": unit_hash},
+    }],
+    "writers": [{
+        "name": "fixture-writer.service",
+        "files": {"/etc/systemd/system/fixture-writer.service": unit_hash},
+    }],
+    "legacy": {
+        "name": "fixture-legacy.service",
+        "files": {"/etc/systemd/system/fixture-legacy.service": unit_hash},
+    },
+    "legacy_binary": str(ROOT / "old-binary"),
+    "legacy_sha256": digest(ROOT / "old-binary"),
+    "allow_cold_prepare": False,
+}
+ring_policy.write_text(json.dumps(policy, separators=(",", ":")) + "\n")
+ring_policy.chmod(0o644)
+protected_paths = [OLD, data, config, ring_tool, ring_policy]
 protected = {str(p): manifest(p) if p.is_dir() else [digest(p), p.stat().st_mode,
-              p.stat().st_uid, p.stat().st_gid] for p in (OLD, data, config)}
+               p.stat().st_uid, p.stat().st_gid] for p in protected_paths}
 
 
 def unchanged():
