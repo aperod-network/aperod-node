@@ -404,7 +404,7 @@ func TestBadBlockBan_ValidBlockResetsCounter(t *testing.T) {
 	}
 }
 
-// ─── Test: custom BadBlockBanThreshold is honoured ───────────────────────────
+// ─── Test: custom BadBlockBanThreshold is honored ───────────────────────────
 
 // TestBadBlockBan_CustomThreshold configures a ban threshold of 3 (not the
 // default 10) and verifies the peer is banned after exactly 3 bad blocks.
@@ -456,7 +456,7 @@ func TestBadBlockBan_CustomThreshold(t *testing.T) {
 	}
 }
 
-// ─── Test: custom BadBlockHeightLead is honoured ─────────────────────────────
+// ─── Test: custom BadBlockHeightLead is honored ─────────────────────────────
 
 // TestBadBlockBan_CustomHeightLead configures a height lead of 50 (not the
 // default 1000) and verifies that a block at ourTip+51 triggers a strike.
@@ -510,7 +510,7 @@ func TestBadBlockBan_CustomHeightLead(t *testing.T) {
 	}
 }
 
-// ─── Test: custom BadBlockBanDuration is honoured ────────────────────────────
+// ─── Test: custom BadBlockBanDuration is honored ────────────────────────────
 
 // TestBadBlockBan_CustomBanDuration verifies that the ban's expiry time
 // reflects the configured duration (5 minutes here) rather than the 24h default.
@@ -1959,7 +1959,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 	if err != nil {
 		// Host closed the connection before or during the TLS handshake — the
 		// strongest form of rejection: ban gate fires before TLS records flow.
-		// This is the production behaviour (ban check in handleConn precedes
+		// This is the production behavior (ban check in handleConn precedes
 		// the eager TLS Handshake() call).
 		t.Logf("step 5 ✓ TLS reconnect rejected at/before TLS handshake (expected): %v", err)
 		time.Sleep(50 * time.Millisecond)
@@ -2509,7 +2509,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 
 	// concurrentDial launches n goroutines that all dial hostAddr at the same
 	// instant.  Each goroutine signals readyCh when it is blocked at the start
-	// gate, then waits for startCh to be closed before dialling.  The caller
+	// gate, then waits for startCh to be closed before dialing.  The caller
 	// must drain readyCh (n times) and then close startCh.
 	// Returns a slice of n net.Conn values; nil entries mean the dial failed.
 	concurrentDial := func(n int, mustSucceed bool) []net.Conn {
@@ -2577,7 +2577,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 
 	// ── Phase 2: send excess connections simultaneously ───────────────────────
 	// All extraFlood goroutines are released from the same gate so they race
-	// through acceptLoop concurrently, maximising the chance of a double-count
+	// through acceptLoop concurrently, maximizing the chance of a double-count
 	// window in the atomic Add/compare.
 	//
 	// Each excess connection MUST have been accepted at the TCP level (dial must
@@ -3070,7 +3070,7 @@ func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
 			} else {
 				readerReads.Add(1)
 			}
-			// Tight polling: no sleep, to maximise the chance of catching a
+			// Tight polling: no sleep, to maximize the chance of catching a
 			// partial write between the truncate and re-write steps that a
 			// non-atomic implementation would expose.
 			runtime_gosched()
@@ -3125,7 +3125,7 @@ func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
 // Defined as a function (not a direct call) to keep the import confined to the
 // helper and avoid adding "runtime" to the top-level import block unnecessarily.
 func runtime_gosched() {
-	// Intentional tight loop without sleep: we want to maximise read frequency
+	// Intentional tight loop without sleep: we want to maximize read frequency
 	// to stress the atomicity of the sidecar write.  A brief yield prevents
 	// the goroutine from starving the writers on single-CPU builds.
 	//
@@ -3220,7 +3220,7 @@ func TestWhitelistSidecar_NullJSONBlocksStartup(t *testing.T) {
 //     CurrentHeight + BadBlockHeightLead, driving the strike counter through
 //     the real dispatch path up to BadBlockBanThreshold.
 //  2. Below the threshold: no ban, no BanEvent, and HostCanDial still allows
-//     dialling the rogue IP (proves no premature ban).
+//     dialing the rogue IP (proves no premature ban).
 //  3. At the threshold: a BanEvent is recorded via GetBanEvents AND
 //     HostCanDial returns false for that IP — both for the bare IP and for
 //     the IP:port form (PeerMgr.IsBanned falls back to the bare-IP key).

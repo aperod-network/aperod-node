@@ -182,7 +182,7 @@ func TestReplayAttack_GossipDedup(t *testing.T) {
 // ─── 3.5.4 Rate limiting / banned peer reconnect ─────────────────────────────
 
 // TestRateLimiting_BannedPeerDropped verifies that a peer banned for bad
-// behaviour is rejected during the handshake phase.
+// behavior is rejected during the handshake phase.
 func TestRateLimiting_BannedPeerDropped(t *testing.T) {
 	handler := &stubHandler{}
 	host := p2p.NewHost(p2p.Config{
@@ -216,7 +216,7 @@ func TestRateLimiting_BannedPeerDropped(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Ban the peer address.
-	host.BanPeer(conn.LocalAddr().String(), "bad behaviour", time.Hour)
+	host.BanPeer(conn.LocalAddr().String(), "bad behavior", time.Hour)
 	conn.Close()
 
 	// A subsequent connection from the same address should be handled; the ban
@@ -368,7 +368,7 @@ func TestMaliciousPacket_NodeStaysAlive(t *testing.T) {
 // ─── Peer IP whitelist ────────────────────────────────────────────────────────
 
 // TestPeerWhitelist_EmptyAllowsAll verifies that an empty peer_whitelist leaves
-// the network open: connections from any IP are accepted (existing behaviour).
+// the network open: connections from any IP are accepted (existing behavior).
 func TestPeerWhitelist_EmptyAllowsAll(t *testing.T) {
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
@@ -690,7 +690,7 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	// remoteClosed is signalled when the host closes the connection (the
+	// remoteClosed is signaled when the host closes the connection (the
 	// listener side observes EOF / reset on its first read).
 	remoteClosed := make(chan error, 1)
 	go func() {

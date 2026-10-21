@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestWalletReadSnapshotPinsWalletReadsAndReleases(t *testing.T) {

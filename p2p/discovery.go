@@ -6,7 +6,7 @@ import (
 )
 
 // Discovery handles peer discovery by periodically requesting peer lists from
-// connected peers and re-dialling known addresses when the peer count is low.
+// connected peers and re-dialing known addresses when the peer count is low.
 // It is a lightweight pull-based "gossip about peers" — each round, we pick up
 // to discoverFanout random peers and ask them for their MsgGetPeers list.
 type Discovery struct {
@@ -72,7 +72,7 @@ func (d *Discovery) round() {
 	h.mu.RUnlock()
 
 	if len(peers) == 0 {
-		h.log.Info("discovery: no peers, re-dialling bootnodes")
+		h.log.Info("discovery: no peers, re-dialing bootnodes")
 		for _, addr := range h.cfg.Bootnodes {
 			go func(a string) {
 				resolved, err := resolveBootnode(a)

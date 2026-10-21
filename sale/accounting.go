@@ -116,14 +116,14 @@ func (c Checkpoint) Verify(genesis, parent crypto.Hash32, height uint64, trusted
 // block validator must additionally verify the exact credited output and
 // persist/rollback state atomically with the block before using this ledger.
 type Purchase struct {
-	Genesis        crypto.Hash32
-	Height         uint64
-	Parent         crypto.Hash32
-	OrderHash      crypto.Hash32
-	PaymentHash    crypto.Hash32
-	Recipient      crypto.Address
-	Amount         uint64
-	Signature      []byte
+	Genesis     crypto.Hash32
+	Height      uint64
+	Parent      crypto.Hash32
+	OrderHash   crypto.Hash32
+	PaymentHash crypto.Hash32
+	Recipient   crypto.Address
+	Amount      uint64
+	Signature   []byte
 }
 
 func (p Purchase) Message() crypto.Hash32 {
@@ -139,12 +139,12 @@ func (p Purchase) Message() crypto.Hash32 {
 // made durable alongside the canonical block in the eventual integration.
 type Ledger struct {
 	checkpoint Checkpoint
-	height uint64
-	hash crypto.Hash32
-	remaining uint64
-	sold uint64
-	seen map[crypto.Hash32]struct{}
-	paid map[crypto.Hash32]struct{}
+	height     uint64
+	hash       crypto.Hash32
+	remaining  uint64
+	sold       uint64
+	seen       map[crypto.Hash32]struct{}
+	paid       map[crypto.Hash32]struct{}
 }
 
 func Begin(c Checkpoint, genesis, parent crypto.Hash32, height uint64, trusted []crypto.ValidatorPubKey) (*Ledger, error) {
@@ -211,7 +211,7 @@ func (s *Ledger) Seen(order crypto.Hash32) bool {
 	return ok
 }
 
-func (s *Ledger) Remaining() uint64 { return s.remaining }
-func (s *Ledger) Sold() uint64 { return s.sold }
-func (s *Ledger) Height() uint64 { return s.height }
+func (s *Ledger) Remaining() uint64   { return s.remaining }
+func (s *Ledger) Sold() uint64        { return s.sold }
+func (s *Ledger) Height() uint64      { return s.height }
 func (s *Ledger) Hash() crypto.Hash32 { return s.hash }

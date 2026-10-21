@@ -4,7 +4,7 @@ package main
 // self-heal, exercising the REAL production code path (checkStartupIntegrity,
 // called verbatim from run()).
 //
-// The behaviour under test: when the canonical height index (h/<tipHeight>) is
+// The behavior under test: when the canonical height index (h/<tipHeight>) is
 // missing or zeroed but the tip pointer is intact, the node repairs the index
 // from the tip pointer and logs the self-heal at INFO — NOT WARN or ERROR.
 // Operators filter alerts by log level, so an accidental revert of INFO → WARN

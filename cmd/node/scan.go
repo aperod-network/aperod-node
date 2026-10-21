@@ -152,7 +152,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			TipHashHex: p.TipHashHex,
 			TxTotal:    p.InitTxTotal,
 			SavedAt:    time.Now(),
-			UTXOs:      p.UTXOs.TakeSnapshot(),
+			UTXOs:      p.UTXOs.TakeSnapshotView(),
 			Registry:   p.Registry.TakeSnapshot(),
 		}
 		if p.SnapshotWg != nil {
@@ -201,7 +201,7 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 	} else if partial := findLatestSnapshot(p.DataDir, p.TipHeight, p.Log); partial != nil {
 		// Cross-check: verify the snapshot's recorded TipHashHex against the
 		// actual block stored in the DB at that height.  A mismatch means the
-		// block was reorganised (e.g. in dev/test) after the checkpoint was
+		// block was reorganized (e.g. in dev/test) after the checkpoint was
 		// written; restoring stale UTXO state would cause silent corruption.
 		// In that case we discard the checkpoint and scan from block 1.
 		hashOK := false
@@ -420,14 +420,14 @@ func runStartupScan(p startupScanParams) (startupScanResult, error) {
 			}
 			for i, out := range tx.Outputs {
 				su := &store.StoredUTXO{
-					TxHash:          txHash,
-					OutputIndex:     uint32(i),
-					OneTimePub:      out.OneTimePub,
-					TxPubKey:        out.TxPubKey,
-					AmountCommit:    out.AmountCommit,
-					EncAmount:       out.EncAmount,
-					BlockHeight:     b.Header.Height,
-ProtocolLocked: tx.IsGuardianFund(),
+					TxHash:         txHash,
+					OutputIndex:    uint32(i),
+					OneTimePub:     out.OneTimePub,
+					TxPubKey:       out.TxPubKey,
+					AmountCommit:   out.AmountCommit,
+					EncAmount:      out.EncAmount,
+					BlockHeight:    b.Header.Height,
+					ProtocolLocked: tx.IsGuardianFund(),
 				}
 				_ = p.DB.PutUTXO(txHash, uint32(i), su)
 				utxoCount++
@@ -454,7 +454,18 @@ ProtocolLocked: tx.IsGuardianFund(),
 					kiCount++
 					_ = p.DB.MarkKeyImageSpent(inp.KeyImage)
 				}
-				if !(txIdx == 0 && tx.IsCoinbase()) {
+				if tx.IsStake() && len(tx.Extra) == core.StakePayloadSizeV4 {
+					_, _, _, _, _, _, _, keyImage, _, decodeErr := core.DecodeStakeExtraV4(tx.Extra)
+					if decodeErr != nil {
+						return startupScanResult{}, fmt.Errorf("scan block %d stake key-image payload: %w", h, decodeErr)
+					}
+					p.UTXOs.MarkSpent(keyImage)
+					kiCount++
+					if err := p.DB.MarkKeyImageSpent(keyImage); err != nil {
+						return startupScanResult{}, fmt.Errorf("persist stake key image at block %d: %w", h, err)
+					}
+				}
+				if txIdx != 0 || !tx.IsCoinbase() {
 					txCount++
 				}
 			}
@@ -494,7 +505,7 @@ ProtocolLocked: tx.IsGuardianFund(),
 				TipHashHex: fmt.Sprintf("%x", cpHashArr[:]),
 				TxTotal:    cpTxTotal,
 				SavedAt:    time.Now(),
-				UTXOs:      p.UTXOs.TakeSnapshot(),
+				UTXOs:      p.UTXOs.TakeSnapshotView(),
 				Registry:   p.Registry.TakeSnapshot(),
 			}
 			cpActiveCount := len(cpSnap.UTXOs.ActiveUTXOs)
@@ -626,7 +637,7 @@ ProtocolLocked: tx.IsGuardianFund(),
 			TipHashHex: p.TipHashHex,
 			TxTotal:    txTotal,
 			SavedAt:    time.Now(),
-			UTXOs:      p.UTXOs.TakeSnapshot(),
+			UTXOs:      p.UTXOs.TakeSnapshotView(),
 			Registry:   p.Registry.TakeSnapshot(),
 		}
 		if p.SnapshotWg != nil {

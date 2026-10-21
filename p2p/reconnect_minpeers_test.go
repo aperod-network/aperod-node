@@ -225,7 +225,7 @@ func TestSync_RelayNode_ReconnectViaMinPeers(t *testing.T) {
 	// ── Relay p2p host — MinPeers=1, NO Bootnodes ────────────────────────────
 	// Without a Bootnodes entry the relay cannot bypass exponential back-off.
 	// After the connection is dropped (lasting < stableConnTime=60 s) the peer
-	// manager records a dial failure and blocks re-dialling for 5 s.  The test
+	// manager records a dial failure and blocks re-dialing for 5 s.  The test
 	// waits for that window via HostCanDial, then fires HostTriggerMaintain to
 	// immediately advance the maintainLoop — which sees count < MinPeers and
 	// re-dials the peer from peerList.

@@ -139,9 +139,9 @@ func TestHandleIncomingBlock_LockedGenesisSpendRejected(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
 		// MyKey intentionally nil — this node is not a validator/proposer;
 		// we are testing the incoming-block acceptance path only.
 	}, chain, mp, newNopLogger())
@@ -286,9 +286,9 @@ func TestHandleIncomingBlock_UnlockedGenesisSpendPassesVestingCheck(t *testing.T
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{proposerPub},
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{proposerPub},
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(txVerifier, utxos)
 

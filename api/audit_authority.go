@@ -29,7 +29,7 @@ func (s *Server) SetAuditValidatorAuthorityFork(f *core.ValidatorAuthorityFork) 
 		return err
 	}
 	if height >= f.Height-1 {
-		parent, found, err := s.blockStore.GetCanonicalHash(f.Height-1)
+		parent, found, err := s.blockStore.GetCanonicalHash(f.Height - 1)
 		if err != nil || !found || parent != f.Parent {
 			return fmt.Errorf("audit authority activation-parent binding mismatch")
 		}
@@ -51,7 +51,9 @@ func (s *Server) localValidatorIdentity(next bool) (crypto.ValidatorPubKey, erro
 	var height uint64
 	if s.blockStore != nil {
 		_, h, err := s.blockStore.GetTip()
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		height = h
 	} else if s.chain != nil && s.chain.Tip() != nil {
 		height = s.chain.Tip().Header.Height
@@ -59,7 +61,9 @@ func (s *Server) localValidatorIdentity(next bool) (crypto.ValidatorPubKey, erro
 		return nil, fmt.Errorf("canonical validator authority height unavailable")
 	}
 	if next {
-		if height == ^uint64(0) { return nil, fmt.Errorf("validator authority height overflow") }
+		if height == ^uint64(0) {
+			return nil, fmt.Errorf("validator authority height overflow")
+		}
 		height++
 	}
 	identity := s.validatorAuthorityFork.LocalIdentity(signing, height)

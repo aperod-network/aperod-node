@@ -25,7 +25,9 @@ func TestGenesisVestingLiquiditySizeNativeReceiptAndSpend(t *testing.T) {
 
 func testNativeReserveReceiptAndSpend(t *testing.T, amount uint64) {
 	owner, err := crypto.GenerateWalletKeys()
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	address := crypto.AddressFromKeys(crypto.MainnetByte, owner)
 	parent := crypto.HashBytes([]byte("annual-output-control-parent"))
 	digest := crypto.HashBytes([]byte("annual-output-control-checkpoint"))
@@ -35,11 +37,15 @@ func testNativeReserveReceiptAndSpend(t *testing.T, amount uint64) {
 		to := address
 		if i > 1 {
 			other, err := crypto.GenerateWalletKeys()
-			if err != nil { t.Fatal(err) }
+			if err != nil {
+				t.Fatal(err)
+			}
 			to = crypto.AddressFromKeys(crypto.MainnetByte, other)
 		}
 		out, err := core.BuildLPoDPayoutOutput(to, amount, i, parent, digest)
-		if err != nil { t.Fatal(err) }
+		if err != nil {
+			t.Fatal(err)
+		}
 		tx := core.Transaction{Version: core.TxVersionLPoDPayout}
 		tx.Outputs = append(tx.Outputs, out)
 		b := &core.Block{Header: core.BlockHeader{Height: i}, Txs: []core.Transaction{tx}}
@@ -51,17 +57,23 @@ func testNativeReserveReceiptAndSpend(t *testing.T, amount uint64) {
 				t.Fatal("annual-size output is not owned, exact and spendable")
 			}
 			blind, err := crypto.DeterministicPaymentBlind(*hs, amount)
-			if err != nil { t.Fatal(err) }
+			if err != nil {
+				t.Fatal(err)
+			}
 			controlled = core.OwnedUTXO{UTXO: *u, Amount: amount, Blind: blind, HsScalar: *hs}
 		}
 	}
 	recipient, err := crypto.GenerateWalletKeys()
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	spend, err := core.NewTxBuilder(owner.Spend.Private, owner.View.Private, owner.Spend.Public,
 		[]core.OwnedUTXO{controlled}, core.InitialBaseFeePerByte).
 		WithVersion(core.TxVersionCLSAG).WithDecoySet(utxos).
 		Build(100_000_000, crypto.AddressFromKeys(crypto.MainnetByte, recipient), address)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := core.NewTxVerifier(utxos).VerifyTx(&spend.Tx); err != nil {
 		t.Fatalf("annual-size native output cannot be spent: %v", err)
 	}

@@ -59,12 +59,12 @@ func mempoolTestConfig() core.MempoolConfig {
 // passes TxVerifier.VerifyTx under the returned UTXOSet.
 //
 // The setup mirrors the production mint + spend flow:
-//   1. Generate a wallet key pair (Alice).
-//   2. Mint a faucet UTXO to Alice via BuildMintTx at height=1.
-//   3. Register the mint UTXO in the UTXOSet so C-0 / C-0a checks pass.
-//   4. Build a spend tx via TxBuilder (Phase 1 random decoys; all absent from
-//      the UTXOSet, so only the real input is present — the exact scenario the
-//      C-0 fix was designed for).
+//  1. Generate a wallet key pair (Alice).
+//  2. Mint a faucet UTXO to Alice via BuildMintTx at height=1.
+//  3. Register the mint UTXO in the UTXOSet so C-0 / C-0a checks pass.
+//  4. Build a spend tx via TxBuilder (Phase 1 random decoys; all absent from
+//     the UTXOSet, so only the real input is present — the exact scenario the
+//     C-0 fix was designed for).
 //
 // Returns the built transaction and the UTXOSet that makes it verifiable.
 func buildProductionTx(t *testing.T) (core.Transaction, *core.UTXOSet) {
@@ -199,15 +199,15 @@ func makeTestTx(fee uint64, kiIdx int) core.Transaction {
 
 // TestMempoolPersistProductionPath exercises the exact main.go lifecycle:
 //
-//   "Before shutdown":
-//     pool.SetVerifier(txVerifier)  // wired after UTXO scan completes
-//     pool.Add(tx)                  // full crypto verification runs
-//     pool.Save(dataDir)            // SIGTERM handler persists to disk
+//	"Before shutdown":
+//	  pool.SetVerifier(txVerifier)  // wired after UTXO scan completes
+//	  pool.Add(tx)                  // full crypto verification runs
+//	  pool.Save(dataDir)            // SIGTERM handler persists to disk
 //
-//   "After restart":
-//     pool.SetVerifier(txVerifier)  // same UTXO set, same verifier setup
-//     pool.Load(dataDir, log)       // re-adds with full verification
-//     pool.SelectTxs(1)             // tx is returned for next block
+//	"After restart":
+//	  pool.SetVerifier(txVerifier)  // same UTXO set, same verifier setup
+//	  pool.Load(dataDir, log)       // re-adds with full verification
+//	  pool.SelectTxs(1)             // tx is returned for next block
 //
 // Uses a cryptographically valid RingCT transaction built by TxBuilder so that
 // the full ring-signature + range-proof + Pedersen-balance path is exercised.
@@ -589,7 +589,7 @@ func TestMempoolPersistFeeRateOrderPreserved(t *testing.T) {
 // Test cases:
 //   - Truncated JSON (simulates a mid-write OOM kill):  `{"saved_at":"2026`
 //   - Pure garbage bytes:                               `NOT JSON AT ALL`
-//   - Empty file (zero bytes):                          ``
+//   - Empty file (zero bytes):                          “
 //   - Valid JSON but wrong schema (an array, not an object): `[]`
 func TestMempoolLoadCorruptFileReturnsZero(t *testing.T) {
 	cases := []struct {
@@ -797,21 +797,21 @@ func TestCleanStaleTmpFilesCalledBeforeLoad(t *testing.T) {
 
 	lines := strings.Split(string(data), "\n")
 
-	var cleanLines []int  // all cleanStaleSnapshotTmpFiles call sites
-	branchLine := -1      // genesis/resume branch split
+	var cleanLines []int    // all cleanStaleSnapshotTmpFiles call sites
+	branchLine := -1        // genesis/resume branch split
 	var snapLoadLines []int // all tryLoadStartupSnapshot call sites
-checkSnapshotStart := -1
-checkSnapshotEnd := -1
+	checkSnapshotStart := -1
+	checkSnapshotEnd := -1
 
 	for i, raw := range lines {
 		lineNo := i + 1
 		trimmed := strings.TrimSpace(raw)
-if strings.HasPrefix(trimmed, "func runCheckSnapshot()") {
-checkSnapshotStart = lineNo
-} else if checkSnapshotStart != -1 && checkSnapshotEnd == -1 &&
-lineNo > checkSnapshotStart && strings.HasPrefix(trimmed, "func ") {
-checkSnapshotEnd = lineNo
-}
+		if strings.HasPrefix(trimmed, "func runCheckSnapshot()") {
+			checkSnapshotStart = lineNo
+		} else if checkSnapshotStart != -1 && checkSnapshotEnd == -1 &&
+			lineNo > checkSnapshotStart && strings.HasPrefix(trimmed, "func ") {
+			checkSnapshotEnd = lineNo
+		}
 		switch {
 		case strings.Contains(trimmed, "cleanStaleSnapshotTmpFiles("):
 			cleanLines = append(cleanLines, lineNo)
@@ -840,17 +840,17 @@ checkSnapshotEnd = lineNo
 		)
 	}
 
-// ── Invariant 2: every startup snapshot load has a preceding cleanup ───────
-// Checks that no new startup load site was added without cleanup coverage.
-// The config-free checker is a deliberate exception because it is read-only.
+	// ── Invariant 2: every startup snapshot load has a preceding cleanup ───────
+	// Checks that no new startup load site was added without cleanup coverage.
+	// The config-free checker is a deliberate exception because it is read-only.
 	if len(snapLoadLines) == 0 {
 		t.Error("tryLoadStartupSnapshot not found in main.go — was the snapshot load removed?")
 	}
 	for _, loadLine := range snapLoadLines {
-if checkSnapshotStart != -1 && loadLine > checkSnapshotStart &&
-(checkSnapshotEnd == -1 || loadLine < checkSnapshotEnd) {
-continue
-}
+		if checkSnapshotStart != -1 && loadLine > checkSnapshotStart &&
+			(checkSnapshotEnd == -1 || loadLine < checkSnapshotEnd) {
+			continue
+		}
 		hasPrior := false
 		for _, cleanLine := range cleanLines {
 			if cleanLine < loadLine {

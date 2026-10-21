@@ -52,6 +52,24 @@ The burn is recorded in the `emission_config` table and visible on the [Block Ex
 
 ---
 
+## AVM Mandatory Gas Fee
+
+An AVM transaction must pay both its byte-based minimum fee and the required
+gas fee. Before the coordinated AVM gas-burn activation, the existing reward
+rule treats fee surplus above the byte minimum as a proposer tip, including
+the mandatory gas amount. Historical blocks keep that rule; they must not be
+reinterpreted or rewritten.
+
+The consensus setting `avm_gas_burn_activation_height` selects a future,
+network-wide rule boundary. From that height, mandatory AVM gas is burned and
+only any fee surplus beyond the byte minimum, intentional burn, and required
+gas can be paid as a validator tip. A zero value leaves the deployed rule
+unchanged. Do not set or deploy a non-zero height until all validators run a
+compatible release and use the same agreed height. Configuration also
+requires the boundary to follow AVM activation and reward authorization.
+
+---
+
 ## Why 100 % Burn?
 
 Aperod is designed to offset tail emission through **deflationary usage**.

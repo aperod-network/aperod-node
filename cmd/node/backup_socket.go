@@ -115,7 +115,7 @@ func removeStaleBackupSocket(path string, info os.FileInfo) error {
 		return fmt.Errorf("backup socket: another node is listening at %s", path)
 	}
 	var netErr net.Error
-	if !errors.Is(err, syscall.ECONNREFUSED) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+	if !errors.Is(err, syscall.ECONNREFUSED) && (!errors.As(err, &netErr) || !netErr.Timeout()) {
 		return fmt.Errorf("backup socket: could not verify existing socket %s: %w", path, err)
 	}
 	current, err := os.Lstat(path)

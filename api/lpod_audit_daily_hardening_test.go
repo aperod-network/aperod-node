@@ -228,8 +228,8 @@ func TestDailyAuditCanceledRequestStopsBeforeStoreScan(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/?date=2024-01-02", nil).WithContext(ctx)
 	recorder := httptest.NewRecorder()
 	server.restLPoDAuditDaily(recorder, request)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "request was cancelled") {
-		t.Fatalf("cancelled request response %d: %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "request was canceled") {
+		t.Fatalf("canceled request response %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

@@ -142,7 +142,7 @@ func TestPongCooldown_SuppressesRedundantRequestHeaders(t *testing.T) {
 	}
 	defer catchingHost.Stop()
 
-	// Snapshot counter before dialling so any pre-connection noise is excluded.
+	// Snapshot counter before dialing so any pre-connection noise is excluded.
 	baseline := p2p.HostPongGetHeadersTotal(catchingHost)
 
 	catchingHost.DialPeer(ln.Addr().String())
@@ -228,7 +228,7 @@ func TestPongCooldown_SelfHealFallback(t *testing.T) {
 		conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 
 		// ── Write goroutine ───────────────────────────────────────────────────
-		// Serialises all writes to conn via a mutex shared with the Ping
+		// Serializes all writes to conn via a mutex shared with the Ping
 		// responder below, so the read loop and test-directed Pong sends do not
 		// interleave bytes on the wire.
 		var wMu sync.Mutex

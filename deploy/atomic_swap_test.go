@@ -22,7 +22,7 @@
 // ──────────────────
 // The check uses a goroutine that calls stubProc.Wait() and reports to a
 // channel.  Signal(0) is intentionally NOT used: on Linux a crashed child
-// becomes a zombie until Wait() is called, and signalling a zombie with
+// becomes a zombie until Wait() is called, and signaling a zombie with
 // signal 0 succeeds — the very false-green the test must avoid.
 //
 // # Skip conditions
@@ -88,7 +88,7 @@ func TestAtomicBinarySwap(t *testing.T) {
 	// ── Step 1: build the long-running stub into build/aperod-node ────────────
 	//
 	// We compile testdata/stub/main.go (a tiny program that sleeps until
-	// signalled) with CGO_ENABLED=0 so it is fully static and runnable from
+	// signaled) with CGO_ENABLED=0 so it is fully static and runnable from
 	// any path without dynamic-linker issues.  Using a purpose-built stub
 	// avoids the NixOS dynamic-linker path problem that arises when copying
 	// system binaries to a new location.
@@ -134,7 +134,7 @@ func TestAtomicBinarySwap(t *testing.T) {
 	}
 	defer cleanupStub()
 
-	// Give the stub a moment to fully initialise.
+	// Give the stub a moment to fully initialize.
 	time.Sleep(300 * time.Millisecond)
 
 	// Sanity check: stub must be alive before the build starts.
@@ -167,7 +167,7 @@ func TestAtomicBinarySwap(t *testing.T) {
 	// process exited — whether cleanly, via crash, or via fatal signal.
 	//
 	// Why NOT Signal(0): on Linux a crashed child stays as a zombie until
-	// Wait() is called; signalling a zombie with signal 0 succeeds, producing
+	// Wait() is called; signaling a zombie with signal 0 succeeds, producing
 	// a false-green result.  Polling waitCh is the only reliable check.
 	select {
 	case exitErr := <-waitCh:

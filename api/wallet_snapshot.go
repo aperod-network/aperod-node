@@ -353,6 +353,11 @@ func writeWalletSnapshotError(w http.ResponseWriter, status int, code, message s
 	writeJSON(w, status, map[string]string{"code": code, "error": message})
 }
 
+func writeWalletSnapshotQueryUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "5")
+	writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "pinned wallet output query temporarily unavailable")
+}
+
 func writeSnapshotLeaseError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errWalletSnapshotExpired) {
 		writeWalletSnapshotError(w, http.StatusConflict, "SNAPSHOT_EXPIRED", err.Error())
@@ -518,7 +523,11 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 			return
 		}
 		canonical, found, readErr := entry.read.GetCanonicalHash(throughHeight)
-		if readErr != nil || !found {
+		if readErr != nil {
+			writeWalletSnapshotQueryUnavailable(w)
+			return
+		}
+		if !found {
 			reconciliationError(w, throughHeight, throughHeight, "through_height canonical header is unavailable")
 			return
 		}
@@ -555,7 +564,11 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 			return
 		}
 		canonical, found, readErr := entry.read.GetCanonicalHash(afterHeight)
-		if readErr != nil || !found {
+		if readErr != nil {
+			writeWalletSnapshotQueryUnavailable(w)
+			return
+		}
+		if !found {
 			reconciliationError(w, afterHeight, afterHeight, "after_height canonical header is unavailable")
 			return
 		}
@@ -596,7 +609,11 @@ func (s *Server) restLPoDWalletOutputsSnapshot(w http.ResponseWriter, r *http.Re
 			reorgError(w, cursorReorg.Height, cursorReorg.Error())
 			return
 		}
-		writeWalletSnapshotError(w, http.StatusBadRequest, "SNAPSHOT_QUERY_FAILED", err.Error())
+		if errors.Is(err, store.ErrInvalidWalletResumeCursor) {
+			writeWalletSnapshotError(w, http.StatusBadRequest, "INVALID_CURSOR", "wallet resume cursor is invalid for this query")
+			return
+		}
+		writeWalletSnapshotQueryUnavailable(w)
 		return
 	}
 	outputs := make([]map[string]interface{}, 0, len(rows))

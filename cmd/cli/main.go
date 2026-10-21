@@ -15,12 +15,13 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
 	"github.com/aperod/aperod/wallet"
-	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 // ─── JSON-RPC helper ──────────────────────────────────────────────────────────
@@ -157,7 +158,7 @@ var walletCmd = &cobra.Command{
 	Short: "Wallet management commands",
 }
 
-// wallet create — BIP39 mnemonic + HD derivation + encrypted keystore
+// wallet create — BIP39 mnemonic + HD derivation + encrypted keystore.
 var walletCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Generate a new HD wallet with BIP39 mnemonic",
@@ -249,7 +250,7 @@ var walletCreateCmd = &cobra.Command{
 	},
 }
 
-// wallet restore — restore from BIP39 mnemonic phrase
+// wallet restore — restore from BIP39 mnemonic phrase.
 var walletRestoreCmd = &cobra.Command{
 	Use:   "restore",
 	Short: "Restore wallet from BIP39 mnemonic phrase",
@@ -324,7 +325,7 @@ var walletRestoreCmd = &cobra.Command{
 	},
 }
 
-// wallet unlock — decrypt keystore and show keys
+// wallet unlock — decrypt keystore and show keys.
 var walletUnlockCmd = &cobra.Command{
 	Use:   "unlock [keystore-file]",
 	Short: "Decrypt a keystore file and show wallet info",
@@ -446,7 +447,7 @@ var walletValidateCmd = &cobra.Command{
 	},
 }
 
-// wallet keygen — generate a raw Ed25519 validator key pair (not an HD wallet)
+// wallet keygen — generate a raw Ed25519 validator key pair (not an HD wallet).
 var walletKeygenCmd = &cobra.Command{
 	Use:   "keygen",
 	Short: "Generate a new raw Ed25519 validator key pair",
@@ -462,7 +463,7 @@ var walletKeygenCmd = &cobra.Command{
 	},
 }
 
-// wallet pubkey — derive public key from a private key hex
+// wallet pubkey — derive public key from a private key hex.
 var walletPubkeyCmd = &cobra.Command{
 	Use:   "pubkey <hex-private-key>",
 	Short: "Derive the Ed25519 public key from a private key (32 or 64-byte hex)",
@@ -718,7 +719,7 @@ var validatorApproveLPoDExitCmd = &cobra.Command{
 			c.Action, c.PubKey, c.Amount, c.CurrentStake, c.Genesis, c.Nonce, c.Generation, c.Expiry, c.PubKey[len(c.PubKey)-8:])
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if strings.TrimSpace(line) != "EXIT "+c.PubKey[len(c.PubKey)-8:] {
-			return fmt.Errorf("operator cancelled")
+			return fmt.Errorf("operator canceled")
 		}
 		auth := core.StakeWithdrawalAuthorizationV2{Action: action, PubKey: pub, Amount: amount, Genesis: genesis, Nonce: nonce, Generation: generation, ExpiryHeight: expiry, StakeRef: ref}
 		sig, err := priv.Sign(core.StakeWithdrawalSignMsgV2(auth))
@@ -845,6 +846,13 @@ StakeSignMsgV2 locally, and broadcasts the 173-byte signed payload.
 Your private key is never sent to the node.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		nodeURL, _ := cmd.Flags().GetString("node")
+		apiKey, _ := cmd.Flags().GetString("api-key")
+		if apiKey == "" {
+			apiKey = os.Getenv("APEROD_API_KEY")
+		}
+		if apiKey == "" {
+			return fmt.Errorf("API key is required: set --api-key or APEROD_API_KEY")
+		}
 		privKeyHex, _ := cmd.Flags().GetString("priv-key")
 		utxoTxHashHex, _ := cmd.Flags().GetString("utxo-txhash")
 		utxoIdx, _ := cmd.Flags().GetUint32("utxo-idx")
@@ -1007,7 +1015,13 @@ Your private key is never sent to the node.`,
 		fmt.Printf("  utxo_out_idx   : %d\n", utxoIdx)
 		fmt.Printf("Broadcasting to %s ...\n", broadcastURL)
 
-		httpResp, err := http.Post(broadcastURL, "application/json", strings.NewReader(broadcastPayload)) //nolint:noctx
+		broadcastReq, err := http.NewRequest(http.MethodPost, broadcastURL, strings.NewReader(broadcastPayload))
+		if err != nil {
+			return fmt.Errorf("build stake broadcast request: %w", err)
+		}
+		broadcastReq.Header.Set("Content-Type", "application/json")
+		broadcastReq.Header.Set("X-API-Key", apiKey)
+		httpResp, err := http.DefaultClient.Do(broadcastReq) //nolint:noctx
 		if err != nil {
 			return fmt.Errorf("broadcast stake tx: %w", err)
 		}
@@ -1061,6 +1075,7 @@ func init() {
 
 	// validator stake — local signing, UTXO pre-flight check, broadcast
 	validatorStakeCmd.Flags().String("node", "http://localhost:8080", "Node REST URL")
+	validatorStakeCmd.Flags().String("api-key", "", "Node API key (prefer APEROD_API_KEY environment variable)")
 	validatorStakeCmd.Flags().String("priv-key", "", "Validator private key (64-hex Ed25519) — never sent to the node")
 	validatorStakeCmd.Flags().String("utxo-txhash", "", "64-hex hash of the UTXO transaction to burn as stake proof")
 	validatorStakeCmd.Flags().Uint32("utxo-idx", 0, "Output index within the UTXO transaction (default 0)")

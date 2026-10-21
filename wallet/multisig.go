@@ -24,11 +24,12 @@ import (
 	"math/big"
 
 	"filippo.io/edwards25519"
+
 	"github.com/aperod/aperod/crypto"
 )
 
 // edOrder is the prime order of the Ed25519 group.
-// l = 2^252 + 27742317777372353535851937790883648493
+// l = 2^252 + 27742317777372353535851937790883648493.
 var edOrder, _ = new(big.Int).SetString(
 	"7237005577332262213973186563042994240857116359379907606001950938285454250989", 10)
 
@@ -241,7 +242,7 @@ func shamirSplit2of3(secret crypto.Scalar32) ([]crypto.Scalar32, error) {
 }
 
 // lagrangeCoeff returns L_xi(0) for a 2-point interpolation with the other point at xj.
-// L_xi(0) = (0 - xj) / (xi - xj) = (−xj) · (xi − xj)^{−1}  mod order
+// L_xi(0) = (0 - xj) / (xi - xj) = (−xj) · (xi − xj)^{−1}  mod order.
 func lagrangeCoeff(xi, xj int) *big.Int {
 	num := new(big.Int).SetInt64(int64(-xj))
 	num.Mod(num, edOrder)

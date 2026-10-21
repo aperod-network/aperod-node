@@ -86,9 +86,9 @@ func pruneGET(t *testing.T, srv *api.Server, txHash crypto.Hash32) (int, map[str
 //	tipHeight = 18    →  blocksLeft = 2  (exactly at threshold → present)
 func TestUTXOPruneWarning_FieldPresentWhenClose(t *testing.T) {
 	const (
-		keepBlocks      uint64 = 20
-		tipHeight              = 18 // blocksLeft = 20 − 18 = 2 ≤ threshold(2)
-		utxoBlockHeight uint64 = 0
+		keepBlocks      uint64  = 20
+		tipHeight               = 18 // blocksLeft = 20 − 18 = 2 ≤ threshold(2)
+		utxoBlockHeight uint64  = 0
 		wantBlocksLeft  float64 = 2
 	)
 
@@ -118,9 +118,9 @@ func TestUTXOPruneWarning_FieldPresentWhenClose(t *testing.T) {
 //	tipHeight = 19    →  blocksLeft = 1  (< threshold → present, value = 1)
 func TestUTXOPruneWarning_FieldPresentWithCorrectValue(t *testing.T) {
 	const (
-		keepBlocks      uint64 = 20
-		tipHeight              = 19
-		utxoBlockHeight uint64 = 0
+		keepBlocks      uint64  = 20
+		tipHeight               = 19
+		utxoBlockHeight uint64  = 0
 		wantBlocksLeft  float64 = 1
 	)
 
@@ -273,9 +273,9 @@ func TestUTXOPruneWarning_FieldAbsentWhenKeepBlocksZero(t *testing.T) {
 //	tipHeight=90    →  blocksLeft=10 == threshold → present
 func TestUTXOPruneWarning_ExactlyAtThreshold(t *testing.T) {
 	const (
-		keepBlocks      uint64 = 100
-		tipHeight              = 90
-		utxoBlockHeight uint64 = 0
+		keepBlocks      uint64  = 100
+		tipHeight               = 90
+		utxoBlockHeight uint64  = 0
 		wantBlocksLeft  float64 = 10
 	)
 

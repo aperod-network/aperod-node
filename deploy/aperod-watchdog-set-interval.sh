@@ -13,7 +13,7 @@
 #    1. Validates N (integer 5–3600).
 #    2. Writes WATCHDOG_INTERVAL_SECS=N to /etc/aperod/watchdog.env
 #       (creates the file / directory if absent; preserves other lines).
-#    3. Writes a systemd drop-in that overrides OnBootSec / OnUnitActiveSec.
+#    3. Writes a systemd drop-in that overrides OnActiveSec / OnUnitInactiveSec.
 #    4. Runs systemctl daemon-reload and restarts the timer.
 #
 #  The Admin Panel API calls this with --interval=N via a sudoers rule
@@ -99,9 +99,11 @@ cat > "${DROPIN_FILE}" <<DROPIN
 [Timer]
 # Clear any previously inherited values before setting the new ones.
 OnBootSec=
+OnActiveSec=
 OnUnitActiveSec=
-OnBootSec=${INTERVAL}
-OnUnitActiveSec=${INTERVAL}
+OnUnitInactiveSec=
+OnActiveSec=${INTERVAL}
+OnUnitInactiveSec=${INTERVAL}
 DROPIN
 
 # ── Reload systemd (and optionally restart the timer) ────────────────────────

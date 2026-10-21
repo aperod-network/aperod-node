@@ -1,8 +1,9 @@
 package store
 
 import (
-	"github.com/aperod/aperod/sale"
 	"testing"
+
+	"github.com/aperod/aperod/sale"
 )
 
 func TestSaleKnownIssuedFloorIncludesPostDeclarationRewards(t *testing.T) {

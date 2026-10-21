@@ -126,7 +126,7 @@ func TestPeerMgr_OnDialSuccess_ResetsBackoff(t *testing.T) {
 }
 
 // TestPeerMgr_RapidDisconnect_Throttled verifies that a peer whose connection
-// keeps dropping quickly (< stableConnTime) cannot be dialled more than a
+// keeps dropping quickly (< stableConnTime) cannot be dialed more than a
 // small number of times within a short observation window.
 //
 // In the real host, OnDialFail is called both for TCP/TLS dial errors AND when

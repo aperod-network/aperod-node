@@ -9,9 +9,9 @@ package main
 // live would corrupt running subsystems.
 
 import (
-        "log/slog"
+	"log/slog"
 
-        "github.com/aperod/aperod/config"
+	"github.com/aperod/aperod/config"
 )
 
 // reloadScanCheckpointInterval re-reads the YAML config at cfgPath and, if
@@ -26,18 +26,18 @@ import (
 // On any parse or validation error the existing value is left unchanged and a
 // warning is logged so the operator knows the reload was a no-op.
 func reloadScanCheckpointInterval(cfgPath string, cfg *config.Config, log *slog.Logger) {
-        newCfg, err := config.Load(cfgPath)
-        if err != nil {
-                log.Warn("SIGHUP: config reload failed — keeping current ScanCheckpointInterval",
-                        "err", err,
-                        "current_interval", cfg.Snapshot.ScanCheckpointInterval,
-                )
-                return
-        }
-        old := cfg.Snapshot.ScanCheckpointInterval
-        cfg.Snapshot.ScanCheckpointInterval = newCfg.Snapshot.ScanCheckpointInterval
-        log.Info("SIGHUP: ScanCheckpointInterval reloaded",
-                "old", old,
-                "new", cfg.Snapshot.ScanCheckpointInterval,
-        )
+	newCfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Warn("SIGHUP: config reload failed — keeping current ScanCheckpointInterval",
+			"err", err,
+			"current_interval", cfg.Snapshot.ScanCheckpointInterval,
+		)
+		return
+	}
+	old := cfg.Snapshot.ScanCheckpointInterval
+	cfg.Snapshot.ScanCheckpointInterval = newCfg.Snapshot.ScanCheckpointInterval
+	log.Info("SIGHUP: ScanCheckpointInterval reloaded",
+		"old", old,
+		"new", cfg.Snapshot.ScanCheckpointInterval,
+	)
 }

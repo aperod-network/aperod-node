@@ -4,9 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aperod/aperod/core"
 	wabinbinary "github.com/tetratelabs/wabin/binary"
 	"github.com/tetratelabs/wabin/wasm"
+
+	"github.com/aperod/aperod/core"
 )
 
 func TestInstructionAdmissionDepthBound(t *testing.T) {

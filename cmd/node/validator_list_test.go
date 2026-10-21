@@ -57,9 +57,9 @@ func TestBuildValidatorList_NonValidatorMode_UsesGenesisKeys(t *testing.T) {
 
 	// ── Call the production wiring function ───────────────────────────────────
 	validators, err := buildValidatorList(
-		true,                    // nonValidator = true
-		[]string{genesisHex},   // genesis config validators (as hex)
-		myKey,                   // node's own identity key
+		true,                 // nonValidator = true
+		[]string{genesisHex}, // genesis config validators (as hex)
+		myKey,                // node's own identity key
 	)
 	if err != nil {
 		t.Fatalf("buildValidatorList: %v", err)
@@ -100,8 +100,8 @@ func TestBuildValidatorList_ValidatorMode_UsesOwnKey(t *testing.T) {
 	defer myKey.Destroy()
 
 	validators, err := buildValidatorList(
-		false,         // nonValidator = false (validator mode)
-		[]string{},    // genesis config validators unused in this mode
+		false,      // nonValidator = false (validator mode)
+		[]string{}, // genesis config validators unused in this mode
 		myKey,
 	)
 	if err != nil {

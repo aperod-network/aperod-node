@@ -110,7 +110,7 @@ func TestNativeLPoDWASMFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 		decoys = append(decoys, map[string]string{
-			"one_time_pub": hex.EncodeToString(d.OneTimePub[:]),
+			"one_time_pub":  hex.EncodeToString(d.OneTimePub[:]),
 			"amount_commit": hex.EncodeToString(d.AmountCommit[:]),
 		})
 	}

@@ -18,12 +18,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tetratelabs/wabin/binary"
+	"github.com/tetratelabs/wabin/wasm"
+
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
-	"github.com/tetratelabs/wabin/binary"
-	"github.com/tetratelabs/wabin/wasm"
 )
 
 // TestAVMTwoValidatorEngineIntegration replaces the old deploy-package
@@ -316,7 +317,7 @@ func engineGenesis(t *testing.T, validator crypto.ValidatorPrivKey, owners []*cr
 }
 
 func buildAVMCLSAG(t *testing.T, genesis *core.Block, owner, recipient *crypto.WalletKeyPair, blind crypto.BlindFactor, priv ed25519.PrivateKey,
-	action core.AVMAction, contract [32]byte, nonce uint64, code []byte) (core.Transaction, *core.BuildResult, []core.DecoyUTXO) {
+	action core.AVMAction, contract [32]byte, nonce uint64, code []byte, edits ...func(*core.AVMPayload)) (core.Transaction, *core.BuildResult, []core.DecoyUTXO) {
 	t.Helper()
 	chain := core.NewChain()
 	if err := chain.SetGenesis(genesis); err != nil {
@@ -350,6 +351,9 @@ func buildAVMCLSAG(t *testing.T, genesis *core.Block, owner, recipient *crypto.W
 	copy(payload.Signer[:], pub)
 	if action == core.AVMDeployContract {
 		payload.ContractID = core.DeriveAVMContractID(payload.Signer, nonce, code)
+	}
+	for _, edit := range edits {
+		edit(&payload)
 	}
 	hash := payload.SigningHash()
 	copy(payload.Signature[:], ed25519.Sign(priv, hash[:]))

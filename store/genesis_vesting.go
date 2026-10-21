@@ -24,21 +24,21 @@ const GenesisNominalTotal uint64 = 10_000_000_000 * lpod.Unit
 // tip selection therefore rolls back both payments and their reserve debit.
 // Heights, rather than local job flags, provide restart/downtime idempotency.
 type GenesisVestingState struct {
-	Basis         string        `json:"basis"`
-	Genesis       crypto.Hash32 `json:"genesis"`
-	FundingHeight uint64        `json:"funding_height"`
-	FundingParent crypto.Hash32 `json:"funding_parent"`
-	Recipient     crypto.Address `json:"recipient"`
-	FundingDebit  uint64        `json:"funding_debit_napro,string"`
-	SourceSnapshot crypto.Hash32 `json:"source_snapshot"`
-	FundingProof *GenesisVestingFunding `json:"funding_proof"`
-	OriginalNonCirculating uint64 `json:"original_nominal_noncirculating_napro,string"`
-	OtherNonCirculating uint64 `json:"other_nominal_noncirculating_napro,string"`
-	Remaining     uint64        `json:"remaining_napro,string"`
-	Paid          uint64        `json:"paid_napro,string"`
-	PaidHeights   [10]uint64    `json:"paid_heights"`
-	LiquidityRecipient crypto.Address `json:"liquidity_recipient,omitempty"`
-	LiquidityPaid uint64 `json:"liquidity_paid_napro,string,omitempty"`
+	Basis                  string                 `json:"basis"`
+	Genesis                crypto.Hash32          `json:"genesis"`
+	FundingHeight          uint64                 `json:"funding_height"`
+	FundingParent          crypto.Hash32          `json:"funding_parent"`
+	Recipient              crypto.Address         `json:"recipient"`
+	FundingDebit           uint64                 `json:"funding_debit_napro,string"`
+	SourceSnapshot         crypto.Hash32          `json:"source_snapshot"`
+	FundingProof           *GenesisVestingFunding `json:"funding_proof"`
+	OriginalNonCirculating uint64                 `json:"original_nominal_noncirculating_napro,string"`
+	OtherNonCirculating    uint64                 `json:"other_nominal_noncirculating_napro,string"`
+	Remaining              uint64                 `json:"remaining_napro,string"`
+	Paid                   uint64                 `json:"paid_napro,string"`
+	PaidHeights            [10]uint64             `json:"paid_heights"`
+	LiquidityRecipient     crypto.Address         `json:"liquidity_recipient,omitempty"`
+	LiquidityPaid          uint64                 `json:"liquidity_paid_napro,string,omitempty"`
 }
 
 func GenesisVestingTranche(index int) (int64, uint64, error) {
@@ -102,16 +102,26 @@ func nominalNonCirculatingBound(a *LPoDAllocation) (uint64, error) {
 	}
 	// Guardian's 1B was a reclassification INSIDE circulating, not an
 	// additional allocation. Validator remaining is outside that circulation.
-	return GenesisNominalTotal-circulating-a.InitialValidatorRemaining, nil
+	return GenesisNominalTotal - circulating - a.InitialValidatorRemaining, nil
 }
 
 func (v *GenesisVestingState) validateSource(a *LPoDAllocation, height uint64) error {
-	if v == nil { return nil }
-	if a == nil { return fmt.Errorf("genesis vesting: missing allocation") }
-	if err := v.Validate(a.Genesis, height); err != nil { return err }
-	if err := v.FundingProof.validate(a, v.FundingHeight); err != nil { return err }
+	if v == nil {
+		return nil
+	}
+	if a == nil {
+		return fmt.Errorf("genesis vesting: missing allocation")
+	}
+	if err := v.Validate(a.Genesis, height); err != nil {
+		return err
+	}
+	if err := v.FundingProof.validate(a, v.FundingHeight); err != nil {
+		return err
+	}
 	bound, err := nominalNonCirculatingBound(a)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	if v.OriginalNonCirculating != bound || v.SourceSnapshot != a.SnapshotRoot ||
 		v.FundingHeight <= a.FundingHeight {
 		return fmt.Errorf("genesis vesting: source differs from signed genesis accounting")
@@ -129,9 +139,13 @@ func previewGenesisVesting(before, next *LPoDCheckpoint, r *LPoDSettlement, heig
 		return fmt.Errorf("genesis vesting: funded v3 canonical nominal allocation required")
 	}
 	if before.GenesisVesting == nil {
-		if err := r.GenesisVestingFunding.verifyQuorum(before.Allocation, height, r.Stake); err != nil { return err }
+		if err := r.GenesisVestingFunding.verifyQuorum(before.Allocation, height, r.Stake); err != nil {
+			return err
+		}
 		bound, err := nominalNonCirculatingBound(before.Allocation)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		if height != r.GenesisVestingActivationHeight || height <= before.Allocation.FundingHeight ||
 			bound < GenesisVestingReserve || r.Parent == (crypto.Hash32{}) {
 			return fmt.Errorf("genesis vesting: invalid activation or insufficient unallocated genesis budget")
@@ -144,8 +158,8 @@ func previewGenesisVesting(before, next *LPoDCheckpoint, r *LPoDSettlement, heig
 			FundingHeight: height, FundingParent: r.Parent, Recipient: GenesisVestingRecipient,
 			FundingDebit: GenesisVestingReserve, Remaining: GenesisVestingReserve,
 			SourceSnapshot: before.Allocation.SnapshotRoot, OriginalNonCirculating: bound,
-			FundingProof: r.GenesisVestingFunding,
-			OtherNonCirculating: bound-GenesisVestingReserve,
+			FundingProof:        r.GenesisVestingFunding,
+			OtherNonCirculating: bound - GenesisVestingReserve,
 		}
 		if r.GenesisVestingFunding.Version == 2 {
 			next.GenesisVesting.LiquidityRecipient = r.GenesisVestingFunding.LiquidityRecipient

@@ -14,12 +14,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/util"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 // This uses a synthetic, signed v3 funding transition and its real earnings
@@ -326,12 +327,12 @@ func seedSyntheticEarningsRows(
 }
 
 func syntheticLPoDV3Funding(t *testing.T) (*store.DB, *store.LPoDMigration, crypto.Address) {
-db, m, address, _ := syntheticLPoDV3FundingWithSigner(t)
-return db, m, address
+	db, m, address, _ := syntheticLPoDV3FundingWithSigner(t)
+	return db, m, address
 }
 
 func syntheticLPoDV3FundingWithSigner(t *testing.T) (*store.DB, *store.LPoDMigration, crypto.Address, crypto.ValidatorPrivKey) {
-return syntheticLPoDV3FundingAt(t, t.TempDir())
+	return syntheticLPoDV3FundingAt(t, t.TempDir())
 }
 
 func syntheticLPoDV3FundingAt(t *testing.T, path string, withLiquidity ...bool) (*store.DB, *store.LPoDMigration, crypto.Address, crypto.ValidatorPrivKey) {
@@ -401,9 +402,9 @@ func syntheticLPoDV3FundingAt(t *testing.T, path string, withLiquidity ...bool) 
 		ValidatorRemaining:       migration.ValidatorRemaining,
 	}
 	migration.NominalSnapshot = &snapshot
-if len(withLiquidity) > 0 && withLiquidity[0] {
-snapshot.NominalCirculatingBefore += store.GenesisLiquidityAmount
-}
+	if len(withLiquidity) > 0 && withLiquidity[0] {
+		snapshot.NominalCirculatingBefore += store.GenesisLiquidityAmount
+	}
 	migration.SnapshotRoot = snapshot.Root()
 	migration.ReconciliationRoot = migration.Root()
 	signature, err := validator.Sign(migration.AttestationMessage())
@@ -446,5 +447,5 @@ snapshot.NominalCirculatingBefore += store.GenesisLiquidityAmount
 	if err := db.CommitRawBlockWithAVM(block.Hash(), block.Header.Height, raw, nil, crypto.Hash32{}, request); err != nil {
 		t.Fatalf("commit synthetic v3 funding: %v", err)
 	}
-return db, migration, leader, validator
+	return db, migration, leader, validator
 }

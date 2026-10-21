@@ -8,10 +8,11 @@
 //	NODE_API_URL  — legacy override for the Go node REST base URL
 //	POLL_INTERVAL — seconds between tip polls after catch-up (default: 5)
 //	BATCH_SIZE    — blocks per batch during initial catch-up (default: 50)
+//	INDEXER_REQUESTS_PER_SECOND — maximum serial node REST requests/sec (default: 50, max: 50)
 //	BACKFILL_FROM_HEIGHT — optional initial catch-up start; invalid values fail
 //	  startup and this value is never used for steady-state polling
 //
-// Startup behaviour:
+// Startup behavior:
 //   - Waits for the Go node to report ok:true and syncing:false before indexing.
 //     This prevents indexing a partial window while the node replays its chain.
 //   - Reads chain_stats.last_indexed_height to resume where it left off.
@@ -27,6 +28,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aperod/aperod/explorer"
@@ -73,6 +76,11 @@ func run() error {
 		}
 	}
 
+	requestsPerSecond, err := indexerRequestsPerSecondFromEnv()
+	if err != nil {
+		return err
+	}
+
 	backfillFrom, err := backfillFromHeightFromEnv()
 	if err != nil {
 		return err
@@ -82,6 +90,7 @@ func run() error {
 		"node_url", nodeURL,
 		"poll_interval", pollInterval,
 		"batch_size", batchSize,
+		"requests_per_second", requestsPerSecond,
 	)
 	if backfillFrom != nil {
 		log.Info("initial catch-up override enabled; steady-state resumes chain_stats checkpoint",
@@ -96,7 +105,11 @@ func run() error {
 	defer idx.Close()
 	log.Info("connected to PostgreSQL")
 
-	client := &nodeClient{base: nodeURL, http: &http.Client{Timeout: 30 * time.Second}}
+	client := &nodeClient{
+		base:  nodeURL,
+		http:  &http.Client{Timeout: 30 * time.Second},
+		pacer: &requestPacer{interval: time.Second / time.Duration(requestsPerSecond)},
+	}
 
 	// ── Wait for Go node to be fully ready ────────────────────────────────────
 	// The node REST API is reachable during startup replay/sync, so we must
@@ -154,6 +167,69 @@ func backfillFromHeightFromEnv() (*uint64, error) {
 		return nil, fmt.Errorf("BACKFILL_FROM_HEIGHT must be an unsigned integer: %w", err)
 	}
 	return &height, nil
+}
+
+const (
+	defaultIndexerRequestsPerSecond = 50
+	maxIndexerRequestsPerSecond     = 50
+	maxRetryAfter                   = 24 * time.Hour
+	minRateLimitRetryDelay          = 250 * time.Millisecond
+	maxFallbackRetryDelay           = 30 * time.Second
+)
+
+func indexerRequestsPerSecondFromEnv() (int, error) {
+	value := os.Getenv("INDEXER_REQUESTS_PER_SECOND")
+	if value == "" {
+		return defaultIndexerRequestsPerSecond, nil
+	}
+	requestsPerSecond, err := strconv.Atoi(value)
+	if err != nil || requestsPerSecond < 1 || requestsPerSecond > maxIndexerRequestsPerSecond {
+		return 0, fmt.Errorf("INDEXER_REQUESTS_PER_SECOND must be an integer from 1 to %d", maxIndexerRequestsPerSecond)
+	}
+	return requestsPerSecond, nil
+}
+
+type requestPacer struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+// wait spaces requests from this process. Holding the mutex while waiting also
+// keeps the bound correct if a future caller adds concurrent requests.
+func (p *requestPacer) wait() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if wait := time.Until(p.next); wait > 0 {
+		time.Sleep(wait)
+	}
+	p.next = time.Now().Add(p.interval)
+}
+
+func retryAfterDuration(header string, now time.Time) (time.Duration, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(header, 10, 64); err == nil && seconds >= 0 {
+		delay := time.Duration(seconds) * time.Second
+		if delay < 0 || delay > maxRetryAfter {
+			delay = maxRetryAfter
+		}
+		return delay, true
+	}
+	retryAt, err := http.ParseTime(header)
+	if err != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxRetryAfter {
+		delay = maxRetryAfter
+	}
+	return delay, true
 }
 
 func catchUp(idx *explorer.Indexer, client *nodeClient, batchSize uint64, initialStartOverride *uint64, log *slog.Logger) error {
@@ -294,8 +370,9 @@ func indexBlock(idx *explorer.Indexer, client *nodeClient, height uint64, log *s
 // ─── Node REST client ─────────────────────────────────────────────────────────
 
 type nodeClient struct {
-	base string
-	http *http.Client
+	base  string
+	http  *http.Client
+	pacer *requestPacer
 }
 
 // nodeStatusResponse maps GET /api/v1/status.
@@ -360,13 +437,38 @@ type blocksListResponse struct {
 }
 
 func (c *nodeClient) get(url string) ([]byte, int, error) {
-	resp, err := c.http.Get(url)
-	if err != nil {
-		return nil, 0, err
+	fallbackDelay := time.Second
+	for {
+		if c.pacer != nil {
+			c.pacer.wait()
+		}
+		resp, err := c.http.Get(url)
+		if err != nil {
+			return nil, 0, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			delay, hasRetryAfter := retryAfterDuration(resp.Header.Get("Retry-After"), time.Now())
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+
+			if !hasRetryAfter {
+				delay = fallbackDelay
+				fallbackDelay *= 2
+				if fallbackDelay > maxFallbackRetryDelay {
+					fallbackDelay = maxFallbackRetryDelay
+				}
+			} else if delay < minRateLimitRetryDelay {
+				delay = minRateLimitRetryDelay
+			}
+			slog.Warn("node REST rate limited; retrying without restarting catch-up",
+				"retry_after", delay, "url", url)
+			time.Sleep(delay)
+			continue
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return body, resp.StatusCode, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	return body, resp.StatusCode, err
 }
 
 func (c *nodeClient) isNodeReady() (bool, error) {

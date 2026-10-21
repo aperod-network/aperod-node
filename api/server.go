@@ -28,12 +28,105 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
-// utxoCacheEntry holds a serialised /address/{addr}/utxos response body and
+// utxoCacheEntry holds a serialized /address/{addr}/utxos response body and
 // an expiry timestamp.  Entries are stored in Server.utxoAddrCache and evicted
 // lazily on next access after they expire.
 type utxoCacheEntry struct {
 	body      []byte
 	expiresAt time.Time
+}
+
+const (
+	maxUTXOAddrCacheEntries = 128
+	maxUTXOAddrCacheBytes   = 32 << 20
+)
+
+// boundedUTXOAddrCache keeps the public address-scan response cache bounded
+// even when callers vary addresses or view keys. Expired entries are swept on
+// writes, and the byte/entry ceilings prevent high-cardinality requests from
+// growing process memory without limit.
+type boundedUTXOAddrCache struct {
+	mu      sync.Mutex
+	entries map[string]*utxoCacheEntry
+	bytes   int
+}
+
+func (c *boundedUTXOAddrCache) load(key string, now time.Time) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[key]
+	if entry == nil {
+		return nil, false
+	}
+	if !now.Before(entry.expiresAt) {
+		c.deleteLocked(key)
+		return nil, false
+	}
+	return entry.body, true
+}
+
+func (c *boundedUTXOAddrCache) store(key string, entry *utxoCacheEntry, now time.Time) {
+	if entry == nil || !now.Before(entry.expiresAt) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]*utxoCacheEntry)
+	}
+	c.pruneExpiredLocked(now)
+	c.deleteLocked(key)
+	if len(entry.body) > maxUTXOAddrCacheBytes {
+		return
+	}
+	for len(c.entries) >= maxUTXOAddrCacheEntries ||
+		c.bytes+len(entry.body) > maxUTXOAddrCacheBytes {
+		if !c.evictOldestLocked() {
+			return
+		}
+	}
+	body := append([]byte(nil), entry.body...)
+	c.entries[key] = &utxoCacheEntry{body: body, expiresAt: entry.expiresAt}
+	c.bytes += len(body)
+}
+
+func (c *boundedUTXOAddrCache) clear() {
+	c.mu.Lock()
+	c.entries = nil
+	c.bytes = 0
+	c.mu.Unlock()
+}
+
+func (c *boundedUTXOAddrCache) pruneExpiredLocked(now time.Time) {
+	for key, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			c.deleteLocked(key)
+		}
+	}
+}
+
+func (c *boundedUTXOAddrCache) deleteLocked(key string) {
+	if entry := c.entries[key]; entry != nil {
+		c.bytes -= len(entry.body)
+		delete(c.entries, key)
+	}
+}
+
+func (c *boundedUTXOAddrCache) evictOldestLocked() bool {
+	var oldestKey string
+	var oldestExpiry time.Time
+	found := false
+	for key, entry := range c.entries {
+		if !found || entry.expiresAt.Before(oldestExpiry) {
+			oldestKey = key
+			oldestExpiry = entry.expiresAt
+			found = true
+		}
+	}
+	if found {
+		c.deleteLocked(oldestKey)
+	}
+	return found
 }
 
 // utxoCacheTTL is how long a cached /address/{addr}/utxos response is kept.
@@ -45,7 +138,7 @@ const utxoCacheTTL = 90 * time.Second
 type Server struct {
 	saleMigration          *store.SaleMigration
 	saleProducerReady      func() bool
-saleFinalized          func(uint64, crypto.Hash32) bool
+	saleFinalized          func(uint64, crypto.Hash32) bool
 	lpodMigration          *store.LPoDMigration
 	genesisVestingHeight   uint64
 	validatorAuthorityFork *core.ValidatorAuthorityFork
@@ -284,7 +377,7 @@ saleFinalized          func(uint64, crypto.Hash32) bool
 	// responses. The mint-UTXO monitor calls this endpoint every 5 minutes
 	// for each admin-mint address; without caching each call does an O(n)
 	// UTXO scan with Ed25519 point ops that pins all CPU cores for 20-30 s.
-	utxoAddrCache sync.Map // key: addr+"|"+viewKeyHex  value: *utxoCacheEntry
+	utxoAddrCache boundedUTXOAddrCache
 
 	// dataDir is the node's data directory (cfg.DataDir).  Set via SetDataDir
 	// after the API server is created; used by snapshot and chaindb export
@@ -311,14 +404,14 @@ saleFinalized          func(uint64, crypto.Hash32) bool
 
 	// avmStore is the canonical AVM state reader used by the public,
 	// read-only contract API. It never receives private signing material.
-	avmStore                     avm.Store
-	avmActivationHeight          uint64
-	avmGasBurnActivationHeight   uint64
-stakedCollateralRingExclusionActivationHeight uint64
-	guardianFundActivationHeight uint64
-	guardianFundChainAnchor      crypto.Hash32
-	broadcastTxMu                sync.RWMutex
-	broadcastTxFn                func(*core.Transaction)
+	avmStore                                      avm.Store
+	avmActivationHeight                           uint64
+	avmGasBurnActivationHeight                    uint64
+	stakedCollateralRingExclusionActivationHeight uint64
+	guardianFundActivationHeight                  uint64
+	guardianFundChainAnchor                       crypto.Hash32
+	broadcastTxMu                                 sync.RWMutex
+	broadcastTxFn                                 func(*core.Transaction)
 }
 
 // NewServer creates a new API server.
@@ -589,10 +682,7 @@ func (s *Server) SetNodeViewKey(hexKey string) { s.nodeViewKeyHex = hexKey }
 // Intended for use in tests that mutate the UTXO set and then require a fresh
 // response from the REST handler on the very next call, bypassing the normal TTL.
 func (s *Server) FlushUTXOCache() {
-	s.utxoAddrCache.Range(func(k, _ interface{}) bool {
-		s.utxoAddrCache.Delete(k)
-		return true
-	})
+	s.utxoAddrCache.clear()
 }
 
 // SetPeerCounter wires a function returning the live P2P peer count so

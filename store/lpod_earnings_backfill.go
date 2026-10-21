@@ -12,11 +12,12 @@ import (
 	"reflect"
 	"sort"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 const lpodEarningsBackfillBatchHeights = 64
@@ -81,13 +82,11 @@ func (d *DB) BackfillLPoDEarningsIndex(m *LPoDMigration) error {
 		return err
 	}
 	var progress lpodEarningsProgress
-	resume := false
-	if progressRaw != nil && json.Unmarshal(progressRaw, &progress) == nil &&
+	resume := progressRaw != nil && json.Unmarshal(progressRaw, &progress) == nil &&
 		progress.FundingHash == funding && progress.TargetHash == targetHash &&
 		progress.TargetHeight == targetHeight && progress.NextHeight >= m.Height &&
-		progress.NextHeight <= targetHeight+1 {
-		resume = true
-	}
+		progress.NextHeight <= targetHeight+1
+
 	if !resume {
 		// Reuse a completed canonical prefix when extending readiness to a
 		// newer durable tip. Otherwise discard all old-fork and partial rows.
@@ -386,20 +385,22 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 	for address := range principal {
 		addressSet[address] = true
 	}
-var vestingAddress crypto.Address
-var vestingAmount uint64
-if after.GenesisVesting != nil {
-vestingAddress = after.GenesisVesting.Recipient
-vestingAmount = after.GenesisVesting.paymentAt(block.Header.Height)
-if vestingAmount > 0 { addressSet[vestingAddress] = true }
-if after.GenesisVesting.FundingHeight == block.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
-addressSet[after.GenesisVesting.LiquidityRecipient] = true
-}
-}
+	var vestingAddress crypto.Address
+	var vestingAmount uint64
+	if after.GenesisVesting != nil {
+		vestingAddress = after.GenesisVesting.Recipient
+		vestingAmount = after.GenesisVesting.paymentAt(block.Header.Height)
+		if vestingAmount > 0 {
+			addressSet[vestingAddress] = true
+		}
+		if after.GenesisVesting.FundingHeight == block.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
+			addressSet[after.GenesisVesting.LiquidityRecipient] = true
+		}
+	}
 	addresses := make([]string, 0, len(addressSet))
 	for address := range addressSet {
- if rewards[address] > 0 || principal[address] > 0 || (address == vestingAddress && vestingAmount > 0) ||
- (after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
+		if rewards[address] > 0 || principal[address] > 0 || (address == vestingAddress && vestingAmount > 0) ||
+			(after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			addresses = append(addresses, string(address))
 		}
 	}
@@ -412,10 +413,12 @@ addressSet[after.GenesisVesting.LiquidityRecipient] = true
 	for _, text := range addresses {
 		address := crypto.Address(text)
 		total, err := lpodAdd(rewards[address], principal[address])
-if err == nil && address == vestingAddress { total, err = lpodAdd(total, vestingAmount) }
-if err == nil && after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient {
-total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
-}
+		if err == nil && address == vestingAddress {
+			total, err = lpodAdd(total, vestingAmount)
+		}
+		if err == nil && after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient {
+			total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -431,8 +434,8 @@ total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
 	refs := make([]lpodEarningsRef, 0, len(addresses))
 	for i, text := range addresses {
 		address := crypto.Address(text)
- if !isLPoDPureReward(rewards[address], principal[address]) || (address == vestingAddress && vestingAmount > 0) ||
- (after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
+		if !isLPoDPureReward(rewards[address], principal[address]) || (address == vestingAddress && vestingAmount > 0) ||
+			(after.GenesisVesting != nil && block.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			continue
 		}
 		output := block.Txs[0].Outputs[i]

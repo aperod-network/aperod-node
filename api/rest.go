@@ -14,11 +14,13 @@ package api
 //   POST /api/v1/admin/stake-deposit                   — admin-only: v2 UTXO-backed stake deposit
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -75,7 +77,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/wallet/snapshot", s.restWalletSnapshot)
 	s.mux.HandleFunc("/api/v1/wallet/changes", s.restWalletChanges)
 	s.mux.HandleFunc("/api/v1/keyimage/", s.restKeyImageIsSpent)
-	s.mux.HandleFunc("/api/v1/stake", s.restStakeBroadcast)
+	s.mux.HandleFunc("/api/v1/stake", s.requireMutationAPIKey(s.restStakeBroadcast))
 	s.mux.HandleFunc("/api/v1/status", s.restStatus)
 	s.mux.HandleFunc("/api/v1/guardian-fund", s.restGuardianFund)
 	s.mux.HandleFunc("/api/v1/lpod-pool", s.restLPoDPool)
@@ -94,6 +96,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/avm/signers/", s.restAVMSigner)
 	s.mux.HandleFunc("/api/v1/avm/query", s.restAVMQuery)
 	s.mux.HandleFunc("/api/v1/avm/simulate", s.restAVMSimulate)
+	s.mux.HandleFunc("/api/v1/avm/estimate-gas", s.restAVMEstimateGas)
 	s.mux.HandleFunc("/api/v1/avm/transactions", s.restAVMTransaction)
 	// Node-join workflow: export endpoints consumed by aperod-join.sh.
 	s.mux.HandleFunc("/api/v1/snapshot/export", s.restSnapshotExport)
@@ -216,7 +219,7 @@ func burnAddressString(tx *core.Transaction) string {
 }
 
 // pathSuffix extracts the path segment after prefix.
-// e.g. pathSuffix("/api/v1/blocks/", "/api/v1/blocks/42") == "42"
+// e.g. pathSuffix("/api/v1/blocks/", "/api/v1/blocks/42") == "42".
 func pathSuffix(prefix, path string) string {
 	return strings.TrimPrefix(path, prefix)
 }
@@ -430,7 +433,7 @@ func (s *Server) lookupBlockMem(id string) *core.Block {
 //     stripped.  Identified by the "tx_count" key (json struct tag).
 //
 // Returns (fullBlock, nil, nil) for the native format, (nil, prunedBlock, nil)
-// for the pruned format, or (nil, nil, nil) if not found / unrecognised.
+// for the pruned format, or (nil, nil, nil) if not found / unrecognized.
 func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock, error) {
 	var rawBytes []byte
 	var ioErr error
@@ -459,7 +462,7 @@ func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock
 		TxCount *int             `json:"tx_count"` // present in StoredBlock JSON
 	}
 	if err := json.Unmarshal(rawBytes, &probe); err != nil {
-		return nil, nil, nil // unrecognised format — treat as not found
+		return nil, nil, nil // unrecognized format — treat as not found
 	}
 
 	if probe.Header != nil {
@@ -737,8 +740,6 @@ type AddressUTXO struct {
 	IsCoinbase bool `json:"is_coinbase"`
 }
 
-const maxAddressHistoryScanBlocks = 1_000
-
 // restAddressUTXOs handles GET /api/v1/address/{addr}/utxos.
 //
 // Without a view key: returns transparent / mint outputs (OneTimePub matches
@@ -769,8 +770,29 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 	// query parameters are logged by reverse proxies, access logs, and browser
 	// history, leaking the private view scalar to anyone with log access.
 	viewKeyHex := r.Header.Get("X-View-Key")
+	requestViewKey := viewKeyHex != ""
 	if viewKeyHex == "" {
 		viewKeyHex = s.nodeViewKeyHex
+	}
+
+	var viewPriv *crypto.Scalar32
+	var viewKey []byte
+	if viewKeyHex != "" {
+		if requestViewKey && len(viewKeyHex) != 64 {
+			writeJSONError(w, http.StatusBadRequest, "X-View-Key must be exactly 32 bytes of hex")
+			return
+		}
+		raw, hexErr := hex.DecodeString(viewKeyHex)
+		if requestViewKey && (hexErr != nil || len(raw) != 32) {
+			writeJSONError(w, http.StatusBadRequest, "X-View-Key must be exactly 32 bytes of hex")
+			return
+		}
+		if hexErr == nil && len(raw) == 32 {
+			var vk crypto.Scalar32
+			copy(vk[:], raw)
+			viewPriv = &vk
+			viewKey = raw
+		}
 	}
 
 	// Short-TTL response cache: restAddressUTXOs scans the entire UTXO set
@@ -778,27 +800,18 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 	// The mint-UTXO monitor calls this every 5 min for each admin-mint address.
 	// A 90-second TTL lets the first call in each window do the scan;
 	// all subsequent calls within that window are served from cache in <1 ms.
-	cacheKey := addrStr + "|" + viewKeyHex
-	if raw, ok := s.utxoAddrCache.Load(cacheKey); ok {
-		e := raw.(*utxoCacheEntry)
-		if time.Now().Before(e.expiresAt) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(e.body)
-			return
-		}
-		s.utxoAddrCache.Delete(cacheKey) // expired, evict
+	// Keep only a digest in the cache key so the cache does not retain the
+	// caller's private view key for the entry lifetime.
+	cacheKey := addrStr
+	if len(viewKey) == 32 {
+		viewKeyDigest := sha256.Sum256(viewKey)
+		cacheKey += "|" + hex.EncodeToString(viewKeyDigest[:])
 	}
-
-	var viewPriv *crypto.Scalar32
-	if viewKeyHex != "" {
-		raw, hexErr := hex.DecodeString(viewKeyHex)
-		if hexErr == nil && len(raw) == 32 {
-			var vk crypto.Scalar32
-			copy(vk[:], raw)
-			viewPriv = &vk
-		}
-		// Silently ignore invalid hex — fall back to no-key behaviour.
+	if body, ok := s.utxoAddrCache.load(cacheKey, time.Now()); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return
 	}
 
 	// F10 security fix: cap the number of UTXOs scanned to prevent a
@@ -889,10 +902,11 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 		"scan_limited": scanLimited, // true when UTXO set exceeds maxUTXOScan
 	}
 	if body, marshalErr := json.Marshal(respPayload); marshalErr == nil {
-		s.utxoAddrCache.Store(cacheKey, &utxoCacheEntry{
+		now := time.Now()
+		s.utxoAddrCache.store(cacheKey, &utxoCacheEntry{
 			body:      body,
-			expiresAt: time.Now().Add(utxoCacheTTL),
-		})
+			expiresAt: now.Add(utxoCacheTTL),
+		}, now)
 	}
 	writeJSON(w, http.StatusOK, respPayload)
 }
@@ -904,9 +918,13 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 	tail := pathSuffix("/api/v1/address/", r.URL.Path)
 	parts := strings.SplitN(tail, "/", 2)
 	addrStr := parts[0]
+	subpath := ""
+	if len(parts) >= 2 {
+		subpath = strings.TrimRight(parts[1], "/")
+	}
 
 	// Dispatch sub-paths first so they can accept their own HTTP methods.
-	if len(parts) >= 2 && parts[1] == "utxos" {
+	if subpath == "utxos" {
 		if r.Method != http.MethodGet {
 			writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
 			return
@@ -914,12 +932,16 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		s.restAddressUTXOs(w, r, addrStr)
 		return
 	}
-	if len(parts) >= 2 && parts[1] == "scan" {
+	if subpath == "scan" {
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
 			return
 		}
 		s.restAddressScan(w, r, addrStr)
+		return
+	}
+	if subpath != "transactions" {
+		writeJSONError(w, http.StatusNotFound, "unknown address endpoint")
 		return
 	}
 
@@ -940,99 +962,7 @@ func (s *Server) restAddressTxs(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "cannot decode address")
 		return
 	}
-
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
-			limit = n
-		}
-	}
-
-	// Each request scans only a fixed number of retained block heights. Older
-	// pages can be requested with start_height; this keeps an address query from
-	// scaling with the configured in-memory chain window.
-	var startHeight uint64
-	startAtTip := true
-	if raw := r.URL.Query().Get("start_height"); raw != "" {
-		parsed, err := strconv.ParseUint(raw, 10, 64)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid start_height")
-			return
-		}
-		startHeight = parsed
-		startAtTip = false
-	}
-	blocks, pageNextStart, pageHasMore, oldestRetainedHeight :=
-		s.chain.BlocksNewestFirstPage(startHeight, startAtTip, maxAddressHistoryScanBlocks)
-	if len(blocks) == 0 {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"transactions": []AddressTx{},
-			"address":      addrStr,
-			"scan_limited": false,
-		})
-		return
-	}
-
-	results := make([]AddressTx, 0, 16)
-	scanLimited := false
-	var nextStartHeight uint64
-	hasNextPage := false
-	for _, b := range blocks {
-		if len(results) >= limit {
-			break
-		}
-		h := b.Header.Height
-		txHash := func(i int) string {
-			hh := b.Txs[i].Hash()
-			return fmt.Sprintf("%x", hh[:])
-		}
-		// Mint outputs at this height use mint_pub = spend_pub + height*G
-		// (see core.BuildMintTx). Recompute the expected key for this height
-		// so per-block coinbase rewards are still discoverable by address scan.
-		expectedMintPub := spendPub
-		if heightPub, hErr := crypto.ScalarMulBase(crypto.ScalarFromUint64(h)); hErr == nil {
-			if shifted, aErr := crypto.AddPoints(spendPub, heightPub); aErr == nil {
-				expectedMintPub = shifted
-			}
-		}
-		for i, tx := range b.Txs {
-			isCoinbase := tx.IsCoinbase()
-			for j, out := range tx.Outputs {
-				if out.OneTimePub == spendPub || out.OneTimePub == expectedMintPub {
-					results = append(results, AddressTx{
-						TxHash:      txHash(i),
-						BlockHeight: h,
-						TxIndex:     i,
-						OutputIndex: j,
-						IsCoinbase:  isCoinbase,
-					})
-				}
-			}
-		}
-		if len(results) >= limit {
-			if h > oldestRetainedHeight {
-				nextStartHeight = h - 1
-				hasNextPage = true
-			}
-			break
-		}
-	}
-	if len(results) < limit && pageHasMore {
-		scanLimited = true
-		nextStartHeight = pageNextStart
-		hasNextPage = true
-	}
-
-	response := map[string]interface{}{
-		"address":      addrStr,
-		"transactions": results,
-		"note":         "shows transparent (non-stealth) outputs only; full privacy scanning requires view key",
-		"scan_limited": scanLimited,
-	}
-	if hasNextPage {
-		response["next_start_height"] = nextStartHeight
-	}
-	writeJSON(w, http.StatusOK, response)
+	s.restAddressTransactionsPage(w, r, addrStr, spendPub)
 }
 
 // ─── POST /api/v1/address/{addr}/scan ────────────────────────────────────────
@@ -1049,12 +979,22 @@ type scanRequest struct {
 
 func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr string) {
 	var req scanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if req.ViewKeyHex == "" {
-		writeJSONError(w, http.StatusBadRequest, "view_key_hex is required")
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSONError(w, http.StatusBadRequest, "request must contain one JSON object")
+		return
+	}
+	if len(req.ViewKeyHex) != 64 {
+		writeJSONError(w, http.StatusBadRequest, "view_key_hex must be a 32-byte hexadecimal value")
+		return
+	}
+	if _, err := hex.DecodeString(req.ViewKeyHex); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "view_key_hex must be a 32-byte hexadecimal value")
 		return
 	}
 	// Pass the view key via X-View-Key header (not query string — query params
@@ -1368,7 +1308,7 @@ func (s *Server) restNetworkWhitelistByEntry(w http.ResponseWriter, r *http.Requ
 // the automatic ban strike was skipped.  Accepts an optional `since` query
 // parameter (Unix milliseconds) to fetch only events recorded after that time.
 //
-// Response: { "events": [ { ip, peer_addr, block_height, our_tip, at } ] }
+// Response: { "events": [ { ip, peer_addr, block_height, our_tip, at } ] }.
 func (s *Server) restNetworkWhitelistExemptions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1403,7 +1343,7 @@ func (s *Server) restNetworkWhitelistExemptions(w http.ResponseWriter, r *http.R
 // optional `since` query parameter (Unix milliseconds) to fetch only events
 // recorded after that time.
 //
-// Response: { "events": [ { ip, peer_addr, peer_id, reason, violations, ban_duration_secs, at } ] }
+// Response: { "events": [ { ip, peer_addr, peer_id, reason, violations, ban_duration_secs, at } ] }.
 func (s *Server) restNetworkBanEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1446,7 +1386,7 @@ func (s *Server) restNetworkBanEvents(w http.ResponseWriter, r *http.Request) {
 // the validator's own tip_height to detect sync stalls before they escalate
 // to a ban.
 //
-// Response: [ { "addr": "ip:port", "height": N, "direction": "in"|"out" }, … ]
+// Response: [ { "addr": "ip:port", "height": N, "direction": "in"|"out" }, … ].
 func (s *Server) restNetworkPeers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1466,7 +1406,7 @@ func (s *Server) restNetworkPeers(w http.ResponseWriter, r *http.Request) {
 // Accepts an optional `since` query parameter (Unix milliseconds) to fetch
 // only events recorded after that time.
 //
-// Response: { "events": [ { peer_addr, stalled_count, at } ] }
+// Response: { "events": [ { peer_addr, stalled_count, at } ] }.
 func (s *Server) restNetworkStallEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1502,7 +1442,7 @@ func (s *Server) restNetworkStallEvents(w http.ResponseWriter, r *http.Request) 
 // Accepts an optional `since` query parameter (Unix milliseconds) to fetch only
 // events recorded after that time.
 //
-// Response: { "events": [ { bootnode, err, age_secs, at } ] }
+// Response: { "events": [ { bootnode, err, age_secs, at } ] }.
 func (s *Server) restNetworkBootnodeWarnEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1538,7 +1478,7 @@ func (s *Server) restNetworkBootnodeWarnEvents(w http.ResponseWriter, r *http.Re
 // Accepts an optional `since` query parameter (Unix milliseconds) to fetch only
 // events recorded after that time.
 //
-// Response: { "events": [ { addr, fingerprint, at } ] }
+// Response: { "events": [ { addr, fingerprint, at } ] }.
 func (s *Server) restNetworkDuplicateIdentityEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1573,10 +1513,10 @@ func (s *Server) restNetworkDuplicateIdentityEvents(w http.ResponseWriter, r *ht
 //
 // Response:
 //
-//	base_fee_per_byte  uint64  nAPRO per serialised byte (current tip)
+//	base_fee_per_byte  uint64  nAPRO per serialized byte (current tip)
 //	estimated_fee_napro uint64  fee for a typical 1-in, 2-out APRO transfer
 //	estimated_fee_apro  float64 same value converted to APRO (÷ 1e8)
-//	tx_size_bytes       int     estimated serialised size used for the above
+//	tx_size_bytes       int     estimated serialized size used for the above
 func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -1584,7 +1524,7 @@ func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read current base fee from tip block header.
-	var baseFeePerByte uint64 = core.InitialBaseFeePerByte
+	var baseFeePerByte = core.InitialBaseFeePerByte
 	if tip := s.chain.Tip(); tip != nil && tip.Header.BaseFee > 0 {
 		baseFeePerByte = tip.Header.BaseFee
 	}
@@ -1949,7 +1889,7 @@ func (s *Server) restAdminPartialUnstake(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if s.registry == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialised")
+		writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialized")
 		return
 	}
 
@@ -2070,7 +2010,7 @@ func (s *Server) restAdminFullUnstake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.registry == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialised")
+		writeJSONError(w, http.StatusServiceUnavailable, "validator registry not initialized")
 		return
 	}
 
@@ -2184,7 +2124,7 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 // source UTXO can never be spent again.
 //
 // GET /api/v1/keyimage/{ki_hex}/is-spent
-// Response: {"is_spent": true|false}
+// Response: {"is_spent": true|false}.
 func (s *Server) restKeyImageIsSpent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -2293,13 +2233,13 @@ func (s *Server) restUTXODecoys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		type snapshotDecoy struct {
-			TxHash      string `json:"tx_hash"`
-			OutputIndex uint32 `json:"out_idx"`
-			BlockHeight uint64 `json:"block_height"`
-			OneTimePub  string `json:"one_time_pub"`
-			TxPubKey    string `json:"tx_pub_key"`
+			TxHash       string `json:"tx_hash"`
+			OutputIndex  uint32 `json:"out_idx"`
+			BlockHeight  uint64 `json:"block_height"`
+			OneTimePub   string `json:"one_time_pub"`
+			TxPubKey     string `json:"tx_pub_key"`
 			AmountCommit string `json:"amount_commit"`
-			EncAmount   string `json:"enc_amount"`
+			EncAmount    string `json:"enc_amount"`
 		}
 		// The caller's count is bounded above, but keep initial allocation
 		// independent of request data so future parser changes cannot turn it
@@ -2406,7 +2346,7 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		// UTXO can therefore appear in s.utxos while su/ records it as spent
 		// (populated by --rebuild-spent-index or normal block processing),
 		// causing the endpoint to incorrectly report exists=true for a spent
-		// output.  Consistent behaviour: if su/ says spent, report not-found.
+		// output.  Consistent behavior: if su/ says spent, report not-found.
 		if s.blockStore != nil && s.blockStore.IsUTXOSpent(txHash, outIdx) {
 			// Spent — fall through to not-found handling.
 		} else {
@@ -2704,11 +2644,59 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Build v2 Extra payload ─────────────────────────────────────────────────
-	extra, err := core.EncodeStakeExtraV2(
-		core.StakeDeposit, targetPub, req.AmountNAPR, sig,
-		burnTxHash, req.UTXOOutIdx, burnBlind,
-	)
+	// Select v4 when the caller supplies the key-image DLEQ proof. This is
+	// required once all validators reach the coordinated activation height.
+	proofFields := []string{
+		req.KeyImageHex, req.ProofCommitmentGHex, req.ProofCommitmentHpHex, req.ProofResponseHex,
+	}
+	hasProofField := false
+	for _, value := range proofFields {
+		hasProofField = hasProofField || value != ""
+	}
+	var extra []byte
+	if hasProofField {
+		decoded := make([][]byte, len(proofFields))
+		for i, value := range proofFields {
+			raw, decodeErr := hex.DecodeString(value)
+			if decodeErr != nil || len(raw) != 32 {
+				writeJSONError(w, http.StatusBadRequest, "all key-image proof fields must be exactly 64 hex characters")
+				return
+			}
+			decoded[i] = raw
+		}
+		var keyImage crypto.KeyImage
+		copy(keyImage[:], decoded[0])
+		proof := crypto.KeyImageDLEQProof{}
+		copy(proof.CommitmentG[:], decoded[1])
+		copy(proof.CommitmentHp[:], decoded[2])
+		copy(proof.Response[:], decoded[3])
+		context := core.StakeKeyImageProofContext(
+			core.StakeDeposit, targetPub, req.AmountNAPR, burnTxHash, req.UTXOOutIdx, burnBlind,
+		)
+		if verifyErr := crypto.VerifyKeyImageProof(burnUTXO.OneTimePub, keyImage, context, proof); verifyErr != nil {
+			writeJSONError(w, http.StatusUnprocessableEntity, "invalid collateral key-image proof")
+			return
+		}
+		spent, spentErr := s.utxos.HasSpentKeyImage(keyImage)
+		if spentErr != nil {
+			s.log.Error("admin stake deposit: key-image spentness read failed", "err", spentErr)
+			writeJSONError(w, http.StatusServiceUnavailable, "cannot verify collateral spentness")
+			return
+		}
+		if spent {
+			writeJSONError(w, http.StatusUnprocessableEntity, "collateral key image is already spent")
+			return
+		}
+		extra, err = core.EncodeStakeExtraV4(
+			core.StakeDeposit, targetPub, req.AmountNAPR, sig,
+			burnTxHash, req.UTXOOutIdx, burnBlind, keyImage, proof,
+		)
+	} else {
+		extra, err = core.EncodeStakeExtraV2(
+			core.StakeDeposit, targetPub, req.AmountNAPR, sig,
+			burnTxHash, req.UTXOOutIdx, burnBlind,
+		)
+	}
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "encode extra: "+err.Error())
 		return
@@ -2750,12 +2738,16 @@ func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
 // stakeDepositRequest is the JSON body for POST /api/v1/admin/stake-deposit.
 // The node signs the deposit on behalf of its own configured validator key.
 type stakeDepositRequest struct {
-	PubKey      string `json:"pub_key"`       // 64-hex-char Ed25519 public key
-	AmountNAPR  uint64 `json:"amount_napr"`   // stake amount in nAPRO (base units)
-	UTXOTxHash  string `json:"utxo_txhash"`   // 64-hex-char tx hash of the burn UTXO
-	UTXOOutIdx  uint32 `json:"utxo_out_idx"`  // output index of the burn UTXO
-	BlindHex    string `json:"blind_hex"`     // 64-hex-char Pedersen blinding factor; "" for stealth outputs
-	HsScalarHex string `json:"hs_scalar_hex"` // optional: ECDH shared secret for stealth outputs; used when blind_hex is empty
+	PubKey               string `json:"pub_key"`
+	AmountNAPR           uint64 `json:"amount_napr"`
+	UTXOTxHash           string `json:"utxo_txhash"`
+	UTXOOutIdx           uint32 `json:"utxo_out_idx"`
+	BlindHex             string `json:"blind_hex"`
+	HsScalarHex          string `json:"hs_scalar_hex"`
+	KeyImageHex          string `json:"key_image_hex,omitempty"`
+	ProofCommitmentGHex  string `json:"proof_a_hex,omitempty"`
+	ProofCommitmentHpHex string `json:"proof_b_hex,omitempty"`
+	ProofResponseHex     string `json:"proof_z_hex,omitempty"`
 }
 
 // ─── POST /api/v1/stake ───────────────────────────────────────────────────────

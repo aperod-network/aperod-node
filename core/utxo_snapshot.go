@@ -5,7 +5,7 @@ import "github.com/aperod/aperod/crypto"
 // RollbackJournalEntry is the serialisable form of one rollbackEntry.
 // Exported fields allow JSON round-trips in UTXOSnapshot.
 // The rollback journal is bounded to maxRollbackDepth distinct heights, so
-// the total serialised size is small relative to the full UTXO set.
+// the total serialized size is small relative to the full UTXO set.
 type RollbackJournalEntry struct {
 	Height     uint64         `json:"height"`
 	RingMember crypto.Point32 `json:"ring_member"`
@@ -16,10 +16,10 @@ type RollbackJournalEntry struct {
 // UTXOSet.  It is used to persist the set after the startup scan so that
 // subsequent restarts can skip the expensive block replay.
 type UTXOSnapshot struct {
-	ActiveUTXOs    []*UTXO                `json:"active_utxos"`
-	StakedUTXOs    []*UTXO                `json:"staked_utxos"`
-	SpentDecoys    []*UTXO                `json:"spent_decoys"`
-	KeyImages      []crypto.KeyImage      `json:"key_images"`
+	ActiveUTXOs []*UTXO           `json:"active_utxos"`
+	StakedUTXOs []*UTXO           `json:"staked_utxos"`
+	SpentDecoys []*UTXO           `json:"spent_decoys"`
+	KeyImages   []crypto.KeyImage `json:"key_images"`
 	// RollbackJournal carries the bounded per-block rollback state so that
 	// after a snapshot restore the node can roll back a newly applied block
 	// even when the spentPubKeys decoy pool is already at capacity.
@@ -36,34 +36,66 @@ func (s *UTXOSet) TakeSnapshot() UTXOSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	return s.snapshotLocked(true)
+}
+
+// TakeSnapshotView captures the UTXO indexes without copying every UTXO
+// record. The returned slices own their pointer arrays, while the referenced
+// records remain immutable: Add stores a copy and repair paths replace records
+// rather than mutating them. This lets a background snapshot writer retain a
+// stable point-in-time view using O(number of UTXOs) pointers instead of a
+// second full set of UTXO structs.
+//
+// Callers must treat the returned UTXO pointers as read-only. Use TakeSnapshot
+// when an independently mutable deep copy is required.
+func (s *UTXOSet) TakeSnapshotView() UTXOSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.snapshotLocked(false)
+}
+
+// SnapshotKeyImages returns only the bounded in-memory key-image portion of
+// the set. Historical production key images are stored in LevelDB.
+func (s *UTXOSet) SnapshotKeyImages() []crypto.KeyImage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.keyImages.toSlice()
+}
+
+func (s *UTXOSet) snapshotLocked(deepCopy bool) UTXOSnapshot {
+	copyUTXO := func(u *UTXO) *UTXO {
+		if !deepCopy {
+			return u
+		}
+		cp := *u
+		return &cp
+	}
+
 	active := make([]*UTXO, 0, len(s.utxos))
 	for _, u := range s.utxos {
-		cp := *u
-		active = append(active, &cp)
+		active = append(active, copyUTXO(u))
 	}
 	staked := make([]*UTXO, 0, len(s.stakedUTXOs))
 	for _, u := range s.stakedUTXOs {
-		cp := *u
-		staked = append(staked, &cp)
+		staked = append(staked, copyUTXO(u))
 	}
 	decoys := make([]*UTXO, 0, len(s.spentPubKeys))
 	for _, u := range s.spentPubKeys {
-		cp := *u
-		decoys = append(decoys, &cp)
+		decoys = append(decoys, copyUTXO(u))
 	}
 	// toSlice returns a sorted copy — no additional sort needed on restore.
 	kis := s.keyImages.toSlice()
 
-	// Serialise the rollback journal as a flat slice (JSON map keys must be
+	// Serialize the rollback journal as a flat slice (JSON map keys must be
 	// strings; using a slice with an explicit Height field avoids that limit).
 	var journal []RollbackJournalEntry
 	for height, entries := range s.rollbackJournal {
 		for _, e := range entries {
-			cp := *e.utxo // deep copy so snapshot is independent of live maps
 			journal = append(journal, RollbackJournalEntry{
 				Height:     height,
 				RingMember: e.ringMember,
-				UTXO:       &cp,
+				UTXO:       copyUTXO(e.utxo),
 			})
 		}
 	}
@@ -122,15 +154,13 @@ func (s *UTXOSet) ReconcileWithStore(
 			if onFix != nil {
 				onFix(u, disk)
 			}
-			u.AmountCommit = disk.AmountCommit
-			u.TxPubKey = disk.TxPubKey
-			u.EncAmount = disk.EncAmount
-			u.BlockHeight = disk.BlockHeight
-			u.ProtocolLocked = disk.ProtocolLocked
-			if u.ProtocolLocked {
-				delete(s.byPubKey, u.OneTimePub)
-				delete(s.spentPubKeys, u.OneTimePub)
-			}
+			repaired := *u
+			repaired.AmountCommit = disk.AmountCommit
+			repaired.TxPubKey = disk.TxPubKey
+			repaired.EncAmount = disk.EncAmount
+			repaired.BlockHeight = disk.BlockHeight
+			repaired.ProtocolLocked = disk.ProtocolLocked
+			s.replaceUTXOReferenceLocked(u, &repaired)
 			fixed++
 		}
 	}

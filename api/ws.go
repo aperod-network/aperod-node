@@ -23,8 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aperod/aperod/core"
 	"golang.org/x/net/websocket"
+
+	"github.com/aperod/aperod/core"
 )
 
 // WSEvent is the envelope sent to every subscribed client.

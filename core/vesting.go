@@ -7,7 +7,7 @@
 //   - immediate      — all tokens unlocked at genesis (no lock-up)
 //   - linear         — tokens unlock gradually from genesis over VestSeconds
 //   - cliff_linear   — tokens are fully locked for CliffSeconds, then unlock
-//                      linearly over VestSeconds
+//     linearly over VestSeconds
 //
 // All timestamps are Unix seconds.  VestedAmount is monotone-increasing and
 // always returns a value in [0, totalAmount].

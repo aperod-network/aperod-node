@@ -10,11 +10,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {

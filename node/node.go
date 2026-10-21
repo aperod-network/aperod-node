@@ -35,19 +35,19 @@ type Node struct {
 
 // Config holds all node configuration.
 type Config struct {
-	DataDir          string
-	Network          string
-	LogLevel         string
-	GenesisFile      string
-	ValidatorKeyFile string
-	P2PAddr          string
-	Bootnodes        []string
-	MaxPeers         int
-	MinPeers         int
-	BlockTime        time.Duration
-	APIAddr          string
-	APIEnabled       bool
-StakedCollateralRingExclusionActivationHeight uint64
+	DataDir                                       string
+	Network                                       string
+	LogLevel                                      string
+	GenesisFile                                   string
+	ValidatorKeyFile                              string
+	P2PAddr                                       string
+	Bootnodes                                     []string
+	MaxPeers                                      int
+	MinPeers                                      int
+	BlockTime                                     time.Duration
+	APIAddr                                       string
+	APIEnabled                                    bool
+	StakedCollateralRingExclusionActivationHeight uint64
 }
 
 // New creates a fully initialized (but not yet started) node.
@@ -67,9 +67,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	utxos.OnUTXODeleted = func(txHash crypto.Hash32, outIdx uint32) error {
 		return db.DeleteUTXO(txHash, outIdx)
 	}
-mempoolCfg := core.DefaultMempoolConfig()
-mempoolCfg.CurrentHeight = chain.Height
-mempool := core.NewMempool(mempoolCfg)
+	mempoolCfg := core.DefaultMempoolConfig()
+	mempoolCfg.CurrentHeight = chain.Height
+	mempool := core.NewMempool(mempoolCfg)
 
 	// ── Genesis ───────────────────────────────────────────────────────────────
 	genesisCfg, err := core.LoadGenesis(cfg.GenesisFile)
@@ -126,7 +126,7 @@ mempool := core.NewMempool(mempoolCfg)
 
 	// ── Block/Tx verifiers ────────────────────────────────────────────────────
 	txV := core.NewTxVerifier(utxos)
-txV.SetStakedCollateralRingExclusionActivationHeight(cfg.StakedCollateralRingExclusionActivationHeight)
+	txV.SetStakedCollateralRingExclusionActivationHeight(cfg.StakedCollateralRingExclusionActivationHeight)
 	// Wire vesting enforcement using the actual genesis block timestamp.
 	// chain.Genesis() is always non-nil here because both fresh-start and resume
 	// paths above call chain.SetGenesis before this point.
@@ -352,6 +352,15 @@ func persistBlockToDB(db *store.DB, block *core.Block) error {
 		for _, inp := range tx.Inputs {
 			if err := db.MarkKeyImageSpent(inp.KeyImage); err != nil {
 				return fmt.Errorf("mark key image spent: %w", err)
+			}
+		}
+		if tx.IsStake() && len(tx.Extra) == core.StakePayloadSizeV4 {
+			_, _, _, _, _, _, _, keyImage, _, decodeErr := core.DecodeStakeExtraV4(tx.Extra)
+			if decodeErr != nil {
+				return fmt.Errorf("decode stake key image: %w", decodeErr)
+			}
+			if err := db.MarkKeyImageSpent(keyImage); err != nil {
+				return fmt.Errorf("mark stake key image spent: %w", err)
 			}
 		}
 		for i, out := range tx.Outputs {

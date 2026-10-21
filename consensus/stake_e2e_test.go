@@ -706,6 +706,7 @@ func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
 
 	// ── 4. REST Server wired to the same UTXOSet + Mempool + Chain ────────────
 	srv := api.NewServer(":0", chain, mp, utxos, newNopLogger())
+	srv.SetAPIKey("test-stake-api-key")
 
 	// ── 5. Build a stake payload with a WRONG (all-zero) blind ───────────────
 	// Commit(amount, zeroBlind) ≠ realCommit so the handler must reject it.
@@ -727,6 +728,7 @@ func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
 	// ── 6. POST to the REST handler ────────────────────────────────────────────
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stake", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-stake-api-key")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 

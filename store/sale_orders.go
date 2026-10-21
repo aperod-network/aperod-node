@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 // SaleOrder is private operator storage, never public chain metadata.

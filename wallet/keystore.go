@@ -5,54 +5,54 @@ package wallet
 // Task 3.1.3.
 
 import (
-        "crypto/aes"
-        "crypto/cipher"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
-        "crypto/rand"
-        "crypto/sha256"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
-        "encoding/hex"
-        "encoding/json"
-        "errors"
-        "fmt"
-        "io"
-        "time"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"time"
 )
 
 // KDF parameters for PBKDF2-SHA256.
 // 200000 iterations matches 2024 OWASP recommendations for PBKDF2-SHA256.
 const (
-        pbkdf2Iter = 200000
-        keyLen     = 32 // AES-256
+	pbkdf2Iter = 200000
+	keyLen     = 32 // AES-256
 )
 
 // KeystoreV1 is the JSON-serialisable encrypted wallet record. Version 1 is
 // the legacy format; version 2 authenticates the HD derivation metadata.
 type KeystoreV1 struct {
-        Version      int            `json:"version"`
-        Address      string         `json:"address"`
-        AccountIndex *uint32        `json:"account_index,omitempty"`
-        AddressIndex *uint32        `json:"address_index,omitempty"`
-        CreatedAt    string         `json:"created_at"`
-        Crypto       keystoreCrypto `json:"crypto"`
+	Version      int            `json:"version"`
+	Address      string         `json:"address"`
+	AccountIndex *uint32        `json:"account_index,omitempty"`
+	AddressIndex *uint32        `json:"address_index,omitempty"`
+	CreatedAt    string         `json:"created_at"`
+	Crypto       keystoreCrypto `json:"crypto"`
 }
 
 type keystoreCrypto struct {
-        Cipher     string       `json:"cipher"`     // "aes-256-gcm"
-        CipherText string       `json:"ciphertext"` // hex
-        Nonce      string       `json:"nonce"`      // hex (12 bytes)
-        KDF        string       `json:"kdf"`        // "pbkdf2-sha256"
-        KDFParams  pbkdf2Params `json:"kdfparams"`
-        MAC        string       `json:"mac"` // hex authentication MAC
+	Cipher     string       `json:"cipher"`     // "aes-256-gcm"
+	CipherText string       `json:"ciphertext"` // hex
+	Nonce      string       `json:"nonce"`      // hex (12 bytes)
+	KDF        string       `json:"kdf"`        // "pbkdf2-sha256"
+	KDFParams  pbkdf2Params `json:"kdfparams"`
+	MAC        string       `json:"mac"` // hex authentication MAC
 }
 
 type pbkdf2Params struct {
-        Iter int    `json:"iter"`
-        Salt string `json:"salt"` // hex (32 bytes)
+	Iter int    `json:"iter"`
+	Salt string `json:"salt"` // hex (32 bytes)
 }
 
 // EncryptMnemonic encrypts the mnemonic phrase with password and returns a
-// KeystoreV1 struct that can be marshalled to JSON for persistent storage.
+// KeystoreV1 struct that can be marshaled to JSON for persistent storage.
 func EncryptMnemonic(mnemonic, password, address string) (*KeystoreV1, error) {
 	return encryptMnemonic(mnemonic, password, address, nil, nil)
 }
@@ -68,67 +68,67 @@ func EncryptMnemonicWithDerivation(mnemonic, password, address string, account, 
 }
 
 func encryptMnemonic(mnemonic, password, address string, account, index *uint32) (*KeystoreV1, error) {
-        if mnemonic == "" {
-                return nil, errors.New("keystore: mnemonic is empty")
-        }
-        if password == "" {
-                return nil, errors.New("keystore: password is required")
-        }
+	if mnemonic == "" {
+		return nil, errors.New("keystore: mnemonic is empty")
+	}
+	if password == "" {
+		return nil, errors.New("keystore: password is required")
+	}
 
-        // Generate random salt and nonce
-        salt := make([]byte, 32)
-        if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-                return nil, fmt.Errorf("keystore: salt: %w", err)
-        }
-        nonce := make([]byte, 12) // GCM standard nonce size
-        if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-                return nil, fmt.Errorf("keystore: nonce: %w", err)
-        }
+	// Generate random salt and nonce
+	salt := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, fmt.Errorf("keystore: salt: %w", err)
+	}
+	nonce := make([]byte, 12) // GCM standard nonce size
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("keystore: nonce: %w", err)
+	}
 
-        // Derive AES key from password using PBKDF2-SHA256
-        aesKey := pbkdf2SHA256([]byte(password), salt, pbkdf2Iter, keyLen)
+	// Derive AES key from password using PBKDF2-SHA256
+	aesKey := pbkdf2SHA256([]byte(password), salt, pbkdf2Iter, keyLen)
 
-        // Encrypt with AES-256-GCM
-        block, err := aes.NewCipher(aesKey)
-        if err != nil {
-                return nil, fmt.Errorf("keystore: cipher: %w", err)
-        }
-        gcm, err := cipher.NewGCM(block)
-        if err != nil {
-                return nil, fmt.Errorf("keystore: gcm: %w", err)
-        }
-        ciphertext := gcm.Seal(nil, nonce, []byte(mnemonic), nil)
+	// Encrypt with AES-256-GCM
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("keystore: gcm: %w", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, []byte(mnemonic), nil)
 
-        // Preserve the legacy MAC for keystores without derivation metadata.
-        // New metadata-bearing keystores authenticate the address and indices
-        // so an edited path cannot silently relabel the wallet.
-        mac := computeMAC(aesKey, ciphertext)
-        if account != nil && index != nil {
-                mac = computeMACWithDerivation(aesKey, ciphertext, address, *account, *index)
-        }
+	// Preserve the legacy MAC for keystores without derivation metadata.
+	// New metadata-bearing keystores authenticate the address and indices
+	// so an edited path cannot silently relabel the wallet.
+	mac := computeMAC(aesKey, ciphertext)
+	if account != nil && index != nil {
+		mac = computeMACWithDerivation(aesKey, ciphertext, address, *account, *index)
+	}
 
-        version := 1
-        if account != nil && index != nil {
-                version = 2
-        }
-        return &KeystoreV1{
-                Version:      version,
-                Address:      address,
-                AccountIndex: account,
-                AddressIndex: index,
-                CreatedAt:    time.Now().UTC().Format(time.RFC3339),
-                Crypto: keystoreCrypto{
-                        Cipher:     "aes-256-gcm",
-                        CipherText: hex.EncodeToString(ciphertext),
-                        Nonce:      hex.EncodeToString(nonce),
-                        KDF:        "pbkdf2-sha256",
-                        KDFParams: pbkdf2Params{
-                                Iter: pbkdf2Iter,
-                                Salt: hex.EncodeToString(salt),
-                        },
-                        MAC: hex.EncodeToString(mac),
-                },
-        }, nil
+	version := 1
+	if account != nil && index != nil {
+		version = 2
+	}
+	return &KeystoreV1{
+		Version:      version,
+		Address:      address,
+		AccountIndex: account,
+		AddressIndex: index,
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		Crypto: keystoreCrypto{
+			Cipher:     "aes-256-gcm",
+			CipherText: hex.EncodeToString(ciphertext),
+			Nonce:      hex.EncodeToString(nonce),
+			KDF:        "pbkdf2-sha256",
+			KDFParams: pbkdf2Params{
+				Iter: pbkdf2Iter,
+				Salt: hex.EncodeToString(salt),
+			},
+			MAC: hex.EncodeToString(mac),
+		},
+	}, nil
 }
 
 // VerifyDerivation ensures a requested derivation matches the authenticated
@@ -167,95 +167,95 @@ func (ks *KeystoreV1) VerifyDerivation(account, index uint32, address string) er
 // DecryptMnemonic decrypts a KeystoreV1 record using the provided password.
 // Returns the plaintext mnemonic or an error if the password is wrong.
 func DecryptMnemonic(ks *KeystoreV1, password string) (string, error) {
-        if ks == nil {
-                return "", errors.New("keystore: missing keystore")
-        }
-        if ks.Version != 1 && ks.Version != 2 {
-                return "", fmt.Errorf("keystore: unsupported version %d", ks.Version)
-        }
-        if ks.Crypto.Cipher != "aes-256-gcm" {
-                return "", fmt.Errorf("keystore: unsupported cipher %q", ks.Crypto.Cipher)
-        }
+	if ks == nil {
+		return "", errors.New("keystore: missing keystore")
+	}
+	if ks.Version != 1 && ks.Version != 2 {
+		return "", fmt.Errorf("keystore: unsupported version %d", ks.Version)
+	}
+	if ks.Crypto.Cipher != "aes-256-gcm" {
+		return "", fmt.Errorf("keystore: unsupported cipher %q", ks.Crypto.Cipher)
+	}
 
-        salt, err := hex.DecodeString(ks.Crypto.KDFParams.Salt)
-        if err != nil {
-                return "", fmt.Errorf("keystore: decode salt: %w", err)
-        }
-        nonce, err := hex.DecodeString(ks.Crypto.Nonce)
-        if err != nil {
-                return "", fmt.Errorf("keystore: decode nonce: %w", err)
-        }
-        ciphertext, err := hex.DecodeString(ks.Crypto.CipherText)
-        if err != nil {
-                return "", fmt.Errorf("keystore: decode ciphertext: %w", err)
-        }
-        expectedMAC, err := hex.DecodeString(ks.Crypto.MAC)
-        if err != nil {
-                return "", fmt.Errorf("keystore: decode mac: %w", err)
-        }
+	salt, err := hex.DecodeString(ks.Crypto.KDFParams.Salt)
+	if err != nil {
+		return "", fmt.Errorf("keystore: decode salt: %w", err)
+	}
+	nonce, err := hex.DecodeString(ks.Crypto.Nonce)
+	if err != nil {
+		return "", fmt.Errorf("keystore: decode nonce: %w", err)
+	}
+	ciphertext, err := hex.DecodeString(ks.Crypto.CipherText)
+	if err != nil {
+		return "", fmt.Errorf("keystore: decode ciphertext: %w", err)
+	}
+	expectedMAC, err := hex.DecodeString(ks.Crypto.MAC)
+	if err != nil {
+		return "", fmt.Errorf("keystore: decode mac: %w", err)
+	}
 
-        // Derive key using PBKDF2-SHA256
-        iter := ks.Crypto.KDFParams.Iter
-        if iter <= 0 {
-                iter = pbkdf2Iter // default for old keystores
-        }
-        aesKey := pbkdf2SHA256([]byte(password), salt, iter, keyLen)
+	// Derive key using PBKDF2-SHA256
+	iter := ks.Crypto.KDFParams.Iter
+	if iter <= 0 {
+		iter = pbkdf2Iter // default for old keystores
+	}
+	aesKey := pbkdf2SHA256([]byte(password), salt, iter, keyLen)
 
-        // Verify the legacy or derivation-bound MAC before decryption.
-        var gotMAC []byte
-        switch ks.Version {
-        case 1:
-                if ks.AccountIndex != nil || ks.AddressIndex != nil {
-                        return "", errors.New("keystore: version 1 cannot contain derivation metadata")
-                }
-                gotMAC = computeMAC(aesKey, ciphertext)
-        case 2:
-                if ks.AccountIndex == nil || ks.AddressIndex == nil {
-                        return "", errors.New("keystore: version 2 requires derivation metadata")
-                }
-                gotMAC = computeMACWithDerivation(aesKey, ciphertext, ks.Address, *ks.AccountIndex, *ks.AddressIndex)
-        }
-        if !macEqual(gotMAC, expectedMAC) {
-                return "", errors.New("keystore: wrong password or corrupted keystore")
-        }
+	// Verify the legacy or derivation-bound MAC before decryption.
+	var gotMAC []byte
+	switch ks.Version {
+	case 1:
+		if ks.AccountIndex != nil || ks.AddressIndex != nil {
+			return "", errors.New("keystore: version 1 cannot contain derivation metadata")
+		}
+		gotMAC = computeMAC(aesKey, ciphertext)
+	case 2:
+		if ks.AccountIndex == nil || ks.AddressIndex == nil {
+			return "", errors.New("keystore: version 2 requires derivation metadata")
+		}
+		gotMAC = computeMACWithDerivation(aesKey, ciphertext, ks.Address, *ks.AccountIndex, *ks.AddressIndex)
+	}
+	if !macEqual(gotMAC, expectedMAC) {
+		return "", errors.New("keystore: wrong password or corrupted keystore")
+	}
 
-        // Decrypt
-        block, err := aes.NewCipher(aesKey)
-        if err != nil {
-                return "", fmt.Errorf("keystore: cipher: %w", err)
-        }
-        gcm, err := cipher.NewGCM(block)
-        if err != nil {
-                return "", fmt.Errorf("keystore: gcm: %w", err)
-        }
-        plain, err := gcm.Open(nil, nonce, ciphertext, nil)
-        if err != nil {
-                return "", errors.New("keystore: decryption failed (wrong password?)")
-        }
-        return string(plain), nil
+	// Decrypt
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", fmt.Errorf("keystore: cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("keystore: gcm: %w", err)
+	}
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", errors.New("keystore: decryption failed (wrong password?)")
+	}
+	return string(plain), nil
 }
 
-// Marshal serialises the keystore to JSON.
+// Marshal serializes the keystore to JSON.
 func (ks *KeystoreV1) Marshal() ([]byte, error) {
-        return json.MarshalIndent(ks, "", "  ")
+	return json.MarshalIndent(ks, "", "  ")
 }
 
 // UnmarshalKeystore parses a JSON-encoded KeystoreV1 record.
 func UnmarshalKeystore(data []byte) (*KeystoreV1, error) {
-        var ks KeystoreV1
-        if err := json.Unmarshal(data, &ks); err != nil {
-                return nil, fmt.Errorf("keystore: unmarshal: %w", err)
-        }
-        return &ks, nil
+	var ks KeystoreV1
+	if err := json.Unmarshal(data, &ks); err != nil {
+		return nil, fmt.Errorf("keystore: unmarshal: %w", err)
+	}
+	return &ks, nil
 }
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
 
 func computeMAC(key, ciphertext []byte) []byte {
-        h := sha256.New()
-        h.Write(key)
-        h.Write(ciphertext)
-        return h.Sum(nil)
+	h := sha256.New()
+	h.Write(key)
+	h.Write(ciphertext)
+	return h.Sum(nil)
 }
 
 func computeMACWithDerivation(key, ciphertext []byte, address string, account, index uint32) []byte {
@@ -274,12 +274,12 @@ func computeMACWithDerivation(key, ciphertext []byte, address string, account, i
 }
 
 func macEqual(a, b []byte) bool {
-        if len(a) != len(b) {
-                return false
-        }
-        var diff byte
-        for i := range a {
-                diff |= a[i] ^ b[i]
-        }
-        return diff == 0
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := range a {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }

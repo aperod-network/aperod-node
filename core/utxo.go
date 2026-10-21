@@ -12,7 +12,7 @@ import (
 
 // KeyImageStore is the persistent backend for spent key images.
 // Implemented by *store.DB in production; nil in unit tests (all historical
-// lookups return false — unspent — which is the correct isolated behaviour
+// lookups return false — unspent — which is the correct isolated behavior
 // for tests that control their own small key-image set via MarkSpent only).
 type KeyImageStore interface {
 	IsKeyImageSpent(ki crypto.KeyImage) (bool, error)
@@ -54,7 +54,7 @@ type RingMemberFilterStore interface {
 //     binary-search lookups work in tests without LevelDB.  In production
 //     sorted is always empty; the 700 MB baseline is eliminated entirely.
 //
-// Snapshots serialise only 'recent' entries when kiDB is set (historical KIs
+// Snapshots serialize only 'recent' entries when kiDB is set (historical KIs
 // are in LevelDB and survive restarts on disk).  restoreFromSlice is a no-op
 // in production, eliminating phantom-KI bugs: mempool entries in old snapshots
 // no longer mark valid UTXOs as permanently spent.
@@ -144,7 +144,7 @@ func (c *compactKeyImageSet) length() int { return len(c.sorted) + len(c.recent)
 // In production (kiDB set): returns only 'recent' entries; historical KIs
 // are in kiDB (LevelDB) and excluded — they survive restarts on disk.
 // In tests (kiDB nil): merges sorted+recent for a complete set, matching the
-// old behaviour expected by snapshot-round-trip tests.
+// old behavior expected by snapshot-round-trip tests.
 func (c *compactKeyImageSet) toSlice() []crypto.KeyImage {
 	total := len(c.sorted) + len(c.recent)
 	if total == 0 {
@@ -230,7 +230,7 @@ var maxSpentDecoys = 10_000
 var maxCLSAGRecentOutputs = 100_000
 
 // maxRollbackDepth is the number of recent block heights kept in the rollback
-// journal.  Any chain reorganisation deeper than this cannot be reversed in
+// journal.  Any chain reorganization deeper than this cannot be reversed in
 // memory.  On a PoA chain such deep reorgs are operationally impossible.
 const maxRollbackDepth = 256
 
@@ -312,6 +312,10 @@ func (s *UTXOSet) SetCLSAGActivationHeight(height uint64) {
 func (s *UTXOSet) Add(u *UTXO) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Store an owned record. Snapshot views may retain pointers after this lock
+	// is released, so caller-owned block/restore data must not be able to mutate
+	// a live record behind the set's back.
+	u = cloneUTXO(u)
 	key := UTXOKey{TxHash: u.TxHash, OutputIndex: u.OutputIndex}
 	s.utxos[key] = u
 	// Guardian outputs are retained for audit/rollback but are permanently
@@ -320,6 +324,53 @@ func (s *UTXOSet) Add(u *UTXO) {
 		s.byPubKey[u.OneTimePub] = u
 	}
 	s.trackCLSAGRecentLocked(key, u.BlockHeight)
+}
+
+func cloneUTXO(u *UTXO) *UTXO {
+	if u == nil {
+		return nil
+	}
+	cp := *u
+	return &cp
+}
+
+// replaceUTXOReferenceLocked swaps an immutable UTXO record everywhere the
+// set currently references it. The caller must hold s.mu.
+func (s *UTXOSet) replaceUTXOReferenceLocked(old, replacement *UTXO) {
+	if old == nil || replacement == nil {
+		return
+	}
+	key := UTXOKey{TxHash: old.TxHash, OutputIndex: old.OutputIndex}
+	active := s.utxos[key] == old
+	staked := s.stakedUTXOs[key] == old
+	spentDecoy := s.spentPubKeys[old.OneTimePub] == old
+
+	if active {
+		s.utxos[key] = replacement
+	}
+	if staked {
+		s.stakedUTXOs[key] = replacement
+	}
+	if s.byPubKey[old.OneTimePub] == old {
+		delete(s.byPubKey, old.OneTimePub)
+		if active && !isProtocolLockedUTXO(replacement) {
+			s.byPubKey[replacement.OneTimePub] = replacement
+		}
+	}
+	if spentDecoy {
+		delete(s.spentPubKeys, old.OneTimePub)
+		if !isProtocolLockedUTXO(replacement) {
+			s.spentPubKeys[replacement.OneTimePub] = replacement
+		}
+	}
+	for height, entries := range s.rollbackJournal {
+		for i := range entries {
+			if entries[i].utxo == old {
+				entries[i].utxo = replacement
+			}
+		}
+		s.rollbackJournal[height] = entries
+	}
 }
 
 func (s *UTXOSet) trackCLSAGRecentLocked(key UTXOKey, height uint64) {
@@ -341,20 +392,20 @@ func (s *UTXOSet) trackCLSAGRecentLocked(key UTXOKey, height uint64) {
 	}
 }
 
-// Get retrieves a UTXO by its key. Returns nil if not found.
+// Get retrieves a copy of a UTXO by its key. Returns nil if not found.
 func (s *UTXOSet) Get(txHash crypto.Hash32, outIdx uint32) *UTXO {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.utxos[UTXOKey{TxHash: txHash, OutputIndex: outIdx}]
+	return cloneUTXO(s.utxos[UTXOKey{TxHash: txHash, OutputIndex: outIdx}])
 }
 
-// GetByPubKey looks up a UTXO by its stealth one-time public key.
+// GetByPubKey looks up a copy of a UTXO by its stealth one-time public key.
 // Used by TxVerifier to bind ring member AmountCommits to actual on-chain
 // UTXO commitments (C-0 fix: prevents attacker-supplied fake commitments).
 func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.byPubKey[pub]
+	return cloneUTXO(s.byPubKey[pub])
 }
 
 // GetRingMember returns an active output or a retained spent output suitable
@@ -364,12 +415,14 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
 	s.mu.RLock()
 	if u := s.byPubKey[pub]; u != nil && !isProtocolLockedUTXO(u) {
+		result := cloneUTXO(u)
 		s.mu.RUnlock()
-		return u
+		return result
 	}
 	if u := s.spentPubKeys[pub]; u != nil && !isProtocolLockedUTXO(u) {
+		result := cloneUTXO(u)
 		s.mu.RUnlock()
-		return u
+		return result
 	}
 	store := s.ringMembers
 	s.mu.RUnlock()
@@ -380,7 +433,7 @@ func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
 	if err != nil || isProtocolLockedUTXO(u) {
 		return nil
 	}
-	return u
+	return cloneUTXO(u)
 }
 
 // ClearKeyImages resets the in-memory 'recent' key-image map to empty.
@@ -408,7 +461,9 @@ func (s *UTXOSet) PatchAmountCommit(oneTimePub crypto.Point32, correct crypto.Co
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if u := s.byPubKey[oneTimePub]; u != nil {
-		u.AmountCommit = correct
+		repaired := cloneUTXO(u)
+		repaired.AmountCommit = correct
+		s.replaceUTXOReferenceLocked(u, repaired)
 	}
 }
 
@@ -426,7 +481,9 @@ func (s *UTXOSet) PatchStakedAmountCommit(txHash crypto.Hash32, outIdx uint32, c
 	defer s.mu.Unlock()
 	k := UTXOKey{TxHash: txHash, OutputIndex: outIdx}
 	if u := s.stakedUTXOs[k]; u != nil {
-		u.AmountCommit = correct
+		repaired := cloneUTXO(u)
+		repaired.AmountCommit = correct
+		s.replaceUTXOReferenceLocked(u, repaired)
 	}
 }
 
@@ -471,6 +528,25 @@ func (s *UTXOSet) IsSpent(ki crypto.KeyImage) bool {
 		return s.keyImages.contains(ki)
 	}
 	return s.keyImages.contains(canonical)
+}
+
+// HasSpentKeyImage returns whether a canonical key image is spent and
+// propagates persistent-index errors. Consensus callers must use this method
+// instead of IsSpent when a storage read failure must reject the transaction.
+func (s *UTXOSet) HasSpentKeyImage(ki crypto.KeyImage) (bool, error) {
+	canonical, err := crypto.CanonicalKeyImage(ki)
+	if err != nil {
+		return false, fmt.Errorf("invalid key image: %w", err)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.keyImages.contains(canonical) {
+		return true, nil
+	}
+	if s.keyImages.kiDB != nil {
+		return s.keyImages.kiDB.IsKeyImageSpent(canonical)
+	}
+	return false, nil
 }
 
 // ClearPhantomSpent removes a key image from the persistent spent set after an
@@ -525,6 +601,28 @@ func (s *UTXOSet) ApplyBlock(block *Block) error {
 	seen := make(map[crypto.KeyImage]int) // ki → first tx index (for error reporting)
 	consumed := make(map[UTXOKey]int)     // UTXO identity → first tx index
 	for txIdx, tx := range block.Txs {
+		if tx.IsStake() && len(tx.Extra) == StakePayloadSizeV4 {
+			_, _, _, _, _, _, _, keyImage, _, err := DecodeStakeExtraV4(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("block %d tx[%d]: decode stake key image: %w",
+					block.Header.Height, txIdx, err)
+			}
+			canonical, err := crypto.CanonicalKeyImage(keyImage)
+			if err != nil {
+				return fmt.Errorf("block %d tx[%d]: invalid stake key image: %w",
+					block.Header.Height, txIdx, err)
+			}
+			if s.keyImages.contains(canonical) {
+				return fmt.Errorf("stake key image %x is already spent at block %d",
+					keyImage[:8], block.Header.Height)
+			}
+			if firstIdx, duplicate := seen[canonical]; duplicate {
+				return fmt.Errorf("key image %x reused by tx[%d] and stake tx[%d] in block %d",
+					keyImage[:8], firstIdx, txIdx, block.Header.Height)
+			}
+			seen[canonical] = txIdx
+			continue
+		}
 		if tx.IsCoinbase() || tx.IsStake() {
 			continue
 		}
@@ -672,7 +770,7 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 						// Always record in the rollback journal, independent of the decoy
 						// pool cap.  RollbackBlock reads from here, not from spentPubKeys,
 						// so that a UTXO spent when the decoy pool is full can still be
-						// restored on a chain reorganisation.
+						// restored on a chain reorganization.
 						s.rollbackJournal[block.Header.Height] = append(
 							s.rollbackJournal[block.Header.Height],
 							rollbackEntry{ringMember: member, utxo: utxo},
@@ -680,7 +778,7 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 						// Prune the journal once it exceeds maxRollbackDepth distinct
 						// heights, evicting the oldest entry to keep memory bounded.
 						if len(s.rollbackJournal) > maxRollbackDepth {
-							var oldest uint64 = ^uint64(0)
+							var oldest = ^uint64(0)
 							for h := range s.rollbackJournal {
 								if h < oldest {
 									oldest = h
@@ -694,6 +792,14 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 						}
 						break // exactly one match expected (Pedersen commitments are binding)
 					}
+				}
+			}
+		}
+		if tx.IsStake() && len(tx.Extra) == StakePayloadSizeV4 {
+			_, _, _, _, _, _, _, keyImage, _, err := DecodeStakeExtraV4(tx.Extra)
+			if err == nil {
+				if canonical, canonicalErr := crypto.CanonicalKeyImage(keyImage); canonicalErr == nil {
+					s.keyImages.insert(canonical)
 				}
 			}
 		}
@@ -797,6 +903,14 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 				}
 			}
 		}
+		if tx.IsStake() && len(tx.Extra) == StakePayloadSizeV4 {
+			_, _, _, _, _, _, _, keyImage, _, err := DecodeStakeExtraV4(tx.Extra)
+			if err == nil {
+				if canonical, canonicalErr := crypto.CanonicalKeyImage(keyImage); canonicalErr == nil {
+					s.keyImages.remove(canonical)
+				}
+			}
+		}
 	}
 	onRestored := s.OnUTXORestored
 	onDeleted := s.OnUTXODeleted
@@ -828,7 +942,7 @@ func (s *UTXOSet) RollbackBlock(block *Block) error {
 // cannot be spent in a normal RingCT transaction or re-used as a ring decoy.
 // The UTXO data is preserved in stakedUTXOs (not discarded) so that
 // UnmarkStaked can restore it for transactional rollback.
-// Returns an error if the UTXO is not in the active set or already staked.  (C-1 fix)
+// Returns an error if the UTXO is not in the active set or already staked.  (C-1 fix).
 func (s *UTXOSet) MarkStaked(txHash crypto.Hash32, outIdx uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -865,7 +979,7 @@ func (s *UTXOSet) MarkStakedKnown(txHash crypto.Hash32, outIdx uint32, u *UTXO) 
 	}
 	// If the UTXO is currently in the active set (e.g. from the startup rebuild
 	// scan), use its data for the staked record and remove it from the active
-	// indices — exactly matching MarkStaked behaviour.
+	// indices — exactly matching MarkStaked behavior.
 	if existing, ok := s.utxos[k]; ok {
 		delete(s.byPubKey, existing.OneTimePub)
 		delete(s.utxos, k)
@@ -875,7 +989,7 @@ func (s *UTXOSet) MarkStakedKnown(txHash crypto.Hash32, outIdx uint32, u *UTXO) 
 	// UTXO absent from active set (e.g. node upgraded mid-chain without a rebuild
 	// or UTXO was already removed): store the provided descriptor so IsStaked()
 	// returns true and prevents collateral reuse.
-	s.stakedUTXOs[k] = u
+	s.stakedUTXOs[k] = cloneUTXO(u)
 }
 
 // UnmarkStaked reverses MarkStaked for transactional rollback: moves the UTXO
@@ -1142,7 +1256,7 @@ func (s *UTXOSet) KeyImagesRecentCount() int {
 //     blocks seen since the last flush, not to total chain history.
 //
 //   - Tests (kiDB nil): merges 'recent' into the compact 'sorted' slice
-//     (32 B/entry vs ≈150 B map bucket), mirroring the old two-tier behaviour
+//     (32 B/entry vs ≈150 B map bucket), mirroring the old two-tier behavior
 //     so test assertions on KeyImagesRecentCount() and KeyImagesCount() pass.
 //
 // Call periodically (every GC cycle) with runtime.GC()+debug.FreeOSMemory()
@@ -1178,7 +1292,9 @@ func (s *UTXOSet) CompactKeyImages() int {
 	return before
 }
 
-// All returns a snapshot of all UTXOs (for testing / export).
+// All returns the current UTXO references (for read-only testing / export).
+// Callers must not mutate the returned records; use PatchAmountCommit or the
+// block mutation methods so snapshot views remain immutable.
 func (s *UTXOSet) All() []*UTXO {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

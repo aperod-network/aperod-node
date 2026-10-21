@@ -11,8 +11,8 @@ package main
 // the failure was logged via slog at WARN level, captured with the JSON handler.
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"

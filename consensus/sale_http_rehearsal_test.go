@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"filippo.io/edwards25519"
+
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/aperod/aperod/core"
@@ -81,6 +82,26 @@ func TestREST_AddressUTXOs_StealthDiscoveredByViewKeyHeader(t *testing.T) {
 	}
 	if gotAmt != fmt.Sprint(wantAmount) {
 		t.Errorf("amount_napr = %s, want %d", gotAmt, wantAmount)
+	}
+}
+
+func TestREST_AddressUTXOs_RejectsMalformedViewKeyHeader(t *testing.T) {
+	srv, _ := buildUTXOServer(t)
+
+	wk, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
+
+	for _, viewKey := range []string{
+		strings.Repeat("a", 1<<16),
+		strings.Repeat("g", 64),
+	} {
+		code, _ := restGetHeader(t, srv, "/api/v1/address/"+string(addr)+"/utxos", "X-View-Key", viewKey)
+		if code != http.StatusBadRequest {
+			t.Errorf("status for malformed X-View-Key length %d = %d, want 400", len(viewKey), code)
+		}
 	}
 }
 

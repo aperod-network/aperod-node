@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/sale"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 // SaleMigration is operator configuration, never accepted from a payment API.
@@ -122,8 +123,8 @@ func (d *DB) PrepareSaleBlock(b *core.Block, m *SaleMigration) (*SaleSettlement,
 		if err != nil {
 			return nil, err
 		}
-if err = VerifySaleReserveFloors(l, m.Reconciliation); err != nil {
-return nil, err
+		if err = VerifySaleReserveFloors(l, m.Reconciliation); err != nil {
+			return nil, err
 		}
 		knownIssued, err := SaleKnownIssuedFloor(l)
 		if err != nil {

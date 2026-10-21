@@ -25,7 +25,7 @@ var bip39WordListBase = []string{
 	"ankle", "announce", "annual", "another", "answer", "antenna", "antique", "anxiety",
 	"any", "apart", "apology", "appear", "apple", "approve", "april", "arch",
 	"arctic", "area", "arena", "argue", "arm", "armed", "armor", "army",
-	"around", "arrange", "arrest", "arrive", "arrow", "art", "artefact", "artist",
+	"around", "arrange", "arrest", "arrive", "arrow", "art", "artefact", "artist", //nolint:misspell // Canonical BIP-39 English list entry.
 	"artwork", "ask", "aspect", "assault", "asset", "assist", "assume", "asthma",
 	"athlete", "atom", "attack", "attend", "attitude", "attract", "auction", "audit",
 	"august", "aunt", "author", "auto", "autumn", "average", "avocado", "avoid",

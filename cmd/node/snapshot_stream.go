@@ -1,43 +1,39 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 )
 
-// writeSnapshotArray encodes one bounded chunk at a time. json.Encoder.Encode
-// buffers its entire argument before writing, which previously kept a second
-// multi-gigabyte copy of the UTXO snapshot alive during gzip compression.
+// writeSnapshotArray encodes one value at a time through a fixed-size buffer.
+// This keeps both the retained UTXO view and the JSON encoder bounded while
+// gzip writes the snapshot to disk.
 func writeSnapshotArray[T any](w io.Writer, values []T) error {
 	if values == nil {
 		_, err := io.WriteString(w, "null")
 		return err
 	}
-	if _, err := io.WriteString(w, "["); err != nil {
+	bw := bufio.NewWriterSize(w, 64*1024)
+	if _, err := io.WriteString(bw, "["); err != nil {
 		return err
 	}
-	const chunkSize = 256
-	for start := 0; start < len(values); start += chunkSize {
-		end := start + chunkSize
-		if end > len(values) {
-			end = len(values)
-		}
-		chunk, err := json.Marshal(values[start:end])
-		if err != nil {
-			return err
-		}
-		if start > 0 {
-			if _, err = io.WriteString(w, ","); err != nil {
+	enc := json.NewEncoder(bw)
+	for i := range values {
+		if i > 0 {
+			if _, err := io.WriteString(bw, ","); err != nil {
 				return err
 			}
 		}
-		if _, err = w.Write(chunk[1 : len(chunk)-1]); err != nil {
+		if err := enc.Encode(values[i]); err != nil {
 			return err
 		}
 	}
-	_, err := io.WriteString(w, "]")
-	return err
+	if _, err := io.WriteString(bw, "]"); err != nil {
+		return err
+	}
+	return bw.Flush()
 }
 
 func writeSnapshotField(w io.Writer, name string, value any) error {
@@ -50,8 +46,9 @@ func writeSnapshotField(w io.Writer, name string, value any) error {
 }
 
 // writeStartupSnapshotJSON preserves the v2 JSON schema while ensuring the
-// encoder never constructs a second full-size JSON buffer. The detached
-// UTXOSnapshot remains immutable until this function returns.
+// encoder never constructs a second full-size JSON buffer. A UTXOSnapshot from
+// TakeSnapshotView contains stable, read-only record pointers until this
+// function returns.
 func writeStartupSnapshotJSON(w io.Writer, snap startupSnapshot) error {
 	if _, err := io.WriteString(w, "{"); err != nil {
 		return err

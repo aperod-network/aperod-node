@@ -17,7 +17,7 @@ const (
 // gossipEntry records a hash and its insertion time in FIFO order.
 type gossipEntry struct {
 	hash crypto.Hash32
-	at time.Time
+	at   time.Time
 }
 
 // GossipFilter is a bounded seen-set that prevents a block or transaction from

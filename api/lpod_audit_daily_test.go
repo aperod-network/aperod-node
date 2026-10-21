@@ -12,12 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 const dailyAuditTestAPIKey = "daily-audit-test-admin-key"
@@ -335,10 +336,12 @@ func TestLPoDAuditDailyFailsClosedWhenTimestampProbeBodyIsPruned(t *testing.T) {
 	srv.SetLPoDConfig(nil, func(height uint64, hash crypto.Hash32) bool {
 		return height == 14 && hash == certHash
 	})
-key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
-if err != nil { t.Fatal(err) }
-t.Cleanup(key.Destroy)
-srv.SetValidatorKey(key)
+	key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(key.Destroy)
+	srv.SetValidatorKey(key)
 	code, body := dailyAuditGet(t, srv, "/api/v1/lpod/audit/daily?date=2024-01-02")
 	if code != http.StatusOK || body["status"] != "incomplete" ||
 		!containsText(body["reason"].(string), "signed-header metadata is unavailable") ||
@@ -568,10 +571,12 @@ func dailyAuditFixture(t *testing.T, markerHeight uint64) (*api.Server, *store.D
 	srv := api.NewServer(":0", nil, nil, nil, testLogger())
 	srv.SetStore(db)
 	srv.SetAPIKey(dailyAuditTestAPIKey)
-key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
-if err != nil { t.Fatal(err) }
-t.Cleanup(key.Destroy)
-srv.SetValidatorKey(key)
+	key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(key.Destroy)
+	srv.SetValidatorKey(key)
 	return srv, db, hashes, path
 }
 
@@ -714,37 +719,41 @@ func dailyAuditCompleteFixture(t *testing.T) (*api.Server, *store.DB, []crypto.H
 	srv := api.NewServer(":0", nil, nil, nil, testLogger())
 	srv.SetStore(db)
 	srv.SetAPIKey(dailyAuditTestAPIKey)
-key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
-if err != nil { t.Fatal(err) }
-t.Cleanup(key.Destroy)
-srv.SetValidatorKey(key)
+	key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(key.Destroy)
+	srv.SetValidatorKey(key)
 	return srv, db, hashes, path
 }
 
 func dailyAuditGet(t *testing.T, srv *api.Server, path string) (int, map[string]interface{}) {
 	t.Helper()
-srv.StartDailyAuditWorker()
-t.Cleanup(srv.StopDailyAuditWorker)
-deadline := time.Now().Add(30*time.Second)
-for {
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, path, nil)
-	request.Host = "127.0.0.1"
-	request.RemoteAddr = "127.0.0.1:12345"
-	request.Header.Set("X-API-Key", dailyAuditTestAPIKey)
-	srv.ServeHTTP(recorder, request)
-	var body map[string]interface{}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode response: %v (%s)", err, recorder.Body.String())
+	srv.StartDailyAuditWorker()
+	t.Cleanup(srv.StopDailyAuditWorker)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Host = "127.0.0.1"
+		request.RemoteAddr = "127.0.0.1:12345"
+		request.Header.Set("X-API-Key", dailyAuditTestAPIKey)
+		srv.ServeHTTP(recorder, request)
+		var body map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v (%s)", err, recorder.Body.String())
+		}
+		reason, _ := body["reason"].(string)
+		if reason == "queued for bounded background verification" || reason == "bounded background verification in progress" {
+			if time.Now().After(deadline) {
+				t.Fatal("background audit did not finish")
+			}
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		return recorder.Code, body
 	}
-reason, _ := body["reason"].(string)
-if reason == "queued for bounded background verification" || reason == "bounded background verification in progress" {
-if time.Now().After(deadline) { t.Fatal("background audit did not finish") }
-time.Sleep(20*time.Millisecond)
-continue
-}
-	return recorder.Code, body
-}
 }
 
 func containsText(value, fragment string) bool {

@@ -19,10 +19,10 @@ func (e *Engine) validateVersionWithSales(tx *core.Transaction, height, activati
 }
 
 func (e *Engine) prepareSale(b *core.Block) (*store.SaleSettlement, error) {
-if e.cfg.SaleMigration != nil && e.cfg.GenesisVestingActivationHeight != 0 &&
-e.cfg.GenesisVestingActivationHeight >= e.cfg.SaleMigration.Checkpoint.Height {
-return nil, fmt.Errorf("sale: scheduled new genesis reserve overlaps the sale allocation")
-}
+	if e.cfg.SaleMigration != nil && e.cfg.GenesisVestingActivationHeight != 0 &&
+		e.cfg.GenesisVestingActivationHeight >= e.cfg.SaleMigration.Checkpoint.Height {
+		return nil, fmt.Errorf("sale: scheduled new genesis reserve overlaps the sale allocation")
+	}
 	if e.cfg.Store == nil {
 		for _, tx := range b.Txs {
 			if tx.IsSale() {

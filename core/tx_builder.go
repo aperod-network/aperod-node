@@ -6,8 +6,10 @@
 package core
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"sort"
 
 	"github.com/aperod/aperod/crypto"
@@ -250,7 +252,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		available = uniq
 	}
 
-	// ── UTXO selection: iterate until fee estimate stabilises ────────────────
+	// ── UTXO selection: iterate until fee estimate stabilizes ────────────────
 	// Fee = estimated_tx_size_bytes × feePerByte.
 	// We iterate: pick UTXOs → estimate size → recalculate fee → check again.
 	// In practice this converges in ≤2 iterations because adding one UTXO
@@ -750,8 +752,9 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
 	}, blind, nil
 }
 
-// txBuildRing assembles a ring of RingSize with the real key at a deterministic
-// position derived from the key bytes (so signing is consistent across retries).
+// txBuildRing assembles a ring of RingSize with the real key at an independently
+// randomized position. The real position is private signing state, not a
+// function of the public key.
 //
 // Phase 2 (decoys provided): decoy slots use real on-chain UTXOs from the supplied
 // slice.  Each DecoyUTXO contributes its OneTimePub to the ring; the caller must
@@ -764,7 +767,21 @@ func txBuildOutput(addr crypto.Address, amount uint64) (Output, crypto.BlindFact
 // of slots that could not be filled with a real decoy and used a random key instead.
 // A non-zero fallbackCount means privacy is degraded for this ring.
 func txBuildRing(realPub crypto.Point32, decoys []DecoyUTXO) ([]crypto.RingMember, int, int, error) {
-	realIdx := int(realPub[0]) % crypto.RingSize
+	return txBuildRingWithEntropy(realPub, decoys, cryptorand.Reader)
+}
+
+// txBuildRingWithEntropy makes real-position selection testable without
+// weakening production randomness. crypto/rand.Int uses rejection sampling,
+// so each slot is equally likely; entropy errors fail closed.
+func txBuildRingWithEntropy(realPub crypto.Point32, decoys []DecoyUTXO, entropy io.Reader) ([]crypto.RingMember, int, int, error) {
+	if entropy == nil {
+		return nil, 0, 0, fmt.Errorf("select real ring position: cryptographic entropy is required")
+	}
+	position, err := cryptorand.Int(entropy, big.NewInt(int64(crypto.RingSize)))
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("select real ring position: %w", err)
+	}
+	realIdx := int(position.Int64())
 	ring := make([]crypto.RingMember, crypto.RingSize)
 	seen := map[crypto.Point32]struct{}{realPub: {}}
 
@@ -866,13 +883,13 @@ func (b *TxBuilder) MaxSpendable() MaxSpendableResult {
 		prefixSums[k] = prefix
 	}
 	for k := 1; k <= limit; k++ {
-fee := txEstimateFeeVersion(b.txVersion, k, 2, b.feePerByte)
+		fee := txEstimateFeeVersion(b.txVersion, k, 2, b.feePerByte)
 		if prefixSums[k] <= fee {
 			continue
 		}
 		amount := prefixSums[k] - fee
-selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
-finalFee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
+		selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
+		finalFee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
 		if selTotal >= amount+finalFee && amount > res.MaxAmount {
 			res.MaxAmount = amount
 			res.Fee = finalFee
@@ -931,15 +948,15 @@ func (b *TxBuilder) EstimateFeeForAmount(amount uint64) FeeEstimateResult {
 		res.SpendableTotal += u.Amount
 	}
 
-selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
+	selCount, selTotal := simulateGreedySelection(available, amount, b.feePerByte, b.txVersion)
 	if selCount < 1 {
 		selCount = 1 // a tx always has ≥1 input
 	}
-fee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
+	fee := txEstimateFeeVersion(b.txVersion, selCount, 2, b.feePerByte)
 	res.Fee = fee
 	res.InputCount = selCount
-res.TxSizeBytes = txEstimatedSize(b.txVersion, selCount, 2)
-res.Sufficient = amount <= ^uint64(0)-fee && selTotal >= amount+fee
+	res.TxSizeBytes = txEstimatedSize(b.txVersion, selCount, 2)
+	res.Sufficient = amount <= ^uint64(0)-fee && selTotal >= amount+fee
 	return res
 }
 
@@ -949,12 +966,12 @@ res.Sufficient = amount <= ^uint64(0)-fee && selTotal >= amount+fee
 // deduplicated by OneTimePub.
 func simulateGreedySelection(available []OwnedUTXO, amount, feePerByte uint64, version TxVersion) (int, uint64) {
 	const maxInputs = 8
-fee := txEstimateFeeVersion(version, 1, 2, feePerByte)
-// Build rejects an amount that overflows once the initial fee is added.
-if amount > ^uint64(0)-fee {
-return 0, 0
-}
-needed := amount + fee
+	fee := txEstimateFeeVersion(version, 1, 2, feePerByte)
+	// Build rejects an amount that overflows once the initial fee is added.
+	if amount > ^uint64(0)-fee {
+		return 0, 0
+	}
+	needed := amount + fee
 	var (
 		count   int
 		totalIn uint64

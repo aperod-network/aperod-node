@@ -10,10 +10,10 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
-	"github.com/aperod/aperod/store"
 	"golang.org/x/sys/unix"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/store"
 )
 
 func main() {
@@ -101,17 +101,9 @@ func main() {
 	if cert.Height != *end || cert.BlockHash != previous {
 		fail("certificate height %d must equal interval end %d", cert.Height, *end)
 	}
-	seen := map[string]bool{}
-	message := crypto.HashBytes([]byte("aperod/finalize/v1"), cert.BlockHash.Bytes())
-	for _, vote := range cert.Votes {
-		key := vote.Validator.Hex()
-		if seen[key] || !vote.Validator.Verify(message, vote.Signature) {
-			fail("invalid or duplicate certificate vote")
-		}
-		seen[key] = true
-	}
-	if len(seen) == 0 {
-		fail("empty certificate")
+	evidence, err := endpointCertificateEvidence(cert)
+	if err != nil {
+		fail("certificate: %v", err)
 	}
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &after); err != nil {
 		fail("resource accounting: %v", err)
@@ -119,9 +111,12 @@ func main() {
 	result := map[string]any{
 		"start": *start, "end": *end, "blocks": count, "transactions": txs,
 		"certificate_height": cert.Height, "certificate_hash": fmt.Sprintf("%x", cert.BlockHash),
-		"signature_valid_vote_keys": seen, "committee_authenticated": false,
-		"trust": "internal consistency only; no historical committee anchor or quorum proof",
-		"input_block_operations": after.Inblock - before.Inblock, "peak_rss_kib": after.Maxrss,
+		"signature_valid_vote_keys": evidence.SignatureValidVoteKeys,
+		"committee_authenticated":   evidence.CommitteeAuthenticated,
+		"quorum_authenticated":      evidence.QuorumAuthenticated,
+		"production_ready":          evidence.ProductionReady,
+		"trust":                     evidence.Trust,
+		"input_block_operations":    after.Inblock - before.Inblock, "peak_rss_kib": after.Maxrss,
 		"file_eviction_requested": *evict,
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {

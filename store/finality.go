@@ -15,8 +15,9 @@ type FinalityVote struct {
 	Signature []byte                 `json:"signature"`
 }
 
-// FinalityCertificate is an authentic quorum proof for one canonical block.
-// It is never inferred from a tip, snapshot, or checkpoint.
+// FinalityCertificate stores votes for one canonical block. Consensus checks
+// their signatures and independently authorized membership before accepting a
+// quorum. Loading this record alone does not authenticate a historical committee.
 type FinalityCertificate struct {
 	Version   uint8          `json:"version"`
 	Height    uint64         `json:"height"`

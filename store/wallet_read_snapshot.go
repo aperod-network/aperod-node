@@ -8,13 +8,15 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 // WalletReadSnapshot pins the wallet-facing namespaces to one LevelDB view.
@@ -223,7 +225,11 @@ func (s *WalletReadSnapshot) loadLPoDCheckpointAtWithBudget(
 // for the requested funding block.
 func (s *WalletReadSnapshot) LPoDWalletIndexReady(funding crypto.Hash32) (bool, error) {
 	value, err := s.get(lpodWalletReadyKey)
-	return string(value) == string(funding[:]), err
+	if err != nil {
+		return false, err
+	}
+	backfilled, err := s.get(lpodWalletBackfillReadyKey)
+	return bytes.Equal(value, funding[:]) && bytes.Equal(backfilled, funding[:]), err
 }
 
 // LPoDEarningsIndexReady reports whether the earnings index was complete at
@@ -350,6 +356,10 @@ type WalletCursorReorgError struct {
 	Height uint64
 }
 
+// ErrInvalidWalletResumeCursor identifies invalid caller-supplied positions,
+// independently of failures reading the pinned storage view.
+var ErrInvalidWalletResumeCursor = errors.New("invalid wallet resume cursor")
+
 func (e *WalletCursorReorgError) Error() string {
 	return fmt.Sprintf("wallet resume cursor is noncanonical at height %d", e.Height)
 }
@@ -413,14 +423,14 @@ func (s *WalletReadSnapshot) lpodWalletOutputsAfterHeight(
 	if resumeCursor != "" {
 		key, err := hex.DecodeString(resumeCursor)
 		if err != nil || !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+76 {
-			return nil, "", "", fmt.Errorf("invalid resume_cursor")
+			return nil, "", "", fmt.Errorf("%w: invalid encoding or owner", ErrInvalidWalletResumeCursor)
 		}
 		height := binary.BigEndian.Uint64(key[len(prefix) : len(prefix)+8])
 		if height > throughHeight {
-			return nil, "", "", fmt.Errorf("resume_cursor is above through_height")
+			return nil, "", "", fmt.Errorf("%w: above through_height", ErrInvalidWalletResumeCursor)
 		}
 		if hasAfterHeight && height <= afterHeight {
-			return nil, "", "", fmt.Errorf("resume_cursor is not after after_height")
+			return nil, "", "", fmt.Errorf("%w: not after after_height", ErrInvalidWalletResumeCursor)
 		}
 		canonical, found, err := s.GetCanonicalHash(height)
 		if err != nil {
@@ -434,6 +444,9 @@ func (s *WalletReadSnapshot) lpodWalletOutputsAfterHeight(
 			return nil, "", "", &WalletCursorReorgError{Height: height}
 		}
 		ok = iter.Seek(key)
+		if !ok && iter.Error() != nil {
+			return nil, "", "", iter.Error()
+		}
 		if !ok || !bytes.Equal(iter.Key(), key) {
 			return nil, "", "", &WalletReconciliationError{Height: height, Reason: "resume cursor index row is missing"}
 		}

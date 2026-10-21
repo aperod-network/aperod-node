@@ -1,7 +1,7 @@
 package core
 
 // RegistrySnapshot is a serialisable image of the ValidatorRegistry state.
-// The utxos pointer cannot be serialised and must be re-wired via
+// The utxos pointer cannot be serialized and must be re-wired via
 // SetUTXOSet after RestoreFromSnapshot.
 type RegistrySnapshot struct {
 	Validators     map[string]*ValidatorEntry `json:"validators"`

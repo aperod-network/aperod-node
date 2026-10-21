@@ -101,10 +101,10 @@ func TestDailyJobTamperingRejectedAcrossRestart(t *testing.T) {
 				strings.Contains(rec.Body.String(), `"status":"complete"`) {
 				t.Fatalf("unsafe result: %s", rec.Body.String())
 			}
-afterGET, err := db.GetMeta(dailyJobKey)
-if err != nil || !bytes.Equal(afterGET, tampered) {
-t.Fatal("GET overwrote/re-signed corrupt state instead of reporting the load error")
-}
+			afterGET, err := db.GetMeta(dailyJobKey)
+			if err != nil || !bytes.Equal(afterGET, tampered) {
+				t.Fatal("GET overwrote/re-signed corrupt state instead of reporting the load error")
+			}
 		})
 	}
 	if err := db.PutMetaSync(dailyJobKey, trusted); err != nil {
@@ -221,20 +221,20 @@ func TestDailyJobResetUnreadableAndWrongKeyState(t *testing.T) {
 			if _, err := s.loadDailyJob(); err == nil {
 				t.Fatal("unreadable/wrong-key state accepted")
 			}
-getRecorder := httptest.NewRecorder()
-s.ServeHTTP(getRecorder, authenticatedDailyAuditRequest())
-afterGET, err := db.GetMeta(dailyJobKey)
-if err != nil || !bytes.Equal(afterGET, test.raw) {
-t.Fatal("GET changed unreadable state")
-}
-if getRecorder.Code != http.StatusOK || strings.Contains(getRecorder.Body.String(), "queued for bounded") {
-t.Fatalf("GET did not report unreadable state: %d %s", getRecorder.Code, getRecorder.Body.String())
-}
+			getRecorder := httptest.NewRecorder()
+			s.ServeHTTP(getRecorder, authenticatedDailyAuditRequest())
+			afterGET, err := db.GetMeta(dailyJobKey)
+			if err != nil || !bytes.Equal(afterGET, test.raw) {
+				t.Fatal("GET changed unreadable state")
+			}
+			if getRecorder.Code != http.StatusOK || strings.Contains(getRecorder.Body.String(), "queued for bounded") {
+				t.Fatalf("GET did not report unreadable state: %d %s", getRecorder.Code, getRecorder.Body.String())
+			}
 			req := authenticatedDailyAuditRequest()
 			req.Method = http.MethodDelete
 			rec := httptest.NewRecorder()
 			s.ServeHTTP(rec, req)
-if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"reason":"daily audit cancelled"`) {
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"reason":"daily audit canceled"`) {
 				t.Fatalf("reset failed: %d %s", rec.Code, rec.Body.String())
 			}
 			raw, err := db.GetMeta(dailyJobKey)

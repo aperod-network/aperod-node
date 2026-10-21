@@ -290,7 +290,7 @@ func validHash(value string) bool {
 		return false
 	}
 	for _, c := range value {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -387,7 +387,7 @@ func verifyStage(stage string) (string, uint64, error) {
 		return "", 0, errors.New("manifest tip_hash must be 64 lowercase hexadecimal characters")
 	}
 	for _, c := range m.tipHash {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return "", 0, errors.New("manifest tip_hash must be 64 lowercase hexadecimal characters")
 		}
 	}

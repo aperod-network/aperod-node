@@ -100,18 +100,18 @@ const snapVersionLegacy = 1
 
 // startupSnapshot is the on-disk format for the UTXOSet + registry snapshot.
 type startupSnapshot struct {
-	Version    int                   `json:"v"`
-	TipHeight  uint64                `json:"tip_height"`
-	TipHashHex string                `json:"tip_hash"`
-	TxTotal    int64                 `json:"tx_total"`
+	Version    int    `json:"v"`
+	TipHeight  uint64 `json:"tip_height"`
+	TipHashHex string `json:"tip_hash"`
+	TxTotal    int64  `json:"tx_total"`
 	// SavedAt records the wall-clock time when this snapshot was written.
 	// Used at startup to determine whether the snapshot falls within the OOM
 	// window (i.e., was saved close enough to an unclean shutdown that the
 	// in-memory state it captured might have been partially corrupted).
 	// Omitted from snapshots written by older binaries; treated as zero-value.
-	SavedAt    time.Time             `json:"saved_at,omitempty"`
-	UTXOs      core.UTXOSnapshot     `json:"utxos"`
-	Registry   core.RegistrySnapshot `json:"registry"`
+	SavedAt  time.Time             `json:"saved_at,omitempty"`
+	UTXOs    core.UTXOSnapshot     `json:"utxos"`
+	Registry core.RegistrySnapshot `json:"registry"`
 }
 
 // ── Clean-shutdown marker ─────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ func cleanShutdownMarkerPath(dataDir string) string {
 
 // writeCleanShutdownMarker records that the last shutdown was graceful so the
 // next startup can skip the OOM-window AmountCommit validation.  Non-fatal on
-// error: an absent marker causes validation to run (fail-closed behaviour).
+// error: an absent marker causes validation to run (fail-closed behavior).
 func writeCleanShutdownMarker(dataDir string) error {
 	return os.WriteFile(cleanShutdownMarkerPath(dataDir), []byte("1\n"), 0644)
 }
@@ -156,7 +156,7 @@ func readAndDeleteCleanShutdownMarker(dataDir string) (wasClean bool) {
 	}
 	if err := os.Remove(path); err != nil {
 		// Cannot consume the marker — treat as unclean (fail-closed).
-		// Log to stderr (logger not yet initialised at call site) so the
+		// Log to stderr (logger not yet initialized at call site) so the
 		// operator can diagnose the permission issue.
 		fmt.Fprintf(os.Stderr,
 			"aperod-node: warning: clean-shutdown marker exists but could not be removed (%v); "+

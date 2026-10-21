@@ -9,7 +9,7 @@ package p2p_test
 //  2. Once the back-off window expires, maintainLoop retries the dial.
 //  3. MaxDialBackoff defaults to 5 m when the caller passes 0.
 //  4. The MinPeers known-peer redial path respects the same back-off window;
-//     a bootnode that has failed is NOT dialled through peerList while in back-off.
+//     a bootnode that has failed is NOT dialed through peerList while in back-off.
 //  5. A negative MaxDialBackoff is treated as invalid and replaced with the default.
 
 import (
@@ -134,7 +134,7 @@ func TestBootnodeDialBackoff_NegativeMaxDialBackoff(t *testing.T) {
 // Scenario: a bootnode's resolved address is also present in peerList (which
 // can happen via normal peer-exchange after the first successful connection).
 // When the bootnode is in back-off and the host is below MinPeers, the
-// MinPeers loop must skip the address rather than dialling it directly.
+// MinPeers loop must skip the address rather than dialing it directly.
 func TestBootnodeDialBackoff_MinPeersBypassBlocked(t *testing.T) {
 	const bootnodeAddr = "127.0.0.1:19943"
 	const backoff = 400 * time.Millisecond
@@ -261,7 +261,7 @@ func TestBootnodeDialBackoff_ClearedAfterBriefConnect(t *testing.T) {
 	var useHandshake atomic.Bool
 	var dialCount atomic.Int64
 
-	// connectCh is signalled once the Phase-2 server goroutine has written
+	// connectCh is signaled once the Phase-2 server goroutine has written
 	// MsgPong (connectedAt will be set in handleConn shortly after).
 	connectCh := make(chan struct{}, 1)
 
@@ -353,7 +353,7 @@ func TestBootnodeDialBackoff_ClearedAfterBriefConnect(t *testing.T) {
 	p2p.HostTriggerMaintain(h)
 	time.Sleep(200 * time.Millisecond)
 	if dialCount.Load() <= beforeCount {
-		t.Errorf("bootnode not re-dialled after back-off cleared by brief connect "+
+		t.Errorf("bootnode not re-dialed after back-off cleared by brief connect "+
 			"(count before=%d, after=%d)", beforeCount, dialCount.Load())
 	}
 }
@@ -524,6 +524,6 @@ func TestBootnodeDialBackoff_InboundDifferentIPDoesNotClear(t *testing.T) {
 		t.Fatal("different-IP inbound peer incorrectly cleared configured bootnode back-off")
 	}
 	if got := dialCount.Load(); got != before {
-		t.Fatalf("bootnode was dialled during active back-off: count changed from %d to %d", before, got)
+		t.Fatalf("bootnode was dialed during active back-off: count changed from %d to %d", before, got)
 	}
 }

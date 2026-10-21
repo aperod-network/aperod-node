@@ -27,12 +27,12 @@ import (
 // handleConn will call the Handler (e.g. CurrentHeight); a nil handler panics.
 type wlIntegHandler struct{}
 
-func (wlIntegHandler) OnBlock(_ *core.Block)                      {}
-func (wlIntegHandler) OnTransaction(_ *core.Transaction)          {}
-func (wlIntegHandler) OnVote(_ VoteMsg)                           {}
-func (wlIntegHandler) CurrentHeight() uint64                      { return 0 }
-func (wlIntegHandler) CurrentTailHashes(_ int) []crypto.Hash32   { return nil }
-func (wlIntegHandler) GetBlock(_ crypto.Hash32) *core.Block      { return nil }
+func (wlIntegHandler) OnBlock(_ *core.Block)                   {}
+func (wlIntegHandler) OnTransaction(_ *core.Transaction)       {}
+func (wlIntegHandler) OnVote(_ VoteMsg)                        {}
+func (wlIntegHandler) CurrentHeight() uint64                   { return 0 }
+func (wlIntegHandler) CurrentTailHashes(_ int) []crypto.Hash32 { return nil }
+func (wlIntegHandler) GetBlock(_ crypto.Hash32) *core.Block    { return nil }
 
 // ─── spoofing listener helpers ────────────────────────────────────────────────
 

@@ -117,7 +117,7 @@ type Config struct {
 	WhitelistFile string
 	// MaxBlockIngestPerSec caps the number of blocks per second that any
 	// single peer may push to this node.  The dispatch goroutine sleeps as
-	// needed to honour the limit, creating TCP-level backpressure without
+	// needed to honor the limit, creating TCP-level backpressure without
 	// dropping blocks.  Default: 50.  0 = disabled.
 	MaxBlockIngestPerSec int
 	// TxRateBurst is the token-bucket capacity for incoming P2P
@@ -286,7 +286,7 @@ type Peer struct {
 	outbound bool
 
 	// lastPongAt is the Unix nanosecond timestamp of the most recent MsgPong
-	// received from this peer.  Initialised to the connection start time so
+	// received from this peer.  Initialized to the connection start time so
 	// the first pong-deadline check does not fire before the peer has had a
 	// chance to reply.  Updated by dispatch on every MsgPong; read by the
 	// keepalive goroutine to detect peers that have stopped replying altogether.
@@ -389,7 +389,7 @@ const stableConnTime = 60 * time.Second
 // distributed attacker cannot exhaust node memory by registering many unique IPs.
 const badBlockMaxTrackedIPs = 1024
 
-// badBlockStrike records the misbehaviour history for one remote IP.
+// badBlockStrike records the misbehavior history for one remote IP.
 type badBlockStrike struct {
 	count    int
 	lastSeen time.Time
@@ -539,7 +539,7 @@ type Host struct {
 	wlNets []*net.IPNet
 	wlIPs  []net.IP
 
-	// wlMutate serialises the entire read-snapshot → compute-new-list →
+	// wlMutate serializes the entire read-snapshot → compute-new-list →
 	// apply (wlMu.Lock swap) → persist sequence for all mutation paths
 	// (SetPeerWhitelist, AddToWhitelist, RemoveFromWhitelist).  Without
 	// this lock, two concurrent AddToWhitelist calls would each snapshot
@@ -547,7 +547,7 @@ type Host struct {
 	// silently drop the other entry.
 	wlMutate sync.Mutex
 
-	// wlPersistMu serialises the snapshot+write+rename sequence for the
+	// wlPersistMu serializes the snapshot+write+rename sequence for the
 	// whitelist file so concurrent calls never interleave two partial writes.
 	wlPersistMu sync.Mutex
 
@@ -613,10 +613,10 @@ type Host struct {
 	// keepaliveIntervalNs holds the current live keepalive Ping interval in
 	// nanoseconds.  Updated atomically by SetKeepaliveInterval so the change
 	// is visible to all active peer goroutines on their next ping tick without
-	// any lock or restart.  Initialised from cfg.KeepaliveInterval in NewHost.
+	// any lock or restart.  Initialized from cfg.KeepaliveInterval in NewHost.
 	keepaliveIntervalNs atomic.Int64
 
-	// Live wrong-fork ban tuning (Task #1922).  Initialised from
+	// Live wrong-fork ban tuning (Task #1922).  Initialized from
 	// cfg.BadBlockBanThreshold / BadBlockBanDuration / BadBlockHeightLead in
 	// NewHost and updated atomically by SetBanConfig so operators can tighten
 	// the rogue-peer ban sensitivity from the Admin Panel without a restart.
@@ -628,14 +628,14 @@ type Host struct {
 	// bootnodeLastResolved maps each raw bootnode string (as it appears in
 	// cfg.Bootnodes) to the IP:port addresses it most recently resolved to.
 	// Updated on every successful DNS resolution in Start() and maintainLoop.
-	// DNS failures leave the previous entry intact (retention behaviour).
+	// DNS failures leave the previous entry intact (retention behavior).
 	// bootnodeSet is always rebuilt from this map so a bootnode that moves to
 	// a new IP loses its old address's privileged status on the next tick.
 	// Protected by h.mu (write-lock for mutations, read-lock for lookups).
 	bootnodeLastResolved map[string][]string
 
 	// bootnodeLastResolvedAt maps each raw bootnode string to the wall-clock
-	// time of its most recent successful DNS resolution.  Initialised to
+	// time of its most recent successful DNS resolution.  Initialized to
 	// time.Now() when Start() is called so new nodes get a full grace period
 	// before any stale-bootnode WARN fires.  Updated by applyBootnodeResolution
 	// on every successful resolution.  Protected by h.mu.
@@ -649,10 +649,10 @@ type Host struct {
 
 	// maintainNow is an optional channel that tests can send on to trigger
 	// an immediate maintainLoop tick without waiting for the 10-second ticker.
-	// nil in production (Start always initialises it).
+	// nil in production (Start always initializes it).
 	maintainNow chan struct{}
 
-	// ── Dial-gate: serialises ban writes with dial initiations ────────────
+	// ── Dial-gate: serializes ban writes with dial initiations ────────────
 	//
 	// dialGateMu is held (briefly) by both dialPeer and BanPeer so that
 	// "check IsBanned, then register intent to dial" is atomic with
@@ -731,7 +731,7 @@ type Host struct {
 // NewHost creates a new p2p host.
 func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 	// Apply defaults for rogue-peer ban parameters so callers that do not
-	// set these fields (e.g. unit tests) get safe, production-grade behaviour.
+	// set these fields (e.g. unit tests) get safe, production-grade behavior.
 	if cfg.BadBlockHeightLead == 0 {
 		cfg.BadBlockHeightLead = 1000
 	}
@@ -875,7 +875,7 @@ func (h *Host) SetKeepaliveInterval(d time.Duration) error {
 
 // recordBootnodeFail updates the per-bootnode exponential back-off state after
 // a failed dial attempt.  Called from the handleConn back-off defer when the
-// dialled address is a configured bootnode.  The back-off window grows
+// dialed address is a configured bootnode.  The back-off window grows
 // exponentially from 5 s (first failure) and is capped at MaxDialBackoff so
 // the relay always retries within a bounded interval.
 func (h *Host) recordBootnodeFail(addr string) {
@@ -1178,7 +1178,7 @@ func (h *Host) SetPeerWhitelist(entries []string) error {
 // Returns an error if the entry is not a valid IP or CIDR, or if the sidecar
 // file cannot be written (in which case the in-memory list is not modified).
 // No-op (returns nil) when the entry is already present.
-// The entire read-snapshot → append → apply → persist sequence is serialised
+// The entire read-snapshot → append → apply → persist sequence is serialized
 // under wlMutate, preventing lost-update races with concurrent calls.
 func (h *Host) AddToWhitelist(entry string) error {
 	// Validate before acquiring the lock to fail fast without contention.
@@ -1209,7 +1209,7 @@ func (h *Host) AddToWhitelist(entry string) error {
 // Returns (false, nil) when the entry was not found in the list.
 // Returns (false, err) when the entry was found but the sidecar file could
 // not be written; in that case the in-memory list is not modified.
-// The entire read-snapshot → filter → apply → persist sequence is serialised
+// The entire read-snapshot → filter → apply → persist sequence is serialized
 // under wlMutate, preventing lost-update races with concurrent calls.
 func (h *Host) RemoveFromWhitelist(entry string) (bool, error) {
 	h.wlMutate.Lock()
@@ -1593,7 +1593,7 @@ func (h *Host) Start() error {
 	}
 	h.mu.Unlock()
 
-	// Dial bootnodes — resolve DNS hostnames before dialling so the
+	// Dial bootnodes — resolve DNS hostnames before dialing so the
 	// canonical peer key in h.peers is always an IP:port string.
 	// applyBootnodeResolution records each successful resolution in
 	// bootnodeLastResolved and rebuilds bootnodeSet so dialPeer can
@@ -1643,7 +1643,7 @@ func (h *Host) Start() error {
 // dialableWhitelistAddr reports whether a whitelist entry looks like a dialable
 // "host:port" address (an IP literal or DNS hostname followed by a decimal port
 // in [1,65535]).  Bare IPs and CIDR ranges (the common whitelist form used for
-// inbound access control) return ok=false so they are never dialled outbound.
+// inbound access control) return ok=false so they are never dialed outbound.
 func dialableWhitelistAddr(entry string) (addr string, ok bool) {
 	// CIDR entries contain '/' and are not dialable.
 	if strings.ContainsRune(entry, '/') {
@@ -2203,7 +2203,7 @@ func (h *Host) maintainLoop() {
 			// Mirror the IsBanned guard applied to the MinPeers path
 			// above: skip banned bootnodes before touching h.mu so the
 			// ban check and the connection-table check are both done
-			// outside the lock, minimising lock contention and closing
+			// outside the lock, minimizing lock contention and closing
 			// the goroutine-scheduling window described in task #1650.
 			if h.mgr.IsBanned(addr) {
 				continue
@@ -2352,7 +2352,7 @@ func (h *Host) dialPeer(addr string) {
 	// Configured bootnodes skip the exponential back-off window so a
 	// simultaneous restart of both validators does not leave the network
 	// isolated for up to 5 minutes.  The ban list still applies — a
-	// bootnode that is actively banned cannot be re-dialled.
+	// bootnode that is actively banned cannot be re-dialed.
 	if h.isBootnode(addr) {
 		if h.mgr.IsBanned(addr) {
 			h.dialGateMu.Unlock()
@@ -2466,7 +2466,7 @@ func (h *Host) dialPeer(addr string) {
 	var conn net.Conn
 	if h.cfg.TLSConfig != nil {
 		// Outbound TLS handshake: wrap the TCP conn and negotiate TLS.
-		// HandshakeContext honours the cancel so a ban during the TLS
+		// HandshakeContext honors the cancel so a ban during the TLS
 		// phase also aborts cleanly.
 		tlsConn := tls.Client(tcpConn, h.cfg.TLSConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -2490,7 +2490,7 @@ func (h *Host) dialPeer(addr string) {
 	// ── Post-connect gate: prevent handoff to handleConn if banned ────────
 	//
 	// dialContextFunc may return a live conn even when the context was
-	// cancelled (e.g. if the TCP connect completed in the same scheduler
+	// canceled (e.g. if the TCP connect completed in the same scheduler
 	// tick as BanPeer's cancel).  Register the conn as pending under
 	// dialGateMu: this is atomic with BanPeer's ban-write, so exactly one
 	// of the following is guaranteed:
@@ -3326,9 +3326,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 				} else if !isFutureTs {
 					// Normal timestamp: reset any accumulated strikes for this IP.
 					h.tsMu.Lock()
-					if _, ok := h.tsStrikeCounts[peerIP]; ok {
-						delete(h.tsStrikeCounts, peerIP)
-					}
+					delete(h.tsStrikeCounts, peerIP)
 					h.tsMu.Unlock()
 				}
 			}

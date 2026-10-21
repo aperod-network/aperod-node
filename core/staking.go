@@ -17,7 +17,7 @@ import (
 	"math"
 	"sort"
 	"sync"
-"sync/atomic"
+	"sync/atomic"
 
 	"github.com/aperod/aperod/crypto"
 )
@@ -112,6 +112,12 @@ const StakePayloadSizeV2 = 173
 // stake deposit.  V3 also permits transparent/mint outputs (TxPubKey==zero) as
 // long as the ownership proof verifies.
 const StakePayloadSizeV3 = 237
+
+// StakePayloadSizeV4 is the byte length of a deposit payload carrying a
+// key-image link proof. It binds the collateral outpoint to the same nullifier
+// used by ordinary ring spends, preventing already-spent outputs from backing
+// stake a second time.
+const StakePayloadSizeV4 = 301
 
 // StakeWithdrawalPayloadSizeV2 is the fixed encoding for chain-bound,
 // state-bound validator withdrawal authorization.
@@ -349,6 +355,147 @@ func DecodeStakeExtraV3(extra []byte) (
 	return
 }
 
+// StakeKeyImageProofContext binds a DLEQ proof to one stake deposit. The proof
+// itself also commits to the UTXO one-time public key and key image.
+func StakeKeyImageProofContext(
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+) []byte {
+	context := make([]byte, 1+32+8+32+4+32)
+	context[0] = byte(action)
+	copy(context[1:33], pub)
+	binary.BigEndian.PutUint64(context[33:41], amount)
+	copy(context[41:73], burnTxHash[:])
+	binary.BigEndian.PutUint32(context[73:77], burnOutIdx)
+	copy(context[77:109], burnBlind[:])
+	return context
+}
+
+func (r *ValidatorRegistry) validateStakeDepositV4(
+	height, activation uint64,
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	keyImage crypto.KeyImage,
+	proof crypto.KeyImageDLEQProof,
+	checkSpent bool,
+) (*UTXO, error) {
+	if activation == 0 || height < activation {
+		return nil, fmt.Errorf("stake key-image proof v4 is not active at height %d", height)
+	}
+	if action != StakeDeposit {
+		return nil, fmt.Errorf("v4 payload is only valid for StakeDeposit, got action=%d", action)
+	}
+	msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
+	if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		return nil, fmt.Errorf("invalid v4 stake signature from %s", pub.ID())
+	}
+	if r.utxos == nil {
+		return nil, fmt.Errorf("UTXO set not wired; cannot verify v4 stake collateral")
+	}
+	burnUTXO := r.utxos.Get(burnTxHash, burnOutIdx)
+	if burnUTXO == nil {
+		return nil, fmt.Errorf("burn UTXO %x:%d not found in active set",
+			burnTxHash[:8], burnOutIdx)
+	}
+	expectedCommit, err := crypto.Commit(amount, burnBlind)
+	if err != nil {
+		return nil, fmt.Errorf("burn commitment computation failed: %w", err)
+	}
+	if expectedCommit != burnUTXO.AmountCommit {
+		return nil, fmt.Errorf("burn UTXO %x:%d AmountCommit mismatch",
+			burnTxHash[:8], burnOutIdx)
+	}
+	context := StakeKeyImageProofContext(action, pub, amount, burnTxHash, burnOutIdx, burnBlind)
+	if err := crypto.VerifyKeyImageProof(burnUTXO.OneTimePub, keyImage, context, proof); err != nil {
+		return nil, fmt.Errorf("stake collateral key-image proof invalid: %w", err)
+	}
+	if checkSpent {
+		spent, err := r.utxos.HasSpentKeyImage(keyImage)
+		if err != nil {
+			return nil, fmt.Errorf("check collateral key-image spentness: %w", err)
+		}
+		if spent {
+			return nil, fmt.Errorf("stake collateral key image %x was already spent", keyImage[:8])
+		}
+	}
+	return burnUTXO, nil
+}
+
+// EncodeStakeExtraV4 packs a deposit with a key-image/DLEQ proof into 301
+// bytes. The DLEQ proof proves that the key image is derived from the
+// referenced UTXO's one-time private key.
+func EncodeStakeExtraV4(
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	keyImage crypto.KeyImage,
+	proof crypto.KeyImageDLEQProof,
+) ([]byte, error) {
+	if len(pub) != 32 {
+		return nil, fmt.Errorf("stake extra v4: pubkey must be 32 bytes, got %d", len(pub))
+	}
+	if len(sig) != 64 {
+		return nil, fmt.Errorf("stake extra v4: signature must be 64 bytes, got %d", len(sig))
+	}
+	b := make([]byte, StakePayloadSizeV4)
+	b[0] = byte(action)
+	copy(b[1:33], pub)
+	binary.BigEndian.PutUint64(b[33:41], amount)
+	copy(b[41:105], sig)
+	copy(b[105:137], burnTxHash[:])
+	binary.BigEndian.PutUint32(b[137:141], burnOutIdx)
+	copy(b[141:173], burnBlind[:])
+	copy(b[173:205], keyImage[:])
+	copy(b[205:237], proof.CommitmentG[:])
+	copy(b[237:269], proof.CommitmentHp[:])
+	copy(b[269:301], proof.Response[:])
+	return b, nil
+}
+
+// DecodeStakeExtraV4 unpacks a 301-byte key-image-protected deposit payload.
+func DecodeStakeExtraV4(extra []byte) (
+	action StakeAction,
+	pub crypto.ValidatorPubKey,
+	amount uint64,
+	sig []byte,
+	burnTxHash crypto.Hash32,
+	burnOutIdx uint32,
+	burnBlind crypto.BlindFactor,
+	keyImage crypto.KeyImage,
+	proof crypto.KeyImageDLEQProof,
+	err error,
+) {
+	if len(extra) != StakePayloadSizeV4 {
+		err = fmt.Errorf("stake extra v4: expected %d bytes, got %d", StakePayloadSizeV4, len(extra))
+		return
+	}
+	action = StakeAction(extra[0])
+	pub = crypto.ValidatorPubKey(extra[1:33])
+	amount = binary.BigEndian.Uint64(extra[33:41])
+	sig = extra[41:105]
+	copy(burnTxHash[:], extra[105:137])
+	burnOutIdx = binary.BigEndian.Uint32(extra[137:141])
+	copy(burnBlind[:], extra[141:173])
+	copy(keyImage[:], extra[173:205])
+	copy(proof.CommitmentG[:], extra[205:237])
+	copy(proof.CommitmentHp[:], extra[237:269])
+	copy(proof.Response[:], extra[269:301])
+	return
+}
+
 // StakeOwnershipSignMsg returns the canonical signing message for the F-049
 // one-time-key ownership proof included in v3 stake deposits.
 // The depositor signs this message with the one-time private key of the burn UTXO
@@ -471,8 +618,9 @@ type ValidatorRegistry struct {
 	utxos                     *UTXOSet                   // required for C-1 UTXO-backed deposit check
 	stakeWithdrawalGenesis    crypto.Hash32
 	stakeWithdrawalActivation uint64
-signatureFork             atomic.Pointer[ValidatorAuthorityFork]
-signatureAdmissionHeight  atomic.Uint64
+	stakeKeyImageActivation   uint64
+	signatureFork             atomic.Pointer[ValidatorAuthorityFork]
+	signatureAdmissionHeight  atomic.Uint64
 }
 
 // ConfigureStakeWithdrawalV2 binds the registry to the quorum-attested LPoD
@@ -496,6 +644,28 @@ func (r *ValidatorRegistry) StakeWithdrawalV2Config() (crypto.Hash32, uint64, bo
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.stakeWithdrawalGenesis, r.stakeWithdrawalActivation, r.stakeWithdrawalActivation != 0
+}
+
+// ConfigureStakeKeyImageV4 binds the spent-collateral proof to an explicit
+// consensus activation height. The same height must be configured on every
+// validator before the fork.
+func (r *ValidatorRegistry) ConfigureStakeKeyImageV4(activation uint64) error {
+	if activation == 0 {
+		return fmt.Errorf("stake key-image v4: activation height is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stakeKeyImageActivation != 0 && r.stakeKeyImageActivation != activation {
+		return fmt.Errorf("stake key-image v4: conflicting activation height")
+	}
+	r.stakeKeyImageActivation = activation
+	return nil
+}
+
+func (r *ValidatorRegistry) StakeKeyImageV4Activation() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.stakeKeyImageActivation
 }
 
 // NewValidatorRegistry creates an empty registry.
@@ -623,7 +793,7 @@ func (r *ValidatorRegistry) validateWithdrawalV2Locked(a StakeWithdrawalAuthoriz
 	if a.StakeRef != wantRef {
 		return nil, fmt.Errorf("stake withdrawal v2: current stake reference mismatch")
 	}
-if !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
+	if !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 		return nil, fmt.Errorf("stake withdrawal v2: invalid validator signature")
 	}
 	return entry, nil
@@ -666,6 +836,9 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
 	}
+	r.mu.RLock()
+	keyImageActivation := r.stakeKeyImageActivation
+	r.mu.RUnlock()
 
 	switch len(tx.Extra) {
 
@@ -685,7 +858,7 @@ func (r *ValidatorRegistry) ProcessStakeTx(tx Transaction, height uint64) error 
 			return fmt.Errorf("registry: legacy stake withdrawal disabled after attested v2 activation")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
 		}
 		r.mu.Lock()
@@ -715,6 +888,9 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return fmt.Errorf("registry: %w", err)
 		}
+		if keyImageActivation != 0 && height >= keyImageActivation {
+			return fmt.Errorf("registry: v2 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("registry: v2 payload (173 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
@@ -722,7 +898,7 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		// Verify self-signature — binds the deposit to a specific burn UTXO,
 		// preventing replay attacks with a different UTXO at the same amount.
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
 		}
 
@@ -772,13 +948,16 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return fmt.Errorf("registry: %w", err)
 		}
+		if keyImageActivation != 0 && height >= keyImageActivation {
+			return fmt.Errorf("registry: v3 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("registry: v3 payload (237 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
 
 		// Verify validator self-signature (same signing msg as v2).
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
 		}
 
@@ -825,9 +1004,24 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		defer r.mu.Unlock()
 		return r.applyDeposit(pub.Hex(), pub, amount, height)
 
+	case StakePayloadSizeV4:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, keyImage, proof, err := DecodeStakeExtraV4(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if _, err := r.validateStakeDepositV4(height, keyImageActivation, action, pub, amount, sig,
+			burnTxHash, burnOutIdx, burnBlind, keyImage, proof, true); err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return fmt.Errorf("registry: failed to burn stake UTXO: %w", err)
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.applyDeposit(pub.Hex(), pub, amount, height)
+
 	default:
-		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw, %d or %d for deposit)",
-			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
+		return fmt.Errorf("registry: invalid stake extra length %d", len(tx.Extra))
 	}
 }
 
@@ -869,7 +1063,7 @@ func (r *ValidatorRegistry) applyOneTxLocked(tx Transaction, height uint64) (*UT
 			return nil, fmt.Errorf("legacy stake withdrawal disabled after attested v2 activation")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid stake signature from %s", pub.ID())
 		}
 		key := pub.Hex()
@@ -894,11 +1088,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return nil, err
 		}
+		if r.stakeKeyImageActivation != 0 && height >= r.stakeKeyImageActivation {
+			return nil, fmt.Errorf("v2 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return nil, fmt.Errorf("v2 payload only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid v2 stake signature from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -941,11 +1138,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return nil, err
 		}
+		if r.stakeKeyImageActivation != 0 && height >= r.stakeKeyImageActivation {
+			return nil, fmt.Errorf("v3 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return nil, fmt.Errorf("v3 payload only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return nil, fmt.Errorf("invalid v3 stake signature from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -982,9 +1182,28 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		k := UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}
 		return &k, nil
 
+	case StakePayloadSizeV4:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, keyImage, proof, err := DecodeStakeExtraV4(tx.Extra)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := r.validateStakeDepositV4(height, r.stakeKeyImageActivation, action, pub, amount, sig,
+			burnTxHash, burnOutIdx, burnBlind, keyImage, proof, false); err != nil {
+			return nil, err
+		}
+		if err := r.utxos.MarkStaked(burnTxHash, burnOutIdx); err != nil {
+			return nil, fmt.Errorf("MarkStaked: %w", err)
+		}
+		key := pub.Hex()
+		if applyErr := r.applyDeposit(key, pub, amount, height); applyErr != nil {
+			r.utxos.UnmarkStaked(burnTxHash, burnOutIdx)
+			return nil, applyErr
+		}
+		k := UTXOKey{TxHash: burnTxHash, OutputIndex: burnOutIdx}
+		return &k, nil
+
 	default:
-		return nil, fmt.Errorf("invalid stake extra length %d (expected %d, %d, or %d)",
-			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
+		return nil, fmt.Errorf("invalid stake extra length %d", len(tx.Extra))
 	}
 }
 
@@ -1097,6 +1316,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 		snapshot[k] = shadowEntry{stakeNAPR: v.StakeNAPR, status: v.Status, generation: v.StakeGeneration, nonce: v.StakeAuthNonce, seeded: v.Seeded}
 	}
 	withdrawalGenesis, withdrawalActivation := r.stakeWithdrawalGenesis, r.stakeWithdrawalActivation
+	keyImageActivation := r.stakeKeyImageActivation
 	r.mu.RUnlock()
 
 	// Per-block reservation: burn UTXOs claimed by earlier txs in this block.
@@ -1105,6 +1325,18 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 		OutIdx uint32
 	}
 	reserved := make(map[utxoKey]int) // key → first tx index that reserved it
+	reservedKeyImages := make(map[crypto.KeyImage]int)
+	blockInputKeyImages := make(map[crypto.KeyImage]int)
+	for txIdx, tx := range txs {
+		if tx.IsStake() {
+			continue
+		}
+		for _, input := range tx.Inputs {
+			if canonical, err := crypto.CanonicalKeyImage(input.KeyImage); err == nil {
+				blockInputKeyImages[canonical] = txIdx
+			}
+		}
+	}
 
 	for i, tx := range txs {
 		if !tx.IsStake() {
@@ -1129,7 +1361,7 @@ func (r *ValidatorRegistry) ValidateBlockStakeTxs(txs []Transaction, height uint
 				return fmt.Errorf("stake tx[%d]: legacy withdrawal disabled after attested v2 activation", i)
 			}
 			msg := StakeSignMsg(action, pub, amount)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+			if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid signature from %s", i, pub.ID())
 			}
 			key := pub.Hex()
@@ -1175,7 +1407,7 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			}
 			if withdrawalActivation == 0 || height < withdrawalActivation || a.Genesis != withdrawalGenesis ||
 				a.ExpiryHeight < height || a.ExpiryHeight-height > StakeWithdrawalMaxExpiryBlocks ||
-!r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
+				!r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 				return fmt.Errorf("stake tx[%d]: invalid, expired, cross-chain, or pre-activation v2 withdrawal", i)
 			}
 			key := a.PubKey.Hex()
@@ -1209,11 +1441,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			if err != nil {
 				return fmt.Errorf("stake tx[%d]: decode v2: %w", i, err)
 			}
+			if keyImageActivation != 0 && height >= keyImageActivation {
+				return fmt.Errorf("stake tx[%d]: v2 deposits disabled after key-image proof activation", i)
+			}
 			if action != StakeDeposit {
 				return fmt.Errorf("stake tx[%d]: v2 payload only valid for StakeDeposit, got action=%d", i, action)
 			}
 			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+			if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid v2 signature from %s", i, pub.ID())
 			}
 			// Within-block duplicate burn UTXO.
@@ -1284,11 +1519,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			if err != nil {
 				return fmt.Errorf("stake tx[%d]: decode v3: %w", i, err)
 			}
+			if keyImageActivation != 0 && height >= keyImageActivation {
+				return fmt.Errorf("stake tx[%d]: v3 deposits disabled after key-image proof activation", i)
+			}
 			if action != StakeDeposit {
 				return fmt.Errorf("stake tx[%d]: v3 payload only valid for StakeDeposit, got action=%d", i, action)
 			}
 			msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+			if !r.verifyValidatorSignature(pub, height, msg, sig) {
 				return fmt.Errorf("stake tx[%d]: invalid v3 signature from %s", i, pub.ID())
 			}
 			// Within-block duplicate burn UTXO.
@@ -1354,6 +1592,65 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			reserved[uk] = i
 			snapshot[key] = se
 
+		case StakePayloadSizeV4:
+			action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, keyImage, proof, err := DecodeStakeExtraV4(tx.Extra)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: decode v4: %w", i, err)
+			}
+			burnUTXO, err := r.validateStakeDepositV4(height, keyImageActivation, action, pub, amount, sig,
+				burnTxHash, burnOutIdx, burnBlind, keyImage, proof, true)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: %w", i, err)
+			}
+			uk := utxoKey{TxHash: burnTxHash, OutIdx: burnOutIdx}
+			if firstIdx, dup := reserved[uk]; dup {
+				return fmt.Errorf("stake tx[%d]: burn UTXO %x:%d already claimed by tx[%d] in this block",
+					i, burnTxHash[:8], burnOutIdx, firstIdx)
+			}
+			canonical, err := crypto.CanonicalKeyImage(keyImage)
+			if err != nil {
+				return fmt.Errorf("stake tx[%d]: invalid v4 key image: %w", i, err)
+			}
+			if inputIdx, dup := blockInputKeyImages[canonical]; dup {
+				return fmt.Errorf("stake tx[%d]: collateral key image is also spent by tx[%d] in this block", i, inputIdx)
+			}
+			if firstIdx, dup := reservedKeyImages[canonical]; dup {
+				return fmt.Errorf("stake tx[%d]: collateral key image already reserved by stake tx[%d]", i, firstIdx)
+			}
+			if burnUTXO == nil {
+				return fmt.Errorf("stake tx[%d]: v4 collateral UTXO unavailable", i)
+			}
+			if amount < effectiveMin {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO < minimum %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(effectiveMin)/float64(BaseUnitsPerAPR))
+			}
+			if amount > MaxStakeNAPR {
+				return fmt.Errorf("stake tx[%d]: deposit %.4f APRO exceeds cap %.4f APRO",
+					i, float64(amount)/float64(BaseUnitsPerAPR), float64(MaxStakeNAPR)/float64(BaseUnitsPerAPR))
+			}
+			key := pub.Hex()
+			se, existing := snapshot[key]
+			if existing {
+				switch se.status {
+				case ValidatorUnbonding, ValidatorExited:
+					return fmt.Errorf("stake tx[%d]: validator is unbonding/exited; cannot stake", i)
+				default:
+					if se.stakeNAPR > math.MaxUint64-amount {
+						return fmt.Errorf("stake tx[%d]: stake top-up overflow", i)
+					}
+					if se.generation == ^uint64(0) {
+						return fmt.Errorf("stake tx[%d]: collateral generation exhausted", i)
+					}
+					se.stakeNAPR += amount
+					se.generation++
+				}
+			} else {
+				se = shadowEntry{stakeNAPR: amount, status: ValidatorPending, generation: 1}
+			}
+			reserved[uk] = i
+			reservedKeyImages[canonical] = i
+			snapshot[key] = se
+
 		default:
 			return fmt.Errorf("stake tx[%d]: invalid extra length %d", i, len(tx.Extra))
 		}
@@ -1374,7 +1671,10 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 //   - Pedersen commitment match: Commit(amount, blind) == UTXO.AmountCommit (C-1)
 //   - For v3: one-time-key ownership proof verified (F-049 fix)
 func (r *ValidatorRegistry) ValidateStakeTx(tx Transaction) error {
-height := r.signatureAdmissionHeight.Load()
+	height := r.signatureAdmissionHeight.Load()
+	r.mu.RLock()
+	keyImageActivation := r.stakeKeyImageActivation
+	r.mu.RUnlock()
 	if tx.Version != TxVersionStake {
 		return fmt.Errorf("registry: not a stake tx (version=%d)", tx.Version)
 	}
@@ -1389,7 +1689,7 @@ height := r.signatureAdmissionHeight.Load()
 			return fmt.Errorf("registry: StakeDeposit requires v2 payload (173 bytes) with UTXO burn proof — v1 deposits no longer accepted (C-1 fix)")
 		}
 		msg := StakeSignMsg(action, pub, amount)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature from %s", pub.ID())
 		}
 		return nil
@@ -1403,7 +1703,7 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		genesis := r.stakeWithdrawalGenesis
 		enabled := r.stakeWithdrawalActivation != 0
 		r.mu.RUnlock()
-if !enabled || a.Genesis != genesis || !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
+		if !enabled || a.Genesis != genesis || !r.verifyValidatorSignature(a.PubKey, height, StakeWithdrawalSignMsgV2(a), a.Signature) {
 			return fmt.Errorf("registry: invalid or unconfigured stake withdrawal v2 authorization")
 		}
 		return nil
@@ -1413,11 +1713,14 @@ if !enabled || a.Genesis != genesis || !r.verifyValidatorSignature(a.PubKey, hei
 		if err != nil {
 			return fmt.Errorf("registry: %w", err)
 		}
+		if keyImageActivation != 0 && height >= keyImageActivation {
+			return fmt.Errorf("registry: v2 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("registry: v2 payload (173 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v2) from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -1450,11 +1753,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return fmt.Errorf("registry: %w", err)
 		}
+		if keyImageActivation != 0 && height >= keyImageActivation {
+			return fmt.Errorf("registry: v3 stake deposits disabled after key-image proof activation")
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("registry: v3 payload (237 bytes) is only valid for StakeDeposit, got action=%d", action)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("registry: invalid stake signature (v3) from %s", pub.ID())
 		}
 		if r.utxos == nil {
@@ -1485,9 +1791,19 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		}
 		return nil
 
+	case StakePayloadSizeV4:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, keyImage, proof, err := DecodeStakeExtraV4(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		if _, err := r.validateStakeDepositV4(height, keyImageActivation, action, pub, amount, sig,
+			burnTxHash, burnOutIdx, burnBlind, keyImage, proof, true); err != nil {
+			return fmt.Errorf("registry: %w", err)
+		}
+		return nil
+
 	default:
-		return fmt.Errorf("registry: invalid stake extra length %d (expected %d for withdraw, %d or %d for deposit)",
-			len(tx.Extra), StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3)
+		return fmt.Errorf("registry: invalid stake extra length %d", len(tx.Extra))
 	}
 }
 
@@ -1539,12 +1855,15 @@ func (r *ValidatorRegistry) replayOneTxLocked(tx Transaction, height uint64) err
 		if err != nil {
 			return fmt.Errorf("replay: %w", err)
 		}
+		if action == StakeDeposit && r.stakeKeyImageActivation != 0 && height >= r.stakeKeyImageActivation {
+			return fmt.Errorf("replay: v1 stake deposit after key-image proof activation at height %d", height)
+		}
 		if r.stakeWithdrawalActivation != 0 && height >= r.stakeWithdrawalActivation &&
 			(action == StakeWithdraw || action == StakePartialWithdraw) {
 			return fmt.Errorf("replay: legacy withdrawal after attested v2 activation at height %d", height)
 		}
 		msg := StakeSignMsg(action, pub, amount)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid stake sig from %s at height %d", pub.ID(), height)
 		}
 		key := pub.Hex()
@@ -1576,11 +1895,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return fmt.Errorf("replay: %w", err)
 		}
+		if r.stakeKeyImageActivation != 0 && height >= r.stakeKeyImageActivation {
+			return fmt.Errorf("replay: v2 stake deposit after key-image proof activation at height %d", height)
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("replay: v2 payload with non-deposit action=%d at height %d", action, height)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid v2 stake sig from %s at height %d", pub.ID(), height)
 		}
 		// Reconstruct the burn-UTXO descriptor from payload data so MarkStakedKnown
@@ -1606,11 +1928,14 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		if err != nil {
 			return fmt.Errorf("replay: %w", err)
 		}
+		if r.stakeKeyImageActivation != 0 && height >= r.stakeKeyImageActivation {
+			return fmt.Errorf("replay: v3 stake deposit after key-image proof activation at height %d", height)
+		}
 		if action != StakeDeposit {
 			return fmt.Errorf("replay: v3 payload with non-deposit action=%d at height %d", action, height)
 		}
 		msg := StakeSignMsgV2(action, pub, amount, burnTxHash, burnOutIdx)
-if !r.verifyValidatorSignature(pub, height, msg, sig) {
+		if !r.verifyValidatorSignature(pub, height, msg, sig) {
 			return fmt.Errorf("replay: invalid v3 stake sig from %s at height %d", pub.ID(), height)
 		}
 		expectedCommit, _ := crypto.Commit(amount, burnBlind)
@@ -1624,6 +1949,21 @@ if !r.verifyValidatorSignature(pub, height, msg, sig) {
 		}
 		key := pub.Hex()
 		return r.applyDeposit(key, pub, amount, height)
+
+	case StakePayloadSizeV4:
+		action, pub, amount, sig, burnTxHash, burnOutIdx, burnBlind, keyImage, proof, err := DecodeStakeExtraV4(tx.Extra)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		burnUTXO, err := r.validateStakeDepositV4(height, r.stakeKeyImageActivation, action, pub, amount, sig,
+			burnTxHash, burnOutIdx, burnBlind, keyImage, proof, false)
+		if err != nil {
+			return fmt.Errorf("replay: %w", err)
+		}
+		if r.utxos != nil {
+			r.utxos.MarkStakedKnown(burnTxHash, burnOutIdx, burnUTXO)
+		}
+		return r.applyDeposit(pub.Hex(), pub, amount, height)
 
 	default:
 		return fmt.Errorf("replay: invalid stake extra length %d at height %d", len(tx.Extra), height)
@@ -1767,7 +2107,7 @@ func (r *ValidatorRegistry) applyPartialWithdraw(key string, amount, height uint
 }
 
 // UpdateEpoch is called at every epoch boundary (height % EpochLength == 0).
-// It finalises unbonding validators, activates the top-staked pending ones
+// It finalizes unbonding validators, activates the top-staked pending ones
 // (up to ChurnLimit), and rebalances the active set to MaxValidators.
 // Returns the new active validator set.
 func (r *ValidatorRegistry) UpdateEpoch(height uint64) []crypto.ValidatorPubKey {

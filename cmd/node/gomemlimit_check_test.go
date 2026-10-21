@@ -3,7 +3,7 @@ package main
 // gomemlimit_check_test.go — coverage for checkGOMLEMLIMIT's startup memory-limit
 // guard (queue task #1710).
 //
-// The behaviour under test: when neither the GOMEMLIMIT environment variable nor
+// The behavior under test: when neither the GOMEMLIMIT environment variable nor
 // node.yaml's memory_limit_bytes is set, the node warns operators that it may OOM
 // under load.  Operators who intentionally run uncapped can set
 // memory_limit_disabled: true in node.yaml to silence the per-startup WARN;

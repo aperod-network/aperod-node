@@ -118,7 +118,7 @@ func (l *txRateLimiter) allow(ip string) (allowed, banNow bool, violations int) 
 
 // forget removes the entry for ip (called after the IP is banned so a
 // post-ban reconnect starts with a clean slate, mirroring the
-// badBlockCounts behaviour).
+// badBlockCounts behavior).
 func (l *txRateLimiter) forget(ip string) {
 	l.mu.Lock()
 	delete(l.buckets, ip)

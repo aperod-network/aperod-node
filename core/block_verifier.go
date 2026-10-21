@@ -33,8 +33,8 @@ func DefaultBlockVerifierConfig() BlockVerifierConfig {
 // BlockVerifier validates blocks against chain and consensus rules.
 // Cryptographic tx verification is delegated to TxVerifier.
 type BlockVerifier struct {
-	cfg    BlockVerifierConfig
-	chain  *Chain
+	cfg        BlockVerifierConfig
+	chain      *Chain
 	txVerifier *TxVerifier
 }
 

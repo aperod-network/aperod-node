@@ -19,7 +19,7 @@ import (
 // policy must reject this legacy transaction at and after v4 activation.
 func TestLegacyCommitmentCopyTheftIsBlockedAtActivation(t *testing.T) {
 	const (
-		amount    = uint64(1_000_000)
+		amount     = uint64(1_000_000)
 		activation = uint64(100)
 	)
 

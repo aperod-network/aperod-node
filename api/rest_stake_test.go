@@ -25,6 +25,7 @@ import (
 // a payload whose Pedersen commitment matches the UTXO stored in the server.
 type stakeServerFixture struct {
 	srv        *api.Server
+	mp         *core.Mempool
 	utxoTxHash crypto.Hash32
 	outIdx     uint32
 	commit     crypto.Commitment
@@ -44,7 +45,7 @@ func buildStakeServerFull(t *testing.T) stakeServerFixture {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	utxos := core.NewUTXOSet()
 
-	// Synthesise a deterministic UTXO (amount = 100 000 APRO = 10_000_000_000_000 nAPRO).
+	// Synthesize a deterministic UTXO (amount = 100 000 APRO = 10_000_000_000_000 nAPRO).
 	const amount uint64 = 10_000_000_000_000
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -79,8 +80,10 @@ func buildStakeServerFull(t *testing.T) stakeServerFixture {
 	utxos.Add(utxo)
 
 	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey(testStakeAPIKey)
 	return stakeServerFixture{
 		srv:        srv,
+		mp:         mp,
 		utxoTxHash: txHash,
 		outIdx:     outIdx,
 		commit:     c,
@@ -90,6 +93,8 @@ func buildStakeServerFull(t *testing.T) stakeServerFixture {
 		amount:     amount,
 	}
 }
+
+const testStakeAPIKey = "test-stake-api-key"
 
 // buildStakeServer is a backward-compatible wrapper for tests that only need
 // the server, txhash, outIdx, and commitment.
@@ -166,9 +171,16 @@ func makeV2StakeExtra(t *testing.T) ([]byte, crypto.ValidatorPubKey) {
 }
 
 func restPost(t *testing.T, srv *api.Server, path string, body string) (int, map[string]interface{}) {
+	return restPostWithAPIKey(t, srv, path, body, testStakeAPIKey)
+}
+
+func restPostWithAPIKey(t *testing.T, srv *api.Server, path string, body, apiKey string) (int, map[string]interface{}) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	var resp map[string]interface{}
@@ -270,6 +282,30 @@ func TestREST_StakeBroadcast_ValidPayload(t *testing.T) {
 	}
 	if status, _ := resp["status"].(string); status != "pending" {
 		t.Errorf("status = %q, want \"pending\"", status)
+	}
+}
+
+func TestREST_StakeBroadcast_RequiresAPIKey(t *testing.T) {
+	f := buildStakeServerFull(t)
+	extra := makeV2StakeExtraFor(t, f)
+	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
+
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{name: "missing key"},
+		{name: "wrong key", key: "wrong-api-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _ := restPostWithAPIKey(t, f.srv, "/api/v1/stake", body, tc.key)
+			if code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", code)
+			}
+			if got := f.mp.Count(); got != 0 {
+				t.Fatalf("mempool count = %d after unauthorized request, want 0", got)
+			}
+		})
 	}
 }
 

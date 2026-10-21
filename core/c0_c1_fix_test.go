@@ -1212,7 +1212,7 @@ func TestPhase2Transfer_WithDecoySet_EndToEnd(t *testing.T) {
 			t.Fatalf("GenerateWalletKeys decoy[%d]: %v", i, kErr)
 		}
 		decoyBlind, _ := crypto.NewBlindFactor()
-		decoyAmount := uint64((i+1) * 3_000_000_000) // 30..450 APRO each
+		decoyAmount := uint64((i + 1) * 3_000_000_000) // 30..450 APRO each
 		decoyCommit, _ := crypto.Commit(decoyAmount, decoyBlind)
 		utxos.AddSpentDecoyForTest(&core.UTXO{
 			TxHash:       crypto.Hash32{byte(i + 50)},
@@ -1355,7 +1355,7 @@ func TestPhase2Privacy_SurvivesNodeRestart(t *testing.T) {
 		if berr != nil {
 			t.Fatalf("NewBlindFactor victim[%d]: %v", i, berr)
 		}
-		vAmount := uint64((i+1) * 1_000_000_000) // 10..200 APRO (distinct per victim)
+		vAmount := uint64((i + 1) * 1_000_000_000) // 10..200 APRO (distinct per victim)
 		vCommit, cerr := crypto.Commit(vAmount, vBlind)
 		if cerr != nil {
 			t.Fatalf("Commit victim[%d]: %v", i, cerr)

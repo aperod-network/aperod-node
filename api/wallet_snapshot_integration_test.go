@@ -23,11 +23,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestWalletSnapshotPagesAndSpentnessStayAtCapturedTip(t *testing.T) {

@@ -23,7 +23,7 @@ package main
 //
 // When a partial checkpoint is present (saved by a previous interrupted scan or
 // the periodic snapshot timer), runStartupScan restores from it via
-// RestoreFromSnapshot — which includes the serialised SpentDecoys — and then
+// RestoreFromSnapshot — which includes the serialized SpentDecoys — and then
 // applies only the blocks AFTER the checkpoint via ApplyBlock.  The total
 // spentPubKeys after the scan therefore equals:
 //
@@ -280,17 +280,17 @@ func TestSpentDecoyPool_RebuildAfterSnapshot(t *testing.T) {
 	blk3Hash := blk3.Hash()
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  fmt.Sprintf("%x", blk3Hash[:]),
-		DB:          db,
-		UTXOs:       utxosRestart,
-		Registry:    registryRestart,
-		KiFromIndex: false, // no pre-loaded key-image index; scan builds them incrementally
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         fmt.Sprintf("%x", blk3Hash[:]),
+		DB:                 db,
+		UTXOs:              utxosRestart,
+		Registry:           registryRestart,
+		KiFromIndex:        false, // no pre-loaded key-image index; scan builds them incrementally
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	wg.Wait() // ensure snapshot goroutine finishes before assertions
 
 	if err != nil {
@@ -430,17 +430,17 @@ func TestSpentDecoyPool_FullScanRebuildsDecoys(t *testing.T) {
 	blk1Hash := blk1.Hash()
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   1,
-		TipHashHex:  fmt.Sprintf("%x", blk1Hash[:]),
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          1,
+		TipHashHex:         fmt.Sprintf("%x", blk1Hash[:]),
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	wg.Wait()
 
 	if err != nil {
@@ -464,11 +464,12 @@ func TestSpentDecoyPool_FullScanRebuildsDecoys(t *testing.T) {
 // index (KiFromIndex=true) via MarkSpent BEFORE runStartupScan runs.  With the
 // old unconditional ApplyBlock call, pass-1's double-spend check then fired
 // for every spending block — the whole block was skipped, so:
-//   • spentPubKeys (the Phase 2 ring-decoy pool) stayed empty → ring privacy
+//   - spentPubKeys (the Phase 2 ring-decoy pool) stayed empty → ring privacy
 //     silently degraded to Phase 1 on every fast-path restart;
-//   • the spending block's own outputs (e.g. change) never entered the active
+//   - the spending block's own outputs (e.g. change) never entered the active
 //     set;
-//   • the spent ring member stayed wrongly active in byPubKey.
+//   - the spent ring member stayed wrongly active in byPubKey.
+//
 // The fix routes KiFromIndex=true replays through ReplayBlockKnownSpends
 // (pass-2 only).  This test asserts all three outcomes.
 func TestSpentDecoyPool_KiFromIndexRebuildsDecoys(t *testing.T) {

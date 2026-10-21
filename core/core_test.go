@@ -806,7 +806,7 @@ func makeCoinbaseTx() core.Transaction {
 
 func makeValidTx(t *testing.T) core.Transaction {
 	t.Helper()
-	// Multiplier must exceed the serialised tx size (~1972 bytes at InitialBaseFeePerByte=200).
+	// Multiplier must exceed the serialized tx size (~1972 bytes at InitialBaseFeePerByte=200).
 	// Use 3000 so fee = 200 * 3000 = 600_000 nAPRO ≥ 1972 * 200 = 394_400 nAPRO minimum.
 	return makeValidTxWithFee(t, core.InitialBaseFeePerByte*3000)
 }

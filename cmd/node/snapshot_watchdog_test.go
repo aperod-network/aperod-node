@@ -42,7 +42,7 @@ func TestMemWatchdogSavesSnapshotBeforeKill(t *testing.T) {
 	// ── Step 2: set up a fake consensus engine ───────────────────────────────
 	// performShutdown closes stop and then waits on engineDone.
 	// The goroutine below simulates consensus.Engine.Run: it exits immediately
-	// when stop is closed, which is the only behaviour the shutdown path needs.
+	// when stop is closed, which is the only behavior the shutdown path needs.
 	engineStop := make(chan struct{})
 	engineDone := make(chan struct{})
 	go func() {

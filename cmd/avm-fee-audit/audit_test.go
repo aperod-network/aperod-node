@@ -364,14 +364,21 @@ func TestAuditRewardErasBoundsAVMWireExamples(t *testing.T) {
 	recipient := crypto.AddressFromKeys(crypto.MainnetByte, recipientKeys)
 	previous := crypto.HashBytes([]byte("bounded AVM examples parent"))
 	txs := make([]core.Transaction, maxRewardEraAVMWireExamples+2)
+	var legacyTips uint64
 	for i := range txs {
 		txs[i] = core.Transaction{
 			Version: core.TxVersionAVM,
 			Inputs:  []core.RingInput{{}},
 			AVM:     &core.AVMPayload{Action: core.AVMExecuteContract, GasLimit: 100},
 		}
+		gasFee, feeErr := core.AVMGasFee(txs[i].AVM.GasLimit)
+		if feeErr != nil {
+			t.Fatal(feeErr)
+		}
+		txs[i].Fee = txs[i].MinFeeAt(core.InitialBaseFeePerByte) + gasFee
+		legacyTips += gasFee
 	}
-	block := makeAuthorizedRewardBlock(t, 2, previous, validatorPriv, validatorPub, recipient, 10_000_000, txs)
+	block := makeAuthorizedRewardBlock(t, 2, previous, validatorPriv, validatorPub, recipient, 10_000_000+legacyTips, txs)
 	var report rewardEraAuditReport
 	if err := auditRewardEraBlock(&report, block, 2, 300_000_000, 10_000_000); err != nil {
 		t.Fatal(err)
@@ -683,6 +690,72 @@ func TestAuditFailsClosedOnLPoDPayoutBlock(t *testing.T) {
 	err := runAuditWithActivations(t, databasePath, 1, 1, 1, 1)
 	if err == nil || !strings.Contains(err.Error(), "unsupported LPoD payout block") {
 		t.Fatalf("LPoD payout audit error = %v", err)
+	}
+}
+
+func TestAuditRewardErasReportsAVMFeesInLPoDSettlementSeparately(t *testing.T) {
+	leaderKeys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader := crypto.AddressFromKeys(crypto.MainnetByte, leaderKeys)
+	digest := crypto.HashBytes([]byte("lpod settlement checkpoint"))
+	payoutExtra, err := json.Marshal(core.LPoDPayoutAuthorization{
+		Leader: leader,
+		Digest: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gasLimit := uint64(1_000)
+	baseFee := core.InitialBaseFeePerByte
+	avmTx := core.Transaction{
+		Version: core.TxVersionAVM,
+		Inputs:  []core.RingInput{{}},
+		AVM:     &core.AVMPayload{GasLimit: gasLimit},
+	}
+	gasFee, err := core.AVMGasFee(gasLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const explicitTip = uint64(37)
+	avmTx.Fee = avmTx.MinFeeAt(baseFee) + gasFee + explicitTip
+	block := &core.Block{
+		Header: core.BlockHeader{Height: 2, BaseFee: baseFee},
+		Txs: []core.Transaction{
+			{Version: core.TxVersionLPoDPayout, Extra: payoutExtra},
+			core.LPoDCheckpointTx(digest),
+			avmTx,
+		},
+	}
+
+	var report rewardEraAuditReport
+	if err := auditRewardEraBlock(&report, block, 2, 300_000_000, 10_000_000); err != nil {
+		t.Fatalf("audit LPoD settlement block: %v", err)
+	}
+	if report.LPoDSettlementBlocks != 1 || report.LPoDAVMTransactions != 1 {
+		t.Fatalf("LPoD settlement/AVM counts = %d/%d, want 1/1",
+			report.LPoDSettlementBlocks, report.LPoDAVMTransactions)
+	}
+	if report.LPoDFeeBearingBlocks != 1 || report.LPoDPriorityFeeSurplusNAPRO != gasFee+explicitTip {
+		t.Fatalf("LPoD fee-bearing/surplus = %d/%d, want 1/%d",
+			report.LPoDFeeBearingBlocks, report.LPoDPriorityFeeSurplusNAPRO, gasFee+explicitTip)
+	}
+	if report.PostCutoverFeeBearingBlocks != 0 || report.PostCutoverPriorityTipsNAPRO != 0 {
+		t.Fatalf("LPoD fees were incorrectly counted as validator reward tips: blocks=%d tips=%d",
+			report.PostCutoverFeeBearingBlocks, report.PostCutoverPriorityTipsNAPRO)
+	}
+	if report.LPoDRequiredAVMGasNAPRO != gasFee {
+		t.Fatalf("LPoD required AVM gas = %d, want %d",
+			report.LPoDRequiredAVMGasNAPRO, gasFee)
+	}
+	if report.LPoDAVMLegacySurplusNAPRO != gasFee+explicitTip {
+		t.Fatalf("legacy AVM surplus = %d, want required gas plus explicit tip %d",
+			report.LPoDAVMLegacySurplusNAPRO, gasFee+explicitTip)
+	}
+	if report.LPoDAVMTipsExcludingGasNAPRO != explicitTip {
+		t.Fatalf("AVM tips excluding gas = %d, want %d",
+			report.LPoDAVMTipsExcludingGasNAPRO, explicitTip)
 	}
 }
 

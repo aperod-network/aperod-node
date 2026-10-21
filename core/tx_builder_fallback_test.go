@@ -1,6 +1,6 @@
 package core
 
-// Internal unit tests for txBuildRing fallback-decoy behaviour.
+// Internal unit tests for txBuildRing fallback-decoy behavior.
 // These tests live in package core (not core_test) so they can access
 // the unexported txBuildRing function directly.
 
@@ -61,7 +61,7 @@ func TestTxBuildRing_FallbackCount_FewerDecoysThanNeeded(t *testing.T) {
 		fallbackCount, nDecoys, crypto.RingSize-1)
 }
 
-// TestTxBuildRing_FallbackCount_NoDecoys verifies Phase 1 behaviour: when no
+// TestTxBuildRing_FallbackCount_NoDecoys verifies Phase 1 behavior: when no
 // decoys are provided at all, every ring slot (all RingSize-1 of them) must
 // fall back to randomly-generated keys.
 func TestTxBuildRing_FallbackCount_NoDecoys(t *testing.T) {

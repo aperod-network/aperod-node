@@ -383,7 +383,7 @@ func TestPeerMgr_ConcurrentBanAndLift(t *testing.T) {
 // restart is still blocked immediately after restart — captured at the exact
 // pre-Listen point inside Start(), before any inbound connection can arrive.
 //
-// This is the ban-file analogue of the whitelist ordering test added in task
+// This is the ban-file analog of the whitelist ordering test added in task
 // 1589.  SetListenFunc fires after LoadBansFromFile but before net.Listen, so
 // the hook provides the earliest possible deterministic snapshot of the ban
 // state: if a future refactor reorders Start() so that the listener opens

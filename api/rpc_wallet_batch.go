@@ -22,11 +22,11 @@ type batchRecipientParam struct {
 }
 
 type walletBatchSendParams struct {
-	SpendKeyHex   string               `json:"spend_key_hex"`
-	ViewKeyHex    string               `json:"view_key_hex"`
-	ChangeAddress string               `json:"change_address"` // empty → derived from keys
+	SpendKeyHex   string                `json:"spend_key_hex"`
+	ViewKeyHex    string                `json:"view_key_hex"`
+	ChangeAddress string                `json:"change_address"` // empty → derived from keys
 	Recipients    []batchRecipientParam `json:"recipients"`     // max 15
-	UTXOs         []walletUTXOInput    `json:"utxos"`
+	UTXOs         []walletUTXOInput     `json:"utxos"`
 }
 
 type batchPayOutput struct {
@@ -290,8 +290,8 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 
 	// ── 5. Cryptographic verification ────────────────────────────────────────
 	verifier := core.NewTxVerifier(s.utxos)
-verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
-if err := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight()); err != nil {
+	verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
+	if err := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight()); err != nil {
 		return nil, fmt.Errorf("verify: %w", err)
 	}
 

@@ -21,7 +21,7 @@ import (
 //
 //	Decodes and returns the public keys from genesisValidators (hex strings as
 //	they appear in genesis.yaml).  This ensures handleIncomingBlock's
-//	isKnownValidator() and proposer-slot checks recognise the real network
+//	isKnownValidator() and proposer-slot checks recognize the real network
 //	validators so the node can sync without producing blocks.
 //	The node's own myKey must NOT appear in the returned list.
 //

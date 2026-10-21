@@ -142,9 +142,9 @@ func TestDecoySelectorsFiltersCountsAndFailures(t *testing.T) {
 }
 
 type samplingStore struct {
-	result []DecoyUTXO
-	err    error
-	calls  int
+	result  []DecoyUTXO
+	err     error
+	calls   int
 	exclude map[crypto.Point32]bool
 }
 

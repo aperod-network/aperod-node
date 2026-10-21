@@ -29,7 +29,7 @@ func newWLTestHost(t *testing.T, cfgOpts func(*Config)) *Host {
 	return NewHost(cfg, nil, wlTestLogger())
 }
 
-// TestWhitelist_AddRemove verifies basic add/remove/idempotent behaviour.
+// TestWhitelist_AddRemove verifies basic add/remove/idempotent behavior.
 func TestWhitelist_AddRemove(t *testing.T) {
 	h := newWLTestHost(t, nil)
 

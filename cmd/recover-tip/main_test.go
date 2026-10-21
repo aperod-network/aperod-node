@@ -106,8 +106,8 @@ func TestPatchSnapshot_NormalUpdate(t *testing.T) {
 
 	path := snapshotPath(dir, height)
 	writeGzipSnapshot(t, path, startupSnapshot{
-		Version:   snapVersion,
-		TipHeight: height,
+		Version:    snapVersion,
+		TipHeight:  height,
 		TipHashHex: oldHash,
 	})
 

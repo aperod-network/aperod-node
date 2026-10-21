@@ -83,7 +83,7 @@ func HashToCurvePoint(data []byte) *edwards25519.Point {
 
 // inv8ModL is 8^{-1} mod l in little-endian, where l is the Ed25519 prime
 // group order.  Used by CanonicalKeyImage to clear torsion components.
-// Precomputed: python3 -c "l=2**252+27742317777372353535851937790883648493; print(pow(8,-1,l).to_bytes(32,'little').hex())"
+// Precomputed: python3 -c "l=2**252+27742317777372353535851937790883648493; print(pow(8,-1,l).to_bytes(32,'little').hex())".
 var inv8ModL = [32]byte{
 	0x79, 0x2f, 0xdc, 0xe2, 0x29, 0xe5, 0x06, 0x61,
 	0xd0, 0xda, 0x1c, 0x7d, 0xb3, 0x9d, 0xd3, 0x07,

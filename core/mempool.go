@@ -198,8 +198,8 @@ func (m *Mempool) Add(tx Transaction) error {
 		return fmt.Errorf("mempool: coinbase (zero-input) transactions are not accepted from external sources")
 	}
 
-nextHeight := m.nextBlockHeight()
-if m.cfg.CurrentHeight != nil {
+	nextHeight := m.nextBlockHeight()
+	if m.cfg.CurrentHeight != nil {
 		if err := ValidateTxVersionAtHeight(
 			&tx,
 			nextHeight,
@@ -218,7 +218,7 @@ if m.cfg.CurrentHeight != nil {
 	// C-0/C-1: prevents supply inflation via forged AmountCommit or unbound stake amount.
 	// Stake txs are included — they carry ring inputs whose proofs must be valid.
 	if m.cfg.Verifier != nil {
-if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
+		if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
 			return fmt.Errorf("mempool: crypto verification failed: %w", err)
 		}
 	}
@@ -514,14 +514,14 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := m.validateAVMNonce(&tx); err != nil {
 		return err
 	}
-nextHeight := m.nextBlockHeight()
+	nextHeight := m.nextBlockHeight()
 	// C1 fix: run full cryptographic verification even for privileged transactions,
 	// EXCEPT for coinbase (zero-input) transactions.  VerifyTx explicitly rejects
 	// coinbase txs to prevent external inflation attacks; engine-synthesized mints
 	// are trusted by construction and must not be re-verified through that path.
 	// Any non-coinbase tx routed through AddPrivileged is still fully verified.
 	if m.cfg.Verifier != nil && !tx.IsCoinbase() {
-if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
+		if err := m.cfg.Verifier.VerifyTxAtHeight(&tx, nextHeight); err != nil {
 			return fmt.Errorf("mempool: crypto verification failed (privileged): %w", err)
 		}
 	}
@@ -582,7 +582,7 @@ func (m *Mempool) IsPrivileged(hash crypto.Hash32) bool {
 }
 
 // SelectTxs returns up to n transactions ordered by fee rate nAPRO/byte (highest first).
-// Sorting by fee/size selects transactions that pay the best rate, maximising
+// Sorting by fee/size selects transactions that pay the best rate, maximizing
 // validator tip income and ensuring high-priority txs are included first.
 // Used by the block proposer to fill a block.
 func (m *Mempool) SelectTxs(n int) []Transaction {
@@ -945,7 +945,7 @@ func (m *Mempool) Load(dataDir string, log *slog.Logger) int {
 //     remain but caps are still exceeded.
 //
 // Using fee-rate (fee/byte) rather than absolute fee means a large low-priority
-// tx is evicted before a tiny one — maximising freed bytes per eviction step.
+// tx is evicted before a tiny one — maximizing freed bytes per eviction step.
 func (m *Mempool) evictLowestFeeRate() bool {
 	var cheapest *mempoolEntry
 	var cheapestRate uint64

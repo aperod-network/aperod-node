@@ -275,7 +275,7 @@ func parseAVMExecution(req avmExecutionJSON) (crypto.Hash32, []byte, []byte, []a
 	return id, code, input, access, nil
 }
 
-func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simulation bool) {
+func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simulation bool, gasEstimate bool) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
 		return
@@ -294,6 +294,14 @@ func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simu
 	id, code, input, access, err := parseAVMExecution(req)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.GasLimit < core.AVMMinGasLimit || req.GasLimit > core.AVMMaxGasLimit {
+		writeJSONError(
+			w,
+			http.StatusBadRequest,
+			fmt.Sprintf("gas_limit must be between %d and %d", core.AVMMinGasLimit, core.AVMMaxGasLimit),
+		)
 		return
 	}
 	action := req.Action
@@ -341,6 +349,22 @@ func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simu
 		writeJSONError(w, status, executeErr.Error())
 		return
 	}
+	if gasEstimate {
+		gasFee, feeErr := core.AVMGasFee(req.GasLimit)
+		if feeErr != nil {
+			writeJSONError(w, http.StatusBadRequest, feeErr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"contract_id":    req.ContractID,
+			"gas_used":       result.GasUsed,
+			"gas_limit":      req.GasLimit,
+			"gas_price_napr": core.AVMGasPriceNAPR,
+			"gas_fee_napr":   gasFee,
+			"committed":      false,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"contract_id": req.ContractID, "gas_used": result.GasUsed,
 		"return_data_hex": hex.EncodeToString(result.ReturnData),
@@ -352,11 +376,15 @@ func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simu
 }
 
 func (s *Server) restAVMQuery(w http.ResponseWriter, r *http.Request) {
-	s.executeAVMReadOnly(w, r, false)
+	s.executeAVMReadOnly(w, r, false, false)
 }
 
 func (s *Server) restAVMSimulate(w http.ResponseWriter, r *http.Request) {
-	s.executeAVMReadOnly(w, r, true)
+	s.executeAVMReadOnly(w, r, true, false)
+}
+
+func (s *Server) restAVMEstimateGas(w http.ResponseWriter, r *http.Request) {
+	s.executeAVMReadOnly(w, r, true, true)
 }
 
 func (s *Server) restAVMTransaction(w http.ResponseWriter, r *http.Request) {

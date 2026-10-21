@@ -7,9 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func appendLPoDIndices(batch *leveldb.Batch, b *core.Block, rollback bool) error {

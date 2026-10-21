@@ -5,7 +5,7 @@ package main
 // processes, and persists the txidx_complete_height marker so a subsequent
 // snapshot-fast-path restart knows those blocks are already covered.
 //
-// Without this behaviour, admin-minted UTXOs whose blocks fall outside the
+// Without this behavior, admin-minted UTXOs whose blocks fall outside the
 // in-memory chain window become permanently unspendable after a node restart
 // because getTransactionFromDisk (LookupTxIdx) finds no t/ entry and the
 // slower u/-store / in-memory fallbacks must cover the gap instead.
@@ -519,8 +519,8 @@ func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
 //
 // This matters in production: after --repair-db some heights may have their
 // height-index entry (b/ prefix) intact but the corresponding raw-block data
-// (r/ prefix) absent.  The old behaviour halted permanently at such a height;
-// the new behaviour skips the gap and indexes the remaining chain so the tx
+// (r/ prefix) absent.  The old behavior halted permanently at such a height;
+// the new behavior skips the gap and indexes the remaining chain so the tx
 // index marker eventually reaches tipHeight.
 func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 	t.Parallel()

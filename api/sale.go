@@ -20,13 +20,17 @@ import (
 func (s *Server) SetSaleConfig(m *store.SaleMigration, ready func() bool, finalized ...func(uint64, crypto.Hash32) bool) {
 	s.saleMigration = m
 	s.saleProducerReady = ready
-if len(finalized) == 1 { s.saleFinalized = finalized[0] }
+	if len(finalized) == 1 {
+		s.saleFinalized = finalized[0]
+	}
 }
 
 func (s *Server) isSaleFinalized(height uint64, hash crypto.Hash32) bool {
-f := s.saleFinalized
-if f == nil { f = s.lpodFinalized }
-return f != nil && f(height, hash)
+	f := s.saleFinalized
+	if f == nil {
+		f = s.lpodFinalized
+	}
+	return f != nil && f(height, hash)
 }
 
 func saleHash(text string) (crypto.Hash32, error) {
@@ -60,7 +64,7 @@ func decodeSaleActivation(raw []byte) (*core.Block, error) {
 
 func (s *Server) activeSale(requireProducer bool) (*sale.State, error) {
 	m := s.saleMigration
-if m == nil || s.blockStore == nil || s.myKey == nil || (s.saleFinalized == nil && s.lpodFinalized == nil) ||
+	if m == nil || s.blockStore == nil || s.myKey == nil || (s.saleFinalized == nil && s.lpodFinalized == nil) ||
 		(requireProducer && (s.saleProducerReady == nil || !s.saleProducerReady())) ||
 		!s.myKey.Public().Equals(m.Checkpoint.SaleAuthority) {
 		return nil, fmt.Errorf("authorized sale authority unavailable")
@@ -88,7 +92,7 @@ if m == nil || s.blockStore == nil || s.myKey == nil || (s.saleFinalized == nil 
 		return nil, err
 	}
 	activation, err := decodeSaleActivation(raw)
-if err != nil || activation.Header.PrevHash != cp.Parent || !s.isSaleFinalized(cp.Height, activation.Hash()) {
+	if err != nil || activation.Header.PrevHash != cp.Parent || !s.isSaleFinalized(cp.Height, activation.Hash()) {
 		return nil, fmt.Errorf("sale activation not finalized")
 	}
 	return state, nil
@@ -156,7 +160,10 @@ func (s *Server) restSaleStatus(w http.ResponseWriter, r *http.Request) {
 // Private, authenticated diagnostics: closed codes only, never keys, endpoint
 // addresses, checkpoint hashes, wallet data or a claim of settled payment.
 func (s *Server) restSaleReadiness(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet { saleJSON(w, 405, map[string]string{"error":"method not allowed"}); return }
+	if r.Method != http.MethodGet {
+		saleJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
 	code := "READY"
 	switch {
 	case s.saleMigration == nil:
@@ -175,7 +182,7 @@ func (s *Server) restSaleReadiness(w http.ResponseWriter, r *http.Request) {
 			code = "NO_READY_PRODUCER"
 		}
 	}
-	saleJSON(w, 200, map[string]any{"code":code, "ready":code=="READY"})
+	saleJSON(w, 200, map[string]any{"code": code, "ready": code == "READY"})
 }
 
 func saleAllocationBasis(r sale.Reconciliation) string {
@@ -288,7 +295,7 @@ func (s *Server) restSaleReceipt(w http.ResponseWriter, r *http.Request) {
 		result["tx_hash"] = saleHex(delivery.Transaction)
 		result["block_hash"] = saleHex(delivery.Block)
 		result["block_height"] = delivery.Height
-if s.isSaleFinalized(delivery.Height, delivery.Block) {
+		if s.isSaleFinalized(delivery.Height, delivery.Block) {
 			result["status"] = "finalized"
 			result["owner_challenge"] = store.SaleRecoveryChallenge(s.saleMigration.Checkpoint.Genesis, order, delivery)
 			recovered, recoveryErr := s.blockStore.SaleOrderRecovery(id)
@@ -329,7 +336,7 @@ func (s *Server) restSaleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 	delivery, err := s.blockStore.SaleOrderDelivery(id)
 	if err != nil || delivery == nil || delivery.Block != block || delivery.Transaction != tx ||
-!s.isSaleFinalized(delivery.Height, delivery.Block) {
+		!s.isSaleFinalized(delivery.Height, delivery.Block) {
 		saleJSON(w, 409, map[string]string{"error": "canonical finalized delivery required"})
 		return
 	}

@@ -123,7 +123,7 @@ func TestGoRuntimeRespectsGomemlimit(t *testing.T) {
 	if err := probeCmd.Run(); err != nil {
 		t.Errorf("memlimit_probe exited with error: %v\n"+
 			"  This means peak RSS exceeded 2.5× GOMEMLIMIT (%d MiB),\n"+
-			"  indicating the runtime is not honouring the GOMEMLIMIT\n"+
+			"  indicating the runtime is not honoring the GOMEMLIMIT\n"+
 			"  environment variable set by the installer drop-in.",
 			err, limitBytes*5/2/1024/1024)
 	}

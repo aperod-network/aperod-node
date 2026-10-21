@@ -7,9 +7,10 @@ import (
 	"io"
 	"math/bits"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 // Bound untrusted request size and pathological entropy rejection. The store

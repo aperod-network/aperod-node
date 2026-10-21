@@ -70,6 +70,7 @@ func buildMissingUTXOServer(t *testing.T, db *store.DB, pruningMode string) (*ap
 	const outIdx uint32 = 0
 
 	srv := api.NewServer(":0", chain, mp, utxos, testLogger())
+	srv.SetAPIKey(testStakeAPIKey)
 	if db != nil {
 		srv.SetStore(db)
 	}
@@ -116,6 +117,7 @@ func postStakePayload(t *testing.T, srv *api.Server, txHash crypto.Hash32, outId
 	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stake", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", testStakeAPIKey)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	return rr.Code, rr.Body.String()
@@ -302,7 +304,7 @@ func buildAdminStakeServer(t *testing.T, db *store.DB, pruningMode string) (
 	const fakeOutIdx uint32 = 0
 
 	srv = api.NewServer(":0", chain, mp, utxos, testLogger())
-	srv.SetAPIKey("test-api-key")
+	srv.SetAPIKey(testStakeAPIKey)
 	srv.SetValidatorKey(lockedKey)
 	if db != nil {
 		srv.SetStore(db)
@@ -330,7 +332,7 @@ func postAdminStakePayload(t *testing.T, srv *api.Server, pubHex string, txHash 
 	req.Host = "127.0.0.1" // localOnly DNS-rebinding guard requires a loopback Host
 	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", "test-api-key")
+	req.Header.Set("X-API-Key", testStakeAPIKey)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 	return rr.Code, rr.Body.String()

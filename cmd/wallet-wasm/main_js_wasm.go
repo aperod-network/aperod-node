@@ -12,6 +12,7 @@ import (
 	"syscall/js"
 
 	"filippo.io/edwards25519"
+
 	"github.com/aperod/aperod/wallet"
 )
 

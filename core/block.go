@@ -81,11 +81,11 @@ func (h *BlockHeader) VerifySignature(authority ...crypto.ValidatorPubKey) bool 
 	h.Signature = nil
 	hash := h.Hash()
 	h.Signature = sig
-pub := h.ValidatorPub
-if len(authority) == 1 {
-pub = authority[0]
-}
-return pub.Verify(hash, sig)
+	pub := h.ValidatorPub
+	if len(authority) == 1 {
+		pub = authority[0]
+	}
+	return pub.Verify(hash, sig)
 }
 
 // Hash returns the hash of the full block (= header hash, since txs are in MerkleRoot).
@@ -112,7 +112,7 @@ func (b *Block) Validate(authority ...crypto.ValidatorPubKey) error {
 	if len(b.Header.ValidatorPub) == 0 {
 		return fmt.Errorf("block %d: missing validator public key", b.Header.Height)
 	}
-if !b.Header.VerifySignature(authority...) {
+	if !b.Header.VerifySignature(authority...) {
 		return fmt.Errorf("block %d: invalid validator signature", b.Header.Height)
 	}
 	expectedRoot := MerkleRoot(b.Txs)
