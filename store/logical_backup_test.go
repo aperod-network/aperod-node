@@ -9,8 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 func TestExportLogicalBackupConcurrentAtomicWrites(t *testing.T) {
@@ -180,7 +181,7 @@ func TestExportLogicalBackupCancelledRemovesPartialDestination(t *testing.T) {
 	baseContext, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx := &cancelAfterErrChecks{Context: baseContext, cancel: cancel, cancelAt: 4}
-	dst := filepath.Join(t.TempDir(), "cancelled-backup")
+	dst := filepath.Join(t.TempDir(), "canceled-backup")
 	if _, _, err := source.exportLogicalBackup(ctx, dst, testBackupFreeBytes); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ExportLogicalBackup error = %v, want context cancellation", err)
 	}

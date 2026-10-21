@@ -38,9 +38,9 @@ func TestVesting_Linear(t *testing.T) {
 	genesis := int64(1_700_000_000)
 
 	tests := []struct {
-		elapsed  int64
-		wantMin  uint64
-		wantMax  uint64
+		elapsed int64
+		wantMin uint64
+		wantMax uint64
 	}{
 		{0, 0, 0},
 		{6 * month, total/2 - 1, total/2 + 1}, // ~50%

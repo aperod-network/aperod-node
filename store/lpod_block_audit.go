@@ -12,11 +12,12 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
 const lpodBlockAuditVersion = 3
@@ -115,7 +116,7 @@ func lpodBlockAuditKey(hash crypto.Hash32) []byte {
 // LoadLPoDAuditAt is a read-only hash-keyed lookup. It never scans, backfills,
 // or follows the current tip.
 func (d *DB) LoadLPoDAuditAt(hash crypto.Hash32) (*LPoDBlockAudit, error) {
-return d.LoadLPoDAuditAtBounded(hash, 0)
+	return d.LoadLPoDAuditAtBounded(hash, 0)
 }
 
 // LoadLPoDAuditAtBounded bounds JSON decoding in auxiliary readers.
@@ -124,9 +125,9 @@ func (d *DB) LoadLPoDAuditAtBounded(hash crypto.Hash32, maxBytes int) (*LPoDBloc
 	if err != nil || raw == nil {
 		return nil, err
 	}
-if maxBytes > 0 && len(raw) > maxBytes {
-return nil, fmt.Errorf("store: block audit exceeds auxiliary read budget")
-}
+	if maxBytes > 0 && len(raw) > maxBytes {
+		return nil, fmt.Errorf("store: block audit exceeds auxiliary read budget")
+	}
 	var record LPoDBlockAudit
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return nil, fmt.Errorf("store: corrupt LPoD block audit: %w", err)

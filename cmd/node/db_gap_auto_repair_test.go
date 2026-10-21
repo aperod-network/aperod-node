@@ -31,9 +31,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/aperod/aperod/store"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/store"
 )
 
 // deleteHeightIndexEntry removes the h/<height> entry from LevelDB directly,
@@ -84,8 +85,8 @@ func deleteHeightIndexEntry(t *testing.T, dbDir string, db *store.DB, height uin
 //     re-verifies the repaired index.
 func TestAutoRepairFixesCrashKillGap(t *testing.T) {
 	const (
-		nBlocks   = 9    // heights 0–9
-		gapHeight = 5    // h/<5> will be deleted to simulate crash
+		nBlocks   = 9 // heights 0–9
+		gapHeight = 5 // h/<5> will be deleted to simulate crash
 	)
 	tipHeight := uint64(nBlocks)
 

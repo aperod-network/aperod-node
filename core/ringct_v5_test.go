@@ -141,9 +141,9 @@ func TestRingCTV5RejectsStakedCollateralAcrossRestartAndRollback(t *testing.T) {
 	set := core.NewUTXOSetWithDB(db)
 	set.SetCLSAGActivationHeight(1)
 	set.Add(&owned[0].UTXO)
-const stakedCollateralActivationHeight = uint64(2_950_000)
-verifier := core.NewTxVerifier(set)
-verifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActivationHeight)
+	const stakedCollateralActivationHeight = uint64(2_950_000)
+	verifier := core.NewTxVerifier(set)
+	verifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActivationHeight)
 
 	decoys := make([]core.DecoyUTXO, crypto.RingSize-1)
 	decoyUTXOs := make([]*core.UTXO, crypto.RingSize-1)
@@ -201,15 +201,15 @@ verifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActiva
 	if err != nil {
 		t.Fatalf("build v5: %v", err)
 	}
-if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight-1); err != nil {
+	if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight-1); err != nil {
 		t.Fatalf("historically valid transaction rejected before stake transition: %v", err)
 	}
-if err := verifier.VerifyTx(&result.Tx); err == nil || !strings.Contains(err.Error(), "height-aware") {
-	t.Fatalf("heightless verification did not fail closed: %v", err)
-}
-if err := verifier.VerifyTxAtHeight(&result.Tx, 0); err == nil || !strings.Contains(err.Error(), "nonzero candidate height") {
-	t.Fatalf("zero-height verification did not fail closed: %v", err)
-}
+	if err := verifier.VerifyTx(&result.Tx); err == nil || !strings.Contains(err.Error(), "height-aware") {
+		t.Fatalf("heightless verification did not fail closed: %v", err)
+	}
+	if err := verifier.VerifyTxAtHeight(&result.Tx, 0); err == nil || !strings.Contains(err.Error(), "nonzero candidate height") {
+		t.Fatalf("zero-height verification did not fail closed: %v", err)
+	}
 
 	var validatorSig, ownershipSig [64]byte
 	pub := crypto.ValidatorPubKey(alice.Spend.Public[:])
@@ -219,17 +219,17 @@ if err := verifier.VerifyTxAtHeight(&result.Tx, 0); err == nil || !strings.Conta
 		t.Fatal(err)
 	}
 	stakeTx := core.Transaction{Version: core.TxVersionStake, Extra: stakeExtra}
-if err := verifier.VerifyBlock(&core.Block{
-	Header: core.BlockHeader{Height: stakedCollateralActivationHeight - 1},
+	if err := verifier.VerifyBlock(&core.Block{
+		Header: core.BlockHeader{Height: stakedCollateralActivationHeight - 1},
 		Txs:    []core.Transaction{result.Tx, stakeTx},
-}); err != nil {
-	t.Fatalf("pre-activation block rejected under the new rule: %v", err)
-}
-if err := verifier.VerifyBlock(&core.Block{
-	Header: core.BlockHeader{Height: stakedCollateralActivationHeight},
-	Txs:    []core.Transaction{result.Tx, stakeTx},
-}); err == nil || !strings.Contains(err.Error(), "staked collateral") {
-	t.Fatalf("same-block spend at activation was not rejected: %v", err)
+	}); err != nil {
+		t.Fatalf("pre-activation block rejected under the new rule: %v", err)
+	}
+	if err := verifier.VerifyBlock(&core.Block{
+		Header: core.BlockHeader{Height: stakedCollateralActivationHeight},
+		Txs:    []core.Transaction{result.Tx, stakeTx},
+	}); err == nil || !strings.Contains(err.Error(), "staked collateral") {
+		t.Fatalf("same-block spend at activation was not rejected: %v", err)
 	}
 
 	// Runtime stake transition must prevent the authentic output from being
@@ -237,27 +237,27 @@ if err := verifier.VerifyBlock(&core.Block{
 	if err := set.MarkStaked(owned[0].TxHash, owned[0].OutputIndex); err != nil {
 		t.Fatalf("MarkStaked: %v", err)
 	}
-if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight-1); err != nil {
-	t.Fatalf("pre-activation mempool transaction rejected: %v", err)
-}
-if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err == nil || !strings.Contains(err.Error(), "staked collateral") {
-	t.Fatalf("CLSAG transaction using staked collateral was not rejected at activation: %v", err)
+	if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight-1); err != nil {
+		t.Fatalf("pre-activation mempool transaction rejected: %v", err)
 	}
-preActivationPoolConfig := core.DefaultMempoolConfig()
-preActivationPoolConfig.CurrentHeight = func() uint64 { return stakedCollateralActivationHeight - 2 }
-preActivationPoolConfig.RingCTCLSAGActivationHeight = 1
-preActivationPoolConfig.BaseFeePerByte = 1
-preActivationPoolConfig.Verifier = verifier
-if err := core.NewMempool(preActivationPoolConfig).Add(result.Tx); err != nil {
-t.Fatalf("mempool rejected transaction before activation: %v", err)
-}
-activePoolConfig := preActivationPoolConfig
-activePoolConfig.CurrentHeight = func() uint64 { return stakedCollateralActivationHeight - 1 }
-if err := core.NewMempool(activePoolConfig).Add(result.Tx); err == nil || !strings.Contains(err.Error(), "staked collateral") {
-t.Fatalf("mempool did not enforce activation-height rule: %v", err)
-}
-if err := verifier.VerifyBlock(&core.Block{
-	Header: core.BlockHeader{Height: stakedCollateralActivationHeight},
+	if err := verifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err == nil || !strings.Contains(err.Error(), "staked collateral") {
+		t.Fatalf("CLSAG transaction using staked collateral was not rejected at activation: %v", err)
+	}
+	preActivationPoolConfig := core.DefaultMempoolConfig()
+	preActivationPoolConfig.CurrentHeight = func() uint64 { return stakedCollateralActivationHeight - 2 }
+	preActivationPoolConfig.RingCTCLSAGActivationHeight = 1
+	preActivationPoolConfig.BaseFeePerByte = 1
+	preActivationPoolConfig.Verifier = verifier
+	if err := core.NewMempool(preActivationPoolConfig).Add(result.Tx); err != nil {
+		t.Fatalf("mempool rejected transaction before activation: %v", err)
+	}
+	activePoolConfig := preActivationPoolConfig
+	activePoolConfig.CurrentHeight = func() uint64 { return stakedCollateralActivationHeight - 1 }
+	if err := core.NewMempool(activePoolConfig).Add(result.Tx); err == nil || !strings.Contains(err.Error(), "staked collateral") {
+		t.Fatalf("mempool did not enforce activation-height rule: %v", err)
+	}
+	if err := verifier.VerifyBlock(&core.Block{
+		Header: core.BlockHeader{Height: stakedCollateralActivationHeight},
 		Txs:    []core.Transaction{result.Tx},
 	}); err == nil {
 		t.Fatal("canonical block validation accepted a CLSAG transaction using staked collateral")
@@ -289,14 +289,14 @@ if err := verifier.VerifyBlock(&core.Block{
 	restarted.SetCLSAGActivationHeight(1)
 	restarted.MarkStakedKnown(owned[0].TxHash, owned[0].OutputIndex, &core.UTXO{
 		TxHash: owned[0].TxHash, OutputIndex: owned[0].OutputIndex,
-		AmountCommit: owned[0].UTXO.AmountCommit,
+		AmountCommit: owned[0].AmountCommit,
 	})
-restartedVerifier := core.NewTxVerifier(restarted)
-restartedVerifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActivationHeight)
+	restartedVerifier := core.NewTxVerifier(restarted)
+	restartedVerifier.SetStakedCollateralRingExclusionActivationHeight(stakedCollateralActivationHeight)
 	if got := restarted.GetRingMember(owned[0].OneTimePub); got == nil {
 		t.Fatal("staked output's canonical ring record was destructively removed")
 	}
-if err := restartedVerifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err == nil || !strings.Contains(err.Error(), "staked collateral") {
+	if err := restartedVerifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err == nil || !strings.Contains(err.Error(), "staked collateral") {
 		t.Fatalf("CLSAG transaction using staked collateral was not rejected after restart replay: %v", err)
 	}
 	sampledAfterRestart := restarted.SampleCLSAGDecoys(crypto.RingSize-1, nil)
@@ -312,7 +312,7 @@ if err := restartedVerifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivat
 
 	// Rolling back the stake transition restores the pre-stake canonical state.
 	restarted.UnmarkStaked(owned[0].TxHash, owned[0].OutputIndex)
-if err := restartedVerifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err != nil {
+	if err := restartedVerifier.VerifyTxAtHeight(&result.Tx, stakedCollateralActivationHeight); err != nil {
 		t.Fatalf("transaction rejected after stake rollback: %v", err)
 	}
 }

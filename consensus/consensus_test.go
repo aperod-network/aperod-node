@@ -52,11 +52,11 @@ func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	return consensus.NewEngine(consensus.Config{
-OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   validators,
-		MyKey:        myKey,
+		OnCanonicalBlock:         noopCanonicalPersistence,
+		BlockTime:                20 * time.Millisecond,
+		BFTThreshold:             0.667,
+		Validators:               validators,
+		MyKey:                    myKey,
 		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
 }
@@ -661,10 +661,10 @@ func TestEngine_NonValidatorMode_NeverProducesBlock(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{pub},
-		MyKey:        nil, // non-validator mode
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{pub},
+		MyKey:            nil, // non-validator mode
 	}, chain, mp, newNopLogger())
 
 	stop := make(chan struct{})

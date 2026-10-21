@@ -14,10 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestWalletBlockEventsIncludeOrdinaryOutputsAndPublicSpends(t *testing.T) {

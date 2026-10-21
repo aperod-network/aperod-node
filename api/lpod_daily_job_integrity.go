@@ -161,15 +161,15 @@ func validateDailyJob(j *dailyJob) error {
 		return nil
 	}
 	var r struct {
-		Version       int    `json:"version"`
-BeneficiaryVersion int `json:"beneficiary_version"`
-		Date          string `json:"date"`
-		Status        string `json:"status"`
-		Level         string `json:"verification_level"`
-		Trust         string `json:"trust_assumption"`
-		IntervalStart string `json:"interval_start"`
-		IntervalEnd   string `json:"interval_end"`
-		Opening       struct {
+		Version            int    `json:"version"`
+		BeneficiaryVersion int    `json:"beneficiary_version"`
+		Date               string `json:"date"`
+		Status             string `json:"status"`
+		Level              string `json:"verification_level"`
+		Trust              string `json:"trust_assumption"`
+		IntervalStart      string `json:"interval_start"`
+		IntervalEnd        string `json:"interval_end"`
+		Opening            struct {
 			Height uint64 `json:"height"`
 			Hash   string `json:"hash"`
 		} `json:"opening_anchor"`
@@ -235,8 +235,8 @@ BeneficiaryVersion int `json:"beneficiary_version"`
 	seen = make(map[string]bool)
 	for _, v := range r.Positions {
 		values, ok := p.Positions[v.ID]
-if !ok || seen[v.ID] || r.BeneficiaryVersion != 1 || values.Beneficiary == "" ||
-values.Beneficiary != v.Beneficiary || values.Vault != v.EffectiveVault || values.After != v.EffectiveVaultAfter ||
+		if !ok || seen[v.ID] || r.BeneficiaryVersion != 1 || values.Beneficiary == "" ||
+			values.Beneficiary != v.Beneficiary || values.Vault != v.EffectiveVault || values.After != v.EffectiveVaultAfter ||
 			!matches(v.Accrued, values.Accrued) || !matches(v.Paid, values.Paid) || !matches(v.PrincipalReturned, values.Principal) {
 			return fail()
 		}

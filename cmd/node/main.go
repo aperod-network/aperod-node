@@ -792,27 +792,32 @@ func checkStartupIntegrity(
 }
 
 func run() error {
-// Preflight must never dispatch a config-free mutating maintenance mode.
-preflightRequested := false
-preflightCapability := false
-for _, arg := range os.Args[1:] {
-if arg == "--sale-upgrade-preflight" { preflightRequested = true }
-if arg == "--sale-upgrade-preflight-capability" { preflightRequested = true; preflightCapability = true }
-}
-if preflightRequested {
-for _, arg := range os.Args[1:] {
-switch arg {
-case "--check-store", "--check-snapshot", "--compact-db", "--repair-height-index":
-return fmt.Errorf("sale preflight cannot be combined with other maintenance modes")
-}
-}
-}
-if preflightCapability {
-// --validate-config accompanies this probe so an older binary which ignores
-// unknown flags can only validate configuration, never start a live node.
-fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
-return nil
-}
+	// Preflight must never dispatch a config-free mutating maintenance mode.
+	preflightRequested := false
+	preflightCapability := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--sale-upgrade-preflight" {
+			preflightRequested = true
+		}
+		if arg == "--sale-upgrade-preflight-capability" {
+			preflightRequested = true
+			preflightCapability = true
+		}
+	}
+	if preflightRequested {
+		for _, arg := range os.Args[1:] {
+			switch arg {
+			case "--check-store", "--check-snapshot", "--compact-db", "--repair-height-index":
+				return fmt.Errorf("sale preflight cannot be combined with other maintenance modes")
+			}
+		}
+	}
+	if preflightCapability {
+		// --validate-config accompanies this probe so an older binary which ignores
+		// unknown flags can only validate configuration, never start a live node.
+		fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
+		return nil
+	}
 	// ── 0. config-free maintenance subcommands ────────────────────────────────
 	// Processed before config loading so operators can verify a chain.db that
 	// was just rsync'd without needing a fully-configured node.yaml.
@@ -834,8 +839,8 @@ return nil
 	configFlagExplicit := false
 	resetP2PIdentity := false
 	validateOnly := false
-saleUpgradePreflight := false
-saleUpgradeCopy := ""
+	saleUpgradePreflight := false
+	saleUpgradeCopy := ""
 	strictMemLimit := false
 	resetTip := false
 	repairDB := false
@@ -853,11 +858,13 @@ saleUpgradeCopy := ""
 			resetP2PIdentity = true
 		case "--validate-config":
 			validateOnly = true
-case "--sale-upgrade-preflight":
-saleUpgradePreflight = true
-case "--sale-upgrade-copy":
-if i+2 >= len(os.Args) { return fmt.Errorf("--sale-upgrade-copy requires a completed backup directory") }
-saleUpgradeCopy = os.Args[i+2]
+		case "--sale-upgrade-preflight":
+			saleUpgradePreflight = true
+		case "--sale-upgrade-copy":
+			if i+2 >= len(os.Args) {
+				return fmt.Errorf("--sale-upgrade-copy requires a completed backup directory")
+			}
+			saleUpgradeCopy = os.Args[i+2]
 		case "--strict-memlimit":
 			strictMemLimit = true
 		case "--reset-tip":
@@ -925,15 +932,19 @@ saleUpgradeCopy = os.Args[i+2]
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-// Read-only inspection does not activate any consensus configuration.
-if saleUpgradePreflight {
-if !configFlagExplicit || cfg.DataDir == "" { return fmt.Errorf("sale preflight requires explicit --config and data_dir") }
-if validateOnly || resetTip || repairDB || rebuildKeyImages || forcePurgeKIIndex || rebuildSpentIndex || resetP2PIdentity {
-return fmt.Errorf("sale preflight cannot be combined with mutation or validation shortcuts")
-}
-return runSaleUpgradePreflight(cfg, saleUpgradeCopy, os.Stdout)
-}
-if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sale-upgrade-preflight") }
+	// Read-only inspection does not activate any consensus configuration.
+	if saleUpgradePreflight {
+		if !configFlagExplicit || cfg.DataDir == "" {
+			return fmt.Errorf("sale preflight requires explicit --config and data_dir")
+		}
+		if validateOnly || resetTip || repairDB || rebuildKeyImages || forcePurgeKIIndex || rebuildSpentIndex || resetP2PIdentity {
+			return fmt.Errorf("sale preflight cannot be combined with mutation or validation shortcuts")
+		}
+		return runSaleUpgradePreflight(cfg, saleUpgradeCopy, os.Stdout)
+	}
+	if saleUpgradeCopy != "" {
+		return fmt.Errorf("--sale-upgrade-copy requires --sale-upgrade-preflight")
+	}
 	if err := guardGuardianFundActivation(cfg); err != nil {
 		return err
 	}
@@ -953,7 +964,7 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 			absConfig, absDataDir)
 	}
 
-// --validate-config: exit 0 after a successful parse+validate so
+	// --validate-config: exit 0 after a successful parse+validate so
 	// operators (and node-config.sh) can verify node.yaml without starting
 	// the node.  Prints the config path and network name so the caller can
 	// confirm which file was checked.
@@ -975,7 +986,7 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 		return nil
 	}
 
-// ── 2. Setup logger ───────────────────────────────────────────────────────
+	// ── 2. Setup logger ───────────────────────────────────────────────────────
 	level := slog.LevelInfo
 	switch cfg.LogLevel {
 	case "debug":
@@ -1166,6 +1177,27 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 	if err != nil {
 		return fmt.Errorf("validator key: %w", err)
 	}
+	var (
+		avmCheckpointPath        string
+		avmCheckpointAuthorities []crypto.ValidatorPubKey
+		avmCheckpointThreshold   int
+	)
+	if len(cfg.Consensus.AVMCheckpointTrustAuthorities) > 0 {
+		avmCheckpointAuthorities, err = avm.ParseCheckpointAuthorities(
+			cfg.Consensus.AVMCheckpointTrustAuthorities,
+		)
+		if err != nil {
+			return err
+		}
+		avmCheckpointPath = cfg.Consensus.AVMCheckpointFile
+		if avmCheckpointPath == "" {
+			avmCheckpointPath = "avm-state.checkpoint.json"
+		}
+		if !filepath.IsAbs(avmCheckpointPath) {
+			avmCheckpointPath = filepath.Join(cfg.DataDir, avmCheckpointPath)
+		}
+		avmCheckpointThreshold = cfg.Consensus.AVMCheckpointWitnessThreshold
+	}
 
 	// ── 5. Load genesis config ────────────────────────────────────────────────
 	genesisConfig, err := core.LoadGenesis(cfg.Genesis.File)
@@ -1178,7 +1210,7 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 	//
 	// Non-validator mode: use the public keys declared in the genesis config.
 	// This ensures handleIncomingBlock's isKnownValidator() and proposer-slot
-	// checks recognise the real network validators so the node can sync.
+	// checks recognize the real network validators so the node can sync.
 	// Our own (P2P-identity) key must NOT be in this list or it would be
 	// treated as a genesis validator with stake, which could cause it to win
 	// a proposer slot even though MyKey is nil in the engine.
@@ -1328,7 +1360,7 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 			// next startup loads key images from k/ when no snapshot is found.
 			repairTipHashHex := fmt.Sprintf("%x", tipHash[:])
 			if existingSnap, _, snapLoadErr := tryLoadStartupSnapshot(cfg.DataDir, tipHeight, repairTipHashHex, log); snapLoadErr == nil {
-				existingSnap.UTXOs.KeyImages = utxos.TakeSnapshot().KeyImages
+				existingSnap.UTXOs.KeyImages = utxos.SnapshotKeyImages()
 				existingSnap.SavedAt = time.Now()
 				if snapSaveErr := saveStartupSnapshot(cfg.DataDir, *existingSnap); snapSaveErr != nil {
 					log.Warn("--repair-db: failed to update snapshot with rebuilt key images",
@@ -1349,9 +1381,18 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 
 	// Declared here so both the genesis and resume branches can assign it.
 	// The genesis path leaves it nil; NewEngine creates a fresh registry.
-	// The resume path initialises it inside the startup scan below.
+	// The resume path initializes it inside the startup scan below.
 	var registry *core.ValidatorRegistry
 	var lpodMigration *store.LPoDMigration
+	finalityMigrationPath := cfg.Consensus.FinalityMigrationFile
+	if finalityMigrationPath != "" && !filepath.IsAbs(finalityMigrationPath) {
+		finalityMigrationPath = filepath.Join(cfg.DataDir, finalityMigrationPath)
+	}
+	finalityMigration, finalityMigrationTrustAuthorities, err := loadFinalityCommitteeMigration(
+		finalityMigrationPath, cfg.Consensus.FinalityMigrationTrustAuthorities)
+	if err != nil {
+		return fmt.Errorf("load finality committee migration: %w", err)
+	}
 	saleMigration, err := db.LoadSaleMigrationFile(cfg.Consensus.SaleMigrationFile)
 	if err != nil {
 		log.Error("protocol sale startup validation failed", "err", err)
@@ -1373,9 +1414,9 @@ if saleUpgradeCopy != "" { return fmt.Errorf("--sale-upgrade-copy requires --sal
 	var apiSrv *api.Server
 	if cfg.API.Enabled && cfg.API.ListenAddr != "" {
 		apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
-apiSrv.SetStakedCollateralRingExclusionActivationHeight(
-	cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
-)
+		apiSrv.SetStakedCollateralRingExclusionActivationHeight(
+			cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
+		)
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
 		apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
 		apiSrv.SetStore(db)
@@ -1527,10 +1568,26 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 		// consensus processing begins. A missing marker or missing state is
 		// deterministically rebuilt from canonical blocks; conflicting data is
 		// corruption and must fail closed.
-		avmRebuilt, avmErr := avm.EnsureCanonicalState(
-			context.Background(), db, cfg.Consensus.AVMActivationHeight,
-			tipHeight, tipHash,
-		)
+		var avmRebuilt bool
+		var avmErr error
+		if len(avmCheckpointAuthorities) > 0 {
+			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithQuorumCheckpoint(
+				context.Background(),
+				db,
+				cfg.Consensus.AVMActivationHeight,
+				tipHeight,
+				tipHash,
+				avmCheckpointPath,
+				avmCheckpointAuthorities,
+				avmCheckpointThreshold,
+				avm.MaxAVMCheckpointReplay,
+			)
+		} else {
+			avmRebuilt, avmErr = avm.EnsureCanonicalState(
+				context.Background(), db, cfg.Consensus.AVMActivationHeight,
+				tipHeight, tipHash,
+			)
+		}
 		if avmErr != nil {
 			return fmt.Errorf("startup AVM integrity: %w", avmErr)
 		}
@@ -1856,6 +1913,11 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 				return err
 			}
 		}
+		if cfg.Consensus.StakeKeyImageV4ActivationHeight != 0 {
+			if err := registry.ConfigureStakeKeyImageV4(cfg.Consensus.StakeKeyImageV4ActivationHeight); err != nil {
+				return err
+			}
+		}
 		// InitFromGenesis is idempotent (!exists guard), so NewEngine's later
 		if authorityFork != nil {
 			if err := registry.ConfigureSignatureAuthority(authorityFork, tipHeight+1); err != nil {
@@ -1935,7 +1997,7 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 				if utxoCountOK {
 					utxos.RestoreFromSnapshot(snap.UTXOs)
 					registry.RestoreFromSnapshot(snap.Registry)
-					registry.SetUTXOSet(utxos) // re-wire pointer (not serialised)
+					registry.SetUTXOSet(utxos) // re-wire pointer (not serialized)
 					if snap.TxTotal > 0 {
 						initialTxTotal = snap.TxTotal
 					}
@@ -1998,7 +2060,7 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 							TipHashHex: snap.TipHashHex,
 							TxTotal:    txTotRec,
 							SavedAt:    time.Now(),
-							UTXOs:      utxos.TakeSnapshot(),
+							UTXOs:      utxos.TakeSnapshotView(),
 							Registry:   registry.TakeSnapshot(),
 						}
 						if saveErr := saveStartupSnapshot(cfg.DataDir, recSnap); saveErr != nil {
@@ -2048,7 +2110,7 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 								TipHashHex: snap.TipHashHex,
 								TxTotal:    oomTxTot,
 								SavedAt:    time.Now(),
-								UTXOs:      utxos.TakeSnapshot(),
+								UTXOs:      utxos.TakeSnapshotView(),
 								Registry:   registry.TakeSnapshot(),
 							}
 							if saveErr := saveStartupSnapshot(cfg.DataDir, oomSnap); saveErr != nil {
@@ -2105,7 +2167,7 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 							TipHashHex: snap.TipHashHex,
 							TxTotal:    txTotKI,
 							SavedAt:    time.Now(),
-							UTXOs:      utxos.TakeSnapshot(),
+							UTXOs:      utxos.TakeSnapshotView(),
 							Registry:   registry.TakeSnapshot(),
 						}
 						if saveErr := saveStartupSnapshot(cfg.DataDir, kiFixSnap); saveErr != nil {
@@ -2567,13 +2629,13 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 
 	// engine is pre-declared with var so that the OnBlockProduced closure
 	// can reference it (e.g. engine.Registry()) via a captured pointer.
-	// By the time any block is produced, engine is fully initialised.
+	// By the time any block is produced, engine is fully initialized.
 	var engine *consensus.Engine
 
 	// gcInFlight guards the periodic CompactKeyImages+GC+FreeOSMemory
 	// goroutine so at most one is active at any time.  Without this guard,
 	// rapid block acceptance (catch-up sync or multi-block bursts) can
-	// queue an unbounded backlog of goroutines that each serialise on the
+	// queue an unbounded backlog of goroutines that each serialize on the
 	// UTXOSet write lock, then each force a stop-the-world GC, worsening
 	// exactly the performance problem this maintenance is meant to solve.
 	// Both the periodic-GC path and the post-snapshot cleanup path use
@@ -2656,6 +2718,11 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 		registry = core.NewValidatorRegistry()
 		registry.SetUTXOSet(utxos)
 	}
+	if cfg.Consensus.StakeKeyImageV4ActivationHeight != 0 {
+		if err := registry.ConfigureStakeKeyImageV4(cfg.Consensus.StakeKeyImageV4ActivationHeight); err != nil {
+			return err
+		}
+	}
 	mempool.SetStakeAdmissionCheck(func(tx core.Transaction, height uint64) error {
 		return registry.ValidateBlockStakeTxs([]core.Transaction{tx}, height)
 	})
@@ -2671,33 +2738,35 @@ apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 		return fmt.Errorf("Development Fund startup safety: %w", err)
 	}
 	engine = consensus.NewEngine(consensus.Config{
-		ValidatorAuthorityFork:              authorityFork,
-		LPoDMigration:                       lpodMigration,
-		SaleMigration:                       saleMigration,
-		GenesisVestingActivationHeight:      cfg.Consensus.GenesisVestingActivationHeight,
-		GenesisVestingFunding:               genesisVestingFunding,
-		BlockTime:                           cfg.Consensus.BlockTime,
-		BFTThreshold:                        genesisConfig.BFTThreshold,
-		Validators:                          validators,
-		Registry:                            registry,
-		MyKey:                               consensusMyKey,
-		RewardAddress:                       cfg.Consensus.RewardAddress,
-		StopProducingAtHeight:               cfg.Consensus.StopProducingAtHeight,
-		BlockRewardNAPR:                     cfg.Consensus.BlockRewardNAPR,
-		StakingPoolNAPR:                     cfg.Consensus.StakingPoolNAPR,
-		TailRewardNAPR:                      cfg.Consensus.TailRewardNAPR,
-		Store:                               db,
-		OracleURL:                           cfg.Consensus.OracleURL,
-		OracleMaxDeviation:                  cfg.Consensus.OracleMaxDeviation,
-		RingCTV4ActivationHeight:            cfg.Consensus.RingCTV4ActivationHeight,
-		RingCTCLSAGActivationHeight:         cfg.Consensus.RingCTCLSAGActivationHeight,
-StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
-		AVMActivationHeight:                 cfg.Consensus.AVMActivationHeight,
-		AVMGasBurnActivationHeight:          cfg.Consensus.AVMGasBurnActivationHeight,
-		AVMExecutor:                         avm.NewBlockExecutor(avm.LevelStore{DB: db}),
-		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
-		GuardianFundActivationHeight:        cfg.Consensus.GuardianFundActivationHeight,
-		GuardianFundChainAnchor:             guardianAnchor,
+		ValidatorAuthorityFork:            authorityFork,
+		FinalityMigration:                 finalityMigration,
+		FinalityMigrationTrustAuthorities: finalityMigrationTrustAuthorities,
+		LPoDMigration:                     lpodMigration,
+		SaleMigration:                     saleMigration,
+		GenesisVestingActivationHeight:    cfg.Consensus.GenesisVestingActivationHeight,
+		GenesisVestingFunding:             genesisVestingFunding,
+		BlockTime:                         cfg.Consensus.BlockTime,
+		BFTThreshold:                      genesisConfig.BFTThreshold,
+		Validators:                        validators,
+		Registry:                          registry,
+		MyKey:                             consensusMyKey,
+		RewardAddress:                     cfg.Consensus.RewardAddress,
+		StopProducingAtHeight:             cfg.Consensus.StopProducingAtHeight,
+		BlockRewardNAPR:                   cfg.Consensus.BlockRewardNAPR,
+		StakingPoolNAPR:                   cfg.Consensus.StakingPoolNAPR,
+		TailRewardNAPR:                    cfg.Consensus.TailRewardNAPR,
+		Store:                             db,
+		OracleURL:                         cfg.Consensus.OracleURL,
+		OracleMaxDeviation:                cfg.Consensus.OracleMaxDeviation,
+		RingCTV4ActivationHeight:          cfg.Consensus.RingCTV4ActivationHeight,
+		RingCTCLSAGActivationHeight:       cfg.Consensus.RingCTCLSAGActivationHeight,
+		StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
+		AVMActivationHeight:                           cfg.Consensus.AVMActivationHeight,
+		AVMGasBurnActivationHeight:                    cfg.Consensus.AVMGasBurnActivationHeight,
+		AVMExecutor:                                   avm.NewBlockExecutor(avm.LevelStore{DB: db}),
+		RewardAuthorizationActivationHeight:           cfg.Consensus.RewardAuthorizationActivationHeight,
+		GuardianFundActivationHeight:                  cfg.Consensus.GuardianFundActivationHeight,
+		GuardianFundChainAnchor:                       guardianAnchor,
 		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
 			raw, err := json.Marshal(block)
 			if err != nil {
@@ -2809,7 +2878,7 @@ StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRin
 				// Single-flight guard: skip if a prior GC goroutine is still
 				// running.  Without this, rapid block acceptance during catch-up
 				// sync queues an unbounded backlog of goroutines that all
-				// serialise on the UTXOSet write lock, then each force a
+				// serialize on the UTXOSet write lock, then each force a
 				// stop-the-world GC — worsening the problem this task solves.
 				if gcInFlight.CompareAndSwap(false, true) {
 					go func(height uint64) {
@@ -2870,7 +2939,7 @@ StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRin
 				TipHashHex: fmt.Sprintf("%x", hash[:]),
 				TxTotal:    txTot,
 				SavedAt:    time.Now(),
-				UTXOs:      utxos.TakeSnapshot(),
+				UTXOs:      utxos.TakeSnapshotView(),
 				Registry:   engine.Registry().TakeSnapshot(),
 			}
 			// Purge any mempool KIs that were never confirmed on-chain.
@@ -2907,14 +2976,13 @@ StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRin
 							"height", height, "err", metaErr)
 					}
 				}
-				// Explicitly release the deep-copy snapshot data so the GC can
-				// reclaim it immediately rather than waiting for the next
-				// scheduled collection.  The disk write above is complete at this
-				// point, so there is no remaining reference to snap's slices.
+				// Drop the pointer view as soon as its disk write completes so the
+				// retained reference arrays can be reclaimed without waiting for
+				// the next scheduled collection.
 				snap.UTXOs = core.UTXOSnapshot{}
 				snap.Registry = core.RegistrySnapshot{}
-				// Compact key images after the snapshot: TakeSnapshot already
-				// serialised them, so we can now merge the 'recent' map
+				// Compact key images after the snapshot: the snapshot view already
+				// serialized them, so we can now merge the 'recent' map
 				// (≈150 B/entry Go-map overhead) into the 'sorted' slice
 				// (32 B/entry).  GC reclaims the old map buckets immediately
 				// after this call.
@@ -2934,7 +3002,7 @@ StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRin
 	}, chain, mempool, log)
 	if apiSrv != nil {
 		apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash)
-apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalizedHash)
+		apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalizedHash)
 		apiSrv.SetGenesisVestingConfig(cfg.Consensus.GenesisVestingActivationHeight)
 	}
 	if db != nil && lpodMigration != nil && lpodMigration.Version == 3 {
@@ -2942,6 +3010,11 @@ apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalized
 			log.Warn("v3 LPoD earnings index backfill incomplete; read API remains fail-closed", "err", err)
 		} else {
 			log.Info("v3 LPoD earnings index backfill complete")
+		}
+		if err := db.BackfillLPoDWalletIndex(lpodMigration); err != nil {
+			log.Warn("v3 LPoD wallet-output index backfill incomplete; wallet balance API remains fail-closed", "err", err)
+		} else {
+			log.Info("v3 LPoD wallet-output index backfill complete")
 		}
 	}
 
@@ -2951,9 +3024,9 @@ apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalized
 	// where blocks are accepted without cryptographic verification (nil verifier
 	// = fail-open).  Wiring first closes that window entirely.
 	txVerifier := core.NewTxVerifier(utxos)
-txVerifier.SetStakedCollateralRingExclusionActivationHeight(
-	cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
-)
+	txVerifier.SetStakedCollateralRingExclusionActivationHeight(
+		cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
+	)
 	// Wire vesting enforcement so the verifier rejects spending of still-locked
 	// genesis allocations at the protocol level (not just display-only).
 	// Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather
@@ -3642,9 +3715,9 @@ func performShutdownWithGate(
 	}
 
 	// Step 3: reclaim as much memory as possible before the snapshot save so
-	// that TakeSnapshot() itself — which serialises the full UTXO set — does
-	// not push RSS above GOMEMLIMIT and trigger an OOM-kill mid-write.  This
-	// mirrors the post-snapshot-load GC already performed on startup.
+	// that snapshot metadata and the bounded pointer view can be allocated
+	// without pushing RSS above GOMEMLIMIT. The UTXO records are streamed in
+	// small JSON batches rather than deep-copied.
 	rssBeforeGC := readRSSBytes()
 	runtime.GC()
 	debug.FreeOSMemory()
@@ -3824,7 +3897,7 @@ func saveShutdownSnapshotWithPaths(
 		TipHashHex: fmt.Sprintf("%x", shutTipHash[:]),
 		TxTotal:    shutTxTotal,
 		SavedAt:    time.Now(),
-		UTXOs:      utxos.TakeSnapshot(),
+		UTXOs:      utxos.TakeSnapshotView(),
 		Registry:   registry.TakeSnapshot(),
 	}
 	// Purge any mempool KIs that were never confirmed on-chain before
@@ -4072,16 +4145,16 @@ func readRSSBytes() int64 {
 //	"1TiB"       → 1099511627776, true
 //
 // Returns (bytes, ok).  ok is false when the value is absent, "off",
-// parses to zero or negative, overflows int64, or uses an unrecognised format.
+// parses to zero or negative, overflows int64, or uses an unrecognized format.
 //
-// Suffixes recognised by the Go 1.21+ runtime: B, KiB, MiB, GiB, TiB.
+// Suffixes recognized by the Go 1.21+ runtime: B, KiB, MiB, GiB, TiB.
 // PiB and EiB are NOT in the runtime grammar and are rejected here.
 func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
 	if raw == "" || raw == "off" {
 		return 0, false
 	}
 
-	// The Go runtime recognises exactly these unit suffixes (longest first
+	// The Go runtime recognizes exactly these unit suffixes (longest first
 	// so that "KiB" is matched before the bare "B" suffix).
 	type unit struct {
 		suffix string
@@ -4121,7 +4194,7 @@ func parseGOMLEMLIMITBytes(raw string) (int64, bool) {
 
 // checkGOMLEMLIMIT inspects the GOMEMLIMIT environment variable and logs a
 // prominent warning when it is absent, explicitly disabled ("off"), set to
-// zero, or uses an unrecognised format.  If strictMode is true the function
+// zero, or uses an unrecognized format.  If strictMode is true the function
 // returns an error so the node exits with a non-zero status, preventing a
 // silent start without a memory cap.
 //
@@ -4476,7 +4549,7 @@ func checkSystemdTimeout(dropinPath, servicePath, systemdDir string, log *slog.L
 // by lost transactions (e.g. after an OOM kill before the tx was confirmed in
 // a block).  This makes UTXOs whose key images were erroneously marked "spent"
 // spendable again.
-// forcePurge controls behaviour when the block scan is incomplete (pruned
+// forcePurge controls behavior when the block scan is incomplete (pruned
 // node).  When false the function falls back to the persistent k/ index so
 // no confirmed key image is lost.  When true the persistent index is purged
 // of all entries that could not be verified from the readable blocks; this
@@ -4496,7 +4569,7 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
 	count := 0
 	// valid holds every key image that appears in a confirmed transaction,
 	// in both raw and canonical form, so the LevelDB k/ index purge below
-	// recognises entries written via either MarkKeyImageSpent path.
+	// recognizes entries written via either MarkKeyImageSpent path.
 	valid := make(map[crypto.KeyImage]bool)
 	// scanComplete guards the purge below: deleting index entries based on an
 	// INCOMPLETE block scan could remove a genuinely confirmed key image and
@@ -4539,6 +4612,21 @@ func rebuildKeyImagesFromBlocks(blockStore *store.DB, tipHeight uint64, utxos *c
 				utxos.MarkSpent(inp.KeyImage)
 				valid[inp.KeyImage] = true
 				if canonical, cErr := crypto.CanonicalKeyImage(inp.KeyImage); cErr == nil {
+					valid[canonical] = true
+				}
+				count++
+			}
+			if tx.IsStake() && len(tx.Extra) == core.StakePayloadSizeV4 {
+				_, _, _, _, _, _, _, keyImage, _, decodeErr := core.DecodeStakeExtraV4(tx.Extra)
+				if decodeErr != nil {
+					scanComplete = false
+					log.Error("--rebuild-key-images: invalid stake key-image payload",
+						"height", h, "err", decodeErr)
+					continue
+				}
+				utxos.MarkSpent(keyImage)
+				valid[keyImage] = true
+				if canonical, cErr := crypto.CanonicalKeyImage(keyImage); cErr == nil {
 					valid[canonical] = true
 				}
 				count++
@@ -4896,7 +4984,7 @@ func verifyUTXOStoreEntries(blockStore *store.DB, tipHeight uint64, log *slog.Lo
 	return fixed, firstErr
 }
 
-// storeBlock serialises a block to JSON and writes it via PutRawBlock.
+// storeBlock serializes a block to JSON and writes it via PutRawBlock.
 // It also persists a UTXO record for every transaction output so that
 // api.utxoMissingReason can later distinguish "never existed" from "already
 // spent or burned" from "originated in a now-pruned block".  The records are
@@ -5111,7 +5199,7 @@ func validateAmountCommitsFromBlocks(
 ) (checked, fixed int) {
 	// Take a read-only snapshot so we can iterate without holding the mutex
 	// while performing potentially slow block reads from disk.
-	snap := utxos.TakeSnapshot()
+	snap := utxos.TakeSnapshotView()
 	if len(snap.ActiveUTXOs) == 0 && len(snap.StakedUTXOs) == 0 {
 		return
 	}

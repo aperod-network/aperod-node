@@ -10,10 +10,11 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 // Nominal public baseline before any validator-pool draw. Reconciliation uses
@@ -540,9 +541,10 @@ func (d *DB) appendLPoDMigration(batch *leveldb.Batch, hash crypto.Hash32, heigh
 		return nil, fmt.Errorf("lpod: migration at wrong height")
 	}
 	bindingKey := []byte("lpod/activation/v1")
-	if m.Version == 2 {
+	switch m.Version {
+	case 2:
 		bindingKey = []byte("lpod/activation/v2")
-	} else if m.Version == 3 {
+	case 3:
 		bindingKey = []byte("lpod/activation/v3")
 	}
 	binding, err := d.get(bindingKey)
@@ -582,10 +584,11 @@ func (d *DB) appendLPoDMigration(batch *leveldb.Batch, hash crypto.Hash32, heigh
 	binary.LittleEndian.PutUint64(activation[:], height)
 	heightKey := []byte("lpod/activation_height/v1")
 	poolKey := []byte("lpod/activation_validator_budget/v1")
-	if m.Version == 2 {
+	switch m.Version {
+	case 2:
 		heightKey = []byte("lpod/activation_height/v2")
 		poolKey = []byte("lpod/activation_validator_budget/v2")
-	} else if m.Version == 3 {
+	case 3:
 		heightKey = []byte("lpod/activation_height/v3")
 		poolKey = []byte("lpod/activation_validator_budget/v3")
 	}
@@ -594,9 +597,10 @@ func (d *DB) appendLPoDMigration(batch *leveldb.Batch, hash crypto.Hash32, heigh
 	binary.LittleEndian.PutUint64(initialPool[:], m.ValidatorRemaining)
 	batch.Put(poolKey, initialPool[:])
 	saleRemaining := 9_000_000_000*lpod.Unit - m.ValidatorRemaining - issued
-	if m.Version == 2 {
+	switch m.Version {
+	case 2:
 		saleRemaining = m.HistoricalSaleRemain
-	} else if m.Version == 3 {
+	case 3:
 		saleRemaining = m.NominalEligible
 	}
 	return &LPoDCheckpoint{

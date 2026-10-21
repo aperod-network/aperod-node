@@ -23,7 +23,9 @@ func (nopHandler) Enabled(_ interface{ Deadline() (interface{}, bool) }, _ slog.
 	return false
 }
 
-func newNopLog() *slog.Logger { return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})) }
+func newNopLog() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -90,12 +92,12 @@ func TestOnBlockAccepted_PeriodicSnapshot_IncomingPath(t *testing.T) {
 	const testInterval uint64 = 2
 
 	eng := consensus.NewEngine(consensus.Config{
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{pub},
-		MyKey:        nil, // not a producing validator in this test
+		BlockTime:                20 * time.Millisecond,
+		BFTThreshold:             0.667,
+		Validators:               []crypto.ValidatorPubKey{pub},
+		MyKey:                    nil, // not a producing validator in this test
 		RingCTV4ActivationHeight: ^uint64(0),
-		OnCanonicalBlock: noopCanonicalPersistence,
+		OnCanonicalBlock:         noopCanonicalPersistence,
 		OnBlockAccepted: func(block *core.Block) {
 			h := block.Header.Height
 			mu.Lock()

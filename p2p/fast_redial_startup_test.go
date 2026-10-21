@@ -3,7 +3,7 @@ package p2p_test
 // Tests for TASK #2008: reconnect to known-good peers fast after a node restart.
 //
 // Problem: after a restart the node used to wait for the first discovery /
-// maintain tick (10 s) before dialling its configured known-good peers.  A
+// maintain tick (10 s) before dialing its configured known-good peers.  A
 // deploy health check that inspects peer_count at 30 s would then flap a
 // warning even though the network is healthy.  Start() must fire an immediate
 // outbound dial of every configured bootnode AND every dialable "host:port"

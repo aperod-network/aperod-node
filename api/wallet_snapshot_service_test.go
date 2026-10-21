@@ -85,7 +85,7 @@ func newWalletSnapshotLoopback(t *testing.T) *walletSnapshotLoopback {
 	})
 	mux.HandleFunc("/_fixture/expire", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", 405)
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
 		m := node.walletSnapshots
@@ -99,7 +99,7 @@ func newWalletSnapshotLoopback(t *testing.T) *walletSnapshotLoopback {
 	})
 	mux.HandleFunc("/_fixture/stop", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", 405)
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
 		writeJSON(w, 200, map[string]bool{"stopping": true})

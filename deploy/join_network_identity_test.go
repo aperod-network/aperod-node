@@ -4,12 +4,12 @@
 // verifies that join-network.sh never lets a relay node inherit the source
 // node's p2p_identity.key after an rsync-based bootstrap.
 //
-// Two complementary defences are tested:
+// Two complementary defenses are tested:
 //
-//  1. Defence A — rsync --exclude='p2p_identity.key'
+//  1. Defense A — rsync --exclude='p2p_identity.key'
 //     The source key is never transferred to the target during rsync.
 //
-//  2. Defence B — SSH rm -f <target>/p2p_identity.key (Step 4)
+//  2. Defense B — SSH rm -f <target>/p2p_identity.key (Step 4)
 //     Any key already on the target (from a previous install or a hypothetical
 //     broken rsync without --exclude) is deleted so the node generates a fresh
 //     TLS identity on first start.

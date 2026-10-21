@@ -12,11 +12,12 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/util"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 func lpodWalletPrefix(address crypto.Address) []byte {
@@ -37,7 +38,11 @@ var lpodEarningsProgressKey = []byte("lpod/earnings-progress/v2")
 
 func (d *DB) LPoDWalletIndexReady(funding crypto.Hash32) (bool, error) {
 	raw, err := d.get(lpodWalletReadyKey)
-	return bytes.Equal(raw, funding[:]), err
+	if err != nil {
+		return false, err
+	}
+	backfilled, err := d.get(lpodWalletBackfillReadyKey)
+	return bytes.Equal(raw, funding[:]) && bytes.Equal(backfilled, funding[:]), err
 }
 
 func (d *DB) LPoDEarningsIndexReady(funding, tip crypto.Hash32, height uint64) (bool, error) {
@@ -65,6 +70,37 @@ func isLPoDPureReward(reward, returnedPrincipal uint64) bool {
 	return reward > 0 && returnedPrincipal == 0
 }
 
+func lpodWalletOwners(
+	leader crypto.Address,
+	after *LPoDCheckpoint,
+	height uint64,
+	parent, digest crypto.Hash32,
+) (map[crypto.Point32]crypto.Address, error) {
+	candidates := map[crypto.Address]bool{leader: true}
+	if after.GenesisVesting != nil && after.GenesisVesting.paymentAt(height) > 0 {
+		candidates[after.GenesisVesting.Recipient] = true
+	}
+	if after.GenesisVesting != nil && after.GenesisVesting.FundingHeight == height &&
+		after.GenesisVesting.LiquidityPaid > 0 {
+		candidates[after.GenesisVesting.LiquidityRecipient] = true
+	}
+	for _, position := range after.Positions {
+		candidates[position.Deposit.Beneficiary] = true
+	}
+	owners := make(map[crypto.Point32]crypto.Address, len(candidates))
+	for address := range candidates {
+		output, err := core.BuildLPoDPayoutOutput(address, 1, height, parent, digest)
+		if err != nil {
+			return nil, err
+		}
+		if existing, ok := owners[output.OneTimePub]; ok && existing != address {
+			return nil, fmt.Errorf("lpod: ambiguous payout beneficiary key")
+		}
+		owners[output.OneTimePub] = address
+	}
+	return owners, nil
+}
+
 // This is a discovery index only. Monetary transitions and payout validation
 // remain authoritative and unchanged. Keys are committed alongside the block,
 // settlement and UTXOs, never manufactured from wallet SQL metadata.
@@ -76,30 +112,17 @@ func (d *DB) appendLPoDWalletIndex(batch *leveldb.Batch, b *core.Block, r *LPoDS
 	if after == nil || after.Allocation == nil {
 		return fmt.Errorf("lpod: funded checkpoint required for wallet discovery")
 	}
-	candidates := map[crypto.Address]bool{r.Leader: true}
-if after.GenesisVesting != nil && after.GenesisVesting.paymentAt(b.Header.Height) > 0 {
-candidates[after.GenesisVesting.Recipient] = true
-}
-if after.GenesisVesting != nil && after.GenesisVesting.FundingHeight == b.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
-candidates[after.GenesisVesting.LiquidityRecipient] = true
-}
-	for _, p := range after.Positions {
-		candidates[p.Deposit.Beneficiary] = true
-	}
-	owners := map[crypto.Point32]crypto.Address{}
-	for a := range candidates {
-		// The public deterministic ephemeral/one-time key is independent of amount.
-		out, err := core.BuildLPoDPayoutOutput(a, 1, b.Header.Height, r.Parent, after.Digest())
-		if err != nil {
-			return err
-		}
-		owners[out.OneTimePub] = a
+	owners, err := lpodWalletOwners(r.Leader, after, b.Header.Height, r.Parent, after.Digest())
+	if err != nil {
+		return err
 	}
 	keys := [][]byte{}
 	if b.Header.Height == after.Allocation.FundingHeight {
 		funding := b.Hash()
 		batch.Put(lpodWalletReadyKey, funding[:])
 		keys = append(keys, lpodWalletReadyKey)
+		batch.Put(lpodWalletBackfillReadyKey, funding[:])
+		keys = append(keys, lpodWalletBackfillReadyKey)
 		if after.Allocation.Version == 3 {
 			ready := earningsReadyValue(funding, funding, b.Header.Height)
 			batch.Put(lpodEarningsReadyKey, ready)
@@ -260,19 +283,21 @@ func (d *DB) classifyLPoDEarnings(b *core.Block, r *LPoDSettlement, after *LPoDC
 	for a := range principal {
 		seen[a] = true
 	}
-var vestingAddress crypto.Address
-var vestingAmount uint64
-if after.GenesisVesting != nil {
-vestingAddress = after.GenesisVesting.Recipient
-vestingAmount = after.GenesisVesting.paymentAt(b.Header.Height)
-if vestingAmount > 0 { seen[vestingAddress] = true }
-if after.GenesisVesting.FundingHeight == b.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
-seen[after.GenesisVesting.LiquidityRecipient] = true
-}
-}
+	var vestingAddress crypto.Address
+	var vestingAmount uint64
+	if after.GenesisVesting != nil {
+		vestingAddress = after.GenesisVesting.Recipient
+		vestingAmount = after.GenesisVesting.paymentAt(b.Header.Height)
+		if vestingAmount > 0 {
+			seen[vestingAddress] = true
+		}
+		if after.GenesisVesting.FundingHeight == b.Header.Height && after.GenesisVesting.LiquidityPaid > 0 {
+			seen[after.GenesisVesting.LiquidityRecipient] = true
+		}
+	}
 	for a := range seen {
-if rewards[a] > 0 || principal[a] > 0 || (a == vestingAddress && vestingAmount > 0) ||
-(after.GenesisVesting != nil && after.GenesisVesting.FundingHeight == b.Header.Height && a == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
+		if rewards[a] > 0 || principal[a] > 0 || (a == vestingAddress && vestingAmount > 0) ||
+			(after.GenesisVesting != nil && after.GenesisVesting.FundingHeight == b.Header.Height && a == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			addresses = append(addresses, string(a))
 		}
 	}
@@ -284,18 +309,20 @@ if rewards[a] > 0 || principal[a] > 0 || (a == vestingAddress && vestingAmount >
 	for i, text := range addresses {
 		address := crypto.Address(text)
 		total, err := lpodAdd(rewards[address], principal[address])
-if err == nil && address == vestingAddress { total, err = lpodAdd(total, vestingAmount) }
-if err == nil && after.GenesisVesting != nil && b.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient {
-total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
-}
+		if err == nil && address == vestingAddress {
+			total, err = lpodAdd(total, vestingAmount)
+		}
+		if err == nil && after.GenesisVesting != nil && b.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient {
+			total, err = lpodAdd(total, after.GenesisVesting.LiquidityPaid)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if total == 0 {
 			return nil, fmt.Errorf("lpod: zero canonical payout classification")
 		}
-if !isLPoDPureReward(rewards[address], principal[address]) || (address == vestingAddress && vestingAmount > 0) ||
-(after.GenesisVesting != nil && b.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
+		if !isLPoDPureReward(rewards[address], principal[address]) || (address == vestingAddress && vestingAmount > 0) ||
+			(after.GenesisVesting != nil && b.Header.Height == after.GenesisVesting.FundingHeight && address == after.GenesisVesting.LiquidityRecipient && after.GenesisVesting.LiquidityPaid > 0) {
 			// Mixed outputs must never be presented as earnings-only, and
 			// principal-only outputs are not earnings.
 			continue

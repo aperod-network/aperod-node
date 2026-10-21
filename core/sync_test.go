@@ -130,7 +130,7 @@ func TestSync_ThreeNodes_FiveBlocks(t *testing.T) {
 	// Mine 5 blocks on A, broadcast to B and C manually
 	const numBlocks = 5
 	blocks := make([]*core.Block, numBlocks)
-	var prev *core.Block = genesis
+	var prev = genesis
 	for i := range numBlocks {
 		b := buildBlock(t, prev, validatorPriv, validatorPub, uint64(i+1))
 		if err := chainA.AddBlock(b); err != nil {
@@ -792,7 +792,7 @@ func TestSync_KeepalivePong_RetriggersHeaderSync(t *testing.T) {
 //  5. Relay performs a fresh GetHeaders sync and reaches the final validator height.
 //
 // This is the regression guard for the reconnect-and-resync path: a stall or
-// wrong-fork ban that prevents re-dialling would leave the relay permanently
+// wrong-fork ban that prevents re-dialing would leave the relay permanently
 // behind the main chain.
 func TestSync_RelayNode_ReconnectAfterDrop(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -1062,7 +1062,7 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 		t.Cleanup(func() { client.Close(); server.Close() })
 		go io.Copy(client, server) //nolint:errcheck // validator→relay flows freely
 		go func() {
-			<-gate // hold relay→validator until the block below is mined
+			<-gate                  // hold relay→validator until the block below is mined
 			io.Copy(server, client) //nolint:errcheck
 		}()
 	}()
@@ -1253,8 +1253,8 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	// returns normally) but the data is dropped, not forwarded.  defer client.Close()
 	// ensures relay sees EOF when the goroutine exits (after server FIN from Stop,
 	// or on test cleanup).
-	gate             := make(chan struct{}) // close to enter intercept mode
-	stalled          := make(chan struct{}) // proxy ack: intercept mode is active
+	gate := make(chan struct{})             // close to enter intercept mode
+	stalled := make(chan struct{})          // proxy ack: intercept mode is active
 	interceptedFirst := make(chan struct{}) // proxy ack: read ≥1 chunk mid-stream
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1287,8 +1287,8 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 			buf := make([]byte, 4096)
-			stalledOnce      := sync.Once{}
-			interceptedOnce  := sync.Once{}
+			stalledOnce := sync.Once{}
+			interceptedOnce := sync.Once{}
 			for {
 				select {
 				case <-gate:
@@ -1431,9 +1431,9 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	// until its goroutine exits, which happens when Stop closes the server conn).
 	// proxyClient.Close() is called explicitly to ensure EOF reaches the relay
 	// promptly regardless of proxy goroutine scheduling.
-	firstSent        := make(chan struct{})
-	proceedCh        := make(chan struct{})
-	broadcastDone    := make(chan struct{})
+	firstSent := make(chan struct{})
+	proceedCh := make(chan struct{})
+	broadcastDone := make(chan struct{})
 	postStopBroadcasts := 0 // written only in goroutine, read after <-broadcastDone
 
 	go func() {

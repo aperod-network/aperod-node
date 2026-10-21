@@ -77,16 +77,22 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 		}
 	}
 
-protectedVestingHeights := map[uint64]bool{}
-if hasFunding {
-checkpoint, err := d.LoadLPoDCheckpoint()
-if err != nil { return 0, fmt.Errorf("load reserve checkpoint before pruning: %w", err) }
-if checkpoint != nil && checkpoint.GenesisVesting != nil {
-protectedVestingHeights[checkpoint.GenesisVesting.FundingHeight] = true
-for _, h := range checkpoint.GenesisVesting.PaidHeights { if h > 0 { protectedVestingHeights[h] = true } }
-}
-}
-if cursor >= pruneBelow {
+	protectedVestingHeights := map[uint64]bool{}
+	if hasFunding {
+		checkpoint, err := d.LoadLPoDCheckpoint()
+		if err != nil {
+			return 0, fmt.Errorf("load reserve checkpoint before pruning: %w", err)
+		}
+		if checkpoint != nil && checkpoint.GenesisVesting != nil {
+			protectedVestingHeights[checkpoint.GenesisVesting.FundingHeight] = true
+			for _, h := range checkpoint.GenesisVesting.PaidHeights {
+				if h > 0 {
+					protectedVestingHeights[h] = true
+				}
+			}
+		}
+	}
+	if cursor >= pruneBelow {
 		return 0, nil // nothing new to prune
 	}
 
@@ -119,9 +125,11 @@ if cursor >= pruneBelow {
 			// Gap in chain — skip, advance cursor past it.
 			continue
 		}
-// Retain the at-most eleven reserve/payment bodies for permanent canonical
-// payout evidence, even when ordinary old block bodies are pruned.
-if protectedVestingHeights[h] { continue }
+		// Retain the at-most eleven reserve/payment bodies for permanent canonical
+		// payout evidence, even when ordinary old block bodies are pruned.
+		if protectedVestingHeights[h] {
+			continue
+		}
 
 		// Strip TxData: replace the block bytes with a header-only version.
 		// We encode the pruned marker as the single JSON string `null` appended

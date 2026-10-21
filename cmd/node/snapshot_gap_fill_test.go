@@ -25,7 +25,7 @@ import (
 // silentLog returns a logger that discards all output.
 func silentLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// putRawBlk serialises blk as core.Block JSON and writes it via PutRawBlock,
+// putRawBlk serializes blk as core.Block JSON and writes it via PutRawBlock,
 // matching exactly how storeBlock() persists blocks in production.
 func putRawBlk(t *testing.T, db *store.DB, blk *core.Block) {
 	t.Helper()

@@ -7,11 +7,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/aperod/aperod/api"
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
-	"github.com/aperod/aperod/lpod"
-	"github.com/aperod/aperod/wallet"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +15,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/aperod/aperod/api"
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/lpod"
+	"github.com/aperod/aperod/wallet"
 )
 
 func TestLPoDCanonicalWalletPayoutDiscovery(t *testing.T) {

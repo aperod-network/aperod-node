@@ -441,7 +441,7 @@ func TestRepairAllHeightIndex_PersistenceAfterRepair(t *testing.T) {
 // TestRepairAllHeightIndex_TwoBodiesAtOneHeight verifies that RepairAllHeightIndex
 // does NOT overwrite a canonical h/<height> entry when two parseable block bodies
 // both claim the same height.  Without a canonical-chain traversal we cannot
-// select between them; the correct behaviour is to leave the existing non-zero
+// select between them; the correct behavior is to leave the existing non-zero
 // h/ entry intact and count the height as OK if it resolves to a valid body.
 func TestRepairAllHeightIndex_TwoBodiesAtOneHeight(t *testing.T) {
 	dir := t.TempDir()

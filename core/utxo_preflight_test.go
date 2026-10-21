@@ -114,7 +114,10 @@ func TestApplyBlockPreflightRejectsWithoutMutation(t *testing.T) {
 			if set.IsSpent(inp.KeyImage) {
 				t.Fatal("failed preflight marked key image spent")
 			}
-			if set.Get(existing.TxHash, existing.OutputIndex) != existing {
+			gotExisting := set.Get(existing.TxHash, existing.OutputIndex)
+			if gotExisting == nil || gotExisting.TxHash != existing.TxHash ||
+				gotExisting.OutputIndex != existing.OutputIndex ||
+				gotExisting.AmountCommit != existing.AmountCommit {
 				t.Fatal("failed preflight removed existing UTXO")
 			}
 			if set.Get(tx.Hash(), 0) != nil {

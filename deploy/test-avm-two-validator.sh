@@ -13,4 +13,4 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}/.."
-GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.26.9+auto go test ./consensus -run '^TestAVMTwoValidatorEngineIntegration$' -count=1 -v
+GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.26.10+auto go test ./consensus -run '^TestAVMTwoValidatorEngineIntegration$' -count=1 -v

@@ -1,7 +1,7 @@
 package api
 
 import (
-"encoding/json"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,25 +9,34 @@ import (
 )
 
 func TestSaleReadinessIsPrivateAndClosed(t *testing.T) {
-s := &Server{}
-s.mux = http.NewServeMux()
-s.registerRESTRoutes()
-path := "/api/v1/admin/protocol-sales/readiness"
-for _, tc := range []struct{ remote, host string; status int }{
-{"203.0.113.9:1234", "localhost", http.StatusForbidden},
-{"127.0.0.1:1234", "localhost", http.StatusUnauthorized},
-} {
-req := httptest.NewRequest(http.MethodGet, "http://"+tc.host+path, nil)
-req.RemoteAddr = tc.remote
-w := httptest.NewRecorder()
-s.mux.ServeHTTP(w, req)
-if w.Code != tc.status { t.Fatalf("private readiness status %d, expected %d",w.Code,tc.status) }
-}
-w := httptest.NewRecorder()
-s.restSaleReadiness(w,httptest.NewRequest(http.MethodGet,path,nil))
-var result map[string]any
-if err := json.Unmarshal(w.Body.Bytes(),&result); err != nil { t.Fatal(err) }
-if len(result)!=2 || result["code"]!="SALE_NOT_ACTIVATED" || result["ready"]!=false { t.Fatal(result) }
+	s := &Server{}
+	s.mux = http.NewServeMux()
+	s.registerRESTRoutes()
+	path := "/api/v1/admin/protocol-sales/readiness"
+	for _, tc := range []struct {
+		remote, host string
+		status       int
+	}{
+		{"203.0.113.9:1234", "localhost", http.StatusForbidden},
+		{"127.0.0.1:1234", "localhost", http.StatusUnauthorized},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+tc.host+path, nil)
+		req.RemoteAddr = tc.remote
+		w := httptest.NewRecorder()
+		s.mux.ServeHTTP(w, req)
+		if w.Code != tc.status {
+			t.Fatalf("private readiness status %d, expected %d", w.Code, tc.status)
+		}
+	}
+	w := httptest.NewRecorder()
+	s.restSaleReadiness(w, httptest.NewRequest(http.MethodGet, path, nil))
+	var result map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 2 || result["code"] != "SALE_NOT_ACTIVATED" || result["ready"] != false {
+		t.Fatal(result)
+	}
 }
 
 func TestSaleEndpointsFailClosedBeforeConfiguration(t *testing.T) {

@@ -51,12 +51,12 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 	e.pool.SetVerifier(e.txVerifier)
 	acceptPositionBlock(t, e, priv, 3_000_000_000, *deposit)
 	// These are consensus-authorized payout outputs, not UTXO/decoy mocks.
-manyRewards := os.Getenv("NATIVE_CHROME_MANY_REWARDS") == "1"
-rewardBlocks := 20
-if manyRewards {
-rewardBlocks = 160
-}
-for i := 0; i < rewardBlocks; i++ {
+	manyRewards := os.Getenv("NATIVE_CHROME_MANY_REWARDS") == "1"
+	rewardBlocks := 20
+	if manyRewards {
+		rewardBlocks = 160
+	}
+	for i := 0; i < rewardBlocks; i++ {
 		acceptPositionBlock(t, e, priv, 3_000_000_000)
 	}
 	exit := action
@@ -67,44 +67,44 @@ for i := 0; i < rewardBlocks; i++ {
 	if err != nil {
 		t.Fatal(err)
 	}
-if !manyRewards {
-acceptPositionBlock(t, e, priv, 1, *withdrawal)
-}
+	if !manyRewards {
+		acceptPositionBlock(t, e, priv, 1, *withdrawal)
+	}
 	tip := e.chain.Tip()
 	if !e.IsFinalizedHash(tip.Header.Height, tip.Hash()) {
 		t.Fatal("fixture lacks real finality")
 	}
-readAmounts := func() (uint64, int, error) {
-var total uint64
-count := 0
-cursor := ""
-for {
-rows, next, err := db.LPoDWalletOutputs(action.Beneficiary, cursor, 128)
-if err != nil {
-return 0, 0, err
-}
-for _, u := range rows {
-hs, err := crypto.ScanForOutput(keys.View.Private, keys.Spend.Public, u.TxPubKey, u.OneTimePub)
-if err != nil || hs == nil {
-return 0, 0, fmt.Errorf("fixture output is not owned")
-}
-total += core.DecryptAmount(u.EncAmount, hs)
-count++
-}
-if next == "" {
-return total, count, nil
-}
-if next == cursor {
-return 0, 0, fmt.Errorf("fixture cursor did not advance")
-}
-cursor = next
-}
-}
-starting, count, err := readAmounts()
-if err != nil {
-t.Fatal(err)
-}
-if count < 16 || starting == 0 {
+	readAmounts := func() (uint64, int, error) {
+		var total uint64
+		count := 0
+		cursor := ""
+		for {
+			rows, next, err := db.LPoDWalletOutputs(action.Beneficiary, cursor, 128)
+			if err != nil {
+				return 0, 0, err
+			}
+			for _, u := range rows {
+				hs, err := crypto.ScanForOutput(keys.View.Private, keys.Spend.Public, u.TxPubKey, u.OneTimePub)
+				if err != nil || hs == nil {
+					return 0, 0, fmt.Errorf("fixture output is not owned")
+				}
+				total += core.DecryptAmount(u.EncAmount, hs)
+				count++
+			}
+			if next == "" {
+				return total, count, nil
+			}
+			if next == cursor {
+				return 0, 0, fmt.Errorf("fixture cursor did not advance")
+			}
+			cursor = next
+		}
+	}
+	starting, count, err := readAmounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count < 16 || starting == 0 {
 		t.Fatal("fixture funding/decoy prerequisites not met")
 	}
 	server := api.NewServer(":0", e.chain, e.pool, e.utxos, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -118,7 +118,7 @@ if count < 16 || starting == 0 {
 	server.SetUTXOReady()
 	var mu sync.Mutex
 	issuedToOwner := func() uint64 {
-total, _, err := readAmounts()
+		total, _, err := readAmounts()
 		if err != nil {
 			t.Error(err)
 			return 0
@@ -128,14 +128,14 @@ total, _, err := readAmounts()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/fixture/mine", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", 405)
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
 		transactions := e.pool.SelectTxs(100)
 		if len(transactions) != 1 {
-			http.Error(w, "expected exactly one genuine mempool transaction", 409)
+			http.Error(w, "expected exactly one genuine mempool transaction", http.StatusConflict)
 			return
 		}
 		beforeFunding := issuedToOwner()
@@ -182,15 +182,15 @@ total, _, err := readAmounts()
 		})
 	})
 	mux.Handle("/", server)
-httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-diagnostic := &nativeChromeResponseDiagnostic{ResponseWriter: w, status: http.StatusOK}
-mux.ServeHTTP(diagnostic, r)
-if diagnostic.status >= http.StatusBadRequest {
-// Log only fixture responses and the path, never credentials, request bodies,
-// seeds or query parameters. Preserve the underlying response unchanged.
-t.Logf("isolated node: %s %s -> %d: %s", r.Method, r.URL.Path, diagnostic.status, diagnostic.failure)
-}
-}))
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		diagnostic := &nativeChromeResponseDiagnostic{ResponseWriter: w, status: http.StatusOK}
+		mux.ServeHTTP(diagnostic, r)
+		if diagnostic.status >= http.StatusBadRequest {
+			// Log only fixture responses and the path, never credentials, request bodies,
+			// seeds or query parameters. Preserve the underlying response unchanged.
+			t.Logf("isolated node: %s %s -> %d: %s", r.Method, r.URL.Path, diagnostic.status, diagnostic.failure)
+		}
+	}))
 	defer httpServer.Close()
 	fixtureDir := t.TempDir()
 	input := filepath.Join(fixtureDir, "private-input.json")
@@ -198,7 +198,7 @@ t.Logf("isolated node: %s %s -> %d: %s", r.Method, r.URL.Path, diagnostic.status
 		"senderPhrase": senderPhrase, "recipientPhrase": recipientPhrase,
 		"sender": string(action.Beneficiary), "recipient": string(crypto.AddressFromKeys(crypto.MainnetByte, recipient.Keys)),
 		"starting": fmt.Sprint(starting), "nodeURL": httpServer.URL, "rpcKey": rpcKey,
-"manyRewards": manyRewards,
+		"manyRewards": manyRewards,
 	})
 	if err := os.WriteFile(input, raw, 0600); err != nil {
 		t.Fatal(err)
@@ -207,7 +207,7 @@ t.Logf("isolated node: %s %s -> %d: %s", r.Method, r.URL.Path, diagnostic.status
 		"src/routes/wallet-native-chrome.integration.test.ts", "--maxWorkers=1")
 	cmd.Dir = "../.."
 	// No workspace credentials may be inherited by the fixture or browser.
-for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "NATIVE_CHROME_ARCHIVE", "NATIVE_CHROME_FROZEN_SIGNER_DIR", "NATIVE_CHROME_EXECUTABLE", "NATIVE_WALLET_SCREENSHOT"} {
+	for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "NATIVE_CHROME_ARCHIVE", "NATIVE_CHROME_FROZEN_SIGNER_DIR", "NATIVE_CHROME_EXECUTABLE", "NATIVE_WALLET_SCREENSHOT"} {
 		if value, ok := os.LookupEnv(name); ok {
 			cmd.Env = append(cmd.Env, name+"="+value)
 		}
@@ -222,23 +222,23 @@ for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LD_LI
 }
 
 type nativeChromeResponseDiagnostic struct {
-http.ResponseWriter
-status int
-failure []byte
+	http.ResponseWriter
+	status  int
+	failure []byte
 }
 
 func (w *nativeChromeResponseDiagnostic) WriteHeader(status int) {
-w.status = status
-w.ResponseWriter.WriteHeader(status)
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *nativeChromeResponseDiagnostic) Write(body []byte) (int, error) {
-if w.status >= http.StatusBadRequest && len(w.failure) < 512 {
-remaining := 512-len(w.failure)
-if len(body) < remaining {
-remaining = len(body)
-}
-w.failure = append(w.failure, body[:remaining]...)
-}
-return w.ResponseWriter.Write(body)
+	if w.status >= http.StatusBadRequest && len(w.failure) < 512 {
+		remaining := 512 - len(w.failure)
+		if len(body) < remaining {
+			remaining = len(body)
+		}
+		w.failure = append(w.failure, body[:remaining]...)
+	}
+	return w.ResponseWriter.Write(body)
 }

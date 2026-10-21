@@ -81,6 +81,9 @@ func walletHistoryOutputEvidence(read *store.WalletReadSnapshot, refs []struct {
 				if txIndex == 0 && block.Header.Height > 0 && tx.IsCoinbase() && !tx.IsStake() {
 					origin = "validator_reward"
 				}
+				if tx.IsLPoDPayout() {
+					origin = "lpod_payout"
+				}
 				if tx.IsSale() {
 					origin = "protocol_sale"
 				}

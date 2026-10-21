@@ -110,7 +110,7 @@ type VoteMsg struct {
 // ─── Framing ──────────────────────────────────────────────────────────────────
 
 // WriteMsg encodes and sends a message over conn.
-// Format: [4-byte big-endian length][msgType byte][JSON body]
+// Format: [4-byte big-endian length][msgType byte][JSON body].
 func WriteMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
 	return writeMsg(conn, msgType, payload)
 }

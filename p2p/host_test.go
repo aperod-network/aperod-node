@@ -167,15 +167,15 @@ func TestHost_SetBanConfig_Validation(t *testing.T) {
 		heightLead uint64
 		wantErr    bool
 	}{
-		{0, time.Hour, 1000, true},                     // threshold below lower bound
-		{1001, time.Hour, 1000, true},                  // threshold above upper bound
-		{10, 30 * time.Second, 1000, true},             // duration below 1m
-		{10, 31 * 24 * time.Hour, 1000, true},          // duration above 30d
-		{10, time.Hour, 0, true},                       // heightLead below lower bound
-		{10, time.Hour, 1_000_001, true},               // heightLead above upper bound
-		{1, time.Minute, 1, false},                     // all lower bounds — valid
-		{10, 24 * time.Hour, 1000, false},              // defaults — valid
-		{1000, 30 * 24 * time.Hour, 1_000_000, false},  // all upper bounds — valid
+		{0, time.Hour, 1000, true},                    // threshold below lower bound
+		{1001, time.Hour, 1000, true},                 // threshold above upper bound
+		{10, 30 * time.Second, 1000, true},            // duration below 1m
+		{10, 31 * 24 * time.Hour, 1000, true},         // duration above 30d
+		{10, time.Hour, 0, true},                      // heightLead below lower bound
+		{10, time.Hour, 1_000_001, true},              // heightLead above upper bound
+		{1, time.Minute, 1, false},                    // all lower bounds — valid
+		{10, 24 * time.Hour, 1000, false},             // defaults — valid
+		{1000, 30 * 24 * time.Hour, 1_000_000, false}, // all upper bounds — valid
 	}
 	for _, tc := range cases {
 		err := h.SetBanConfig(tc.threshold, tc.duration, tc.heightLead)
@@ -717,7 +717,7 @@ func TestHost_Handshake_InboundWithMessages(t *testing.T) {
 // cfg.PeerWhitelist is non-empty, Start() retains the cfg entries rather than
 // silently opening the network.
 //
-// Without this retention behaviour, an admin "clear-all" operation in the
+// Without this retention behavior, an admin "clear-all" operation in the
 // Admin Panel would write an empty sidecar and, on the next restart, the node
 // would accept connections from every IP — even ones that should still be
 // blocked via peer_whitelist in node.yaml.
@@ -1457,7 +1457,7 @@ func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
 //  3. The whitelist is still enforced (not silently reset to open): a second host
 //     whose list contains only a valid CIDR (that excludes 127.0.0.1) plus the
 //     same garbage entry rejects a connection from loopback — proving the CIDR
-//     entry was also kept despite the invalid neighbour.
+//     entry was also kept despite the invalid neighbor.
 func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 	// ── Part 1 & 2: valid IP entry survives the garbage entry ─────────────────
 
@@ -1585,7 +1585,7 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 }
 
 // TestBootnode_SkipsBackoffWindow verifies that after 3 consecutive dial
-// failures back-off blocks a regular peer from being re-dialled while a
+// failures back-off blocks a regular peer from being re-dialed while a
 // configured bootnode is still attempted on the very next call.
 //
 // Scenario:
@@ -1684,7 +1684,7 @@ func TestBootnode_SkipsBackoffWindow(t *testing.T) {
 // TestBootnode_DNSRefresh_RemovesRetiredAddr verifies that when a bootnode's
 // DNS record changes (i.e. the bootnode moves to a new IP), the old address
 // is removed from the privileged set on the next resolution tick so it returns
-// to normal exponential back-off behaviour.
+// to normal exponential back-off behavior.
 //
 // Scenario:
 //  1. Bootnode "bn.example:30303" initially resolves to addrOld.
@@ -2122,7 +2122,7 @@ func TestHost_AddToWhitelist_UnwritableDir_RollsBack(t *testing.T) {
 
 // TestHost_AddToWhitelist_ConcurrentNeverDropsEntry is a concurrent stress test
 // that verifies two goroutines calling AddToWhitelist simultaneously always
-// produce a whitelist containing both entries.  Without wlMutate serialisation
+// produce a whitelist containing both entries.  Without wlMutate serialization
 // both goroutines would snapshot the same (empty) list, append their own entry,
 // and the last writer would silently overwrite the first — a lost-update race.
 func TestHost_AddToWhitelist_ConcurrentNeverDropsEntry(t *testing.T) {
@@ -2175,7 +2175,7 @@ func TestHost_AddToWhitelist_ConcurrentNeverDropsEntry(t *testing.T) {
 // TestHost_RemoveFromWhitelist_ConcurrentNeverDropsOtherRemoval verifies that
 // two goroutines calling RemoveFromWhitelist simultaneously each successfully
 // remove their own entry and neither call silently discards the other removal.
-// Without wlMutate serialisation both goroutines would snapshot the same 2-item
+// Without wlMutate serialization both goroutines would snapshot the same 2-item
 // list, filter out their own entry, and the last writer would restore the entry
 // that the first writer removed — a lost-update race.
 func TestHost_RemoveFromWhitelist_ConcurrentNeverDropsOtherRemoval(t *testing.T) {
@@ -2352,9 +2352,9 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 	}
 	t.Logf("after hiccup: PeerCount=%d", host.PeerCount())
 
-	// ── Phase 3: fire one maintain tick; both bootnodes must be re-dialled ────
+	// ── Phase 3: fire one maintain tick; both bootnodes must be re-dialed ────
 	// Back-off does NOT apply here: a connection that reached the message loop
-	// but then dropped (< stableConnTime) is not penalised with bootnode back-off
+	// but then dropped (< stableConnTime) is not penalized with bootnode back-off
 	// so the relay reconnects immediately on the next tick.
 	p2p.HostTriggerMaintain(host)
 
@@ -2368,15 +2368,15 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 
 	// Each bootnode must have been contacted at least twice (initial + reconnect).
 	if dialCountA.Load() < 2 {
-		t.Errorf("bootnode A (%s) not re-dialled after hiccup: total dials=%d, want ≥2",
+		t.Errorf("bootnode A (%s) not re-dialed after hiccup: total dials=%d, want ≥2",
 			addrA, dialCountA.Load())
 	}
 	if dialCountB.Load() < 2 {
-		t.Errorf("bootnode B (%s) not re-dialled after hiccup: total dials=%d, want ≥2",
+		t.Errorf("bootnode B (%s) not re-dialed after hiccup: total dials=%d, want ≥2",
 			addrBMultiaddr, dialCountB.Load())
 	}
 	if !t.Failed() {
-		t.Logf("✓ both bootnodes re-dialled after hiccup: A=%d B=%d",
+		t.Logf("✓ both bootnodes re-dialed after hiccup: A=%d B=%d",
 			dialCountA.Load(), dialCountB.Load())
 	}
 }
@@ -2384,7 +2384,7 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 // TestHost_DialPeer_BackoffAfterHandshakeDrop verifies that when an outbound
 // TCP connection succeeds but the remote closes the socket before completing
 // the P2P handshake (no Pong), handleConn's back-off defer calls OnDialFail
-// so the address enters a back-off window and cannot be re-dialled immediately.
+// so the address enters a back-off window and cannot be re-dialed immediately.
 // This covers the flapping-peer reconnect-storm case where the peer is
 // reachable at TCP level but never finishes the application handshake.
 func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
@@ -2460,7 +2460,7 @@ func (h *gapSyncHandler) OnBlock(b *core.Block) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// Accept only the strictly next block so the handler mirrors a real node's
-	// sequential AddBlock behaviour.
+	// sequential AddBlock behavior.
 	if b.Header.Height == h.tip+1 {
 		h.chain = append(h.chain, b)
 		h.byHash[b.Hash()] = b
@@ -2876,7 +2876,7 @@ func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// done is closed when this goroutine exits, signalling the write goroutine
+		// done is closed when this goroutine exits, signaling the write goroutine
 		// and the gossip forwarder to stop.  Using a done channel (rather than
 		// closing writeCh) avoids a send-on-closed-channel panic in the forwarder.
 		done := make(chan struct{})
@@ -2888,7 +2888,7 @@ func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
 		}
 		writeCh := make(chan writeReq, 4096)
 
-		// Write goroutine: serialises all writes to conn.
+		// Write goroutine: serializes all writes to conn.
 		go func() {
 			for {
 				select {
@@ -3595,7 +3595,7 @@ func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
 
 	// Phase 2: cross the threshold — send 2 more (total 6 > threshold).
 	// The connection may be evicted mid-loop once the 5th strike lands, so a
-	// write error on the 6th block is acceptable attacker-side behaviour.
+	// write error on the 6th block is acceptable attacker-side behavior.
 	for i := 0; i < 2; i++ {
 		sb := p2p.SerializedBlock{Header: p2p.SerializedHeader{Height: 500_000}}
 		conn.SetWriteDeadline(time.Now().Add(time.Second))
@@ -3983,7 +3983,7 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 
 // TestHost_WhitelistSidecar_UnreadableFailsClosed verifies that Start() returns
 // a non-nil error when the whitelist sidecar file exists but cannot be read
-// (e.g. permission denied).  Without this fail-closed behaviour a refactor that
+// (e.g. permission denied).  Without this fail-closed behavior a refactor that
 // accidentally swallows the I/O error would let the node start in open-network
 // mode — accepting inbound connections from all IPs — after a restart.
 //

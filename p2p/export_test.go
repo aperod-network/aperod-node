@@ -42,7 +42,7 @@ func (h *Host) RecordBadBlockStrike(ip string) int {
 	return strike.count
 }
 
-// HostCanDial reports whether the host's PeerMgr would allow dialling addr
+// HostCanDial reports whether the host's PeerMgr would allow dialing addr
 // right now (not banned and back-off window has elapsed).  Exported for
 // integration tests that need to inspect dial-backoff state without going
 // through the network layer.
@@ -60,7 +60,7 @@ func HostRecordDialFail(h *Host, addr string) {
 // HostSetBootnodeResolved records resolved as the current IP:port addresses
 // for the raw bootnode string raw, then rebuilds bootnodeSet.  An empty or
 // nil resolved slice removes raw's contribution so its addresses return to
-// normal back-off behaviour.  This mirrors what maintainLoop does on a
+// normal back-off behavior.  This mirrors what maintainLoop does on a
 // successful DNS resolution tick — use it in tests instead of calling Start().
 func HostSetBootnodeResolved(h *Host, raw string, resolved []string) {
 	h.mu.Lock()
@@ -140,7 +140,7 @@ func SetListenFunc(h *Host, fn func(network, addr string) (net.Listener, error))
 }
 
 // SetPostConnectHook sets a callback that dialPeer invokes after successfully
-// dialling and registering the connection in pendingConns, but before calling
+// dialing and registering the connection in pendingConns, but before calling
 // go handleConn.  The hook gives a deterministic test window to call BanPeer
 // while the conn is pending: BanPeer will close it via cancelInFlightDials so
 // handleConn never receives a live connection to a banned peer.
@@ -161,7 +161,7 @@ func HostPongGetHeadersTotal(h *Host) int64 {
 
 // SetDialFunc replaces the outbound TCP dial function used by dialPeer.
 // The replacement receives a context that BanPeer may cancel while the dial is
-// in progress; the function must honour context cancellation and return
+// in progress; the function must honor context cancellation and return
 // context.Canceled (or context.DeadlineExceeded) without establishing a
 // connection.  This lets deterministic concurrency tests inject a blocking
 // dial that the test can release or abort on demand.

@@ -238,11 +238,11 @@ func (s *Server) restWalletKeyImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Images     []string `json:"key_images"`
-IncludeHistory bool `json:"include_history,omitempty"`
-		SnapshotID string   `json:"snapshot_id,omitempty"`
-		Address    string   `json:"address,omitempty"`
-		Refs       []struct {
+		Images         []string `json:"key_images"`
+		IncludeHistory bool     `json:"include_history,omitempty"`
+		SnapshotID     string   `json:"snapshot_id,omitempty"`
+		Address        string   `json:"address,omitempty"`
+		Refs           []struct {
 			Hash  string `json:"tx_hash"`
 			Index uint32 `json:"out_idx"`
 		} `json:"refs"`
@@ -252,7 +252,7 @@ IncludeHistory bool `json:"include_history,omitempty"`
 		return
 	}
 	if req.SnapshotID != "" {
-s.restWalletKeyImagesSnapshot(w, req.Images, req.Refs, req.SnapshotID, req.Address, req.IncludeHistory)
+		s.restWalletKeyImagesSnapshot(w, req.Images, req.Refs, req.SnapshotID, req.Address, req.IncludeHistory)
 		return
 	}
 	if s.blockStore == nil {

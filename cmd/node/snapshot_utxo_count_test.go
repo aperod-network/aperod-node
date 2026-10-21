@@ -18,7 +18,7 @@ package main
 //   1. Within-tolerance  — snapshot count matches stored count → accepted.
 //   2. Exceeds tolerance — snapshot count diverges beyond 1%   → rejected, warning logged.
 //   3. No metadata key   — DB has no entry for this hash        → check skipped, snapshot accepted.
-//   4. Historical vs active separation — total stored UTXOs >> active count is not penalised.
+//   4. Historical vs active separation — total stored UTXOs >> active count is not penalized.
 //   5. Store/Load round-trip with hash key — unit test for the DB helpers.
 
 import (
@@ -231,7 +231,7 @@ func TestUTXOCountCheck_NoMetadata(t *testing.T) {
 // (spent/staked outputs are never deleted from the historical store).
 // The divergence check must compare against the hash-keyed active_utxo_count
 // metadata — not the raw u/ record count — so a node with many historical
-// spends is never incorrectly penalised.
+// spends is never incorrectly penalized.
 func TestUTXOCountCheck_HistoricalRecordsIgnored(t *testing.T) {
 	dir := t.TempDir()
 	db, blocks := buildChainInStore(t, dir, 4)

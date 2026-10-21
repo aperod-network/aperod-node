@@ -21,22 +21,24 @@ const GenesisLiquidityAmount uint64 = 300_000_000 * 100_000_000
 // the Development Fund reserve is unissued and excludes Guardian, validator,
 // user balances and every other allocation. Historical proof remains false.
 type GenesisVestingFunding struct {
-	Version uint32 `json:"version"`
-	Genesis crypto.Hash32 `json:"genesis"`
-	Snapshot crypto.Hash32 `json:"nominal_snapshot"`
-	Height uint64 `json:"activation_height"`
-	Recipient crypto.Address `json:"recipient"`
-	Reserve uint64 `json:"exclusive_unissued_development_napro,string"`
-	OtherAllocations uint64 `json:"other_genesis_allocations_napro,string"`
-	Trust string `json:"trust_assumption"`
-	LiquidityRecipient crypto.Address `json:"liquidity_recipient,omitempty"`
-	LiquidityAmount uint64 `json:"liquidity_napro,string,omitempty"`
-	LiquidityTrust string `json:"liquidity_trust_assumption,omitempty"`
-	Attestations []LPoDAttestation `json:"attestations"`
+	Version            uint32            `json:"version"`
+	Genesis            crypto.Hash32     `json:"genesis"`
+	Snapshot           crypto.Hash32     `json:"nominal_snapshot"`
+	Height             uint64            `json:"activation_height"`
+	Recipient          crypto.Address    `json:"recipient"`
+	Reserve            uint64            `json:"exclusive_unissued_development_napro,string"`
+	OtherAllocations   uint64            `json:"other_genesis_allocations_napro,string"`
+	Trust              string            `json:"trust_assumption"`
+	LiquidityRecipient crypto.Address    `json:"liquidity_recipient,omitempty"`
+	LiquidityAmount    uint64            `json:"liquidity_napro,string,omitempty"`
+	LiquidityTrust     string            `json:"liquidity_trust_assumption,omitempty"`
+	Attestations       []LPoDAttestation `json:"attestations"`
 }
 
 func (f *GenesisVestingFunding) Message() crypto.Hash32 {
-	if f == nil { return crypto.Hash32{} }
+	if f == nil {
+		return crypto.Hash32{}
+	}
 	c := *f
 	c.Attestations = nil
 	raw, _ := json.Marshal(c)
@@ -83,14 +85,20 @@ func (f *GenesisVestingFunding) validate(a *LPoDAllocation, height uint64) error
 }
 
 func (f *GenesisVestingFunding) verifyQuorum(a *LPoDAllocation, height uint64, stake map[string]LPoDValidatorStake) error {
-	if err := f.validate(a, height); err != nil { return err }
+	if err := f.validate(a, height); err != nil {
+		return err
+	}
 	total, signed := new(big.Int), new(big.Int)
 	for _, s := range stake {
-		if s.Active { total.Add(total, new(big.Int).SetUint64(s.Amount)) }
+		if s.Active {
+			total.Add(total, new(big.Int).SetUint64(s.Amount))
+		}
 	}
 	for _, attestation := range f.Attestations {
 		s, ok := stake[attestation.Validator.Hex()]
-		if !ok || !s.Active || s.Amount == 0 { return fmt.Errorf("genesis vesting: funding signer is not an active validator") }
+		if !ok || !s.Active || s.Amount == 0 {
+			return fmt.Errorf("genesis vesting: funding signer is not an active validator")
+		}
 		signed.Add(signed, new(big.Int).SetUint64(s.Amount))
 	}
 	if total.Sign() == 0 || new(big.Int).Mul(signed, big.NewInt(3)).Cmp(new(big.Int).Mul(total, big.NewInt(2))) <= 0 {
@@ -101,11 +109,19 @@ func (f *GenesisVestingFunding) verifyQuorum(a *LPoDAllocation, height uint64, s
 
 func LoadGenesisVestingFunding(path string, height uint64) (*GenesisVestingFunding, error) {
 	raw, err := os.ReadFile(path)
-	if err != nil { return nil, err }
-	if len(raw) > 256*1024 { return nil, fmt.Errorf("genesis vesting: funding witness too large") }
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 256*1024 {
+		return nil, fmt.Errorf("genesis vesting: funding witness too large")
+	}
 	var f GenesisVestingFunding
-	if err := json.Unmarshal(raw, &f); err != nil { return nil, err }
-	if f.Height != height || height == 0 { return nil, fmt.Errorf("genesis vesting: funding height mismatch") }
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, err
+	}
+	if f.Height != height || height == 0 {
+		return nil, fmt.Errorf("genesis vesting: funding height mismatch")
+	}
 	return &f, nil
 }
 
@@ -113,7 +129,9 @@ func LoadGenesisVestingFunding(path string, height uint64) (*GenesisVestingFundi
 // starting consensus; do not silently run until the first production failure.
 func (d *DB) CheckGenesisVestingConfig(height uint64, proof *GenesisVestingFunding) error {
 	c, err := d.LoadLPoDCheckpoint()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	if c != nil && c.GenesisVesting != nil {
 		if height != c.GenesisVesting.FundingHeight || proof == nil ||
 			proof.Message() != c.GenesisVesting.FundingProof.Message() {
@@ -122,21 +140,37 @@ func (d *DB) CheckGenesisVestingConfig(height uint64, proof *GenesisVestingFundi
 		return proof.validate(c.Allocation, height)
 	}
 	if height == 0 {
-		if proof != nil { return fmt.Errorf("genesis vesting: funding file without activation") }
+		if proof != nil {
+			return fmt.Errorf("genesis vesting: funding file without activation")
+		}
 		return nil
 	}
-saleState, err := d.LoadSaleState()
-if err != nil { return err }
-if saleState != nil {
-return fmt.Errorf("genesis vesting: active sales require a versioned shared reserve transition")
-}
+	saleState, err := d.LoadSaleState()
+	if err != nil {
+		return err
+	}
+	if saleState != nil {
+		return fmt.Errorf("genesis vesting: active sales require a versioned shared reserve transition")
+	}
 	_, tipHeight, err := d.GetTip()
-	if err != nil { return err }
-	if tipHeight >= height { return fmt.Errorf("genesis vesting: activation already missed") }
-	if c == nil { return fmt.Errorf("genesis vesting: canonical v3 funding prerequisite missing") }
-	if err := proof.validate(c.Allocation, height); err != nil { return err }
+	if err != nil {
+		return err
+	}
+	if tipHeight >= height {
+		return fmt.Errorf("genesis vesting: activation already missed")
+	}
+	if c == nil {
+		return fmt.Errorf("genesis vesting: canonical v3 funding prerequisite missing")
+	}
+	if err := proof.validate(c.Allocation, height); err != nil {
+		return err
+	}
 	bound, err := nominalNonCirculatingBound(c.Allocation)
-	if err != nil { return err }
-	if bound < GenesisVestingReserve { return fmt.Errorf("genesis vesting: original nominal cap exhausted") }
+	if err != nil {
+		return err
+	}
+	if bound < GenesisVestingReserve {
+		return fmt.Errorf("genesis vesting: original nominal cap exhausted")
+	}
 	return nil
 }

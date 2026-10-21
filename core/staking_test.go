@@ -247,7 +247,7 @@ func TestReplayBlockStakeTxs_RestartSafety(t *testing.T) {
 	// Idempotency: a second replay of the same block must not fail or double-count.
 	if replayErr2 := reg2.ReplayBlockStakeTxs([]core.Transaction{stakeTx}, 1); replayErr2 != nil {
 		// Second replay may fail because applyDeposit would see the validator already exists
-		// with the same stake amount — that's expected behaviour (top-up path).
+		// with the same stake amount — that's expected behavior (top-up path).
 		t.Logf("second replay returned error (expected): %v", replayErr2)
 	}
 	// Regardless, burn UTXO must still be in staked set.
@@ -333,8 +333,8 @@ func TestRestartSafety_UTXORebuildAndStakeReplay(t *testing.T) {
 	reg1 := core.NewValidatorRegistry()
 	reg1.SetUTXOSet(utxos1)
 
-	utxos1.ApplyBlock(genesisBlock) // unrelated UTXO added
-	utxos1.ApplyBlock(mintBlock)    // burn UTXO added to active set
+	utxos1.ApplyBlock(genesisBlock)            // unrelated UTXO added
+	utxos1.ApplyBlock(mintBlock)               // burn UTXO added to active set
 	reg1.ApplyBlockStakeTxs(stakeBlock.Txs, 2) // moves burn UTXO to staked set
 
 	// Sanity check first run.

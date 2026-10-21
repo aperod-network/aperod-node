@@ -32,7 +32,7 @@ const (
 
 type lpodDailyPosition struct {
 	ID                  string `json:"id"`
-Beneficiary         string `json:"beneficiary"`
+	Beneficiary         string `json:"beneficiary"`
 	EffectiveVault      string `json:"effective_vault"`
 	EffectiveVaultAfter string `json:"effective_vault_after"`
 	Accrued             string `json:"accrued_napro"`
@@ -49,8 +49,8 @@ type lpodDailyVault struct {
 }
 
 type lpodDailyPositionSum struct {
-id, beneficiary, vault, vaultAfter string
-	accrued, paid, principal uint64
+	id, beneficiary, vault, vaultAfter string
+	accrued, paid, principal           uint64
 }
 type lpodDailyVaultSum struct {
 	id                                  string
@@ -60,26 +60,28 @@ type lpodDailyVaultSum struct {
 // The caller has already reconciled this row with the signed deposit opening
 // and both historical checkpoints. Closure must not erase its beneficiary.
 func accumulateDailyPosition(positions map[string]*lpodDailyPositionSum, p store.LPoDAuditPosition) error {
-if p.ID == "" || p.Beneficiary == "" {
-return fmt.Errorf("position beneficiary unavailable")
-}
-prior := positions[p.ID]
-a := lpodDailyPositionSum{id: p.ID, beneficiary: p.Beneficiary, vault: p.EffectiveVault}
-if prior != nil { a = *prior }
-if a.beneficiary != p.Beneficiary {
-return fmt.Errorf("position beneficiary changed")
-}
-a.vaultAfter = p.EffectiveVaultAfter
-if !sumDaily(&a.accrued, p.Accrued) || !sumDaily(&a.paid, p.Paid) || !sumDaily(&a.principal, p.PrincipalReturned) {
-return fmt.Errorf("position aggregate overflow")
-}
-positions[p.ID] = &a
-return nil
+	if p.ID == "" || p.Beneficiary == "" {
+		return fmt.Errorf("position beneficiary unavailable")
+	}
+	prior := positions[p.ID]
+	a := lpodDailyPositionSum{id: p.ID, beneficiary: p.Beneficiary, vault: p.EffectiveVault}
+	if prior != nil {
+		a = *prior
+	}
+	if a.beneficiary != p.Beneficiary {
+		return fmt.Errorf("position beneficiary changed")
+	}
+	a.vaultAfter = p.EffectiveVaultAfter
+	if !sumDaily(&a.accrued, p.Accrued) || !sumDaily(&a.paid, p.Paid) || !sumDaily(&a.principal, p.PrincipalReturned) {
+		return fmt.Errorf("position aggregate overflow")
+	}
+	positions[p.ID] = &a
+	return nil
 }
 
 func dailyPositionOutput(p *lpodDailyPositionSum) lpodDailyPosition {
-return lpodDailyPosition{ID: p.id, Beneficiary: p.beneficiary, EffectiveVault: p.vault, EffectiveVaultAfter: p.vaultAfter,
-Accrued: strconv.FormatUint(p.accrued, 10), Paid: strconv.FormatUint(p.paid, 10), PrincipalReturned: strconv.FormatUint(p.principal, 10)}
+	return lpodDailyPosition{ID: p.id, Beneficiary: p.beneficiary, EffectiveVault: p.vault, EffectiveVaultAfter: p.vaultAfter,
+		Accrued: strconv.FormatUint(p.accrued, 10), Paid: strconv.FormatUint(p.paid, 10), PrincipalReturned: strconv.FormatUint(p.principal, 10)}
 }
 
 func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +128,7 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	fail := func(reason string) {
-out["status"] = "incomplete"
+		out["status"] = "incomplete"
 		out["reason"] = reason
 		writeJSON(w, http.StatusOK, out)
 	}
@@ -148,16 +150,16 @@ out["status"] = "incomplete"
 		fail("durable finality certificate unavailable")
 		return
 	}
-progress, background := r.Context().Value(dailyProgressKey{}).(*dailyProgress)
-if background && progress.Certificate != nil {
-if !s.dailyBindingValid(progress) {
-fail("saved canonical certificate or finality binding invalid")
-return
-}
-// Continue through today's latest verified certificate. On restart the
-// oracle need not retain the old certificate; the resumed signed ancestry
-// must connect the saved predecessor all the way to the current oracle.
-}
+	progress, background := r.Context().Value(dailyProgressKey{}).(*dailyProgress)
+	if background && progress.Certificate != nil {
+		if !s.dailyBindingValid(progress) {
+			fail("saved canonical certificate or finality binding invalid")
+			return
+		}
+		// Continue through today's latest verified certificate. On restart the
+		// oracle need not retain the old certificate; the resumed signed ancestry
+		// must connect the saved predecessor all the way to the current oracle.
+	}
 	if s.lpodFinalized == nil || !s.lpodFinalized(cert.Height, cert.BlockHash) {
 		fail("finality certificate is not verified by the configured oracle")
 		return
@@ -180,9 +182,12 @@ return
 		fail("LPoD audit coverage marker missing")
 		return
 	}
-markerBytes, markerErr := json.Marshal(marker)
-if markerErr != nil { fail("coverage marker cannot be encoded"); return }
-markerDigest := crypto.HashBytes(markerBytes)
+	markerBytes, markerErr := json.Marshal(marker)
+	if markerErr != nil {
+		fail("coverage marker cannot be encoded")
+		return
+	}
+	markerDigest := crypto.HashBytes(markerBytes)
 
 	readBlock := func(height uint64) (*core.Block, crypto.Hash32, error) {
 		if err := ctx.Err(); err != nil {
@@ -196,13 +201,15 @@ markerDigest := crypto.HashBytes(markerBytes)
 		if readErr != nil || len(raw) == 0 {
 			return nil, crypto.Hash32{}, fmt.Errorf("full block body unavailable at height %d", height)
 		}
-if len(raw) > dailyJobMaxBytes { return nil, crypto.Hash32{}, fmt.Errorf("block exceeds daily verifier byte bound") }
+		if len(raw) > dailyJobMaxBytes {
+			return nil, crypto.Hash32{}, fmt.Errorf("block exceeds daily verifier byte bound")
+		}
 		var block core.Block
 		if readErr = json.Unmarshal(raw, &block); readErr != nil {
 			return nil, crypto.Hash32{}, fmt.Errorf("invalid block body at height %d", height)
 		}
 		if block.Header.Height != height || block.Hash() != hash || block.Header.MerkleRoot != core.MerkleRoot(block.Txs) ||
-!s.verifyAuditHeader(&block.Header) {
+			!s.verifyAuditHeader(&block.Header) {
 			return nil, crypto.Hash32{}, fmt.Errorf("canonical block identity or Merkle proof invalid at height %d", height)
 		}
 		return &block, hash, nil
@@ -216,11 +223,13 @@ if len(raw) > dailyJobMaxBytes { return nil, crypto.Hash32{}, fmt.Errorf("block 
 		if err != nil || len(raw) == 0 {
 			return 0, fmt.Errorf("canonical block unavailable at timestamp probe height %d", height)
 		}
-if len(raw) > dailyJobMaxBytes { return 0, fmt.Errorf("timestamp probe exceeds daily verifier byte bound") }
+		if len(raw) > dailyJobMaxBytes {
+			return 0, fmt.Errorf("timestamp probe exceeds daily verifier byte bound")
+		}
 		var block core.Block
 		if err := json.Unmarshal(raw, &block); err == nil &&
 			block.Header.Height == height && block.Hash() == hash &&
-block.Header.MerkleRoot == core.MerkleRoot(block.Txs) && s.verifyAuditHeader(&block.Header) {
+			block.Header.MerkleRoot == core.MerkleRoot(block.Txs) && s.verifyAuditHeader(&block.Header) {
 			return block.Header.Timestamp, nil
 		}
 		// Pruned StoredBlock metadata is unsigned and is only a binary-search
@@ -379,10 +388,10 @@ block.Header.MerkleRoot == core.MerkleRoot(block.Txs) && s.verifyAuditHeader(&bl
 	witnessHash := witnessBlock.Hash()
 	witnessTimestamp := witnessBlock.Header.Timestamp
 	anchorTimestamp := anchorBlock.Header.Timestamp
-batchBinding := &dailyProgress{
-Certificate: cert, Anchor: anchorHash, Witness: witnessHash,
-AnchorHeight: anchorHeight, WitnessHeight: witnessHeight, Marker: markerDigest, Prune: pruneCursorRaw,
-}
+	batchBinding := &dailyProgress{
+		Certificate: cert, Anchor: anchorHash, Witness: witnessHash,
+		AnchorHeight: anchorHeight, WitnessHeight: witnessHeight, Marker: markerDigest, Prune: pruneCursorRaw,
+	}
 	out["opening_anchor"] = map[string]interface{}{
 		"height": anchorHeight, "hash": fmt.Sprintf("%x", anchorHash[:]),
 		"header_timestamp": anchorTimestamp, "timestamp": time.Unix(0, anchorTimestamp).Format(time.RFC3339Nano),
@@ -427,7 +436,7 @@ AnchorHeight: anchorHeight, WitnessHeight: witnessHeight, Marker: markerDigest, 
 	checkpointCache := make(map[crypto.Hash32]*store.LPoDCheckpoint, 2)
 	vaults := make(map[string]*lpodDailyVaultSum)
 	positions := make(map[string]*lpodDailyPositionSum)
-rewards := newDailyRewardProgress()
+	rewards := newDailyRewardProgress()
 	var burnBase, burnIntentional, burnAVM, burnTotal uint64
 	var included uint64
 	var lastAuditDigest crypto.Hash32
@@ -435,61 +444,69 @@ rewards := newDailyRewardProgress()
 	firstIncluded, lastIncluded := uint64(0), uint64(0)
 	var firstTimestamp, lastTimestamp int64
 	var expectedNextRegistry *core.RegistrySnapshot
-nextHeight := anchorHeight
-if background && progress.Next != 0 {
-if progress.Anchor != anchorHash || progress.Witness != witnessHash || progress.Marker != markerDigest ||
-!bytes.Equal(progress.Prune, pruneCursorRaw) || progress.Next <= anchorHeight || cert.Height == ^uint64(0) || progress.Next > cert.Height+1 {
-fail("saved boundary or prune binding changed")
-return
-}
-previousHash, found, err := s.blockStore.GetCanonicalHash(progress.Next-1)
-if err != nil || !found || previousHash != progress.Previous {
-fail("saved progress predecessor is no longer canonical")
-return
-}
-nextHeight, prevHash, priorTS = progress.Next, progress.Previous, progress.PriorTS
-rewards = progress.Rewards.clone() // Old authenticated progress cannot invent new report evidence.
-previousBlock, _, err = readBlock(nextHeight-1)
-if err != nil { fail("saved predecessor body unavailable"); return }
-for id, v := range progress.Vaults {
-vaults[id] = &lpodDailyVaultSum{id: id, accrued: v[0], leader: v[1], guardian: v[2], unfunded: v[3]}
-}
-for id, p := range progress.Positions {
-positions[id] = &lpodDailyPositionSum{id: id, beneficiary: p.Beneficiary, vault: p.Vault, vaultAfter: p.After, accrued: p.Accrued, paid: p.Paid, principal: p.Principal}
-}
-burnBase, burnIntentional, burnAVM, burnTotal = progress.Burns[0], progress.Burns[1], progress.Burns[2], progress.Burns[3]
-included, firstIncluded, lastIncluded = progress.Included, progress.First, progress.Last
-firstTimestamp, lastTimestamp = progress.FirstTS, progress.LastTS
-lastAuditDigest, haveLastAuditDigest, expectedNextRegistry = progress.Digest, progress.HaveDigest, progress.Registry
-}
-checkpointProgress := func(next uint64) {
-progress.Certificate, progress.Anchor, progress.Witness = cert, anchorHash, witnessHash
-progress.AnchorHeight, progress.WitnessHeight, progress.Marker = anchorHeight, witnessHeight, markerDigest
-progress.Prune = append([]byte(nil), pruneCursorRaw...)
-progress.Next, progress.Previous, progress.PriorTS = next, prevHash, priorTS
-progress.Rewards = rewards.clone()
-progress.Vaults = make(map[string][4]uint64, len(vaults))
-for id, v := range vaults { progress.Vaults[id] = [4]uint64{v.accrued, v.leader, v.guardian, v.unfunded} }
-progress.Positions = make(map[string]dailyPositionProgress, len(positions))
-for id, p := range positions { progress.Positions[id] = dailyPositionProgress{Vault: p.vault, After: p.vaultAfter, Beneficiary: p.beneficiary, Accrued: p.accrued, Paid: p.paid, Principal: p.principal} }
-progress.Burns = [4]uint64{burnBase, burnIntentional, burnAVM, burnTotal}
-progress.Included, progress.First, progress.Last = included, firstIncluded, lastIncluded
-progress.FirstTS, progress.LastTS = firstTimestamp, lastTimestamp
-progress.Digest, progress.HaveDigest, progress.Registry = lastAuditDigest, haveLastAuditDigest, expectedNextRegistry
-}
-batchStarted := time.Now()
-for h := nextHeight; h <= cert.Height; h++ {
-// Cooperative budget at verified block boundaries. A single block is not
-// preemptible; the outer deadline cancels between verifier operations.
-if background && h > nextHeight && (h-nextHeight >= dailyBatchBlocks || time.Since(batchStarted) >= dailyBatchTime) {
-if !s.dailyBindingValid(batchBinding) {
-fail("canonical certificate or finality changed during batch"); return
-}
-checkpointProgress(h)
-out["coverage"] = map[string]interface{}{"blocks": included, "vaults": len(vaults), "positions": len(positions)}
-fail("bounded background verification in progress")
-return
-}
+	nextHeight := anchorHeight
+	if background && progress.Next != 0 {
+		if progress.Anchor != anchorHash || progress.Witness != witnessHash || progress.Marker != markerDigest ||
+			!bytes.Equal(progress.Prune, pruneCursorRaw) || progress.Next <= anchorHeight || cert.Height == ^uint64(0) || progress.Next > cert.Height+1 {
+			fail("saved boundary or prune binding changed")
+			return
+		}
+		previousHash, found, err := s.blockStore.GetCanonicalHash(progress.Next - 1)
+		if err != nil || !found || previousHash != progress.Previous {
+			fail("saved progress predecessor is no longer canonical")
+			return
+		}
+		nextHeight, prevHash, priorTS = progress.Next, progress.Previous, progress.PriorTS
+		rewards = progress.Rewards.clone() // Old authenticated progress cannot invent new report evidence.
+		previousBlock, _, err = readBlock(nextHeight - 1)
+		if err != nil {
+			fail("saved predecessor body unavailable")
+			return
+		}
+		for id, v := range progress.Vaults {
+			vaults[id] = &lpodDailyVaultSum{id: id, accrued: v[0], leader: v[1], guardian: v[2], unfunded: v[3]}
+		}
+		for id, p := range progress.Positions {
+			positions[id] = &lpodDailyPositionSum{id: id, beneficiary: p.Beneficiary, vault: p.Vault, vaultAfter: p.After, accrued: p.Accrued, paid: p.Paid, principal: p.Principal}
+		}
+		burnBase, burnIntentional, burnAVM, burnTotal = progress.Burns[0], progress.Burns[1], progress.Burns[2], progress.Burns[3]
+		included, firstIncluded, lastIncluded = progress.Included, progress.First, progress.Last
+		firstTimestamp, lastTimestamp = progress.FirstTS, progress.LastTS
+		lastAuditDigest, haveLastAuditDigest, expectedNextRegistry = progress.Digest, progress.HaveDigest, progress.Registry
+	}
+	checkpointProgress := func(next uint64) {
+		progress.Certificate, progress.Anchor, progress.Witness = cert, anchorHash, witnessHash
+		progress.AnchorHeight, progress.WitnessHeight, progress.Marker = anchorHeight, witnessHeight, markerDigest
+		progress.Prune = append([]byte(nil), pruneCursorRaw...)
+		progress.Next, progress.Previous, progress.PriorTS = next, prevHash, priorTS
+		progress.Rewards = rewards.clone()
+		progress.Vaults = make(map[string][4]uint64, len(vaults))
+		for id, v := range vaults {
+			progress.Vaults[id] = [4]uint64{v.accrued, v.leader, v.guardian, v.unfunded}
+		}
+		progress.Positions = make(map[string]dailyPositionProgress, len(positions))
+		for id, p := range positions {
+			progress.Positions[id] = dailyPositionProgress{Vault: p.vault, After: p.vaultAfter, Beneficiary: p.beneficiary, Accrued: p.accrued, Paid: p.paid, Principal: p.principal}
+		}
+		progress.Burns = [4]uint64{burnBase, burnIntentional, burnAVM, burnTotal}
+		progress.Included, progress.First, progress.Last = included, firstIncluded, lastIncluded
+		progress.FirstTS, progress.LastTS = firstTimestamp, lastTimestamp
+		progress.Digest, progress.HaveDigest, progress.Registry = lastAuditDigest, haveLastAuditDigest, expectedNextRegistry
+	}
+	batchStarted := time.Now()
+	for h := nextHeight; h <= cert.Height; h++ {
+		// Cooperative budget at verified block boundaries. A single block is not
+		// preemptible; the outer deadline cancels between verifier operations.
+		if background && h > nextHeight && (h-nextHeight >= dailyBatchBlocks || time.Since(batchStarted) >= dailyBatchTime) {
+			if !s.dailyBindingValid(batchBinding) {
+				fail("canonical certificate or finality changed during batch")
+				return
+			}
+			checkpointProgress(h)
+			out["coverage"] = map[string]interface{}{"blocks": included, "vaults": len(vaults), "positions": len(positions)}
+			fail("bounded background verification in progress")
+			return
+		}
 		if err := ctx.Err(); err != nil {
 			fail(dailyAuditContextReason(err))
 			return
@@ -527,14 +544,15 @@ return
 				fail("interval exceeds 40000-block bound")
 				return
 			}
-record, auditErr := s.blockStore.LoadLPoDAuditAtBounded(hash, dailyJobMaxBytes)
+			record, auditErr := s.blockStore.LoadLPoDAuditAtBounded(hash, dailyJobMaxBytes)
 			if auditErr != nil || record == nil {
 				fail(fmt.Sprintf("exact block audit record missing at height %d", h))
 				return
 			}
-if len(record.Vaults)+len(record.Positions) > lpodDailyMaxEntries {
-fail("block audit entry count exceeds bound"); return
-}
+			if len(record.Vaults)+len(record.Positions) > lpodDailyMaxEntries {
+				fail("block audit entry count exceeds bound")
+				return
+			}
 			if h == firstIncluded && marker.FundingHeight != 0 &&
 				(record.FundingHeight != marker.FundingHeight ||
 					record.FundingGenesis != marker.Genesis || record.FundingRoot != marker.Root) {
@@ -572,9 +590,12 @@ fail("block audit entry count exceeds bound"); return
 				return
 			}
 			lastAuditDigest, haveLastAuditDigest = record.AfterCheckpointDigest, true
-if rewards != nil {
-if err := rewards.accumulate(block, record); err != nil { fail(err.Error()); return }
-}
+			if rewards != nil {
+				if err := rewards.accumulate(block, record); err != nil {
+					fail(err.Error())
+					return
+				}
+			}
 			if len(vaults)+len(positions)+len(record.Vaults)+len(record.Positions) > lpodDailyMaxEntries {
 				fail("response entry count exceeds bound")
 				return
@@ -600,8 +621,8 @@ if err := rewards.accumulate(block, record); err != nil { fail(err.Error()); ret
 					fail(dailyAuditContextReason(err))
 					return
 				}
-if err := accumulateDailyPosition(positions, p); err != nil {
-fail(err.Error())
+				if err := accumulateDailyPosition(positions, p); err != nil {
+					fail(err.Error())
 					return
 				}
 			}
@@ -644,7 +665,7 @@ fail(err.Error())
 	afterTip, afterTipHeight, tipErr := s.blockStore.GetTip()
 	afterCert, certFound, certErr := s.blockStore.GetCanonicalHash(cert.Height)
 	afterPruneCursor, pruneCursorErr := s.blockStore.GetMeta("prune_cursor")
-if tipErr != nil || (!background && (afterTip != tipHash || afterTipHeight != tipHeight)) ||
+	if tipErr != nil || (!background && (afterTip != tipHash || afterTipHeight != tipHeight)) ||
 		certErr != nil || !certFound || afterCert != cert.BlockHash ||
 		pruneCursorErr != nil || !bytes.Equal(afterPruneCursor, pruneCursorRaw) {
 		fail("canonical tip, certificate, or prune cursor changed during audit")
@@ -659,13 +680,13 @@ if tipErr != nil || (!background && (afterTip != tipHash || afterTipHeight != ti
 		return
 	}
 	latestCert, latestCertErr := s.blockStore.LoadFinalityCertificate()
-if latestCertErr != nil || latestCert == nil ||
-(!background && (latestCert.Height != cert.Height || latestCert.BlockHash != cert.BlockHash)) ||
-(background && !s.dailyBindingValid(batchBinding)) {
+	if latestCertErr != nil || latestCert == nil ||
+		(!background && (latestCert.Height != cert.Height || latestCert.BlockHash != cert.BlockHash)) ||
+		(background && !s.dailyBindingValid(batchBinding)) {
 		fail("durable certificate changed during audit")
 		return
 	}
-finalCheckpoint, checkpointErr := s.blockStore.LoadLPoDCheckpointAtBounded(cert.BlockHash, dailyJobMaxBytes)
+	finalCheckpoint, checkpointErr := s.blockStore.LoadLPoDCheckpointAtBounded(cert.BlockHash, dailyJobMaxBytes)
 	if checkpointErr != nil || finalCheckpoint == nil || finalCheckpoint.Allocation == nil {
 		fail("certified LPoD funding identity unavailable")
 		return
@@ -675,7 +696,7 @@ finalCheckpoint, checkpointErr := s.blockStore.LoadLPoDCheckpointAtBounded(cert.
 		return
 	}
 	lastAuditHash, lastAuditFound, lastAuditErr := s.blockStore.GetCanonicalHash(lastIncluded)
-lastAuditCheckpoint, lastAuditCPError := s.blockStore.LoadLPoDCheckpointAtBounded(lastAuditHash, dailyJobMaxBytes)
+	lastAuditCheckpoint, lastAuditCPError := s.blockStore.LoadLPoDCheckpointAtBounded(lastAuditHash, dailyJobMaxBytes)
 	if lastAuditErr != nil || !lastAuditFound || lastAuditCPError != nil ||
 		lastAuditCheckpoint == nil || verifyDailyFundingIdentity(lastAuditCheckpoint, finalCheckpoint) != nil {
 		fail("funding identity does not continue from interval through certificate")
@@ -696,18 +717,24 @@ lastAuditCheckpoint, lastAuditCPError := s.blockStore.LoadLPoDCheckpointAtBounde
 	sort.Slice(vaultList, func(i, j int) bool { return vaultList[i].ID < vaultList[j].ID })
 	positionList := make([]lpodDailyPosition, 0, len(positions))
 	for _, p := range positions {
-positionList = append(positionList, dailyPositionOutput(p))
+		positionList = append(positionList, dailyPositionOutput(p))
 	}
 	sort.Slice(positionList, func(i, j int) bool { return positionList[i].ID < positionList[j].ID })
 	out["vaults"], out["positions"] = vaultList, positionList
-out["beneficiary_version"] = 1
-if rewards != nil {
-openingCheckpoint, openingErr := s.blockStore.LoadLPoDCheckpointAtBounded(anchorHash, dailyJobMaxBytes)
-if openingErr == nil {
-summary, summaryErr := rewards.result(openingCheckpoint, lastAuditCheckpoint)
-if summaryErr == nil { out["daily_rewards"] = summary } else { out["daily_rewards_unavailable"] = summaryErr.Error() }
-} else { out["daily_rewards_unavailable"] = "opening reward funds unavailable" }
-}
+	out["beneficiary_version"] = 1
+	if rewards != nil {
+		openingCheckpoint, openingErr := s.blockStore.LoadLPoDCheckpointAtBounded(anchorHash, dailyJobMaxBytes)
+		if openingErr == nil {
+			summary, summaryErr := rewards.result(openingCheckpoint, lastAuditCheckpoint)
+			if summaryErr == nil {
+				out["daily_rewards"] = summary
+			} else {
+				out["daily_rewards_unavailable"] = summaryErr.Error()
+			}
+		} else {
+			out["daily_rewards_unavailable"] = "opening reward funds unavailable"
+		}
+	}
 	out["burns_napro"] = map[string]string{
 		"protocol_base_fee": strconv.FormatUint(burnBase, 10), "signed_intentional": strconv.FormatUint(burnIntentional, 10),
 		"avm_gas": strconv.FormatUint(burnAVM, 10), "total": strconv.FormatUint(burnTotal, 10),
@@ -724,10 +751,13 @@ if summaryErr == nil { out["daily_rewards"] = summary } else { out["daily_reward
 		return
 	}
 	out["status"], out["reason"] = "complete", ""
-if background {
-if cert.Height == ^uint64(0) { fail("certificate height overflows progress"); return }
-checkpointProgress(cert.Height+1)
-}
+	if background {
+		if cert.Height == ^uint64(0) {
+			fail("certificate height overflows progress")
+			return
+		}
+		checkpointProgress(cert.Height + 1)
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -735,7 +765,7 @@ func dailyAuditContextReason(err error) string {
 	if err == context.DeadlineExceeded {
 		return "daily audit exceeded its 20-second work budget"
 	}
-	return "daily audit request was cancelled"
+	return "daily audit request was canceled"
 }
 
 func sumDaily(dst *uint64, value uint64) bool {
@@ -886,9 +916,9 @@ func (s *Server) verifyDailyRegistryEvidence(
 	}
 	replay := core.NewValidatorRegistry()
 	replay.RestoreFromSnapshot(replayStart)
-if err := replay.ConfigureSignatureAuthority(s.validatorAuthorityFork, block.Header.Height); err != nil {
-return fail(fmt.Errorf("configure pinned signature authority replay: %w", err))
-}
+	if err := replay.ConfigureSignatureAuthority(s.validatorAuthorityFork, block.Header.Height); err != nil {
+		return fail(fmt.Errorf("configure pinned signature authority replay: %w", err))
+	}
 	if withdrawalV2 {
 		if err := replay.ConfigureStakeWithdrawalV2(withdrawalGenesis, withdrawalActivation); err != nil {
 			return fail(fmt.Errorf("configure v2 withdrawal replay: %w", err))
@@ -979,7 +1009,7 @@ func (s *Server) verifyDailyLPoDAuditWithCache(
 				return checkpoint, nil
 			}
 		}
-checkpoint, err := s.blockStore.LoadLPoDCheckpointAtBounded(hash, dailyJobMaxBytes)
+		checkpoint, err := s.blockStore.LoadLPoDCheckpointAtBounded(hash, dailyJobMaxBytes)
 		if err != nil || checkpoint == nil || checkpoints == nil {
 			return checkpoint, err
 		}
@@ -1188,7 +1218,7 @@ func (s *Server) verifyDailyPositionRowsWithParent(
 		parentRaw, readErr := s.blockStore.GetRawBlock(parentHash)
 		var decoded core.Block
 		if readErr != nil || len(parentRaw) == 0 || json.Unmarshal(parentRaw, &decoded) != nil ||
-decoded.Hash() != parentHash || !s.verifyAuditHeader(&decoded.Header) ||
+			decoded.Hash() != parentHash || !s.verifyAuditHeader(&decoded.Header) ||
 			decoded.Header.MerkleRoot != core.MerkleRoot(decoded.Txs) {
 			return fail(fmt.Errorf("position accrual parent body or timestamp unavailable"))
 		}

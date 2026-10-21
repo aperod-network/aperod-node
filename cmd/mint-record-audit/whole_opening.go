@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"filippo.io/edwards25519"
+
 	"github.com/aperod/aperod/crypto"
 )
 

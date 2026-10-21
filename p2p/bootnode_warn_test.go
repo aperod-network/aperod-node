@@ -93,8 +93,8 @@ func TestBootnodeWarn_StartupLog(t *testing.T) {
 		NodeID:     "test-bootnode-warn",
 		UserAgent:  "aperod-test/0.1",
 		Bootnodes: []string{
-			"/ip6/badaddr",       // malformed — no /tcp/<port> component
-			"127.0.0.1:19998",   // valid syntax but unreachable; node must try it
+			"/ip6/badaddr",    // malformed — no /tcp/<port> component
+			"127.0.0.1:19998", // valid syntax but unreachable; node must try it
 		},
 	}, &stubHandler{}, log)
 

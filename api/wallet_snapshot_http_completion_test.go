@@ -21,9 +21,9 @@ func (f completionTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 
 type completionBody struct {
 	io.ReadCloser
-	first bool
+	first  bool
 	finish func()
-	eof *atomic.Bool
+	eof    *atomic.Bool
 }
 
 func (b *completionBody) Read(p []byte) (int, error) {

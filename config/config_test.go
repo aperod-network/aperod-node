@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +158,49 @@ func TestValidate_AVMGasBurnActivation(t *testing.T) {
 	}
 }
 
+func TestValidate_AVMCheckpointTrustAuthorities(t *testing.T) {
+	validKeys := []string{strings.Repeat("01", 32), strings.Repeat("02", 32), strings.Repeat("03", 32)}
+	tests := []struct {
+		name        string
+		activation  uint64
+		file        string
+		authorities []string
+		threshold   int
+		wantError   bool
+	}{
+		{name: "valid 2 of 3 quorum", activation: 3, authorities: validKeys, threshold: 2},
+		{name: "checkpoint file requires trust root", activation: 3, file: "avm-checkpoint.json", wantError: true},
+		{name: "trust root requires AVM activation", authorities: validKeys, threshold: 2, wantError: true},
+		{name: "rejects thresholdless v1 trust", activation: 3, authorities: validKeys, wantError: true},
+		{name: "rejects one signer", activation: 3, authorities: validKeys[:1], threshold: 1, wantError: true},
+		{name: "rejects threshold above authority count", activation: 3, authorities: validKeys, threshold: 4, wantError: true},
+		{name: "threshold requires authority keys", activation: 3, threshold: 2, wantError: true},
+		{name: "rejects malformed key", activation: 3, authorities: []string{"abcd"}, threshold: 2, wantError: true},
+		{name: "rejects zero key", activation: 3, authorities: []string{strings.Repeat("00", 32), validKeys[1]}, threshold: 2, wantError: true},
+		{name: "rejects duplicate keys", activation: 3, authorities: []string{validKeys[0], validKeys[0]}, threshold: 2, wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Network = Testnet
+			cfg.Consensus.NonValidator = true
+			cfg.Consensus.RingCTV4ActivationHeight = 1
+			cfg.Consensus.RingCTCLSAGActivationHeight = 2
+			cfg.Consensus.AVMActivationHeight = tc.activation
+			cfg.Consensus.AVMCheckpointFile = tc.file
+			cfg.Consensus.AVMCheckpointTrustAuthorities = tc.authorities
+			cfg.Consensus.AVMCheckpointWitnessThreshold = tc.threshold
+			err := cfg.Validate()
+			if tc.wantError && err == nil {
+				t.Fatal("invalid AVM checkpoint configuration was accepted")
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("valid AVM checkpoint configuration rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "node.yaml")
 	configYAML := []byte(`consensus:
@@ -182,19 +226,19 @@ func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
 	if got := firstStart.Consensus.AVMGasBurnActivationHeight; got != 125 {
 		t.Fatalf("loaded activation height = %d, want 125", got)
 	}
-if got := firstStart.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
-	t.Fatalf("loaded staked-collateral activation height = %d, want 130", got)
-}
-firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 100
-if err := firstStart.Validate(); err == nil {
-	t.Fatal("staked-collateral activation before CLSAG activation was accepted")
-}
-firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 0
-firstStart.Network = "mainnet"
-firstStart.Consensus.NonValidator = true
-if err := firstStart.Validate(); err == nil {
-	t.Fatal("mainnet node without an explicit staked-collateral activation was accepted")
-}
+	if got := firstStart.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
+		t.Fatalf("loaded staked-collateral activation height = %d, want 130", got)
+	}
+	firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 100
+	if err := firstStart.Validate(); err == nil {
+		t.Fatal("staked-collateral activation before CLSAG activation was accepted")
+	}
+	firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 0
+	firstStart.Network = "mainnet"
+	firstStart.Consensus.NonValidator = true
+	if err := firstStart.Validate(); err == nil {
+		t.Fatal("mainnet node without an explicit staked-collateral activation was accepted")
+	}
 
 	restarted, err := Load(configPath)
 	if err != nil {
@@ -204,9 +248,9 @@ if err := firstStart.Validate(); err == nil {
 		t.Fatalf("activation after restart = %d, want %d",
 			got, firstStart.Consensus.AVMGasBurnActivationHeight)
 	}
-if got := restarted.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
-	t.Fatalf("staked-collateral activation after restart = %d, want 130", got)
-}
+	if got := restarted.Consensus.StakedCollateralRingExclusionActivationHeight; got != 130 {
+		t.Fatalf("staked-collateral activation after restart = %d, want 130", got)
+	}
 	if err := restarted.Validate(); err != nil {
 		t.Fatalf("Validate() after restart: %v", err)
 	}

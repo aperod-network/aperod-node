@@ -3,7 +3,7 @@ package main
 // CLI integration tests for the prune-window guard in the `validator stake`
 // command (step 3 of the stake flow).
 //
-// The command now has two distinct behaviours depending on blocks_until_pruned:
+// The command now has two distinct behaviors depending on blocks_until_pruned:
 //
 //  1. blocks_until_pruned < core.PartialUnbondingBlocks
 //     → hard rejection: RunE returns a non-nil error containing the block count.
@@ -34,6 +34,8 @@ import (
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 )
+
+const stakeTestAPIKey = "test-stake-api-key"
 
 // captureOutput redirects os.Stdout to a pipe for the duration of fn,
 // then returns everything written to stdout as a string.
@@ -153,6 +155,9 @@ func resetStakeCmd() {
 	if n := f.Lookup("priv-key"); n != nil {
 		n.Value.Set(n.DefValue) //nolint:errcheck
 	}
+	if n := f.Lookup("api-key"); n != nil {
+		n.Value.Set(n.DefValue) //nolint:errcheck
+	}
 	if n := f.Lookup("utxo-txhash"); n != nil {
 		n.Value.Set(n.DefValue) //nolint:errcheck
 	}
@@ -170,10 +175,11 @@ func runStakeCmd(t *testing.T, nodeURL, privKey, txHashHex string, amount float6
 	t.Helper()
 
 	f := validatorStakeCmd.Flags()
-	f.Set("node", nodeURL)                              //nolint:errcheck
-	f.Set("priv-key", privKey)                          //nolint:errcheck
-	f.Set("utxo-txhash", txHashHex)                     //nolint:errcheck
-	f.Set("utxo-idx", "0")                              //nolint:errcheck
+	f.Set("node", nodeURL)                     //nolint:errcheck
+	f.Set("api-key", stakeTestAPIKey)          //nolint:errcheck
+	f.Set("priv-key", privKey)                 //nolint:errcheck
+	f.Set("utxo-txhash", txHashHex)            //nolint:errcheck
+	f.Set("utxo-idx", "0")                     //nolint:errcheck
 	f.Set("amount", fmt.Sprintf("%g", amount)) //nolint:errcheck
 
 	var runErr error

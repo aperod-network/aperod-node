@@ -18,10 +18,10 @@ package api_test
 //   "simulating > 1000 block old UTXO" to document the production invariant.
 //
 // Critical assertion:
-//   The REST endpoint returns the correct block_hash (the full serialised
+//   The REST endpoint returns the correct block_hash (the full serialized
 //   block hash, not a hash of a synthetic stub with only Header.Height set).
 //   This assertion would FAIL if GetBlockByHeight were used instead of
-//   GetRawBlockByHeight, because a minimal stub serialises differently.
+//   GetRawBlockByHeight, because a minimal stub serializes differently.
 
 import (
 	"encoding/hex"
@@ -52,8 +52,8 @@ func TestGetTransactionFromDisk_FindsTxViaRawBlock(t *testing.T) {
 	// ── Constants ─────────────────────────────────────────────────────────────
 	// Use a tiny window to avoid adding 1001 blocks in the test.
 	// The disk path exercised is identical to the production 1000-block case.
-	const windowSize = uint64(4) // simulating > 1000 block old UTXO (production window = 1000)
-	const mintHeight = uint64(1) // height of the block containing the target tx
+	const windowSize = uint64(4)           // simulating > 1000 block old UTXO (production window = 1000)
+	const mintHeight = uint64(1)           // height of the block containing the target tx
 	const mintAmount = uint64(100_000_000) // 1 APRO
 
 	// ── 1. Keys ───────────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ func TestGetTransactionFromDisk_FindsTxViaRawBlock(t *testing.T) {
 	// ── 8. Assert correct response fields ─────────────────────────────────────
 
 	// block_hash must equal the real hash of the mint block — the full
-	// serialised block hash.  Before the fix, GetBlockByHeight returned a
+	// serialized block hash.  Before the fix, GetBlockByHeight returned a
 	// StoredBlock with nil TxData; the handler then built a synthetic stub
 	// Block{Header: {Height: h}} whose Hash() produced a wrong value.
 	wantBlockHash := fmt.Sprintf("%x", mintBlock.Hash())

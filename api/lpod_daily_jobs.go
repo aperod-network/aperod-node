@@ -18,6 +18,7 @@ import (
 )
 
 const dailyJobKey = "lpod/daily-job/v1"
+
 // A full day must fit between light-pruning epochs. Keep the 250ms cooperative
 // CPU budget and single worker; a block-count cap must not force a 15min scan.
 const dailyBatchBlocks = 256
@@ -26,7 +27,7 @@ const dailyJobMaxBytes = 16 << 20
 
 type dailyPositionProgress struct {
 	Vault, After             string
-Beneficiary              string
+	Beneficiary              string
 	Accrued, Paid, Principal uint64
 }
 
@@ -41,7 +42,7 @@ type dailyProgress struct {
 	PriorTS                     int64
 	Vaults                      map[string][4]uint64
 	Positions                   map[string]dailyPositionProgress
-Rewards                     *dailyRewardProgress `json:",omitempty"`
+	Rewards                     *dailyRewardProgress `json:",omitempty"`
 	Burns                       [4]uint64
 	Included, First, Last       uint64
 	FirstTS, LastTS             int64
@@ -56,6 +57,7 @@ Rewards                     *dailyRewardProgress `json:",omitempty"`
 func dailyRewardsNeedReplay(p *dailyProgress) bool {
 	return p != nil && p.Next > 0 && p.Rewards == nil
 }
+
 type dailyJob struct {
 	ID       int64
 	Updated  int64
@@ -86,25 +88,27 @@ func (s *Server) loadDailyJob() (*dailyJob, error) {
 		return nil, fmt.Errorf("daily job exceeds storage bound")
 	}
 	var j dailyJob
-if s.myKey == nil || len(s.myKey.Public()) != 32 {
-return nil, fmt.Errorf("daily job authentication key unavailable")
-}
-var envelope dailyJobEnvelope
-if err := decodeDailyStrict(raw, &envelope); err != nil {
+	if s.myKey == nil || len(s.myKey.Public()) != 32 {
+		return nil, fmt.Errorf("daily job authentication key unavailable")
+	}
+	var envelope dailyJobEnvelope
+	if err := decodeDailyStrict(raw, &envelope); err != nil {
 		return nil, err
 	}
-if envelope.Version != 2 || !s.myKey.Public().Verify(dailyJobDigest(envelope.Payload), envelope.Signature) {
-return nil, fmt.Errorf("daily job authentication failed; DELETE to reset and reverify")
+	if envelope.Version != 2 || !s.myKey.Public().Verify(dailyJobDigest(envelope.Payload), envelope.Signature) {
+		return nil, fmt.Errorf("daily job authentication failed; DELETE to reset and reverify")
 	}
-if err := decodeDailyStrict(envelope.Payload, &j); err != nil { return nil, err }
-if err := validateDailyJob(&j); err != nil {
-return nil, err
+	if err := decodeDailyStrict(envelope.Payload, &j); err != nil {
+		return nil, err
+	}
+	if err := validateDailyJob(&j); err != nil {
+		return nil, err
 	}
 	return &j, nil
 }
 func (s *Server) saveDailyJob(j *dailyJob) error {
 	j.Updated = time.Now().Unix()
-raw, err := s.encodeDailyJob(j)
+	raw, err := s.encodeDailyJob(j)
 	if err != nil {
 		return err
 	}
@@ -187,7 +191,7 @@ func (s *Server) restLPoDDailyJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Context().Err() != nil {
-		writeJSON(w, http.StatusOK, dailyPending(date, "daily audit request was cancelled"))
+		writeJSON(w, http.StatusOK, dailyPending(date, "daily audit request was canceled"))
 		return
 	}
 	d := &s.dailyJobs
@@ -199,13 +203,16 @@ func (s *Server) restLPoDDailyJob(w http.ResponseWriter, r *http.Request) {
 	}
 	j, err := s.loadDailyJob()
 	if r.Method == http.MethodDelete {
-// Authenticated reset must work even for oversized, malformed, unsigned or
-// wrong-key state. Only enforce date ownership when the record is trusted.
-if err == nil && j != nil && j.Date != date {
+		// Authenticated reset must work even for oversized, malformed, unsigned or
+		// wrong-key state. Only enforce date ownership when the record is trusted.
+		if err == nil && j != nil && j.Date != date {
 			writeJSONError(w, http.StatusConflict, "another date occupies the daily slot")
 			return
 		}
-if s.blockStore == nil { writeJSONError(w, http.StatusServiceUnavailable, "block store unavailable"); return }
+		if s.blockStore == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "block store unavailable")
+			return
+		}
 		if d.batchCancel != nil {
 			d.batchCancel()
 		}
@@ -213,21 +220,21 @@ if s.blockStore == nil { writeJSONError(w, http.StatusServiceUnavailable, "block
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, dailyPending(date, "daily audit cancelled"))
+		writeJSON(w, http.StatusOK, dailyPending(date, "daily audit canceled"))
 		return
 	}
-if err != nil {
-writeJSON(w, http.StatusOK, dailyPending(date, err.Error()))
-return
-}
+	if err != nil {
+		writeJSON(w, http.StatusOK, dailyPending(date, err.Error()))
+		return
+	}
 	if j != nil && j.Date == date {
-missingRewards := dailyRewardsNeedReplay(j.Progress)
-if missingRewards || (j.State == "failed" && time.Now().Unix()-j.Updated >= 30) ||
+		missingRewards := dailyRewardsNeedReplay(j.Progress)
+		if missingRewards || (j.State == "failed" && time.Now().Unix()-j.Updated >= 30) ||
 			(j.State == "complete" && (!s.dailyBindingValid(j.Progress) ||
 				!s.lpodFinalized(j.Progress.Certificate.Height, j.Progress.Certificate.BlockHash))) {
 			// Re-attest an older complete report by verifying only its unprocessed
 			// descendant tail. Invalidated/failed progress is never reused.
-if missingRewards || j.State == "failed" || !s.dailyBindingValid(j.Progress) {
+			if missingRewards || j.State == "failed" || !s.dailyBindingValid(j.Progress) {
 				j.Progress = &dailyProgress{}
 			}
 			j.ID, j.State, j.Result = time.Now().UnixNano(), "queued", nil

@@ -11,10 +11,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 func samplingDB(t *testing.T) *DB {

@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/lpod"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
@@ -662,4 +663,61 @@ func commitLPoDStoreTestBlock(t *testing.T, db *DB, migration *LPoDMigration, pr
 		t.Fatalf("commit LPoD transition: %v", err)
 	}
 	return block, request, next, payout
+}
+
+func TestLPoDWalletIndexBackfillsMissingNativeOutputs(t *testing.T) {
+	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
+	defer db.Close()
+
+	fundingBlock, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
+	if err := db.CommitRawBlockWithAVM(
+		fundingBlock.Hash(), LPoDV2ActivationHeight, raw, nil, crypto.Hash32{}, settlement,
+	); err != nil {
+		t.Fatalf("commit v3 funding: %v", err)
+	}
+	funding := fundingBlock.Hash()
+	outputs, _, err := db.LPoDWalletOutputs(address, "", 128)
+	if err != nil || len(outputs) == 0 {
+		t.Fatalf("expected indexed native payout outputs: outputs=%d err=%v", len(outputs), err)
+	}
+	target := outputs[0]
+	key := lpodWalletPrefix(address)
+	var suffix [12]byte
+	binary.BigEndian.PutUint64(suffix[:8], target.BlockHeight)
+	binary.BigEndian.PutUint32(suffix[8:], target.OutputIndex)
+	key = append(key, suffix[:]...)
+	key = append(key, funding[:]...)
+	key = append(key, target.TxHash[:]...)
+	if err := db.db.Delete(key, nil); err != nil {
+		t.Fatalf("remove native wallet output fixture: %v", err)
+	}
+	if err := db.db.Delete(lpodWalletBackfillReadyKey, nil); err != nil {
+		t.Fatalf("remove wallet index readiness marker: %v", err)
+	}
+	if ready, err := db.LPoDWalletIndexReady(funding); err != nil || ready {
+		t.Fatalf("wallet index remained ready after its backfill marker was removed: ready=%t err=%v", ready, err)
+	}
+
+	if err := db.BackfillLPoDWalletIndex(migration); err != nil {
+		t.Fatalf("backfill native payout outputs from canonical blocks: %v", err)
+	}
+	if ready, err := db.LPoDWalletIndexReady(funding); err != nil || !ready {
+		t.Fatalf("wallet index not ready after replay: ready=%t err=%v", ready, err)
+	}
+	rebuilt, _, err := db.LPoDWalletOutputs(address, "", 128)
+	if err != nil {
+		t.Fatalf("read rebuilt native payout outputs: %v", err)
+	}
+	found := false
+	for _, output := range rebuilt {
+		if output.TxHash == target.TxHash && output.OutputIndex == target.OutputIndex {
+			found = output.OneTimePub == target.OneTimePub &&
+				output.TxPubKey == target.TxPubKey &&
+				output.AmountCommit == target.AmountCommit &&
+				output.EncAmount == target.EncAmount
+		}
+	}
+	if !found {
+		t.Fatal("canonical payout output was not restored by backfill")
+	}
 }

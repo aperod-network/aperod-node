@@ -680,7 +680,7 @@ func TestTLS_ConnectionSurvivesIdleSilence(t *testing.T) {
 // that is NOT on the host's AllowedPeers list must not be able to inject a
 // block into the chain via MsgBlock, even though the TLS handshake itself
 // succeeds (mutual TLS authenticates the cert as valid, but the fingerprint
-// is not recognised).
+// is not recognized).
 //
 // Done looks like:
 //   - handler.OnBlock is never called after the attacker sends MsgBlock.

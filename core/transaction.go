@@ -259,12 +259,13 @@ func (tx *Transaction) Validate() error {
 	//
 	// v1 payload (105 bytes): StakeWithdraw / StakePartialWithdraw
 	// v2 payload (173 bytes): StakeDeposit with UTXO burn proof (C-1 fix)
-	// v3 payload (237 bytes): StakeDeposit with UTXO burn proof + one-time-key ownership proof (F-049 fix)
+	// v3 payload (237 bytes): StakeDeposit with one-time-key ownership proof
+	// v4 payload (301 bytes): StakeDeposit with a key-image DLEQ proof
 	if tx.IsStake() {
 		extraLen := len(tx.Extra)
-		if extraLen != StakePayloadSize && extraLen != StakeWithdrawalPayloadSizeV2 && extraLen != StakePayloadSizeV2 && extraLen != StakePayloadSizeV3 {
-			return fmt.Errorf("stake tx: extra must be %d bytes (withdraw) or %d bytes (deposit), got %d",
-				StakePayloadSize, StakePayloadSizeV2, extraLen)
+		if extraLen != StakePayloadSize && extraLen != StakeWithdrawalPayloadSizeV2 && extraLen != StakePayloadSizeV2 && extraLen != StakePayloadSizeV3 && extraLen != StakePayloadSizeV4 {
+			return fmt.Errorf("stake tx: extra must be %d bytes (withdraw) or %d, %d, or %d bytes (deposit), got %d",
+				StakePayloadSize, StakePayloadSizeV2, StakePayloadSizeV3, StakePayloadSizeV4, extraLen)
 		}
 		action := StakeAction(tx.Extra[0])
 		if action != StakeDeposit && action != StakeWithdraw && action != StakePartialWithdraw {

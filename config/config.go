@@ -9,8 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aperod/aperod/crypto"
 	"gopkg.in/yaml.v3"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 // Network identifies which chain this node is on.
@@ -22,7 +23,7 @@ const (
 	Devnet  Network = "devnet"
 )
 
-// SnapshotConfig controls snapshot integrity-check behaviour.
+// SnapshotConfig controls snapshot integrity-check behavior.
 type SnapshotConfig struct {
 	// UTXOCountTolerancePct is the maximum allowed percentage difference
 	// between the snapshot's active UTXO count and the count stored in the
@@ -33,24 +34,22 @@ type SnapshotConfig struct {
 	UTXOCountTolerancePct float64 `yaml:"utxo_count_tolerance_pct"`
 
 	// PeriodicSnapshotInterval is the number of blocks between periodic
-	// in-process UTXO snapshots. Taking one deep-copies the UTXO set and
-	// serializes it while blocks continue, which can exceed GOMEMLIMIT and
-	// trigger a second snapshot during shutdown. Enable only after sizing
-	// the node for the peak memory of both operations.
+	// in-process UTXO snapshots. Snapshot capture uses copy-on-write UTXO records,
+	// a bounded pointer view, and a fixed-buffer JSON stream. Only one periodic
+	// writer may run at a time, and graceful shutdown waits for it before saving
+	// the final tip.
 	//
 	// The shutdown snapshot (taken on clean exit) is unaffected by this
 	// setting; it remains the primary crash-recovery mechanism.
 	//
-	// Default: 0 (shutdown snapshot only). Set a positive interval only
-	// when there is sufficient memory for the full periodic snapshot.
+	// Default: 500 blocks. Set to 0 to disable periodic snapshots.
 	PeriodicSnapshotInterval uint64 `yaml:"periodic_snapshot_interval"`
 
 	// ScanCheckpointInterval is the number of blocks between intermediate
-	// checkpoints saved during the startup block scan.  A smaller value means
-	// the node can resume from a more recent checkpoint after a crash mid-scan
-	// (faster crash recovery) but takes more frequent TakeSnapshot() calls,
-	// each of which briefly doubles node RSS.  A larger value reduces peak
-	// memory pressure at the cost of replaying more blocks on restart.
+	// checkpoints saved during the startup block scan. A smaller value means the
+	// node can resume from a more recent checkpoint after a crash mid-scan. Each
+	// checkpoint captures a bounded pointer view and streams JSON; a larger value
+	// reduces checkpoint I/O at the cost of replaying more blocks on restart.
 	//
 	// Default: 50000.  Must be > 0; a value of 0 is replaced by the default
 	// at runtime.
@@ -206,7 +205,7 @@ type P2PConfig struct {
 	// When non-empty, any inbound TCP connection whose source IP is not covered
 	// by an entry is rejected immediately — before any P2P handshake occurs.
 	// Outbound dial-outs to bootnodes and discovery peers are not affected.
-	// An empty list means all source IPs are allowed (default behaviour).
+	// An empty list means all source IPs are allowed (default behavior).
 	PeerWhitelist []string `yaml:"peer_whitelist"`
 	// MaxPendingHandshakes caps the number of inbound connections that are
 	// concurrently executing the TLS handshake.  A peer that opens many TCP
@@ -364,6 +363,15 @@ type ConsensusConfig struct {
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
 	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
+	// AVMCheckpointFile is the signed, versioned state snapshot used to bound
+	// AVM recovery replay. Relative paths are resolved under data_dir.
+	AVMCheckpointFile string `yaml:"avm_checkpoint_file"`
+	// AVMCheckpointTrustAuthorities are explicit Ed25519 public-key pins for
+	// AVM state witnesses. Private keys must not be stored in node.yaml.
+	AVMCheckpointTrustAuthorities []string `yaml:"avm_checkpoint_trust_authorities"`
+	// AVMCheckpointWitnessThreshold is the required number of distinct
+	// signatures on a v2 checkpoint. Quorum checkpoints require at least 2.
+	AVMCheckpointWitnessThreshold int `yaml:"avm_checkpoint_witness_threshold"`
 	// AVMGasBurnActivationHeight is the first block that burns the mandatory
 	// AVM gas fee instead of paying it as a validator tip. Zero disables the
 	// new rule and preserves historical block reward accounting. This is
@@ -379,6 +387,17 @@ type ConsensusConfig struct {
 	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
 	// Empty disables the fork. Merely setting a target amount never funds the pool.
 	LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// FinalityMigrationFile is a signed, versioned attestation for one exact
+	// historical finality certificate. Empty leaves ordinary quorum checks intact.
+	FinalityMigrationFile string `yaml:"finality_migration_file"`
+	// FinalityMigrationTrustAuthorities are pinned validator identities allowed
+	// to authorize that one-certificate migration. They are not genesis validators.
+	FinalityMigrationTrustAuthorities []string `yaml:"finality_migration_trust_authorities"`
+	// StakeKeyImageV4ActivationHeight requires v4 stake deposits to prove that
+	// collateral's key image has never been spent. It is consensus-critical and
+	// must use the same future height on every validator; zero leaves legacy
+	// deposit formats enabled.
+	StakeKeyImageV4ActivationHeight uint64 `yaml:"stake_key_image_v4_activation_height"`
 	// SaleMigrationFile is a local signed checkpoint and disjoint allocation
 	// witness. Empty disables sales; it is not an amount or payment-server flag.
 	SaleMigrationFile string `yaml:"sale_migration_file"`
@@ -477,7 +496,7 @@ func DefaultConfig() *Config {
 		},
 		Snapshot: SnapshotConfig{
 			UTXOCountTolerancePct:    1.0,
-			PeriodicSnapshotInterval: 0,
+			PeriodicSnapshotInterval: 500,
 			ScanCheckpointInterval:   50_000,
 		},
 		Pprof: PprofConfig{
@@ -740,6 +759,55 @@ func (c *Config) Validate() error {
 			avmActivation, clsagActivation,
 		)
 	}
+	if c.Consensus.AVMCheckpointFile != "" && len(c.Consensus.AVMCheckpointTrustAuthorities) == 0 {
+		return fmt.Errorf("avm_checkpoint_file requires avm_checkpoint_trust_authorities")
+	}
+	if c.Consensus.FinalityMigrationFile != "" && len(c.Consensus.FinalityMigrationTrustAuthorities) == 0 {
+		return fmt.Errorf("finality_migration_file requires finality_migration_trust_authorities")
+	}
+	if c.Consensus.FinalityMigrationFile == "" && len(c.Consensus.FinalityMigrationTrustAuthorities) != 0 {
+		return fmt.Errorf("finality_migration_trust_authorities requires finality_migration_file")
+	}
+	if len(c.Consensus.FinalityMigrationTrustAuthorities) > 256 {
+		return fmt.Errorf("finality migration has too many trust authorities")
+	}
+	if c.Consensus.AVMCheckpointWitnessThreshold != 0 &&
+		len(c.Consensus.AVMCheckpointTrustAuthorities) == 0 {
+		return fmt.Errorf("avm_checkpoint_witness_threshold requires avm_checkpoint_trust_authorities")
+	}
+	if len(c.Consensus.AVMCheckpointTrustAuthorities) > 0 {
+		if avmActivation == 0 {
+			return fmt.Errorf("avm_checkpoint_trust_authorities requires avm_activation_height")
+		}
+		if c.Consensus.AVMCheckpointWitnessThreshold < 2 ||
+			c.Consensus.AVMCheckpointWitnessThreshold > len(c.Consensus.AVMCheckpointTrustAuthorities) {
+			return fmt.Errorf(
+				"avm_checkpoint_witness_threshold must be between 2 and the authority count (%d)",
+				len(c.Consensus.AVMCheckpointTrustAuthorities),
+			)
+		}
+		seen := make(map[string]struct{}, len(c.Consensus.AVMCheckpointTrustAuthorities))
+		for i, encoded := range c.Consensus.AVMCheckpointTrustAuthorities {
+			raw, err := hex.DecodeString(encoded)
+			if err != nil || len(raw) != 32 {
+				return fmt.Errorf("avm_checkpoint_trust_authorities[%d] must be exactly 32-byte hex", i)
+			}
+			allZero := true
+			for _, b := range raw {
+				if b != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				return fmt.Errorf("avm_checkpoint_trust_authorities[%d] must not be zero", i)
+			}
+			if _, duplicate := seen[string(raw)]; duplicate {
+				return fmt.Errorf("avm_checkpoint_trust_authorities contains a duplicate key")
+			}
+			seen[string(raw)] = struct{}{}
+		}
+	}
 	if rewardActivation > 0 && !c.Consensus.NonValidator && c.Consensus.RewardAddress == "" {
 		return fmt.Errorf(
 			"reward_address must be set for validator nodes when reward_authorization_activation_height is enabled",
@@ -937,7 +1005,7 @@ func (c *Config) Validate() error {
 // A zero value arises either because the field was omitted from node.yaml
 // (YAML leaves the field at its zero value, overriding the DefaultConfig
 // value of 300) or because the operator explicitly wrote
-// mempool_evict_interval_sec: 0 to request the default behaviour.
+// mempool_evict_interval_sec: 0 to request the default behavior.
 func ResolveMempoolEvictInterval(sec uint64) time.Duration {
 	if sec == 0 {
 		return 5 * time.Minute

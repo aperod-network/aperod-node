@@ -7,7 +7,7 @@ package api_test
 // This is the regression test for the block_hash bug: the original
 // getTransactionFromDisk built a synthetic TxLocation.Block with only
 // Header.Height set.  loc.Block.Hash() then produced a wrong hash because
-// Block.Hash() serialises the full block — a minimal stub has different bytes.
+// Block.Hash() serializes the full block — a minimal stub has different bytes.
 // The fix uses the full deserialized block (&b) so Hash() is correct.
 //
 // The test also confirms is_coinbase, inputs, outputs, fee, and version are

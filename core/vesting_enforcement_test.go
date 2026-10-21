@@ -19,11 +19,11 @@ import (
 // mapped to the provided pub key and overrides nowFn so tests control time.
 func buildTestVestingLock(teamPub crypto.Point32, genesisTime int64, nowFn func() int64) *core.VestingLock {
 	const (
-		cliffSeconds = int64(365 * 86400)       // 1 year
-		vestSeconds  = int64(4 * 365 * 86400)   // 4 years after cliff
+		cliffSeconds = int64(365 * 86400)     // 1 year
+		vestSeconds  = int64(4 * 365 * 86400) // 4 years after cliff
 	)
 	teamAlloc := &core.GenesisAlloc{
-		Address: "", // not used directly in VestingLock
+		Address: "",                                   // not used directly in VestingLock
 		Amount:  1_000_000_000 * core.BaseUnitsPerAPR, // 1 000 000 000 APRO
 		Label:   "Team",
 		Vesting: &core.VestingSchedule{
@@ -60,11 +60,11 @@ func TestVestingEnforcement_LockedGenesisRejected(t *testing.T) {
 	for i := 1; i < crypto.RingSize; i++ {
 		decoyPub := crypto.Point32{byte(0x10 + i)}
 		utxos.Add(&core.UTXO{
-			TxHash:      crypto.Hash32{byte(i + 10)},
-			OutputIndex: 0,
-			OneTimePub:  decoyPub,
+			TxHash:       crypto.Hash32{byte(i + 10)},
+			OutputIndex:  0,
+			OneTimePub:   decoyPub,
 			AmountCommit: commit,
-			BlockHeight: 1,
+			BlockHeight:  1,
 		})
 	}
 
@@ -216,8 +216,8 @@ func TestVestingEnforcement_NonGenesisUnaffected(t *testing.T) {
 func TestVestingEnforcement_TimestampZeroBug(t *testing.T) {
 	vs := &core.VestingSchedule{
 		Type:         core.VestingCliffLinear,
-		CliffSeconds: int64(365 * 86400),       // 1-year cliff
-		VestSeconds:  int64(4 * 365 * 86400),   // 4-year linear after cliff
+		CliffSeconds: int64(365 * 86400),     // 1-year cliff
+		VestSeconds:  int64(4 * 365 * 86400), // 4-year linear after cliff
 	}
 	total := uint64(1_000_000_000) * core.BaseUnitsPerAPR // 1 B APRO
 
@@ -527,7 +527,7 @@ func TestBuildVestingLock_DuplicateAddressReturnsError(t *testing.T) {
 
 // TestGenesisValidate_DuplicateAddressRejected verifies that
 // GenesisConfig.Validate() rejects a config whose allocations contain two
-// entries with the same address.  This is the first defence — the config
+// entries with the same address.  This is the first defense — the config
 // should be rejected at load time before BuildVestingLock is ever called.
 func TestGenesisValidate_DuplicateAddressRejected(t *testing.T) {
 	validatorPriv, validatorPub, err := crypto.GenerateValidatorKey()
@@ -648,7 +648,7 @@ func TestGenesisValidate_SameSpendPubDifferentAddressRejected(t *testing.T) {
 }
 
 // TestBuildVestingLock_SameSpendPubDifferentAddressReturnsError verifies that
-// BuildVestingLock also returns an error (second line of defence) when two
+// BuildVestingLock also returns an error (second line of defense) when two
 // non-immediate allocations share a spendPub via distinct address strings.
 // This covers the case where the genesis config was not run through Validate()
 // before BuildVestingLock is called (e.g. programmatic construction in tooling).
@@ -779,7 +779,7 @@ func TestGenesisValidate_UniqueAddressesPass(t *testing.T) {
 //
 // The test also confirms the complementary case: a non-genesis ring member
 // that IS absent from byPubKey fails with a C-0 error (not a vesting error),
-// which is the correct behaviour for a genuinely missing UTXO.
+// which is the correct behavior for a genuinely missing UTXO.
 func TestVestingEnforcement_PrunedGenesisStart(t *testing.T) {
 	const genesisTime = int64(1_700_000_000)
 	// "now" is 1 day after genesis — well within the 1-year cliff.

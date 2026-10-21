@@ -11,8 +11,8 @@ package main
 //     can verify their TimeoutStopSec is high enough to let the write finish.
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -232,12 +232,12 @@ func TestSaveShutdownSnapshot_LogsTipHeight(t *testing.T) {
 
 // TestSaveShutdownSnapshot_RatioPctFiresAfterRealWrite is an end-to-end test that
 // exercises the full path from saveShutdownSnapshotWithPaths → real snapshot
-// serialisation → warnIfSnapshotSlowRelativeToTimeout → ratio_pct log field.
+// serialization → warnIfSnapshotSlowRelativeToTimeout → ratio_pct log field.
 //
 // It uses a synthetic drop-in with a short TimeoutStopSec (100 ms) together with
 // a saveDurOverride (500 ms) so that the ratio is deterministically 500 %, well
 // above the 80 % Error threshold.  The test also populates a configurable number
-// of UTXOs (utxoCount) to exercise realistic snapshot serialisation — a future
+// of UTXOs (utxoCount) to exercise realistic snapshot serialization — a future
 // format change that inflates the snapshot schema will still exercise the real
 // write path even though the ratio check uses the override.
 func TestSaveShutdownSnapshot_RatioPctFiresAfterRealWrite(t *testing.T) {
@@ -246,7 +246,7 @@ func TestSaveShutdownSnapshot_RatioPctFiresAfterRealWrite(t *testing.T) {
 	dir := t.TempDir()
 	db, utxos, registry := buildMinimalChainForShutdown(t, dir)
 
-	// Populate synthetic UTXOs so the snapshot serialisation covers a
+	// Populate synthetic UTXOs so the snapshot serialization covers a
 	// realistic payload.  The fields are zero-valued except for BlockHeight and
 	// OutputIndex to keep each UTXO key unique.
 	for i := 0; i < utxoCount; i++ {
@@ -516,7 +516,7 @@ func TestReadEffectiveTimeoutStopSec_FallsBackToService(t *testing.T) {
 }
 
 func TestReadEffectiveTimeoutStopSec_NeitherPresent(t *testing.T) {
-	dropinDir := t.TempDir() // empty
+	dropinDir := t.TempDir()                                     // empty
 	service := filepath.Join(t.TempDir(), "aperod-node.service") // absent
 
 	got, found := readEffectiveTimeoutStopSec(dropinDir, service)
@@ -746,7 +746,7 @@ func TestWarnIfSnapshotSlow_SuffixedTimeout(t *testing.T) {
 }
 
 func TestWarnIfSnapshotSlow_NoConfigNoOp(t *testing.T) {
-	dropinDir := t.TempDir() // empty — no .conf files
+	dropinDir := t.TempDir()                                     // empty — no .conf files
 	service := filepath.Join(t.TempDir(), "aperod-node.service") // absent
 
 	var buf bytes.Buffer
@@ -1228,7 +1228,7 @@ func TestCheckStartupSnapshotTiming_BelowThreshold(t *testing.T) {
 // file contains a TimeoutStopSec line (non-systemd host, or default config).
 // Even a very long save duration must produce no log output.
 func TestCheckStartupSnapshotTiming_NoTimeoutConfig(t *testing.T) {
-	dropinDir := t.TempDir() // empty — no .conf files
+	dropinDir := t.TempDir()                                     // empty — no .conf files
 	service := filepath.Join(t.TempDir(), "aperod-node.service") // absent
 
 	var buf bytes.Buffer

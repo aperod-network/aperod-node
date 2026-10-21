@@ -20,11 +20,11 @@ package api
 //
 //	For each file the handler opens it before building the tar header so the size
 //	in the header is derived from the open file descriptor (not Walk's pre-open
-//	FileInfo), minimising the time-of-check/time-of-use window.  io.LimitReader
+//	FileInfo), minimizing the time-of-check/time-of-use window.  io.LimitReader
 //	caps the copy at exactly hdr.Size bytes; any shortfall is padded with zeros so
 //	the tar block boundary stays consistent.
 //
-//	Tar entry paths are sanitised: only relative paths that do not escape the
+//	Tar entry paths are sanitized: only relative paths that do not escape the
 //	archive root are included.
 
 import (
@@ -58,7 +58,7 @@ func (s *Server) requireAPIKeyOrOpen(w http.ResponseWriter, r *http.Request) boo
 // The client (aperod-join.sh) writes this file directly to the new node's
 // data_dir; the node reads it on startup via the fast-path logic in snapshot.go.
 //
-// Snapshot filename format: snapshot-v2-<height>.json.gz
+// Snapshot filename format: snapshot-v2-<height>.json.gz.
 func (s *Server) restSnapshotExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -191,7 +191,7 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		// Compute and sanitise the archive entry path.
+		// Compute and sanitize the archive entry path.
 		rel, relErr := filepath.Rel(dataDir, path)
 		if relErr != nil {
 			return nil
@@ -224,7 +224,7 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 
 		// Open the file before building the tar header so the size comes from
 		// the open fd (via Stat), not from Walk's pre-open FileInfo.  This
-		// minimises the TOCTOU window: Walk captures FileInfo before the file
+		// minimizes the TOCTOU window: Walk captures FileInfo before the file
 		// is opened; if a compaction replaced the file in between, the size in
 		// the header would disagree with bytes copied.
 		f, openErr := os.Open(path)

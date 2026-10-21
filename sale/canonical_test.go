@@ -2,9 +2,10 @@ package sale
 
 import (
 	"bytes"
+	"testing"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
-	"testing"
 )
 
 func TestCanonicalSaleBindsOutputAuthorityBudgetAndReplayIdentifiers(t *testing.T) {

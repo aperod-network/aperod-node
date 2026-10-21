@@ -66,89 +66,91 @@ echo "=== aperod-watchdog-set-interval tests ==="
 # 1. Valid integer — written correctly into the drop-in
 echo "--- Test 1: valid interval (30 s)"
 out=$(run_helper "WATCHDOG_INTERVAL_SECS=30")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "30" && "${active}" == "30" ]]; then
-  pass "valid integer 30 → OnBootSec=30, OnUnitActiveSec=30"
+  pass "valid integer 30 → OnActiveSec=30, OnUnitInactiveSec=30"
 else
-  fail "valid integer 30 → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "valid integer 30 → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 2. Inline comment is stripped (primary documented example)
 echo "--- Test 2: inline comment stripped (15   # faster detection for HA setups)"
 out=$(run_helper "WATCHDOG_INTERVAL_SECS=15   # faster detection for HA setups")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "15" && "${active}" == "15" ]]; then
   pass "inline comment stripped → 15"
 else
-  fail "inline comment stripped → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "inline comment stripped → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 3. Missing variable → default 60
 echo "--- Test 3: missing WATCHDOG_INTERVAL_SECS → default 60"
 out=$(run_helper "# no interval set here")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "60" && "${active}" == "60" ]]; then
   pass "missing var → default 60"
 else
-  fail "missing var → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "missing var → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 4. Empty env file → default 60
 echo "--- Test 4: empty env file → default 60"
 out=$(run_helper "")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "60" && "${active}" == "60" ]]; then
   pass "empty env file → default 60"
 else
-  fail "empty env file → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "empty env file → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 5. Value below minimum (< 5) → falls back to 60
 echo "--- Test 5: value below minimum (3) → fallback 60"
 out=$(run_helper "WATCHDOG_INTERVAL_SECS=3")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "60" && "${active}" == "60" ]]; then
   pass "value below minimum → fallback 60"
 else
-  fail "value below minimum → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "value below minimum → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 6. Non-integer value → falls back to 60
 echo "--- Test 6: non-integer value ('fast') → fallback 60"
 out=$(run_helper "WATCHDOG_INTERVAL_SECS=fast")
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "60" && "${active}" == "60" ]]; then
   pass "non-integer → fallback 60"
 else
-  fail "non-integer → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "non-integer → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
 # 7. Quoted value → parsed correctly
 echo "--- Test 7: quoted value (\"45\") → 45"
 out=$(run_helper 'WATCHDOG_INTERVAL_SECS="45"')
-boot=$(extract_value "OnBootSec" "${out}")
-active=$(extract_value "OnUnitActiveSec" "${out}")
+boot=$(extract_value "OnActiveSec" "${out}")
+active=$(extract_value "OnUnitInactiveSec" "${out}")
 if [[ "${boot}" == "45" && "${active}" == "45" ]]; then
   pass "quoted value \"45\" → 45"
 else
-  fail "quoted value → got OnBootSec='${boot}', OnUnitActiveSec='${active}'"
+  fail "quoted value → got OnActiveSec='${boot}', OnUnitInactiveSec='${active}'"
 fi
 
-# 8. Drop-in includes the reset lines (OnBootSec= / OnUnitActiveSec=) before new values
+# 8. Drop-in clears old timer values before setting the new active/inactive schedule
 echo "--- Test 8: drop-in contains reset lines before new values"
 out=$(run_helper "WATCHDOG_INTERVAL_SECS=20")
 reset_boot=$(echo "${out}" | grep -c "^OnBootSec=$" || true)
+reset_onactive=$(echo "${out}" | grep -c "^OnActiveSec=$" || true)
 reset_active=$(echo "${out}" | grep -c "^OnUnitActiveSec=$" || true)
-if [[ "${reset_boot}" -ge 1 && "${reset_active}" -ge 1 ]]; then
-  pass "drop-in contains reset lines (OnBootSec=, OnUnitActiveSec=)"
+reset_inactive=$(echo "${out}" | grep -c "^OnUnitInactiveSec=$" || true)
+if [[ "${reset_boot}" -ge 1 && "${reset_onactive}" -ge 1 && "${reset_active}" -ge 1 && "${reset_inactive}" -ge 1 ]]; then
+  pass "drop-in clears old timer values before setting the new interval"
 else
-  fail "drop-in missing reset lines: reset_boot=${reset_boot}, reset_active=${reset_active}"
+  fail "drop-in missing reset lines: reset_boot=${reset_boot}, reset_onactive=${reset_onactive}, reset_active=${reset_active}, reset_inactive=${reset_inactive}"
 fi
 
 # 9. systemctl called with daemon-reload and restart (via stub)

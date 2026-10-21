@@ -177,8 +177,9 @@ func TestShutdownSavesSnapshot(t *testing.T) {
 
 // TestFastPathLogsOnRestart verifies that when a valid snapshot exists for the
 // current tip, the startup path:
-//   (a) logs "startup fast path complete — snapshot loaded"  ← must appear
-//   (b) does NOT log "running startup block scan"            ← must be absent
+//
+//	(a) logs "startup fast path complete — snapshot loaded"  ← must appear
+//	(b) does NOT log "running startup block scan"            ← must be absent
 //
 // This is achieved by running the same snapshot-presence logic that main.go
 // uses, but in-process with a captured logger.
@@ -410,9 +411,9 @@ func TestCheckSystemdTimeout_MainService(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			dropin := filepath.Join(dir, "timeout.conf")            // absent
+			dropin := filepath.Join(dir, "timeout.conf") // absent
 			service := writeConf(t, dir, "aperod-node.service", tc.service)
-			systemdDir := filepath.Join(dir, "no-systemd")          // absent → no default-warn
+			systemdDir := filepath.Join(dir, "no-systemd") // absent → no default-warn
 
 			var logBuf bytes.Buffer
 			checkSystemdTimeout(dropin, service, systemdDir, newCaptureLogger(&logBuf))
@@ -472,8 +473,8 @@ func TestParseGOMLEMLIMITBytes(t *testing.T) {
 	}{
 		// absent / disabled (exact Go runtime grammar)
 		{"", false, 0},
-		{"off", false, 0},   // exact spelling required
-		{"OFF", false, 0},   // case-fold NOT accepted by runtime
+		{"off", false, 0}, // exact spelling required
+		{"OFF", false, 0}, // case-fold NOT accepted by runtime
 		{"Off", false, 0},
 		{"0", false, 0},
 		// plain byte counts
@@ -518,10 +519,10 @@ func TestParseGOMLEMLIMITBytes(t *testing.T) {
 const dropin = "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf"
 
 // TestCheckGOMLEMLIMIT_WarnCases verifies that absent, zero, "off" (exact),
-// and unrecognised values all produce a warning and return nil in non-strict mode.
+// and unrecognized values all produce a warning and return nil in non-strict mode.
 func TestCheckGOMLEMLIMIT_WarnCases(t *testing.T) {
 	// All of these are effectively "no limit" — either unset, explicitly off,
-	// zero bytes, or unrecognised format that the runtime would reject anyway.
+	// zero bytes, or unrecognized format that the runtime would reject anyway.
 	cases := []string{"", "0", "off", "OFF", "Off", "garbage", "5GB", "5MB", " 5GiB "}
 	for _, val := range cases {
 		var logBuf bytes.Buffer
@@ -541,9 +542,9 @@ func TestCheckGOMLEMLIMIT_WarnCases(t *testing.T) {
 func TestCheckGOMLEMLIMIT_SilentWhenSet(t *testing.T) {
 	validValues := []string{
 		"5368709120", "5905580032", "1073741824", // bare byte counts
-		"5368709120B",                             // explicit B suffix
-		"5B",                                      // small explicit byte count
-		"5GiB", "512MiB", "1TiB", "1KiB",         // IEC suffixes
+		"5368709120B",                    // explicit B suffix
+		"5B",                             // small explicit byte count
+		"5GiB", "512MiB", "1TiB", "1KiB", // IEC suffixes
 	}
 	for _, val := range validValues {
 		var logBuf bytes.Buffer
@@ -753,7 +754,7 @@ func TestExactTipFastPathHashMismatchDiscard(t *testing.T) {
 
 	tip := blocks[len(blocks)-1]
 	correctHash := tip.Hash()
-	tipHeight := tip.Header.Height           // 4
+	tipHeight := tip.Header.Height // 4
 	correctHex := fmt.Sprintf("%x", correctHash[:])
 
 	// Save a valid snapshot using the correct block hash.
@@ -1062,7 +1063,7 @@ func TestBothSnapshotsCorruptFallsBackToScan(t *testing.T) {
 
 	tip := blocks[len(blocks)-1]
 	tipHash := tip.Hash()
-	tipHeight := tip.Header.Height           // 3
+	tipHeight := tip.Header.Height // 3
 	tipHashHex := fmt.Sprintf("%x", tipHash[:])
 
 	// ── Save a valid snapshot at the current tip.
@@ -1400,7 +1401,7 @@ func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
 
 	tip := blocks[len(blocks)-1]
 	tipHash := tip.Hash()
-	tipHeight := tip.Header.Height           // 2
+	tipHeight := tip.Header.Height // 2
 	tipHashHex := fmt.Sprintf("%x", tipHash[:])
 
 	// Build a wrong hash that is guaranteed to differ from the real one.
@@ -1490,9 +1491,10 @@ func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
 // TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact confirms that when the
 // required same-height prev-backup copy inside saveStartupSnapshot fails (e.g.
 // disk full), the function:
-//   (a) removes the .tmp file and returns a non-nil error, and
-//   (b) leaves the pre-existing primary snapshot file untouched so the node
-//       can still recover at startup.
+//
+//	(a) removes the .tmp file and returns a non-nil error, and
+//	(b) leaves the pre-existing primary snapshot file untouched so the node
+//	    can still recover at startup.
 //
 // Scenario:
 //   - A valid snapshot is saved at height H, establishing an old primary
@@ -1503,9 +1505,9 @@ func TestBothSnapshotsHashMismatchFallsBackToScan(t *testing.T) {
 //     returns an error (EISDIR on Linux/macOS), which causes copyFile to fail
 //     before it writes any bytes.
 //   - saveStartupSnapshot is called again for the same height H.  It:
-//       1. writes the new primary .tmp (succeeds — a different path)
-//       2. calls copyFile(tmp, prevPath) — fails because prevPath+".tmp" is a dir
-//       3. removes tmp and returns a non-nil error
+//     1. writes the new primary .tmp (succeeds — a different path)
+//     2. calls copyFile(tmp, prevPath) — fails because prevPath+".tmp" is a dir
+//     3. removes tmp and returns a non-nil error
 //   - The test confirms the error is non-nil.
 //   - The test confirms the old primary is still readable and has the original
 //     TipHashHex / TxTotal values (i.e. no partial overwrite occurred).
@@ -1546,8 +1548,8 @@ func TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact(t *testing.T) {
 	// copyFile(tmp, dst) creates dst+".tmp" internally before renaming to dst.
 	// Creating a directory at that path causes os.Create to return EISDIR,
 	// which propagates as a copyFile error → saveStartupSnapshot aborts.
-	prevPath := snapshotPrevPath(primaryPath)    // snapshot-v1-4-prev.json
-	blockPath := prevPath + ".tmp"               // snapshot-v1-4-prev.json.tmp
+	prevPath := snapshotPrevPath(primaryPath) // snapshot-v1-4-prev.json
+	blockPath := prevPath + ".tmp"            // snapshot-v1-4-prev.json.tmp
 	if err := os.MkdirAll(blockPath, 0755); err != nil {
 		t.Fatalf("MkdirAll blocker %s: %v", blockPath, err)
 	}
@@ -1602,10 +1604,11 @@ func TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact(t *testing.T) {
 // TestSaveSnapshotRenameFailureLeavesOldPrimaryIntact confirms that when the
 // final os.Rename(tmp, path) step inside saveStartupSnapshot fails, the
 // function:
-//   (a) returns a non-nil error,
-//   (b) leaves no stale .tmp file in the data directory, and
-//   (c) leaves the pre-existing primary snapshot file untouched and readable
-//       with its original content.
+//
+//	(a) returns a non-nil error,
+//	(b) leaves no stale .tmp file in the data directory, and
+//	(c) leaves the pre-existing primary snapshot file untouched and readable
+//	    with its original content.
 //
 // Scenario:
 //   - A valid snapshot is saved at height H, establishing an old primary
@@ -1969,7 +1972,7 @@ func TestShutdownSnapshotMatchesFinalDBTip(t *testing.T) {
 	// Simulates a real consensus engine that may be finishing a block when
 	// the shutdown signal arrives.
 	//
-	// Behaviour: upon receiving <-stop, it writes block H+1=6 to the DB (the
+	// Behavior: upon receiving <-stop, it writes block H+1=6 to the DB (the
 	// "in-flight" block), then closes engineDone — just as the real engine.Run()
 	// finishes its current tick and returns after close(stop).
 	stop := make(chan struct{})

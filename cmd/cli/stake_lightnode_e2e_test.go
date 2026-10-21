@@ -113,6 +113,7 @@ func buildLightNodeE2EServer(t *testing.T, tipHeight int, keepBlocks uint64) (*h
 	// (lines annotated "lets stake endpoints detect pruned UTXOs" and
 	// "enables blocks_until_pruned warning in restUTXO").
 	apiSrv := api.NewServer(":0", chain, mp, utxos, nopLog)
+	apiSrv.SetAPIKey(stakeTestAPIKey)
 	apiSrv.SetPruningMode("light")
 	apiSrv.SetKeepBlocks(keepBlocks)
 
@@ -243,7 +244,7 @@ func TestStakeLightNodeE2E_ArchiveModeNoWarning(t *testing.T) {
 	makeBlock := func(height uint64, prevHash crypto.Hash32) *core.Block {
 		txs := []core.Transaction{core.CoinbaseTx(crypto.Point32(pub), 1_000_000)}
 		hdr := core.BlockHeader{
-			Height:    height, PrevHash: prevHash,
+			Height: height, PrevHash: prevHash,
 			Timestamp: time.Now().UnixNano(), ValidatorPub: pub,
 			MerkleRoot: core.MerkleRoot(txs),
 		}
@@ -268,6 +269,7 @@ func TestStakeLightNodeE2E_ArchiveModeNoWarning(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	nopLog := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	apiSrv := api.NewServer(":0", chain, mp, utxos, nopLog)
+	apiSrv.SetAPIKey(stakeTestAPIKey)
 	apiSrv.SetPruningMode("archive") // archive mode — field must never appear
 	apiSrv.SetKeepBlocks(keepBlocks)
 

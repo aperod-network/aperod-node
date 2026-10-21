@@ -182,7 +182,7 @@ func TestAuthorizedRewardAVMGasBurnBoundaryAndRestart(t *testing.T) {
 	}
 	avmTx.Fee = minimumFee + gasFee
 
-	buildBlock := func(height, rewardAmount uint64) *core.Block {
+	buildBlock := func(height, rewardAmount uint64, tx core.Transaction) *core.Block {
 		t.Helper()
 		reward, buildErr := core.BuildAuthorizedRewardTx(
 			rewardAddress,
@@ -201,7 +201,7 @@ func TestAuthorizedRewardAVMGasBurnBoundaryAndRestart(t *testing.T) {
 				ValidatorPub: validatorPub,
 				BaseFee:      baseFee,
 			},
-			Txs: []core.Transaction{*reward, avmTx},
+			Txs: []core.Transaction{*reward, tx},
 		}
 	}
 
@@ -214,7 +214,7 @@ func TestAuthorizedRewardAVMGasBurnBoundaryAndRestart(t *testing.T) {
 		t.Fatalf("pre-activation authorized reward = %d, want legacy gas tip total %d",
 			preActivationReward, want)
 	}
-	preActivationBlock := buildBlock(gasActivation-1, preActivationReward)
+	preActivationBlock := buildBlock(gasActivation-1, preActivationReward, avmTx)
 	if err := engine.validateCoinbasePolicy(preActivationBlock); err != nil {
 		t.Fatalf("pre-activation legacy gas-as-tip block rejected: %v", err)
 	}
@@ -228,24 +228,44 @@ func TestAuthorizedRewardAVMGasBurnBoundaryAndRestart(t *testing.T) {
 		t.Fatalf("post-activation gas-only reward = %d, want base %d",
 			postActivationReward, postActivationBase)
 	}
-	oversizedLegacyBlock := buildBlock(gasActivation, postActivationBase+gasFee)
+	oversizedLegacyBlock := buildBlock(gasActivation, postActivationBase+gasFee, avmTx)
 	if err := engine.validateCoinbasePolicy(oversizedLegacyBlock); err == nil {
 		t.Fatal("pre-activation gas-as-tip reward accepted at AVM gas-burn activation")
 	}
-	postActivationBlock := buildBlock(gasActivation, postActivationReward)
+	postActivationBlock := buildBlock(gasActivation, postActivationReward, avmTx)
 	if err := engine.validateCoinbasePolicy(postActivationBlock); err != nil {
 		t.Fatalf("gas-burn activation reward rejected: %v", err)
 	}
 
+	const explicitTip = uint64(77)
+	tippedAVMTx := avmTx
+	tippedAVMTx.Fee += explicitTip
+	tippedReward, err := engine.authorizedRewardAmount(gasActivation, []core.Transaction{tippedAVMTx})
+	if err != nil {
+		t.Fatalf("post-activation tipped reward: %v", err)
+	}
+	if want := postActivationBase + explicitTip; tippedReward != want {
+		t.Fatalf("post-activation reward with separate tip = %d, want base plus tip %d",
+			tippedReward, want)
+	}
+	tippedBlock := buildBlock(gasActivation, tippedReward, tippedAVMTx)
+	if err := engine.validateCoinbasePolicy(tippedBlock); err != nil {
+		t.Fatalf("gas-burn activation rejected the separately tipped reward: %v", err)
+	}
+	legacyTippedBlock := buildBlock(gasActivation, postActivationBase+gasFee+explicitTip, tippedAVMTx)
+	if err := engine.validateCoinbasePolicy(legacyTippedBlock); err == nil {
+		t.Fatal("gas-burn activation accepted a reward that paid mandatory gas as a tip")
+	}
+
 	restarted := newEngine()
-	restartedReward, err := restarted.expectedAuthorizedRewardAmount(postActivationBlock)
+	restartedReward, err := restarted.expectedAuthorizedRewardAmount(tippedBlock)
 	if err != nil {
 		t.Fatalf("restarted validator expected reward: %v", err)
 	}
-	if restartedReward != postActivationReward {
-		t.Fatalf("restarted validator reward = %d, want %d", restartedReward, postActivationReward)
+	if restartedReward != tippedReward {
+		t.Fatalf("restarted validator reward = %d, want %d", restartedReward, tippedReward)
 	}
-	if err := restarted.validateCoinbasePolicy(postActivationBlock); err != nil {
+	if err := restarted.validateCoinbasePolicy(tippedBlock); err != nil {
 		t.Fatalf("restarted validator rejected activation block: %v", err)
 	}
 }

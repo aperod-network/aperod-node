@@ -48,11 +48,11 @@ func buildMintBlock(t *testing.T, dir string) (*store.DB, *core.Block, crypto.Ha
 	// Genesis block (height 0, no transactions).
 	genesis := &core.Block{
 		Header: core.BlockHeader{
-			Height:     0,
-			PrevHash:   crypto.Hash32{},
-			Timestamp:  time.Now().UnixNano(),
+			Height:       0,
+			PrevHash:     crypto.Hash32{},
+			Timestamp:    time.Now().UnixNano(),
 			ValidatorPub: pub,
-			MerkleRoot: core.MerkleRoot(nil),
+			MerkleRoot:   core.MerkleRoot(nil),
 		},
 	}
 	if serr := genesis.Header.Sign(priv); serr != nil {

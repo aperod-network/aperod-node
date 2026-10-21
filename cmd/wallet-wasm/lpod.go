@@ -48,7 +48,8 @@ func signLPoD(r lpodSignRequest, keys *wallet.DerivedKeys, source *core.OwnedUTX
 	address := crypto.AddressFromKeys(crypto.MainnetByte, keys.Keys)
 	var a core.LPoDPositionAction
 	var sourceKey crypto.Scalar32
-	if r.Action == "deposit" {
+	switch r.Action {
+	case "deposit":
 		if source == nil || source.Amount == 0 {
 			return nil, fmt.Errorf("select an exact owned source output")
 		}
@@ -69,7 +70,7 @@ func signLPoD(r lpodSignRequest, keys *wallet.DerivedKeys, source *core.OwnedUTX
 		if err != nil || pub != source.OneTimePub {
 			return nil, fmt.Errorf("source ownership mismatch")
 		}
-	} else if r.Action == "withdraw" {
+	case "withdraw":
 		if len(r.DepositJSON) > 4096 || json.Unmarshal([]byte(r.DepositJSON), &a) != nil {
 			return nil, fmt.Errorf("invalid canonical deposit")
 		}
@@ -93,7 +94,7 @@ func signLPoD(r lpodSignRequest, keys *wallet.DerivedKeys, source *core.OwnedUTX
 		a.Action = core.LPoDWithdraw
 		a.Nonce = nonce + 1
 		a.WithdrawAmount = amount
-	} else {
+	default:
 		return nil, fmt.Errorf("invalid LPoD action")
 	}
 	return core.BuildLPoDPositionTx(a, keys.Keys.Spend.Private, sourceKey)

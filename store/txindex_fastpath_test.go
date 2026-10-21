@@ -276,7 +276,7 @@ func TestFastForwardWithIndex_TrustsProvidedHashes(t *testing.T) {
 	blk1 := buildTxIdxBlock(t, priv, pub, 1, genesis.Hash(), 2)
 	blk2 := buildTxIdxBlock(t, priv, pub, 2, blk1.Hash(), 3)
 
-	// Assign each tx a synthetic (non-real) hash with a recognisable pattern.
+	// Assign each tx a synthetic (non-real) hash with a recognizable pattern.
 	// The real tx.Hash() values will be different from these.
 	type syntheticEntry struct {
 		hash   crypto.Hash32

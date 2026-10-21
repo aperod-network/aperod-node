@@ -21,7 +21,7 @@ func (e *Engine) CanSettleSale() bool {
 		return false
 	}
 	for _, member := range e.cfg.Registry.GetActiveValidators() {
-if member.Equals(e.localIdentity(height+1)) {
+		if member.Equals(e.localIdentity(height + 1)) {
 			return true
 		}
 	}

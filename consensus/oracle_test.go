@@ -123,11 +123,11 @@ func newOracleEngine(
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	return consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    15 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   validators,
-		MyKey:        myKey,
-		OracleURL:    oracleURL,
+		BlockTime:        15 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       validators,
+		MyKey:            myKey,
+		OracleURL:        oracleURL,
 	}, chain, mp, log)
 }
 
@@ -349,11 +349,11 @@ func TestOraclePrice_NoURLSkipsEmbedding(t *testing.T) {
 	// No OracleURL → embedding disabled.
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    15 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{pub},
-		MyKey:        lk,
-		OracleURL:    "", // intentionally empty
+		BlockTime:        15 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{pub},
+		MyKey:            lk,
+		OracleURL:        "", // intentionally empty
 	}, chain, mp, newNopLogger())
 
 	stop := make(chan struct{})
@@ -450,11 +450,11 @@ func TestOracleSlowFetch_DoesNotDelayBlockProduction(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    blockTime,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{pub},
-		MyKey:        lk,
-		OracleURL:    slowSrv.URL, // slow — responds after 2 s
+		BlockTime:        blockTime,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{pub},
+		MyKey:            lk,
+		OracleURL:        slowSrv.URL, // slow — responds after 2 s
 	}, chain, mp, newNopLogger())
 
 	stop := make(chan struct{})

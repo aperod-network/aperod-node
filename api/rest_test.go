@@ -484,6 +484,24 @@ func TestREST_AddressTxsBoundsScanAndPaginates(t *testing.T) {
 	if code, _ := restGet(t, srv, path+"?start_height=not-a-height"); code != http.StatusBadRequest {
 		t.Fatalf("invalid start_height status = %d, want 400", code)
 	}
+
+	code, trailingSlash := restGet(t, srv, path+"/")
+	if code != http.StatusOK || trailingSlash["scan_limited"] != true {
+		t.Fatalf("trailing-slash page status/scan_limited = %d/%v, want 200/true", code, trailingSlash["scan_limited"])
+	}
+}
+
+func TestREST_AddressTxsRejectsUnknownSubpaths(t *testing.T) {
+	srv, _ := buildChainServer(t, 0)
+	wk, _ := crypto.GenerateWalletKeys()
+	addr := crypto.AddressFromKeys(crypto.MainnetByte, wk)
+
+	for _, suffix := range []string{"/transactions/extra", "/unknown"} {
+		code, _ := restGet(t, srv, "/api/v1/address/"+addr.String()+suffix)
+		if code != http.StatusNotFound {
+			t.Errorf("suffix %q status = %d, want 404", suffix, code)
+		}
+	}
 }
 
 func TestREST_AddressTxs_MethodNotAllowed(t *testing.T) {
@@ -946,7 +964,7 @@ func TestREST_AddressUTXOs_MintHeightMatch(t *testing.T) {
 // TestREST_AddressUTXOs_StealthNotReturnedWithoutViewKey confirms that a
 // genuine stealth UTXO (TxPubKey ≠ zero, OneTimePub derived via ECDH) is
 // intentionally NOT returned by the address/utxos endpoint when no view key is
-// supplied.  This is the expected behaviour, not a bug — the server cannot
+// supplied.  This is the expected behavior, not a bug — the server cannot
 // reverse the Diffie-Hellman without the receiver's private view key.
 //
 // The second sub-test verifies that supplying view_key_hex resolves the gap:
@@ -1077,7 +1095,7 @@ func TestREST_AddressUTXOs_RollbackTransparent(t *testing.T) {
 	}
 }
 
-// TestREST_AddressUTXOs_RollbackCoinbase verifies the same rollback behaviour for
+// TestREST_AddressUTXOs_RollbackCoinbase verifies the same rollback behavior for
 // coinbase (height-offset mint) outputs, where OneTimePub = spend_pub + height*G.
 func TestREST_AddressUTXOs_RollbackCoinbase(t *testing.T) {
 	srv, utxos := buildUTXOServer(t)
@@ -1267,7 +1285,7 @@ func TestREST_ScanOutputs_ReturnsStealthFields(t *testing.T) {
 	}
 }
 
-// TestREST_ScanOutputs_Pagination verifies that limit and from_height are honoured.
+// TestREST_ScanOutputs_Pagination verifies that limit and from_height are honored.
 func TestREST_ScanOutputs_Pagination(t *testing.T) {
 	srv, _ := buildChainServer(t, 5)
 
@@ -1368,6 +1386,25 @@ func TestREST_AddressScan_PostViewKey(t *testing.T) {
 		t.Error("amount_napr must be non-null when view key is provided via POST body")
 	} else if entry["amount_napr"] != fmt.Sprint(testAmt) {
 		t.Errorf("amount_napr = %v, want %d", entry["amount_napr"], testAmt)
+	}
+}
+
+func TestREST_AddressScan_RejectsOversizedBody(t *testing.T) {
+	srv, _ := buildUTXOServer(t)
+	body := append([]byte(`{"view_key_hex":"`), bytes.Repeat([]byte("a"), 5000)...)
+	body = append(body, []byte(`"}`)...)
+	code, _ := restPostJSON(t, srv, "/api/v1/address/invalid/scan", body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("oversized scan body status = %d, want 400", code)
+	}
+}
+
+func TestREST_AddressScan_RejectsMalformedViewKeyBeforeScanning(t *testing.T) {
+	srv, _ := buildUTXOServer(t)
+	body := []byte(`{"view_key_hex":"not-hex"}`)
+	code, _ := restPostJSON(t, srv, "/api/v1/address/invalid/scan", body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("malformed view key status = %d, want 400", code)
 	}
 }
 

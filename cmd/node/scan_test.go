@@ -327,9 +327,9 @@ func TestStartupScanGCCadenceSingleBlockMultipleThresholds(t *testing.T) {
 // after step 3, isKnownValidator() fails for every incoming block, and step 5
 // times out with the chain stuck at height 10.
 func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
-	const chainHeight = 10   // total blocks produced by the validator
-	const snapAtHeight = 5   // intermediate snapshot that pre-dates registry data
-	const outsPerBlock = 2   // coinbase outputs per block
+	const chainHeight = 10 // total blocks produced by the validator
+	const snapAtHeight = 5 // intermediate snapshot that pre-dates registry data
+	const outsPerBlock = 2 // coinbase outputs per block
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -457,13 +457,13 @@ func TestRelayNodeOldSnapshotAcceptsNewBlocks(t *testing.T) {
 
 	relayMp := core.NewMempool(core.DefaultMempoolConfig())
 	relayEng := consensus.NewEngine(consensus.Config{
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   activeValidators, // seeded by the observed-producer fallback
-		Registry:     registry,
-		MyKey:        nil, // non-validator relay: never produces blocks
+		BlockTime:                20 * time.Millisecond,
+		BFTThreshold:             0.667,
+		Validators:               activeValidators, // seeded by the observed-producer fallback
+		Registry:                 registry,
+		MyKey:                    nil, // non-validator relay: never produces blocks
 		RingCTV4ActivationHeight: ^uint64(0),
-		OnCanonicalBlock: noopCanonicalPersistence,
+		OnCanonicalBlock:         noopCanonicalPersistence,
 	}, relayChain, relayMp, discardLog())
 	relayEng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 

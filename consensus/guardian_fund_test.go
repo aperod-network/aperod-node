@@ -40,7 +40,7 @@ func TestGuardianFundConsensusPlacementAndHeight(t *testing.T) {
 		{"late", 3, []core.Transaction{guardian}},
 		{"missing", 2, nil},
 		{"duplicate", 2, []core.Transaction{guardian, guardian}},
-		{"wrong_position", 2, []core.Transaction{coinbase, core.Transaction{Version: core.TxVersionBase}, guardian}},
+		{"wrong_position", 2, []core.Transaction{coinbase, {Version: core.TxVersionBase}, guardian}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

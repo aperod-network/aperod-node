@@ -89,25 +89,31 @@ func run() error {
 		SaleRemaining: left, SaleAuthority: head.Header.ValidatorPub}
 	m := store.SaleMigration{Checkpoint: cp, Reconciliation: r}
 	if *sign {
-if *cfgPath == "" { return fmt.Errorf("explicit node config required for signing") }
-cfg, err := config.Load(*cfgPath)
-if err != nil { return err }
-authority, err := signingAuthority(cfg.Consensus, d)
-if err != nil { return err }
-certificate, err := d.LoadFinalityCertificate()
-if err != nil || certificate == nil || certificate.Height != height || certificate.BlockHash != parent {
-return fmt.Errorf("exact canonical parent finality certificate required before signing")
-}
-producerVote := false
-message := crypto.HashBytes([]byte("aperod/finalize/v1"), parent[:])
-for _, vote := range certificate.Votes {
-if vote.Validator.Equals(head.Header.ValidatorPub) && authority.Authority(vote.Validator, height).Verify(message, vote.Signature) {
-producerVote = true
-}
-}
-if !producerVote {
-return fmt.Errorf("canonical producer finality vote required before signing")
-}
+		if *cfgPath == "" {
+			return fmt.Errorf("explicit node config required for signing")
+		}
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			return err
+		}
+		authority, err := signingAuthority(cfg.Consensus, d)
+		if err != nil {
+			return err
+		}
+		certificate, err := d.LoadFinalityCertificate()
+		if err != nil || certificate == nil || certificate.Height != height || certificate.BlockHash != parent {
+			return fmt.Errorf("exact canonical parent finality certificate required before signing")
+		}
+		producerVote := false
+		message := crypto.HashBytes([]byte("aperod/finalize/v1"), parent[:])
+		for _, vote := range certificate.Votes {
+			if vote.Validator.Equals(head.Header.ValidatorPub) && authority.Authority(vote.Validator, height).Verify(message, vote.Signature) {
+				producerVote = true
+			}
+		}
+		if !producerVote {
+			return fmt.Errorf("canonical producer finality vote required before signing")
+		}
 		info, err := os.Stat(cfg.Consensus.ValidatorKey)
 		if err != nil || info.Mode().Perm()&0077 != 0 {
 			return fmt.Errorf("protected producer key file required")
@@ -122,12 +128,12 @@ return fmt.Errorf("canonical producer finality vote required before signing")
 			return fmt.Errorf("invalid configured signer")
 		}
 		defer key.Destroy()
-if !key.Public().Equals(authority.Authority(head.Header.ValidatorPub, height+1)) {
+		if !key.Public().Equals(authority.Authority(head.Header.ValidatorPub, height+1)) {
 			return fmt.Errorf("signer is not the canonical parent producer")
 		}
-// Sale transactions are signed by the active key, not the retained stake ID.
-cp.SaleAuthority = key.Public()
-m.Checkpoint.SaleAuthority = key.Public()
+		// Sale transactions are signed by the active key, not the retained stake ID.
+		cp.SaleAuthority = key.Public()
+		m.Checkpoint.SaleAuthority = key.Public()
 		signature, err := key.Sign(cp.Message())
 		if err != nil {
 			return err
@@ -159,8 +165,8 @@ m.Checkpoint.SaleAuthority = key.Public()
 	if err := f.Close(); err != nil {
 		return err
 	}
-checkpointHash := cp.Message()
-fmt.Printf("epoch_proposal height=%d available_napro=%d checkpoint=%x historical_supply_verified=false signed=%t\n", height+1, left, checkpointHash[:], *sign)
+	checkpointHash := cp.Message()
+	fmt.Printf("epoch_proposal height=%d available_napro=%d checkpoint=%x historical_supply_verified=false signed=%t\n", height+1, left, checkpointHash[:], *sign)
 	return nil
 }
 

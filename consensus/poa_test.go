@@ -83,11 +83,11 @@ func buildValidatorGenesisAndBlock(t *testing.T) (
 	validatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	validatorEng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{validatorPub},
-		Registry:     validatorReg,
-		MyKey:        lk,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{validatorPub},
+		Registry:         validatorReg,
+		MyKey:            lk,
 	}, validatorChain, validatorMp, newNopLogger())
 	validatorEng.SetTxVerifier(core.NewTxVerifier(validatorUTXOs), validatorUTXOs)
 
@@ -129,8 +129,8 @@ func TestNonValidatorAcceptsBlockFromRealValidator(t *testing.T) {
 	nonValidatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	nonValidatorEng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
 		// ← genesis validator's pub key (the fix): isKnownValidator() will return true.
 		Validators: []crypto.ValidatorPubKey{validatorPub},
 		Registry:   nonValidatorReg,
@@ -164,7 +164,7 @@ func TestNonValidatorAcceptsBlockFromRealValidator(t *testing.T) {
 
 // TestNonValidatorRejectsBlock_WhenSeededWithOwnKey verifies the REGRESSION
 // scenario: if the non-validator engine seeds its registry with its own random
-// P2P-identity key (the pre-fix behaviour), the incoming block from the real
+// P2P-identity key (the pre-fix behavior), the incoming block from the real
 // validator is rejected because isKnownValidator() returns false.
 //
 // This test will FAIL if main.go regresses to:
@@ -196,8 +196,8 @@ func TestNonValidatorRejectsBlock_WhenSeededWithOwnKey(t *testing.T) {
 	nonValidatorMp := core.NewMempool(core.DefaultMempoolConfig())
 	nonValidatorEng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
 		// ← the node's OWN key (the regression): isKnownValidator() will return false
 		//   for the real validator's block → block must be rejected.
 		Validators: []crypto.ValidatorPubKey{nodePub},
@@ -261,13 +261,13 @@ func buildEngineWithGenesis(t *testing.T) (
 	reg := core.NewValidatorRegistry()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng = consensus.NewEngine(consensus.Config{
-		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{validatorPub},
-		Registry:     reg,
-		MyKey:        nil, // relay node — never produces blocks
-RingCTV4ActivationHeight: ^uint64(0),
+		OnCanonicalBlock:         noopCanonicalPersistence,
+		BlockTime:                20 * time.Millisecond,
+		BFTThreshold:             0.667,
+		Validators:               []crypto.ValidatorPubKey{validatorPub},
+		Registry:                 reg,
+		MyKey:                    nil, // relay node — never produces blocks
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
 	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
@@ -384,7 +384,7 @@ func TestTimejackingGuard_FutureBlockRejected(t *testing.T) {
 // sync on a restarting relay node.
 func TestCrashRecovery_RelayFillsMultiHourGap(t *testing.T) {
 	const (
-		numBlocks   = 20           // blocks the validator produced while relay was offline
+		numBlocks   = 20            // blocks the validator produced while relay was offline
 		gapDuration = 4 * time.Hour // simulated outage duration
 	)
 
@@ -451,13 +451,13 @@ func TestCrashRecovery_RelayFillsMultiHourGap(t *testing.T) {
 	relayMp := core.NewMempool(core.DefaultMempoolConfig())
 	relayEng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
 		// Seeded with the genesis validator key so isKnownValidator() returns true.
-		Validators: []crypto.ValidatorPubKey{validatorPub},
-		Registry:   relayReg,
-		MyKey:      nil, // relay node — never produces blocks
-RingCTV4ActivationHeight: ^uint64(0),
+		Validators:               []crypto.ValidatorPubKey{validatorPub},
+		Registry:                 relayReg,
+		MyKey:                    nil, // relay node — never produces blocks
+		RingCTV4ActivationHeight: ^uint64(0),
 	}, relayChain, relayMp, newNopLogger())
 	relayEng.SetTxVerifier(core.NewTxVerifier(relayUTXOs), relayUTXOs)
 
@@ -482,10 +482,8 @@ RingCTV4ActivationHeight: ^uint64(0),
 		// Poll until chain advances — fail fast if the engine stalls (which would
 		// indicate the timejacking guard incorrectly rejected a past-ts block).
 		deadline := time.After(500 * time.Millisecond)
-		for {
-			if relayChain.Height() >= wantHeight {
-				break
-			}
+		for relayChain.Height() < wantHeight {
+
 			select {
 			case <-deadline:
 				t.Fatalf("relay stalled at height %d (want %d) — "+
@@ -559,11 +557,11 @@ func TestTimejackingBan_PeerBannedAfterThreshold(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
-		BlockTime:    20 * time.Millisecond,
-		BFTThreshold: 0.667,
-		Validators:   []crypto.ValidatorPubKey{validatorPub},
-		Registry:     reg,
-		MyKey:        nil, // relay — never produces blocks
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{validatorPub},
+		Registry:         reg,
+		MyKey:            nil, // relay — never produces blocks
 
 		TimestampBanThreshold: threshold,
 		OnTimestampBan: func(pub crypto.ValidatorPubKey, count int) {

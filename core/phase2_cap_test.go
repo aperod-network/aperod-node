@@ -91,7 +91,7 @@ func TestSpentDecoyPool_CapEnforced(t *testing.T) {
 		smallCap, smallCap+1)
 }
 
-// TestSpentDecoyPool_CapEnforced_ViaApplyBlock verifies the same cap behaviour
+// TestSpentDecoyPool_CapEnforced_ViaApplyBlock verifies the same cap behavior
 // through ApplyBlock (the live-chain path), not just the startup-replay path.
 // The pool must not grow beyond maxSpentDecoys even when new blocks are committed.
 func TestSpentDecoyPool_CapEnforced_ViaApplyBlock(t *testing.T) {

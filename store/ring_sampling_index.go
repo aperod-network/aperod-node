@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 // These are derived local indexes, not consensus/wire-format changes. rm/

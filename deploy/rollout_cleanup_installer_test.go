@@ -46,10 +46,10 @@ func TestRolloutCleanupHooksStandaloneLayout(t *testing.T) {
 	for _, name := range []string{
 		"test-rollout-cleanup-hooks.sh", "update-node.sh", "setup-rollout-cleanup.sh",
 		"aperod-rollout-cleanup.service", "aperod-rollout-cleanup.timer",
-"aperod-historical-retirement.service", "aperod-historical-retirement.timer",
+		"aperod-historical-retirement.service", "aperod-historical-retirement.timer",
 		"rollout_cleanup/__init__.py", "rollout_cleanup/cli.py",
-"rollout_cleanup/runtime.py", "rollout_cleanup/provider.py", "rollout_cleanup/retirement.py",
- "rollout_cleanup/transition.py",
+		"rollout_cleanup/runtime.py", "rollout_cleanup/provider.py", "rollout_cleanup/retirement.py",
+		"rollout_cleanup/transition.py",
 	} {
 		content, err := os.ReadFile(name)
 		if err != nil {

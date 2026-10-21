@@ -136,11 +136,14 @@ wait_for_server() {
   local deadline=$(( $(date +%s) + timeout ))
   while (( $(date +%s) < deadline )); do
     if python3 -c "
-import urllib.request, sys
+import urllib.error, urllib.request, sys
 try:
-    urllib.request.urlopen('http://127.0.0.1:$port/', timeout=0.5)
+    with urllib.request.urlopen('http://127.0.0.1:$port/', timeout=0.5):
+        pass
+except urllib.error.HTTPError:
+    pass  # an HTTP response, including 4xx/5xx, proves the listener is up
 except Exception:
-    pass  # non-200 raises but the server IS up
+    sys.exit(1)
 sys.exit(0)
 " 2>/dev/null; then
       return 0
@@ -298,7 +301,7 @@ NODE_API_URL="http://127.0.0.1:${PORT3}" \
   SUPPORT_BOT_TOKEN="" \
   SUPPORT_ADMIN_CHAT_ID="" \
   PATH="$FAKE3:$PATH" \
-  bash "$WATCHDOG_SH" >/dev/null 2>&1
+  bash "$WATCHDOG_SH" >"$TMPDIR_TEST/t3-output.log" 2>&1
 WDEXIT3=$?
 
 if [[ $WDEXIT3 -eq 0 ]]; then
@@ -308,9 +311,14 @@ else
 fi
 
 if [[ -f "$LOG3" ]] && grep -q "systemctl restart aperod-node" "$LOG3"; then
-  pass "systemctl was called with 'restart aperod-node' on connection refused"
+  pass "systemctl restart was called on connection refused"
 else
   fail "systemctl was NOT called on connection refused (log: $(cat "$LOG3" 2>/dev/null || echo '<empty>'))"
+fi
+if grep -Eq 'returned HTTP 000([[:space:]]|$)' "$TMPDIR_TEST/t3-output.log"; then
+  pass "connection-refused status is logged as HTTP 000, not a duplicated code"
+else
+  fail "connection-refused status was not logged accurately (output: $(cat "$TMPDIR_TEST/t3-output.log" 2>/dev/null || echo '<empty>'))"
 fi
 
 # =============================================================================
@@ -548,9 +556,9 @@ STUB
 }
 
 # =============================================================================
-# Test 9: valid integer → correct OnBootSec/OnUnitActiveSec in the drop-in
+# Test 9: valid integer → correct OnActiveSec/OnUnitInactiveSec in the drop-in
 # =============================================================================
-section "Test 9: valid WATCHDOG_INTERVAL_SECS=30 → drop-in contains OnBootSec=30"
+section "Test 9: valid WATCHDOG_INTERVAL_SECS=30 → drop-in contains OnActiveSec=30"
 
 T9_DIR=$(mktemp -d "$TMPDIR_TEST/t9-XXXXXXXX")
 T9_ENV="$T9_DIR/watchdog.env"
@@ -580,16 +588,16 @@ else
   fail "drop-in file was NOT created at $T9_DROPIN"
 fi
 
-if grep -q "^OnBootSec=30$" "$T9_DROPIN" 2>/dev/null; then
-  pass "drop-in contains OnBootSec=30"
+if grep -q "^OnActiveSec=30$" "$T9_DROPIN" 2>/dev/null; then
+  pass "drop-in contains OnActiveSec=30"
 else
-  fail "drop-in does NOT contain OnBootSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT contain OnActiveSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q "^OnUnitActiveSec=30$" "$T9_DROPIN" 2>/dev/null; then
-  pass "drop-in contains OnUnitActiveSec=30"
+if grep -q "^OnUnitInactiveSec=30$" "$T9_DROPIN" 2>/dev/null; then
+  pass "drop-in contains OnUnitInactiveSec=30"
 else
-  fail "drop-in does NOT contain OnUnitActiveSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT contain OnUnitInactiveSec=30 (content: $(cat "$T9_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
 if grep -q "daemon-reload" "$T9_SC_LOG" 2>/dev/null; then
@@ -632,16 +640,16 @@ else
 fi
 
 T10_DROPIN="$T10_DROPIN_DIR/interval.conf"
-if grep -q "^OnBootSec=60$" "$T10_DROPIN" 2>/dev/null; then
-  pass "drop-in defaults to OnBootSec=60 when key is missing"
+if grep -q "^OnActiveSec=60$" "$T10_DROPIN" 2>/dev/null; then
+  pass "drop-in defaults to OnActiveSec=60 when key is missing"
 else
-  fail "drop-in does NOT contain OnBootSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT contain OnActiveSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q "^OnUnitActiveSec=60$" "$T10_DROPIN" 2>/dev/null; then
-  pass "drop-in defaults to OnUnitActiveSec=60 when key is missing"
+if grep -q "^OnUnitInactiveSec=60$" "$T10_DROPIN" 2>/dev/null; then
+  pass "drop-in defaults to OnUnitInactiveSec=60 when key is missing"
 else
-  fail "drop-in does NOT contain OnUnitActiveSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT contain OnUnitInactiveSec=60 (content: $(cat "$T10_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
 # =============================================================================
@@ -678,16 +686,16 @@ else
 fi
 
 T11_DROPIN="$T11_DROPIN_DIR/interval.conf"
-if grep -q "^OnBootSec=60$" "$T11_DROPIN" 2>/dev/null; then
-  pass "drop-in falls back to OnBootSec=60 for value below minimum"
+if grep -q "^OnActiveSec=60$" "$T11_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnActiveSec=60 for value below minimum"
 else
   fail "drop-in does NOT fall back to 60 for value below minimum (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q "^OnUnitActiveSec=60$" "$T11_DROPIN" 2>/dev/null; then
-  pass "drop-in falls back to OnUnitActiveSec=60 for value below minimum"
+if grep -q "^OnUnitInactiveSec=60$" "$T11_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnUnitInactiveSec=60 for value below minimum"
 else
-  fail "drop-in does NOT fall back to 60 for OnUnitActiveSec (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT fall back to 60 for OnUnitInactiveSec (content: $(cat "$T11_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
 # =============================================================================
@@ -724,16 +732,16 @@ else
 fi
 
 T12_DROPIN="$T12_DROPIN_DIR/interval.conf"
-if grep -q "^OnBootSec=60$" "$T12_DROPIN" 2>/dev/null; then
-  pass "drop-in falls back to OnBootSec=60 for non-integer"
+if grep -q "^OnActiveSec=60$" "$T12_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnActiveSec=60 for non-integer"
 else
   fail "drop-in does NOT fall back to 60 for non-integer (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
-if grep -q "^OnUnitActiveSec=60$" "$T12_DROPIN" 2>/dev/null; then
-  pass "drop-in falls back to OnUnitActiveSec=60 for non-integer"
+if grep -q "^OnUnitInactiveSec=60$" "$T12_DROPIN" 2>/dev/null; then
+  pass "drop-in falls back to OnUnitInactiveSec=60 for non-integer"
 else
-  fail "drop-in does NOT fall back to 60 for OnUnitActiveSec (non-integer) (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
+  fail "drop-in does NOT fall back to 60 for OnUnitInactiveSec (non-integer) (content: $(cat "$T12_DROPIN" 2>/dev/null || echo '<missing>'))"
 fi
 
 fi  # end of set-interval tests block (script exists guard)
@@ -1969,6 +1977,153 @@ if [[ $T37_EXIT -eq 0 ]] &&
 else
   fail "malformed active-enter timestamp did not fail closed (exit=$T37_EXIT, systemctl=$(cat "$T37_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T37_OUTPUT" 2>/dev/null || echo '<empty>'))"
 fi
+
+# =============================================================================
+# Test 38: real API stop during a slow graceful snapshot, followed by recovery
+# =============================================================================
+section "Test 38: stopped API during slow snapshot does not restart node; recovery remains healthy"
+
+T38_DIR=$(mktemp -d "$TMPDIR_TEST/t38-XXXXXXXX")
+T38_NODE_DATA_DIR="$T38_DIR/node-data"
+T38_STATE_DIR="$T38_DIR/watchdog-state"
+T38_SC_LOG="$T38_DIR/systemctl.log"
+T38_OUTPUT="$T38_DIR/output.log"
+mkdir -p "$T38_NODE_DATA_DIR" "$T38_STATE_DIR"
+
+T38_SC=$(mktemp -d "$TMPDIR_TEST/t38-sc-XXXXXXXX")
+cat >"$T38_SC/systemctl" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
+  echo 15min
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
+  echo active
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=SubState --value" ]]; then
+  echo running
+  exit 0
+fi
+echo "systemctl \$*" >> "$T38_SC_LOG"
+STUB
+chmod +x "$T38_SC/systemctl"
+
+T38_PORT=$(find_free_port)
+T38_API_URL="http://127.0.0.1:${T38_PORT}"
+T38_SRV_PID=$(start_json_server "$T38_PORT" 200 '{"height":900,"syncing":false,"peer_count":1}')
+if wait_for_server "$T38_PORT" 5; then
+  pass "real local HTTP API is healthy before graceful shutdown"
+else
+  fail "real local HTTP API did not start before graceful shutdown"
+fi
+
+NODE_API_URL="$T38_API_URL" \
+  STATE_DIR="$T38_STATE_DIR" \
+  NODE_DATA_DIR="$T38_NODE_DATA_DIR" \
+  TIMEOUT_SECS="1" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T38_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T38_OUTPUT" 2>&1
+T38_HEALTHY_EXIT=$?
+
+# Keep a live process with the same PID/start-time marker while the HTTP API is
+# stopped. This models the node's SIGTERM handler remaining alive during a slow
+# snapshot save; the watchdog performs multiple real HTTP probes in that window.
+sleep 30 &
+T38_NODE_PID=$!
+T38_START_ID=$(sed 's/^.*) //' "/proc/$T38_NODE_PID/stat" | awk '{print $20}')
+printf '%s %s %s\n' "$T38_NODE_PID" "$T38_START_ID" "$(date +%s)" \
+  >"$T38_NODE_DATA_DIR/shutdown-intent"
+
+kill "$T38_SRV_PID" 2>/dev/null || true
+wait "$T38_SRV_PID" 2>/dev/null || true
+T38_SRV_PID=""
+T38_DOWN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
+  "$T38_API_URL/api/v1/status" 2>/dev/null || true)
+if [[ "$T38_DOWN_CODE" == "000" ]]; then
+  pass "real API listener is confirmed stopped during the simulated snapshot"
+else
+  fail "API listener did not stop (curl status: ${T38_DOWN_CODE:-empty})"
+fi
+
+for T38_CHECK in 1 2; do
+  NODE_API_URL="$T38_API_URL" \
+    STATE_DIR="$T38_STATE_DIR" \
+    NODE_DATA_DIR="$T38_NODE_DATA_DIR" \
+    TIMEOUT_SECS="1" \
+    RAM_THRESHOLD_MB="0" \
+    DISK_WARN_PCT="0" \
+    STALL_CHECKS_MAX="0" \
+    PEER_WAIT_MINS="0" \
+    SUPPORT_BOT_TOKEN="" \
+    SUPPORT_ADMIN_CHAT_ID="" \
+    PATH="$T38_SC:$PATH" \
+    bash "$WATCHDOG_SH" >>"$T38_OUTPUT" 2>&1
+  T38_CHECK_EXIT=$?
+  if [[ $T38_CHECK_EXIT -ne 0 ]]; then
+    fail "watchdog failed during shutdown probe $T38_CHECK (exit=$T38_CHECK_EXIT)"
+  fi
+  sleep 2
+done
+
+if [[ ! -s "$T38_SC_LOG" ]] &&
+   [[ $(grep -Fc 'valid graceful-shutdown intent' "$T38_OUTPUT" 2>/dev/null || echo 0) -ge 2 ]] &&
+   [[ ! -e "$T38_STATE_DIR/watchdog-last-alert" ]]; then
+  pass "slow snapshot window with a stopped API produced no restart or outage alert"
+else
+  fail "watchdog acted on the expected shutdown outage (systemctl=$(cat "$T38_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T38_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+kill "$T38_NODE_PID" 2>/dev/null || true
+wait "$T38_NODE_PID" 2>/dev/null || true
+rm -f "$T38_NODE_DATA_DIR/shutdown-intent"
+
+T38_SRV_PID=$(start_json_server "$T38_PORT" 200 '{"height":900,"syncing":false,"peer_count":1}')
+if wait_for_server "$T38_PORT" 5; then
+  pass "real local HTTP API recovered after the snapshot window"
+else
+  fail "real local HTTP API did not recover after the snapshot window"
+fi
+T38_RECOVERY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
+  "$T38_API_URL/api/v1/status" 2>/dev/null || true)
+if [[ "$T38_RECOVERY_CODE" == "200" ]]; then
+  pass "recovered API returns HTTP 200"
+else
+  fail "recovered API returned HTTP ${T38_RECOVERY_CODE:-empty}, expected 200"
+fi
+
+NODE_API_URL="$T38_API_URL" \
+  STATE_DIR="$T38_STATE_DIR" \
+  NODE_DATA_DIR="$T38_NODE_DATA_DIR" \
+  TIMEOUT_SECS="1" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T38_SC:$PATH" \
+  bash "$WATCHDOG_SH" >>"$T38_OUTPUT" 2>&1
+T38_RECOVERY_EXIT=$?
+kill "$T38_SRV_PID" 2>/dev/null || true
+wait "$T38_SRV_PID" 2>/dev/null || true
+T38_SRV_PID=""
+
+if [[ $T38_HEALTHY_EXIT -eq 0 && $T38_RECOVERY_EXIT -eq 0 &&
+      ! -s "$T38_SC_LOG" && ! -e "$T38_STATE_DIR/watchdog-last-alert" &&
+      ! -e "$T38_NODE_DATA_DIR/shutdown-intent" ]]; then
+  pass "healthy-before and recovered-after API checks did not schedule a restart"
+else
+  fail "API recovery check changed watchdog state unexpectedly (systemctl=$(cat "$T38_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T38_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+kill "$T38_NODE_PID" 2>/dev/null || true
+wait "$T38_NODE_PID" 2>/dev/null || true
 
 # =============================================================================
 # Summary

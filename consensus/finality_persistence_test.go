@@ -1,9 +1,11 @@
 package consensus
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"sort"
 	"testing"
 
 	"github.com/aperod/aperod/core"
@@ -114,6 +116,128 @@ func TestForgedFinalityCertificateFailsClosed(t *testing.T) {
 	}
 	if !engine.halted.Load() {
 		t.Fatal("node did not halt on forged durable finality evidence")
+	}
+}
+
+func TestFinalityCommitteeMigrationRestoresCertificateOnlyWithPinnedQuorum(t *testing.T) {
+	historicalPriv, historicalPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var authorityPrivs []crypto.ValidatorPrivKey
+	var authorities []crypto.ValidatorPubKey
+	for range 2 {
+		priv, pub, err := crypto.GenerateValidatorKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		authorityPrivs = append(authorityPrivs, priv)
+		authorities = append(authorities, pub)
+	}
+
+	chain, block := finalityTestChain(t, "migration-anchor")
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rawBlock, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutRawBlock(block.Hash(), block.Header.Height, rawBlock); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutTip(block.Hash(), block.Header.Height); err != nil {
+		t.Fatal(err)
+	}
+	certificateMessage := crypto.HashBytes([]byte("aperod/finalize/v1"), block.Hash().Bytes())
+	historicalVote, err := historicalPriv.Sign(certificateMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := store.FinalityCertificate{
+		Version: 1, Height: block.Header.Height, BlockHash: block.Hash(),
+		Votes: []store.FinalityVote{{Validator: historicalPub, Signature: historicalVote}},
+	}
+	if err := db.SaveFinalityCertificate(certificate); err != nil {
+		t.Fatal(err)
+	}
+
+	type signer struct {
+		approval store.FinalityMigrationApproval
+		priv     crypto.ValidatorPrivKey
+	}
+	signers := make([]signer, len(authorities))
+	for i, authority := range authorities {
+		signers[i] = signer{
+			approval: store.FinalityMigrationApproval{
+				Validator: authority,
+				Signature: make([]byte, 64),
+			},
+			priv: authorityPrivs[i],
+		}
+	}
+	sort.Slice(signers, func(i, j int) bool {
+		return bytes.Compare(signers[i].approval.Validator, signers[j].approval.Validator) < 0
+	})
+	migration := &store.FinalityCommitteeMigration{
+		Version:              store.FinalityCommitteeMigrationVersion,
+		Genesis:              chain.Genesis().Hash(),
+		CertificateHeight:    certificate.Height,
+		CertificateBlockHash: certificate.BlockHash,
+		ApprovalHeight:       block.Header.Height,
+		ApprovalBlockHash:    block.Hash(),
+		BFTThresholdPPM:      667_000,
+		HistoricalCommittee:  []crypto.ValidatorPubKey{historicalPub},
+	}
+	for _, signer := range signers {
+		migration.Approvals = append(migration.Approvals, signer.approval)
+	}
+	approvalMessage, err := migration.SigningMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range signers {
+		signature, err := signers[i].priv.Sign(approvalMessage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		migration.Approvals[i].Signature = signature
+	}
+
+	registry := core.NewValidatorRegistry()
+	registry.InitFromGenesis(authorities, core.MinStakeNAPR*10)
+	cfg := Config{
+		Validators:                        authorities,
+		Registry:                          registry,
+		Store:                             db,
+		BFTThreshold:                      0.667,
+		FinalityMigration:                 migration,
+		FinalityMigrationTrustAuthorities: authorities,
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	engine := NewEngine(cfg, chain, core.NewMempool(core.DefaultMempoolConfig()), log)
+	if engine.halted.Load() || !engine.IsFinalizedHash(certificate.Height, certificate.BlockHash) {
+		t.Fatal("valid signed migration did not restore the exact historical certificate")
+	}
+
+	insufficient := *migration
+	insufficient.Approvals = append([]store.FinalityMigrationApproval(nil), migration.Approvals[:1]...)
+	insufficientCfg := cfg
+	insufficientCfg.FinalityMigration = &insufficient
+	if !NewEngine(insufficientCfg, chain, core.NewMempool(core.DefaultMempoolConfig()), log).halted.Load() {
+		t.Fatal("migration with fewer than the pinned authority quorum was accepted")
+	}
+
+	tampered := *migration
+	tampered.Approvals = append([]store.FinalityMigrationApproval(nil), migration.Approvals...)
+	tampered.Approvals[0].Signature = append([]byte(nil), tampered.Approvals[0].Signature...)
+	tampered.Approvals[0].Signature[0] ^= 0x01
+	tamperedCfg := cfg
+	tamperedCfg.FinalityMigration = &tampered
+	if !NewEngine(tamperedCfg, chain, core.NewMempool(core.DefaultMempoolConfig()), log).halted.Load() {
+		t.Fatal("tampered migration signature was accepted")
 	}
 }
 

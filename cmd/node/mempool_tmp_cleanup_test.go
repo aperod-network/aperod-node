@@ -196,7 +196,7 @@ func TestMempoolStartupStaleTmpAlongsideSavedEntries(t *testing.T) {
 		t.Errorf("stale .tmp still present after startupLoadMempool (err=%v)", err)
 	}
 	// Note: Load() removes mempool.json after consuming it — that is correct
-	// behaviour (prevents double-replay on a second restart).  We do not assert
+	// behavior (prevents double-replay on a second restart).  We do not assert
 	// the file is still present; we assert the transaction was restored instead.
 
 	// Cleanup message must appear.

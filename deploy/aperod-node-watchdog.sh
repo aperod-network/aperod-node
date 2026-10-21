@@ -274,9 +274,15 @@ write_timestamp "${LAST_CHECK_FILE}"
 # Health check (body captured for block-height parsing)
 # ---------------------------------------------------------------------------
 _body_file=$(mktemp /tmp/aperod-wdog-XXXXXX)
-HTTP_CODE=$(curl -s -o "${_body_file}" -w "%{http_code}" \
+if HTTP_CODE=$(curl -s -o "${_body_file}" -w "%{http_code}" \
   --max-time "${TIMEOUT_SECS}" \
-  "${STATUS_URL}" 2>/dev/null || echo "000")
+  "${STATUS_URL}" 2>/dev/null); then
+  :
+else
+  # curl still prints %{http_code} (usually 000) when it exits nonzero. Do not
+  # append another 000 to that output; preserve the real transport status.
+  HTTP_CODE="${HTTP_CODE:-000}"
+fi
 RESPONSE_BODY=$(cat "${_body_file}" 2>/dev/null || echo "")
 rm -f "${_body_file}"
 

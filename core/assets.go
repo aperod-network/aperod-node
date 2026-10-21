@@ -84,7 +84,7 @@ func (p AssetPayload) validate() error {
 
 // ─── Encoding ─────────────────────────────────────────────────────────────────
 
-// EncodeAssetPayload serialises p into the Transaction.Extra binary format.
+// EncodeAssetPayload serializes p into the Transaction.Extra binary format.
 // The result is at most 255 bytes (enforced by Transaction.Validate).
 func EncodeAssetPayload(p AssetPayload) ([]byte, error) {
 	if err := p.validate(); err != nil {

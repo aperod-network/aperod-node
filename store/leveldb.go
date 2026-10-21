@@ -11,11 +11,12 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/aperod/aperod/core"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
 )
 
 // Key prefixes separate different namespaces in the single LevelDB instance.
@@ -37,12 +38,14 @@ type DB struct {
 	db          *leveldb.DB
 	path        string
 	canonicalMu sync.Mutex
-ringMu      sync.Mutex // serializes canonical rm/ and dense sampling-index writes
+	ringMu      sync.Mutex // serializes canonical rm/ and dense sampling-index writes
 }
 
 // Open opens or creates a LevelDB database at path.
 func Open(path string) (*DB, error) {
-	if err := CheckRingMaintenanceFence(path); err != nil { return nil, err }
+	if err := CheckRingMaintenanceFence(path); err != nil {
+		return nil, err
+	}
 	opts := &opt.Options{
 		BlockCacheCapacity:  32 * opt.MiB,
 		WriteBuffer:         16 * opt.MiB,
@@ -58,7 +61,9 @@ func Open(path string) (*DB, error) {
 // OpenReadOnly opens an existing LevelDB without recovery, compaction or writes.
 // The caller must close the returned handle.
 func OpenReadOnly(path string) (*DB, error) {
-	if err := CheckRingMaintenanceFence(path); err != nil { return nil, err }
+	if err := CheckRingMaintenanceFence(path); err != nil {
+		return nil, err
+	}
 	opts := &opt.Options{ReadOnly: true, ErrorIfMissing: true}
 	db, err := leveldb.OpenFile(path, opts)
 	if err != nil {
@@ -276,20 +281,20 @@ type StoredUTXO struct {
 
 // PutUTXO persists a UTXO.
 func (d *DB) PutUTXO(txHash crypto.Hash32, outIdx uint32, u *StoredUTXO) error {
-if u == nil {
-return fmt.Errorf("nil UTXO")
-}
-d.ringMu.Lock()
-defer d.ringMu.Unlock()
+	if u == nil {
+		return fmt.Errorf("nil UTXO")
+	}
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	data, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
 	batch := new(leveldb.Batch)
 	batch.Put(utxoKey(txHash, outIdx), data)
-if err := d.stageRingSamplingChange(batch, u.OneTimePub, !u.ProtocolLocked); err != nil {
-return err
-}
+	if err := d.stageRingSamplingChange(batch, u.OneTimePub, !u.ProtocolLocked); err != nil {
+		return err
+	}
 	batch.Put(ringMemberKey(u.OneTimePub), data)
 	return d.db.Write(batch, nil)
 }
@@ -310,8 +315,8 @@ func (d *DB) GetUTXO(txHash crypto.Hash32, outIdx uint32) (*StoredUTXO, error) {
 // DeleteUTXO removes a rolled-back canonical output. Spending uses su/ markers,
 // not this method: spent outputs must remain in the CLSAG anonymity set.
 func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
-d.ringMu.Lock()
-defer d.ringMu.Unlock()
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	u, err := d.GetUTXO(txHash, outIdx)
 	if err != nil {
 		return err
@@ -320,9 +325,9 @@ defer d.ringMu.Unlock()
 	batch.Delete(utxoKey(txHash, outIdx))
 	batch.Delete(spentUTXOKey(txHash, outIdx))
 	if u != nil {
-if err := d.stageRingSamplingChange(batch, u.OneTimePub, false); err != nil {
-return err
-}
+		if err := d.stageRingSamplingChange(batch, u.OneTimePub, false); err != nil {
+			return err
+		}
 		batch.Delete(ringMemberKey(u.OneTimePub))
 	}
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
@@ -360,11 +365,11 @@ func (d *DB) ensureLegacyRingMemberIndex() error {
 	} else if ready != nil {
 		return nil
 	}
-// An unfinished legacy backfill must not leave an apparently ready ordinal
-// index. Sampling stays unavailable until the complete rm/ store is indexed.
-if err := d.db.Delete(ringSamplingCountKey, &opt.WriteOptions{Sync: true}); err != nil {
-return err
-}
+	// An unfinished legacy backfill must not leave an apparently ready ordinal
+	// index. Sampling stays unavailable until the complete rm/ store is indexed.
+	if err := d.db.Delete(ringSamplingCountKey, &opt.WriteOptions{Sync: true}); err != nil {
+		return err
+	}
 	iter := d.db.NewIterator(util.BytesPrefix(prefixUTXO), nil)
 	defer iter.Release()
 	batch := new(leveldb.Batch)
@@ -869,12 +874,12 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil {
 		return err
 	}
-if len(lpodSettlement) == 1 {
-if err := d.checkSaleGenesisFundingTransition(height, lpodSettlement[0],
-saleSettlement != nil && saleSettlement.Before == nil); err != nil {
-return err
-}
-}
+	if len(lpodSettlement) == 1 {
+		if err := d.checkSaleGenesisFundingTransition(height, lpodSettlement[0],
+			saleSettlement != nil && saleSettlement.Before == nil); err != nil {
+			return err
+		}
+	}
 	batch, err := avmBatch(writes)
 	if err != nil {
 		return err
@@ -909,6 +914,13 @@ return err
 		for _, tx := range committedBlock.Txs {
 			for _, input := range tx.Inputs {
 				batch.Put(keyImageSpentKey(input.KeyImage), []byte{0x01})
+			}
+			if tx.IsStake() && len(tx.Extra) == core.StakePayloadSizeV4 {
+				_, _, _, _, _, _, _, keyImage, _, decodeErr := core.DecodeStakeExtraV4(tx.Extra)
+				if decodeErr != nil {
+					return fmt.Errorf("decode stake key image for atomic index: %w", decodeErr)
+				}
+				batch.Put(keyImageSpentKey(keyImage), []byte{0x01})
 			}
 		}
 	}
@@ -1302,7 +1314,7 @@ func (d *DB) LookupTxIdx(txHash crypto.Hash32) (*TxIdxEntry, error) {
 //
 // The b/ key suffix is always the 32-byte block hash; the JSON body contains
 // the height (top-level "height" for StoredBlock, or nested "Header"."Height"
-// for a serialised core.Block).  If two parseable bodies exist for the same
+// for a serialized core.Block).  If two parseable bodies exist for the same
 // height, the slot is treated as ambiguous and skipped even if h/ is absent.
 //
 // For non-zero h/ entries the function verifies that the body (a) exists and

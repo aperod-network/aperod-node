@@ -15,8 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aperod/aperod/store"
 	"golang.org/x/sys/unix"
+
+	"github.com/aperod/aperod/store"
 )
 
 type tipReceipt struct {

@@ -3,10 +3,11 @@
 package api
 
 import (
-	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Advisory eviction of the closed synthetic fixture only, never global caches.

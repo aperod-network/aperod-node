@@ -211,7 +211,7 @@ func TestCountMissingBlocksCustomWindow(t *testing.T) {
 
 // TestConfigDefaultMaxInMemoryBlocks confirms that DefaultConfig sets
 // MaxInMemoryBlocks to 1000 so omitting the field in node.yaml produces the
-// same behaviour as the old compile-time constant.
+// same behavior as the old compile-time constant.
 func TestConfigDefaultMaxInMemoryBlocks(t *testing.T) {
 	cfg := config.DefaultConfig()
 	if cfg.MaxInMemoryBlocks != 1000 {

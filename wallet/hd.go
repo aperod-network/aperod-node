@@ -30,7 +30,7 @@ type extKey struct {
 }
 
 // masterFromSeed derives the root extended key from a 64-byte BIP39 seed.
-// SLIP-0010: HMAC-SHA512("ed25519 seed", seed)
+// SLIP-0010: HMAC-SHA512("ed25519 seed", seed).
 func masterFromSeed(seed []byte) (*extKey, error) {
 	if len(seed) != 64 {
 		return nil, errors.New("hd: seed must be 64 bytes")
@@ -68,7 +68,7 @@ func (ek *extKey) child(index uint32) (*extKey, error) {
 
 // DerivedKeys holds the Aperod spend + view key pair at a specific BIP44 path.
 type DerivedKeys struct {
-	Path         string       // e.g. "m/44'/7777'/0'/0'/0'"
+	Path         string // e.g. "m/44'/7777'/0'/0'/0'"
 	Keys         *crypto.WalletKeyPair
 	Address      crypto.Address
 	AccountIndex uint32
@@ -76,7 +76,7 @@ type DerivedKeys struct {
 }
 
 // DeriveKeys derives Aperod spend+view keys from a 64-byte BIP39 seed.
-// BIP44 path: m/44'/7777'/account'/0'/index'
+// BIP44 path: m/44'/7777'/account'/0'/index'.
 func DeriveKeys(seed []byte, account, index uint32) (*DerivedKeys, error) {
 	// The hardened bit is part of the encoded child index, not part of the
 	// caller's index. Reject it up front so distinct uint32 inputs cannot

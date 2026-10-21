@@ -11,9 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
-	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func enqueueDailyTest(t *testing.T, s *Server) *dailyJob {
@@ -40,12 +41,12 @@ func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("queue must reject second date: %d", rec.Code)
 	}
-	cancelled, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	s.runDailyJobBatch(cancelled)
+	s.runDailyJobBatch(canceled)
 	j, _ := s.loadDailyJob()
 	if j.Progress.Next != 0 {
-		t.Fatal("cancelled batch changed progress")
+		t.Fatal("canceled batch changed progress")
 	}
 	s.runDailyJobBatch(context.Background())
 	j, err := s.loadDailyJob()
@@ -63,10 +64,12 @@ func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
 	defer db.Close()
 	restarted := NewServer(":0", nil, nil, nil, slog.Default())
 	restarted.SetStore(db)
-reloadedKey, err := crypto.NewLockedValidatorKey(s.myKey.PrivKey().Bytes(), nil)
-if err != nil { t.Fatal(err) }
-defer reloadedKey.Destroy()
-restarted.SetValidatorKey(reloadedKey)
+	reloadedKey, err := crypto.NewLockedValidatorKey(s.myKey.PrivKey().Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloadedKey.Destroy()
+	restarted.SetValidatorKey(reloadedKey)
 	restarted.SetAPIKey(dailyAuditBenchmarkAPIKey)
 	restarted.SetLPoDConfig(nil, func(uint64, crypto.Hash32) bool { return true })
 	j, err = restarted.loadDailyJob()
@@ -205,8 +208,10 @@ func TestDailyJobStorageBudgetAndRetry(t *testing.T) {
 	j.State, j.Progress = "failed", nil
 	j.Result, _ = json.Marshal(dailyPending(j.Date, "closing witness not yet present"))
 	j.Updated = time.Now().Add(-time.Minute).Unix()
-raw, err := s.encodeDailyJob(j)
-if err != nil { t.Fatal(err) }
+	raw, err := s.encodeDailyJob(j)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.PutMetaSync(dailyJobKey, raw); err != nil {
 		t.Fatal(err)
 	}
@@ -217,60 +222,79 @@ if err != nil { t.Fatal(err) }
 // retain only the latest one. Require forward progress when EVERY previously
 // saved certificate disappears from the oracle, not merely after 256 heights.
 func TestDailyJobAdvancingCertificateOracleDoesNotResetCursor(t *testing.T) {
-const intervalBlocks = 4 * dailyBatchBlocks
-db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, intervalBlocks, 1, 128, 4, 0, 4, intervalBlocks)
-defer db.Close()
-certificate, err := db.LoadFinalityCertificate()
-if err != nil { t.Fatal(err) }
-initialHeight := certificate.Height
-_, tipHeight, err := db.GetTip()
-if err != nil { t.Fatal(err) }
-var oracleHeight uint64
-var oracleHash crypto.Hash32
-oracle := func(height uint64, hash crypto.Hash32) bool {
-return height == oracleHeight && hash == oracleHash
-}
-enqueueDailyTest(t, s)
-var priorNext uint64
-for batch := 0; batch < 100; batch++ {
-height := initialHeight + uint64(batch)*uint64(dailyBatchBlocks/2)
-if height > tipHeight { height = tipHeight }
-hash, found, err := db.GetCanonicalHash(height)
-if err != nil || !found { t.Fatal("missing tail certificate hash") }
-if err := db.SaveFinalityCertificate(store.FinalityCertificate{
-Version: 1, Height: height, BlockHash: hash,
-Votes: []store.FinalityVote{{Signature: []byte{1}}},
-}); err != nil { t.Fatal(err) }
-oracleHeight, oracleHash = height, hash
-if batch == 2 {
-// Simulate loss of all server-local state while the durable job remains.
-fresh := NewServer(":0", nil, nil, nil, slog.Default())
-fresh.SetStore(db)
-fresh.SetValidatorKey(s.myKey)
-fresh.SetAPIKey(dailyAuditBenchmarkAPIKey)
-s = fresh
-}
-s.SetLPoDConfig(nil, oracle)
-s.runDailyJobBatch(context.Background())
-j, err := s.loadDailyJob()
-if err != nil || j == nil || j.State == "failed" { t.Fatalf("batch %d failed: %+v %v", batch, j, err) }
-if j.Progress.Next <= priorNext || j.Progress.Next-priorNext > dailyBatchBlocks {
-t.Fatalf("certificate advancement reset/stalled/unbounded cursor: batch=%d before=%d after=%d", batch, priorNext, j.Progress.Next)
-}
-priorNext = j.Progress.Next
-if j.State == "complete" {
-if oracleHeight-initialHeight <= 256 { t.Fatal("did not cross oracle retention window") }
-var result struct {
-Status string `json:"status"`
-Coverage struct { Blocks int `json:"blocks"`; Positions int `json:"positions"` } `json:"coverage"`
-}
-if err := json.Unmarshal(j.Result, &result); err != nil { t.Fatal(err) }
-if result.Status != "complete" || result.Coverage.Blocks != intervalBlocks || result.Coverage.Positions != 4 {
-t.Fatalf("unexpected report after advancing certificates: %s", j.Result)
-}
-t.Logf("completed after %d batches; certificate advanced %d heights; cursor=%d; only latest certificate accepted by oracle", batch+1, oracleHeight-initialHeight, priorNext)
-return
-}
-}
-t.Fatal("advancing oracle prevented completion")
+	const intervalBlocks = 4 * dailyBatchBlocks
+	db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, intervalBlocks, 1, 128, 4, 0, 4, intervalBlocks)
+	defer db.Close()
+	certificate, err := db.LoadFinalityCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialHeight := certificate.Height
+	_, tipHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oracleHeight uint64
+	var oracleHash crypto.Hash32
+	oracle := func(height uint64, hash crypto.Hash32) bool {
+		return height == oracleHeight && hash == oracleHash
+	}
+	enqueueDailyTest(t, s)
+	var priorNext uint64
+	for batch := 0; batch < 100; batch++ {
+		height := initialHeight + uint64(batch)*uint64(dailyBatchBlocks/2)
+		if height > tipHeight {
+			height = tipHeight
+		}
+		hash, found, err := db.GetCanonicalHash(height)
+		if err != nil || !found {
+			t.Fatal("missing tail certificate hash")
+		}
+		if err := db.SaveFinalityCertificate(store.FinalityCertificate{
+			Version: 1, Height: height, BlockHash: hash,
+			Votes: []store.FinalityVote{{Signature: []byte{1}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		oracleHeight, oracleHash = height, hash
+		if batch == 2 {
+			// Simulate loss of all server-local state while the durable job remains.
+			fresh := NewServer(":0", nil, nil, nil, slog.Default())
+			fresh.SetStore(db)
+			fresh.SetValidatorKey(s.myKey)
+			fresh.SetAPIKey(dailyAuditBenchmarkAPIKey)
+			s = fresh
+		}
+		s.SetLPoDConfig(nil, oracle)
+		s.runDailyJobBatch(context.Background())
+		j, err := s.loadDailyJob()
+		if err != nil || j == nil || j.State == "failed" {
+			t.Fatalf("batch %d failed: %+v %v", batch, j, err)
+		}
+		if j.Progress.Next <= priorNext || j.Progress.Next-priorNext > dailyBatchBlocks {
+			t.Fatalf("certificate advancement reset/stalled/unbounded cursor: batch=%d before=%d after=%d", batch, priorNext, j.Progress.Next)
+		}
+		priorNext = j.Progress.Next
+		if j.State == "complete" {
+			if oracleHeight-initialHeight <= 256 {
+				t.Fatal("did not cross oracle retention window")
+			}
+			var result struct {
+				Status   string `json:"status"`
+				Coverage struct {
+					Blocks    int `json:"blocks"`
+					Positions int `json:"positions"`
+				} `json:"coverage"`
+			}
+			if err := json.Unmarshal(j.Result, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != "complete" || result.Coverage.Blocks != intervalBlocks || result.Coverage.Positions != 4 {
+				t.Fatalf("unexpected report after advancing certificates: %s", j.Result)
+			}
+			t.Logf("completed after %d batches; certificate advanced %d heights; cursor=%d; only latest certificate accepted by oracle", batch+1, oracleHeight-initialHeight, priorNext)
+			return
+		}
+	}
+	t.Fatal("advancing oracle prevented completion")
 }

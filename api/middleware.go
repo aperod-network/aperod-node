@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -161,19 +162,24 @@ var globalHeavyRL = newHeavyRL()
 // isHeavyPath returns true for endpoints with chain- or UTXO-sized scan costs.
 // These get the stricter heavyRL bucket (2 req/s, burst 5).
 func isHeavyPath(path string) bool {
-	// Address history scans retained blocks; address UTXOs scan the full UTXO set.
+	// Normalize trailing slashes so alternate spellings cannot bypass the
+	// heavier bucket for address scans.
+	path = strings.TrimRight(path, "/")
 	const pfx = "/api/v1/address/"
-	if len(path) > len(pfx) {
-		if path[:len(pfx)] == pfx {
-			for _, suffix := range [...]string{"/utxos", "/transactions"} {
-				if len(path) > len(pfx)+len(suffix) && path[len(path)-len(suffix):] == suffix {
+	if strings.HasPrefix(path, pfx) {
+		tail := strings.TrimPrefix(path, pfx)
+		slash := strings.IndexByte(tail, '/')
+		if slash > 0 {
+			endpoint := tail[slash+1:]
+			for _, name := range [...]string{"utxos", "transactions", "scan"} {
+				if endpoint == name || strings.HasPrefix(endpoint, name+"/") {
 					return true
 				}
 			}
 		}
 	}
 	switch path {
-	case "/api/v1/avm/query", "/api/v1/avm/simulate", "/api/v1/avm/transactions":
+	case "/api/v1/avm/query", "/api/v1/avm/simulate", "/api/v1/avm/estimate-gas", "/api/v1/avm/transactions":
 		return true
 	}
 	return false
@@ -201,16 +207,23 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			ip := realIP(r)
 			// Heavy endpoints (O(N) UTXO scan) get a stricter bucket first.
 			if isHeavyPath(r.URL.Path) && !globalHeavyRL.allow(ip) {
-				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				writeRateLimitExceeded(w)
 				return
 			}
 			if !rl.bucket(ip).allow() {
-				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				writeRateLimitExceeded(w)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func writeRateLimitExceeded(w http.ResponseWriter) {
+	// One second is conservative for both token buckets and gives clients a
+	// useful retry hint without changing the bucket limits or adding exemptions.
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
 }
 
 // realIP extracts the real client IP.
@@ -222,7 +235,7 @@ func realIP(r *http.Request) string {
 	if remoteIP == "" {
 		remoteIP = r.RemoteAddr
 	}
-	// Only honour X-Forwarded-For from a trusted local proxy.
+	// Only honor X-Forwarded-For from a trusted local proxy.
 	if remoteIP == "127.0.0.1" || remoteIP == "::1" {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			// Take only the first (leftmost) address.

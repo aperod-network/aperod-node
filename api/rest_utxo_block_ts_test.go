@@ -30,10 +30,10 @@ func addUTXOAtHeight(utxos *core.UTXOSet, txHashByte byte, height uint64) (crypt
 	var commit [32]byte
 	commit[0] = 0xAB
 	utxos.Add(&core.UTXO{
-		TxHash:        txHash,
-		OutputIndex:   0,
-		AmountCommit:  commit,
-		BlockHeight:   height,
+		TxHash:       txHash,
+		OutputIndex:  0,
+		AmountCommit: commit,
+		BlockHeight:  height,
 	})
 	return txHash, hex.EncodeToString(commit[:])
 }

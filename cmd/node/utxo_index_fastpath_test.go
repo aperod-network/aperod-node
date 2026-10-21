@@ -15,8 +15,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"testing"

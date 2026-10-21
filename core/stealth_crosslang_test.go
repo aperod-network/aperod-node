@@ -90,9 +90,9 @@ func TestStealthScannerCrossLangVector(t *testing.T) {
 
 	// ── Derive and log the vector (deterministic across runs) ─────────────────
 
-	spendPubHex  := hex.EncodeToString(wk.Spend.Public[:])
-	viewPrivHex  := hex.EncodeToString(wk.View.Private[:])
-	txPubKeyHex  := hex.EncodeToString(stealthOut.TxPubKey[:])
+	spendPubHex := hex.EncodeToString(wk.Spend.Public[:])
+	viewPrivHex := hex.EncodeToString(wk.View.Private[:])
+	txPubKeyHex := hex.EncodeToString(stealthOut.TxPubKey[:])
 	oneTimePubHex := hex.EncodeToString(stealthOut.OneTimePub[:])
 	encAmountHex := hex.EncodeToString(encAmount[:])
 

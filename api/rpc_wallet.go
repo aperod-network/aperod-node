@@ -67,9 +67,9 @@ type walletSendResult struct {
 	// against GET /api/v1/keyimage/{ki}/is-spent gives an authoritative
 	// Monero-style spent check without needing the wallet's private key.
 	SpentKeyImages []spentInputKI `json:"spent_key_images,omitempty"`
-	IsBurn          bool           `json:"is_burn"`
-	BurnedNAPRO     string         `json:"burned_napro"`
-	BurnAddress     string         `json:"burn_address"`
+	IsBurn         bool           `json:"is_burn"`
+	BurnedNAPRO    string         `json:"burned_napro"`
+	BurnAddress    string         `json:"burn_address"`
 }
 
 // aprWalletSend builds, signs, verifies, and submits a real RingCT transaction.
@@ -173,15 +173,15 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 	// ── 6. Cryptographic verification ────────────────────────────────────────
 	// Phase 2: all ring members are real on-chain UTXOs — enable strict C-0 check.
 	verifier := core.NewTxVerifier(s.utxos)
-verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
-verifyErr := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
+	verifier.SetStakedCollateralRingExclusionActivationHeight(s.stakedCollateralRingExclusionActivationHeight)
+	verifyErr := verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
 	if isKeyImageConflictErr(verifyErr) {
 		repaired, repairErr := s.repairPhantomKeyImages(result)
 		if repairErr != nil {
 			return nil, fmt.Errorf("verify: %w", repairErr)
 		}
 		if repaired {
-verifyErr = verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
+			verifyErr = verifier.VerifyTxAtHeight(&result.Tx, s.nextBlockHeight())
 		}
 	}
 	if verifyErr != nil {
@@ -320,7 +320,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 				"tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx,
 				"height", su.BlockHeight,
 				"commit", fmt.Sprintf("%x", su.AmountCommit[:8]))
-			// Synthesise core.Output from the stored UTXO fields.
+			// Synthesize core.Output from the stored UTXO fields.
 			// Only OneTimePub, TxPubKey, and AmountCommit are needed for
 			// RingCT input construction; EncAmount is not used downstream.
 			out = core.Output{
@@ -373,13 +373,13 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 									// a subsequent node restart finds this UTXO
 									// in LevelDB without needing Fallback 4 again.
 									healEntry := &store.StoredUTXO{
-										TxHash:       txHash,
-										OutputIndex:  u.OutIdx,
-										OneTimePub:   out.OneTimePub,
-										TxPubKey:     out.TxPubKey,
-										AmountCommit: out.AmountCommit,
-										EncAmount:    out.EncAmount,
-										BlockHeight:  blk.Header.Height,
+										TxHash:         txHash,
+										OutputIndex:    u.OutIdx,
+										OneTimePub:     out.OneTimePub,
+										TxPubKey:       out.TxPubKey,
+										AmountCommit:   out.AmountCommit,
+										EncAmount:      out.EncAmount,
+										BlockHeight:    blk.Header.Height,
 										ProtocolLocked: bTx.IsGuardianFund(),
 									}
 									if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, healEntry); putErr != nil {
@@ -420,13 +420,13 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 				// catch it — the operator can re-mint to get a clean entry.
 				if s.blockStore != nil {
 					snapHeal := &store.StoredUTXO{
-						TxHash:       txHash,
-						OutputIndex:  u.OutIdx,
-						OneTimePub:   memUTXO.OneTimePub,
-						TxPubKey:     memUTXO.TxPubKey,
-						AmountCommit: memUTXO.AmountCommit,
-						EncAmount:    memUTXO.EncAmount,
-						BlockHeight:  memUTXO.BlockHeight,
+						TxHash:         txHash,
+						OutputIndex:    u.OutIdx,
+						OneTimePub:     memUTXO.OneTimePub,
+						TxPubKey:       memUTXO.TxPubKey,
+						AmountCommit:   memUTXO.AmountCommit,
+						EncAmount:      memUTXO.EncAmount,
+						BlockHeight:    memUTXO.BlockHeight,
 						ProtocolLocked: memUTXO.ProtocolLocked,
 					}
 					if putErr := s.blockStore.PutUTXO(txHash, u.OutIdx, snapHeal); putErr != nil {

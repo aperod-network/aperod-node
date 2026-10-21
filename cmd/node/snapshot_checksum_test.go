@@ -310,7 +310,7 @@ func TestChecksum_PromotionWithoutSourceSidecarDropsStaleDst(t *testing.T) {
 	prev := snapshotPrevPath(primary)
 	if _, err := os.Stat(snapshotChecksumPath(prev)); err == nil {
 		// A stale sidecar surviving would be tolerable ONLY if it matches; the
-		// implementation removes it, which is the simpler correct behaviour.
+		// implementation removes it, which is the simpler correct behavior.
 		t.Error("stale prev sidecar should have been removed when source had none")
 	}
 	snap := tryLoadSnapshotFile(prev, 600)

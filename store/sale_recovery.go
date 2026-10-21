@@ -8,8 +8,9 @@ import (
 	"strconv"
 
 	"filippo.io/edwards25519"
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 // SaleRecovery is an owner-signed acknowledgement of a particular canonical

@@ -65,7 +65,7 @@ func TestRingCTV4RejectsCommitmentCopyTheft(t *testing.T) {
 			OneTimePub:   crypto.Point32{2},
 			AmountCommit: victimCommit,
 		}},
-		FeeCommit:  feeCommit,
+		FeeCommit:   feeCommit,
 		RangeProofs: []*crypto.RangeProof{outputProof},
 		Signatures:  make([]*crypto.MLSAGSignature, 1),
 	}

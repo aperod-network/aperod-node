@@ -1,11 +1,11 @@
 package core
 
 import (
-        "fmt"
-        "sort"
-        "sync"
+	"fmt"
+	"sort"
+	"sync"
 
-        "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/crypto"
 )
 
 // MaxInMemoryBlocks is the default sliding-window size of blocks kept in RAM.
@@ -16,36 +16,36 @@ const MaxInMemoryBlocks = 1_000
 
 // TxLocation records where a transaction lives in the chain.
 type TxLocation struct {
-        Block    *Block
-        TxIndex  int
+	Block   *Block
+	TxIndex int
 }
 
 // Chain tracks the canonical chain state: the tip block and the full index of
 // known blocks. Reorganizations are handled via Reorg().
 type Chain struct {
-        mu                sync.RWMutex
-        blocks            map[crypto.Hash32]*Block     // recent blocks by hash
-        byHeight          map[uint64]*Block            // canonical chain: height → block
-        txIndex           map[crypto.Hash32]TxLocation // tx hash → location
-        tip               *Block
-        genesis           *Block
-        maxInMemoryBlocks uint64 // sliding-window size; default MaxInMemoryBlocks
-        lastAdd           *chainAddRollback
+	mu                sync.RWMutex
+	blocks            map[crypto.Hash32]*Block     // recent blocks by hash
+	byHeight          map[uint64]*Block            // canonical chain: height → block
+	txIndex           map[crypto.Hash32]TxLocation // tx hash → location
+	tip               *Block
+	genesis           *Block
+	maxInMemoryBlocks uint64 // sliding-window size; default MaxInMemoryBlocks
+	lastAdd           *chainAddRollback
 }
 
 type chainAddRollback struct {
-        blockHash   crypto.Hash32
-        previousTip *Block
-        evicted     *Block
+	blockHash   crypto.Hash32
+	previousTip *Block
+	evicted     *Block
 }
 
 // InMemoryBlockCount returns the number of blocks currently held in the
 // sliding in-memory window.  Used by /api/health to expose live memory stats
 // without requiring the caller to SSH into the node.
 func (c *Chain) InMemoryBlockCount() int {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        return len(c.blocks)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.blocks)
 }
 
 // NewChain creates an empty chain.  An optional maxInMemoryBlocks value may be
@@ -53,187 +53,187 @@ func (c *Chain) InMemoryBlockCount() int {
 // MaxInMemoryBlocks constant (1 000).  This allows node operators to tune the
 // in-memory block window via node.yaml without recompiling.
 func NewChain(maxBlocks ...uint64) *Chain {
-        max := uint64(MaxInMemoryBlocks)
-        if len(maxBlocks) > 0 && maxBlocks[0] > 0 {
-                max = maxBlocks[0]
-        }
-        return &Chain{
-                blocks:            make(map[crypto.Hash32]*Block),
-                byHeight:          make(map[uint64]*Block),
-                txIndex:           make(map[crypto.Hash32]TxLocation),
-                maxInMemoryBlocks: max,
-        }
+	max := uint64(MaxInMemoryBlocks)
+	if len(maxBlocks) > 0 && maxBlocks[0] > 0 {
+		max = maxBlocks[0]
+	}
+	return &Chain{
+		blocks:            make(map[crypto.Hash32]*Block),
+		byHeight:          make(map[uint64]*Block),
+		txIndex:           make(map[crypto.Hash32]TxLocation),
+		maxInMemoryBlocks: max,
+	}
 }
 
 // SetGenesis installs the genesis block. Must be called once before any other method.
 func (c *Chain) SetGenesis(b *Block) error {
-        if !b.IsGenesis() {
-                return fmt.Errorf("block at height %d is not a genesis block", b.Header.Height)
-        }
-        c.mu.Lock()
-        defer c.mu.Unlock()
-        h := b.Hash()
-        c.blocks[h] = b
-        c.byHeight[0] = b
-        c.tip = b
-        c.genesis = b
-        c.lastAdd = nil
-        c.indexTxs(b)
-        return nil
+	if !b.IsGenesis() {
+		return fmt.Errorf("block at height %d is not a genesis block", b.Header.Height)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h := b.Hash()
+	c.blocks[h] = b
+	c.byHeight[0] = b
+	c.tip = b
+	c.genesis = b
+	c.lastAdd = nil
+	c.indexTxs(b)
+	return nil
 }
 
 // Tip returns the current canonical chain tip (highest finalized block).
 func (c *Chain) Tip() *Block {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        return c.tip
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tip
 }
 
 // Height returns the current chain height.
 func (c *Chain) Height() uint64 {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        if c.tip == nil {
-                return 0
-        }
-        return c.tip.Header.Height
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.tip == nil {
+		return 0
+	}
+	return c.tip.Header.Height
 }
 
 // Genesis returns the genesis block.
 func (c *Chain) Genesis() *Block {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        return c.genesis
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.genesis
 }
 
 // GetByHash retrieves a block by its hash. Returns nil if unknown.
 func (c *Chain) GetByHash(h crypto.Hash32) *Block {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        return c.blocks[h]
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.blocks[h]
 }
 
 // GetByHeight retrieves the canonical block at height h. Returns nil if not yet known.
 func (c *Chain) GetByHeight(h uint64) *Block {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        return c.byHeight[h]
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.byHeight[h]
 }
 
 // BlocksNewestFirst returns a stable snapshot of the blocks currently retained
 // in memory, ordered from the canonical tip backwards. Older bodies have
 // already been evicted and cannot be returned by GetByHeight.
 func (c *Chain) BlocksNewestFirst() []*Block {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        blocks := make([]*Block, 0, len(c.byHeight))
-        for _, block := range c.byHeight {
-                blocks = append(blocks, block)
-        }
-        sort.Slice(blocks, func(i, j int) bool {
-                return blocks[i].Header.Height > blocks[j].Header.Height
-        })
-        return blocks
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	blocks := make([]*Block, 0, len(c.byHeight))
+	for _, block := range c.byHeight {
+		blocks = append(blocks, block)
+	}
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Header.Height > blocks[j].Header.Height
+	})
+	return blocks
 }
 
 // BlocksNewestFirstPage returns at most maxHeightScan retained block heights,
 // newest first. startHeight is inclusive when startAtTip is false. The
 // returned nextStartHeight is an inclusive cursor for the next page.
 func (c *Chain) BlocksNewestFirstPage(startHeight uint64, startAtTip bool, maxHeightScan int) (
-        blocks []*Block,
-        nextStartHeight uint64,
-        hasMore bool,
-        oldestRetainedHeight uint64,
+	blocks []*Block,
+	nextStartHeight uint64,
+	hasMore bool,
+	oldestRetainedHeight uint64,
 ) {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-        if c.tip == nil || len(c.byHeight) == 0 || maxHeightScan <= 0 {
-                return nil, 0, false, 0
-        }
+	if c.tip == nil || len(c.byHeight) == 0 || maxHeightScan <= 0 {
+		return nil, 0, false, 0
+	}
 
-        tipHeight := c.tip.Header.Height
-        if c.maxInMemoryBlocks > 0 && tipHeight >= c.maxInMemoryBlocks {
-                oldestRetainedHeight = tipHeight - c.maxInMemoryBlocks + 1
-        }
-        if startAtTip || startHeight > tipHeight {
-                startHeight = tipHeight
-        }
-        if startHeight < oldestRetainedHeight {
-                return nil, 0, false, oldestRetainedHeight
-        }
+	tipHeight := c.tip.Header.Height
+	if c.maxInMemoryBlocks > 0 && tipHeight >= c.maxInMemoryBlocks {
+		oldestRetainedHeight = tipHeight - c.maxInMemoryBlocks + 1
+	}
+	if startAtTip || startHeight > tipHeight {
+		startHeight = tipHeight
+	}
+	if startHeight < oldestRetainedHeight {
+		return nil, 0, false, oldestRetainedHeight
+	}
 
-        firstHeight := oldestRetainedHeight
-        if scannedHeights := startHeight - oldestRetainedHeight + 1; scannedHeights > uint64(maxHeightScan) {
-                firstHeight = startHeight - uint64(maxHeightScan) + 1
-                hasMore = firstHeight > oldestRetainedHeight
-                if hasMore {
-                        nextStartHeight = firstHeight - 1
-                }
-        }
+	firstHeight := oldestRetainedHeight
+	if scannedHeights := startHeight - oldestRetainedHeight + 1; scannedHeights > uint64(maxHeightScan) {
+		firstHeight = startHeight - uint64(maxHeightScan) + 1
+		hasMore = firstHeight > oldestRetainedHeight
+		if hasMore {
+			nextStartHeight = firstHeight - 1
+		}
+	}
 
-        blocks = make([]*Block, 0, int(startHeight-firstHeight+1))
-        for height := startHeight; ; height-- {
-                if block := c.byHeight[height]; block != nil {
-                        blocks = append(blocks, block)
-                }
-                if height == firstHeight {
-                        break
-                }
-        }
-        return blocks, nextStartHeight, hasMore, oldestRetainedHeight
+	blocks = make([]*Block, 0, int(startHeight-firstHeight+1))
+	for height := startHeight; ; height-- {
+		if block := c.byHeight[height]; block != nil {
+			blocks = append(blocks, block)
+		}
+		if height == firstHeight {
+			break
+		}
+	}
+	return blocks, nextStartHeight, hasMore, oldestRetainedHeight
 }
 
 // HasBlock returns true if the block with this hash is already known.
 func (c *Chain) HasBlock(h crypto.Hash32) bool {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        _, ok := c.blocks[h]
-        return ok
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.blocks[h]
+	return ok
 }
 
 // AddBlock appends a validated block to the canonical chain.
 // The block must extend the current tip.
 func (c *Chain) AddBlock(b *Block) error {
-        c.mu.Lock()
-        defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-        if c.tip == nil {
-                return fmt.Errorf("chain not initialized: call SetGenesis first")
-        }
-        if b.Header.Height != c.tip.Header.Height+1 {
-                return fmt.Errorf("block height %d does not extend tip at %d",
-                        b.Header.Height, c.tip.Header.Height)
-        }
-        if b.Header.PrevHash != c.tip.Hash() {
-                return fmt.Errorf("block %d: prev hash mismatch", b.Header.Height)
-        }
+	if c.tip == nil {
+		return fmt.Errorf("chain not initialized: call SetGenesis first")
+	}
+	if b.Header.Height != c.tip.Header.Height+1 {
+		return fmt.Errorf("block height %d does not extend tip at %d",
+			b.Header.Height, c.tip.Header.Height)
+	}
+	if b.Header.PrevHash != c.tip.Hash() {
+		return fmt.Errorf("block %d: prev hash mismatch", b.Header.Height)
+	}
 
-        h := b.Hash()
-        rollback := &chainAddRollback{
-                blockHash:   h,
-                previousTip: c.tip,
-        }
-        c.blocks[h] = b
-        c.byHeight[b.Header.Height] = b
-        c.tip = b
-        c.indexTxs(b)
+	h := b.Hash()
+	rollback := &chainAddRollback{
+		blockHash:   h,
+		previousTip: c.tip,
+	}
+	c.blocks[h] = b
+	c.byHeight[b.Header.Height] = b
+	c.tip = b
+	c.indexTxs(b)
 
-        // Evict the block that has fallen outside the sliding window.
-        if b.Header.Height >= c.maxInMemoryBlocks {
-                evictH := b.Header.Height - c.maxInMemoryBlocks
-                if old, ok := c.byHeight[evictH]; ok {
-                        rollback.evicted = old
-                        delete(c.byHeight, evictH)
-                        delete(c.blocks, old.Hash())
-                        for _, tx := range old.Txs {
-                                delete(c.txIndex, tx.Hash())
-                        }
-                }
-        }
-        c.lastAdd = rollback
+	// Evict the block that has fallen outside the sliding window.
+	if b.Header.Height >= c.maxInMemoryBlocks {
+		evictH := b.Header.Height - c.maxInMemoryBlocks
+		if old, ok := c.byHeight[evictH]; ok {
+			rollback.evicted = old
+			delete(c.byHeight, evictH)
+			delete(c.blocks, old.Hash())
+			for _, tx := range old.Txs {
+				delete(c.txIndex, tx.Hash())
+			}
+		}
+	}
+	c.lastAdd = rollback
 
-        return nil
+	return nil
 }
 
 // RollbackLastBlock reverses the most recent successful AddBlock. Consensus
@@ -241,46 +241,46 @@ func (c *Chain) AddBlock(b *Block) error {
 // transition. It also restores any block evicted from the sliding window by
 // that AddBlock, so readers see the exact pre-add chain state.
 func (c *Chain) RollbackLastBlock(b *Block) error {
-        if b == nil {
-                return fmt.Errorf("rollback last block: nil block")
-        }
-        c.mu.Lock()
-        defer c.mu.Unlock()
+	if b == nil {
+		return fmt.Errorf("rollback last block: nil block")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-        hash := b.Hash()
-        rollback := c.lastAdd
-        if c.tip == nil || c.tip.Hash() != hash || rollback == nil ||
-                rollback.blockHash != hash || rollback.previousTip == nil {
-                return fmt.Errorf("rollback last block: block is not the latest AddBlock")
-        }
-        if b.Header.Height == 0 ||
-                rollback.previousTip.Header.Height+1 != b.Header.Height ||
-                b.Header.PrevHash != rollback.previousTip.Hash() {
-                return fmt.Errorf("rollback last block: invalid parent linkage")
-        }
+	hash := b.Hash()
+	rollback := c.lastAdd
+	if c.tip == nil || c.tip.Hash() != hash || rollback == nil ||
+		rollback.blockHash != hash || rollback.previousTip == nil {
+		return fmt.Errorf("rollback last block: block is not the latest AddBlock")
+	}
+	if b.Header.Height == 0 ||
+		rollback.previousTip.Header.Height+1 != b.Header.Height ||
+		b.Header.PrevHash != rollback.previousTip.Hash() {
+		return fmt.Errorf("rollback last block: invalid parent linkage")
+	}
 
-        delete(c.blocks, hash)
-        delete(c.byHeight, b.Header.Height)
-        for _, tx := range b.Txs {
-                delete(c.txIndex, tx.Hash())
-        }
+	delete(c.blocks, hash)
+	delete(c.byHeight, b.Header.Height)
+	for _, tx := range b.Txs {
+		delete(c.txIndex, tx.Hash())
+	}
 
-        restore := func(block *Block) {
-                if block == nil {
-                        return
-                }
-                blockHash := block.Hash()
-                c.blocks[blockHash] = block
-                c.byHeight[block.Header.Height] = block
-                c.indexTxs(block)
-        }
-        restore(rollback.previousTip)
-        if rollback.evicted != rollback.previousTip {
-                restore(rollback.evicted)
-        }
-        c.tip = rollback.previousTip
-        c.lastAdd = nil
-        return nil
+	restore := func(block *Block) {
+		if block == nil {
+			return
+		}
+		blockHash := block.Hash()
+		c.blocks[blockHash] = block
+		c.byHeight[block.Header.Height] = block
+		c.indexTxs(block)
+	}
+	restore(rollback.previousTip)
+	if rollback.evicted != rollback.previousTip {
+		restore(rollback.evicted)
+	}
+	c.tip = rollback.previousTip
+	c.lastAdd = nil
+	return nil
 }
 
 // FastForward installs a slice of pre-validated blocks into the chain without
@@ -292,38 +292,38 @@ func (c *Chain) RollbackLastBlock(b *Block) error {
 // that large catch-up batches (e.g. P2P sync of 10 000+ blocks) do not
 // accumulate unboundedly in RAM.
 func (c *Chain) FastForward(blocks []*Block) {
-        if len(blocks) == 0 {
-                return
-        }
-        c.mu.Lock()
-        defer c.mu.Unlock()
-        c.lastAdd = nil
-        for _, b := range blocks {
-                h := b.Hash()
-                c.blocks[h] = b
-                c.byHeight[b.Header.Height] = b
-                c.tip = b
-                c.indexTxs(b)
-                // Evict the block that has fallen outside the sliding window,
-                // mirroring AddBlock so memory stays bounded during bulk loads.
-                if b.Header.Height >= c.maxInMemoryBlocks {
-                        evictH := b.Header.Height - c.maxInMemoryBlocks
-                        if old, ok := c.byHeight[evictH]; ok {
-                                delete(c.byHeight, evictH)
-                                delete(c.blocks, old.Hash())
-                                for _, tx := range old.Txs {
-                                        delete(c.txIndex, tx.Hash())
-                                }
-                        }
-                }
-        }
+	if len(blocks) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAdd = nil
+	for _, b := range blocks {
+		h := b.Hash()
+		c.blocks[h] = b
+		c.byHeight[b.Header.Height] = b
+		c.tip = b
+		c.indexTxs(b)
+		// Evict the block that has fallen outside the sliding window,
+		// mirroring AddBlock so memory stays bounded during bulk loads.
+		if b.Header.Height >= c.maxInMemoryBlocks {
+			evictH := b.Header.Height - c.maxInMemoryBlocks
+			if old, ok := c.byHeight[evictH]; ok {
+				delete(c.byHeight, evictH)
+				delete(c.blocks, old.Hash())
+				for _, tx := range old.Txs {
+					delete(c.txIndex, tx.Hash())
+				}
+			}
+		}
+	}
 }
 
 // TxIndexEntry is a pre-built tx location record used by FastForwardWithIndex
 // to avoid recomputing tx.Hash() at startup.
 type TxIndexEntry struct {
-        Height uint64
-        TxIdx  int
+	Height uint64
+	TxIdx  int
 }
 
 // FastForwardWithIndex is like FastForward but skips the expensive tx.Hash()
@@ -335,61 +335,61 @@ type TxIndexEntry struct {
 // As with FastForward, the MaxInMemoryBlocks sliding-window eviction is applied
 // during the first pass so memory stays bounded.
 func (c *Chain) FastForwardWithIndex(blocks []*Block, txEntries map[crypto.Hash32]TxIndexEntry) {
-        if len(blocks) == 0 {
-                return
-        }
-        c.mu.Lock()
-        defer c.mu.Unlock()
-        c.lastAdd = nil
-        // First pass: populate blocks and byHeight maps with sliding-window eviction.
-        for _, b := range blocks {
-                h := b.Hash()
-                c.blocks[h] = b
-                c.byHeight[b.Header.Height] = b
-                c.tip = b
-                if b.Header.Height >= c.maxInMemoryBlocks {
-                        evictH := b.Header.Height - c.maxInMemoryBlocks
-                        if old, ok := c.byHeight[evictH]; ok {
-                                delete(c.byHeight, evictH)
-                                delete(c.blocks, old.Hash())
-                                for _, tx := range old.Txs {
-                                        delete(c.txIndex, tx.Hash())
-                                }
-                        }
-                }
-        }
-        // Second pass: populate tx index from pre-built entries.
-        // Entries whose block was evicted above are silently skipped.
-        for txHash, entry := range txEntries {
-                blk := c.byHeight[entry.Height]
-                if blk == nil {
-                        continue
-                }
-                if entry.TxIdx < 0 || entry.TxIdx >= len(blk.Txs) {
-                        continue
-                }
-                c.txIndex[txHash] = TxLocation{Block: blk, TxIndex: entry.TxIdx}
-        }
+	if len(blocks) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAdd = nil
+	// First pass: populate blocks and byHeight maps with sliding-window eviction.
+	for _, b := range blocks {
+		h := b.Hash()
+		c.blocks[h] = b
+		c.byHeight[b.Header.Height] = b
+		c.tip = b
+		if b.Header.Height >= c.maxInMemoryBlocks {
+			evictH := b.Header.Height - c.maxInMemoryBlocks
+			if old, ok := c.byHeight[evictH]; ok {
+				delete(c.byHeight, evictH)
+				delete(c.blocks, old.Hash())
+				for _, tx := range old.Txs {
+					delete(c.txIndex, tx.Hash())
+				}
+			}
+		}
+	}
+	// Second pass: populate tx index from pre-built entries.
+	// Entries whose block was evicted above are silently skipped.
+	for txHash, entry := range txEntries {
+		blk := c.byHeight[entry.Height]
+		if blk == nil {
+			continue
+		}
+		if entry.TxIdx < 0 || entry.TxIdx >= len(blk.Txs) {
+			continue
+		}
+		c.txIndex[txHash] = TxLocation{Block: blk, TxIndex: entry.TxIdx}
+	}
 }
 
 // indexTxs adds all transactions in b to the tx index. Caller must hold mu.
 func (c *Chain) indexTxs(b *Block) {
-        for i, tx := range b.Txs {
-                h := tx.Hash()
-                c.txIndex[h] = TxLocation{Block: b, TxIndex: i}
-        }
+	for i, tx := range b.Txs {
+		h := tx.Hash()
+		c.txIndex[h] = TxLocation{Block: b, TxIndex: i}
+	}
 }
 
 // GetTransaction looks up a transaction by its hash in the canonical chain.
 // Returns (tx, location, true) if found, or zero values and false otherwise.
 func (c *Chain) GetTransaction(hash crypto.Hash32) (Transaction, TxLocation, bool) {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
-        loc, ok := c.txIndex[hash]
-        if !ok {
-                return Transaction{}, TxLocation{}, false
-        }
-        return loc.Block.Txs[loc.TxIndex], loc, true
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	loc, ok := c.txIndex[hash]
+	if !ok {
+		return Transaction{}, TxLocation{}, false
+	}
+	return loc.Block.Txs[loc.TxIndex], loc, true
 }
 
 // BlockPruner is the interface used by PruneOldData to strip transaction data
@@ -420,64 +420,64 @@ func (c *Chain) PruneOldData(pruner BlockPruner, keepBlocks uint64) (int, error)
 // Reorg replaces the canonical chain from forkPoint+1 onwards with newBlocks.
 // newBlocks must be contiguous, validated, and have higher cumulative weight.
 func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
-        c.mu.Lock()
-        defer c.mu.Unlock()
-        c.lastAdd = nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAdd = nil
 
-        if len(newBlocks) == 0 {
-                return fmt.Errorf("reorg: no new blocks")
-        }
-        if newBlocks[0].Header.Height != forkPoint+1 {
-                return fmt.Errorf("reorg: new chain starts at %d, expected %d",
-                        newBlocks[0].Header.Height, forkPoint+1)
-        }
+	if len(newBlocks) == 0 {
+		return fmt.Errorf("reorg: no new blocks")
+	}
+	if newBlocks[0].Header.Height != forkPoint+1 {
+		return fmt.Errorf("reorg: new chain starts at %d, expected %d",
+			newBlocks[0].Header.Height, forkPoint+1)
+	}
 
-        // Verify contiguity
-        for i := 1; i < len(newBlocks); i++ {
-                if newBlocks[i].Header.Height != newBlocks[i-1].Header.Height+1 {
-                        return fmt.Errorf("reorg: gap between blocks %d and %d",
-                                newBlocks[i-1].Header.Height, newBlocks[i].Header.Height)
-                }
-                if newBlocks[i].Header.PrevHash != newBlocks[i-1].Hash() {
-                        return fmt.Errorf("reorg: prev hash mismatch at height %d",
-                                newBlocks[i].Header.Height)
-                }
-        }
+	// Verify contiguity
+	for i := 1; i < len(newBlocks); i++ {
+		if newBlocks[i].Header.Height != newBlocks[i-1].Header.Height+1 {
+			return fmt.Errorf("reorg: gap between blocks %d and %d",
+				newBlocks[i-1].Header.Height, newBlocks[i].Header.Height)
+		}
+		if newBlocks[i].Header.PrevHash != newBlocks[i-1].Hash() {
+			return fmt.Errorf("reorg: prev hash mismatch at height %d",
+				newBlocks[i].Header.Height)
+		}
+	}
 
-        // Remove old canonical blocks above fork point from both indexes.
-        oldTip := c.tip
-        for h := oldTip.Header.Height; h > forkPoint; h-- {
-                if old, ok := c.byHeight[h]; ok {
-                        delete(c.blocks, old.Hash())
-                        delete(c.byHeight, h)
-                        // Remove tx index entries for the orphaned block.
-                        for _, tx := range old.Txs {
-                                delete(c.txIndex, tx.Hash())
-                        }
-                }
-        }
+	// Remove old canonical blocks above fork point from both indexes.
+	oldTip := c.tip
+	for h := oldTip.Header.Height; h > forkPoint; h-- {
+		if old, ok := c.byHeight[h]; ok {
+			delete(c.blocks, old.Hash())
+			delete(c.byHeight, h)
+			// Remove tx index entries for the orphaned block.
+			for _, tx := range old.Txs {
+				delete(c.txIndex, tx.Hash())
+			}
+		}
+	}
 
-        // Install new blocks and index their transactions so GetTransaction works.
-        // Apply the same MaxInMemoryBlocks sliding-window eviction as AddBlock so
-        // a reorg that brings in many blocks does not inflate the maps unboundedly.
-        for _, b := range newBlocks {
-                h := b.Hash()
-                c.blocks[h] = b
-                c.byHeight[b.Header.Height] = b
-                c.indexTxs(b)
-                if b.Header.Height >= c.maxInMemoryBlocks {
-                        evictH := b.Header.Height - c.maxInMemoryBlocks
-                        if old, ok := c.byHeight[evictH]; ok {
-                                delete(c.byHeight, evictH)
-                                delete(c.blocks, old.Hash())
-                                for _, tx := range old.Txs {
-                                        delete(c.txIndex, tx.Hash())
-                                }
-                        }
-                }
-        }
-        c.tip = newBlocks[len(newBlocks)-1]
-        return nil
+	// Install new blocks and index their transactions so GetTransaction works.
+	// Apply the same MaxInMemoryBlocks sliding-window eviction as AddBlock so
+	// a reorg that brings in many blocks does not inflate the maps unboundedly.
+	for _, b := range newBlocks {
+		h := b.Hash()
+		c.blocks[h] = b
+		c.byHeight[b.Header.Height] = b
+		c.indexTxs(b)
+		if b.Header.Height >= c.maxInMemoryBlocks {
+			evictH := b.Header.Height - c.maxInMemoryBlocks
+			if old, ok := c.byHeight[evictH]; ok {
+				delete(c.byHeight, evictH)
+				delete(c.blocks, old.Hash())
+				for _, tx := range old.Txs {
+					delete(c.txIndex, tx.Hash())
+				}
+			}
+		}
+	}
+	c.tip = newBlocks[len(newBlocks)-1]
+	return nil
 }
 
 // HeadersFrom returns up to limit block headers that come after the highest
@@ -489,63 +489,63 @@ func (c *Chain) Reorg(forkPoint uint64, newBlocks []*Block) error {
 // (skipping genesis, which both parties are expected to share).
 // Implements the p2p.HeaderProvider interface.
 func (c *Chain) HeadersFrom(knownHashes []crypto.Hash32, limit int) []BlockHeader {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-        if c.tip == nil {
-                return nil
-        }
+	if c.tip == nil {
+		return nil
+	}
 
-        // Find the highest canonical height that matches any knownHash.
-        startHeight := uint64(1) // default: send from block 1 (skip genesis)
-        for _, h := range knownHashes {
-                if b, ok := c.blocks[h]; ok {
-                        // Confirm this block is on the canonical chain.
-                        if canon, ok2 := c.byHeight[b.Header.Height]; ok2 && canon.Hash() == h {
-                                next := b.Header.Height + 1
-                                if next > startHeight {
-                                        startHeight = next
-                                }
-                        }
-                }
-        }
+	// Find the highest canonical height that matches any knownHash.
+	startHeight := uint64(1) // default: send from block 1 (skip genesis)
+	for _, h := range knownHashes {
+		if b, ok := c.blocks[h]; ok {
+			// Confirm this block is on the canonical chain.
+			if canon, ok2 := c.byHeight[b.Header.Height]; ok2 && canon.Hash() == h {
+				next := b.Header.Height + 1
+				if next > startHeight {
+					startHeight = next
+				}
+			}
+		}
+	}
 
-        if startHeight > c.tip.Header.Height {
-                return nil // already in sync
-        }
+	if startHeight > c.tip.Header.Height {
+		return nil // already in sync
+	}
 
-        if limit <= 0 || limit > 500 {
-                limit = 500
-        }
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
 
-        headers := make([]BlockHeader, 0, limit)
-        for h := startHeight; h <= c.tip.Header.Height && len(headers) < limit; h++ {
-                if b, ok := c.byHeight[h]; ok {
-                        headers = append(headers, b.Header)
-                }
-        }
-        return headers
+	headers := make([]BlockHeader, 0, limit)
+	for h := startHeight; h <= c.tip.Header.Height && len(headers) < limit; h++ {
+		if b, ok := c.byHeight[h]; ok {
+			headers = append(headers, b.Header)
+		}
+	}
+	return headers
 }
 
 // TailHashes returns the hashes of the last n canonical blocks (for sync requests).
 func (c *Chain) TailHashes(n int) []crypto.Hash32 {
-        c.mu.RLock()
-        defer c.mu.RUnlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-        tip := c.tip
-        if tip == nil {
-                return nil
-        }
+	tip := c.tip
+	if tip == nil {
+		return nil
+	}
 
-        start := int(tip.Header.Height) - n + 1
-        if start < 0 {
-                start = 0
-        }
-        out := make([]crypto.Hash32, 0, n)
-        for h := uint64(start); h <= tip.Header.Height; h++ {
-                if b, ok := c.byHeight[h]; ok {
-                        out = append(out, b.Hash())
-                }
-        }
-        return out
+	start := int(tip.Header.Height) - n + 1
+	if start < 0 {
+		start = 0
+	}
+	out := make([]crypto.Hash32, 0, n)
+	for h := uint64(start); h <= tip.Header.Height; h++ {
+		if b, ok := c.byHeight[h]; ok {
+			out = append(out, b.Hash())
+		}
+	}
+	return out
 }

@@ -446,7 +446,7 @@ func TestDBGapAtStartOfWindow(t *testing.T) {
 // where every block in the loadRecentBlocksFromStore window (startLoad..tipHeight)
 // is absent from the store — i.e. the entire in-memory window is a gap.
 //
-// With the old `break` behaviour this returned 0 blocks and left chain.Height()
+// With the old `break` behavior this returned 0 blocks and left chain.Height()
 // at genesis, causing the consensus engine to produce a duplicate block at
 // height 1 and silently fork away from the canonical chain.  Even with the
 // `continue` fix, if every height in the window is missing the returned slice

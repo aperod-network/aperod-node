@@ -19,7 +19,7 @@ const (
 
 // Human-readable prefix prepended before the Base58Check payload.
 // Mainnet addresses look like:  apro<base58...>
-// Testnet addresses look like: tapr<base58...>
+// Testnet addresses look like: tapr<base58...>.
 const (
 	mainnetHRPrefix = "apro"
 	testnetHRPrefix = "tapr"
@@ -42,7 +42,7 @@ func hrPrefix(net NetworkByte) string {
 // Address is the human-readable representation of a wallet (spend + view public keys).
 // Format: <hrPrefix> + Base58Check( version_byte || spend_pubkey[32] || view_pubkey[32] )
 // Example mainnet:  aproXXXXXXX...  (~98 chars total)
-// Example testnet: taprXXXXXXX... (~99 chars total)
+// Example testnet: taprXXXXXXX... (~99 chars total).
 type Address string
 
 // EncodeAddress encodes a spend+view public key pair into an Aperod address.

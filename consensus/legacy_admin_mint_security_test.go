@@ -40,7 +40,7 @@ func TestScheduleAdminMintFailsClosedBeforeFutureRingCTActivation(t *testing.T) 
 	address := crypto.AddressFromKeys(crypto.MainnetByte, keys)
 
 	hash, height, err := engine.ScheduleAdminMint(
-"legacy-unauthenticated-mint",
+		"legacy-unauthenticated-mint",
 		string(address),
 		1_000_000*100_000_000,
 		time.Second,
@@ -54,7 +54,7 @@ func TestScheduleAdminMintFailsClosedBeforeFutureRingCTActivation(t *testing.T) 
 	if pool.Count() != 0 {
 		t.Fatalf("rejected mint changed mempool: got %d transaction(s)", pool.Count())
 	}
-if _, found, err := db.LoadAdminMintRecord("legacy-unauthenticated-mint"); err != nil {
+	if _, found, err := db.LoadAdminMintRecord("legacy-unauthenticated-mint"); err != nil {
 		t.Fatal(err)
 	} else if found {
 		t.Fatal("rejected unauthenticated mint persisted an intent")

@@ -71,7 +71,15 @@ type rewardEraAuditReport struct {
 	TotalLegacyFeeFloorNAPRO     uint64                `json:"total_legacy_fee_floor_napro"`
 	TotalPriorityTipsNAPRO       uint64                `json:"total_priority_tips_napro"`
 	TotalRequiredAVMGasNAPRO     uint64                `json:"total_required_avm_gas_napro"`
+	LPoDSettlementBlocks         uint64                `json:"lpod_settlement_blocks"`
+	LPoDFeeBearingBlocks         uint64                `json:"lpod_fee_bearing_blocks"`
+	LPoDPriorityFeeSurplusNAPRO  uint64                `json:"lpod_priority_fee_surplus_napro"`
+	LPoDAVMTransactions          uint64                `json:"lpod_avm_transactions"`
+	LPoDRequiredAVMGasNAPRO      uint64                `json:"lpod_required_avm_gas_napro"`
+	LPoDAVMLegacySurplusNAPRO    uint64                `json:"lpod_avm_legacy_surplus_napro"`
+	LPoDAVMTipsExcludingGasNAPRO uint64                `json:"lpod_avm_tips_excluding_gas_napro"`
 	FeeBearingExamples           []rewardEraFeeExample `json:"fee_bearing_examples,omitempty"`
+	LPoDAVMFeeExamples           []lpodAVMFeeExample   `json:"lpod_avm_fee_examples,omitempty"`
 	AVMWireExamples              []avmWireExample      `json:"avm_wire_examples,omitempty"`
 }
 
@@ -89,6 +97,13 @@ type avmWireExample struct {
 	Action     core.AVMAction `json:"action"`
 	GasLimit   uint64         `json:"gas_limit"`
 	CodeLength uint64         `json:"code_length"`
+}
+
+type lpodAVMFeeExample struct {
+	Height                uint64 `json:"height"`
+	RequiredGasNAPRO      uint64 `json:"required_gas_napro"`
+	LegacySurplusNAPRO    uint64 `json:"legacy_fee_surplus_napro"`
+	TipsExcludingGasNAPRO uint64 `json:"tips_excluding_gas_napro"`
 }
 
 func main() {
@@ -513,14 +528,40 @@ func auditRewardEraBlock(
 	block *core.Block,
 	cutoverHeight, preCutoverBase, postCutoverBase uint64,
 ) error {
+	lpodSettlement := false
+	var lpodDigest crypto.Hash32
 	for i := range block.Txs {
 		if block.Txs[i].IsLPoDPayout() {
-			return fmt.Errorf("unsupported LPoD payout block; reward-era audit is pre-LPoD only")
+			if lpodSettlement || i != 0 {
+				return fmt.Errorf("malformed LPoD payout position")
+			}
+			auth, err := block.Txs[i].LPoDPayoutAuthorization()
+			if err != nil {
+				return fmt.Errorf("invalid LPoD payout authorization")
+			}
+			lpodSettlement = true
+			lpodDigest = auth.Digest
+		}
+	}
+	if lpodSettlement {
+		if len(block.Txs) < 2 || !block.Txs[1].IsLPoD() {
+			return fmt.Errorf("LPoD settlement is missing its checkpoint transaction")
+		}
+		digest, err := block.Txs[1].LPoDCheckpointDigest()
+		if err != nil || digest != lpodDigest {
+			return fmt.Errorf("LPoD settlement checkpoint does not match payout authorization")
+		}
+		for i := 2; i < len(block.Txs); i++ {
+			if block.Txs[i].IsCoinbase() && !block.Txs[i].IsStake() {
+				return fmt.Errorf("LPoD settlement block contains an additional coinbase reward")
+			}
 		}
 	}
 
 	var blockPriorityTips uint64
 	var blockRequiredGas uint64
+	var blockAVMLegacySurplus uint64
+	var blockAVMTipsExcludingGas uint64
 	var authorizedAmount uint64
 	var avmTransactions uint64
 	var coinbaseRewards uint64
@@ -560,13 +601,10 @@ func auditRewardEraBlock(
 			}
 			continue
 		}
-		if tx.IsStake() {
+		if tx.IsStake() || tx.IsLPoD() || tx.IsLPoDPosition() || tx.IsLPoDPayout() || tx.IsSale() {
 			continue
 		}
 
-		if err := add(&report.TotalTransactionFeesNAPRO, tx.Fee); err != nil {
-			return fmt.Errorf("total transaction fees overflow uint64")
-		}
 		requiredBeforeGas, err := rewardEraMinimumFee(tx, block.Header.BaseFee)
 		if err != nil {
 			return fmt.Errorf("transaction %d minimum fee: %w", i, err)
@@ -577,16 +615,38 @@ func auditRewardEraBlock(
 				return fmt.Errorf("transaction %d legacy fee floor overflows uint64", i)
 			}
 		}
+		if tx.IsAVM() {
+			gasFee, gasErr := core.AVMGasFee(tx.AVM.GasLimit)
+			if gasErr != nil {
+				return fmt.Errorf("transaction %d AVM gas fee: %w", i, gasErr)
+			}
+			requiredWithGas, sumErr := checkedSum(requiredBeforeGas, gasFee)
+			if sumErr != nil || tx.Fee < requiredWithGas {
+				return fmt.Errorf("transaction %d fee does not cover its byte minimum, intentional burn, and mandatory AVM gas", i)
+			}
+			surplus := tx.Fee - requiredBeforeGas
+			if err := add(&blockAVMLegacySurplus, surplus); err != nil {
+				return fmt.Errorf("block AVM legacy surplus overflows uint64")
+			}
+			if err := add(&blockAVMTipsExcludingGas, surplus-gasFee); err != nil {
+				return fmt.Errorf("block AVM tips excluding gas overflow uint64")
+			}
+		}
 		if err := add(&report.TotalLegacyFeeFloorNAPRO, requiredBeforeGas); err != nil {
 			return fmt.Errorf("total legacy fee floor overflows uint64")
+		}
+		if err := add(&report.TotalTransactionFeesNAPRO, tx.Fee); err != nil {
+			return fmt.Errorf("total transaction fees overflow uint64")
 		}
 		if tx.Fee > requiredBeforeGas {
 			tips := tx.Fee - requiredBeforeGas
 			if err := add(&blockPriorityTips, tips); err != nil {
 				return fmt.Errorf("block priority tips overflow uint64")
 			}
-			if err := add(&report.TotalPriorityTipsNAPRO, tips); err != nil {
-				return fmt.Errorf("total priority tips overflow uint64")
+			if !lpodSettlement {
+				if err := add(&report.TotalPriorityTipsNAPRO, tips); err != nil {
+					return fmt.Errorf("total priority tips overflow uint64")
+				}
 			}
 		}
 	}
@@ -597,20 +657,57 @@ func auditRewardEraBlock(
 	if err := add(&report.TotalRequiredAVMGasNAPRO, blockRequiredGas); err != nil {
 		return fmt.Errorf("total required AVM gas overflows uint64")
 	}
-	if coinbaseRewards != 1 || verifiedRewards != 1 {
-		return fmt.Errorf("block must have exactly one signature-verified authorized coinbase reward; found %d coinbase and %d valid authorization(s)", coinbaseRewards, verifiedRewards)
-	}
-
-	expectedAmount := preCutoverBase
-	if block.Header.Height >= cutoverHeight {
-		var err error
-		expectedAmount, err = checkedSum(postCutoverBase, blockPriorityTips)
-		if err != nil {
-			return fmt.Errorf("expected post-cutover reward overflows uint64")
+	expectedAmount := uint64(0)
+	if lpodSettlement {
+		if coinbaseRewards != 0 {
+			return fmt.Errorf("LPoD settlement block contains an unexpected validator coinbase")
 		}
-	}
-	if authorizedAmount != expectedAmount {
-		return fmt.Errorf("authorized reward mismatch at height %d: got %d nAPRO; expected %d nAPRO", block.Header.Height, authorizedAmount, expectedAmount)
+		if err := add(&report.LPoDSettlementBlocks, 1); err != nil {
+			return fmt.Errorf("LPoD settlement block count overflows uint64")
+		}
+		if blockPriorityTips > 0 {
+			if err := add(&report.LPoDFeeBearingBlocks, 1); err != nil {
+				return fmt.Errorf("LPoD fee-bearing block count overflows uint64")
+			}
+			if err := add(&report.LPoDPriorityFeeSurplusNAPRO, blockPriorityTips); err != nil {
+				return fmt.Errorf("LPoD priority fee surplus overflows uint64")
+			}
+		}
+		if err := add(&report.LPoDAVMTransactions, avmTransactions); err != nil {
+			return fmt.Errorf("LPoD AVM transaction count overflows uint64")
+		}
+		if err := add(&report.LPoDRequiredAVMGasNAPRO, blockRequiredGas); err != nil {
+			return fmt.Errorf("LPoD required AVM gas overflows uint64")
+		}
+		if err := add(&report.LPoDAVMLegacySurplusNAPRO, blockAVMLegacySurplus); err != nil {
+			return fmt.Errorf("LPoD AVM legacy surplus overflows uint64")
+		}
+		if err := add(&report.LPoDAVMTipsExcludingGasNAPRO, blockAVMTipsExcludingGas); err != nil {
+			return fmt.Errorf("LPoD AVM tips excluding gas overflow uint64")
+		}
+		if avmTransactions > 0 && len(report.LPoDAVMFeeExamples) < maxRewardEraFeeExamples {
+			report.LPoDAVMFeeExamples = append(report.LPoDAVMFeeExamples, lpodAVMFeeExample{
+				Height:                block.Header.Height,
+				RequiredGasNAPRO:      blockRequiredGas,
+				LegacySurplusNAPRO:    blockAVMLegacySurplus,
+				TipsExcludingGasNAPRO: blockAVMTipsExcludingGas,
+			})
+		}
+	} else {
+		if coinbaseRewards != 1 || verifiedRewards != 1 {
+			return fmt.Errorf("block must have exactly one signature-verified authorized coinbase reward; found %d coinbase and %d valid authorization(s)", coinbaseRewards, verifiedRewards)
+		}
+		expectedAmount = preCutoverBase
+		if block.Header.Height >= cutoverHeight {
+			var err error
+			expectedAmount, err = checkedSum(postCutoverBase, blockPriorityTips)
+			if err != nil {
+				return fmt.Errorf("expected post-cutover reward overflows uint64")
+			}
+		}
+		if authorizedAmount != expectedAmount {
+			return fmt.Errorf("authorized reward mismatch at height %d: got %d nAPRO; expected %d nAPRO", block.Header.Height, authorizedAmount, expectedAmount)
+		}
 	}
 
 	if block.Header.Height < cutoverHeight {
@@ -620,12 +717,14 @@ func auditRewardEraBlock(
 		if err := add(&report.PreCutoverAVMTransactions, avmTransactions); err != nil {
 			return fmt.Errorf("pre-cutover AVM transaction count overflows uint64")
 		}
-		if err := add(&report.PreCutoverPriorityTipsNAPRO, blockPriorityTips); err != nil {
-			return fmt.Errorf("pre-cutover priority tips overflow uint64")
-		}
-		if blockPriorityTips > 0 {
-			if err := add(&report.PreCutoverFeeBearingBlocks, 1); err != nil {
-				return fmt.Errorf("pre-cutover fee-bearing block count overflows uint64")
+		if !lpodSettlement {
+			if err := add(&report.PreCutoverPriorityTipsNAPRO, blockPriorityTips); err != nil {
+				return fmt.Errorf("pre-cutover priority tips overflow uint64")
+			}
+			if blockPriorityTips > 0 {
+				if err := add(&report.PreCutoverFeeBearingBlocks, 1); err != nil {
+					return fmt.Errorf("pre-cutover fee-bearing block count overflows uint64")
+				}
 			}
 		}
 	} else {
@@ -635,20 +734,22 @@ func auditRewardEraBlock(
 		if err := add(&report.PostCutoverAVMTransactions, avmTransactions); err != nil {
 			return fmt.Errorf("post-cutover AVM transaction count overflows uint64")
 		}
-		if err := add(&report.PostCutoverPriorityTipsNAPRO, blockPriorityTips); err != nil {
-			return fmt.Errorf("post-cutover priority tips overflow uint64")
-		}
-		if blockPriorityTips > 0 {
-			if err := add(&report.PostCutoverFeeBearingBlocks, 1); err != nil {
-				return fmt.Errorf("post-cutover fee-bearing block count overflows uint64")
+		if !lpodSettlement {
+			if err := add(&report.PostCutoverPriorityTipsNAPRO, blockPriorityTips); err != nil {
+				return fmt.Errorf("post-cutover priority tips overflow uint64")
+			}
+			if blockPriorityTips > 0 {
+				if err := add(&report.PostCutoverFeeBearingBlocks, 1); err != nil {
+					return fmt.Errorf("post-cutover fee-bearing block count overflows uint64")
+				}
 			}
 		}
 	}
-	if blockPriorityTips > 0 {
+	if blockPriorityTips > 0 && !lpodSettlement {
 		if err := add(&report.FeeBearingBlocks, 1); err != nil {
 			return err
 		}
-		if len(report.FeeBearingExamples) < maxRewardEraFeeExamples {
+		if !lpodSettlement && len(report.FeeBearingExamples) < maxRewardEraFeeExamples {
 			report.FeeBearingExamples = append(report.FeeBearingExamples, rewardEraFeeExample{
 				Height:                      block.Header.Height,
 				PriorityTipsNAPRO:           blockPriorityTips,

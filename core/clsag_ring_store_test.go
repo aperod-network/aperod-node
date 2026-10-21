@@ -12,8 +12,8 @@ type testRingStore struct {
 }
 
 func (*testRingStore) IsKeyImageSpent(crypto.KeyImage) (bool, error) { return false, nil }
-func (*testRingStore) MarkKeyImageSpent(crypto.KeyImage) error      { return nil }
-func (*testRingStore) DeleteKeyImage(crypto.KeyImage) error         { return nil }
+func (*testRingStore) MarkKeyImageSpent(crypto.KeyImage) error       { return nil }
+func (*testRingStore) DeleteKeyImage(crypto.KeyImage) error          { return nil }
 func (s *testRingStore) LookupRingMember(pub crypto.Point32) (*UTXO, error) {
 	return s.members[pub], nil
 }
@@ -49,7 +49,8 @@ func TestCLSAGOutputCacheIsBoundedAndFallsBackToPersistentIndex(t *testing.T) {
 	if got := set.Get(first.TxHash, 0); got != nil {
 		t.Fatal("old v5 output remained in bounded in-memory cache")
 	}
-	if got := set.GetRingMember(first.OneTimePub); got != first {
+	if got := set.GetRingMember(first.OneTimePub); got == nil ||
+		got.TxHash != first.TxHash || got.OneTimePub != first.OneTimePub {
 		t.Fatal("persistent ring-member fallback did not resolve evicted output")
 	}
 }

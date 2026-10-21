@@ -36,6 +36,12 @@ type Config struct {
 	// ValidatorAuthorityFork separates collateral identity from future signing
 	// authority. Nil preserves the deployed protocol without any change.
 	ValidatorAuthorityFork *core.ValidatorAuthorityFork
+	// FinalityMigration is an explicitly signed, one-certificate historical
+	// committee attestation. It never manufactures votes or changes the quorum.
+	FinalityMigration *store.FinalityCommitteeMigration
+	// FinalityMigrationTrustAuthorities are operator-pinned validator identities
+	// authorized to sign the migration, independent of genesis validators.
+	FinalityMigrationTrustAuthorities []crypto.ValidatorPubKey
 	LPoDMigration          *store.LPoDMigration
 	SaleMigration          *store.SaleMigration
 	// Approved durable purchase intents are built at the real slot and parent.
@@ -127,9 +133,9 @@ type Config struct {
 	// RingCTCLSAGActivationHeight is the first height requiring v5; zero
 	// disables activation to avoid an accidental uncoordinated fork.
 	RingCTCLSAGActivationHeight uint64
-// StakedCollateralRingExclusionActivationHeight is the first height at which
-// CLSAG rings must exclude staked collateral. Zero disables this fork.
-StakedCollateralRingExclusionActivationHeight uint64
+	// StakedCollateralRingExclusionActivationHeight is the first height at which
+	// CLSAG rings must exclude staked collateral. Zero disables this fork.
+	StakedCollateralRingExclusionActivationHeight uint64
 	// AVMActivationHeight is the first height accepting v6 AVM transactions.
 	// Zero disables AVM consensus.
 	AVMActivationHeight uint64
@@ -346,10 +352,11 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 	}
 	if cfg.LPoDMigration != nil {
 		m := *cfg.LPoDMigration
-		if m.Version == 1 {
+		switch m.Version {
+		case 1:
 			// Preserve the legacy v1 trust behavior exactly.
 			m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), cfg.Validators...)
-		} else if m.Version == 2 || m.Version == 3 {
+		case 2, 3:
 			// Trusted checkpoint authority is configured separately from consensus.
 			// Never replace it with the effective consensus validator set.
 			m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), m.TrustedValidators...)
@@ -415,7 +422,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 			e.tailRewardNAPR = defaultTailRewardNAPR
 		}
 		// Try to restore persisted pool balance from LevelDB so restarts
-		// do not re-initialise to the full 2 B.
+		// do not re-initialize to the full 2 B.
 		if cfg.Store != nil {
 			if rem, found, err := cfg.Store.LoadStakingPoolRemaining(); err != nil {
 				log.Warn("staking pool: failed to load from store; using config value", "err", err)
@@ -430,7 +437,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 				// First boot with pool enabled — persist initial balance.
 				atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
 				_ = cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR)
-				log.Info("staking pool: initialised",
+				log.Info("staking pool: initialized",
 					"total_napro", cfg.StakingPoolNAPR,
 					"total_apro", float64(cfg.StakingPoolNAPR)/1e8,
 				)
@@ -439,7 +446,7 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 			atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
 		}
 	} else {
-		// Pool disabled — -1 signals legacy mint behaviour.
+		// Pool disabled — -1 signals legacy mint behavior.
 		atomic.StoreInt64(&e.stakingPoolRemaining, -1)
 	}
 	// Reconstruct the fee expected for the block after the current tip.  Without
@@ -596,9 +603,9 @@ func (e *Engine) TimestampRejectedCount() int64 {
 func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.txVerifier = v
 	e.utxos = utxos
-if v != nil {
-v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
-}
+	if v != nil {
+		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
+	}
 }
 
 // activeValidators returns the current active validator set.
@@ -1721,7 +1728,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 				screened = append(screened, *tx)
 				continue
 			}
-		if err := e.txVerifier.VerifyTxAtHeight(tx, height); err != nil {
+			if err := e.txVerifier.VerifyTxAtHeight(tx, height); err != nil {
 				hash := tx.Hash()
 				e.log.Warn("produceBlock: banning mempool tx that failed re-verification",
 					"hash", hash,
@@ -2490,11 +2497,20 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 
 func (e *Engine) restoreFinalityCertificate() error {
 	if e.cfg.Store == nil {
+		if e.cfg.FinalityMigration != nil || len(e.cfg.FinalityMigrationTrustAuthorities) != 0 {
+			return fmt.Errorf("finality: migration configured without a durable store")
+		}
 		return nil
 	}
 	certificate, err := e.cfg.Store.LoadFinalityCertificate()
-	if err != nil || certificate == nil {
+	if err != nil {
 		return err
+	}
+	if certificate == nil {
+		if e.cfg.FinalityMigration != nil || len(e.cfg.FinalityMigrationTrustAuthorities) != 0 {
+			return fmt.Errorf("finality: migration configured without its durable certificate")
+		}
+		return nil
 	}
 	tip := e.chain.Tip()
 	if tip == nil || certificate.Height > tip.Header.Height {
@@ -2541,11 +2557,21 @@ func (e *Engine) restoreFinalityCertificate() error {
 		}
 	}
 	active := e.activeValidators()
-	committee := make(map[string]bool, len(active))
-	for _, validator := range active {
+	committeeMembers := active
+	if e.cfg.FinalityMigration != nil {
+		migrationCommittee, err := e.verifyFinalityCommitteeMigration(certificate)
+		if err != nil {
+			return err
+		}
+		committeeMembers = migrationCommittee
+	} else if len(e.cfg.FinalityMigrationTrustAuthorities) != 0 {
+		return fmt.Errorf("finality: migration authorities configured without a migration file")
+	}
+	committee := make(map[string]bool, len(committeeMembers))
+	for _, validator := range committeeMembers {
 		committee[validator.Hex()] = true
 	}
-	needed := int(float64(len(active))*e.cfg.BFTThreshold) + 1
+	needed := int(float64(len(committeeMembers))*e.cfg.BFTThreshold) + 1
 	seen := make(map[string]bool, len(certificate.Votes))
 	message := crypto.HashBytes([]byte("aperod/finalize/v1"), certificate.BlockHash[:])
 	for _, vote := range certificate.Votes {

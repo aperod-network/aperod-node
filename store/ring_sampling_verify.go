@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 // RingSamplingInventory is an offline local integrity receipt, not a consensus

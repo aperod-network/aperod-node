@@ -1,6 +1,6 @@
 package p2p_test
 
-// Test for TASK #1770: fail-closed behaviour when the whitelist sidecar file
+// Test for TASK #1770: fail-closed behavior when the whitelist sidecar file
 // exists but cannot be read (permission denied).
 //
 // loadWhitelistFromFile must return a fatal error in that case so Start()
@@ -8,7 +8,7 @@ package p2p_test
 // which would defeat the whitelist's access-control purpose).
 //
 // NOTE: an EMPTY or ABSENT sidecar intentionally falls back to the node.yaml
-// peer_whitelist entries; that behaviour is covered elsewhere and is not
+// peer_whitelist entries; that behavior is covered elsewhere and is not
 // exercised here.  Only the unreadable-file case must fail closed.
 
 import (

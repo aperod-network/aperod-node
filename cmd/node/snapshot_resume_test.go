@@ -112,10 +112,10 @@ func applyBlockRange(t *testing.T, utxos *core.UTXOSet, blocks []*core.Block, lo
 //   - The node crashed mid-scan at block 5: a partial checkpoint was written at
 //     height 5 but the scan never reached the tip (height 10).
 //   - On restart, runStartupScan (the production function) must:
-//       (a) find the height-5 checkpoint via findLatestSnapshot,
-//       (b) log "partial snapshot loaded — resuming scan from checkpoint",
-//       (c) return ScanFrom == 6 (not 1),
-//       (d) leave p.UTXOs with the same count as a full scan from block 1.
+//     (a) find the height-5 checkpoint via findLatestSnapshot,
+//     (b) log "partial snapshot loaded — resuming scan from checkpoint",
+//     (c) return ScanFrom == 6 (not 1),
+//     (d) leave p.UTXOs with the same count as a full scan from block 1.
 func TestPartialSnapshotResume(t *testing.T) {
 	const totalBlocks = 10 // heights 1–10 plus genesis at 0
 	const checkpointAt = 5 // "crash" height: partial checkpoint saved here
@@ -172,18 +172,18 @@ func TestPartialSnapshotResume(t *testing.T) {
 	// ── Call the production function under test.
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false, // fresh start — no index pre-loaded
-		InitTxTotal: 0,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         tipHashHex,
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false, // fresh start — no index pre-loaded
+		InitTxTotal:        0,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
 	}
@@ -237,18 +237,18 @@ func TestNoPartialSnapshot_ScanFromOne(t *testing.T) {
 
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		InitTxTotal: 0,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         tipHashHex,
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false,
+		InitTxTotal:        0,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestNoPartialSnapshot_ScanFromOne(t *testing.T) {
 	}
 }
 
-// ─── Test 3: findLatestSnapshot honours limitHeight ──────────────────────────
+// ─── Test 3: findLatestSnapshot honors limitHeight ──────────────────────────
 
 // TestFindLatestSnapshot_LimitHeight verifies that findLatestSnapshot returns
 // the highest checkpoint strictly below limitHeight and never at or above it.
@@ -460,18 +460,18 @@ func TestPartialSnapshot_HashMismatch(t *testing.T) {
 
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		InitTxTotal: 0,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         tipHashHex,
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false,
+		InitTxTotal:        0,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestCorruptCheckpointRunStartupScan_PrevBackupAccepted(t *testing.T) {
 	// Write the prev-backup explicitly so the recovery path has a valid file.
 	// The first save at a height does not create a prev (nothing to preserve);
 	// a same-height overwrite would, but we create it directly here to keep
-	// the test focused on the recovery behaviour.
+	// the test focused on the recovery behavior.
 	prevP := snapshotPrevPath(snapshotPath(dir, uint64(checkpointAt)))
 	writeGzipSnapFile(t, prevP, cpSnap)
 
@@ -593,18 +593,18 @@ func TestCorruptCheckpointRunStartupScan_PrevBackupAccepted(t *testing.T) {
 	// ── Call the production function under test.
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		InitTxTotal: 0,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         tipHashHex,
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false,
+		InitTxTotal:        0,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
 	}
@@ -722,7 +722,7 @@ func TestFindLatestSnapshot_BothCorrupt(t *testing.T) {
 //  3. The number of blocks processed equals tipHeight - checkpointAt.
 //  4. Final UTXOSet count equals a full-scan reference.
 func TestForcedKillRestart_ResumesFromPeriodicCheckpoint(t *testing.T) {
-	const totalBlocks  = 15 // heights 1–15 plus genesis at 0; tip == 15
+	const totalBlocks = 15  // heights 1–15 plus genesis at 0; tip == 15
 	const checkpointAt = 10 // periodic checkpoint height saved before the kill
 
 	dir := t.TempDir()
@@ -784,18 +784,18 @@ func TestForcedKillRestart_ResumesFromPeriodicCheckpoint(t *testing.T) {
 	// ── Call the production function under test.
 	var wg sync.WaitGroup
 	result, err := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tipHeight,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false, // fresh start — no index pre-loaded
-		InitTxTotal: 0,
-		Log:         log,
-		SnapshotWg:  &wg,
+		DataDir:            dir,
+		TipHeight:          tipHeight,
+		TipHashHex:         tipHashHex,
+		DB:                 db,
+		UTXOs:              utxos,
+		Registry:           registry,
+		KiFromIndex:        false, // fresh start — no index pre-loaded
+		InitTxTotal:        0,
+		Log:                log,
+		SnapshotWg:         &wg,
 		CheckpointInterval: 50000,
-		})
+	})
 	if err != nil {
 		t.Fatalf("runStartupScan: %v", err)
 	}
@@ -929,15 +929,15 @@ func TestRecoverTip_RelaxedHashFallback(t *testing.T) {
 // written during a first forced-kill (mid-full-scan) is still intact and
 // usable after a *second* forced-kill that occurs mid-delta-scan:
 //
-//  - Boot 1: scan starts from block 1.  A periodic checkpoint is written at
-//    height N.  The process is SIGKILL-ed before reaching the tip → no tip
-//    snapshot is saved.
-//  - Boot 2 (simulated kill): the node resumes from the height-N checkpoint
-//    and begins scanning the delta (N+1 … N+K).  The process is SIGKILL-ed
-//    again before writing any new checkpoint or tip snapshot.
-//  - Boot 3 (the boot under test): the original checkpoint at N must still be
-//    on disk, findLatestSnapshot must return it, and runStartupScan must
-//    report ScanFrom == N+1 (not 1).
+//   - Boot 1: scan starts from block 1.  A periodic checkpoint is written at
+//     height N.  The process is SIGKILL-ed before reaching the tip → no tip
+//     snapshot is saved.
+//   - Boot 2 (simulated kill): the node resumes from the height-N checkpoint
+//     and begins scanning the delta (N+1 … N+K).  The process is SIGKILL-ed
+//     again before writing any new checkpoint or tip snapshot.
+//   - Boot 3 (the boot under test): the original checkpoint at N must still be
+//     on disk, findLatestSnapshot must return it, and runStartupScan must
+//     report ScanFrom == N+1 (not 1).
 //
 // The invariant being tested: deleteOldSnapshots is only called inside the
 // goroutine that saves a *new* snapshot.  A mid-delta kill before any new
@@ -951,9 +951,9 @@ func TestRecoverTip_RelaxedHashFallback(t *testing.T) {
 //  4. The "partial snapshot loaded" log is emitted.
 //  5. Final UTXOSet count equals a full-scan reference.
 func TestDoubleKillMidDeltaScan_CheckpointSurvives(t *testing.T) {
-	const totalBlocks  = 20 // heights 1–20 plus genesis at 0; tip == 20
-	const checkpointAt = 8  // height N: checkpoint written before first kill
-	const deltaBlocks  = 12 // K: delta that Boot 2 would have scanned
+	const totalBlocks = 20 // heights 1–20 plus genesis at 0; tip == 20
+	const checkpointAt = 8 // height N: checkpoint written before first kill
+	const deltaBlocks = 12 // K: delta that Boot 2 would have scanned
 
 	dir := t.TempDir()
 	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
@@ -1105,8 +1105,8 @@ func TestUnwritableDataDir_CheckpointFailureNonFatal(t *testing.T) {
 		t.Skip("cannot test unwritable directory as root (root ignores permission bits)")
 	}
 
-	const totalBlocks        = 10 // heights 1–10 plus genesis at 0; tip == 10
-	const checkpointInterval = 5  // checkpoint goroutine fires at h == 5
+	const totalBlocks = 10       // heights 1–10 plus genesis at 0; tip == 10
+	const checkpointInterval = 5 // checkpoint goroutine fires at h == 5
 
 	dir := t.TempDir()
 	db, blocks, _, pub := buildChainResume(t, dir, totalBlocks)
@@ -1215,8 +1215,8 @@ func logContainsMsgWithIntField(buf *bytes.Buffer, wantMsg, fieldName string, wa
 // at h=12, resumes from the *highest* eligible checkpoint (h=10) rather than
 // from h=5 or from block 1.  ScanFrom must equal 11.
 func TestCheckpointInterval_CheckpointsWrittenAndHighestResumed(t *testing.T) {
-	const totalBlocks        = 12 // heights 1–12 plus genesis at 0; tip == 12
-	const checkpointInterval = 5  // checkpoint fires at h=5 and h=10 (both < 12)
+	const totalBlocks = 12       // heights 1–12 plus genesis at 0; tip == 12
+	const checkpointInterval = 5 // checkpoint fires at h=5 and h=10 (both < 12)
 
 	// ── Phase 1: first scan — verify checkpoints logged at h=5 and h=10 ──
 
@@ -1503,7 +1503,7 @@ func TestPostScanSnapshotCreated(t *testing.T) {
 //   - The log contains "startup snapshot saved" with tip_height == 12.
 //   - result.ScanFrom == 7 (resume path taken, not full scan).
 func TestPostScanSnapshotCreated_CheckpointResume(t *testing.T) {
-	const totalBlocks  = 12
+	const totalBlocks = 12
 	const checkpointAt = 6
 
 	dir := t.TempDir()

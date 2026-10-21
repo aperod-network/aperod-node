@@ -58,12 +58,12 @@ func TestStallTimeout_HostRetainsRaisedValue(t *testing.T) {
 // here is on a stall-specific observable — GetStallEvents — so a re-issued
 // MsgGetHeaders from the ordinary 3s sync ticker can never satisfy the test:
 //
-//   1. No StallEvent may exist before the configured timeout has elapsed
-//      (measured from a baseline taken BEFORE the host is started, so no
-//      earlier ticker could have fired unobserved).
-//   2. A StallEvent MUST be recorded within the [timeout, timeout+grace]
-//      window.  If the config-to-host wiring broke and the host silently used
-//      the 15s default, no StallEvent appears in the window and the test fails.
+//  1. No StallEvent may exist before the configured timeout has elapsed
+//     (measured from a baseline taken BEFORE the host is started, so no
+//     earlier ticker could have fired unobserved).
+//  2. A StallEvent MUST be recorded within the [timeout, timeout+grace]
+//     window.  If the config-to-host wiring broke and the host silently used
+//     the 15s default, no StallEvent appears in the window and the test fails.
 func TestStallTimeout_ConfiguredValueDrivesStallTicker(t *testing.T) {
 	const peerHeight = uint64(3)
 	const stallTimeout = 1200 * time.Millisecond

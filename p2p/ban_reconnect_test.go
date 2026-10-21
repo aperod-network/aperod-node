@@ -84,8 +84,8 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 	// (no context-cancellation check on return) so the raw TCP connection
 	// always reaches dialPeer regardless of whether BanPeer cancels the context.
 	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Dial without honouring ctx so that the conn is returned even if
-		// BanPeer has already cancelled the dial context.
+		// Dial without honoring ctx so that the conn is returned even if
+		// BanPeer has already canceled the dial context.
 		return net.Dial(network, addr)
 	})
 
@@ -228,7 +228,7 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 		// Block until either BanPeer cancels us or the test times out.
 		select {
 		case <-ctx.Done():
-			// BanPeer cancelled: return without connecting.
+			// BanPeer canceled: return without connecting.
 			return nil, ctx.Err()
 		case <-time.After(5 * time.Second):
 			// Safety: avoid hanging the test forever if cancellation breaks.
@@ -254,13 +254,13 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 	// context.Canceled, and (c) prevent the TCP connect from reaching ln.
 	h.BanPeer(targetAddr, "concurrent ban test", 24*time.Hour)
 
-	// Allow time for the cancelled dial goroutine to finish.
+	// Allow time for the canceled dial goroutine to finish.
 	time.Sleep(100 * time.Millisecond)
 
 	if n := dialCount.Load(); n != 0 {
-		t.Errorf("listener received %d TCP connection(s) after BanPeer cancelled the in-flight dial — dial-gate race not closed", n)
+		t.Errorf("listener received %d TCP connection(s) after BanPeer canceled the in-flight dial — dial-gate race not closed", n)
 	}
-	t.Logf("✓ concurrent ban cancelled in-flight dial to %s before TCP connect (dialCount=%d)", targetAddr, dialCount.Load())
+	t.Logf("✓ concurrent ban canceled in-flight dial to %s before TCP connect (dialCount=%d)", targetAddr, dialCount.Load())
 }
 
 // TestBanDial_ConcurrentBan_Bootnode mirrors TestBanDial_ConcurrentBan_KnownPeer
@@ -347,9 +347,9 @@ func TestBanDial_ConcurrentBan_Bootnode(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	if n := dialCount.Load(); n != 0 {
-		t.Errorf("listener received %d TCP connection(s) after BanPeer cancelled the in-flight bootnode dial — dial-gate race not closed", n)
+		t.Errorf("listener received %d TCP connection(s) after BanPeer canceled the in-flight bootnode dial — dial-gate race not closed", n)
 	}
-	t.Logf("✓ concurrent ban cancelled in-flight bootnode dial to %s before TCP connect (dialCount=%d)", targetAddr, dialCount.Load())
+	t.Logf("✓ concurrent ban canceled in-flight bootnode dial to %s before TCP connect (dialCount=%d)", targetAddr, dialCount.Load())
 }
 
 func TestBanReconnect_MaintainLoopSkipsBannedPeer(t *testing.T) {
@@ -479,7 +479,7 @@ func TestBanReconnect_BootnodePathSkipsBannedAddr(t *testing.T) {
 		t.Fatal("BanPeer did not register any ban entries")
 	}
 
-	// Reset the dial counter: Start() may have already dialled bannedAddr
+	// Reset the dial counter: Start() may have already dialed bannedAddr
 	// during the initial bootnode dial goroutine.  We only care about dials
 	// triggered by the maintainLoop tick below.
 	time.Sleep(50 * time.Millisecond) // let any in-flight Start() dials land
@@ -536,7 +536,7 @@ func TestBanReconnect_BareIPBanBlocksListenPort(t *testing.T) {
 	}()
 
 	ephemeralAddr := lnEphemeral.Addr().String() // "127.0.0.1:XXXXX" — banned addr
-	listenAddr := lnListen.Addr().String()        // "127.0.0.1:YYYYY" — dial target
+	listenAddr := lnListen.Addr().String()       // "127.0.0.1:YYYYY" — dial target
 
 	h := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
