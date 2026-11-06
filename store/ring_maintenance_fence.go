@@ -20,8 +20,35 @@ import (
 // the maintenance fence. This is not installed as part of a node update.
 const RingMaintenanceStateDirectory = "/var/lib/aperod-ring-maintenance"
 
+func ringMaintenanceFileFromFD(fd int, name string) (*os.File, error) {
+	if fd < 0 {
+		return nil, fmt.Errorf("ring maintenance: invalid file descriptor")
+	}
+	// #nosec G115 -- successful OS descriptors are nonnegative and bounded by the process descriptor table.
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("ring maintenance: cannot wrap file descriptor")
+	}
+	return file, nil
+}
+
+func ringMaintenanceFDInt(file *os.File) (int, error) {
+	if file == nil {
+		return 0, fmt.Errorf("ring maintenance: missing file descriptor")
+	}
+	fd := file.Fd()
+	maxInt := uintptr(^uint(0) >> 1)
+	if fd > maxInt {
+		return 0, fmt.Errorf("ring maintenance: file descriptor exceeds int range")
+	}
+	// #nosec G115 -- fd was checked against the maximum representable int above.
+	return int(fd), nil
+}
+
 func protectedRingMaintenanceRoot(root string, owner uint32) error {
 	for path := root; ; path = filepath.Dir(path) {
+		// #nosec G703 -- root is supplied by the trusted operator configuration and each ancestor is verified before use.
 		dir, err := os.Lstat(path)
 		if err != nil {
 			return err
@@ -119,6 +146,7 @@ func checkRingScopeFiles(state string) error {
 }
 
 func checkRingStateFile(state string) error {
+	// #nosec G703 -- state is a hash-derived filename beneath the independently verified protected root.
 	_, err := os.Lstat(state)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -163,6 +191,7 @@ func acquireRingMaintenanceAt(path, root string, owner uint32) (*RingMaintenance
 	if err != nil || identity != absolute || identity == "/" {
 		return nil, fmt.Errorf("ring maintenance: canonical non-symlink database path required")
 	}
+	// #nosec G703 -- identity is an absolute, canonical, non-symlink database path verified immediately above.
 	info, err := os.Lstat(identity)
 	if err != nil {
 		return nil, err
@@ -181,8 +210,16 @@ func acquireRingMaintenanceAt(path, root string, owner uint32) (*RingMaintenance
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(fd), state+".lock")
-	fail := func(err error) (*RingMaintenanceLease, error) { file.Close(); return nil, err }
+	file, err := ringMaintenanceFileFromFD(fd, state+".lock")
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*RingMaintenanceLease, error) {
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close ring maintenance lock: %w", closeErr))
+		}
+		return nil, err
+	}
 	li, err := file.Stat()
 	if err != nil {
 		return fail(err)
@@ -212,6 +249,7 @@ type RingMaintenanceWorkerReceipt struct {
 	Inventory  RingSamplingInventory `json:"inventory"`
 }
 
+// WorkerGeneration returns the fenced generation assigned to the maintenance worker.
 func (l *RingMaintenanceLease) WorkerGeneration() string {
 	if l == nil {
 		return ""
@@ -219,16 +257,25 @@ func (l *RingMaintenanceLease) WorkerGeneration() string {
 	return l.generation
 }
 
+// WorkerFile returns the inherited descriptor authorized for the maintenance worker.
 func (l *RingMaintenanceLease) WorkerFile() (*os.File, error) {
 	if err := l.check(); err != nil {
 		return nil, err
 	}
-	fd, err := syscall.Dup(int(l.lock.Fd()))
+	lockFD, err := ringMaintenanceFDInt(l.lock)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := syscall.Dup(lockFD)
 	if err != nil {
 		return nil, err
 	}
 	syscall.CloseOnExec(fd)
-	return os.NewFile(uintptr(fd), "ring-maintenance-lease"), nil
+	file, err := ringMaintenanceFileFromFD(fd, "ring-maintenance-lease")
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 func borrowRingMaintenanceAt(path, root, generation string, file *os.File, owner uint32) (*RingMaintenanceLease, error) {
@@ -265,7 +312,11 @@ func borrowRingMaintenanceAt(path, root, generation string, file *os.File, owner
 	if _, err := hex.DecodeString(generation); err != nil || len(generation) != 32 {
 		return nil, fmt.Errorf("ring maintenance: invalid worker generation")
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	fd, err := ringMaintenanceFDInt(file)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, err
 	}
 	return &RingMaintenanceLease{path: identity, state: state, lock: file, generation: generation}, nil
@@ -349,12 +400,17 @@ func (l *RingMaintenanceLease) check() error {
 }
 
 func syncRingStateDirectory(path string) error {
+	// #nosec G703 -- path is the trusted hash-derived state file under the protected root.
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil || closeErr != nil {
+		return errors.Join(syncErr, closeErr)
+	}
+	return nil
 }
 
 // Fence publishes a durable external barrier BEFORE permitting a legacy writer,
@@ -368,7 +424,10 @@ func (l *RingMaintenanceLease) Fence() error {
 	if err != nil {
 		return fmt.Errorf("ring maintenance: fence already present or cannot create: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), l.state)
+	f, err := ringMaintenanceFileFromFD(fd, l.state)
+	if err != nil {
+		return err
+	}
 	_, writeErr := f.WriteString(l.path + "\n")
 	syncErr := f.Sync()
 	closeErr := f.Close()
@@ -379,6 +438,7 @@ func (l *RingMaintenanceLease) existingFencedDB() (*DB, error) {
 	if err := l.check(); err != nil {
 		return nil, err
 	}
+	// #nosec G703 -- l.state is derived from the canonical database identity beneath the verified protected root.
 	fi, err := os.Lstat(l.state)
 	if err != nil {
 		return nil, err
@@ -388,6 +448,7 @@ func (l *RingMaintenanceLease) existingFencedDB() (*DB, error) {
 	}
 	// OpenFile(ErrorIfMissing) still creates its filesystem directory before
 	// detecting an absent CURRENT. Never initialize a removed import target.
+	// #nosec G703 -- l.path was canonicalized and identity-checked when the lease was acquired.
 	fi, err = os.Lstat(l.path)
 	if err != nil {
 		return nil, err
@@ -469,6 +530,7 @@ func (l *RingMaintenanceLease) Commit() error {
 	return nil
 }
 
+// Close releases the maintenance lock and invalidates the lease.
 func (l *RingMaintenanceLease) Close() error {
 	if l == nil || l.lock == nil {
 		return nil

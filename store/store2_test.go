@@ -10,11 +10,18 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
+func closeStoreTestResource(t *testing.T, resource interface{ Close() error }) {
+	t.Helper()
+	if err := resource.Close(); err != nil {
+		t.Errorf("close test database: %v", err)
+	}
+}
+
 // ─── StoredBlock: PutBlock / GetBlock / GetBlockByHeight ─────────────────────
 
 func TestDB_PutBlock_GetBlock(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var hash crypto.Hash32
 	hash[0] = 0xAA
@@ -45,7 +52,7 @@ func TestDB_PutBlock_GetBlock(t *testing.T) {
 
 func TestDB_GetBlock_NotFound(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var missing crypto.Hash32
 	missing[0] = 0xFF
@@ -60,7 +67,7 @@ func TestDB_GetBlock_NotFound(t *testing.T) {
 
 func TestDB_GetBlockByHeight_NotFound(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	got, err := db.GetBlockByHeight(99999)
 	if err != nil {
@@ -73,7 +80,7 @@ func TestDB_GetBlockByHeight_NotFound(t *testing.T) {
 
 func TestDB_GetBlockByHeight_Found(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var hash crypto.Hash32
 	hash[1] = 0xBB
@@ -93,7 +100,7 @@ func TestDB_GetBlockByHeight_Found(t *testing.T) {
 
 func TestDB_UTXO_PutGetDelete(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var txHash crypto.Hash32
 	txHash[0] = 0x11
@@ -142,7 +149,7 @@ func TestDB_UTXO_PutGetDelete(t *testing.T) {
 
 func TestDB_GetUTXO_NotFound(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var txHash crypto.Hash32
 	txHash[0] = 0xCC
@@ -157,7 +164,7 @@ func TestDB_GetUTXO_NotFound(t *testing.T) {
 
 func TestDB_UTXO_MultipleOutputs(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var txHash crypto.Hash32
 	txHash[0] = 0x22
@@ -185,7 +192,7 @@ func TestDB_UTXO_MultipleOutputs(t *testing.T) {
 
 func TestDB_IsKeyImageSpent(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var ki crypto.KeyImage
 	ki[0] = 0x55
@@ -213,7 +220,7 @@ func TestDB_IsKeyImageSpent(t *testing.T) {
 
 func TestDB_Meta_RoundTrip(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	if err := db.PutMeta("sync_state", []byte(`{"height":42}`)); err != nil {
 		t.Fatalf("PutMeta: %v", err)
@@ -230,7 +237,7 @@ func TestDB_Meta_RoundTrip(t *testing.T) {
 
 func TestDB_Meta_NotFound(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	val, err := db.GetMeta("nonexistent")
 	if err != nil {
@@ -245,7 +252,7 @@ func TestDB_Meta_NotFound(t *testing.T) {
 
 func TestDB_GetTip_Empty(t *testing.T) {
 	db, _ := store.Open(t.TempDir())
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	hash, height, err := db.GetTip()
 	if err != nil {

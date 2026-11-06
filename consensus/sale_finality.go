@@ -2,6 +2,7 @@ package consensus
 
 import "github.com/aperod/aperod/crypto"
 
+// IsSaleFinalizedHash reports whether a block hash belongs to the finalized sale chain.
 // Sales must remain recoverable after restart, when the in-memory per-height
 // cache contains only the restored, quorum-verified certificate. A canonical
 // ancestor of that finalized block is finalized too. Do not apply this fallback

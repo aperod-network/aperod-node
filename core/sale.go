@@ -8,14 +8,15 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// TxVersionSale identifies an authorized sale transaction.
 const TxVersionSale TxVersion = 11
 const saleExtraSize = 280
 
 var salePrefix = []byte{'A', 'P', 'S', 'A', 'L', 'E', 1, 0}
 
-// Recipient addresses are deliberately absent from the public authorization.
-// The trusted issuer signs the exact confidential output, and the buyer must
-// discover that output locally before an off-chain order can be completed.
+// SaleAuthorization is a signed purchase authorization that omits recipient
+// addresses. The trusted issuer signs the exact confidential output, and the
+// buyer must discover that output locally before an off-chain order completes.
 type SaleAuthorization struct {
 	Genesis   crypto.Hash32
 	Height    uint64
@@ -27,6 +28,7 @@ type SaleAuthorization struct {
 	Signature [64]byte
 }
 
+// IsSale reports whether tx uses the sale transaction version.
 func (tx *Transaction) IsSale() bool { return tx != nil && tx.Version == TxVersionSale }
 
 func (a SaleAuthorization) extra() []byte {
@@ -43,6 +45,7 @@ func (a SaleAuthorization) extra() []byte {
 	return out
 }
 
+// SaleAuthorization parses the sale authorization embedded in tx.
 func (tx *Transaction) SaleAuthorization() (*SaleAuthorization, error) {
 	if !tx.IsSale() || len(tx.Extra) != saleExtraSize || !bytes.Equal(tx.Extra[:8], salePrefix) ||
 		len(tx.Inputs) != 0 || len(tx.Outputs) != 1 || tx.Fee != 0 ||
@@ -72,6 +75,7 @@ func (tx *Transaction) SaleAuthorization() (*SaleAuthorization, error) {
 	return &a, nil
 }
 
+// SaleSigningMessage returns the digest authorized by the sale signer.
 func (tx *Transaction) SaleSigningMessage() crypto.Hash32 {
 	unsigned := *tx
 	unsigned.Extra = append([]byte(nil), tx.Extra...)
@@ -82,6 +86,7 @@ func (tx *Transaction) SaleSigningMessage() crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/sale/confidential-output-authorization/v1"), hash[:])
 }
 
+// BuildSaleTransaction creates and signs a transaction for an authorized sale purchase.
 func BuildSaleTransaction(a SaleAuthorization, recipient crypto.Address,
 	network crypto.NetworkByte, key interface {
 		Sign(crypto.Hash32) ([]byte, error)

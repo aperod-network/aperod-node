@@ -221,14 +221,7 @@ func BlindSum(in []BlindFactor, out []BlindFactor) (BlindFactor, error) {
 // scalarFromUint64 encodes a uint64 as a little-endian Edwards scalar.
 func scalarFromUint64(v uint64) *edwards25519.Scalar {
 	var b [32]byte
-	b[0] = byte(v)
-	b[1] = byte(v >> 8)
-	b[2] = byte(v >> 16)
-	b[3] = byte(v >> 24)
-	b[4] = byte(v >> 32)
-	b[5] = byte(v >> 40)
-	b[6] = byte(v >> 48)
-	b[7] = byte(v >> 56)
+	binary.LittleEndian.PutUint64(b[:8], v)
 	s, _ := edwards25519.NewScalar().SetCanonicalBytes(b[:])
 	return s
 }

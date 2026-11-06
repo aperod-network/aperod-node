@@ -116,7 +116,13 @@ func TestAVMCanonicalCommitSurvivesProcessCrash(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if db != nil {
+					if err := db.Close(); err != nil {
+						t.Errorf("close crash-recovery database: %v", err)
+					}
+				}
+			}()
 			tipHash, tipHeight, err := db.GetTip()
 			if err != nil {
 				t.Fatal(err)
@@ -160,11 +166,16 @@ func TestAVMCanonicalCommitSurvivesProcessCrash(t *testing.T) {
 				if err := db.Close(); err != nil {
 					t.Fatal(err)
 				}
+				db = nil
 				reopened, err := store.Open(dbPath)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer reopened.Close()
+				defer func() {
+					if err := reopened.Close(); err != nil {
+						t.Errorf("close reopened crash-recovery database: %v", err)
+					}
+				}()
 				for _, write := range prepared.Writes {
 					value, found, err := reopened.GetAVMState(write.Key)
 					if err != nil || !found || !bytes.Equal(value, write.Value) {

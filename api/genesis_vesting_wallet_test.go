@@ -49,7 +49,9 @@ func testNativeReserveReceiptAndSpend(t *testing.T, amount uint64) {
 		tx := core.Transaction{Version: core.TxVersionLPoDPayout}
 		tx.Outputs = append(tx.Outputs, out)
 		b := &core.Block{Header: core.BlockHeader{Height: i}, Txs: []core.Transaction{tx}}
-		utxos.ApplyBlock(b)
+		if err := utxos.ApplyBlock(b); err != nil {
+			t.Fatal(err)
+		}
 		if i == 1 {
 			u := utxos.Get(tx.Hash(), 0)
 			hs, err := crypto.ScanForOutput(owner.View.Private, owner.Spend.Public, out.TxPubKey, out.OneTimePub)

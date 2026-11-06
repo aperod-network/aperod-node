@@ -25,10 +25,12 @@ func (r *ValidatorRegistry) ConfigureSignatureAuthority(f *ValidatorAuthorityFor
 	return nil
 }
 
+// SetSignatureAdmissionHeight sets the height at which upgraded signatures are admitted.
 func (r *ValidatorRegistry) SetSignatureAdmissionHeight(nextHeight uint64) {
 	r.signatureAdmissionHeight.Store(nextHeight)
 }
 
+// SignatureAuthority returns the key allowed to sign for identity at height.
 func (r *ValidatorRegistry) SignatureAuthority(identity crypto.ValidatorPubKey, height uint64) crypto.ValidatorPubKey {
 	return r.signatureFork.Load().Authority(identity, height)
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/tetratelabs/wabin/wasm"
 )
 
+// MaxCodeSize is the maximum accepted size, in bytes, of a Wasm module.
 const (
 	MaxCodeSize              = 1 << 20
 	MaxMemoryPages           = 512 // 32 MiB at 64 KiB per Wasm page.
@@ -152,7 +153,7 @@ func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) 
 				return 0, err
 			}
 			offset += n
-		case op == byte(wasm.OpcodeEnd):
+		case op == wasm.OpcodeEnd:
 			if depth > 0 {
 				depth--
 			}

@@ -41,6 +41,7 @@ func BuildMintTx(addr crypto.Address, amount uint64, height uint64) (*Transactio
 	if height > 0 {
 		blind, err = crypto.DeterministicMintBlindV2(spendPub, amount, height)
 	} else {
+		//nolint:staticcheck // Height 0 is the legacy/admin mint domain; block rewards use the height-bound V2 function above.
 		blind, err = crypto.DeterministicMintBlind(spendPub, amount)
 	}
 	if err != nil {

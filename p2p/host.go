@@ -215,6 +215,7 @@ type BlockValidationHandler interface {
 	ValidateBlock(*core.Block) error
 }
 
+// SyncHeaderValidationHandler validates a peer-provided header before it is accepted.
 type SyncHeaderValidationHandler interface {
 	ValidateSyncHeader(core.BlockHeader) error
 }
@@ -2677,13 +2678,19 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 		}
 	}
 	defer releaseHS() // safety net: covers ban-check return and any other early exit
-	handshakeTimer := time.AfterFunc(h.cfg.HandshakeTimeout, func() { conn.Close() })
+	handshakeTimer := time.AfterFunc(h.cfg.HandshakeTimeout, func() {
+		if err := conn.Close(); err != nil {
+			h.log.Debug("close timed-out handshake connection", "err", err)
+		}
+	})
 	defer handshakeTimer.Stop()
 
 	// Reject banned peers immediately
 	if h.mgr.IsBanned(addr) {
 		h.log.Debug("handleConn: banned peer rejected", "addr", addr)
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			h.log.Debug("close banned peer connection", "err", err)
+		}
 		return
 	}
 

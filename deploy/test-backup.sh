@@ -361,6 +361,16 @@ run_backup_fail() {
   local fake_gpg
   fake_gpg=$(make_fake_bin "gpg" "$gpg_log" 0)
 
+  # Report enough space so the low-disk preflight does not hide the intended
+  # pg_dump failure on small CI tmpfs filesystems.
+  local fake_df_dir="$run_dir/fake-df"
+  mkdir -p "$fake_df_dir"
+  cat >"$fake_df_dir/df" <<'STUB'
+#!/usr/bin/env bash
+printf 'Avail\n20971520\n'
+STUB
+  chmod +x "$fake_df_dir/df"
+
   # Provide a writable backup dir so the new mkdir guard passes and the
   # script reaches the pg_dump stage (where the sudo stub fails as intended).
   local backup_dir="$run_dir/backup-tmp"
@@ -374,7 +384,7 @@ run_backup_fail() {
     APEROD_BACKUP_DIR_OVERRIDE="$backup_dir" \
     TELEGRAM_BOT_TOKEN="$bot_token" \
     ADMIN_TELEGRAM_CHAT_ID="$chat_id" \
-    PATH="$fake_curl_dir:$fake_sudo:$fake_rclone:$fake_gpg:$PATH" \
+    PATH="$fake_curl_dir:$fake_df_dir:$fake_sudo:$fake_rclone:$fake_gpg:$PATH" \
     bash "$BACKUP_SH" >/dev/null 2>&1 || exit_code=$?
 
   echo "$exit_code"

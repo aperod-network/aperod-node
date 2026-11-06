@@ -284,7 +284,9 @@ func seedSyntheticEarningsRows(
 		}
 		if err := iter.Error(); err != nil {
 			iter.Release()
-			raw.Close()
+			if closeErr := raw.Close(); closeErr != nil {
+				t.Errorf("close synthetic earnings index: %v", closeErr)
+			}
 			t.Fatalf("scan synthetic earnings index: %v", err)
 		}
 		iter.Release()
@@ -304,14 +306,18 @@ func seedSyntheticEarningsRows(
 			key = append(key, row.TxHash[:]...)
 			value, err := json.Marshal(row)
 			if err != nil {
-				raw.Close()
+				if closeErr := raw.Close(); closeErr != nil {
+					t.Errorf("close synthetic earnings index: %v", closeErr)
+				}
 				t.Fatalf("marshal synthetic earnings row %d for %s: %v", i, owner, err)
 			}
 			batch.Put(key, value)
 		}
 	}
 	if err := raw.Write(batch, nil); err != nil {
-		raw.Close()
+		if closeErr := raw.Close(); closeErr != nil {
+			t.Errorf("close synthetic earnings index: %v", closeErr)
+		}
 		t.Fatalf("write synthetic earnings rows: %v", err)
 	}
 	if err := raw.Close(); err != nil {
@@ -322,7 +328,11 @@ func seedSyntheticEarningsRows(
 	if err != nil {
 		t.Fatalf("reopen synthetic store after seeding: %v", err)
 	}
-	t.Cleanup(func() { reopened.Close() })
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened synthetic store: %v", err)
+		}
+	})
 	return reopened
 }
 

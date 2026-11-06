@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -114,14 +115,14 @@ func filepathCanonical(path string) (string, error) { return filepath.EvalSymlin
 // Exact protected file bytes, independently installed outside the checkout,
 // authenticate tools and unit/config policies. No caller-supplied digest or
 // source-generated self-manifest can substitute for this trust anchor.
-func protectedPath(path string, owner uint32) error {
+func protectedPath(path string) error {
 	for current := path; ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
 		if err != nil {
 			return err
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != owner || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 {
+		if !ok || stat.Uid != 0 || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 {
 			return fmt.Errorf("untrusted policy/tool path")
 		}
 		if current == "/" {
@@ -130,13 +131,19 @@ func protectedPath(path string, owner uint32) error {
 	}
 }
 
-func fileDigest(path string) (string, error) {
+func fileDigest(path string) (digest string, retErr error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
+	// #nosec G115 -- syscall.Open succeeded, so fd is a nonnegative OS descriptor within the process descriptor table.
 	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close %s: %w", path, err))
+			digest = ""
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil {
 		return "", err
@@ -155,16 +162,19 @@ func loadApprovedPolicy() (maintenancePolicy, error) {
 	return loadApprovedPolicyMode(true)
 }
 
-func loadApprovedPolicyMode(checkConfig bool) (maintenancePolicy, error) {
-	var p maintenancePolicy
-	if err := protectedPath(policyPath, 0); err != nil {
+func loadApprovedPolicyMode(checkConfig bool) (p maintenancePolicy, retErr error) {
+	if err := protectedPath(policyPath); err != nil {
 		return p, fmt.Errorf("separate privileged-tool approval unavailable: %w", err)
 	}
 	f, err := os.Open(policyPath)
 	if err != nil {
 		return p, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close approved maintenance policy: %w", err))
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil {
 		return p, err
@@ -191,7 +201,7 @@ func loadApprovedPolicyMode(checkConfig bool) (maintenancePolicy, error) {
 	if self != approvedTool {
 		return p, fmt.Errorf("only separately installed tool may execute")
 	}
-	if err := protectedPath(self, 0); err != nil {
+	if err := protectedPath(self); err != nil {
 		return p, err
 	}
 	image, err := os.Open("/proc/self/exe")
@@ -199,9 +209,9 @@ func loadApprovedPolicyMode(checkConfig bool) (maintenancePolicy, error) {
 		return p, err
 	}
 	hash := sha256.New()
-	_, err = io.Copy(hash, image)
-	image.Close()
-	if err != nil {
+	_, copyErr := io.Copy(hash, image)
+	closeErr := image.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
 		return p, err
 	}
 	digest := hex.EncodeToString(hash.Sum(nil))
@@ -214,7 +224,7 @@ func loadApprovedPolicyMode(checkConfig bool) (maintenancePolicy, error) {
 	if !checkConfig {
 		return p, nil
 	}
-	if err := protectedPath(p.ConfigPath, 0); err != nil {
+	if err := protectedPath(p.ConfigPath); err != nil {
 		return p, err
 	}
 	digest, err = fileDigest(p.ConfigPath)

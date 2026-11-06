@@ -12,7 +12,7 @@ func TestSaleReservationPaymentAndRollbackObligation(t *testing.T) {
 	g, m, key, address, records := saleStoreFixture(t)
 	path := t.TempDir()
 	d := seedSaleParent(t, path, records)
-	defer func() { d.Close() }()
+	defer closeStoreTestResource(t, d)
 	initial, r := saleTestBlock(t, d, m, key, address, m.Checkpoint.Height, g.Hash(), "activation")
 	commitSaleFixture(t, d, initial, m, r)
 	order := SaleOrder{Order: crypto.HashBytes([]byte("reserved-order")), Checkpoint: m.Checkpoint.Message(), Recipient: address, Amount: 500 * 100000000, QuoteUSD: "0.08"}
@@ -86,7 +86,9 @@ func TestSaleReservationPaymentAndRollbackObligation(t *testing.T) {
 	block.Txs[len(block.Txs)-1] = txs[0]
 	settlement.Transactions = append([]core.Transaction(nil), block.Txs[2:]...)
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
-	block.Header.Sign(key)
+	if err := block.Header.Sign(key); err != nil {
+		t.Fatal(err)
+	}
 	commitSaleFixture(t, d, block, m, settlement)
 	delivery, err := d.SaleOrderDelivery(order.Order)
 	if err != nil || delivery == nil || delivery.Block != block.Hash() || delivery.Transaction != txs[0].Hash() {
@@ -119,7 +121,9 @@ func TestSaleReservationPaymentAndRollbackObligation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var persisted map[string]any
-	json.Unmarshal(raw, &persisted)
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := persisted["amount_napro"].(string); !ok {
 		t.Fatal("inexact persisted amount")
 	}

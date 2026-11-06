@@ -17,7 +17,7 @@ func TestDB_PutGetRawBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	// Create a minimal block
 	priv, pub, _ := crypto.GenerateValidatorKey()
@@ -57,7 +57,7 @@ func TestDB_PutGetRawBlock(t *testing.T) {
 func TestDB_IterKeyImages(t *testing.T) {
 	dir := t.TempDir()
 	db, _ := store.Open(dir)
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var kis [3]crypto.KeyImage
 	for i := range kis {
@@ -92,7 +92,7 @@ func TestDB_IterKeyImages(t *testing.T) {
 func TestDB_TipRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	db, _ := store.Open(dir)
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	var h crypto.Hash32
 	h[0] = 0xAB
@@ -113,7 +113,11 @@ func TestChainPersistRestore(t *testing.T) {
 
 	// ── First run: create genesis + 2 blocks ──────────────────────────────────
 	genesisFile := writeTempGenesis(t)
-	defer os.Remove(genesisFile)
+	defer func() {
+		if err := os.Remove(genesisFile); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove temporary genesis file: %v", err)
+		}
+	}()
 
 	db1, _ := store.Open(dir)
 
@@ -172,11 +176,13 @@ func TestChainPersistRestore(t *testing.T) {
 	}
 	addAndPersist(db1, chain1, utxos1, 1)
 	addAndPersist(db1, chain1, utxos1, 2)
-	db1.Close()
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// ── Second run: restore from DB ────────────────────────────────────────────
 	db2, _ := store.Open(dir)
-	defer db2.Close()
+	defer closeStoreTestResource(t, db2)
 
 	_, tipHeight, err := db2.GetTip()
 	if err != nil {
@@ -227,7 +233,7 @@ func TestDB_SnapshotSaveDuration_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	cases := []struct {
 		name string
@@ -266,7 +272,7 @@ func TestDB_SnapshotSaveDuration_AbsentBeforeFirstStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	got, found, err := db.LoadSnapshotSaveDuration()
 	if err != nil {
@@ -295,14 +301,16 @@ func TestDB_SnapshotSaveDuration_SurvivesReopen(t *testing.T) {
 	if err := db1.StoreSnapshotSaveDuration(wantMs); err != nil {
 		t.Fatalf("StoreSnapshotSaveDuration: %v", err)
 	}
-	db1.Close()
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Second open: the value must still be present.
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("open store (second): %v", err)
 	}
-	defer db2.Close()
+	defer closeStoreTestResource(t, db2)
 
 	got, found, err := db2.LoadSnapshotSaveDuration()
 	if err != nil {
@@ -340,6 +348,8 @@ func writeTempGenesis(t *testing.T) string {
 		t.Fatal(err2)
 	}
 	_, _ = f.WriteString(content)
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return f.Name()
 }

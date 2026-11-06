@@ -36,6 +36,7 @@ func loadFinalityCommitteeMigration(path string, authorityHex []string) (*store.
 		return nil, nil, fmt.Errorf("finality migration must be a regular file no larger than %d bytes",
 			maxFinalityMigrationFileBytes)
 	}
+	// #nosec G304 -- path is operator-configured and validated as a bounded regular file above.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read finality migration: %w", err)

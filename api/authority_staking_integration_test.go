@@ -15,7 +15,11 @@ import (
 func TestDailyAuditSpansAuthorityRotationWithSignedStakeOperations(t *testing.T) {
 	var retired crypto.ValidatorPrivKey
 	db, s, _, _ := makeDailyAuditBenchmarkFixtureWithOptions(t, 8, 0, 0, 1, 0, 0, 0, false, true, &retired)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close authority staking fixture: %v", err)
+		}
+	}()
 	rec := httptest.NewRecorder()
 	s.restLPoDAuditDaily(rec, httptest.NewRequest(http.MethodGet, "/?date=2024-01-02", nil))
 	var result struct {
@@ -79,7 +83,11 @@ func TestDailyAuditSpansAuthorityRotationWithSignedStakeOperations(t *testing.T)
 func TestRotatedLocalStakingUsesCollateralIdentity(t *testing.T) {
 	var retired crypto.ValidatorPrivKey
 	db, s, _, _ := makeDailyAuditBenchmarkFixtureWithOptions(t, 8, 0, 0, 1, 0, 0, 0, false, true, &retired)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close authority staking fixture: %v", err)
+		}
+	}()
 	identity := s.validatorAuthorityFork.Identity
 	got, err := s.localValidatorIdentity(true)
 	if err != nil || !got.Equals(identity) {

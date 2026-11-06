@@ -6,16 +6,23 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 
 	"github.com/aperod/aperod/crypto"
 )
 
+// GenesisVestingTrust identifies the operator attestation for the unissued vesting reserve.
 const GenesisVestingTrust = "operator-attested-exclusive-unissued-development-genesis-reserve/v1"
+
+// GenesisLiquidityTrust identifies the operator attestation for initial liquidity.
 const GenesisLiquidityTrust = "operator-attested-exclusive-unissued-initial-liquidity-genesis-allocation/v1"
+
+// GenesisLiquidityAmount is the nominal initial-liquidity allocation in nAPRO.
 const GenesisLiquidityAmount uint64 = 300_000_000 * 100_000_000
 
+// GenesisVestingFunding records the operator attestation for unissued reserve value.
 // Circulation arithmetic only supplies an upper bound, NOT source eligibility.
 // This distinct, purpose-bound governance attestation explicitly declares that
 // the Development Fund reserve is unissued and excludes Guardian, validator,
@@ -35,6 +42,7 @@ type GenesisVestingFunding struct {
 	Attestations       []LPoDAttestation `json:"attestations"`
 }
 
+// Message returns the digest signed by the configured governance witnesses.
 func (f *GenesisVestingFunding) Message() crypto.Hash32 {
 	if f == nil {
 		return crypto.Hash32{}
@@ -107,10 +115,20 @@ func (f *GenesisVestingFunding) verifyQuorum(a *LPoDAllocation, height uint64, s
 	return nil
 }
 
+// LoadGenesisVestingFunding reads and validates the operator-configured witness file.
 func LoadGenesisVestingFunding(path string, height uint64) (*GenesisVestingFunding, error) {
-	raw, err := os.ReadFile(path)
+	// #nosec G304 -- this local governance witness path is selected in operator-managed node configuration.
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(file, 256*1024+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	if len(raw) > 256*1024 {
 		return nil, fmt.Errorf("genesis vesting: funding witness too large")
@@ -125,6 +143,7 @@ func LoadGenesisVestingFunding(path string, height uint64) (*GenesisVestingFundi
 	return &f, nil
 }
 
+// CheckGenesisVestingConfig rejects missed activations and disabling committed funds.
 // Reject missed activations and disabling an already committed fund before
 // starting consensus; do not silently run until the first production failure.
 func (d *DB) CheckGenesisVestingConfig(height uint64, proof *GenesisVestingFunding) error {

@@ -14,7 +14,7 @@ import (
 func TestSaleFullyResignedGuardianOmissionRejectedAtStartupAndBlock(t *testing.T) {
 	g, m, key, address, records := saleStoreFixture(t)
 	d := seedSaleParent(t, filepath.Join(t.TempDir(), "chain"), records)
-	defer d.Close()
+	defer closeStoreTestResource(t, d)
 	// Use a disposable, explicit one-authority trust root. Both controls
 	// really pass its signature threshold; no signature check is mocked.
 	m.Trusted = []crypto.ValidatorPubKey{key.Public()}
@@ -80,7 +80,7 @@ func TestSaleFullyResignedGuardianOmissionRejectedAtStartupAndBlock(t *testing.T
 func TestSaleRejectsNewGenesisReserveWithoutChangingExistingFund(t *testing.T) {
 	g, _, _, _, records := saleStoreFixture(t)
 	d := seedSaleParent(t, filepath.Join(t.TempDir(), "chain"), records)
-	defer d.Close()
+	defer closeStoreTestResource(t, d)
 	request := &LPoDSettlement{GenesisVestingActivationHeight: g.Header.Height + 1}
 	if err := d.checkSaleGenesisFundingTransition(g.Header.Height+1, request, true); err == nil {
 		t.Fatal("simultaneous reservation accepted")

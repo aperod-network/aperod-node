@@ -280,7 +280,11 @@ func TestRingCTV5RejectsStakedCollateralAcrossRestartAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close reopened RingCT database: %v", err)
+		}
+	}()
 
 	// Reconstruct the normal restart state from the persistent ring index and
 	// replayed canonical stake event. The retained rm/ record remains available

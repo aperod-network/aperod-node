@@ -8,10 +8,12 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// FinalityCommitteeMigrationVersion is the canonical encoding version for committee migrations.
 const FinalityCommitteeMigrationVersion uint8 = 1
 
 const finalityCommitteeMigrationDomain = "aperod/finality-committee-migration/v1\x00"
 
+// FinalityMigrationApproval records one validator's signature for a migration.
 type FinalityMigrationApproval struct {
 	Validator crypto.ValidatorPubKey `json:"validator"`
 	Signature []byte                 `json:"signature"`
@@ -21,15 +23,15 @@ type FinalityMigrationApproval struct {
 // historical committee attestation. It does not add votes to, rewrite, or
 // weaken the quorum rules of the original certificate.
 type FinalityCommitteeMigration struct {
-	Version                uint8                         `json:"version"`
-	Genesis                crypto.Hash32                 `json:"genesis"`
-	CertificateHeight      uint64                        `json:"certificate_height"`
-	CertificateBlockHash   crypto.Hash32                 `json:"certificate_block_hash"`
-	ApprovalHeight         uint64                        `json:"approval_height"`
-	ApprovalBlockHash      crypto.Hash32                 `json:"approval_block_hash"`
-	BFTThresholdPPM        uint32                        `json:"bft_threshold_ppm"`
-	HistoricalCommittee    []crypto.ValidatorPubKey      `json:"historical_committee"`
-	Approvals              []FinalityMigrationApproval   `json:"approvals"`
+	Version              uint8                       `json:"version"`
+	Genesis              crypto.Hash32               `json:"genesis"`
+	CertificateHeight    uint64                      `json:"certificate_height"`
+	CertificateBlockHash crypto.Hash32               `json:"certificate_block_hash"`
+	ApprovalHeight       uint64                      `json:"approval_height"`
+	ApprovalBlockHash    crypto.Hash32               `json:"approval_block_hash"`
+	BFTThresholdPPM      uint32                      `json:"bft_threshold_ppm"`
+	HistoricalCommittee  []crypto.ValidatorPubKey    `json:"historical_committee"`
+	Approvals            []FinalityMigrationApproval `json:"approvals"`
 }
 
 // SigningMessage returns the domain-separated digest approved by migration
@@ -64,6 +66,8 @@ func (m FinalityCommitteeMigration) SigningMessage() (crypto.Hash32, error) {
 	if err := binary.Write(&payload, binary.BigEndian, m.BFTThresholdPPM); err != nil {
 		return crypto.Hash32{}, err
 	}
+	// The committee is capped at 256 entries during validation above.
+	// #nosec G115 -- the validated maximum is well below uint32's range.
 	if err := binary.Write(&payload, binary.BigEndian, uint32(len(m.HistoricalCommittee))); err != nil {
 		return crypto.Hash32{}, err
 	}

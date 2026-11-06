@@ -119,7 +119,6 @@ func TestSnapshotViewTwoMillionUTXOsHasBoundedMemory(t *testing.T) {
 	}
 	utxos := core.NewUTXOSet()
 	utxos.RestoreFromSnapshot(core.UTXOSnapshot{ActiveUTXOs: records})
-	records = nil
 	runtime.GC()
 
 	var before runtime.MemStats

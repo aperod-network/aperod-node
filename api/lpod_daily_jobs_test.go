@@ -224,7 +224,11 @@ func TestDailyJobStorageBudgetAndRetry(t *testing.T) {
 func TestDailyJobAdvancingCertificateOracleDoesNotResetCursor(t *testing.T) {
 	const intervalBlocks = 4 * dailyBatchBlocks
 	db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, intervalBlocks, 1, 128, 4, 0, 4, intervalBlocks)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close daily audit fixture: %v", err)
+		}
+	}()
 	certificate, err := db.LoadFinalityCertificate()
 	if err != nil {
 		t.Fatal(err)

@@ -7,6 +7,9 @@ from unittest.mock import Mock, patch
 import publish_public_repo as publisher
 from publication_security import git, inspect
 
+TEST_PRIVATE_REPO = "test-private-owner/" + "source-monorepo"
+TEST_PRIVATE_REPO_MARKERS = (TEST_PRIVATE_REPO.encode(),)
+
 
 def fixture(root):
     subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -26,6 +29,185 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(publisher.MESSAGE, "chore: maintain verified source distribution")
         self.assertNotIn("Co-authored-by:", publisher.MESSAGE)
         self.assertNotIn("Co-authored-by:", publisher.MERGE_MESSAGE)
+
+    def test_private_repository_identity_is_read_at_runtime(self):
+        with patch.dict(publisher.os.environ, {
+            "GITHUB_REPOSITORY": TEST_PRIVATE_REPO,
+        }):
+            markers = publisher.private_repository_markers(Path("."))
+        self.assertIn(TEST_PRIVATE_REPO.encode(), markers)
+        self.assertNotIn(b"aperod-network/aperod-node", markers)
+
+    def test_live_branch_policy_requires_trusted_checks_and_admin_enforcement(self):
+        calls = []
+
+        def request(method, url, data=None):
+            calls.append((method, url))
+            if url == "https://api.github.com/user":
+                return {"login": "aperod-network"}
+            if url == publisher.API:
+                return {
+                    "id": publisher.PUBLIC_REPO_ID, "private": False,
+                    "fork": False, "default_branch": "main",
+                }
+            if url.endswith("/branches/main/protection"):
+                return {
+                    "required_status_checks": {
+                        "strict": True,
+                        "checks": [
+                            {"context": name, "app_id": app_id}
+                            for name, app_id in publisher.BRANCH_REQUIRED_CHECKS
+                        ],
+                    },
+                    "enforce_admins": {"enabled": True},
+                    "allow_force_pushes": {"enabled": False},
+                    "allow_deletions": {"enabled": False},
+                }
+            if "/rulesets?" in url:
+                return []
+            raise AssertionError(f"unexpected request: {method} {url}")
+
+        publisher.verify_public_repo_policy(request)
+        self.assertEqual(len(calls), 4)
+
+    def test_live_branch_policy_fails_closed_if_admins_can_bypass(self):
+        def request(method, url, data=None):
+            if url == "https://api.github.com/user":
+                return {"login": "aperod-network"}
+            if url == publisher.API:
+                return {
+                    "id": publisher.PUBLIC_REPO_ID, "private": False,
+                    "fork": False, "default_branch": "main",
+                }
+            if url.endswith("/branches/main/protection"):
+                return {
+                    "required_status_checks": {
+                        "strict": True,
+                        "checks": [
+                            {"context": name, "app_id": app_id}
+                            for name, app_id in publisher.BRANCH_REQUIRED_CHECKS
+                        ],
+                    },
+                    "enforce_admins": {"enabled": False},
+                    "allow_force_pushes": {"enabled": False},
+                    "allow_deletions": {"enabled": False},
+                }
+            raise AssertionError(f"unexpected request: {method} {url}")
+
+        with self.assertRaisesRegex(RuntimeError, "trusted policy"):
+            publisher.verify_public_repo_policy(request)
+
+    def test_live_branch_policy_rejects_other_publisher_identity(self):
+        def request(method, url, data=None):
+            if url == "https://api.github.com/user":
+                return {"login": "another-account"}
+            raise AssertionError(f"unexpected request after identity mismatch: {url}")
+
+        with self.assertRaisesRegex(RuntimeError, "not authenticated as aperod-network"):
+            publisher.verify_public_repo_policy(request)
+
+    def test_live_branch_policy_rejects_unreviewed_rulesets(self):
+        def request(method, url, data=None):
+            if url == "https://api.github.com/user":
+                return {"login": "aperod-network"}
+            if url == publisher.API:
+                return {
+                    "id": publisher.PUBLIC_REPO_ID, "private": False,
+                    "fork": False, "default_branch": "main",
+                }
+            if url.endswith("/branches/main/protection"):
+                return {
+                    "required_status_checks": {
+                        "strict": True,
+                        "checks": [
+                            {"context": name, "app_id": app_id}
+                            for name, app_id in publisher.BRANCH_REQUIRED_CHECKS
+                        ],
+                    },
+                    "enforce_admins": {"enabled": True},
+                    "allow_force_pushes": {"enabled": False},
+                    "allow_deletions": {"enabled": False},
+                }
+            if "/rulesets?" in url:
+                return [{"id": 9, "enforcement": "active"}]
+            raise AssertionError(f"unexpected request: {method} {url}")
+
+        with self.assertRaisesRegex(RuntimeError, "rulesets"):
+            publisher.verify_public_repo_policy(request)
+
+    def test_publish_uses_scanned_git_data_api_and_explicit_single_author(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture(root)
+            base = git(root, "rev-parse", "HEAD").decode().strip()
+            (root / "source.go").write_text("package source\n")
+            subprocess.run(["git", "-C", str(root), "add", "source.go"], check=True)
+            tree = git(root, "write-tree").decode().strip()
+            blob_row = git(root, "ls-tree", "-r", tree, "--", "source.go")
+            blob_sha = blob_row.decode().split()[2]
+            base_tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
+            events = []
+            payloads = {}
+
+            def request(method, url, data=None):
+                events.append((method, url))
+                if method == "GET" and url.endswith("/git/ref/heads/main"):
+                    return {"object": {"sha": base}}
+                if method == "GET" and url == "https://api.github.com/user":
+                    return {"login": "aperod-network"}
+                if method == "GET" and url == publisher.API:
+                    return {
+                        "id": publisher.PUBLIC_REPO_ID, "private": False,
+                        "fork": False, "default_branch": "main",
+                    }
+                if method == "GET" and url.endswith("/branches/main/protection"):
+                    return {
+                        "required_status_checks": {
+                            "strict": True,
+                            "checks": [
+                                {"context": name, "app_id": app_id}
+                                for name, app_id in publisher.BRANCH_REQUIRED_CHECKS
+                            ],
+                        },
+                        "enforce_admins": {"enabled": True},
+                        "allow_force_pushes": {"enabled": False},
+                        "allow_deletions": {"enabled": False},
+                    }
+                if method == "GET" and "/rulesets?" in url:
+                    return []
+                if method == "GET" and url.endswith("/git/commits/" + base):
+                    return {"tree": {"sha": base_tree}}
+                if method == "POST" and url.endswith("/git/blobs"):
+                    return {"sha": blob_sha}
+                if method == "POST" and url.endswith("/git/trees"):
+                    return {"sha": tree}
+                if method == "POST" and url.endswith("/git/commits"):
+                    payloads["commit"] = data
+                    return {"sha": "c" * 40}
+                if method == "POST" and url.endswith("/git/refs"):
+                    return {}
+                if method == "POST" and url.endswith("/pulls"):
+                    return {"number": 1, "html_url": "https://github.com/aperod-network/aperod-node/pull/1"}
+                raise AssertionError(f"unexpected request: {method} {url}")
+
+            def verified(*args, **kwargs):
+                events.append(("VERIFY", "whole frozen candidate"))
+
+            with patch.object(publisher, "verify", side_effect=verified):
+                pr = publisher.publish(
+                    root, tree, base, request,
+                    private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                )
+
+            self.assertEqual(events[0][0], "VERIFY")
+            self.assertEqual(payloads["commit"]["author"], publisher.AUTHOR)
+            self.assertEqual(payloads["commit"]["committer"], publisher.AUTHOR)
+            self.assertNotIn("Co-authored-by:", payloads["commit"]["message"])
+            self.assertEqual(pr["_verified_base_sha"], base)
+            self.assertFalse(any("/contents/" in url for _, url in events))
+            self.assertIn(("POST", f"{publisher.API}/git/blobs"), events)
+            self.assertTrue(all(method != "POST" or "/contents/" not in url
+                                for method, url in events))
 
     def test_candidate_symlink_cannot_overwrite_external_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -173,7 +355,8 @@ class PublisherTests(unittest.TestCase):
                 })
             return {"check_runs": checks}
 
-        with patch.object(publisher.time, "sleep"):
+        with patch.object(publisher.time, "sleep"), \
+                patch.object(publisher, "verify_public_repo_policy"):
             publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertIn(
             ("GET", f"{publisher.API}/code-scanning/alerts?pr=1&tool_name=CodeQL&state=open&per_page=100"),
@@ -212,7 +395,8 @@ class PublisherTests(unittest.TestCase):
                 })
             return {"check_runs": checks}
 
-        with patch.object(publisher.time, "sleep"):
+        with patch.object(publisher.time, "sleep"), \
+                patch.object(publisher, "verify_public_repo_policy"):
             publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
         self.assertEqual(check_reads, 2)
         self.assertFalse(any("/code-scanning/alerts?" in url for _, url in methods))
@@ -269,6 +453,31 @@ class PublisherTests(unittest.TestCase):
                 )
         self.assertNotIn("PUT", methods)
 
+    def test_policy_change_after_checks_prevents_merge(self):
+        methods = []
+
+        def request(method, url, data=None):
+            methods.append(method)
+            if method == "PUT":
+                return {"merged": True}
+            if url.endswith("/pulls/1"):
+                return {"state": "open", "head": {"sha": "reviewed"}, "base": {"ref": "main"}}
+            return {"check_runs": [
+                {"name": name, "status": "completed", "conclusion": "success",
+                 "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
+                     name, publisher.GITHUB_ACTIONS_APP_ID)}}
+                for name in publisher.REQUIRED_CHECKS
+            ]}
+
+        with patch.object(publisher, "verify_public_repo_policy",
+                          side_effect=RuntimeError("protection changed")):
+            with self.assertRaisesRegex(RuntimeError, "protection changed"):
+                publisher.await_merge(
+                    {"number": 1, "html_url": "test"}, request,
+                    expected_head_sha="reviewed",
+                )
+        self.assertNotIn("PUT", methods)
+
     def test_merge_is_bound_to_reviewed_head(self):
         bodies = []
         def request(method, url, data=None):
@@ -282,7 +491,11 @@ class PublisherTests(unittest.TestCase):
                                    "app": {"id": publisher.TRUSTED_CHECK_APP_IDS.get(
                                        name, publisher.GITHUB_ACTIONS_APP_ID)}}
                                    for name in publisher.REQUIRED_CHECKS]}
-        publisher.await_merge({"number": 1, "html_url": "test"}, request, expected_head_sha="reviewed")
+        with patch.object(publisher, "verify_public_repo_policy"):
+            publisher.await_merge(
+                {"number": 1, "html_url": "test"}, request,
+                expected_head_sha="reviewed",
+            )
         self.assertEqual(bodies[0]["sha"], "reviewed")
         self.assertNotIn("force", bodies[0])
 
@@ -313,7 +526,8 @@ class PublisherTests(unittest.TestCase):
                 ]}
             raise AssertionError(f"unexpected request: {method} {url}")
 
-        with patch.object(publisher.time, "sleep"):
+        with patch.object(publisher.time, "sleep"), \
+                patch.object(publisher, "verify_public_repo_policy"):
             publisher.await_merge(
                 {"number": 1, "html_url": "test"}, request,
                 expected_head_sha="reviewed",
@@ -376,7 +590,10 @@ class PublisherTests(unittest.TestCase):
             tree = git(root, "write-tree").decode().strip()
             request = Mock()
             with self.assertRaisesRegex(RuntimeError, "Publication policy"):
-                publisher.publish(root, tree, "head", request)
+                publisher.publish(
+                    root, tree, "head", request,
+                    private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                )
             request.assert_not_called()
 
     def test_missing_scanner_prevents_every_network_request(self):
@@ -387,7 +604,10 @@ class PublisherTests(unittest.TestCase):
             request = Mock()
             with patch.object(publisher.shutil, "which", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "scanner missing"):
-                    publisher.publish(root, tree, "head", request)
+                    publisher.publish(
+                        root, tree, "head", request,
+                        private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                    )
             request.assert_not_called()
 
     def test_deleted_historical_key_prevents_every_network_request(self):
@@ -403,7 +623,10 @@ class PublisherTests(unittest.TestCase):
             request = Mock()
             with patch.object(publisher.shutil, "which", return_value="/scanner"):
                 with self.assertRaisesRegex(RuntimeError, "Historical publication"):
-                    publisher.publish(root, tree, "head", request)
+                    publisher.publish(
+                        root, tree, "head", request,
+                        private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                    )
             request.assert_not_called()
 
     def test_scanner_error_cannot_upload(self):
@@ -415,7 +638,57 @@ class PublisherTests(unittest.TestCase):
             with patch.object(publisher.shutil, "which", return_value="/scanner"), \
                  patch.object(publisher, "run", side_effect=subprocess.CalledProcessError(2, "scanner")):
                 with self.assertRaises(subprocess.CalledProcessError):
-                    publisher.publish(root, tree, "head", request)
+                    publisher.publish(
+                        root, tree, "head", request,
+                        private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                    )
+            request.assert_not_called()
+
+    def test_secret_in_unchanged_file_is_scanned_before_any_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture(root)
+            (root / "unchanged.md").write_text("TEST_SECRET_UNCHANGED_VALUE\n")
+            subprocess.run(["git", "-C", str(root), "add", "unchanged.md"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "unchanged fixture"], check=True)
+            (root / "new.go").write_text("package source\n")
+            subprocess.run(["git", "-C", str(root), "add", "new.go"], check=True)
+            tree = git(root, "write-tree").decode().strip()
+            request = Mock()
+
+            def reject_secret_scan(*args, **kwargs):
+                if args[:2] == ("gitleaks", "git"):
+                    paths = git(root, "ls-tree", "-r", "--name-only", "HEAD").decode()
+                    self.assertIn("unchanged.md", paths)
+                    self.assertIn("--redact=100", args)
+                    raise subprocess.CalledProcessError(1, "gitleaks")
+                raise AssertionError(f"unexpected verification command: {args[:2]}")
+
+            with patch.object(publisher.shutil, "which", return_value="/scanner"), \
+                    patch.object(publisher, "run", side_effect=reject_secret_scan):
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    publisher.publish(
+                        root, tree, "head", request,
+                        private_repo_markers=TEST_PRIVATE_REPO_MARKERS,
+                    )
+            self.assertNotIn("TEST_SECRET_UNCHANGED_VALUE", str(error.exception))
+            request.assert_not_called()
+
+    def test_private_repository_reference_blocks_before_any_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture(root)
+            marker = TEST_PRIVATE_REPO.encode()
+            (root / "README.md").write_bytes(
+                b"Private issue tracker: https://github.com/" + marker + b"\n"
+            )
+            subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+            tree = git(root, "write-tree").decode().strip()
+            request = Mock()
+            with self.assertRaisesRegex(RuntimeError, "private repository references") as error:
+                publisher.publish(root, tree, "head", request,
+                                  private_repo_markers=(marker,))
+            self.assertNotIn(marker.decode(), str(error.exception))
             request.assert_not_called()
 
     def test_old_runtime_is_removed_only_from_disposable_candidate(self):
@@ -461,6 +734,24 @@ class PublisherTests(unittest.TestCase):
             )
             self.assertEqual((candidate / "Makefile").read_text(),
                              (source / "Makefile").read_text())
+
+    def test_private_sync_wrapper_is_not_in_public_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source, candidate = base / "source", base / "candidate"
+            source.mkdir()
+            candidate.mkdir()
+            fixture(candidate)
+            (source / "go.mod").write_text("module example.invalid/test\n")
+            wrapper = source / "deploy/sync-public-repo.sh"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("# private publication entrypoint\n")
+
+            tree = publisher.prepare(source, candidate)
+            paths = git(candidate, "ls-tree", "-r", "--name-only", tree).decode().splitlines()
+
+            self.assertTrue(wrapper.exists())
+            self.assertNotIn("deploy/sync-public-repo.sh", paths)
 
     def test_disguised_binary_and_hex_secret_are_refused(self):
         from publication_security import content_problem

@@ -34,12 +34,19 @@ func (e *Engine) lpodActive(height uint64) bool {
 	return e.cfg.LPoDMigration != nil && height >= e.cfg.LPoDMigration.Height
 }
 
+func (e *Engine) lpodDailyActive(height uint64) bool {
+	return e.cfg.LPoDDailyUpgradeHeight > 0 && height >= e.cfg.LPoDDailyUpgradeHeight
+}
+
 func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.LPoDSettlement, *store.LPoDCheckpoint, []lpod.Payment, error) {
 	height := block.Header.Height
 	if !e.lpodActive(height) {
 		return nil, nil, nil, nil
 	}
 	m := e.cfg.LPoDMigration
+	if e.cfg.LPoDDailyUpgradeHeight > 0 && e.cfg.LPoDDailyUpgradeHeight < m.Height {
+		return nil, nil, nil, fmt.Errorf("lpod: daily upgrade height precedes the position migration")
+	}
 	if e.cfg.Store == nil || e.cfg.OnCanonicalBlock == nil || e.cfg.Registry == nil {
 		return nil, nil, nil, fmt.Errorf("lpod: canonical store, atomic commit and validator registry required")
 	}
@@ -69,7 +76,8 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 			return nil, nil, nil, err
 		}
 	}
-	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true, Timestamp: block.Header.Timestamp,
+	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true,
+		DailyPayout: e.lpodDailyActive(height), Timestamp: block.Header.Timestamp,
 		GenesisVestingActivationHeight: e.cfg.GenesisVestingActivationHeight,
 		GenesisVestingFunding:          e.cfg.GenesisVestingFunding,
 		Proposer:                       block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
@@ -245,13 +253,18 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 		}
 		if c != nil {
 			for id, p := range c.Positions {
-				if p.Returned && p.Due == 0 {
+				if p.Returned && p.Due == 0 && p.PendingDue == 0 {
 					continue
 				}
 				positions[id] = p
 				if p.UnlockHeight == 0 {
 					effective := store.LPoDEffectiveVault(p)
-					totals[hex.EncodeToString(effective[:])] += p.Deposit.Amount - p.Withdrawn
+					principal, err := store.LPoDPositionPrincipal(p)
+					if err != nil || principal < p.Withdrawn ||
+						principal-p.Withdrawn > ^uint64(0)-totals[hex.EncodeToString(effective[:])] {
+						return nil, fmt.Errorf("lpod: invalid position principal in mempool filter")
+					}
+					totals[hex.EncodeToString(effective[:])] += principal - p.Withdrawn
 				}
 			}
 		}
@@ -274,6 +287,9 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 			continue
 		}
 		valid := e.lpodActive(height)
+		if tx.Version == core.TxVersionLPoDTopUp && !e.lpodDailyActive(height) {
+			valid = false
+		}
 		var a core.LPoDPositionAction
 		if json.Unmarshal(tx.Extra, &a) != nil {
 			valid = false
@@ -287,7 +303,7 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 			case core.LPoDDeposit:
 				_, exists := positions[id]
 				stake, found := e.cfg.Registry.GetEntry(crypto.ValidatorPubKey(a.Vault[:]))
-				max := uint64(100_000_000 * lpod.Unit)
+				max := 100_000_000 * lpod.Unit
 				if exists || len(positions) >= store.LPoDMaxPositions || !found || stake.Seeded ||
 					stake.Status != core.ValidatorActive || exiting[v] || stake.StakeNAPR > max || totals[v] > max-stake.StakeNAPR ||
 					a.Amount > max-stake.StakeNAPR-totals[v] {
@@ -300,6 +316,10 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 					break
 				}
 				positions[id] = store.LPoDPosition{Deposit: a}
+				if a.Amount > ^uint64(0)-totals[v] {
+					valid = false
+					break
+				}
 				totals[v] += a.Amount
 			case core.LPoDWithdraw:
 				p, exists := positions[id]
@@ -310,13 +330,47 @@ func (e *Engine) filterLPoDPositions(txs []core.Transaction, height uint64) ([]c
 				}
 				p.Nonce++
 				p.Withdrawn += amount
-				p.Returned = p.Withdrawn == p.Deposit.Amount
+				principal, err := store.LPoDPositionPrincipal(p)
+				if err != nil {
+					valid = false
+					break
+				}
+				p.Returned = p.Withdrawn == principal
 				if p.Returned {
 					p.UnlockHeight = height
 				}
 				effective := store.LPoDEffectiveVault(p)
 				totals[hex.EncodeToString(effective[:])] -= amount
 				positions[id] = p
+			case core.LPoDTopUp:
+				p, exists := positions[id]
+				amount, err := store.LPoDTopUpAmount(p, a)
+				if !exists || err != nil {
+					valid = false
+					break
+				}
+				effective := store.LPoDEffectiveVault(p)
+				effectiveID := hex.EncodeToString(effective[:])
+				stake, found := e.cfg.Registry.GetEntry(crypto.ValidatorPubKey(effective[:]))
+				max := 100_000_000 * lpod.Unit
+				if !found || stake.Seeded || stake.Status != core.ValidatorActive ||
+					effectiveID != v || stake.StakeNAPR > max || totals[effectiveID] > max-stake.StakeNAPR ||
+					amount > max-stake.StakeNAPR-totals[effectiveID] {
+					valid = false
+					break
+				}
+				if _, err := lpod.TierFor(stake.StakeNAPR + totals[effectiveID] + amount); err != nil {
+					valid = false
+					break
+				}
+				p.Nonce++
+				p.TopUps = append(p.TopUps, a)
+				positions[id] = p
+				if amount > ^uint64(0)-totals[effectiveID] {
+					valid = false
+					break
+				}
+				totals[effectiveID] += amount
 			default:
 				valid = false
 			}

@@ -69,6 +69,7 @@ const BaseUnitsPerAPR = 100_000_000
 
 // LoadGenesis reads a genesis YAML file.
 func LoadGenesis(path string) (*GenesisConfig, error) {
+	// #nosec G304 -- this path comes from the operator-managed node configuration, not network input.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read genesis %s: %w", path, err)

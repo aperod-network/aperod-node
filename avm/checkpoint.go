@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// AVMCheckpointVersion identifies the persisted replay checkpoint format.
 const (
 	AVMCheckpointVersion       uint32 = 1
 	AVMCheckpointQuorumVersion uint32 = 2
@@ -38,6 +40,8 @@ type CheckpointEntry struct {
 // operator-attested signature; v2 uses detached signatures from a configured
 // witness quorum. It is not a consensus rule or a substitute for block
 // validation: it only provides a trusted starting state for bounded replay.
+//
+//nolint:revive // The AVM prefix is retained because this serialized type is AVM-scoped.
 type AVMCheckpoint struct {
 	Version            uint32
 	ActivationHeight   uint64
@@ -132,13 +136,15 @@ func StateSnapshotCommitment(entries []CheckpointEntry) (crypto.Hash32, error) {
 	var number [8]byte
 	binary.BigEndian.PutUint64(number[:], uint64(len(entries)))
 	_, _ = hasher.Write(number[:])
+	var previousKey []byte
 	for i, entry := range entries {
 		if len(entry.Key) == 0 {
 			return crypto.Hash32{}, fmt.Errorf("avm checkpoint: empty state key at entry %d", i)
 		}
-		if i > 0 && bytes.Compare(entries[i-1].Key, entry.Key) >= 0 {
+		if i > 0 && bytes.Compare(previousKey, entry.Key) >= 0 {
 			return crypto.Hash32{}, fmt.Errorf("avm checkpoint: state entries are not strictly key ordered")
 		}
+		previousKey = entry.Key
 		binary.BigEndian.PutUint64(number[:], uint64(len(entry.Key)))
 		_, _ = hasher.Write(number[:])
 		_, _ = hasher.Write(entry.Key)
@@ -561,7 +567,8 @@ func VerifyCheckpoint(
 // ReadCheckpointFile reads one bounded JSON checkpoint. A missing file is
 // reported separately so callers can choose a safe full replay for short
 // histories or require an offline-seeded checkpoint for long histories.
-func ReadCheckpointFile(path string) (*AVMCheckpoint, bool, error) {
+func ReadCheckpointFile(path string) (checkpoint *AVMCheckpoint, present bool, retErr error) {
+	// #nosec G304 -- checkpoint paths are operator-configured and never request-controlled.
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -569,7 +576,11 @@ func ReadCheckpointFile(path string) (*AVMCheckpoint, bool, error) {
 		}
 		return nil, false, fmt.Errorf("avm checkpoint: open: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("avm checkpoint: close: %w", err))
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return nil, false, fmt.Errorf("avm checkpoint: stat: %w", err)
@@ -593,7 +604,7 @@ func ReadCheckpointFile(path string) (*AVMCheckpoint, bool, error) {
 		}
 		return nil, false, fmt.Errorf("avm checkpoint: trailing data: %w", err)
 	}
-	checkpoint, err := checkpointFromWire(wire)
+	checkpoint, err = checkpointFromWire(wire)
 	if err != nil {
 		return nil, false, err
 	}
@@ -607,7 +618,7 @@ func WriteCheckpointFile(path string, checkpoint *AVMCheckpoint) error {
 	return writeCheckpointFileWithLimit(path, checkpoint, maxAVMCheckpointFileBytes)
 }
 
-func writeCheckpointFileWithLimit(path string, checkpoint *AVMCheckpoint, maxBytes int64) error {
+func writeCheckpointFileWithLimit(path string, checkpoint *AVMCheckpoint, maxBytes int64) (retErr error) {
 	if checkpoint == nil {
 		return fmt.Errorf("avm checkpoint: nil checkpoint")
 	}
@@ -619,6 +630,7 @@ func writeCheckpointFileWithLimit(path string, checkpoint *AVMCheckpoint, maxByt
 	}
 	wire := checkpointToWire(checkpoint)
 	dir := filepath.Dir(path)
+	// #nosec G703 -- checkpointPath is supplied by node configuration; no network input contributes to this path.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("avm checkpoint: create directory: %w", err)
 	}
@@ -627,35 +639,48 @@ func writeCheckpointFileWithLimit(path string, checkpoint *AVMCheckpoint, maxByt
 		return fmt.Errorf("avm checkpoint: create temporary file: %w", err)
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	tempOpen := true
+	defer func() {
+		if tempOpen {
+			if err := temp.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("avm checkpoint: close temporary file: %w", err))
+			}
+		}
+		// #nosec G703 -- tempPath comes from os.CreateTemp in the controlled parent directory.
+		if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("avm checkpoint: remove temporary file: %w", err))
+		}
+	}()
 	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
 		return fmt.Errorf("avm checkpoint: chmod temporary file: %w", err)
 	}
 	encoder := json.NewEncoder(&checkpointLimitWriter{
 		writer: temp, remaining: maxBytes, limit: maxBytes,
 	})
 	if err := encoder.Encode(wire); err != nil {
-		_ = temp.Close()
 		return fmt.Errorf("avm checkpoint: encode: %w", err)
 	}
 	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
 		return fmt.Errorf("avm checkpoint: sync temporary file: %w", err)
 	}
 	if err := temp.Close(); err != nil {
+		tempOpen = false
 		return fmt.Errorf("avm checkpoint: close temporary file: %w", err)
 	}
+	tempOpen = false
+	// #nosec G703 -- the destination is the configured checkpoint path and the temporary file is created in its directory.
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("avm checkpoint: atomically replace: %w", err)
 	}
+	// #nosec G304 G703 -- dir is only the parent directory of the local operator-configured checkpoint path.
 	dirFile, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("avm checkpoint: open parent directory: %w", err)
 	}
-	defer dirFile.Close()
-	if err := dirFile.Sync(); err != nil {
-		return fmt.Errorf("avm checkpoint: sync parent directory: %w", err)
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf("avm checkpoint: sync or close parent directory: %w", err)
 	}
 	return nil
 }

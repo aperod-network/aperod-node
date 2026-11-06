@@ -10,6 +10,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -439,6 +440,18 @@ class LifecycleFixture:
         self.settings.write_text(json.dumps({"s3backup": {"fixture": True}}))
         self.neighbor = self.release / "node.previous"
         self.neighbor.write_bytes(b"keep this neighboring release artifact")
+        self.live_db_sentinel = self.data / "chain.db" / "fixture-live-data"
+        self.live_db_sentinel.write_bytes(b"live chain data must remain")
+        self.key_fixture = root / "keys" / "validator-key.fixture"
+        self.key_fixture.parent.mkdir(parents=True)
+        self.key_fixture.write_bytes(b"fixture only; not a real key")
+        self.lpod_evidence = root / "lpod-evidence" / "witness.fixture"
+        self.lpod_evidence.parent.mkdir(parents=True)
+        self.lpod_evidence.write_bytes(b"preserve LPoD evidence")
+        self.frontend_asset = root / "frontend-assets" / "wallet.js"
+        self.frontend_asset.parent.mkdir(parents=True)
+        self.frontend_asset.write_bytes(b"preserve frontend asset")
+        self.neighbor_before = self.neighbor.read_bytes()
         self.stopped = self.release / "stopped-copy"
         self.stopped.mkdir(mode=0o700)
         (self.stopped / "CURRENT").write_text("MANIFEST-000001\n")
@@ -516,6 +529,18 @@ class LifecycleFixture:
         cleanup.mark(self.job_id, str(self.candidate), "candidate", runtime=self.runtime)
         return self.job_id
 
+    def complete_single_artifact_lifecycle(self, kind):
+        result = cleanup.begin(
+            str(self.release), str(self.data), str(self.config), "aperod-node", self.api,
+            runtime=self.runtime,
+        )
+        self.job_id = result["id"]
+        artifact = self.candidate if kind == "candidate" else self.stopped
+        cleanup.mark(self.job_id, str(artifact), kind, runtime=self.runtime)
+        self.restart_and_complete()
+        self.backup_pin_and_publish()
+        return artifact
+
     def restart_and_complete(self):
         self.current_pid[0] = 202
         self.add_process(202)
@@ -553,6 +578,40 @@ class LifecycleFixture:
 
 
 class ProcKernelThreadTests(unittest.TestCase):
+    def test_backup_capture_waits_for_concurrent_cleanup_state_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = LifecycleFixture(Path(tmp))
+            attempting = threading.Event()
+            captured_origin = threading.Event()
+            failures = []
+
+            def capture_origin(*_args, **_kwargs):
+                captured_origin.set()
+                raise cleanup.CleanupError("test stop after lock acquisition")
+
+            def backup():
+                attempting.set()
+                try:
+                    cleanup.backup_begin(
+                        str(fixture.data), str(fixture.config), "aperod-node", fixture.api,
+                        str(fixture.anchors_path), str(fixture.context_path),
+                        runtime=fixture.runtime,
+                    )
+                except cleanup.CleanupError as exc:
+                    failures.append(str(exc))
+
+            with mock.patch.object(cleanup, "_capture_origin", side_effect=capture_origin):
+                with cleanup.state_lock(fixture.state, runtime=fixture.runtime):
+                    worker = threading.Thread(target=backup)
+                    worker.start()
+                    self.assertTrue(attempting.wait(timeout=2))
+                    self.assertFalse(captured_origin.wait(timeout=0.15))
+                worker.join(timeout=2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(captured_origin.is_set())
+            self.assertEqual(failures, ["test stop after lock acquisition"])
+
     def test_real_proc_stat_pf_kthread_allows_empty_cmdline_without_bracketed_comm(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = LifecycleFixture(Path(tmp))
@@ -636,6 +695,101 @@ class RolloutLifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.fixture = LifecycleFixture(Path(self.temp.name))
+
+    @staticmethod
+    def _install_final_fingerprint_mutation(fixture, target, mutation):
+        calls = {"count": 0}
+
+        def after_fingerprint(artifact, _kind):
+            if artifact == target:
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    mutation()
+
+        fixture.runtime.after_artifact_fingerprint = after_fingerprint
+        return calls
+
+    @staticmethod
+    def _protected_snapshot(fixture):
+        paths = (
+            fixture.neighbor, fixture.live_db_sentinel, fixture.key_fixture,
+            fixture.lpod_evidence, fixture.frontend_asset, fixture.settings,
+            fixture.anchors_path, fixture.proof_path,
+        )
+        return {path: path.read_bytes() for path in paths}
+
+    def _assert_late_apply_refused(self, fixture, target, kind, reason):
+        before_manifest = cleanup._manifest(target, kind, fixture.runtime)[0]
+        protected = self._protected_snapshot(fixture)
+        report = cleanup.scan(True, runtime=fixture.runtime, provider=fixture.provider)
+        self.assertEqual(len(report["artifacts"]), 1)
+        row = report["artifacts"][0]
+        self.assertFalse(row["eligible"], row["reasons"])
+        self.assertFalse(row["removed"], row["reasons"])
+        self.assertEqual(report["bytes"], 0)
+        self.assertTrue(any(reason in item for item in row["reasons"]), row["reasons"])
+        self.assertTrue(target.exists())
+        self.assertEqual(cleanup._manifest(target, kind, fixture.runtime)[0], before_manifest)
+        self.assertEqual({path: path.read_bytes() for path in protected}, protected)
+        self.assertEqual(fixture.neighbor.read_bytes(), fixture.neighbor_before)
+        self.assertTrue(fixture.candidate.exists())
+        self.assertTrue(fixture.stopped.exists())
+
+    def test_apply_rechecks_pid_ticks_and_config_after_final_fingerprint(self):
+        mutations = ("pid", "start_ticks", "config_content", "config_identity")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                fixture = LifecycleFixture(Path(temp))
+                target = fixture.complete_single_artifact_lifecycle("candidate")
+
+                def change_live_identity():
+                    if mutation == "pid":
+                        fixture.current_pid[0] = 303
+                        fixture.add_process(303)
+                    elif mutation == "start_ticks":
+                        fixture.ticks[202] = 999
+                    elif mutation == "config_content":
+                        fixture.config.write_text('{"network":"changed"}')
+                    else:
+                        original_identity = cleanup._identity(fixture.config)
+                        replacement = fixture.root / "replacement-config.yaml"
+                        replacement.write_bytes(fixture.config.read_bytes())
+                        os.replace(replacement, fixture.config)
+                        self.assertNotEqual(original_identity, cleanup._identity(fixture.config))
+
+                calls = self._install_final_fingerprint_mutation(
+                    fixture, target, change_live_identity,
+                )
+                self._assert_late_apply_refused(
+                    fixture, target, "candidate",
+                    "changed" if mutation in ("pid", "start_ticks") else "config identity or content changed",
+                )
+                self.assertEqual(calls["count"], 2)
+
+    def test_apply_rechecks_new_fd_config_and_cwd_references_after_final_fingerprint(self):
+        for scenario in ("fd", "config", "cwd"):
+            with self.subTest(reference=scenario), tempfile.TemporaryDirectory() as temp:
+                fixture = LifecycleFixture(Path(temp))
+                kind = "stopped-copy" if scenario == "cwd" else "candidate"
+                target = fixture.complete_single_artifact_lifecycle(kind)
+
+                def add_reference():
+                    if scenario == "fd":
+                        fixture.add_process(303, fds=((9, target),))
+                    elif scenario == "config":
+                        process_config = fixture.root / "worker-config.json"
+                        process_config.write_text(json.dumps({"sourceFile": str(target)}))
+                        fixture.add_process(
+                            303, cmdline=["worker", "--config", str(process_config)],
+                        )
+                    else:
+                        fixture.add_process(303, cwd=target)
+
+                calls = self._install_final_fingerprint_mutation(fixture, target, add_reference)
+                self._assert_late_apply_refused(
+                    fixture, target, kind, "references cleanup artifact",
+                )
+                self.assertEqual(calls["count"], 2)
 
     def test_restart_backup_pin_publish_dry_run_apply_and_neighbor_preservation(self):
         fixture = self.fixture

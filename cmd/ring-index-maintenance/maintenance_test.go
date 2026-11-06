@@ -66,15 +66,21 @@ func syntheticBackup(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	encoder := json.NewEncoder(f)
-	encoder.Encode(map[string]any{"schema": 1, "db_path": source + "/chain.db", "tip": tipReceipt{Hash: strings.Repeat("a", 64), Height: 7}, "approval_id": "synthetic-only"})
+	if err := encoder.Encode(map[string]any{"schema": 1, "db_path": source + "/chain.db", "tip": tipReceipt{Hash: strings.Repeat("a", 64), Height: 7}, "approval_id": "synthetic-only"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := copyTree(source, filepath.Join(backup, "data"), encoder); err != nil {
 		t.Fatal(err)
 	}
-	encoder.Encode(map[string]any{"complete": true})
+	if err := encoder.Encode(map[string]any{"complete": true}); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return source, backup
 }
 
@@ -97,7 +103,9 @@ func TestCoherentCopyChecksEveryFileAndCompleteness(t *testing.T) {
 		t.Fatal(err)
 	}
 	body = []byte(strings.Replace(string(body), `{"complete":true}`, "", 1))
-	os.WriteFile(manifest, body, 0600)
+	if err := os.WriteFile(manifest, body, 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := verifyBackup(backup); err == nil {
 		t.Fatal("partial backup accepted")
 	}
@@ -113,7 +121,11 @@ func TestCopyRefusesLinksAndSpecialFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close test manifest: %v", err)
+		}
+	}()
 	if err := copyTree(source, backup, json.NewEncoder(f)); err == nil {
 		t.Fatal("source symlink accepted")
 	}
@@ -121,13 +133,21 @@ func TestCopyRefusesLinksAndSpecialFiles(t *testing.T) {
 
 func TestCgroupQuiescenceIncludesDescendants(t *testing.T) {
 	root := t.TempDir()
-	os.WriteFile(filepath.Join(root, "cgroup.procs"), nil, 0600)
-	os.Mkdir(filepath.Join(root, "child"), 0700)
-	os.WriteFile(filepath.Join(root, "child", "cgroup.procs"), []byte("123\n"), 0600)
+	if err := os.WriteFile(filepath.Join(root, "cgroup.procs"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "child", "cgroup.procs"), []byte("123\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := emptyCgroup(root); err == nil {
 		t.Fatal("descendant writer ignored")
 	}
-	os.WriteFile(filepath.Join(root, "child", "cgroup.procs"), nil, 0600)
+	if err := os.WriteFile(filepath.Join(root, "child", "cgroup.procs"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := emptyCgroup(root); err != nil {
 		t.Fatal(err)
 	}

@@ -20,6 +20,7 @@ type AllocationEpochBasis struct {
 	LegacyHoldingsUnverified bool          `json:"legacy_holdings_unverified"`
 }
 
+// Validate checks the allocation epoch totals and supply bounds.
 func (e AllocationEpochBasis) Validate() error {
 	if e.FundingHash == zeroHash || !e.LegacyHoldingsUnverified ||
 		e.Available == 0 || e.Available > CapNAPRO || e.Burned > CapNAPRO ||
@@ -29,6 +30,7 @@ func (e AllocationEpochBasis) Validate() error {
 	return nil
 }
 
+// Digest returns the canonical commitment to this allocation epoch.
 func (e AllocationEpochBasis) Digest() crypto.Hash32 {
 	return crypto.HashBytes(
 		[]byte("aperod/sale/operator-allocation-epoch/legacy-holdings-unverified/v1"),

@@ -177,12 +177,16 @@ func adviseDiskFilesCold(path string) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-		return unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_DONTNEED)
+		adviseErr := unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_DONTNEED)
+		closeErr := file.Close()
+		if adviseErr != nil {
+			return adviseErr
+		}
+		return closeErr
 	})
 }
 
-func writeDiskReport(path string, value any) error {
+func writeDiskReport(path string, value any) (retErr error) {
 	raw, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
@@ -191,8 +195,17 @@ func writeDiskReport(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(file.Name())
-	defer file.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			if closeErr := file.Close(); closeErr != nil && retErr == nil {
+				retErr = closeErr
+			}
+		}
+		if removeErr := os.Remove(file.Name()); removeErr != nil && !os.IsNotExist(removeErr) && retErr == nil {
+			retErr = removeErr
+		}
+	}()
 	if _, err := file.Write(append(raw, '\n')); err != nil {
 		return err
 	}
@@ -202,6 +215,7 @@ func writeDiskReport(path string, value any) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
+	closed = true
 	if err := os.Rename(file.Name(), path); err != nil {
 		return err
 	}
@@ -209,11 +223,11 @@ func writeDiskReport(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
 	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
 		return fmt.Errorf("sync report directory: %w", err)
 	}
-	return nil
+	return dir.Close()
 }
 
 func TestRingDiskReportAtomicCheckpoint(t *testing.T) {

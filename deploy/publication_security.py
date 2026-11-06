@@ -73,6 +73,16 @@ def content_problem(path, content):
     return None
 
 
+def private_reference_problem(content, markers):
+    """Refuse references to the private source repository without echoing them."""
+    normalized = content.lower()
+    if not markers or any(not isinstance(marker, bytes) or not marker for marker in markers):
+        return "private repository identity unavailable"
+    if any(marker.lower() in normalized for marker in markers):
+        return "private source repository reference"
+    return None
+
+
 def git(repo, *args):
     # Git otherwise silently discovers a containing repository when a
     # disposable candidate loses its .git directory. Never scan or publish
@@ -150,6 +160,26 @@ def inspect_history(repo, ref=None):
             if reason:
                 failures.append((path, oid, reason))
     return len(commits), len(seen), failures
+
+
+def inspect_private_references(repo, tree, markers):
+    """Check every blob in the frozen publication tree for private repo references."""
+    if not markers or any(not isinstance(marker, bytes) or not marker for marker in markers):
+        raise ValueError("private repository identity unavailable")
+    failures = []
+    for item in git(repo, "ls-tree", "-rz", "--full-tree", tree).split(b"\0"):
+        if not item:
+            continue
+        metadata, raw_path = item.split(b"\t", 1)
+        _, kind, oid = metadata.decode("ascii").split()
+        if kind != "blob":
+            continue
+        path = raw_path.decode("utf-8")
+        problem = (private_reference_problem(raw_path, markers)
+                   or private_reference_problem(git(repo, "cat-file", "blob", oid), markers))
+        if problem:
+            failures.append((path, problem))
+    return failures
 
 
 def main():

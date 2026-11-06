@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -16,7 +17,7 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
-func run() error {
+func run() (retErr error) {
 	dbPath := flag.String("db", "", "closed canonical chain.db path")
 	cfgPath := flag.String("config", "", "node config; required only for signing")
 	out := flag.String("out", "", "new configuration file, never overwritten")
@@ -34,7 +35,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("closed database required: %w", err)
 	}
-	defer d.Close()
+	defer func() {
+		if closeErr := d.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close database: %w", closeErr))
+		}
+	}()
 	active, err := d.LoadSaleState()
 	if err != nil || active != nil {
 		return fmt.Errorf("existing sale ledger must not be reopened as a fresh budget")
@@ -152,17 +157,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := json.NewEncoder(f).Encode(&m); err != nil {
-		f.Close()
-		os.Remove(*out)
-		return err
+	writeErr := json.NewEncoder(f).Encode(&m)
+	if writeErr == nil {
+		writeErr = f.Sync()
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(*out)
-		return err
-	}
-	if err := f.Close(); err != nil {
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		if removeErr := os.Remove(*out); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, fmt.Errorf("remove incomplete proposal: %w", removeErr))
+		}
 		return err
 	}
 	checkpointHash := cp.Message()

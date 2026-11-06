@@ -320,7 +320,7 @@ func TestRingSamplingDiskRehearsal(t *testing.T) {
 	}
 	defer func() {
 		if db != nil {
-			db.Close()
+			closeStoreTestResource(t, db)
 		}
 	}()
 	defer func() {
@@ -506,7 +506,7 @@ func TestRingDiskCrashDurablyBuildsNewNotOldSlots(t *testing.T) {
 	}
 	defer func() {
 		if db != nil {
-			db.Close()
+			closeStoreTestResource(t, db)
 		}
 	}()
 	const population = uint64(20_000)

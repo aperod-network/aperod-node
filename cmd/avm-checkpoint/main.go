@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -78,12 +79,16 @@ func main() {
 	}
 }
 
-func runBuild(dbPath string, activationHeight uint64, outputPath string) error {
+func runBuild(dbPath string, activationHeight uint64, outputPath string) (retErr error) {
 	db, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		return fmt.Errorf("open chain database read-only: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close checkpoint database: %w", err))
+		}
+	}()
 	tipHash, tipHeight, err := db.GetTip()
 	if err != nil {
 		return fmt.Errorf("read canonical tip: %w", err)
@@ -110,7 +115,7 @@ func runBuild(dbPath string, activationHeight uint64, outputPath string) error {
 	return nil
 }
 
-func runSign(dbPath string, activationHeight uint64, candidatePath, keyPath, outputPath string) error {
+func runSign(dbPath string, activationHeight uint64, candidatePath, keyPath, outputPath string) (retErr error) {
 	draft, found, err := avm.ReadCheckpointFile(candidatePath)
 	if err != nil {
 		return err
@@ -126,7 +131,11 @@ func runSign(dbPath string, activationHeight uint64, candidatePath, keyPath, out
 	if err != nil {
 		return fmt.Errorf("open independent chain database read-only: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close checkpoint database: %w", err))
+		}
+	}()
 	localDraft, err := avm.BuildCheckpointDraftFromCanonical(
 		context.Background(), db, activationHeight, draft.Height, draft.BlockHash,
 	)
@@ -213,12 +222,17 @@ func writeWitnessSignature(path string, signature avm.CheckpointWitnessSignature
 	return nil
 }
 
-func readWitnessSignature(path string) (avm.CheckpointWitnessSignature, error) {
+func readWitnessSignature(path string) (signature avm.CheckpointWitnessSignature, retErr error) {
+	// #nosec G304 -- the signature file is selected by the local operator.
 	file, err := os.Open(path)
 	if err != nil {
 		return avm.CheckpointWitnessSignature{}, fmt.Errorf("open witness signature %q: %w", path, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close witness signature: %w", err))
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return avm.CheckpointWitnessSignature{}, fmt.Errorf("stat witness signature %q: %w", path, err)
@@ -254,12 +268,17 @@ func readWitnessSignature(path string) (avm.CheckpointWitnessSignature, error) {
 	}, nil
 }
 
-func readWitnessKey(keyPath string) (crypto.ValidatorPrivKey, error) {
+func readWitnessKey(keyPath string) (result crypto.ValidatorPrivKey, retErr error) {
+	// #nosec G304 -- the key file is selected by the local operator, not network input.
 	keyFile, err := os.Open(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("open witness key: %w", err)
 	}
-	defer keyFile.Close()
+	defer func() {
+		if err := keyFile.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close witness key: %w", err))
+		}
+	}()
 	info, err := keyFile.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat witness key: %w", err)

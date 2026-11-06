@@ -387,6 +387,9 @@ type ConsensusConfig struct {
 	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
 	// Empty disables the fork. Merely setting a target amount never funds the pool.
 	LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// LPoDDailyUpgradeHeight activates signed position top-ups and daily 20:00
+	// Moscow payout processing. Zero leaves the historical per-block rules intact.
+	LPoDDailyUpgradeHeight uint64 `yaml:"lpod_daily_upgrade_height"`
 	// FinalityMigrationFile is a signed, versioned attestation for one exact
 	// historical finality certificate. Empty leaves ordinary quorum checks intact.
 	FinalityMigrationFile string `yaml:"finality_migration_file"`
@@ -676,6 +679,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("stop_producing_at_height (%d) exceeds the supported maximum (%d)",
 			c.Consensus.StopProducingAtHeight, uint64(1<<63-1))
 	}
+	if c.Consensus.LPoDDailyUpgradeHeight > uint64(1<<63-1) {
+		return fmt.Errorf("lpod_daily_upgrade_height exceeds the supported maximum")
+	}
 	if c.Consensus.StopProducingAtHeight > 0 && c.Consensus.NonValidator {
 		return fmt.Errorf("stop_producing_at_height is only valid for validator nodes")
 	}
@@ -730,6 +736,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	guardianActivation := c.Consensus.GuardianFundActivationHeight
+	if c.Consensus.LPoDDailyUpgradeHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
+		return fmt.Errorf("lpod_daily_upgrade_height requires a canonical LPoD migration")
+	}
 	if c.Consensus.GenesisVestingActivationHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
 		return fmt.Errorf("genesis_vesting_activation_height requires a canonical LPoD migration")
 	}

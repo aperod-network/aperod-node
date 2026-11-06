@@ -188,7 +188,11 @@ func makeCheckpointTestDB(t *testing.T) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close checkpoint fixture database: %v", err)
+		}
+	}()
 	producerKey, producerPublic, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		return "", err

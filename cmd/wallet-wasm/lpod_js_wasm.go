@@ -31,7 +31,7 @@ func buildLPoDTransaction(_ js.Value, args []js.Value) any {
 		return promiseResult(nil, err)
 	}
 	var source *core.OwnedUTXO
-	if r.Action == "deposit" {
+	if r.Action == "deposit" || r.Action == "topup" {
 		if len(wr.Outputs) != 1 {
 			return promiseResult(nil, fmt.Errorf("select exactly one source output"))
 		}

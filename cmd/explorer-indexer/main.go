@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -61,6 +62,10 @@ func run() error {
 	if nodeURL == "" {
 		nodeURL = "http://127.0.0.1:8545"
 	}
+	nodeBase, err := parseNodeBaseURL(nodeURL)
+	if err != nil {
+		return fmt.Errorf("invalid Go node URL: %w", err)
+	}
 
 	pollInterval := 5 * time.Second
 	if s := os.Getenv("POLL_INTERVAL"); s != "" {
@@ -87,7 +92,7 @@ func run() error {
 	}
 
 	log.Info("explorer-indexer starting",
-		"node_url", nodeURL,
+		"node_host", nodeBase.Host,
 		"poll_interval", pollInterval,
 		"batch_size", batchSize,
 		"requests_per_second", requestsPerSecond,
@@ -436,13 +441,52 @@ type blocksListResponse struct {
 	Total uint64 `json:"total"`
 }
 
-func (c *nodeClient) get(url string) ([]byte, int, error) {
+func parseNodeBaseURL(raw string) (*url.URL, error) {
+	if strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "\r\n\t") {
+		return nil, fmt.Errorf("URL contains whitespace or control characters")
+	}
+	base, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse URL: %w", err)
+	}
+	if (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" ||
+		base.User != nil || base.RawQuery != "" || base.Fragment != "" || base.Opaque != "" {
+		return nil, fmt.Errorf("URL must be an HTTP(S) origin without credentials, query, or fragment")
+	}
+	return base, nil
+}
+
+func validateNodeRequestURL(configuredBase, requestURL string) error {
+	base, err := parseNodeBaseURL(configuredBase)
+	if err != nil {
+		return err
+	}
+	target, err := url.Parse(requestURL)
+	if err != nil {
+		return fmt.Errorf("parse request URL: %w", err)
+	}
+	if target.Scheme != base.Scheme || !strings.EqualFold(target.Host, base.Host) ||
+		target.User != nil || target.Fragment != "" || target.Opaque != "" {
+		return fmt.Errorf("request URL does not match configured node origin")
+	}
+	return nil
+}
+
+func (c *nodeClient) get(requestURL string) ([]byte, int, error) {
+	if err := validateNodeRequestURL(c.base, requestURL); err != nil {
+		return nil, 0, fmt.Errorf("reject node request: %w", err)
+	}
 	fallbackDelay := time.Second
 	for {
 		if c.pacer != nil {
 			c.pacer.wait()
 		}
-		resp, err := c.http.Get(url)
+		safeClient := *c.http
+		safeClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		// #nosec G704 -- requestURL is bound to the configured node origin above, and redirects are disabled.
+		resp, err := safeClient.Get(requestURL)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -460,12 +504,15 @@ func (c *nodeClient) get(url string) ([]byte, int, error) {
 			} else if delay < minRateLimitRetryDelay {
 				delay = minRateLimitRetryDelay
 			}
-			slog.Warn("node REST rate limited; retrying without restarting catch-up",
-				"retry_after", delay, "url", url)
+			slog.Warn("node REST rate limited; retrying without restarting catch-up")
 			time.Sleep(delay)
 			continue
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				slog.Warn("failed to close node REST response body")
+			}
+		}()
 		body, err := io.ReadAll(resp.Body)
 		return body, resp.StatusCode, err
 	}

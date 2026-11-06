@@ -1,6 +1,8 @@
 package core
 
 import (
+	"encoding/binary"
+
 	"github.com/aperod/aperod/crypto"
 )
 
@@ -120,9 +122,7 @@ func decryptAmount(enc [8]byte, hs *crypto.Scalar32) uint64 {
 // Used by the transaction builder.
 func EncryptAmount(amount uint64, hs *crypto.Scalar32) [8]byte {
 	var plain [8]byte
-	for i := range plain {
-		plain[i] = byte(amount >> (uint(i) * 8))
-	}
+	binary.LittleEndian.PutUint64(plain[:], amount)
 	keyStream := crypto.HashBytes([]byte("aperod/amount-enc/v1"), hs[:])
 	var enc [8]byte
 	for i := range enc {

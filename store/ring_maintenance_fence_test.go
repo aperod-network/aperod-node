@@ -31,20 +31,20 @@ func copyMaintenanceDB(t *testing.T, source, dest string) {
 		}
 		out, err := os.OpenFile(filepath.Join(dest, entry.Name()), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
-			in.Close()
+			closeStoreTestResource(t, in)
 			t.Fatal(err)
 		}
 		_, err = io.Copy(out, in)
-		in.Close()
+		closeStoreTestResource(t, in)
 		if err != nil {
-			out.Close()
+			closeStoreTestResource(t, out)
 			t.Fatal(err)
 		}
 		if err := out.Sync(); err != nil {
-			out.Close()
+			closeStoreTestResource(t, out)
 			t.Fatal(err)
 		}
-		out.Close()
+		closeStoreTestResource(t, out)
 	}
 }
 
@@ -65,7 +65,7 @@ func TestRingMaintenancePhysicalOlderGenerationImport(t *testing.T) {
 	}
 	copyMaintenanceDB(t, backup, path) // physically restores old valid ready count
 	legacyPutMember(t, path, 8, false) // canonical change invisible to old ordinals
-	l.Close()
+	closeStoreTestResource(t, l)
 	if err := checkRingMaintenanceFenceAt(path, state); err == nil {
 		t.Fatal("older generation hid external fence")
 	}
@@ -84,7 +84,7 @@ func TestRingMaintenancePhysicalOlderGenerationImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	if _, err := db.VerifyRingSamplingIndex(); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestRingMaintenanceBorrowedWorkerAndReceiptFencing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	borrowed.Close()
+	closeStoreTestResource(t, borrowed)
 	receipt := RingMaintenanceWorkerReceipt{Schema: 1, DBPath: path, Generation: l.WorkerGeneration(), Inventory: inventory}
 	stale := receipt
 	stale.Generation = "stale"
@@ -136,9 +136,9 @@ func TestRingMaintenanceRejectsCounterfeitLeaseDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fake.Close()
+	defer closeStoreTestResource(t, fake)
 	if borrowed, err := borrowRingMaintenanceAt(path, state, l.WorkerGeneration(), fake, uint32(os.Geteuid())); err == nil {
-		borrowed.Close()
+		closeStoreTestResource(t, borrowed)
 		t.Fatal("unrelated descriptor authorized maintenance")
 	}
 	other, _ := maintenanceFixture(t)
@@ -146,9 +146,9 @@ func TestRingMaintenanceRejectsCounterfeitLeaseDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fd.Close()
+	defer closeStoreTestResource(t, fd)
 	if borrowed, err := borrowRingMaintenanceAt(other, state, l.WorkerGeneration(), fd, uint32(os.Geteuid())); err == nil {
-		borrowed.Close()
+		closeStoreTestResource(t, borrowed)
 		t.Fatal("lease authorized different database")
 	}
 }
@@ -175,7 +175,7 @@ func TestRingMaintenanceRejectsConflictingLegacyBackfill(t *testing.T) {
 	if err := db.db.Put(ringMemberKey(u.OneTimePub), raw, &opt.WriteOptions{Sync: true}); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	closeStoreTestResource(t, db)
 	if _, err := l.RebuildAndVerify(); err == nil {
 		t.Fatal("legacy backfill overwrote canonical repair")
 	}
@@ -183,7 +183,7 @@ func TestRingMaintenanceRejectsConflictingLegacyBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	got, err := db.db.Get(ringMemberKey(u.OneTimePub), nil)
 	if err != nil || string(got) != string(raw) {
 		t.Fatal("canonical repair lost on failed rebuild")
@@ -198,7 +198,7 @@ func TestRingMaintenanceReadOnlyNeverCreatesMissingLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if db, err := l.OpenReadOnly(); err == nil {
-		db.Close()
+		closeStoreTestResource(t, db)
 		t.Fatal("missing native lock accepted")
 	}
 	if _, err := os.Lstat(lock); !os.IsNotExist(err) {
@@ -238,7 +238,7 @@ func fixtureLease(t *testing.T, path, root string) *RingMaintenanceLease {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { l.Close() })
+	t.Cleanup(func() { closeStoreTestResource(t, l) })
 	return l
 }
 
@@ -248,7 +248,7 @@ func legacyPutMember(t *testing.T, path string, id byte, locked bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	u := sparseRingOutput(id)
 	u.ProtocolLocked = locked
 	raw, err := json.Marshal(u)
@@ -276,7 +276,7 @@ func TestRingMaintenanceDowngradeRepairAndRetainedSpent(t *testing.T) {
 		t.Fatal("unaudited commit")
 	}
 	if other, err := acquireRingMaintenanceAt(path, root, uint32(os.Geteuid())); err == nil {
-		other.Close()
+		closeStoreTestResource(t, other)
 		t.Fatal("mixed controllers")
 	}
 	legacyPutMember(t, path, 7, false)
@@ -300,7 +300,7 @@ func TestRingMaintenanceDowngradeRepairAndRetainedSpent(t *testing.T) {
 		t.Fatal(err)
 	}
 	spent.Release()
-	db.Close()
+	closeStoreTestResource(t, db)
 	if count != 1 {
 		t.Fatal("spent anonymity marker lost")
 	}
@@ -329,7 +329,7 @@ func TestRingMaintenanceRestoreReadyMarkerAndFailureRemainFenced(t *testing.T) {
 	if err := raw.Put(ringSamplingCountKey, ringSamplingUint(4), &opt.WriteOptions{Sync: true}); err != nil {
 		t.Fatal(err)
 	}
-	raw.Close()
+	closeStoreTestResource(t, raw)
 	legacyPutMember(t, path, 8, false)
 	if err := checkRingMaintenanceFenceAt(path, root); err == nil {
 		t.Fatal("imported ready marker bypassed external fence")
@@ -346,7 +346,7 @@ func TestRingMaintenanceRestoreReadyMarkerAndFailureRemainFenced(t *testing.T) {
 	if err := raw.Put(ringMemberKey(sparseRingOutput(9).OneTimePub), []byte("{broken"), nil); err != nil {
 		t.Fatal(err)
 	}
-	raw.Close()
+	closeStoreTestResource(t, raw)
 	if _, err := l.RebuildAndVerify(); err == nil {
 		t.Fatal("bad repair accepted")
 	}
@@ -363,7 +363,7 @@ func TestRingMaintenanceRestoreReadyMarkerAndFailureRemainFenced(t *testing.T) {
 	if _, ready, err := ringSamplingCount(raw); err != nil || ready {
 		t.Fatal("failed repair left ready", err)
 	}
-	raw.Close()
+	closeStoreTestResource(t, raw)
 }
 
 func TestRingMaintenanceMissingBusyAndRedirectedDatabase(t *testing.T) {
@@ -379,7 +379,7 @@ func TestRingMaintenanceMissingBusyAndRedirectedDatabase(t *testing.T) {
 	if err := l.Invalidate(); err == nil {
 		t.Fatal("active legacy writer not rejected")
 	}
-	writer.Close()
+	closeStoreTestResource(t, writer)
 	moved := path + ".held"
 	if err := os.Rename(path, moved); err != nil {
 		t.Fatal(err)
@@ -451,7 +451,7 @@ func TestRingMaintenanceLeaseRejectsUnsafeControlRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if l, err := acquireRingMaintenanceAt(path, root, uint32(os.Geteuid())); err == nil {
-		l.Close()
+		closeStoreTestResource(t, l)
 		t.Fatal("writable control root accepted")
 	}
 	var l *RingMaintenanceLease

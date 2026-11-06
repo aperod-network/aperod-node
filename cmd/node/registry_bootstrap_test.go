@@ -27,7 +27,11 @@ func TestBootstrapDatabaseBackedSpendReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close bootstrap test database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)
@@ -130,7 +134,11 @@ func TestBootstrapWrongRoundSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close bootstrap test database: %v", err)
+		}
+	}()
 	priv1, pub1, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +175,11 @@ func TestBootstrapAuthenticationBeforeDecompressionAndNullEntries(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close bootstrap test database: %v", err)
+		}
+	}()
 	path := filepath.Join(t.TempDir(), "bad.gz")
 	if err := os.WriteFile(path, []byte("not gzip"), 0600); err != nil {
 		t.Fatal(err)
@@ -198,7 +210,11 @@ func TestBootstrapRealArchiveReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close bootstrap test database: %v", err)
+		}
+	}()
 	_, tip, err := db.GetTip()
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +266,9 @@ func TestBootstrapCopiedDBInventory(t *testing.T) {
 		count := 0
 		kiErr := db.IterKeyImages(func(crypto.KeyImage) error { count++; return nil })
 		t.Logf("%s tip=%d hash=%x key_images=%d errors=%v/%v", path, height, hash, count, err, kiErr)
-		db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close diagnostic registry database: %v", closeErr)
+		}
 	}
 }
 
@@ -261,7 +279,11 @@ func TestBootstrapUTXOValidationTrustBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close bootstrap UTXO validation database: %v", err)
+				}
+			}()
 			original := &core.UTXO{TxHash: crypto.HashStr("pinned-output"), BlockHeight: 1}
 			snap := &startupSnapshot{TipHeight: 1, UTXOs: core.UTXOSnapshot{ActiveUTXOs: []*core.UTXO{original}}}
 			utxos := core.NewUTXOSet()
@@ -304,7 +326,11 @@ func TestBootstrapExpandedLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close gzip reader: %v", err)
+		}
+	}()
 	limited := &io.LimitedReader{R: r, N: 100}
 	if err := json.NewDecoder(limited).Decode(new(startupSnapshot)); err == nil || limited.N != 0 {
 		t.Fatal("expanded bound not enforced")
@@ -333,7 +359,11 @@ func TestOperatorRegistryBootstrapPinsStateAndTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close operator registry bootstrap database: %v", err)
+		}
+	}()
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +462,11 @@ func TestOperatorRegistryReplayEpochAndUnauthorizedProposer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close operator registry replay database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)
@@ -481,7 +515,11 @@ func TestOperatorRegistryReplayRejectsBrokenContinuity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close broken-continuity database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,7 +27,7 @@ const bootstrapMaxArrayEntries = 8_000_000
 // This opt-in pins the entire operator-selected state, not merely a list of
 // signers. Neither a witness signature nor the DB index authenticates that
 // operator's historical committee assertion.
-func loadOperatorRegistryBootstrap(c *config.RegistryBootstrapConfig, nonValidator bool, db *store.DB, tip uint64) (*startupSnapshot, error) {
+func loadOperatorRegistryBootstrap(c *config.RegistryBootstrapConfig, nonValidator bool, db *store.DB, tip uint64) (snapshot *startupSnapshot, retErr error) {
 	if c == nil {
 		return nil, nil
 	}
@@ -42,7 +43,11 @@ func loadOperatorRegistryBootstrap(c *config.RegistryBootstrapConfig, nonValidat
 		return nil, fmt.Errorf("registry bootstrap: %w", err)
 	}
 	h := sha256.New()
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close registry bootstrap file: %w", err))
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > bootstrapMaxCompressedBytes {
 		return nil, fmt.Errorf("registry bootstrap requires a regular compressed snapshot <=512 MiB")
@@ -63,7 +68,11 @@ func loadOperatorRegistryBootstrap(c *config.RegistryBootstrapConfig, nonValidat
 	if err != nil {
 		return nil, fmt.Errorf("registry bootstrap gzip: %w", err)
 	}
-	defer gz.Close()
+	defer func() {
+		if err := gz.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close registry bootstrap gzip stream: %w", err))
+		}
+	}()
 	snap := new(startupSnapshot)
 	expanded := &io.LimitedReader{R: gz, N: bootstrapMaxExpandedBytes + 1}
 	decoder := json.NewDecoder(expanded)

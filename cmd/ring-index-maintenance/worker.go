@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,7 +50,7 @@ func tipMetadata(db *store.DB) (tipReceipt, error) {
 	return tipReceipt{hex.EncodeToString(hash), binary.LittleEndian.Uint64(height)}, nil
 }
 
-func worker(mode, path, generation string) error {
+func worker(mode, path, generation string) (retErr error) {
 	if os.Geteuid() == 0 {
 		return fmt.Errorf("database worker must not run as root")
 	}
@@ -72,14 +73,22 @@ func worker(mode, path, generation string) error {
 	if err != nil {
 		return err
 	}
-	defer lease.Close()
+	defer func() {
+		if err := lease.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close worker lease: %w", err))
+		}
+	}()
 	switch mode {
 	case "backup-lock":
 		db, err := lease.OpenReadOnly()
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close backup database: %w", err))
+			}
+		}()
 		tip, err := tipMetadata(db)
 		if err != nil {
 			return err
@@ -129,6 +138,7 @@ func workerCommand(p maintenancePolicy, l *store.RingMaintenanceLease, mode stri
 		return nil, nil, nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// #nosec G204 -- toolPath is separately installed and hash-verified; arguments are fixed flags and validated policy values.
 	cmd := exec.CommandContext(ctx, toolPath, "--worker", mode, "--db", p.DBPath, "--generation", l.WorkerGeneration())
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "GOMEMLIMIT=256MiB"}
 	cmd.ExtraFiles = []*os.File{fd}
@@ -136,24 +146,31 @@ func workerCommand(p maintenancePolicy, l *store.RingMaintenanceLease, mode stri
 	return cmd, fd, cancel, nil
 }
 
-func invalidateWorker(p maintenancePolicy, l *store.RingMaintenanceLease) error {
+func invalidateWorker(p maintenancePolicy, l *store.RingMaintenanceLease) (retErr error) {
 	cmd, fd, cancel, err := workerCommand(p, l, "invalidate")
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
+	defer func() {
+		if err := fd.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close invalidate worker descriptor: %w", err))
+		}
+	}()
 	defer cancel()
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func rebuildWorker(p maintenancePolicy, l *store.RingMaintenanceLease) (store.RingMaintenanceWorkerReceipt, error) {
-	var receipt store.RingMaintenanceWorkerReceipt
+func rebuildWorker(p maintenancePolicy, l *store.RingMaintenanceLease) (receipt store.RingMaintenanceWorkerReceipt, retErr error) {
 	cmd, fd, cancel, err := workerCommand(p, l, "rebuild")
 	if err != nil {
 		return receipt, err
 	}
-	defer fd.Close()
+	defer func() {
+		if err := fd.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close rebuild worker descriptor: %w", err))
+		}
+	}()
 	defer cancel()
 	out, err := cmd.StdoutPipe()
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,11 +21,12 @@ import (
 type serviceController struct{}
 
 func systemctl(args ...string) (string, error) {
-	if err := protectedPath("/usr/bin/systemctl", 0); err != nil {
+	if err := protectedPath("/usr/bin/systemctl"); err != nil {
 		return "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
+	// #nosec G204 -- fixed systemctl binary; call sites supply only allowlisted unit and property arguments.
 	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", args...)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"}
 	var out bytes.Buffer
@@ -49,7 +51,7 @@ func approvedUnitFiles(p maintenancePolicy) error {
 			if strings.ContainsAny(path, " \t\r\n\\\"") {
 				return fmt.Errorf("ambiguous unit-file path")
 			}
-			if err := protectedPath(path, 0); err != nil {
+			if err := protectedPath(path); err != nil {
 				return err
 			}
 			got, err := fileDigest(path)
@@ -73,6 +75,7 @@ func blockerDropIn(u unitPolicy, control string, invert bool) error {
 	if _, ok := u.Files[path]; !ok {
 		return fmt.Errorf("independently approved persistent service interlock missing")
 	}
+	// #nosec G304 -- this exact systemd drop-in path was matched against independently approved policy.
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -154,7 +157,7 @@ func (serviceController) validate(p maintenancePolicy, reload bool) error {
 	if enabled != "static" && enabled != "disabled" {
 		return fmt.Errorf("legacy worker must not auto-start at boot")
 	}
-	if err := protectedPath(p.LegacyBinary, 0); err != nil {
+	if err := protectedPath(p.LegacyBinary); err != nil {
 		return err
 	}
 	digest, err := fileDigest(p.LegacyBinary)
@@ -200,7 +203,8 @@ func (serviceController) stopped(u unitPolicy) error {
 	return emptyCgroup(filepath.Join("/sys/fs/cgroup", group))
 }
 
-func emptyCgroup(path string) error {
+func emptyCgroup(path string) (retErr error) {
+	// #nosec G304 -- path is constrained to the validated cgroup hierarchy under /sys/fs/cgroup.
 	procs, err := os.Open(filepath.Join(path, "cgroup.procs"))
 	if os.IsNotExist(err) {
 		return nil
@@ -208,19 +212,22 @@ func emptyCgroup(path string) error {
 	if err != nil {
 		return err
 	}
-	data, err := io.ReadAll(io.LimitReader(procs, 65537))
-	procs.Close()
-	if err != nil {
-		return err
+	data, readErr := io.ReadAll(io.LimitReader(procs, 65537))
+	closeErr := procs.Close()
+	if readErr != nil || closeErr != nil {
+		return errors.Join(readErr, closeErr)
 	}
 	if len(data) > 65536 || strings.TrimSpace(string(data)) != "" {
 		return fmt.Errorf("writer cgroup still contains processes")
 	}
+	// #nosec G304 -- path is constrained to the validated cgroup hierarchy under /sys/fs/cgroup.
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() {
+		retErr = errors.Join(retErr, dir.Close())
+	}()
 	for {
 		entries, err := dir.ReadDir(256)
 		if err != nil && err != io.EOF {
@@ -325,15 +332,16 @@ func (serviceController) witnessDB(p maintenancePolicy) error {
 				continue
 			}
 			if target == filepath.Join(p.DBPath, "LOCK") {
+				// #nosec G304 -- text is a numeric PID read from the kernel-owned cgroup task list.
 				image, err := os.Open(filepath.Join("/proc", text, "exe"))
 				if err != nil {
 					return err
 				}
 				h := sha256.New()
-				_, err = io.Copy(h, image)
-				image.Close()
-				if err != nil {
-					return err
+				_, copyErr := io.Copy(h, image)
+				closeErr := image.Close()
+				if copyErr != nil || closeErr != nil {
+					return errors.Join(copyErr, closeErr)
 				}
 				if hex.EncodeToString(h.Sum(nil)) != expected {
 					return fmt.Errorf("running image differs from backup binary")

@@ -64,10 +64,7 @@ func FuzzHashBytes(f *testing.F) {
 	f.Add(make([]byte, 1024))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		h := crypto.HashBytes(data)
-		if len(h) != 32 {
-			t.Errorf("hash len = %d, want 32", len(h))
-		}
+		_ = crypto.HashBytes(data)
 	})
 }
 
@@ -110,9 +107,9 @@ func FuzzMLSAGVerify(f *testing.F) {
 	ring := make([]crypto.RingMember, 3)
 	for i := range ring {
 		kk, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(kk.Spend.Public)
+		ring[i] = kk.Spend.Public
 	}
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	var msg crypto.Hash32
 	msg[0] = 0xDE
 	sig, err := crypto.MLSAGSign(msg, ring, 0, wk.Spend.Private)

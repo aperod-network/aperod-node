@@ -42,7 +42,10 @@ type Config struct {
 	// FinalityMigrationTrustAuthorities are operator-pinned validator identities
 	// authorized to sign the migration, independent of genesis validators.
 	FinalityMigrationTrustAuthorities []crypto.ValidatorPubKey
-	LPoDMigration          *store.LPoDMigration
+	LPoDMigration                     *store.LPoDMigration
+	// LPoDDailyUpgradeHeight is a coordinated fork gate for top-ups and daily
+	// Guardian-position settlement. Zero keeps the feature disabled.
+	LPoDDailyUpgradeHeight uint64
 	SaleMigration          *store.SaleMigration
 	// Approved durable purchase intents are built at the real slot and parent.
 	// Nil never enables the legacy admin-mint path.
@@ -605,6 +608,7 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.utxos = utxos
 	if v != nil {
 		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
+		v.SetLPoDDailyUpgradeHeight(e.cfg.LPoDDailyUpgradeHeight)
 	}
 }
 

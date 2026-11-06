@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,7 +16,7 @@ func main() {
 	}
 }
 
-func run(args []string) error {
+func run(args []string) (retErr error) {
 	flags := flag.NewFlagSet("ring-index-maintenance", flag.ContinueOnError)
 	phase := flags.String("phase", "", "prepare, legacy, finalize or guard-update")
 	workerMode := flags.String("worker", "", "internal inherited-capability worker")
@@ -71,7 +72,7 @@ func run(args []string) error {
 	if resolved, err := filepathCanonical(p.DBPath); err != nil || resolved != p.DBPath {
 		return fmt.Errorf("canonical DB path changed")
 	}
-	if err := protectedPath(p.NodeBinary, 0); err != nil {
+	if err := protectedPath(p.NodeBinary); err != nil {
 		return err
 	}
 	s := serviceController{}
@@ -82,7 +83,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer l.Close()
+	defer func() {
+		if err := l.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release maintenance lease: %w", err))
+		}
+	}()
 	switch *phase {
 	case "prepare":
 		return prepare(p, l, s)

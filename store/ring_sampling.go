@@ -20,6 +20,7 @@ const maxRingSamplingRequest = 4096
 const maxRingEntropyRejections = 128
 const maxStakedRingExclusions = 1_000_000
 
+// SampleRingMembers selects canonical ring members excluding the supplied public keys.
 func (d *DB) SampleRingMembers(count int, exclude map[crypto.Point32]bool) ([]core.DecoyUTXO, error) {
 	return d.sampleRingMembers(count, exclude, cryptorand.Reader)
 }

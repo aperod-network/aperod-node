@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +33,7 @@ func control(p maintenancePolicy, kind string) string {
 	return path
 }
 
-func readJournal(p maintenancePolicy) (operationJournal, error) {
+func readJournal(p maintenancePolicy) (j operationJournal, retErr error) {
 	j, err := readJournalHeader(p)
 	if err != nil {
 		return j, err
@@ -40,7 +41,7 @@ func readJournal(p maintenancePolicy) (operationJournal, error) {
 	if filepath.Dir(j.Backup) != p.BackupRoot || !digestRE.MatchString(j.ManifestSHA256) {
 		return j, fmt.Errorf("unverified coherent backup")
 	}
-	if err := protectedPath(j.Backup, 0); err != nil {
+	if err := protectedPath(j.Backup); err != nil {
 		return j, err
 	}
 	got, err := fileDigest(filepath.Join(j.Backup, "manifest.jsonl"))
@@ -56,17 +57,21 @@ func readJournal(p maintenancePolicy) (operationJournal, error) {
 	return j, nil
 }
 
-func readJournalHeader(p maintenancePolicy) (operationJournal, error) {
-	var j operationJournal
+func readJournalHeader(p maintenancePolicy) (j operationJournal, retErr error) {
 	path := control(p, "journal.json")
-	if err := protectedPath(path, 0); err != nil {
+	if err := protectedPath(path); err != nil {
 		return j, err
 	}
+	// #nosec G304 -- path is derived from the protected control directory and checked with protectedPath above.
 	f, err := os.Open(path)
 	if err != nil {
 		return j, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close maintenance journal: %w", err))
+		}
+	}()
 	decoder := json.NewDecoder(io.LimitReader(f, 65537))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&j); err != nil {
@@ -86,15 +91,19 @@ func readJournalHeader(p maintenancePolicy) (operationJournal, error) {
 	return j, nil
 }
 
-func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register func(string) error) (string, string, error) {
-	if err := protectedPath(p.BackupRoot, 0); err != nil {
+func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register func(string) error) (backup string, digest string, retErr error) {
+	if err := protectedPath(p.BackupRoot); err != nil {
 		return "", "", err
 	}
 	cmd, fd, cancel, err := workerCommand(p, l, "backup-lock")
 	if err != nil {
 		return "", "", err
 	}
-	defer fd.Close()
+	defer func() {
+		if err := fd.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close backup worker descriptor: %w", err))
+		}
+	}()
 	defer cancel()
 	input, err := cmd.StdinPipe()
 	if err != nil {
@@ -109,11 +118,21 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 		return "", "", err
 	}
 	done := false
+	inputClosed := false
+	processWaited := false
 	defer func() {
 		if !done {
 			cancel()
-			input.Close()
-			cmd.Wait()
+			if !inputClosed {
+				if err := input.Close(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("close backup worker input: %w", err))
+				}
+			}
+			if !processWaited {
+				if err := cmd.Wait(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("wait for backup worker: %w", err))
+				}
+			}
 		}
 	}()
 	var original tipReceipt
@@ -122,13 +141,14 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 	if err := decoder.Decode(&original); err != nil {
 		return "", "", err
 	}
-	backup, err := os.MkdirTemp(p.BackupRoot, "ring-maintenance-")
+	backup, err = os.MkdirTemp(p.BackupRoot, "ring-maintenance-")
 	if err != nil {
 		return "", "", err
 	}
 	if err := register(backup); err != nil {
 		return backup, "", err
 	}
+	// #nosec G304 -- backup is a new protected staging directory created by MkdirTemp.
 	manifest, err := os.OpenFile(filepath.Join(backup, "manifest.jsonl"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return backup, "", err
@@ -136,7 +156,9 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 	closed := false
 	defer func() {
 		if !closed {
-			manifest.Close()
+			if err := manifest.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close backup manifest: %w", err))
+			}
 		}
 	}()
 	encoder := json.NewEncoder(manifest)
@@ -149,28 +171,23 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 	// Preserve exact matching config/binary, but never install/restore either
 	// automatically. A restored old writer needs this procedure again.
 	for _, pair := range [][2]string{{p.ConfigPath, "node.yaml"}, {p.NodeBinary, "node.bin"}} {
+		// #nosec G304 -- pair[0] comes from the validated maintenance plan.
 		in, err := os.Open(pair[0])
 		if err != nil {
 			return backup, "", err
 		}
+		// #nosec G304 -- the destination is a fixed filename under the new protected backup directory.
 		out, err := os.OpenFile(filepath.Join(backup, pair[1]), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
-			in.Close()
-			return backup, "", err
+			return backup, "", errors.Join(err, in.Close())
 		}
 		h := sha256.New()
 		n, copyErr := io.Copy(io.MultiWriter(out, h), in)
-		in.Close()
+		inputCloseErr := in.Close()
 		syncErr := out.Sync()
 		closeErr := out.Close()
-		if copyErr != nil {
-			return backup, "", copyErr
-		}
-		if syncErr != nil {
-			return backup, "", syncErr
-		}
-		if closeErr != nil {
-			return backup, "", closeErr
+		if err := errors.Join(copyErr, inputCloseErr, syncErr, closeErr); err != nil {
+			return backup, "", err
 		}
 		if err := encoder.Encode(backupEntry{Tree: "meta", Path: pair[1], SHA256: hex.EncodeToString(h.Sum(nil)), Bytes: n, Mode: 0600}); err != nil {
 			return backup, "", err
@@ -198,10 +215,11 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 	if err := manifest.Sync(); err != nil {
 		return backup, "", err
 	}
-	if err := manifest.Close(); err != nil {
-		return backup, "", err
-	}
+	closeErr = manifest.Close()
 	closed = true
+	if closeErr != nil {
+		return backup, "", closeErr
+	}
 	if err := syncDirectory(backup); err != nil {
 		return backup, "", err
 	}
@@ -214,12 +232,18 @@ func coherentBackup(p maintenancePolicy, l *store.RingMaintenanceLease, register
 	if _, err := io.WriteString(input, "release\n"); err != nil {
 		return backup, "", err
 	}
-	input.Close()
-	if err := cmd.Wait(); err != nil {
+	closeErr = input.Close()
+	inputClosed = true
+	if closeErr != nil {
+		cancel()
+	}
+	waitErr := cmd.Wait()
+	processWaited = true
+	done = true
+	if err := errors.Join(closeErr, waitErr); err != nil {
 		return backup, "", err
 	}
-	done = true
-	digest, err := fileDigest(filepath.Join(backup, "manifest.jsonl"))
+	digest, err = fileDigest(filepath.Join(backup, "manifest.jsonl"))
 	return backup, digest, err
 }
 
@@ -296,7 +320,7 @@ func prepare(p maintenancePolicy, l *store.RingMaintenanceLease, s serviceContro
 		if filepath.Dir(partial) != p.BackupRoot {
 			return fmt.Errorf("partial backup scope invalid")
 		}
-		if err := protectedPath(partial, 0); err != nil {
+		if err := protectedPath(partial); err != nil {
 			return err
 		}
 		if err := os.RemoveAll(partial); err != nil {

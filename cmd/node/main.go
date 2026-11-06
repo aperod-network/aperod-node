@@ -815,7 +815,9 @@ func run() error {
 	if preflightCapability {
 		// --validate-config accompanies this probe so an older binary which ignores
 		// unknown flags can only validate configuration, never start a live node.
-		fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
+		if _, err := fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`); err != nil {
+			return fmt.Errorf("write sale preflight capability receipt: %w", err)
+		}
 		return nil
 	}
 	// ── 0. config-free maintenance subcommands ────────────────────────────────
@@ -1397,6 +1399,14 @@ func run() error {
 	if err != nil {
 		log.Error("protocol sale startup validation failed", "err", err)
 		os.Exit(1)
+	}
+	if saleMigration != nil {
+		if err := db.EnsureSaleRetention(saleMigration); err != nil {
+			// Keep the node online, but PruneBlocksOlderThan refuses to advance
+			// while this active sale ledger lacks a complete canonical retention
+			// index. This is not a finality or historical LPoD proof.
+			log.Error("protocol sale retention index is incomplete; sale block pruning will fail closed", "err", err)
+		}
 	}
 	authorityFork, err := loadValidatorAuthorityFork(cfg.Consensus)
 	if err != nil {
@@ -2735,13 +2745,14 @@ func run() error {
 		}
 	}
 	if err := db.CheckGenesisVestingConfig(cfg.Consensus.GenesisVestingActivationHeight, genesisVestingFunding); err != nil {
-		return fmt.Errorf("Development Fund startup safety: %w", err)
+		return fmt.Errorf("development fund startup safety: %w", err)
 	}
 	engine = consensus.NewEngine(consensus.Config{
 		ValidatorAuthorityFork:            authorityFork,
 		FinalityMigration:                 finalityMigration,
 		FinalityMigrationTrustAuthorities: finalityMigrationTrustAuthorities,
 		LPoDMigration:                     lpodMigration,
+		LPoDDailyUpgradeHeight:            cfg.Consensus.LPoDDailyUpgradeHeight,
 		SaleMigration:                     saleMigration,
 		GenesisVestingActivationHeight:    cfg.Consensus.GenesisVestingActivationHeight,
 		GenesisVestingFunding:             genesisVestingFunding,
@@ -3027,6 +3038,7 @@ func run() error {
 	txVerifier.SetStakedCollateralRingExclusionActivationHeight(
 		cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 	)
+	txVerifier.SetLPoDDailyUpgradeHeight(cfg.Consensus.LPoDDailyUpgradeHeight)
 	// Wire vesting enforcement so the verifier rejects spending of still-locked
 	// genesis allocations at the protocol level (not just display-only).
 	// Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather

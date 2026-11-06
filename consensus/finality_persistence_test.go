@@ -42,7 +42,11 @@ func TestFinalityCertificateSurvivesRestartAndRejectsWrongFork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close finality persistence database: %v", err)
+		}
+	}()
 	chain, block := finalityTestChain(t, "canonical")
 	registry := core.NewValidatorRegistry()
 	registry.InitFromGenesis(pubs, core.MinStakeNAPR*10)
@@ -140,7 +144,11 @@ func TestFinalityCommitteeMigrationRestoresCertificateOnlyWithPinnedQuorum(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close finality migration database: %v", err)
+		}
+	}()
 	rawBlock, err := json.Marshal(block)
 	if err != nil {
 		t.Fatal(err)

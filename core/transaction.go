@@ -207,7 +207,7 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("tx version 0 is invalid")
 	}
 	switch tx.Version {
-	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout, TxVersionSale:
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout, TxVersionSale, TxVersionLPoDTopUp:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
