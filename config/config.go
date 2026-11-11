@@ -69,12 +69,19 @@ type SnapshotConfig struct {
 
 // MaintenanceConfig controls the node's scheduled maintenance window.
 type MaintenanceConfig struct {
+	// RestartEnabled controls whether the in-process nightly restart scheduler
+	// is allowed to run. Default: true. Set false together with RestartAt: ""
+	// to disable the in-process scheduler; an explicit restart_at time while
+	// disabled is rejected as contradictory configuration.
+	RestartEnabled bool `yaml:"restart_enabled"`
 	// RestartAt is the UTC time at which the node sends a graceful SIGTERM to
 	// itself for a nightly RAM-reclaim restart (HH:MM, 24-hour clock, UTC).
 	// Go heap fragmentation accumulates ~1.3 GB/h in production; a nightly
 	// restart clears it before memory pressure builds.
-	// Default: "04:00".  Set to "" to disable the in-process nightly restart
-	// (e.g. when the operator manages scheduling via an external systemd timer).
+	// Default: "04:00". Set to "" to suppress the in-process scheduler; for an
+	// explicit node.yaml opt-out, also set restart_enabled: false. The
+	// scheduler additionally requires SCHED_RESTART_ENABLED=true in the
+	// process environment for compatibility with existing deployments.
 	RestartAt string `yaml:"restart_at"`
 }
 
@@ -101,6 +108,18 @@ func ParseRestartAt(s string) (int, int, error) {
 		return 0, 0, fmt.Errorf("invalid minute in %q: want 00–59", s)
 	}
 	return h, m, nil
+}
+
+// NextRestartAt returns the next occurrence of hour:minute UTC. If now is
+// exactly at or after that time, the next occurrence is on the following day.
+// Callers must pass a validated hour and minute, normally from ParseRestartAt.
+func NextRestartAt(now time.Time, hour, minute int) time.Time {
+	now = now.UTC()
+	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
+	if !target.After(now) {
+		target = target.Add(24 * time.Hour)
+	}
+	return target
 }
 
 // PprofConfig controls the Go pprof HTTP diagnostic endpoint.
@@ -185,11 +204,15 @@ type Config struct {
 // at connect-time so that node operators can rotate IPs without changing
 // their configuration file.
 type P2PConfig struct {
-	ListenAddr    string   `yaml:"listen_addr"` // e.g. "/ip4/0.0.0.0/tcp/30303"
-	Bootnodes     []string `yaml:"bootnodes"`   // "domain:port" or "ip:port"
-	MaxPeers      int      `yaml:"max_peers"`
-	MinPeers      int      `yaml:"min_peers"`
-	MaxPeersPerIP int      `yaml:"max_peers_per_ip"` // max inbound connections per source IP (0 = unlimited, recommended: 3)
+	// HandshakeTimeout bounds inbound TLS handshakes so stalled ClientHello
+	// connections cannot occupy handshake slots for long. Loaded production
+	// default: 3s. Explicit 0 uses the p2p host fallback (10s). Restart to apply.
+	HandshakeTimeout time.Duration `yaml:"handshake_timeout"`
+	ListenAddr       string        `yaml:"listen_addr"` // e.g. "/ip4/0.0.0.0/tcp/30303"
+	Bootnodes        []string      `yaml:"bootnodes"`   // "domain:port" or "ip:port"
+	MaxPeers         int           `yaml:"max_peers"`
+	MinPeers         int           `yaml:"min_peers"`
+	MaxPeersPerIP    int           `yaml:"max_peers_per_ip"` // max inbound connections per source IP (0 = unlimited, recommended: 3)
 	// MinOutbound reserves this many peer slots exclusively for outbound dial-outs.
 	// Inbound connections are capped at (MaxPeers − MinOutbound) so a validator
 	// under an inbound flood can always gossip produced blocks to the network.
@@ -316,7 +339,7 @@ type ConsensusConfig struct {
 	ValidatorAuthorityForkFile   string        `yaml:"validator_authority_fork_file"`
 	ValidatorAuthorityForkSHA256 string        `yaml:"validator_authority_fork_sha256"`
 	ValidatorKey                 string        `yaml:"validator_key"`      // path to ED25519 key file
-	ViewKey                      string        `yaml:"view_key"`           // hex-encoded Ed25519 view private scalar for automatic UTXO amount decryption (optional)
+	ViewKey                      string        `yaml:"view_key"`           // deprecated; retained for config compatibility, never exposed through unauthenticated REST
 	RewardAddress                string        `yaml:"reward_address"`     // APRO wallet address for block rewards
 	BlockRewardNAPR              uint64        `yaml:"block_reward_napro"` // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
 	BlockTime                    time.Duration `yaml:"block_time"`
@@ -353,6 +376,10 @@ type ConsensusConfig struct {
 	// RingCTCLSAGActivationHeight is the first height requiring RingCT v5.
 	// Zero deliberately disables v5 rather than activating it immediately.
 	RingCTCLSAGActivationHeight uint64 `yaml:"ring_ct_clsag_activation_height"`
+	// RingCTAmountBindingActivationHeight is the first height requiring
+	// verifiable encrypted-amount proofs in transaction versions 13/14.
+	// It must be coordinated across validators; zero disables this fork.
+	RingCTAmountBindingActivationHeight uint64 `yaml:"ring_ct_amount_binding_activation_height"`
 	// StakedCollateralRingExclusionActivationHeight is the first block height
 	// whose CLSAG rings must exclude staked collateral. Zero disables this fork.
 	StakedCollateralRingExclusionActivationHeight uint64 `yaml:"staked_collateral_ring_exclusion_activation_height"`
@@ -387,6 +414,9 @@ type ConsensusConfig struct {
 	// LPoDMigrationFile is a complete, height/genesis-bound reconciliation witness.
 	// Empty disables the fork. Merely setting a target amount never funds the pool.
 	LPoDMigrationFile string `yaml:"lpod_migration_file"`
+	// LPoDDailyUpgradeHeight activates signed position top-ups and daily 20:00
+	// Moscow payout processing. Zero leaves the historical per-block rules intact.
+	LPoDDailyUpgradeHeight uint64 `yaml:"lpod_daily_upgrade_height"`
 	// FinalityMigrationFile is a signed, versioned attestation for one exact
 	// historical finality certificate. Empty leaves ordinary quorum checks intact.
 	FinalityMigrationFile string `yaml:"finality_migration_file"`
@@ -467,6 +497,7 @@ func DefaultConfig() *Config {
 			MaxPeersPerIP:         3,  // eclipse/partition guard: max 3 connections per source IP
 			MinOutbound:           4,  // always keep 4 slots free for outbound dial-outs
 			MaxPendingHandshakes:  20, // goroutine-exhaustion guard: cap in-flight TLS handshakes
+			HandshakeTimeout:      3 * time.Second,
 			BadBlockHeightLead:    1000,
 			BadBlockBanThreshold:  5,
 			BadBlockBanDuration:   24 * time.Hour,
@@ -506,7 +537,8 @@ func DefaultConfig() *Config {
 		MaxInMemoryBlocks:       1_000,
 		MempoolEvictIntervalSec: 300,
 		Maintenance: MaintenanceConfig{
-			RestartAt: "04:00",
+			RestartEnabled: true,
+			RestartAt:      "04:00",
 		},
 	}
 }
@@ -676,12 +708,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("stop_producing_at_height (%d) exceeds the supported maximum (%d)",
 			c.Consensus.StopProducingAtHeight, uint64(1<<63-1))
 	}
+	if c.Consensus.LPoDDailyUpgradeHeight > uint64(1<<63-1) {
+		return fmt.Errorf("lpod_daily_upgrade_height exceeds the supported maximum")
+	}
 	if c.Consensus.StopProducingAtHeight > 0 && c.Consensus.NonValidator {
 		return fmt.Errorf("stop_producing_at_height is only valid for validator nodes")
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
+	amountBindingActivation := c.Consensus.RingCTAmountBindingActivationHeight
 	stakedRingActivation := c.Consensus.StakedCollateralRingExclusionActivationHeight
 	if c.Network == "mainnet" && stakedRingActivation == 0 {
 		return fmt.Errorf("mainnet nodes must configure staked_collateral_ring_exclusion_activation_height")
@@ -691,6 +727,18 @@ func (c *Config) Validate() error {
 			"ring_ct_clsag_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
 			clsagActivation, ringCTActivation,
 		)
+	}
+	if amountBindingActivation > 0 && clsagActivation == 0 {
+		return fmt.Errorf("ring_ct_amount_binding_activation_height requires ring_ct_clsag_activation_height")
+	}
+	if amountBindingActivation > 0 && amountBindingActivation < clsagActivation {
+		return fmt.Errorf(
+			"ring_ct_amount_binding_activation_height (%d) must be >= ring_ct_clsag_activation_height (%d)",
+			amountBindingActivation, clsagActivation,
+		)
+	}
+	if amountBindingActivation > uint64(1<<63-1) {
+		return fmt.Errorf("ring_ct_amount_binding_activation_height exceeds the supported maximum")
 	}
 	if stakedRingActivation > 0 && clsagActivation == 0 {
 		return fmt.Errorf("staked_collateral_ring_exclusion_activation_height requires ring_ct_clsag_activation_height")
@@ -730,6 +778,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	guardianActivation := c.Consensus.GuardianFundActivationHeight
+	if c.Consensus.LPoDDailyUpgradeHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
+		return fmt.Errorf("lpod_daily_upgrade_height requires a canonical LPoD migration")
+	}
 	if c.Consensus.GenesisVestingActivationHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
 		return fmt.Errorf("genesis_vesting_activation_height requires a canonical LPoD migration")
 	}
@@ -945,6 +996,10 @@ func (c *Config) Validate() error {
 		)
 	}
 
+	if c.P2P.HandshakeTimeout < 0 {
+		return fmt.Errorf("p2p.handshake_timeout (%v) must not be negative; use a positive duration (e.g. \"3s\") or 0 for the host fallback (10s)", c.P2P.HandshakeTimeout)
+	}
+
 	// KeepaliveInterval validation.  Zero means "use the built-in default (10s)"
 	// so it is accepted without complaint.  Explicit values must be in [1s, 15s]:
 	//   • < 1s would flood slow peers with pings and may saturate a CPU core.
@@ -957,6 +1012,13 @@ func (c *Config) Validate() error {
 			"p2p.keepalive_interval (%v) is out of the allowed range [%v, %v] — "+
 				"values shorter than 1s flood peers; values longer than 15s risk the peer's 30s ReadTimeout firing; use 0 for the default (10s)",
 			c.P2P.KeepaliveInterval, keepaliveMin, keepaliveMax,
+		)
+	}
+	if !c.Maintenance.RestartEnabled && c.Maintenance.RestartAt != "" {
+		return fmt.Errorf(
+			"maintenance.restart_enabled is false but maintenance.restart_at is %q; "+
+				"set maintenance.restart_at to an empty string or set restart_enabled to true",
+			c.Maintenance.RestartAt,
 		)
 	}
 	if c.Maintenance.RestartAt != "" {

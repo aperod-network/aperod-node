@@ -34,7 +34,8 @@ else
   pass "live node data directory is not archived directly"
 fi
 for required in 'chain.db' 'manifest.json' 'explorer_db.dump' 'sha256sum' \
-  'unix-socket' '_verify_remote_archive' 'CHAIN_DATA_DIR' \
+  'unix-socket' '_verify_remote_archive' 'rclone cat' '--max-time 3600' 'CHAIN_DATA_DIR' \
+  'LOCAL_VERIFY_OUTPUT=$("$BACKUP_VERIFY_BIN" --stage "$SNAPSHOT_DIR")' \
   '_cleanup_validated_snapshot' 'realpath -e' 'PREVIOUS_OBJECT' \
   'uploads[:keep_count]' 'du -sk --apparent-size' \
   'APEROD_BACKUP_VERIFY_BIN:-/usr/local/bin/aperod-backup-verify' \
@@ -43,11 +44,19 @@ for required in 'chain.db' 'manifest.json' 'explorer_db.dump' 'sha256sum' \
   'LEGACY_OBJECT_PREFIX="${BACKUP_NAME}_legacy_"' '--legacy-stage' \
   'preserved-legacy-copy.tar.gpg' 'aperod_backup_legacy_migration' \
   'BACKUP_ROOT_REQUESTED="${APEROD_BACKUP_DIR_OVERRIDE}"' \
-  'mktemp -d -- "${BACKUP_ROOT%/}/aperod_backups_XXXXXX"' 'BACKUP_DIR_OWNED=1'; do
+  'mktemp -d -- "${BACKUP_ROOT%/}/aperod_backups_XXXXXX"' 'BACKUP_DIR_OWNED=1' \
+  'APEROD_BACKUP_CHECKPOINT_RESERVE_BYTES' 'STAGING_USED_BYTES' 'PROJECTED_STAGING_BYTES'; do
   if grep -qF -- "$required" "$BACKUP_SH"; then pass "backup implementation contains $required"
   else fail "backup implementation is missing $required"; fi
 done
-DB_PREFLIGHT_LINE=$(grep -n 'CHAIN_REQUIRED_KB=' "$BACKUP_SH" | head -1 | cut -d: -f1)
+LOCAL_VERIFY_LINE=$(grep -n 'LOCAL_VERIFY_OUTPUT=$("$BACKUP_VERIFY_BIN" --stage "$SNAPSHOT_DIR")' "$BACKUP_SH" | head -1 | cut -d: -f1)
+ARCHIVE_CREATE_LINE=$(grep -n '^tar -czf -' "$BACKUP_SH" | head -1 | cut -d: -f1)
+if [[ -n "$LOCAL_VERIFY_LINE" && -n "$ARCHIVE_CREATE_LINE" && "$LOCAL_VERIFY_LINE" -lt "$ARCHIVE_CREATE_LINE" ]]; then
+  pass "the closed checkpoint is read-only verified before archive creation"
+else
+  fail "the checkpoint is archived before its read-only LevelDB verification"
+fi
+DB_PREFLIGHT_LINE=$(grep -n 'CHAIN_REQUIRED_BYTES=' "$BACKUP_SH" | head -1 | cut -d: -f1)
 CHECKPOINT_POST_LINE=$(grep -n '"http://localhost/checkpoint"' "$BACKUP_SH" | head -1 | cut -d: -f1)
 if [[ -n "$DB_PREFLIGHT_LINE" && -n "$CHECKPOINT_POST_LINE" && "$DB_PREFLIGHT_LINE" -lt "$CHECKPOINT_POST_LINE" ]]; then
   pass "active chain.db size plus reserve is checked before checkpoint request"
@@ -443,6 +452,12 @@ REMOTE_PREVIOUS_SHA=$(sha256sum "$REMOTE_COPY_ROOT/previous.tar.gpg" | awk '{pri
   rclone() {
     local action="$1" source="$2" target="${3:-}" file ignore_times=0
     shift 3 || true
+    if [[ "$action" == cat ]]; then
+      file="$REMOTE_COPY_ROOT/store/${source##*/}"
+      printf '%s -> stdout\n' "$source" >> "$REMOTE_COPY_ROOT/cat.log"
+      cat "$file"
+      return
+    fi
     if [[ "$action" == copyto ]]; then
       for argument in "$@"; do [[ "$argument" != --ignore-times ]] || ignore_times=1; done
       printf '%s\n' "$source $target $*" >> "$REMOTE_COPY_ROOT/copy.log"
@@ -723,8 +738,6 @@ if not os.path.isdir(os.path.join(root, "chain.db")):
     raise SystemExit("missing new-format chain.db")
 with open(os.path.join(root, "manifest.json"), encoding="utf-8") as source:
     manifest = json.load(source)
-if not os.path.isfile(os.path.join(root, "explorer_db.dump")):
-    raise SystemExit("missing new-format pg dump")
 print(json.dumps({"success": True, "tip_hash": manifest["tip_hash"],
                   "tip_height": manifest["tip_height"]}))
 PY
@@ -777,6 +790,11 @@ PY
         printf x >> "$store/$(remote_path "$dst")"
       fi
     fi
+    ;;
+  cat)
+    source="$2"
+    printf '%s -> stdout\n' "$source" >> "$MOCK_DOWNLOAD_LOG"
+    cat "$store/$(remote_path "$source")"
     ;;
   size)
     file="$store/$(remote_path "$2")"

@@ -96,6 +96,7 @@ type TxVerifier struct {
 	utxos                                         *UTXOSet
 	vestingLock                                   *VestingLock // nil = vesting enforcement disabled
 	stakedCollateralRingExclusionActivationHeight uint64
+	lpodDailyUpgradeHeight                        uint64
 }
 
 // NewTxVerifier creates a verifier backed by the given UTXO set.
@@ -117,6 +118,12 @@ func (v *TxVerifier) SetStakedCollateralRingExclusionActivationHeight(height uin
 	v.stakedCollateralRingExclusionActivationHeight = height
 }
 
+// SetLPoDDailyUpgradeHeight gates the v12 source-backed top-up operation.
+// Zero keeps top-ups disabled; every validator must use the same future height.
+func (v *TxVerifier) SetLPoDDailyUpgradeHeight(height uint64) {
+	v.lpodDailyUpgradeHeight = height
+}
+
 // VerifyTx performs full cryptographic verification of a transaction when no
 // height-gated rules are configured. Call VerifyTxAtHeight for block/mempool
 // validation whenever a height-dependent consensus rule is active.
@@ -129,7 +136,7 @@ func (v *TxVerifier) SetStakedCollateralRingExclusionActivationHeight(height uin
 //  5. Range proofs are valid for each output
 //  6. Pedersen commitment balance: ΣC_in = ΣC_out + C_fee
 func (v *TxVerifier) VerifyTx(tx *Transaction) error {
-	if v.stakedCollateralRingExclusionActivationHeight > 0 {
+	if v.stakedCollateralRingExclusionActivationHeight > 0 || v.lpodDailyUpgradeHeight > 0 {
 		return fmt.Errorf("height-aware transaction verification required")
 	}
 	return v.VerifyTxAtHeight(tx, 0)
@@ -141,6 +148,10 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 func (v *TxVerifier) VerifyTxAtHeight(tx *Transaction, height uint64) error {
 	if v.stakedCollateralRingExclusionActivationHeight > 0 && height == 0 {
 		return fmt.Errorf("height-aware transaction verification requires a nonzero candidate height")
+	}
+	if tx != nil && tx.Version == TxVersionLPoDTopUp &&
+		(v.lpodDailyUpgradeHeight == 0 || height < v.lpodDailyUpgradeHeight) {
+		return fmt.Errorf("lpod: top-ups are not active at candidate height %d", height)
 	}
 	return v.verifyTx(tx, nil, height)
 }
@@ -405,6 +416,18 @@ func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struc
 		// Verify that the proof covers the correct commitment
 		if proof.ValueCommit != tx.Outputs[i].AmountCommit {
 			return fmt.Errorf("tx %x: range proof commitment mismatch at output %d", txHashPrefix[:8], i)
+		}
+	}
+	if tx.UsesAmountBinding() {
+		for i := range tx.Outputs {
+			output := &tx.Outputs[i]
+			ok, err := crypto.VerifyAmountBinding(output.AmountCommit, output.OneTimePub, output.AmountBinding)
+			if err != nil {
+				return fmt.Errorf("tx %x: amount binding proof error at output %d: %w", txHashPrefix[:8], i, err)
+			}
+			if !ok {
+				return fmt.Errorf("tx %x: amount binding mismatch at output %d", txHashPrefix[:8], i)
+			}
 		}
 	}
 

@@ -13,6 +13,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// CapNAPRO is the maximum protocol supply, expressed in nAPRO.
 const CapNAPRO uint64 = 10_000_000_000 * 100_000_000
 
 var zeroHash crypto.Hash32
@@ -72,6 +73,7 @@ func nonzeroPub(key crypto.ValidatorPubKey) bool {
 	return false
 }
 
+// Verify checks checkpoint bounds, ancestry, and validator authorization.
 func (c Checkpoint) Verify(genesis, parent crypto.Hash32, height uint64, trusted []crypto.ValidatorPubKey) error {
 	if height == 0 || c.Height != height || c.Parent != parent || parent == zeroHash ||
 		c.Genesis != genesis || genesis == zeroHash || c.SnapshotRoot == zeroHash ||
@@ -126,6 +128,7 @@ type Purchase struct {
 	Signature   []byte
 }
 
+// Message returns the domain-separated digest signed for this purchase.
 func (p Purchase) Message() crypto.Hash32 {
 	return crypto.HashBytes(
 		[]byte("aperod/sale/purchase/authorization/v1"),
@@ -147,6 +150,7 @@ type Ledger struct {
 	paid       map[crypto.Hash32]struct{}
 }
 
+// Begin creates a sale ledger from a verified checkpoint.
 func Begin(c Checkpoint, genesis, parent crypto.Hash32, height uint64, trusted []crypto.ValidatorPubKey) (*Ledger, error) {
 	if err := c.Verify(genesis, parent, height, trusted); err != nil {
 		return nil, err
@@ -211,7 +215,14 @@ func (s *Ledger) Seen(order crypto.Hash32) bool {
 	return ok
 }
 
-func (s *Ledger) Remaining() uint64   { return s.remaining }
-func (s *Ledger) Sold() uint64        { return s.sold }
-func (s *Ledger) Height() uint64      { return s.height }
+// Remaining returns the sale allocation not yet purchased.
+func (s *Ledger) Remaining() uint64 { return s.remaining }
+
+// Sold returns the total amount purchased from the sale allocation.
+func (s *Ledger) Sold() uint64 { return s.sold }
+
+// Height returns the last block height applied to the ledger.
+func (s *Ledger) Height() uint64 { return s.height }
+
+// Hash returns the hash of the last block applied to the ledger.
 func (s *Ledger) Hash() crypto.Hash32 { return s.hash }

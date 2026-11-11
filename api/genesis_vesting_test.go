@@ -127,7 +127,11 @@ func TestGenesisVestingCanonicalPaymentRestartAndPruning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close reopened genesis vesting database: %v", err)
+		}
+	})
 	commit(deadline+1, false)
 	c, err = db.LoadLPoDCheckpoint()
 	if err != nil || c.GenesisVesting.Paid != amount {
@@ -179,7 +183,7 @@ func TestGenesisVestingCanonicalPaymentRestartAndPruning(t *testing.T) {
 		raw, err := db.GetRawBlockByHeight(b.Header.Height)
 		var saved core.Block
 		if err != nil || json.Unmarshal(raw, &saved) != nil || len(saved.Txs) != 2 {
-			t.Fatal("annual funding/payment evidence was pruned")
+			t.Fatalf("annual funding/payment evidence at height %d was pruned: txs=%d err=%v", b.Header.Height, len(saved.Txs), err)
 		}
 	}
 	// Canonical tip selection after a reorg selects its reserve checkpoint,

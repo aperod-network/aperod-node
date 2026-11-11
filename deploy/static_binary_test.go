@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -333,6 +334,134 @@ func TestUpdateNodeStaticGuard(t *testing.T) {
 		return
 	}
 	t.Log("Case 2 ✓: aperod-node passes the static-link guard — update-node.sh would not abort ✓")
+}
+
+// TestUpdateExplorerIndexerStaticGuard exercises the guard used by the real
+// monorepo upgrade entrypoint, with both a genuinely dynamic ELF and a fresh
+// Makefile-built indexer. No candidate or deployment entrypoint is executed.
+func TestUpdateExplorerIndexerStaticGuard(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("explorer-indexer ELF/ldd guard requires Linux")
+	}
+	if _, err := exec.LookPath("ldd"); err != nil {
+		t.Skip("ldd unavailable; explorer-indexer guard cases cannot run")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash unavailable; cannot invoke the actual guard")
+	}
+	deployDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockchainDir := filepath.Dir(deployDir)
+	guardPath := filepath.Join(deployDir, "explorer-indexer-static-guard.sh")
+	if _, err := os.Stat(guardPath); err != nil {
+		t.Fatalf("actual explorer-indexer guard missing: %v", err)
+	}
+	runGuard := func(binary string) ([]byte, error) {
+		cmd := exec.Command(bash, "-c",
+			`set -euo pipefail; source "$1"; explorer_indexer_static_guard "$2"`,
+			"indexer-static-guard-test", guardPath, binary)
+		return cmd.CombinedOutput()
+	}
+
+	t.Run("dynamic_binary_is_rejected", func(t *testing.T) {
+		var dynamicBin string
+		candidates := []string{"/bin/ls", "/usr/bin/ls", "/bin/cat"}
+		if found, err := exec.LookPath("ls"); err == nil {
+			candidates = append(candidates, found)
+		}
+		for _, candidate := range candidates {
+			f, err := elf.Open(candidate)
+			if err != nil {
+				continue
+			}
+			for _, prog := range f.Progs {
+				if prog.Type == elf.PT_INTERP {
+					dynamicBin = candidate
+					break
+				}
+			}
+			f.Close()
+			if dynamicBin != "" {
+				break
+			}
+		}
+		if dynamicBin == "" {
+			t.Skip("no dynamic ELF with PT_INTERP available for the negative control")
+		}
+		out, err := runGuard(dynamicBin)
+		if err == nil {
+			t.Fatalf("actual upgrade guard accepted dynamic ELF %s:\n%s", dynamicBin, out)
+		}
+		if !strings.Contains(string(out), "Static-link check FAILED") ||
+			!strings.Contains(string(out), "CGO_ENABLED=0") {
+			t.Fatalf("guard failed for the wrong reason:\n%s", out)
+		}
+		t.Logf("dynamic ELF rejected by actual guard: %s", dynamicBin)
+	})
+
+	t.Run("fresh_static_indexer_is_accepted", func(t *testing.T) {
+		makeBin, err := exec.LookPath("make")
+		if err != nil {
+			t.Skip("make unavailable; cannot build the static positive control")
+		}
+		buildDir := t.TempDir()
+		cmd := exec.Command(makeBin, "BUILD_DIR="+buildDir, "build-explorer-indexer")
+		cmd.Dir = blockchainDir
+		// The Makefile must override this ambient setting itself. Do not make
+		// the test pass by silently forcing CGO_ENABLED=0 outside the target.
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("make build-explorer-indexer failed: %v\n%s", err, out)
+		}
+		indexer := filepath.Join(buildDir, "aperod-explorer-indexer")
+		assertNoInterp(t, indexer)
+		out, err := runGuard(indexer)
+		if err != nil {
+			t.Fatalf("actual upgrade guard rejected the freshly built indexer: %v\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "ldd confirmed a statically linked binary") {
+			t.Fatalf("guard succeeded without confirming the static positive control:\n%s", out)
+		}
+		t.Log("fresh Makefile-built indexer passes the actual upgrade guard")
+	})
+
+	t.Run("upgrade_wires_guard_before_service_stop", func(t *testing.T) {
+		monorepoRoot := filepath.Dir(blockchainDir)
+		script, err := os.ReadFile(filepath.Join(monorepoRoot, "deploy", "deploy-server.sh"))
+		if err != nil {
+			if _, workspaceErr := os.Stat(filepath.Join(monorepoRoot, "pnpm-workspace.yaml")); os.IsNotExist(workspaceErr) && os.IsNotExist(err) {
+				// Public node-only distributions omit the monorepo installer.
+				// Both real-binary guard cases above still run there.
+				t.Skip("monorepo upgrade entrypoint is not part of the standalone node distribution")
+			}
+			t.Fatalf("cannot read the monorepo upgrade entrypoint: %v", err)
+		}
+		text := string(script)
+		position := func(pattern string) int {
+			t.Helper()
+			match := regexp.MustCompile(pattern).FindStringIndex(text)
+			if match == nil {
+				t.Fatalf("upgrade entrypoint lost required command matching %s", pattern)
+			}
+			return match[0]
+		}
+		source := position(`(?m)^source "\$\{SCRIPT_DIR\}/../blockchain/deploy/explorer-indexer-static-guard\.sh"$`)
+		build := position(`(?m)^[ \t]*make BUILD_DIR="\$preflight_dir" build-explorer-indexer \|\| exit 1$`)
+		guard := position(`(?m)^[ \t]*explorer_indexer_static_guard "\$preflight_dir/aperod-explorer-indexer" \|\| exit 1$`)
+		stopNode := position(`(?m)^systemctl stop aperod-node\b`)
+		stopIndexer := position(`(?m)^systemctl stop aperod-explorer-indexer\b`)
+		if !(source < build && build < guard && guard < stopNode && guard < stopIndexer) {
+			t.Fatal("the built candidate must pass the guard before either running service is stopped")
+		}
+		finalGuard := position(`(?m)^explorer_indexer_static_guard "\$APP_DIR/blockchain/build/aperod-explorer-indexer" \|\| error `)
+		enable := position(`(?m)^systemctl enable --now aperod-explorer-indexer\b`)
+		if finalGuard <= guard || finalGuard >= enable {
+			t.Fatal("the final rebuilt indexer must be checked again before installation/start")
+		}
+	})
 }
 
 // assertLddStatic runs ldd on path and checks that the output contains

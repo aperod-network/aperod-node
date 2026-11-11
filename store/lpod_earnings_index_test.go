@@ -316,11 +316,12 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 		mixedAudit.Outputs[0].Beneficiary != string(address) {
 		t.Fatal("mixed payout audit output ref does not match the actual transaction")
 	}
-	if len(mixedAudit.Positions) != 1 || mixedAudit.Positions[0].PrincipalReturned == 0 ||
+	if len(mixedAudit.Positions) != 1 || mixedAudit.Positions[0].Beneficiary != string(address) ||
+		mixedAudit.Positions[0].PrincipalReturned == 0 ||
 		mixedAudit.Positions[0].Paid == 0 || mixedAudit.Positions[0].Accrued == 0 ||
 		mixedAudit.Positions[0].APRCarryAfter == 0 ||
 		mixedAudit.Positions[0].DueAfter > mixedAudit.Positions[0].DueBefore+mixedAudit.Positions[0].Accrued {
-		t.Fatal("mixed position reward/principal transition was not captured")
+		t.Fatal("mixed position reward/principal transition or immutable beneficiary was not captured")
 	}
 	duplicateBytes, err := db.get(lpodBlockAuditKey(mixedBlock.Hash()))
 	if err != nil {
@@ -667,7 +668,7 @@ func commitLPoDStoreTestBlock(t *testing.T, db *DB, migration *LPoDMigration, pr
 
 func TestLPoDWalletIndexBackfillsMissingNativeOutputs(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	fundingBlock, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(

@@ -31,6 +31,10 @@ type AdminMintRecordStore interface {
 	LoadAdminMintRecord(idempotencyKey string) (record store.AdminMintRecord, found bool, err error)
 }
 
+type AdminMintRecordLister interface {
+	ListAdminMintRecords() ([]store.AdminMintRecordEntry, error)
+}
+
 // Config holds PoA consensus parameters.
 type Config struct {
 	// ValidatorAuthorityFork separates collateral identity from future signing
@@ -42,7 +46,10 @@ type Config struct {
 	// FinalityMigrationTrustAuthorities are operator-pinned validator identities
 	// authorized to sign the migration, independent of genesis validators.
 	FinalityMigrationTrustAuthorities []crypto.ValidatorPubKey
-	LPoDMigration          *store.LPoDMigration
+	LPoDMigration                     *store.LPoDMigration
+	// LPoDDailyUpgradeHeight is a coordinated fork gate for top-ups and daily
+	// Guardian-position settlement. Zero keeps the feature disabled.
+	LPoDDailyUpgradeHeight uint64
 	SaleMigration          *store.SaleMigration
 	// Approved durable purchase intents are built at the real slot and parent.
 	// Nil never enables the legacy admin-mint path.
@@ -133,6 +140,9 @@ type Config struct {
 	// RingCTCLSAGActivationHeight is the first height requiring v5; zero
 	// disables activation to avoid an accidental uncoordinated fork.
 	RingCTCLSAGActivationHeight uint64
+	// RingCTAmountBindingActivationHeight is the first height requiring
+	// publicly verifiable encrypted-amount proofs in transaction versions 13/14.
+	RingCTAmountBindingActivationHeight uint64
 	// StakedCollateralRingExclusionActivationHeight is the first height at which
 	// CLSAG rings must exclude staked collateral. Zero disables this fork.
 	StakedCollateralRingExclusionActivationHeight uint64
@@ -605,6 +615,7 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.utxos = utxos
 	if v != nil {
 		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
+		v.SetLPoDDailyUpgradeHeight(e.cfg.LPoDDailyUpgradeHeight)
 	}
 }
 
@@ -843,6 +854,13 @@ func (e *Engine) tick() error {
 	} else {
 		persistErr := fmt.Errorf("persist canonical block %d: OnCanonicalBlock is required", block.Header.Height)
 		return e.failCanonicalPersistence(block, stakeRollback, persistErr)
+	}
+	if ev := e.slashing.RecordAcceptedBlock(
+		block.Header.Height, block.Header.Round,
+		block.Header.ValidatorPub, block.Hash(), block.Header.Signature,
+	); ev != nil {
+		e.halted.Store(true)
+		return fmt.Errorf("fatal slashing detector conflict after canonical persistence: %s", ev.String())
 	}
 
 	// Notify local-producer listeners after the canonical durability boundary.
@@ -1367,6 +1385,45 @@ func (e *Engine) expectedBaseFeeAt(height uint64) uint64 {
 
 // ─── Admin mint scheduling ────────────────────────────────────────────────────
 
+const validatorRewardAddressMintFailure = "cannot admin-mint to the validator reward address: the per-block coinbase reward would collide with the same one-time pub"
+
+// ReconcileRewardAddressAdminMintIntents permanently fails queued intents that
+// target this node's reward address. An intent has not reached transaction
+// preparation, so it is safe to retire. Prepared records are deliberately left
+// unresolved: a restart must first reconcile their exact transaction against
+// canonical storage before deciding whether a mint occurred.
+func (e *Engine) ReconcileRewardAddressAdminMintIntents() (int, error) {
+	if e.cfg.RewardAddress == "" || e.adminMintStore == nil {
+		return 0, nil
+	}
+	lister, ok := e.adminMintStore.(AdminMintRecordLister)
+	if !ok {
+		return 0, fmt.Errorf("admin mint record store does not support startup reconciliation")
+	}
+
+	e.mintMu.Lock()
+	defer e.mintMu.Unlock()
+	records, err := lister.ListAdminMintRecords()
+	if err != nil {
+		return 0, fmt.Errorf("list admin mint intents for startup reconciliation: %w", err)
+	}
+
+	failed := 0
+	for _, entry := range records {
+		record := entry.Record
+		if record.State != "intent" || record.Address != e.cfg.RewardAddress {
+			continue
+		}
+		record.State = "failed"
+		record.Failure = validatorRewardAddressMintFailure
+		if err := e.adminMintStore.StoreAdminMintRecord(entry.IdempotencyKey, record); err != nil {
+			return failed, fmt.Errorf("persist failed validator-reward admin mint intent: %w", err)
+		}
+		failed++
+	}
+	return failed, nil
+}
+
 // ScheduleAdminMint is retained for API compatibility but fails closed while
 // the legacy admin-mint transaction has no consensus-authenticated envelope.
 //
@@ -1448,6 +1505,13 @@ func (e *Engine) ScheduleAdminMint(idempotencyKey, addr string, amountNAPR uint6
 			case "", "completed":
 				e.mintMu.Unlock()
 				return record.TxHash, record.Height, nil
+			case "failed":
+				e.mintMu.Unlock()
+				failure := strings.TrimSpace(record.Failure)
+				if failure == "" {
+					failure = "admin mint previously failed and requires operator review"
+				}
+				return crypto.Hash32{}, 0, fmt.Errorf("%s", failure)
 			case "prepared":
 				// A crash may happen after a proposal was prepared but before
 				// its result was recorded.  Only declare it complete when the
@@ -1961,6 +2025,17 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 		return fmt.Errorf("invalid block: %w", err)
 	}
 
+	// Detection is read-only here. Only a block that passes every consensus
+	// check and is durably committed is recorded below.
+	hash := block.Hash()
+	if ev := e.slashing.DetectDoubleSign(
+		block.Header.Height, block.Header.Round,
+		block.Header.ValidatorPub, hash, block.Header.Signature,
+	); ev != nil {
+		e.log.Error("SLASHING: double-sign detected", "evidence", ev.String())
+		return fmt.Errorf("double-sign: %s", ev.String())
+	}
+
 	// Timejacking guard: only reject blocks whose timestamp is more than
 	// 15 s in the FUTURE.  Past-timestamped sync blocks must be accepted
 	// so a restarting relay node can fill historical gaps.  A negative
@@ -2024,16 +2099,6 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 			return fmt.Errorf("block round %d: producer %s is not the scheduled proposer %s",
 				block.Header.Round, block.Header.ValidatorPub.ID(), expected.ID())
 		}
-	}
-
-	// Double-sign detection
-	hash := block.Hash()
-	if ev := e.slashing.CheckBlock(
-		block.Header.Height, block.Header.Round,
-		block.Header.ValidatorPub, hash, block.Header.Signature,
-	); ev != nil {
-		e.log.Error("SLASHING: double-sign detected", "evidence", ev.String())
-		return fmt.Errorf("double-sign: %s", ev.String())
 	}
 
 	// Oracle price sanity check: reject blocks whose embedded price deviates
@@ -2160,6 +2225,13 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 	} else {
 		persistErr := fmt.Errorf("persist canonical block %d: OnCanonicalBlock is required", block.Header.Height)
 		return e.failCanonicalPersistence(block, stakeRollback, persistErr)
+	}
+	if ev := e.slashing.RecordAcceptedBlock(
+		block.Header.Height, block.Header.Round,
+		block.Header.ValidatorPub, hash, block.Header.Signature,
+	); ev != nil {
+		e.halted.Store(true)
+		return fmt.Errorf("fatal slashing detector conflict after canonical persistence: %s", ev.String())
 	}
 	// Stake txs already applied above — no processStakeTxs call needed.
 	if e.cfg.Registry != nil {

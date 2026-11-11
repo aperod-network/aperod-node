@@ -25,6 +25,7 @@ type ValidatorAuthorityFork struct {
 	Possession          []byte                 `json:"possession"`
 }
 
+// Message returns the domain-separated validator-authority fork message.
 func (f *ValidatorAuthorityFork) Message() crypto.Hash32 {
 	copy := *f
 	copy.Possession = nil
@@ -32,6 +33,7 @@ func (f *ValidatorAuthorityFork) Message() crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/validator-authority-fork/v1"), raw)
 }
 
+// Validate checks the fork's activation and authority configuration.
 func (f *ValidatorAuthorityFork) Validate() error {
 	if f == nil || f.Version != 1 || f.Height < 2 ||
 		f.Genesis == (crypto.Hash32{}) || f.Parent == (crypto.Hash32{}) ||
@@ -46,6 +48,7 @@ func (f *ValidatorAuthorityFork) Validate() error {
 	return nil
 }
 
+// Clone returns a deep copy of the fork configuration.
 func (f *ValidatorAuthorityFork) Clone() *ValidatorAuthorityFork {
 	if f == nil {
 		return nil
@@ -66,6 +69,7 @@ func (f *ValidatorAuthorityFork) Authority(identity crypto.ValidatorPubKey, heig
 	return append(crypto.ValidatorPubKey(nil), identity...)
 }
 
+// LocalIdentity returns the validator identity authorized at height for key.
 func (f *ValidatorAuthorityFork) LocalIdentity(key crypto.ValidatorPubKey, height uint64) crypto.ValidatorPubKey {
 	if f != nil && height >= f.Height && key.Equals(f.Replacement) {
 		return append(crypto.ValidatorPubKey(nil), f.Identity...)
@@ -73,6 +77,7 @@ func (f *ValidatorAuthorityFork) LocalIdentity(key crypto.ValidatorPubKey, heigh
 	return append(crypto.ValidatorPubKey(nil), key...)
 }
 
+// CheckParent verifies the parent header against this fork's authority rules.
 func (f *ValidatorAuthorityFork) CheckParent(header BlockHeader) error {
 	if f != nil && header.Height == f.Height && header.PrevHash != f.Parent {
 		return fmt.Errorf("validator authority fork: activation parent mismatch")

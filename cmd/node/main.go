@@ -112,6 +112,7 @@ func buildP2PConfig(
 		AllowedPeers:          cfg.P2P.AllowedPeers,
 		PeerWhitelist:         cfg.P2P.PeerWhitelist,
 		MaxPendingHandshakes:  cfg.P2P.MaxPendingHandshakes,
+		HandshakeTimeout:      cfg.P2P.HandshakeTimeout,
 		BadBlockHeightLead:    cfg.P2P.BadBlockHeightLead,
 		BadBlockBanThreshold:  cfg.P2P.BadBlockBanThreshold,
 		BadBlockBanDuration:   cfg.P2P.BadBlockBanDuration,
@@ -208,18 +209,9 @@ func finalityMsgFromP2P(vote p2p.VoteMsg) (consensus.FinalizeMsg, error) {
 // several minutes on large databases.  It prints before/after size estimates
 // to stdout so operators can see how much space was recovered.
 func runCompactDB() error {
-	dataDir := ""
-	args := os.Args[1:]
-	for i, arg := range args {
-		switch {
-		case strings.HasPrefix(arg, "--data-dir="):
-			dataDir = strings.TrimPrefix(arg, "--data-dir=")
-		case arg == "--data-dir" && i+1 < len(args):
-			dataDir = args[i+1]
-		}
-	}
-	if dataDir == "" {
-		return fmt.Errorf("--compact-db requires --data-dir=<path>")
+	dataDir, err := explicitMaintenanceDataDir(os.Args[1:], "--compact-db")
+	if err != nil {
+		return err
 	}
 
 	absDataDir, err := filepath.Abs(dataDir)
@@ -574,18 +566,9 @@ func storeHeightIndexSentinel(dataDir string) error {
 // the auto-repair path inside run() knows the index has been verified.  The
 // file lives outside chain.db/ so it is NOT copied by a chain.db-only rsync.
 func runRepairHeightIndex() error {
-	dataDir := ""
-	args := os.Args[1:]
-	for i, arg := range args {
-		switch {
-		case strings.HasPrefix(arg, "--data-dir="):
-			dataDir = strings.TrimPrefix(arg, "--data-dir=")
-		case arg == "--data-dir" && i+1 < len(args):
-			dataDir = args[i+1]
-		}
-	}
-	if dataDir == "" {
-		return fmt.Errorf("--repair-height-index requires --data-dir=<path>")
+	dataDir, err := explicitMaintenanceDataDir(os.Args[1:], "--repair-height-index")
+	if err != nil {
+		return err
 	}
 
 	absDataDir, err := filepath.Abs(dataDir)
@@ -906,8 +889,8 @@ func run() error {
 	//
 	// Fix: if the system config exists at the canonical production path and no
 	// --config was given, print a clear warning, switch to the system config,
-	// and continue.  If the system config does NOT exist this guard is a no-op
-	// so the binary still works correctly in development / CI environments.
+	// and continue. If the system config does NOT exist, require an explicit
+	// --config instead of allowing maintenance against the development default.
 	const systemConfigPath = "/etc/aperod/node.yaml"
 	maintenanceMode := repairDB || resetTip || rebuildKeyImages || rebuildSpentIndex
 	if maintenanceMode && !configFlagExplicit {
@@ -1237,6 +1220,7 @@ func run() error {
 	mempoolCfg := core.DefaultMempoolConfig()
 	mempoolCfg.RingCTV4ActivationHeight = cfg.Consensus.RingCTV4ActivationHeight
 	mempoolCfg.RingCTCLSAGActivationHeight = cfg.Consensus.RingCTCLSAGActivationHeight
+	mempoolCfg.RingCTAmountBindingActivationHeight = cfg.Consensus.RingCTAmountBindingActivationHeight
 	mempoolCfg.AVMActivationHeight = cfg.Consensus.AVMActivationHeight
 	mempoolCfg.CurrentHeight = chain.Height
 	if cfg.Consensus.AVMActivationHeight != 0 {
@@ -1258,7 +1242,6 @@ func run() error {
 	// 700 MB in-memory sorted slice, eliminating the main RSS baseline
 	// and the ≈768 KB/h growth that accumulated between restarts.
 	utxos := core.NewUTXOSetWithDB(db)
-	utxos.SetCLSAGActivationHeight(cfg.Consensus.RingCTCLSAGActivationHeight)
 	if cfg.Consensus.RingCTCLSAGActivationHeight != 0 {
 		if err := db.EnsureRingMemberIndex(); err != nil {
 			return fmt.Errorf("prepare CLSAG ring-member index: %w", err)
@@ -1398,6 +1381,14 @@ func run() error {
 		log.Error("protocol sale startup validation failed", "err", err)
 		os.Exit(1)
 	}
+	if saleMigration != nil {
+		if err := db.EnsureSaleRetention(saleMigration); err != nil {
+			// Keep the node online, but PruneBlocksOlderThan refuses to advance
+			// while this active sale ledger lacks a complete canonical retention
+			// index. This is not a finality or historical LPoD proof.
+			log.Error("protocol sale retention index is incomplete; sale block pruning will fail closed", "err", err)
+		}
+	}
 	authorityFork, err := loadValidatorAuthorityFork(cfg.Consensus)
 	if err != nil {
 		return err
@@ -1414,11 +1405,11 @@ func run() error {
 	var apiSrv *api.Server
 	if cfg.API.Enabled && cfg.API.ListenAddr != "" {
 		apiSrv = api.NewServer(cfg.API.ListenAddr, chain, mempool, utxos, log)
+		apiSrv.SetRewardAddress(cfg.Consensus.RewardAddress)
 		apiSrv.SetStakedCollateralRingExclusionActivationHeight(
 			cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 		)
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
-		apiSrv.SetNodeViewKey(cfg.Consensus.ViewKey)
 		apiSrv.SetStore(db)
 		var apiGuardianAnchor crypto.Hash32
 		if raw, err := hex.DecodeString(cfg.Consensus.GuardianFundChainAnchor); err == nil && len(raw) == 32 {
@@ -2492,7 +2483,6 @@ func run() error {
 					if !utxoFromIndex {
 						// Partial load failed — clear and fall back to block scan.
 						utxos = core.NewUTXOSetWithDB(db)
-						utxos.SetCLSAGActivationHeight(cfg.Consensus.RingCTCLSAGActivationHeight)
 						utxos.OnUTXOSpent = func(txHash crypto.Hash32, outIdx uint32) {
 							if spentErr := db.MarkUTXOSpent(txHash, outIdx); spentErr != nil {
 								log.Warn("failed to persist spent UTXO", "err", spentErr)
@@ -2559,11 +2549,17 @@ func run() error {
 			completeH, _, _ := db.LoadTxIdxCompleteHeight()
 			backfillTarget := startLoad - 1
 			if completeH < backfillTarget {
+				pruneBelowHeight := txIndexPruneBelowHeight(
+					tipHeight,
+					cfg.Pruning.Mode,
+					cfg.Pruning.KeepBlocks,
+				)
 				log.Info("tx index background backfill queued",
 					"from_height", completeH+1,
 					"to_height", backfillTarget,
+					"prune_below_height", pruneBelowHeight,
 				)
-				go backfillTxIdxRange(completeH, backfillTarget, db, log)
+				go backfillTxIdxRange(completeH, backfillTarget, pruneBelowHeight, db, log)
 			}
 		}
 	}
@@ -2735,31 +2731,33 @@ func run() error {
 		}
 	}
 	if err := db.CheckGenesisVestingConfig(cfg.Consensus.GenesisVestingActivationHeight, genesisVestingFunding); err != nil {
-		return fmt.Errorf("Development Fund startup safety: %w", err)
+		return fmt.Errorf("development fund startup safety: %w", err)
 	}
 	engine = consensus.NewEngine(consensus.Config{
-		ValidatorAuthorityFork:            authorityFork,
-		FinalityMigration:                 finalityMigration,
-		FinalityMigrationTrustAuthorities: finalityMigrationTrustAuthorities,
-		LPoDMigration:                     lpodMigration,
-		SaleMigration:                     saleMigration,
-		GenesisVestingActivationHeight:    cfg.Consensus.GenesisVestingActivationHeight,
-		GenesisVestingFunding:             genesisVestingFunding,
-		BlockTime:                         cfg.Consensus.BlockTime,
-		BFTThreshold:                      genesisConfig.BFTThreshold,
-		Validators:                        validators,
-		Registry:                          registry,
-		MyKey:                             consensusMyKey,
-		RewardAddress:                     cfg.Consensus.RewardAddress,
-		StopProducingAtHeight:             cfg.Consensus.StopProducingAtHeight,
-		BlockRewardNAPR:                   cfg.Consensus.BlockRewardNAPR,
-		StakingPoolNAPR:                   cfg.Consensus.StakingPoolNAPR,
-		TailRewardNAPR:                    cfg.Consensus.TailRewardNAPR,
-		Store:                             db,
-		OracleURL:                         cfg.Consensus.OracleURL,
-		OracleMaxDeviation:                cfg.Consensus.OracleMaxDeviation,
-		RingCTV4ActivationHeight:          cfg.Consensus.RingCTV4ActivationHeight,
-		RingCTCLSAGActivationHeight:       cfg.Consensus.RingCTCLSAGActivationHeight,
+		ValidatorAuthorityFork:              authorityFork,
+		FinalityMigration:                   finalityMigration,
+		FinalityMigrationTrustAuthorities:   finalityMigrationTrustAuthorities,
+		LPoDMigration:                       lpodMigration,
+		LPoDDailyUpgradeHeight:              cfg.Consensus.LPoDDailyUpgradeHeight,
+		SaleMigration:                       saleMigration,
+		GenesisVestingActivationHeight:      cfg.Consensus.GenesisVestingActivationHeight,
+		GenesisVestingFunding:               genesisVestingFunding,
+		BlockTime:                           cfg.Consensus.BlockTime,
+		BFTThreshold:                        genesisConfig.BFTThreshold,
+		Validators:                          validators,
+		Registry:                            registry,
+		MyKey:                               consensusMyKey,
+		RewardAddress:                       cfg.Consensus.RewardAddress,
+		StopProducingAtHeight:               cfg.Consensus.StopProducingAtHeight,
+		BlockRewardNAPR:                     cfg.Consensus.BlockRewardNAPR,
+		StakingPoolNAPR:                     cfg.Consensus.StakingPoolNAPR,
+		TailRewardNAPR:                      cfg.Consensus.TailRewardNAPR,
+		Store:                               db,
+		OracleURL:                           cfg.Consensus.OracleURL,
+		OracleMaxDeviation:                  cfg.Consensus.OracleMaxDeviation,
+		RingCTV4ActivationHeight:            cfg.Consensus.RingCTV4ActivationHeight,
+		RingCTCLSAGActivationHeight:         cfg.Consensus.RingCTCLSAGActivationHeight,
+		RingCTAmountBindingActivationHeight: cfg.Consensus.RingCTAmountBindingActivationHeight,
 		StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 		AVMActivationHeight:                           cfg.Consensus.AVMActivationHeight,
 		AVMGasBurnActivationHeight:                    cfg.Consensus.AVMGasBurnActivationHeight,
@@ -3000,6 +2998,11 @@ func run() error {
 			}(periodicSnap, h, periodicActive)
 		},
 	}, chain, mempool, log)
+	if failed, err := engine.ReconcileRewardAddressAdminMintIntents(); err != nil {
+		return fmt.Errorf("admin mint startup reconciliation: %w", err)
+	} else if failed > 0 {
+		log.Warn("failed queued admin mints to validator reward address at startup", "count", failed)
+	}
 	if apiSrv != nil {
 		apiSrv.SetLPoDConfig(lpodMigration, engine.IsFinalizedHash)
 		apiSrv.SetSaleConfig(saleMigration, engine.CanSettleSale, engine.IsSaleFinalizedHash)
@@ -3027,6 +3030,7 @@ func run() error {
 	txVerifier.SetStakedCollateralRingExclusionActivationHeight(
 		cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 	)
+	txVerifier.SetLPoDDailyUpgradeHeight(cfg.Consensus.LPoDDailyUpgradeHeight)
 	// Wire vesting enforcement so the verifier rejects spending of still-locked
 	// genesis allocations at the protocol level (not just display-only).
 	// Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather
@@ -3161,13 +3165,22 @@ func run() error {
 	}()
 
 	// Nightly restart scheduler: at maintenance.restart_at (UTC, HH:MM) the
-	// node sends SIGTERM to itself for a graceful RAM-reclaim restart.  Go
-	// heap fragmentation grows ~1.3 GB/h in production; a nightly SIGTERM
-	// triggers a clean snapshot-save → restart before memory pressure builds.
-	// The scheduler respects the stop channel so a concurrent external
-	// SIGTERM (operator or watchdog) simply cancels the pending self-restart.
-	if os.Getenv("SCHED_RESTART_ENABLED") == "true" && cfg.Maintenance.RestartAt != "" {
+	// node sends SIGTERM to itself for a graceful RAM-reclaim restart. The
+	// explicit node.yaml switch and existing deployment environment gate are
+	// both reflected in a startup log so operators can see the effective state.
+	// The scheduler respects stop so an external SIGTERM cancels the pending restart.
+	if logNightlyRestartSchedulerStatus(
+		log,
+		cfg.Maintenance.RestartEnabled,
+		cfg.Maintenance.RestartAt,
+		os.Getenv("SCHED_RESTART_ENABLED") == "true",
+	) {
 		h, m, _ := config.ParseRestartAt(cfg.Maintenance.RestartAt) // already validated by Validate()
+		if apiSrv != nil {
+			if err := apiSrv.SetNightlyRestartSchedule(cfg.Maintenance.RestartAt); err != nil {
+				return fmt.Errorf("nightly restart: failed to expose active schedule through status API: %w", err)
+			}
+		}
 		go runNightlyRestartScheduler(stop, h, m, time.Now, time.After, func() {
 			log.Info("nightly restart: sending SIGTERM to self for scheduled RAM-reclaim restart",
 				"restart_at", fmt.Sprintf("%02d:%02d UTC", h, m))
@@ -3346,8 +3359,7 @@ func run() error {
 			)
 
 			if err := host.Start(); err != nil {
-				log.Error("p2p failed to start", "err", err)
-				// Non-fatal: node runs standalone if P2P fails.
+				return fmt.Errorf("p2p failed to start; refusing to run a node without its configured peer network: %w", err)
 			} else {
 				log.Info("p2p started", "listen", tcpAddr, "bootnodes", len(bootnodes))
 				defer host.Stop()
@@ -5066,38 +5078,95 @@ func replayPostSnapshotGap(
 	return
 }
 
-// backfillTxIdxRange writes t/ LevelDB entries for every transaction in every
-// block from fromH+1 through toH.
-//
-// It halts at the first unrecoverable error — block missing from the store,
-// JSON decode failure, or PutTxIdx write failure — to avoid advancing the
-// txidx_complete_height marker past heights whose t/ entries were not actually
-// written.  Only the last successfully indexed height is saved to the marker,
-// so the next restart retries the failed range rather than treating it as done.
+// txIndexPruneBelowHeight returns the exclusive lower bound below which light
+// pruning removes transaction data. It mirrors Chain.PruneOldData; archive
+// mode and chains not yet beyond KeepBlocks have no pruned prefix.
+func txIndexPruneBelowHeight(tipHeight uint64, mode string, keepBlocks uint64) uint64 {
+	if mode != "light" || tipHeight <= keepBlocks {
+		return 0
+	}
+	return tipHeight - keepBlocks
+}
+
+// backfillTxIdxRange writes t/ LevelDB entries for every available transaction
+// in every block from fromH+1 through toH. Missing block bodies are warned
+// about and skipped so one unavailable historical body cannot block indexing
+// later blocks. Store read errors, JSON decode failures, and PutTxIdx write
+// failures still halt the backfill. The completion marker records the highest
+// height examined, including heights whose bodies were unavailable.
 //
 // This function is called in a background goroutine by the snapshot fast-path
 // startup; it is package-level (not inlined) so tests can exercise it directly.
-func backfillTxIdxRange(fromH, toH uint64, db *store.DB, log *slog.Logger) {
+func backfillTxIdxRange(fromH, toH, pruneBelowHeight uint64, db *store.DB, log *slog.Logger) {
 	const progressInterval = uint64(10_000)
 	lastGood := fromH
+	var missingStart, missingEnd, missingCount uint64
+	flushMissingRange := func() {
+		if missingCount == 0 {
+			return
+		}
+		log.Info("tx index background backfill: missing block data range skipped",
+			"from_height", missingStart,
+			"to_height", missingEnd,
+			"missing_blocks", missingCount,
+		)
+		missingStart, missingEnd, missingCount = 0, 0, 0
+	}
 	for h := fromH + 1; h <= toH; h++ {
 		raw, fetchErr := db.GetRawBlockByHeight(h)
 		if fetchErr != nil {
 			// Real LevelDB read error — halt and retry the whole range next restart.
+			flushMissingRange()
 			log.Warn("tx index background backfill: block fetch error — halting; will retry next restart",
 				"height", h, "err", fetchErr)
 			_ = db.StoreTxIdxCompleteHeight(lastGood)
 			return
 		}
 		if raw == nil {
-			// Height entry exists but raw-block data is absent (e.g. post-repair
-			// gap or pruned block).  Nothing to index; skip and continue so all
-			// subsequent blocks are not permanently blocked by this gap.
-			log.Warn("tx index background backfill: block data missing — skipping height",
-				"height", h)
-			lastGood = h // mark as processed so we don't retry this gap forever
+			if h < pruneBelowHeight {
+				// A missing body below the configured light-pruning boundary is
+				// expected. Mark it processed immediately so a later restart does
+				// not retry the same pruned height forever.
+				log.Warn("tx index background backfill: block pruned, skipping",
+					"height", h,
+					"prune_below_height", pruneBelowHeight,
+				)
+				lastGood = h
+				if markerErr := db.StoreTxIdxCompleteHeight(lastGood); markerErr != nil {
+					log.Warn("tx index background backfill: failed to persist pruned skip — halting",
+						"height", h, "err", markerErr)
+					return
+				}
+				continue
+			}
+			// A nil body with no LevelDB read error is not actionable by this
+			// indexer. Skip it, persist progress, and continue so subsequent
+			// transactions keep their fast-path index entries. Warn once when a
+			// gap begins, then aggregate its final range to avoid flooding logs
+			// when a historical range is unavailable.
+			if missingCount == 0 {
+				missingStart = h
+				log.Warn("tx index background backfill: missing block data; skipping",
+					"height", h,
+					"prune_below_height", pruneBelowHeight,
+				)
+			}
+			missingEnd = h
+			missingCount++
+			lastGood = h
+			if h%progressInterval == 0 {
+				if markerErr := db.StoreTxIdxCompleteHeight(lastGood); markerErr != nil {
+					flushMissingRange()
+					log.Warn("tx index background backfill: failed to persist missing-body skip — halting",
+						"height", h, "err", markerErr)
+					return
+				}
+				log.Info("tx index background backfill progress",
+					"height", h, "target", toH, "skipped_missing_blocks", missingCount)
+			}
 			continue
 		}
+		flushMissingRange()
 		var b core.Block
 		if jsonErr := json.Unmarshal(raw, &b); jsonErr != nil {
 			log.Warn("tx index background backfill: block decode failed — halting; will retry next restart",
@@ -5121,6 +5190,7 @@ func backfillTxIdxRange(fromH, toH uint64, db *store.DB, log *slog.Logger) {
 				"height", h, "target", toH)
 		}
 	}
+	flushMissingRange()
 	_ = db.StoreTxIdxCompleteHeight(toH)
 	log.Info("tx index background backfill complete",
 		"from_height", fromH+1,

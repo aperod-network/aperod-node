@@ -94,6 +94,9 @@ func validateDailyJob(j *dailyJob) error {
 			len(p.Vaults)+len(p.Positions) > lpodDailyMaxEntries {
 			return fail()
 		}
+		if p.Preclosing && j.State == "complete" {
+			return fail()
+		}
 		lastExclusive := p.Next
 		if lastExclusive > p.WitnessHeight {
 			lastExclusive = p.WitnessHeight

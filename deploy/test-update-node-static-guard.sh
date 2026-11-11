@@ -9,6 +9,8 @@
 #        "not a dynamic executable" — the happy path must pass through.
 #    G3. The guard section is syntactically present in update-node.sh so that
 #        a future rename/refactor cannot silently remove it.
+#    G4. With ldd hidden, readelf detects PT_INTERP in a dynamic ELF and aborts.
+#    G5. With ldd hidden, readelf output without INTERP passes the guard.
 #
 #  Design
 #  ------
@@ -18,6 +20,7 @@
 #    - BINARY_SRC overridden to a known dynamic/static binary
 #    - send_telegram_alert() stubbed to a no-op (no real HTTP call)
 #    - For G2, ldd injected via PATH to emit "not a dynamic executable"
+#    - For G4/G5, a minimal PATH exposes readelf but deliberately omits ldd
 #
 #  Skip conditions
 #  ---------------
@@ -94,6 +97,11 @@ if [[ -z "${_DYN_BIN}" ]]; then
   skip_all "Could not find a known dynamically-linked system binary — skipping"
 fi
 echo "  Using dynamic binary: ${_DYN_BIN}"
+
+if [[ "${_has_readelf}" != "true" ]]; then
+  echo "ERROR: readelf is required to test the musl/Alpine fallback." >&2
+  exit 1
+fi
 
 # ── Extract the Step 2b guard block from update-node.sh ─────────────────────
 #
@@ -232,6 +240,108 @@ fi
 
 rm -f "${_G2_OUT}" "${_G2_ERR}"
 rm -rf "${_MOCK_BIN}"
+
+# ── G4/G5: hide ldd and exercise the readelf fallback ────────────────────────
+#
+# A private PATH exposes only the helper tools the extracted guard requires.
+# In particular, ldd is deliberately absent even if the host has it installed.
+echo ""
+echo "── G4/G5: readelf fallback when ldd is absent ───────────────────────────"
+
+_MOCK_NO_LDD_BIN="$(mktemp -d)"
+_READ_ELF_BIN="$(command -v readelf)"
+for _tool in bash env grep touch; do
+  _tool_path="$(command -v "${_tool}")"
+  if [[ -z "${_tool_path}" ]] || ! ln -s "${_tool_path}" "${_MOCK_NO_LDD_BIN}/${_tool}"; then
+    echo "ERROR: cannot prepare isolated PATH for readelf fallback (${_tool})." >&2
+    rm -rf "${_MOCK_NO_LDD_BIN}"
+    exit 1
+  fi
+done
+if ! ln -s "${_READ_ELF_BIN}" "${_MOCK_NO_LDD_BIN}/readelf"; then
+  echo "ERROR: cannot expose readelf in the isolated PATH." >&2
+  rm -rf "${_MOCK_NO_LDD_BIN}"
+  exit 1
+fi
+
+# G4: use the actual readelf tool on the known dynamic ELF. It must find
+# PT_INTERP and reject the candidate before the update script stops the service.
+_G4_OUT="$(mktemp)"
+_G4_ERR="$(mktemp)"
+_G4_RC=0
+bash > "${_G4_OUT}" 2>"${_G4_ERR}" <<SUBSHELL || _G4_RC=$?
+set -uo pipefail
+export PATH="${_MOCK_NO_LDD_BIN}"
+if command -v ldd > /dev/null 2>&1; then
+  echo "ldd unexpectedly present in fallback PATH" >&2
+  exit 99
+fi
+send_telegram_alert() { :; }
+BINARY_SRC="${_DYN_BIN}"
+${GUARD_SRC}
+SUBSHELL
+
+if [[ "${_G4_RC}" -eq 1 ]]; then
+  pass_test "G4a: readelf fallback exited 1 with ldd absent"
+else
+  fail_test "G4a: expected exit 1 for dynamic ELF, got rc=${_G4_RC}"
+fi
+if grep -q "readelf: PT_INTERP segment found" "${_G4_ERR}" \
+    && grep -q "Static-link check FAILED" "${_G4_ERR}"; then
+  pass_test "G4b: stderr confirms readelf found PT_INTERP and the guard failed"
+else
+  fail_test "G4b: expected PT_INTERP and static-link failure — got: $(head -5 "${_G4_ERR}")"
+fi
+if grep -q "NOT stopped\|not stopped\|still running" "${_G4_ERR}"; then
+  pass_test "G4c: stderr confirms the service was NOT stopped"
+else
+  fail_test "G4c: expected service-not-stopped message — got: $(head -5 "${_G4_ERR}")"
+fi
+rm -f "${_G4_OUT}" "${_G4_ERR}"
+
+# G5: mock readelf with output that contains no INTERP marker. The marker file
+# proves the fallback executable (not ldd) actually ran in this isolated PATH.
+_G5_MARKER="${_MOCK_NO_LDD_BIN}/readelf-was-called"
+rm -f "${_MOCK_NO_LDD_BIN}/readelf"
+cat > "${_MOCK_NO_LDD_BIN}/readelf" <<'MOCKREADELF'
+#!/usr/bin/env bash
+echo "no program interpreter header"
+touch "${G5_MARKER}"
+MOCKREADELF
+chmod +x "${_MOCK_NO_LDD_BIN}/readelf"
+_G5_OUT="$(mktemp)"
+_G5_ERR="$(mktemp)"
+_G5_RC=0
+bash > "${_G5_OUT}" 2>"${_G5_ERR}" <<SUBSHELL || _G5_RC=$?
+set -uo pipefail
+export PATH="${_MOCK_NO_LDD_BIN}"
+export G5_MARKER="${_G5_MARKER}"
+if command -v ldd > /dev/null 2>&1; then
+  echo "ldd unexpectedly present in fallback PATH" >&2
+  exit 99
+fi
+send_telegram_alert() { :; }
+BINARY_SRC="${_DYN_BIN}"
+${GUARD_SRC}
+SUBSHELL
+
+if [[ "${_G5_RC}" -eq 0 ]]; then
+  pass_test "G5a: no-INTERP fallback exited 0 with ldd absent"
+else
+  fail_test "G5a: readelf fallback exited ${_G5_RC} for output without INTERP"
+fi
+if [[ -f "${_G5_MARKER}" ]] && grep -q "no PT_INTERP segment" "${_G5_OUT}"; then
+  pass_test "G5b: mock readelf was called and the guard accepted no INTERP"
+else
+  fail_test "G5b: mock readelf did not run or guard did not report a static binary"
+fi
+if ! grep -q "Static-link check FAILED" "${_G5_ERR}"; then
+  pass_test "G5c: stderr contains no static-link failure"
+else
+  fail_test "G5c: static-link failure was unexpected on the no-INTERP path"
+fi
+rm -f "${_G5_OUT}" "${_G5_ERR}"
+rm -rf "${_MOCK_NO_LDD_BIN}"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

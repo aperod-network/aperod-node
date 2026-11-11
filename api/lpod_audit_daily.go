@@ -84,6 +84,19 @@ func dailyPositionOutput(p *lpodDailyPositionSum) lpodDailyPosition {
 		Accrued: strconv.FormatUint(p.accrued, 10), Paid: strconv.FormatUint(p.paid, 10), PrincipalReturned: strconv.FormatUint(p.principal, 10)}
 }
 
+func dailyOpeningBoundaryFailure(start time.Time, anchorTimestamp int64, certifiedWindowLimited, candidateAtSearchFloor, parentHashMatches bool) string {
+	if !time.Unix(0, anchorTimestamp).Before(start) {
+		if certifiedWindowLimited && candidateAtSearchFloor {
+			return "certified search window starts after interval opening"
+		}
+		return "opening anchor timestamp is not before interval start"
+	}
+	if !parentHashMatches {
+		return "opening boundary is discontinuous"
+	}
+	return ""
+}
+
 func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
@@ -123,9 +136,6 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		"opening_anchor": nil, "closing_witness": nil, "certificate": nil, "funding": nil,
 		"coverage": map[string]interface{}{"blocks": 0, "vaults": 0, "positions": 0},
 		"vaults":   []lpodDailyVault{}, "positions": []lpodDailyPosition{},
-		"burns_napro": map[string]string{
-			"protocol_base_fee": "0", "signed_intentional": "0", "avm_gas": "0", "total": "0",
-		},
 	}
 	fail := func(reason string) {
 		out["status"] = "incomplete"
@@ -298,10 +308,12 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	searchFloor := pruneCursor + 1
+	certifiedWindowLimited := false
 	if cert.Height >= lpodDailyMaxBlocks {
 		certifiedFloor := cert.Height - lpodDailyMaxBlocks + 2
 		if certifiedFloor > searchFloor {
 			searchFloor = certifiedFloor
+			certifiedWindowLimited = true
 		}
 	}
 	if searchFloor > cert.Height {
@@ -349,6 +361,10 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !openingFound || openingHeight == 0 {
+		if background {
+			fail("opening boundary not yet certified")
+			return
+		}
 		fail("opening anchor is unavailable")
 		return
 	}
@@ -362,9 +378,14 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !time.Unix(0, anchorBlock.Header.Timestamp).Before(start) ||
-		openingBlock.Header.PrevHash != anchorHash {
-		fail("opening boundary is discontinuous")
+	if reason := dailyOpeningBoundaryFailure(
+		start,
+		anchorBlock.Header.Timestamp,
+		certifiedWindowLimited,
+		openingHeight == searchFloor,
+		openingBlock.Header.PrevHash == anchorHash,
+	); reason != "" {
+		fail(reason)
 		return
 	}
 	witnessHeight, witnessBlock, witnessFound, boundaryErr := firstAtOrAfter(end)
@@ -376,7 +397,9 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !witnessFound {
+	preclosing := !witnessFound
+	preclosingReason := "closing witness not yet present"
+	if preclosing && !background {
 		tipBlock, _, tipReadErr := readBlock(tipHeight)
 		if tipReadErr == nil && !time.Unix(0, tipBlock.Header.Timestamp).Before(end) {
 			fail("verified certificate predates the closing witness")
@@ -384,6 +407,30 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 			fail("closing witness not yet present")
 		}
 		return
+	}
+	if preclosing {
+		tipBlock, _, tipReadErr := readBlock(tipHeight)
+		if tipReadErr == nil && !time.Unix(0, tipBlock.Header.Timestamp).Before(end) {
+			preclosingReason = "verified certificate predates the closing witness"
+		}
+		// Before the closing witness is final, use the certificate's last
+		// authenticated block as a provisional boundary. The worker audits only
+		// through the preceding block and advances this boundary with each new
+		// certificate; no daily result is complete until the real witness exists.
+		witnessHeight = cert.Height
+		witnessBlock, _, readErr = readBlock(witnessHeight)
+		if readErr != nil {
+			if ctx.Err() != nil {
+				fail(dailyAuditContextReason(ctx.Err()))
+			} else {
+				fail(readErr.Error())
+			}
+			return
+		}
+		if !time.Unix(0, witnessBlock.Header.Timestamp).Before(end) {
+			fail("closing witness boundary could not be located")
+			return
+		}
 	}
 	witnessHash := witnessBlock.Hash()
 	witnessTimestamp := witnessBlock.Header.Timestamp
@@ -446,7 +493,7 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 	var expectedNextRegistry *core.RegistrySnapshot
 	nextHeight := anchorHeight
 	if background && progress.Next != 0 {
-		if progress.Anchor != anchorHash || progress.Witness != witnessHash || progress.Marker != markerDigest ||
+		if progress.Anchor != anchorHash || (!progress.Preclosing && progress.Witness != witnessHash) || progress.Marker != markerDigest ||
 			!bytes.Equal(progress.Prune, pruneCursorRaw) || progress.Next <= anchorHeight || cert.Height == ^uint64(0) || progress.Next > cert.Height+1 {
 			fail("saved boundary or prune binding changed")
 			return
@@ -477,6 +524,7 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 	checkpointProgress := func(next uint64) {
 		progress.Certificate, progress.Anchor, progress.Witness = cert, anchorHash, witnessHash
 		progress.AnchorHeight, progress.WitnessHeight, progress.Marker = anchorHeight, witnessHeight, markerDigest
+		progress.Preclosing = preclosing
 		progress.Prune = append([]byte(nil), pruneCursorRaw...)
 		progress.Next, progress.Previous, progress.PriorTS = next, prevHash, priorTS
 		progress.Rewards = rewards.clone()
@@ -494,7 +542,11 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 		progress.Digest, progress.HaveDigest, progress.Registry = lastAuditDigest, haveLastAuditDigest, expectedNextRegistry
 	}
 	batchStarted := time.Now()
-	for h := nextHeight; h <= cert.Height; h++ {
+	processThrough := cert.Height
+	if preclosing {
+		processThrough = witnessHeight - 1
+	}
+	for h := nextHeight; h <= processThrough; h++ {
 		// Cooperative budget at verified block boundaries. A single block is not
 		// preemptible; the outer deadline cancels between verifier operations.
 		if background && h > nextHeight && (h-nextHeight >= dailyBatchBlocks || time.Since(batchStarted) >= dailyBatchTime) {
@@ -637,6 +689,20 @@ func (s *Server) restLPoDAuditDaily(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		previousBlock = block
+	}
+	if preclosing {
+		if err := ctx.Err(); err != nil {
+			fail(dailyAuditContextReason(err))
+			return
+		}
+		if !s.dailyBindingValid(batchBinding) {
+			fail("canonical certificate or finality changed during batch")
+			return
+		}
+		checkpointProgress(witnessHeight)
+		out["coverage"] = map[string]interface{}{"blocks": included, "vaults": len(vaults), "positions": len(positions)}
+		fail(preclosingReason)
+		return
 	}
 	if included == 0 {
 		fail("interval has no included canonical blocks")

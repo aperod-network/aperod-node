@@ -865,6 +865,103 @@ func TestTLS_HandshakeTimeout_SlotFreedOnDeadline(t *testing.T) {
 	}
 }
 
+// TestTLS_HandshakeFlood_AllSlotsFreedAfterTimeout verifies finite-burst
+// recovery, not guaranteed admission under an attacker that continually refills
+// slots. The per-source admission budget already prevents one IP from occupying
+// all three slots, so use distinct loopback sources to genuinely saturate them.
+func TestTLS_HandshakeFlood_AllSlotsFreedAfterTimeout(t *testing.T) {
+	const (
+		slots     = 3
+		hsTimeout = 200 * time.Millisecond
+		budget    = slots*hsTimeout + 100*time.Millisecond
+	)
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate host identity: %v", err)
+	}
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate peer identity: %v", err)
+	}
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
+	host := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "tls-burst-recovery",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
+		MaxPendingHandshakes: slots,
+		HandshakeTimeout:     hsTimeout,
+	}, &stubHandler{}, newTestLogger())
+	if err := host.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer host.Stop()
+
+	started := time.Now()
+	for _, source := range []string{"127.0.0.2", "127.0.0.3", "127.0.0.4"} {
+		dialer := net.Dialer{
+			Timeout:   time.Second,
+			LocalAddr: &net.TCPAddr{IP: net.ParseIP(source)},
+		}
+		slow, err := dialer.Dial("tcp", host.ListenAddr())
+		if err != nil {
+			t.Fatalf("dial stalled source %s: %v", source, err)
+		}
+		// Keep every client open until assertions finish: local cleanup must
+		// not be what releases the server's pending-handshake slots.
+		defer slow.Close()
+		if err := slow.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		// A valid TLS record header with an incomplete ClientHello body.
+		if _, err := slow.Write([]byte{0x16, 0x03, 0x03, 0x00, 0x40, 0x01, 0x00}); err != nil {
+			t.Fatalf("send partial ClientHello from %s: %v", source, err)
+		}
+	}
+	if !waitFor(hsTimeout/2, func() bool { return host.PendingHandshakes() == slots }) {
+		t.Fatalf("flood never occupied all %d slots; pending=%d", slots, host.PendingHandshakes())
+	}
+	if host.PeerCount() != 0 {
+		t.Fatal("incomplete TLS clients were registered as peers")
+	}
+	remaining := time.Until(started.Add(budget))
+	if remaining <= 0 || !waitFor(remaining, func() bool { return host.PendingHandshakes() == 0 }) {
+		t.Fatalf("%d pending handshakes remain after %v budget", host.PendingHandshakes(), budget)
+	}
+	t.Logf("all %d stalled handshakes drained in %v (budget %v)", slots, time.Since(started), budget)
+
+	// Admission is not proven by the counter alone: complete mutual TLS and
+	// the application's asymmetric Ping/Pong handshake using a pinned peer.
+	legitimate, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", host.ListenAddr(), cfgPeer)
+	if err != nil {
+		t.Fatalf("legitimate TLS peer cannot connect after drain: %v", err)
+	}
+	defer legitimate.Close()
+	// ReadMsg overwrites deadlines, so separately bound a stalled handshake.
+	stall := time.AfterFunc(time.Second, func() { _ = legitimate.Close() })
+	defer stall.Stop()
+	if err := p2p.WriteMsg(legitimate, p2p.MsgPing, p2p.PingMsg{
+		NodeID: "legitimate-after-flood", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("legitimate peer Ping: %v", err)
+	}
+	msgType, _, err := p2p.ReadMsg(legitimate)
+	if err != nil || msgType != p2p.MsgPong {
+		t.Fatalf("legitimate peer expected Pong, got %v: %v", msgType, err)
+	}
+	stall.Stop()
+	if p2p.PeerFingerprint(legitimate) != fpHost {
+		t.Fatal("legitimate peer connected to an unexpected TLS identity")
+	}
+	if !waitFor(100*time.Millisecond, func() bool {
+		return host.PeerCount() == 1 && host.PendingHandshakes() == 0
+	}) {
+		t.Fatalf("handshake did not finish cleanly: peers=%d pending=%d", host.PeerCount(), host.PendingHandshakes())
+	}
+}
+
 func TestKeepalive_SilentPeerEvicted(t *testing.T) {
 	const (
 		ka      = 100 * time.Millisecond // keepalive interval

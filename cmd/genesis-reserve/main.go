@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,24 +18,22 @@ import (
 )
 
 func writeExclusive(path string, value interface{}) error {
+	// #nosec G304 -- this operator-selected output path is created exclusively to prevent overwrites.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
-	ok := false
-	defer func() {
-		f.Close()
-		if !ok {
-			os.Remove(path)
+	writeErr := json.NewEncoder(f).Encode(value)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, fmt.Errorf("remove incomplete output: %w", removeErr))
 		}
-	}()
-	if err = json.NewEncoder(f).Encode(value); err != nil {
 		return err
 	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	ok = true
 	return nil
 }
 
@@ -45,7 +44,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (retErr error) {
 	action := flag.String("action", "", "init-wallet, rekey-wallet or attest")
 	path := flag.String("wallet", "", "encrypted treasury keystore path")
 	output := flag.String("output", "", "new exclusive witness/keystore path")
@@ -123,7 +122,11 @@ func run() error {
 			return err
 		}
 		offlineDB = db
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close offline database: %w", err))
+			}
+		}()
 		_, tip, err := db.GetTip()
 		if err != nil {
 			return err
@@ -155,8 +158,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("cannot securely open signing key")
 	}
+	// #nosec G115 -- syscall.Open returned a valid nonnegative descriptor, which fits uintptr on supported Linux targets.
 	file := os.NewFile(uintptr(fd), *signer)
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close signing key: %w", err))
+		}
+	}()
 	raw, err := io.ReadAll(io.LimitReader(file, 65))
 	if err != nil || (len(raw) != 32 && len(raw) != 64) {
 		return fmt.Errorf("invalid signing key length")

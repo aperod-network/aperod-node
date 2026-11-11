@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/avm"
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -180,6 +181,7 @@ type Server struct {
 	// consensus.Engine.ScheduleAdminMint in cmd/node after engine start.
 	// nil = this node is not an active validator; admin mints are refused.
 	mintScheduler func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error)
+	rewardAddress string
 
 	banListFn func() []BanEntry                          // optional; wired to p2p.Host.ListBans by cmd/node
 	banLiftFn func(string) bool                          // optional; wired to p2p.Host.LiftBan by cmd/node
@@ -266,11 +268,6 @@ type Server struct {
 	tlsFingerprint string // SHA-256 fingerprint of the node's TLS certificate
 	p2pListenAddr  string // TCP listen address for P2P (e.g. "0.0.0.0:30303")
 	nodeID         string // hex node ID derived from the validator public key
-
-	// nodeViewKeyHex is the hex-encoded Ed25519 view private scalar from node.yaml (optional).
-	// When non-empty, restAddressUTXOs uses it to decrypt enc_amount for owned stealth outputs
-	// inline, without requiring the caller to supply a view_key_hex query parameter.
-	nodeViewKeyHex string
 
 	// pruningMode is "light" or "archive" (default "archive").
 	// Set via SetPruningMode so the API can hint about pruned UTXOs.
@@ -373,6 +370,11 @@ type Server struct {
 	startupSnapshotErrStr    string
 	startupID                string
 
+	// nightlyRestartSchedule is set only when the in-process restart scheduler
+	// is active. The status endpoint uses it to expose the next UTC occurrence.
+	nightlyRestartScheduleMu sync.RWMutex
+	nightlyRestartSchedule   *nightlyRestartSchedule
+
 	// utxoAddrCache is a short-TTL in-memory cache for /address/{addr}/utxos
 	// responses. The mint-UTXO monitor calls this endpoint every 5 minutes
 	// for each admin-mint address; without caching each call does an O(n)
@@ -432,6 +434,41 @@ func NewServer(addr string, chain *core.Chain, mempool *core.Mempool, utxos *cor
 	}
 	s.registerRoutes()
 	return s
+}
+
+type nightlyRestartSchedule struct {
+	hour   int
+	minute int
+}
+
+// SetNightlyRestartSchedule records the active in-process scheduler's UTC
+// schedule for GET /api/v1/status. An empty value clears the schedule so the
+// endpoint reports next_restart_at: null.
+func (s *Server) SetNightlyRestartSchedule(restartAt string) error {
+	var schedule *nightlyRestartSchedule
+	if restartAt != "" {
+		hour, minute, err := config.ParseRestartAt(restartAt)
+		if err != nil {
+			return err
+		}
+		schedule = &nightlyRestartSchedule{hour: hour, minute: minute}
+	}
+
+	s.nightlyRestartScheduleMu.Lock()
+	s.nightlyRestartSchedule = schedule
+	s.nightlyRestartScheduleMu.Unlock()
+	return nil
+}
+
+func (s *Server) nextNightlyRestartAt(now time.Time) *time.Time {
+	s.nightlyRestartScheduleMu.RLock()
+	schedule := s.nightlyRestartSchedule
+	s.nightlyRestartScheduleMu.RUnlock()
+	if schedule == nil {
+		return nil
+	}
+	next := config.NextRestartAt(now, schedule.hour, schedule.minute)
+	return &next
 }
 
 // SetReady marks the node as fully loaded and no longer syncing.
@@ -672,12 +709,6 @@ func (s *Server) SetPruningMode(mode string) { s.pruningMode = mode }
 // blocks_until_pruned warning field for UTXOs approaching the prune window.
 func (s *Server) SetKeepBlocks(n uint64) { s.keepBlocks = n }
 
-// SetNodeViewKey stores the node's configured view private key (hex-encoded).
-// When set, restAddressUTXOs automatically decrypts enc_amount for all owned
-// UTXOs — both transparent outputs and stealth outputs — without requiring the
-// caller to supply a view_key_hex query parameter.
-func (s *Server) SetNodeViewKey(hexKey string) { s.nodeViewKeyHex = hexKey }
-
 // FlushUTXOCache removes all cached /address/{addr}/utxos entries immediately.
 // Intended for use in tests that mutate the UTXO set and then require a fresh
 // response from the REST handler on the very next call, bypassing the normal TTL.
@@ -796,6 +827,12 @@ func (s *Server) SetTimestampRejectedCounter(f func() int64) { s.tsRejectedCount
 // legacy height=0 mempool path (shared key image per address).
 func (s *Server) SetMintScheduler(f func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error)) {
 	s.mintScheduler = f
+}
+
+// SetRewardAddress wires the node's configured per-block coinbase destination
+// so the REST handler can reject a colliding admin mint before scheduling it.
+func (s *Server) SetRewardAddress(address string) {
+	s.rewardAddress = address
 }
 
 // SetWhitelistGetFunc wires a function returning the current peer whitelist entries.

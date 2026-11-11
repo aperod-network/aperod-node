@@ -53,6 +53,7 @@ func TestMintAndSpend(t *testing.T) {
 	}
 
 	// 4. Recompute blind (as aprWalletSend does)
+	//nolint:staticcheck // This test exercises a legacy height-zero admin mint.
 	blind, err := crypto.DeterministicMintBlind(spendPubFromPriv, mintAmount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)

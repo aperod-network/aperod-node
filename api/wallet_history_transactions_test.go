@@ -16,7 +16,11 @@ func TestWalletHistoryExactBudgetSendHasCanonicalEvidenceWithoutChange(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close wallet history transaction database: %v", err)
+		}
+	}()
 	image := crypto.KeyImage{7}
 	tx := core.Transaction{Version: core.TxVersionCLSAG, Fee: 252750,
 		Inputs:  []core.RingInput{{KeyImage: image}},

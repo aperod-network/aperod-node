@@ -21,6 +21,7 @@ type SaleRecovery struct {
 	Signature   string        `json:"signature"`
 }
 
+// SaleRecoveryChallenge returns the challenge bound to a sale order and delivery.
 func SaleRecoveryChallenge(genesis crypto.Hash32, order *SaleOrder, delivery *SaleDelivery) string {
 	return "APRO_SALE_RECOVERY_V1\x00" + hex.EncodeToString(genesis[:]) + ":" +
 		hex.EncodeToString(order.Checkpoint[:]) + ":" + hex.EncodeToString(order.Order[:]) + ":" +
@@ -106,6 +107,7 @@ func (d *DB) RecordSaleRecovery(genesis, id, block, tx crypto.Hash32, signature 
 	return d.db.Put(saleRecoveryKey(id), encoded, &opt.WriteOptions{Sync: true})
 }
 
+// SaleOrderRecovery returns the verified recovery record for a sale order.
 func (d *DB) SaleOrderRecovery(id crypto.Hash32) (*SaleRecovery, error) {
 	raw, err := d.get(saleRecoveryKey(id))
 	if err != nil || raw == nil {

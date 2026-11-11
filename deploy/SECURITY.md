@@ -7,11 +7,10 @@
 | Latest `main` | ✅ Active |
 | Older tags | ❌ No patches |
 
-Always run the latest release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-node.sh | sudo bash
-```
+Use only an installer from a signed, immutable release after independently
+verifying its source revision and checksum. Do not fetch scripts from mutable
+`main` and pipe them to a root shell. No signed installer release is currently
+published.
 
 ---
 

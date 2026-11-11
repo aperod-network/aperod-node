@@ -1507,6 +1507,9 @@ def _revalidate_artifact(mark_data: dict[str, Any], job: dict[str, Any],
     manifest, size = _manifest(artifact, mark_data["kind"], runtime)
     if manifest != mark_data["manifest"]:
         raise CleanupError("artifact fingerprint changed after registration")
+    after_fingerprint = _rt(runtime).after_artifact_fingerprint
+    if after_fingerprint is not None:
+        after_fingerprint(artifact, mark_data["kind"])
     return size
 
 

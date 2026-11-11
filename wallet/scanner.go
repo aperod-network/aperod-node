@@ -17,13 +17,23 @@ type Scanner struct {
 // NewScannerFromDerived creates a Scanner from a DerivedKeys set.
 // viewPriv is available via dk.Keys.View.Private.
 func NewScannerFromDerived(dk *DerivedKeys) *Scanner {
-	s := core.NewWalletScanner(
+	s := core.NewWalletScannerWithSpendKey(
+		dk.Keys.Spend.Private,
 		dk.Keys.View.Private,
 		dk.Keys.Spend.Public,
 		dk.Keys.View.Public,
 		crypto.TestnetByte,
 	)
 	return &Scanner{inner: s, addr: dk.Address}
+}
+
+// NewScannerFromKeysWithSpendKey creates a scanner that can authenticate and
+// decrypt amount-bound outputs after the v8 protocol activation.
+func NewScannerFromKeysWithSpendKey(spendPriv, viewPriv crypto.Scalar32, spendPub, viewPub crypto.Point32, net crypto.NetworkByte) *Scanner {
+	return &Scanner{
+		inner: core.NewWalletScannerWithSpendKey(spendPriv, viewPriv, spendPub, viewPub, net),
+		addr:  crypto.EncodeAddress(net, spendPub, viewPub),
+	}
 }
 
 // NewScannerFromKeys creates a Scanner from raw key material.
@@ -42,10 +52,20 @@ func (s *Scanner) ScanBlock(block *core.Block) []core.OwnedUTXO {
 	return s.inner.ScanBlock(block)
 }
 
+// ScanBlockVerified preserves amount-proof or missing-spend-key errors.
+func (s *Scanner) ScanBlockVerified(block *core.Block) ([]core.OwnedUTXO, error) {
+	return s.inner.ScanBlockVerified(block)
+}
+
 // ScanChain scans blocks [startHeight, endHeight] (inclusive) and returns all
 // owned UTXOs found. Stops early if chain.GetByHeight returns nil.
 func (s *Scanner) ScanChain(chain *core.Chain, startHeight, endHeight uint64) []core.OwnedUTXO {
 	return s.inner.ScanChain(chain, startHeight, endHeight)
+}
+
+// ScanChainVerified preserves amount-proof or missing-spend-key errors.
+func (s *Scanner) ScanChainVerified(chain *core.Chain, startHeight, endHeight uint64) ([]core.OwnedUTXO, error) {
+	return s.inner.ScanChainVerified(chain, startHeight, endHeight)
 }
 
 // Balance scans the entire chain up to its tip height and returns the total

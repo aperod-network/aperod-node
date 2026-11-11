@@ -26,6 +26,8 @@ type LPoDCheckpoint struct {
 	Carries            map[string]lpod.Carry   `json:"carries"`
 	Allocation         *LPoDAllocation         `json:"allocation,omitempty"`
 	Positions          map[string]LPoDPosition `json:"positions,omitempty"`
+	DailyPayoutVersion uint8                   `json:"daily_payout_version,omitempty"`
+	PendingLiability   uint64                  `json:"pending_liability_napro,string,omitempty"`
 	PrincipalDeposited uint64                  `json:"principal_deposited_napro,string"`
 	PrincipalLocked    uint64                  `json:"principal_locked_napro,string"`
 	PrincipalReturned  uint64                  `json:"principal_returned_napro,string"`
@@ -40,6 +42,7 @@ type LPoDSettlement struct {
 	Vaults                         []lpod.Vault
 	Migration                      *LPoDMigration
 	PositionProtocol               bool
+	DailyPayout                    bool
 	Timestamp                      int64
 	Proposer                       string
 	Leader                         crypto.Address
@@ -267,7 +270,7 @@ func (c LPoDCheckpoint) Digest() crypto.Hash32 {
 		a := *c.Allocation
 		a.FundingBlock = crypto.Hash32{}
 		c.Allocation = &a
-		if a.Version == 1 {
+		if a.Version == 1 && c.DailyPayoutVersion == 0 {
 			// Preserve the byte-for-byte legacy v1 checkpoint encoding. New v2
 			// allocation fields are not part of the historical v1 commitment.
 			legacy := struct {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +17,7 @@ import (
 
 // A file is not authorization merely because it contains a valid possession
 // signature. The independently deployed configuration pins its full SHA-256.
-func loadValidatorAuthorityFork(cfg config.ConsensusConfig) (*core.ValidatorAuthorityFork, error) {
+func loadValidatorAuthorityFork(cfg config.ConsensusConfig) (result *core.ValidatorAuthorityFork, retErr error) {
 	if cfg.ValidatorAuthorityForkFile == "" {
 		if cfg.ValidatorAuthorityForkSHA256 != "" {
 			return nil, fmt.Errorf("authority fork digest without a rule file")
@@ -31,7 +32,11 @@ func loadValidatorAuthorityFork(cfg config.ConsensusConfig) (*core.ValidatorAuth
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close validator authority file: %w", err))
+		}
+	}()
 	raw, err := io.ReadAll(io.LimitReader(file, 65537))
 	if err != nil || len(raw) > 65536 {
 		return nil, fmt.Errorf("authority fork file exceeds limit")

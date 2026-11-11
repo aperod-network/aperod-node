@@ -5,6 +5,8 @@ package p2p_test
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -127,6 +129,99 @@ func TestDispatch_Peers(t *testing.T) {
 		p2p.WriteMsg(conn, p2p.MsgPeers, peers)
 		time.Sleep(30 * time.Millisecond) // let host process
 	})
+}
+
+func TestPeerExchangeCannotFillKnownPeerListWithOneMessage(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	addrs := make([]string, 32)
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("10.%d.%d.%d:30303", (i/65536)%256, (i/256)%256, i%256)
+	}
+	p2p.HostTryPeerExchange(host, addrs)
+	if got := p2p.HostKnownPeerCount(host); got > 16 {
+		t.Fatalf("one peer exchange added %d addresses from one source; maximum is 16", got)
+	}
+	if got := p2p.HostKnownPeerCount(host); got != 16 {
+		t.Fatalf("valid IP:port peers admitted = %d, want 16", got)
+	}
+
+	tooMany := append(append([]string(nil), addrs...), addrs...)
+	p2p.HostTryPeerExchange(host, tooMany)
+	if got := p2p.HostKnownPeerCount(host); got != 16 {
+		t.Fatalf("oversized peer exchange changed list to %d entries", got)
+	}
+	oversizedMsg, err := json.Marshal(p2p.PeersMsg{Addrs: tooMany})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p2p.HostDispatchForTest(host, "192.0.2.1:30303", p2p.MsgPeers, oversizedMsg); err == nil {
+		t.Fatal("oversized MsgPeers was not rejected")
+	}
+
+	invalidHost := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	p2p.HostTryPeerExchange(invalidHost, []string{"not-an-address", "example.invalid:30303", "10.0.0.1:0"})
+	if got := p2p.HostKnownPeerCount(invalidHost); got != 0 {
+		t.Fatalf("invalid peer addresses admitted: %d", got)
+	}
+}
+
+func TestRejectedTransactionIsNotRelayed(t *testing.T) {
+	handler := &stubHandler{admitErr: errors.New("mempool rejected")}
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, handler, newTestLogger())
+	hostConn, relayConn := net.Pipe()
+	defer hostConn.Close()
+	defer relayConn.Close()
+	p2p.HostRegisterPeerForTest(host, "10.0.0.2:30303", hostConn)
+	relayConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
+	body, err := json.Marshal(core.Transaction{Fee: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p2p.HostDispatchForTest(host, "10.0.0.1:30303", p2p.MsgTx, body); err != nil {
+		t.Fatalf("dispatch rejected transaction: %v", err)
+	}
+	if _, _, err := p2p.ReadMsg(relayConn); err == nil {
+		t.Fatal("rejected transaction was relayed")
+	}
+}
+
+func TestAcceptedTransactionCanBeRelayed(t *testing.T) {
+	handler := &stubHandler{}
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, handler, newTestLogger())
+	hostConn, relayConn := net.Pipe()
+	defer hostConn.Close()
+	defer relayConn.Close()
+	p2p.HostRegisterPeerForTest(host, "10.0.0.2:30303", hostConn)
+
+	type result struct {
+		msgType p2p.MessageType
+		err     error
+	}
+	readResult := make(chan result, 1)
+	go func() {
+		msgType, _, err := p2p.ReadMsg(relayConn)
+		readResult <- result{msgType: msgType, err: err}
+	}()
+
+	body, err := json.Marshal(core.Transaction{Fee: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p2p.HostDispatchForTest(host, "10.0.0.1:30303", p2p.MsgTx, body); err != nil {
+		t.Fatalf("dispatch accepted transaction: %v", err)
+	}
+	select {
+	case got := <-readResult:
+		if got.err != nil {
+			t.Fatalf("read relayed transaction: %v", got.err)
+		}
+		if got.msgType != p2p.MsgTx {
+			t.Fatalf("relayed message type = %v, want MsgTx", got.msgType)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted transaction was not relayed")
+	}
 }
 
 // ─── MsgBlock (handler.OnBlock) ───────────────────────────────────────────────

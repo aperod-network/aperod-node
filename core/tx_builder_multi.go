@@ -229,7 +229,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		}
 		need := len(selected) * (crypto.RingSize - 1)
 		var err error
-		allDecoys, err = b.sampleChainDecoys(need, excludePubs, b.txVersion == TxVersionCLSAG)
+		allDecoys, err = b.sampleChainDecoys(need, excludePubs, txVersionUsesCLSAG(b.txVersion))
 		if err != nil {
 			return nil, fmt.Errorf("sample chain decoys: %w", err)
 		}
@@ -258,7 +258,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			ringDecoys = allDecoys[start:end]
 		}
 
-		if b.txVersion == TxVersionCLSAG && len(ringDecoys) != crypto.RingSize-1 {
+		if txVersionUsesCLSAG(b.txVersion) && len(ringDecoys) != crypto.RingSize-1 {
 			return nil, fmt.Errorf("v5 requires %d real on-chain decoys per input", crypto.RingSize-1)
 		}
 		ring, realIdx, fallbacks, err := txBuildRing(u.OneTimePub, ringDecoys)
@@ -279,7 +279,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			AmountCommit: u.AmountCommit,
 			RealIndex:    uint8(realIdx),
 		}
-		if b.txVersion == TxVersionCLSAG {
+		if txVersionUsesCLSAG(b.txVersion) {
 			commits := make([]crypto.Commitment, crypto.RingSize)
 			di := 0
 			for j := range commits {
@@ -300,6 +300,21 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 	rangeProofs := make([]*crypto.RangeProof, len(outEntries))
 	for i, e := range outEntries {
 		outputs[i] = e.output
+		if txVersionUsesAmountBinding(b.txVersion) {
+			// The old EncAmount is readable by a static view key and is not
+			// authenticated by RingCT. Keep it zero for the new format.
+			outputs[i].EncAmount = [8]byte{}
+			binding, aggregateCommit, bindingErr := crypto.CreateAmountBinding(
+				e.amount, e.blind, e.output.OneTimePub,
+			)
+			if bindingErr != nil {
+				return nil, fmt.Errorf("amount binding[%d]: %w", i, bindingErr)
+			}
+			if aggregateCommit != e.output.AmountCommit {
+				return nil, fmt.Errorf("amount binding[%d]: aggregate commitment mismatch", i)
+			}
+			outputs[i].AmountBinding = binding
+		}
 		proof, err := crypto.ProveRange(e.amount, e.blind)
 		if err != nil {
 			return nil, fmt.Errorf("range proof[%d]: %w", i, err)
@@ -317,7 +332,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		FeeCommit:   feeCommit,
 		RangeProofs: rangeProofs,
 	}
-	if tx.Version == TxVersionCLSAG {
+	if tx.UsesCLSAG() {
 		pseudoBlinds = make([]crypto.BlindFactor, len(inputs))
 		for i := 0; i < len(inputs)-1; i++ {
 			pseudoBlinds[i], err = crypto.NewBlindFactor()
@@ -348,7 +363,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 		msg := ringSignMessage(txHashVal, uint32(i))
 		var sig *crypto.MLSAGSignature
 		var err error
-		if tx.Version == TxVersionCLSAG {
+		if tx.UsesCLSAG() {
 			cs, signErr := crypto.CLSAGSign(msg, inputs[i].Ring, inputs[i].RingCommitments, tx.Inputs[i].PseudoOut, inputRealIdxs[i], inputPrivKeys[i], selected[i].Blind, pseudoBlinds[i])
 			if signErr != nil {
 				return nil, fmt.Errorf("clsag sign[%d]: %w", i, signErr)

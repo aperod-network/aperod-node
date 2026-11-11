@@ -104,7 +104,10 @@ func encryptMnemonic(mnemonic, password, address string, account, index *uint32)
 	// so an edited path cannot silently relabel the wallet.
 	mac := computeMAC(aesKey, ciphertext)
 	if account != nil && index != nil {
-		mac = computeMACWithDerivation(aesKey, ciphertext, address, *account, *index)
+		mac, err = computeMACWithDerivation(aesKey, ciphertext, address, *account, *index)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	version := 1
@@ -213,7 +216,10 @@ func DecryptMnemonic(ks *KeystoreV1, password string) (string, error) {
 		if ks.AccountIndex == nil || ks.AddressIndex == nil {
 			return "", errors.New("keystore: version 2 requires derivation metadata")
 		}
-		gotMAC = computeMACWithDerivation(aesKey, ciphertext, ks.Address, *ks.AccountIndex, *ks.AddressIndex)
+		gotMAC, err = computeMACWithDerivation(aesKey, ciphertext, ks.Address, *ks.AccountIndex, *ks.AddressIndex)
+		if err != nil {
+			return "", err
+		}
 	}
 	if !macEqual(gotMAC, expectedMAC) {
 		return "", errors.New("keystore: wrong password or corrupted keystore")
@@ -258,11 +264,15 @@ func computeMAC(key, ciphertext []byte) []byte {
 	return h.Sum(nil)
 }
 
-func computeMACWithDerivation(key, ciphertext []byte, address string, account, index uint32) []byte {
+func computeMACWithDerivation(key, ciphertext []byte, address string, account, index uint32) ([]byte, error) {
+	if len(address) > 256 {
+		return nil, fmt.Errorf("keystore: address exceeds maximum encoded length")
+	}
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte("aperod/keystore-v1/hd-derivation\x00"))
 	h.Write(ciphertext)
 	var addressLength [4]byte
+	// #nosec G115 -- address length is capped at 256 bytes above.
 	binary.BigEndian.PutUint32(addressLength[:], uint32(len(address)))
 	h.Write(addressLength[:])
 	h.Write([]byte(address))
@@ -270,7 +280,7 @@ func computeMACWithDerivation(key, ciphertext []byte, address string, account, i
 	binary.BigEndian.PutUint32(indices[:4], account)
 	binary.BigEndian.PutUint32(indices[4:], index)
 	h.Write(indices[:])
-	return h.Sum(nil)
+	return h.Sum(nil), nil
 }
 
 func macEqual(a, b []byte) bool {

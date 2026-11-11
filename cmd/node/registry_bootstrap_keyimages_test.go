@@ -65,7 +65,11 @@ func TestBootstrapExportCopiedAnchorKeyImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close anchor export database: %v", err)
+		}
+	}()
 	hash, height, err := db.GetTip()
 	if err != nil {
 		t.Fatal(err)

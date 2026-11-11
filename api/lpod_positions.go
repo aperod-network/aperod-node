@@ -23,13 +23,17 @@ type lpodWalletPosition struct {
 	ID             string `json:"id"`
 	Vault          string `json:"vault"`
 	Principal      string `json:"principal_napro"`
+	Original       string `json:"original_principal_napro"`
 	Returned       string `json:"returned_napro"`
 	Due            string `json:"due_napro"`
+	PendingDue     string `json:"pending_due_napro"`
+	NextPayoutNS   string `json:"next_payout_ns,omitempty"`
 	Nonce          string `json:"nonce"`
 	DepositJSON    string `json:"deposit_action_json"`
 	EffectiveVault string `json:"effective_vault"`
 	RouteHeight    string `json:"route_height"`
 	AutoReturned   bool   `json:"auto_returned"`
+	TopUpCount     int    `json:"top_up_count"`
 	Beneficiary    string `json:"beneficiary"`
 }
 
@@ -40,10 +44,11 @@ func lpodWalletProjection(c *store.LPoDCheckpoint, address crypto.Address) ([]lp
 		if p.Deposit.Beneficiary != address {
 			continue
 		}
-		if p.Withdrawn > p.Deposit.Amount {
+		principalTotal, err := store.LPoDPositionPrincipal(p)
+		if err != nil || p.Withdrawn > principalTotal {
 			return nil, 0, fmt.Errorf("invalid principal")
 		}
-		principal := p.Deposit.Amount - p.Withdrawn
+		principal := principalTotal - p.Withdrawn
 		if p.Returned {
 			principal = 0
 		}
@@ -58,8 +63,11 @@ func lpodWalletProjection(c *store.LPoDCheckpoint, address crypto.Address) ([]lp
 		effective := store.LPoDEffectiveVault(p)
 		rows = append(rows, lpodWalletPosition{
 			ID: id, Vault: fmt.Sprintf("%x", effective[:]), EffectiveVault: fmt.Sprintf("%x", effective[:]),
-			Principal: strconv.FormatUint(principal, 10), Returned: strconv.FormatUint(p.Withdrawn, 10),
-			Due: strconv.FormatUint(p.Due, 10), Nonce: strconv.FormatUint(p.Nonce, 10),
+			Principal: strconv.FormatUint(principal, 10), Original: strconv.FormatUint(principalTotal, 10),
+			Returned: strconv.FormatUint(p.Withdrawn, 10),
+			Due:      strconv.FormatUint(p.Due, 10), Nonce: strconv.FormatUint(p.Nonce, 10),
+			PendingDue: strconv.FormatUint(p.PendingDue, 10), NextPayoutNS: strconv.FormatInt(p.NextPayoutNS, 10),
+			TopUpCount:  len(p.TopUps),
 			DepositJSON: string(action), RouteHeight: strconv.FormatUint(p.RouteHeight, 10), AutoReturned: p.AutoReturned,
 			Beneficiary: string(p.Deposit.Beneficiary),
 		})
@@ -75,10 +83,11 @@ func lpodVaultProjection(c *store.LPoDCheckpoint, vault crypto.Point32) ([]lpodW
 		if store.LPoDEffectiveVault(p) != vault {
 			continue
 		}
-		if p.Withdrawn > p.Deposit.Amount {
+		principalTotal, err := store.LPoDPositionPrincipal(p)
+		if err != nil || p.Withdrawn > principalTotal {
 			return nil, 0, fmt.Errorf("invalid principal")
 		}
-		principal := p.Deposit.Amount - p.Withdrawn
+		principal := principalTotal - p.Withdrawn
 		if p.Returned {
 			principal = 0
 		}
@@ -91,8 +100,10 @@ func lpodVaultProjection(c *store.LPoDCheckpoint, vault crypto.Point32) ([]lpodW
 			return nil, 0, err
 		}
 		rows = append(rows, lpodWalletPosition{ID: id, Vault: fmt.Sprintf("%x", vault[:]), EffectiveVault: fmt.Sprintf("%x", vault[:]),
-			Principal: strconv.FormatUint(principal, 10), Returned: strconv.FormatUint(p.Withdrawn, 10), Due: strconv.FormatUint(p.Due, 10),
-			Nonce: strconv.FormatUint(p.Nonce, 10), DepositJSON: string(action), RouteHeight: strconv.FormatUint(p.RouteHeight, 10),
+			Principal: strconv.FormatUint(principal, 10), Original: strconv.FormatUint(principalTotal, 10),
+			Returned: strconv.FormatUint(p.Withdrawn, 10), Due: strconv.FormatUint(p.Due, 10),
+			PendingDue: strconv.FormatUint(p.PendingDue, 10), NextPayoutNS: strconv.FormatInt(p.NextPayoutNS, 10),
+			TopUpCount: len(p.TopUps), Nonce: strconv.FormatUint(p.Nonce, 10), DepositJSON: string(action), RouteHeight: strconv.FormatUint(p.RouteHeight, 10),
 			AutoReturned: p.AutoReturned, Beneficiary: string(p.Deposit.Beneficiary)})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
@@ -126,7 +137,7 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]interface{}{"version": 1, "state": "disabled", "address": address,
 		"reserved_napro": nil, "positions": nil, "checkpoint_hash": nil, "finalized_height": nil,
-		"wallet_mutations_supported": false}
+		"wallet_mutations_supported": false, "daily_payout_version": 0, "daily_topups_supported": false}
 	defer func() { writeJSON(w, 200, out) }()
 	if s.lpodMigration == nil {
 		return
@@ -198,6 +209,8 @@ func (s *Server) restLPoDPositions(w http.ResponseWriter, r *http.Request) {
 	}
 	out["state"] = "active"
 	out["wallet_mutations_supported"] = true
+	out["daily_payout_version"] = c.DailyPayoutVersion
+	out["daily_topups_supported"] = c.DailyPayoutVersion > 0
 	out["chain_anchor"] = fmt.Sprintf("%x", a.Genesis[:])
 	out["vaults"] = vaults
 	out["positions"] = rows

@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,7 +16,7 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
-func run() error {
+func run() (retErr error) {
 	copied := flag.String("copied-db", "", "separate, quiesced LevelDB copy")
 	claimsPath := flag.String("claims", "", "optional operator declaration; produces an unsigned snapshot candidate only")
 	burnReview := flag.String("recorded-burn-napro", "", "optional recorded counter for unsigned post-burn classification review, not historical proof")
@@ -51,7 +52,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close preflight database: %w", err))
+		}
+	}()
 	tip, height, err := db.GetTip()
 	if err != nil {
 		return err

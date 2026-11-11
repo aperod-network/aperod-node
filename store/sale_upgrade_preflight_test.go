@@ -109,7 +109,7 @@ func TestSaleUpgradeCopyReadOnly(t *testing.T) {
 					t.Fatal(exportErr)
 				}
 				exportRecords := saleUpgradeRecords(t, exported)
-				exported.Close()
+				closeStoreTestResource(t, exported)
 				if len(before) != len(exportRecords) {
 					t.Fatal("logical copy omitted records")
 				}
@@ -137,7 +137,7 @@ func TestSaleUpgradeCopyReadOnly(t *testing.T) {
 				t.Fatal(err)
 			}
 			after := saleUpgradeRecords(t, readonly)
-			readonly.Close()
+			closeStoreTestResource(t, readonly)
 			if len(before) != len(after) {
 				t.Fatal("preflight changed record count")
 			}

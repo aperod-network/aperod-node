@@ -12,12 +12,15 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2130,6 +2133,121 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 	bans := h.ListBans()
 	if len(bans) == 0 {
 		t.Errorf("no ban entry found after %d TLS bad blocks", threshold)
+	}
+}
+
+// TestTimestampBan_TLSAllConnectionsEvicted exercises the timestamp strike
+// pipeline over real pinned mutual TLS, independently of wrong-fork strikes.
+func TestTimestampBan_TLSAllConnectionsEvicted(t *testing.T) {
+	const threshold = 3
+	cfgHost, fpHost, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate host TLS config: %v", err)
+	}
+	cfgPeer, fpPeer, err := p2p.GenerateNodeTLSConfig()
+	if err != nil {
+		t.Fatalf("generate peer TLS config: %v", err)
+	}
+	// Pin the host identity rather than bypassing certificate verification.
+	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
+	h := p2p.NewHost(p2p.Config{
+		ListenAddr:           "127.0.0.1:0",
+		MaxPeers:             10,
+		NodeID:               "test-timestamp-tls-evict",
+		UserAgent:            "aperod/test",
+		TLSConfig:            cfgHost,
+		AllowedPeers:         []string{fpPeer},
+		TimestampBanThreshold: threshold,
+		TimestampBanDuration:  time.Hour,
+	}, &stubHandler{}, newTestLogger())
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
+
+	dialTLS := func(nodeID string) *tls.Conn {
+		t.Helper()
+		c, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", h.ListenAddr(), cfgPeer)
+		if err != nil {
+			t.Fatalf("TLS dial (%s): %v", nodeID, err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		// ReadMsg replaces connection deadlines; close only a stalled handshake,
+		// never a socket whose remote eviction we later need to prove.
+		stall := time.AfterFunc(3*time.Second, func() { _ = c.Close() })
+		defer stall.Stop()
+		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
+			NodeID: nodeID, Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
+		}); err != nil {
+			t.Fatalf("write ping (%s): %v", nodeID, err)
+		}
+		msgType, _, err := p2p.ReadMsg(c)
+		if err != nil || msgType != p2p.MsgPong {
+			t.Fatalf("expected MsgPong (%s), got %v err=%v", nodeID, msgType, err)
+		}
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			t.Fatalf("clear handshake deadline: %v", err)
+		}
+		return c
+	}
+
+	first := dialTLS("timestamp-tls-sender")
+	second := dialTLS("timestamp-tls-idle")
+	firstIP, _, err := net.SplitHostPort(first.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIP, _, err := net.SplitHostPort(second.LocalAddr().String())
+	if err != nil || firstIP != secondIP || first.LocalAddr().String() == second.LocalAddr().String() {
+		t.Fatalf("expected two source ports on the same IP: %v, %v (%v)", first.LocalAddr(), second.LocalAddr(), err)
+	}
+	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 2 }) {
+		t.Fatalf("expected 2 registered TLS peers, got %d", h.PeerCount())
+	}
+	if bans := h.ListBans(); len(bans) != 0 {
+		t.Fatalf("healthy TLS connections unexpectedly banned: %v", bans)
+	}
+
+	before := time.Now()
+	for i := 0; i < threshold; i++ {
+		// Height 1 is within the lead limit of the stub's tip (0). Only the
+		// timestamp, 30 seconds in the future, can trigger this ban.
+		sendFutureTimestampBlock(t, first)
+	}
+	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
+		t.Errorf("timestamp ban left %d TLS peers registered", h.PeerCount())
+	}
+	bans := h.ListBans()
+	if len(bans) != 1 || bans[0].Addr != firstIP ||
+		bans[0].Reason != "repeated future-timestamped blocks (timejacking attack)" {
+		t.Errorf("expected timestamp-abuse ban for bare IP %s, got %v", firstIP, bans)
+	}
+	if !waitFor(600*time.Millisecond, func() bool { return len(h.GetBanEvents(before)) == 1 }) {
+		t.Fatal("timestamp ban event was not recorded")
+	}
+	event := h.GetBanEvents(before)[0]
+	if event.IP != firstIP || event.Violations != threshold || event.BanDurationSecs != 3600 {
+		t.Errorf("wrong timestamp ban event: %+v", event)
+	}
+
+	for _, c := range []*tls.Conn{first, second} {
+		if err := c.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatalf("set eviction read deadline: %v", err)
+		}
+		// Drain buffered GetHeaders before checking actual socket closure.
+		buf := make([]byte, 256)
+		var readErr error
+		for readErr == nil {
+			_, readErr = c.Read(buf)
+		}
+		if nerr, ok := readErr.(net.Error); ok && nerr.Timeout() {
+			t.Errorf("TLS connection %v still open after timestamp ban: %v", c.LocalAddr(), readErr)
+		} else if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) &&
+			!errors.Is(readErr, syscall.ECONNRESET) {
+			t.Errorf("expected remote EOF/reset for %v, got %v", c.LocalAddr(), readErr)
+		} else {
+			t.Logf("TLS connection %v closed remotely: %v", c.LocalAddr(), readErr)
+		}
 	}
 }
 

@@ -42,7 +42,11 @@ func TestFinalityCertificateSurvivesRestartAndRejectsWrongFork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close finality persistence database: %v", err)
+		}
+	}()
 	chain, block := finalityTestChain(t, "canonical")
 	registry := core.NewValidatorRegistry()
 	registry.InitFromGenesis(pubs, core.MinStakeNAPR*10)
@@ -98,7 +102,11 @@ func TestForgedFinalityCertificateFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close finality migration database: %v", err)
+		}
+	}()
 	badSignature, _ := priv.Sign(crypto.HashBytes([]byte("not-finality")))
 	if err := db.SaveFinalityCertificate(store.FinalityCertificate{Version: 1, Height: 1, BlockHash: block.Hash(),
 		Votes: []store.FinalityVote{{Validator: attacker, Signature: badSignature}}}); err != nil {

@@ -24,7 +24,7 @@ func samplingDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { closeStoreTestResource(t, db) })
 	return db
 }
 
@@ -230,7 +230,9 @@ func TestRingSamplingStorageFaultDiscardsPartialSelection(t *testing.T) {
 			t.Fatalf("storage fault %d leaked partial selection: %v %v", failAt, got, err)
 		}
 	}
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := db.SampleRingMembers(3, nil); got != nil || err == nil {
 		t.Fatal("closed backend fell back instead of failing")
 	}
@@ -246,23 +248,37 @@ func TestRingSamplingCorruptionFailsClosed(t *testing.T) {
 			u := sparseRingOutput(3) // tail checked on every nonempty request
 			switch fault {
 			case "count":
-				db.db.Put(ringSamplingCountKey, []byte{1}, nil)
+				if err := db.db.Put(ringSamplingCountKey, []byte{1}, nil); err != nil {
+					t.Fatal(err)
+				}
 			case "slot":
-				db.db.Delete(ringSamplingSlotKey(3), nil)
+				if err := db.db.Delete(ringSamplingSlotKey(3), nil); err != nil {
+					t.Fatal(err)
+				}
 			case "reverse":
-				db.db.Put(ringSamplingReverseKey(u.OneTimePub), ringSamplingUint(2), nil)
+				if err := db.db.Put(ringSamplingReverseKey(u.OneTimePub), ringSamplingUint(2), nil); err != nil {
+					t.Fatal(err)
+				}
 			case "payload":
-				db.db.Put(ringMemberKey(u.OneTimePub), []byte("{"), nil)
+				if err := db.db.Put(ringMemberKey(u.OneTimePub), []byte("{"), nil); err != nil {
+					t.Fatal(err)
+				}
 			case "key":
 				u.OneTimePub = sparseRingOutput(1).OneTimePub
 				data, _ := json.Marshal(u)
-				db.db.Put(ringMemberKey(sparseRingOutput(3).OneTimePub), data, nil)
+				if err := db.db.Put(ringMemberKey(sparseRingOutput(3).OneTimePub), data, nil); err != nil {
+					t.Fatal(err)
+				}
 			case "lock":
 				u.ProtocolLocked = true
 				data, _ := json.Marshal(u)
-				db.db.Put(ringMemberKey(u.OneTimePub), data, nil)
+				if err := db.db.Put(ringMemberKey(u.OneTimePub), data, nil); err != nil {
+					t.Fatal(err)
+				}
 			case "tail":
-				db.db.Put(ringSamplingSlotKey(4), sparseRingOutput(0).OneTimePub[:], nil)
+				if err := db.db.Put(ringSamplingSlotKey(4), sparseRingOutput(0).OneTimePub[:], nil); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if got, err := db.sampleRingMembers(3, nil, bytes.NewReader([]byte{0, 0, 0})); got != nil || err == nil {
 				t.Fatalf("corrupt %s accepted: %v %v", fault, got, err)
@@ -288,7 +304,7 @@ func TestRingSamplingSnapshotAtomicWritesRollbackAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { db.Close() }()
+	defer closeStoreTestResource(t, db)
 	for i := byte(0); i < 4; i++ {
 		putSamplingOutput(t, db, sparseRingOutput(i))
 	}
@@ -413,7 +429,7 @@ func TestRingSamplingInterruptedPreparedRMBuildRestartsAfterReopen(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	// The canonical source is explicitly repaired in the temporary fixture.
 	if err := db.db.Delete(ringMemberKey(broken), nil); err != nil {
 		t.Fatal(err)
@@ -450,7 +466,9 @@ func TestRingSamplingFailedMutationCannotPartiallyWriteCanonicalState(t *testing
 		t.Fatal("failed rollback deleted canonical output")
 	}
 	// A closed real backend fails snapshot acquisition and mutations.
-	db.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.PutUTXO(next.TxHash, 0, next); err == nil {
 		t.Fatal("closed backend accepted write")
 	}

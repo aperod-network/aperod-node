@@ -18,7 +18,11 @@ func TestREST_AddressTxsPagesCanonicalDiskHistoryBeyondReportedHeight(t *testing
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close address history database: %v", err)
+		}
+	}()
 
 	priv, validatorPub, err := crypto.GenerateValidatorKey()
 	if err != nil {

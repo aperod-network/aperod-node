@@ -36,10 +36,11 @@ type MempoolConfig struct {
 	// transactions that cannot be included in the next block. Keeping this gate
 	// at admission prevents callers from receiving a successful hash for a tx
 	// that the block producer will immediately evict.
-	RingCTV4ActivationHeight    uint64
-	RingCTCLSAGActivationHeight uint64
-	AVMActivationHeight         uint64
-	CurrentHeight               func() uint64
+	RingCTV4ActivationHeight            uint64
+	RingCTCLSAGActivationHeight         uint64
+	RingCTAmountBindingActivationHeight uint64
+	AVMActivationHeight                 uint64
+	CurrentHeight                       func() uint64
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
@@ -170,6 +171,10 @@ func (m *Mempool) NextSpendVersion() TxVersion {
 	if nextHeight < ^uint64(0) {
 		nextHeight++
 	}
+	if m.cfg.RingCTAmountBindingActivationHeight > 0 &&
+		nextHeight >= m.cfg.RingCTAmountBindingActivationHeight {
+		return TxVersionAmountBinding
+	}
 	if m.cfg.RingCTCLSAGActivationHeight > 0 && nextHeight >= m.cfg.RingCTCLSAGActivationHeight {
 		return TxVersionCLSAG
 	}
@@ -177,6 +182,20 @@ func (m *Mempool) NextSpendVersion() TxVersion {
 		return TxVersionBase
 	}
 	return TxVersionCommitmentBinding
+}
+
+// NextAVMVersion returns the AVM transaction format valid in the next block.
+func (m *Mempool) NextAVMVersion() TxVersion {
+	if m.cfg.CurrentHeight != nil && m.cfg.RingCTAmountBindingActivationHeight > 0 {
+		nextHeight := m.cfg.CurrentHeight()
+		if nextHeight < ^uint64(0) {
+			nextHeight++
+		}
+		if nextHeight >= m.cfg.RingCTAmountBindingActivationHeight {
+			return TxVersionAVMAmountBinding
+		}
+	}
+	return TxVersionAVM
 }
 
 // Add attempts to add a transaction to the mempool.
@@ -206,6 +225,7 @@ func (m *Mempool) Add(tx Transaction) error {
 			m.cfg.RingCTV4ActivationHeight,
 			m.cfg.RingCTCLSAGActivationHeight,
 			m.cfg.AVMActivationHeight,
+			m.cfg.RingCTAmountBindingActivationHeight,
 		); err != nil {
 			return fmt.Errorf("mempool: transaction activation policy: %w", err)
 		}

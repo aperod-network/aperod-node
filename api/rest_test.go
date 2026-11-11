@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -796,6 +797,35 @@ func TestREST_AdminMint_ZeroAmount(t *testing.T) {
 	code, _ := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
 	if code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for zero amount, got %d", code)
+	}
+}
+
+func TestREST_AdminMint_RejectsValidatorRewardAddressBeforeScheduling(t *testing.T) {
+	srv, _ := newTestServer(t)
+	wallet, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys: %v", err)
+	}
+	rewardAddress := crypto.EncodeAddress(crypto.MainnetByte, wallet.Spend.Public, wallet.View.Public)
+	srv.SetRewardAddress(string(rewardAddress))
+	scheduled := false
+	srv.SetMintScheduler(func(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (string, uint64, error) {
+		scheduled = true
+		return "", 0, nil
+	})
+
+	body := []byte(`{"idempotency_key":"reward-collision","address":"` + string(rewardAddress) + `","amount_apr":1}`)
+	code, response := restLocalPostJSON(t, srv, "/api/v1/admin/mint", body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for validator reward address, got %d: %v", code, response)
+	}
+	message, _ := response["error"].(string)
+	if !strings.Contains(message, "validator reward address") ||
+		!strings.Contains(message, "one-time pub") {
+		t.Fatalf("expected readable reward-address collision, got %q", message)
+	}
+	if scheduled {
+		t.Fatal("reward-address mint was passed to the scheduler")
 	}
 }
 

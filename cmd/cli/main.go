@@ -261,9 +261,11 @@ var walletRestoreCmd = &cobra.Command{
 
 		if phrase == "" {
 			fmt.Print("  Enter mnemonic phrase: ")
-			var line string
-			fmt.Scanln(&line)
-			phrase = strings.TrimSpace(line)
+			var err error
+			phrase, err = readMnemonicLine(os.Stdin)
+			if err != nil {
+				return fmt.Errorf("read mnemonic: %w", err)
+			}
 		}
 
 		legacyMnemonic, err := wallet.ValidateMnemonicForRecovery(phrase)
@@ -323,6 +325,14 @@ var walletRestoreCmd = &cobra.Command{
 
 		return nil
 	},
+}
+
+func readMnemonicLine(reader io.Reader) (string, error) {
+	line, err := bufio.NewReader(reader).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // wallet unlock — decrypt keystore and show keys.

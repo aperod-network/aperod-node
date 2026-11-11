@@ -7,10 +7,7 @@ import (
 )
 
 func TestWholeOpeningUsesRecordedBlindWithoutAssumingMintDerivation(t *testing.T) {
-	blind, err := crypto.DeterministicMintBlind(crypto.Point32{7}, 123)
-	if err != nil {
-		t.Fatal(err)
-	}
+	blind := crypto.BlindFactor{1}
 	for _, whole := range []uint64{0, 1, 37, 1000, 65535} {
 		c, err := crypto.Commit(whole*100000000, blind)
 		if err != nil {

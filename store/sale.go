@@ -19,6 +19,8 @@ type SaleMigration struct {
 	Reconciliation sale.Reconciliation
 	Trusted        []crypto.ValidatorPubKey
 }
+
+// SaleSettlement contains the durable state transition prepared for a sale block.
 type SaleSettlement struct {
 	Migration *SaleMigration
 	Before    *sale.State
@@ -36,6 +38,7 @@ func saleFence(kind byte, id crypto.Hash32) []byte {
 }
 func saleJournalKey(hash crypto.Hash32) []byte { return append([]byte("sale/journal/v1/"), hash[:]...) }
 
+// LoadSaleState returns the persisted sale ledger state, if one exists.
 func (d *DB) LoadSaleState() (*sale.State, error) {
 	raw, err := d.get(saleStateKey)
 	if err != nil || raw == nil {
@@ -47,6 +50,8 @@ func (d *DB) LoadSaleState() (*sale.State, error) {
 	}
 	return &s, nil
 }
+
+// SaleConsumed reports whether an order or payment identifier is durably fenced.
 func (d *DB) SaleConsumed(kind byte, id crypto.Hash32) (bool, error) {
 	if kind != 'o' && kind != 'p' {
 		return false, fmt.Errorf("sale: invalid fence namespace")
@@ -54,6 +59,7 @@ func (d *DB) SaleConsumed(kind byte, id crypto.Hash32) (bool, error) {
 	return d.db.Has(saleFence(kind, id), nil)
 }
 
+// PrepareSaleBlock validates and prepares sale-ledger effects for a candidate block.
 func (d *DB) PrepareSaleBlock(b *core.Block, m *SaleMigration) (*SaleSettlement, error) {
 	if b == nil {
 		return nil, fmt.Errorf("sale: nil block")
@@ -186,10 +192,13 @@ func (d *DB) appendSaleSettlement(batch *leveldb.Batch, data []byte, hash crypto
 	}
 	batch.Put(saleStateKey, raw)
 	journal := saleJournal{Before: actual.Before}
+	activationBlock := actual.Before == nil
+	hasSaleDelivery := false
 	for txIndex, tx := range b.Txs {
 		if !tx.IsSale() {
 			continue
 		}
+		hasSaleDelivery = true
 		a, err := tx.SaleAuthorization()
 		if err != nil {
 			return err
@@ -222,6 +231,29 @@ func (d *DB) appendSaleSettlement(batch *leveldb.Batch, data []byte, hash crypto
 			batch.Put(utxoKey(th, uint32(i)), raw)
 			batch.Put(ringMemberKey(out.OneTimePub), raw)
 		}
+	}
+	retentionKind := byte(0)
+	if activationBlock {
+		retentionKind |= saleRetainedActivation
+	}
+	if hasSaleDelivery {
+		retentionKind |= saleRetainedDelivery
+	}
+	if retentionKind != 0 {
+		if err := d.stageSaleRetainedBlock(batch, height, hash, retentionKind); err != nil {
+			return err
+		}
+	}
+	if activationBlock {
+		expectedIndex := saleRetentionHeightValue(p.Migration.Checkpoint.Height)
+		existingIndex, err := d.get(saleRetentionIndexKey)
+		if err != nil {
+			return err
+		}
+		if existingIndex != nil && string(existingIndex) != string(expectedIndex) {
+			return fmt.Errorf("sale: conflicting retained activation height")
+		}
+		batch.Put(saleRetentionIndexKey, expectedIndex)
 	}
 	raw, err = json.Marshal(journal)
 	if err != nil {
@@ -260,6 +292,7 @@ func (d *DB) restoreSale(batch *leveldb.Batch, target crypto.Hash32, height uint
 		if json.Unmarshal(body, &b) != nil || b.Hash() != cursor || b.Header.Height != current {
 			return fmt.Errorf("sale: rollback body missing")
 		}
+		retainBlock := journal.Before == nil
 		for _, id := range journal.QueuedOrders {
 			order, err := d.SaleOrder(id)
 			if err != nil {
@@ -274,6 +307,7 @@ func (d *DB) restoreSale(batch *leveldb.Batch, target crypto.Hash32, height uint
 			if !tx.IsSale() {
 				continue
 			}
+			retainBlock = true
 			a, err := tx.SaleAuthorization()
 			if err != nil {
 				return err
@@ -287,6 +321,12 @@ func (d *DB) restoreSale(batch *leveldb.Batch, target crypto.Hash32, height uint
 				batch.Delete(ringMemberKey(out.OneTimePub))
 				batch.Delete(spentUTXOKey(th, uint32(i)))
 			}
+		}
+		if retainBlock {
+			batch.Delete(saleRetainedBlockKey(current))
+		}
+		if journal.Before == nil {
+			batch.Delete(saleRetentionIndexKey)
 		}
 		batch.Delete(heightKey(current))
 		batch.Delete(saleJournalKey(cursor))

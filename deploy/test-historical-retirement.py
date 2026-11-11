@@ -686,6 +686,13 @@ class HistoricalRegistrationTests(unittest.TestCase):
 
 
 class B2VersionTests(unittest.TestCase):
+    def test_missing_archive_proof_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = RetirementFixture(Path(tmp))
+            record = cleanup.read_json(fixture.record_path())
+            with self.assertRaisesRegex(cleanup.CleanupError, "archive proof is missing"):
+                retirement._validated_archive_proof(record, {}, {})
+
     def test_by_id_download_uses_account_authorization_token(self):
         settings = {"s3backup": {
             "endpoint": "https://s3.us-west-004.backblazeb2.com", "bucket": "vault",

@@ -675,14 +675,21 @@ func (d *DB) BindGuardianFundConfig(height uint64, genesis crypto.Hash32) error 
 }
 
 type AdminMintRecord struct {
-	// State is intent, prepared, or completed. Empty is accepted as
+	// State is intent, prepared, completed, or failed. Empty is accepted as
 	// completed for records written by versions predating this state
 	// machine.
 	State      string        `json:"state,omitempty"`
+	Failure    string        `json:"failure,omitempty"`
 	Address    string        `json:"address"`
 	AmountNAPR uint64        `json:"amount_napr"`
 	TxHash     crypto.Hash32 `json:"tx_hash"`
 	Height     uint64        `json:"height"`
+}
+
+// AdminMintRecordEntry describes the canonical record for an administrator mint.
+type AdminMintRecordEntry struct {
+	IdempotencyKey string
+	Record         AdminMintRecord
 }
 
 // StoreAdminMintRecord synchronously persists an admin-mint state transition.
@@ -713,6 +720,32 @@ func (d *DB) LoadAdminMintRecord(idempotencyKey string) (record AdminMintRecord,
 		return record, false, fmt.Errorf("load admin mint record: corrupt value: %w", err)
 	}
 	return record, true, nil
+}
+
+// ListAdminMintRecords returns a consistent snapshot of all durable mint
+// records. Startup reconciliation uses it to retire queued intents that are
+// invalid under the active node configuration.
+func (d *DB) ListAdminMintRecords() ([]AdminMintRecordEntry, error) {
+	prefix := append(append([]byte(nil), prefixMeta...), []byte("admin_mint/")...)
+	iter := d.db.NewIterator(util.BytesPrefix(prefix), nil)
+	defer iter.Release()
+
+	records := make([]AdminMintRecordEntry, 0)
+	for iter.Next() {
+		key := string(append([]byte(nil), iter.Key()[len(prefix):]...))
+		if key == "" {
+			return nil, fmt.Errorf("list admin mint records: empty idempotency key")
+		}
+		var record AdminMintRecord
+		if err := json.Unmarshal(append([]byte(nil), iter.Value()...), &record); err != nil {
+			return nil, fmt.Errorf("list admin mint records: corrupt record")
+		}
+		records = append(records, AdminMintRecordEntry{IdempotencyKey: key, Record: record})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("list admin mint records: %w", err)
+	}
+	return records, nil
 }
 
 // ─── Staking pool ─────────────────────────────────────────────────────────────
@@ -862,6 +895,7 @@ func (d *DB) CommitRawBlockWithAVM(
 	return d.commitRawBlock(hash, height, data, writes, writeSetCommitment, nil, lpodSettlement)
 }
 
+// CommitRawBlockWithSale atomically commits a canonical block and its sale settlement.
 func (d *DB) CommitRawBlockWithSale(hash crypto.Hash32, height uint64, data []byte, writes []AVMWrite,
 	writeSetCommitment crypto.Hash32, saleSettlement *SaleSettlement, lpodSettlement ...*LPoDSettlement) error {
 	return d.commitRawBlock(hash, height, data, writes, writeSetCommitment, saleSettlement, lpodSettlement)
@@ -1071,22 +1105,22 @@ func (d *DB) GetRawBlockByHeight(height uint64) ([]byte, error) {
 	return d.GetRawBlock(hash)
 }
 
-// StoreTxIdxCompleteHeight records that all blocks from height 1 up to and
-// including h have had their per-transaction location written to the t/ index.
-// The value is updated incrementally by the startup scan (scan.go) and the
-// background backfill goroutine (main.go) so that a subsequent restart
-// resumes from where the previous run stopped rather than reprocessing the
-// full history.
+// StoreTxIdxCompleteHeight records the highest contiguous height covered by
+// the tx-index startup scan or backfill. Available transaction bodies through
+// this height have t/ entries; the background backfill may advance past an
+// unavailable body after warning so it can index later blocks. The marker lets
+// a later restart resume without reprocessing the full history.
 func (d *DB) StoreTxIdxCompleteHeight(h uint64) error {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, h)
 	return d.PutMeta("txidx_complete_height", buf)
 }
 
-// LoadTxIdxCompleteHeight returns the highest block height through which the
-// t/ tx-hash index is guaranteed to be fully populated.  Returns (0, false,
-// nil) when no backfill has run yet (first boot or a pre-feature DB); the
-// caller should treat 0 as "nothing indexed yet".
+// LoadTxIdxCompleteHeight returns the highest contiguous block height covered
+// by the tx-index scan/backfill. A body skipped by the background backfill is
+// considered covered, but cannot have transaction index entries.
+// Returns (0, false, nil) when no backfill has run yet (first boot or a
+// pre-feature DB); the caller should treat 0 as "nothing indexed yet".
 func (d *DB) LoadTxIdxCompleteHeight() (h uint64, found bool, err error) {
 	v, err := d.GetMeta("txidx_complete_height")
 	if err != nil {

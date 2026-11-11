@@ -27,7 +27,7 @@ For a five-minute mixed-HTTP soak alone:
 cd blockchain
 APEROD_RUN_AVM_STRESS=1 APEROD_AVM_STRESS_DURATION=5m \
   APEROD_AVM_STRESS_WORKERS=12 GOMAXPROCS=2 GOMEMLIMIT=512MiB \
-  GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.26.10+auto \
+  GOSUMDB=sum.golang.org GOTOOLCHAIN=go1.26.11+auto \
   go test -p 1 ./consensus -run '^TestAVMMixedHTTPStress$' -v -count=1 -timeout=8m
 ```
 

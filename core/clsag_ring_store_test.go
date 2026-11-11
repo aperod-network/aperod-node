@@ -24,14 +24,9 @@ func (s *testRingStore) SampleRingMembers(count int, _ map[crypto.Point32]bool) 
 	return s.sampled[:count], nil
 }
 
-func TestCLSAGOutputCacheIsBoundedAndFallsBackToPersistentIndex(t *testing.T) {
-	oldLimit := maxCLSAGRecentOutputs
-	maxCLSAGRecentOutputs = 2
-	t.Cleanup(func() { maxCLSAGRecentOutputs = oldLimit })
-
+func TestCLSAGActiveOutputsRemainSpendableAndIndexed(t *testing.T) {
 	backend := &testRingStore{members: make(map[crypto.Point32]*UTXO)}
 	set := NewUTXOSetWithDB(backend)
-	set.SetCLSAGActivationHeight(10)
 
 	var first *UTXO
 	for i := byte(1); i <= 4; i++ {
@@ -46,8 +41,11 @@ func TestCLSAGOutputCacheIsBoundedAndFallsBackToPersistentIndex(t *testing.T) {
 		}
 	}
 
-	if got := set.Get(first.TxHash, 0); got != nil {
-		t.Fatal("old v5 output remained in bounded in-memory cache")
+	if got := set.Get(first.TxHash, 0); got == nil {
+		t.Fatal("old unspent output was evicted from the active UTXO set")
+	}
+	if got := set.GetByPubKey(first.OneTimePub); got == nil {
+		t.Fatal("old unspent output was evicted from the active public-key index")
 	}
 	if got := set.GetRingMember(first.OneTimePub); got == nil ||
 		got.TxHash != first.TxHash || got.OneTimePub != first.OneTimePub {

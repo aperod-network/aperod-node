@@ -28,14 +28,16 @@
 #  systemctl stubs) is identical to test-install-node-e2e.sh so the real
 #  install-node.sh runs end-to-end, not a stripped excerpt.
 #
-#  Skip condition: Docker not found or daemon unreachable → exit 0 (skip).
+#  Skip condition: Docker unavailable or no reviewed source commit is provided.
+#  Infrastructure skips print SKIP_SUMMARY and exit 77.
 #
 #  Run from anywhere:
 #    bash blockchain/deploy/test-install-node-primary-ip.sh
 #
 #  Exit codes:
-#    0 — all assertions passed (or Docker unavailable → skipped)
-#    1 — one or more assertions failed
+#    0  — all assertions passed
+#    1  — one or more assertions failed
+#    77 — skipped (Docker unavailable or reviewed source commit not provided)
 # =============================================================================
 set -uo pipefail
 
@@ -47,15 +49,21 @@ BOLD='\033[1m'; NC='\033[0m'
 pass()    { echo -e "${GREEN}  PASS${NC}  $*"; }
 fail()    { echo -e "${RED}  FAIL${NC}  $*"; }
 section() { echo -e "\n${BOLD}▶ $*${NC}"; }
+skip() {
+  echo -e "${YELLOW}[SKIP]${NC}  $*"
+  echo "SKIP_SUMMARY: install-node-primary-ip: $*"
+  exit 77
+}
 
 # ── Docker availability check ─────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
-  echo -e "${YELLOW}[SKIP]${NC}  Docker not found in PATH — skipping primary-ip test."
-  exit 0
+  skip "Docker not found in PATH."
 fi
 if ! docker info &>/dev/null 2>&1; then
-  echo -e "${YELLOW}[SKIP]${NC}  Docker daemon not reachable — skipping primary-ip test."
-  exit 0
+  skip "Docker daemon is not reachable."
+fi
+if [[ ! "${APEROD_NODE_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  skip "Set APEROD_NODE_SOURCE_COMMIT to a reviewed full public commit before running the installer rehearsal."
 fi
 
 IMAGE_TAG="aperod-primary-ip-test:latest"
@@ -229,17 +237,16 @@ case "${1:-} ${2:-}" in
   "wallet create")
     out=""
     prev=""
-    for a in "$@"; do [[ "$prev" == "--out" ]] && out="$a"; prev="$a"; done
+    for a in "$@"; do [[ "$prev" == "--output" ]] && out="$a"; prev="$a"; done
     if [[ -n "$out" ]]; then
       mkdir -p "$(dirname "$out")"
       printf '{"address":"apr1test00000000000000000000000000000000000","version":1}\n' > "$out"
     fi
     ;;
-  "wallet address") echo "apr1test00000000000000000000000000000000000" ;;
-  "wallet import")
+  "wallet restore")
     out=""
     prev=""
-    for a in "$@"; do [[ "$prev" == "--out" ]] && out="$a"; prev="$a"; done
+    for a in "$@"; do [[ "$prev" == "--output" ]] && out="$a"; prev="$a"; done
     if [[ -n "$out" ]]; then
       mkdir -p "$(dirname "$out")"
       printf '{"address":"apr1test00000000000000000000000000000000000","version":1}\n' > "$out"

@@ -1,9 +1,14 @@
 package consensus
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +19,8 @@ import (
 	"github.com/aperod/aperod/sale"
 	"github.com/aperod/aperod/store"
 	"github.com/aperod/aperod/wallet"
+
+	"github.com/syndtr/goleveldb/leveldb"
 )
 
 // Independent engines use real quorum signatures and separately committed
@@ -45,7 +52,9 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 	g := engineBlock(t, 0, 0, crypto.Hash32{}, keys[0], nil)
 	parent := engineBlock(t, store.LPoDV2ActivationHeight-1, 0, g.Hash(), keys[0], nil)
 	parent.Header.Timestamp = time.Now().UnixNano() - 6_000_000_000
-	parent.Header.Sign(keys[0])
+	if err := parent.Header.Sign(keys[0]); err != nil {
+		t.Fatal(err)
+	}
 	lm := &store.LPoDMigration{Version: 3, PositionLifecycleVersion: 1,
 		Height: store.LPoDV2ActivationHeight, Genesis: g.Hash(), ParentHash: parent.Hash(),
 		TrustAssumption: store.LPoDV3TrustAssumption, NominalEligible: 6_000_000_000 * lpod.Unit,
@@ -73,7 +82,11 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 			t.Fatal(err)
 		}
 		dbs[i] = d
-		t.Cleanup(func() { d.Close() })
+		t.Cleanup(func() {
+			if err := d.Close(); err != nil && !errors.Is(err, leveldb.ErrClosed) {
+				t.Errorf("close sale integration database: %v", err)
+			}
+		})
 		raw, _ := json.Marshal(g)
 		if err = d.CommitRawBlockWithAVM(g.Hash(), 0, raw, nil, crypto.Hash32{}); err != nil {
 			t.Fatal(err)
@@ -110,7 +123,9 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 		}
 		b := engineBlock(t, lm.Height, 1, parent.Hash(), keys[0], []core.Transaction{reward, core.LPoDCheckpointTx(c.Digest())})
 		b.Header.Timestamp = settlement.Timestamp
-		b.Header.Sign(keys[0])
+		if err := b.Header.Sign(keys[0]); err != nil {
+			t.Fatal(err)
+		}
 		if funding != nil && funding.Hash() != b.Hash() {
 			t.Fatal("independent funding differs")
 		}
@@ -446,8 +461,22 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 		t.Fatal("purchase did not debit the available allocation by its credited amount")
 	}
 	if httpRehearsal != nil {
-		// Sign only after the actual owner scanner found the exact credited output.
-		httpRehearsal.acknowledge(buyer.Keys)
+		// Exercise a legacy-style bounded prune window across the activation,
+		// intervening block, and finalized delivery without scanning millions of
+		// synthetic heights in this isolated fixture.
+		for _, d := range dbs {
+			if err := d.EnsureSaleRetention(migration); err != nil {
+				t.Fatal("sale retention setup failed", err)
+			}
+			var cursor [8]byte
+			binary.LittleEndian.PutUint64(cursor[:], cp.Height-2)
+			if err := d.PutMeta("prune_cursor", cursor[:]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := d.PruneBlocksOlderThan(block.Header.Height + 1); err != nil {
+				t.Fatal("bounded sale-history prune failed", err)
+			}
+		}
 	}
 	// Purchases must exist as actual active outputs in the node snapshot, not
 	// merely as a payment callback or an incremented display total.
@@ -504,7 +533,11 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer reopened.Close()
+		defer func() {
+			if err := reopened.Close(); err != nil {
+				t.Errorf("close reopened sale integration database: %v", err)
+			}
+		}()
 		persisted, err := reopened.LoadSaleState()
 		if err != nil || persisted == nil || *persisted != *a {
 			t.Fatalf("validator %d lost sale debit on reopening: %v", i, err)
@@ -512,13 +545,62 @@ func testSaleTwoValidatorCanonicalDelivery(t *testing.T, basis string) {
 		if _, err := reopened.LoadSaleMigrationFile(configPath); err != nil {
 			t.Fatal("reopened ledger rejected its signed configuration", err)
 		}
+		if err := reopened.EnsureSaleRetention(migration); err != nil {
+			t.Fatal("reopened ledger could not validate sale retention", err)
+		}
 		engines[i].cfg.Store = reopened
 		if httpRehearsal != nil && producer == engines[i] {
 			httpRehearsal.server.SetStore(reopened)
+			// Restore only the exact anchor that both validators finalized above;
+			// ancestor checks still require the persisted canonical height index.
+			restoredFinality := &Engine{cfg: engines[i].cfg, lpodFinalizedHashes: map[uint64]crypto.Hash32{
+				block.Header.Height: block.Hash(),
+			}}
+			if !restoredFinality.IsSaleFinalizedHash(block.Header.Height, block.Hash()) {
+				t.Fatal("reopened canonical delivery lost its finalized anchor")
+			}
+			httpRehearsal.server.SetSaleConfig(migration, engines[i].CanSettleSale, restoredFinality.IsSaleFinalizedHash)
+			status := httpRehearsal.request("status", nil, 200)
+			if status["remaining_napro"] != strconv.FormatUint(a.Remaining, 10) ||
+				status["sold_napro"] != strconv.FormatUint(a.Sold, 10) ||
+				status["historical_supply_verified"] != false {
+				t.Fatal("post-prune status reset allocation or overstated history", status)
+			}
+			finalized := httpRehearsal.receipt("finalized")
+			delivery, err := reopened.SaleOrderDelivery(httpRehearsal.order)
+			if err != nil || delivery == nil ||
+				finalized["block_hash"] != hex.EncodeToString(delivery.Block[:]) ||
+				finalized["tx_hash"] != hex.EncodeToString(delivery.Transaction[:]) {
+				t.Fatal("post-prune receipt is not bound to the canonical delivery", err, finalized)
+			}
+			wrongBlock := crypto.HashBytes([]byte("noncanonical sale delivery"))
+			httpRehearsal.request("recover", map[string]any{
+				"order":      hex.EncodeToString(httpRehearsal.order[:]),
+				"block_hash": hex.EncodeToString(wrongBlock[:]),
+				"tx_hash":    finalized["tx_hash"], "signature": strings.Repeat("00", 64),
+			}, 409)
+			// Sign only after the real owner scanner found the credited output and
+			// the pruned/reopened API revalidated its canonical receipt.
+			httpRehearsal.acknowledge(buyer.Keys)
+			recovery, err := reopened.SaleOrderRecovery(httpRehearsal.order)
+			if err != nil || recovery == nil || recovery.Block != delivery.Block ||
+				recovery.Transaction != delivery.Transaction {
+				t.Fatal("owner recovery was not preserved against canonical hashes", err)
+			}
+			persisted, err := reopened.LoadSaleState()
+			if err != nil || persisted == nil || *persisted != *a {
+				t.Fatal("pruning/recovery changed the sale allocation or double-credited it", err)
+			}
 			httpRehearsal.receipt("completed")
 			pending, err := reopened.PendingPaidSales(cp.Genesis, block.Header.Height+1, block.Hash(), cp.Network, keys[0])
 			if err != nil || len(pending) != 0 {
 				t.Fatal("restart requeued an already delivered payment", err)
+			}
+			if consumed, err := reopened.SaleConsumed('o', httpRehearsal.order); err != nil || !consumed {
+				t.Fatal("order replay fence disappeared after pruning", err)
+			}
+			if consumed, err := reopened.SaleConsumed('p', httpRehearsal.payment); err != nil || !consumed {
+				t.Fatal("payment replay fence disappeared after pruning", err)
 			}
 		}
 	}

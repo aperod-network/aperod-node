@@ -28,6 +28,7 @@ var saleProviderID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 var saleCurrency = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
 var saleDecimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,29})(\.[0-9]{1,30})?$`)
 
+// Valid reports whether the invoice fields satisfy the provider wire contract.
 func (i SaleInvoice) Valid() bool {
 	value, ok := new(big.Rat).SetString(i.Amount)
 	return saleProviderID.MatchString(i.ProviderID) && saleCurrency.MatchString(i.Currency) &&
@@ -41,6 +42,7 @@ func validSalePrice(price string) bool {
 	return saleDecimal.MatchString(price) && ok && v.Sign() > 0
 }
 
+// SaleProviderPayment derives the stable payment identifier for a provider invoice.
 func SaleProviderPayment(id string) crypto.Hash32 {
 	return crypto.Hash32(sha256.Sum256([]byte("aperod/protocol-sale/payment/v1\x00NOWPayments\x00" + id)))
 }

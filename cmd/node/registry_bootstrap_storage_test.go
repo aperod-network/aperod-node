@@ -31,7 +31,11 @@ func TestBootstrapSpentLookupErrorsFailClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close bootstrap storage database: %v", err)
+				}
+			}()
 			u := &core.UTXO{TxHash: crypto.HashStr("lookup-error"), BlockHeight: 1}
 			snap := &startupSnapshot{TipHeight: 1, UTXOs: core.UTXOSnapshot{ActiveUTXOs: []*core.UTXO{u}}}
 			utxos := core.NewUTXOSet()
@@ -60,7 +64,14 @@ func TestBootstrapCapturedTipBinding(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			dbClosed := false
+			defer func() {
+				if !dbClosed {
+					if err := db.Close(); err != nil {
+						t.Errorf("close captured-tip database: %v", err)
+					}
+				}
+			}()
 			hash, other := crypto.HashStr("captured"), crypto.HashStr("changed")
 			if err := db.PutRawBlock(hash, 10, []byte("{}")); err != nil {
 				t.Fatal(err)
@@ -77,6 +88,7 @@ func TestBootstrapCapturedTipBinding(t *testing.T) {
 				err = db.PutRawBlock(other, 10, []byte("{}"))
 			case "closed":
 				err = db.Close()
+				dbClosed = true
 			}
 			if err != nil {
 				t.Fatal(err)

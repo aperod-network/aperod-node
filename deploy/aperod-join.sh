@@ -7,13 +7,7 @@
 #    sudo bash aperod-join.sh <PRIMARY_IP>:<API_PORT> [OPTIONS]
 #
 #  Примеры:
-#    # Простой вариант (dev/тест, без API-ключа):
-#    sudo bash aperod-join.sh 89.169.53.128:8545
-#
-#    # С API-ключом (передаётся в открытом виде по HTTP — используйте --tunnel!):
-#    sudo bash aperod-join.sh 89.169.53.128:8545 --api-key mySecret --tunnel user@primary
-#
-#    # Через SSH-туннель (рекомендуется для prod):
+#    # Remote sync is only supported through an SSH tunnel with a pinned host key:
 #    sudo bash aperod-join.sh 89.169.53.128:8545 --tunnel aperod@89.169.53.128
 #
 #    # Нестандартная директория данных:
@@ -28,15 +22,10 @@
 #    --skip-start            Не запускать aperod-node после загрузки
 #    --no-chaindb            Пропустить загрузку chain.db (только snapshot)
 #
-#  ⚠️  ВАЖНО — безопасность передачи данных:
-#    Этот скрипт использует plain HTTP для загрузки chain.db и snapshot.
-#    Если задан --api-key, ключ передаётся в открытом виде.
-#    В производственной среде настоятельно рекомендуется один из вариантов:
-#      1. --tunnel user@primary-host  (SSH-туннель, автоматически)
-#      2. Настроить HTTPS на основном узле (nginx + TLS)
-#      3. Использовать VPN (WireGuard/OpenVPN)
-#    Без одного из этих вариантов API-ключ и данные цепочки могут быть
-#    перехвачены на промежуточных узлах сети.
+#  Безопасность передачи:
+#    Remote HTTP sync is rejected. Use --tunnel with the primary server's
+#    SSH host key already pinned in root's known_hosts. Loopback HTTP is
+#    allowed for local test fixtures only. Never accept a first-use host key.
 #
 #  Что делает скрипт:
 #    1. Останавливает aperod-node на ТЕКУЩЕМ сервере
@@ -103,6 +92,16 @@ done
 PRIMARY_HOST="${PRIMARY%%:*}"
 PRIMARY_PORT="${PRIMARY##*:}"
 [[ "${PRIMARY_PORT}" =~ ^[0-9]+$ ]] || PRIMARY_PORT="8545"
+
+# Chain DB and snapshots are consensus-critical bootstrap data. Do not accept
+# them over remote plaintext HTTP, even when no API key is configured.
+if [[ -z "${TUNNEL_HOST}" && "${PRIMARY_HOST}" != "127.0.0.1" ]]; then
+  die "Удалённая загрузка по HTTP запрещена. Используйте --tunnel с заранее закреплённым SSH host key."
+fi
+
+# Joining without a config cannot install the validator's whitelist protection.
+# Fail before stopping a service or replacing any existing chain data.
+[[ -f "${NODE_YAML}" ]] || die "${NODE_YAML} не найден. Сначала установите ноду через install-node.sh; без node.yaml нельзя настроить peer_whitelist."
 
 # ── Ранняя проверка: --no-chaindb несовместим с safe-mode guard ───────────────
 # install-node.sh sets consensus.non_validator: true when no --primary-ip is
@@ -174,16 +173,6 @@ if [[ -n "${TUNNEL_HOST}" ]]; then
   command -v ssh >/dev/null 2>&1 || die "Требуется 'ssh' для --tunnel, но он не установлен"
 fi
 
-# ── Предупреждение: HTTP + API-ключ ──────────────────────
-if [[ -n "${API_KEY}" && -z "${TUNNEL_HOST}" ]]; then
-  echo -e "${YELLOW}${BOLD}⚠️  ВНИМАНИЕ: API-ключ будет передан по нешифрованному HTTP.${NC}"
-  echo -e "${YELLOW}   Рекомендуем использовать SSH-туннель:${NC}"
-  echo -e "${YELLOW}   ${BOLD}bash aperod-join.sh ${PRIMARY} --api-key ... --tunnel ${DATA_USER}@${PRIMARY_HOST}${NC}"
-  echo
-  read -rp "Продолжить без туннеля? [y/N] " CONFIRM
-  [[ "${CONFIRM,,}" == "y" ]] || die "Прервано. Запустите с --tunnel для безопасной передачи."
-fi
-
 # ── Вспомогательная функция: cleanup ─────────────────────
 cleanup() {
   if [[ -n "${TUNNEL_PID}" ]]; then
@@ -209,7 +198,8 @@ info "Шаг 1/7: Проверяем доступность основного �
 
 if [[ -n "${TUNNEL_HOST}" ]]; then
   info "  Поднимаем SSH-туннель: ${TUNNEL_HOST}:${PRIMARY_PORT} → localhost:${TUNNEL_LOCAL_PORT}…"
-  ssh -o StrictHostKeyChecking=accept-new \
+  ssh -o StrictHostKeyChecking=yes \
+      -o UserKnownHostsFile=/root/.ssh/known_hosts \
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=30 \
       -fN \
@@ -345,9 +335,7 @@ BOOTNODE_ADDR="/ip4/${PRIMARY_HOST}/tcp/${PRIMARY_P2P_PORT}"
 info "Шаг 7/8: Прописываем bootnode ${BOOTNODE_ADDR} в ${NODE_YAML}…"
 
 if [[ ! -f "${NODE_YAML}" ]]; then
-  warn "${NODE_YAML} не найден — пропускаем настройку bootnode"
-  warn "Прописать вручную после установки:"
-  warn "  bash /opt/aperod/blockchain/deploy/node-config.sh add-bootnode ${BOOTNODE_ADDR}"
+  die "${NODE_YAML} не найден — bootnode и peer_whitelist не настроены."
 else
   # Preferred path: node-config.sh (YAML-safe, idempotent, handles legacy migration).
   if [[ -x "${NODE_CONFIG_SH}" ]]; then
@@ -394,13 +382,47 @@ PY
   # догоняет цепь и не может принять gossip-блоки основного узла.
   # peer_whitelist исключает PRIMARY_HOST из счётчика страйков.
   info "Шаг 7.5/8: Прописываем ${PRIMARY_HOST} в p2p.peer_whitelist…"
-  python3 - "${NODE_YAML}" "${PRIMARY_HOST}" <<'PY'
-import sys, yaml, os
+  python3 - "${NODE_YAML}" "${PRIMARY_HOST}" "${DATA_DIR}" <<'PY'
+import sys, yaml, os, json, ipaddress, stat, subprocess, tempfile
 cfg_path     = sys.argv[1]
 primary_ip   = sys.argv[2]
 with open(cfg_path) as f:
     cfg = yaml.safe_load(f) or {}
 p2p = cfg.setdefault("p2p", {})
+validator_ip = primary_ip
+ipaddress.IPv4Address(validator_ip)
+# A nonempty runtime sidecar overrides YAML. Merge the joining validator into
+# the target's policy too; do not delete existing operator entries or import
+# the source host's policy. "-" explicitly disables sidecar persistence.
+sidecar = p2p.get("whitelist_file") or os.path.join(cfg.get("data_dir") or sys.argv[3], "p2p_whitelist.json")
+if sidecar != "-":
+    if not os.path.isabs(sidecar):
+        cwd = subprocess.check_output(["systemctl", "show", "aperod-node", "--property=WorkingDirectory", "--value"], text=True).strip() or "/"
+        if not os.path.isabs(cwd):
+            raise ValueError("aperod-node WorkingDirectory must be absolute")
+        sidecar = os.path.join(cwd, sidecar)
+    if os.path.lexists(sidecar):
+        with open(sidecar) as f:
+            entries = json.load(f)
+        if not isinstance(entries, list) or any(not isinstance(e, str) for e in entries):
+            raise ValueError("Invalid whitelist sidecar: expected IP/CIDR array")
+        for entry in entries:
+            ipaddress.ip_network(entry, strict=False)
+        if validator_ip not in entries:
+            entries.append(validator_ip)
+            meta = os.stat(sidecar)
+            fd, tmp_sidecar = tempfile.mkstemp(prefix=".join-whitelist-", dir=os.path.dirname(sidecar))
+            try:
+                with os.fdopen(fd, "w") as f:
+                    os.fchown(f.fileno(), meta.st_uid, meta.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(meta.st_mode))
+                    json.dump(entries, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_sidecar, sidecar)
+            finally:
+                if os.path.exists(tmp_sidecar):
+                    os.unlink(tmp_sidecar)
 wl  = list(p2p.get("peer_whitelist") or [])
 if primary_ip not in wl:
     wl.append(primary_ip)

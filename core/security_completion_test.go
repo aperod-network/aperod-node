@@ -118,7 +118,11 @@ func TestSecurityReview_KeyImageAcrossLevelDBReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close reopened security completion database: %v", err)
+		}
+	}()
 	restarted := core.NewUTXOSetWithDB(db)
 	if !restarted.IsSpent(ki) {
 		t.Fatal("spent image lost across actual LevelDB close/reopen")

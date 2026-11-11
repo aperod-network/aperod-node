@@ -15,7 +15,12 @@ func (e *Engine) validateVersionWithSales(tx *core.Transaction, height, activati
 		_, err := tx.SaleAuthorization()
 		return err
 	}
-	return core.ValidateTxVersionAtHeight(tx, height, activation, e.cfg.RingCTCLSAGActivationHeight, e.cfg.AVMActivationHeight)
+	return core.ValidateTxVersionAtHeight(
+		tx, height, activation,
+		e.cfg.RingCTCLSAGActivationHeight,
+		e.cfg.AVMActivationHeight,
+		e.cfg.RingCTAmountBindingActivationHeight,
+	)
 }
 
 func (e *Engine) prepareSale(b *core.Block) (*store.SaleSettlement, error) {

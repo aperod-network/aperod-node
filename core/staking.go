@@ -662,6 +662,7 @@ func (r *ValidatorRegistry) ConfigureStakeKeyImageV4(activation uint64) error {
 	return nil
 }
 
+// StakeKeyImageV4Activation returns the configured activation height for v4 stake key images.
 func (r *ValidatorRegistry) StakeKeyImageV4Activation() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

@@ -32,9 +32,15 @@ func signingAuthority(cfg config.ConsensusConfig, d *store.DB) (*core.ValidatorA
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	raw, err := io.ReadAll(io.LimitReader(f, 65537))
-	if err != nil || len(raw) > 65536 {
+	closeErr := f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close authority rule: %w", closeErr)
+	}
+	if len(raw) > 65536 {
 		return nil, fmt.Errorf("authority rule exceeds limit")
 	}
 	sum := sha256.Sum256(raw)

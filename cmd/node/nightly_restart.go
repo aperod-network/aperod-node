@@ -4,18 +4,43 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/aperod/aperod/config"
 )
 
 // durationUntilRestartAt returns how long until the next occurrence of
 // hour:minute UTC, given now.  The result is always in the range (0, 24h]:
 // if now is exactly at hour:minute the next occurrence is 24 h from now.
 func durationUntilRestartAt(now time.Time, hour, minute int) time.Duration {
-	now = now.UTC()
-	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
-	if !target.After(now) {
-		target = target.Add(24 * time.Hour)
+	return config.NextRestartAt(now, hour, minute).Sub(now)
+}
+
+// logNightlyRestartSchedulerStatus reports the effective in-process scheduler
+// state and returns whether the scheduler should be started. The environment
+// gate is retained for existing deployments; maintenance.restart_enabled is
+// the explicit node.yaml opt-out.
+func logNightlyRestartSchedulerStatus(
+	log *slog.Logger,
+	restartEnabled bool,
+	restartAt string,
+	envEnabled bool,
+) bool {
+	var disabledReason string
+	switch {
+	case !restartEnabled:
+		disabledReason = "maintenance.restart_enabled is false"
+	case restartAt == "":
+		disabledReason = "maintenance.restart_at is empty"
+	case !envEnabled:
+		disabledReason = "SCHED_RESTART_ENABLED is not true"
 	}
-	return target.Sub(now)
+	if disabledReason != "" {
+		log.Info("nightly restart: in-process scheduler disabled", "reason", disabledReason)
+		return false
+	}
+
+	log.Info("nightly restart: in-process scheduler active", "restart_at", restartAt)
+	return true
 }
 
 // runNightlyRestartScheduler sleeps until the configured restart window and

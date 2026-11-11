@@ -96,7 +96,7 @@ func TestSaleNetCheckpointLoadsOnlyAtExactParentAndRejectsResignedPrincipalOmiss
 	g, m, key, address, records := saleStoreFixture(t)
 	chainPath := filepath.Join(t.TempDir(), "chain")
 	d := seedSaleParent(t, chainPath, records)
-	defer func() { d.Close() }()
+	defer closeStoreTestResource(t, d)
 	l, err := d.LoadLPoDCheckpoint()
 	if err != nil {
 		t.Fatal(err)

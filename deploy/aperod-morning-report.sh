@@ -3,10 +3,10 @@
 # aperod-morning-report.sh — утренний отчёт о работе систем за ночь
 #
 # УСТАНОВКА:
-#   sudo curl -fsSL \
-#     "https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/aperod-morning-report.sh" \
-#     -o /usr/local/bin/aperod-morning-report.sh \
-#     && sudo chmod +x /usr/local/bin/aperod-morning-report.sh
+#   Сначала получите проверенный checkout по инструкции VALIDATORS.md, затем
+#   установите скрипт непосредственно из этого checkout:
+#   sudo install -o root -g root -m 0755 deploy/aperod-morning-report.sh \
+#     /usr/local/bin/aperod-morning-report.sh
 #
 # CRON (07:00 ежедневно):
 #   echo "0 7 * * * root /usr/local/bin/aperod-morning-report.sh" \

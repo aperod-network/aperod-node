@@ -256,6 +256,11 @@ import json, os, sys
 print(json.dumps({"count": 1, "bytes": os.path.getsize(sys.argv[1])}))
 PY
     ;;
+  cat)
+    file="$store/$(base_name "$2")"
+    [[ -f "$file" ]] || { echo "missing remote fixture: $file" >&2; exit 1; }
+    cat "$file"
+    ;;
   deletefile)
     rm -f "$store/$(base_name "$2")"
     ;;
@@ -361,6 +366,16 @@ run_backup_fail() {
   local fake_gpg
   fake_gpg=$(make_fake_bin "gpg" "$gpg_log" 0)
 
+  # Report enough space so the low-disk preflight does not hide the intended
+  # pg_dump failure on small CI tmpfs filesystems.
+  local fake_df_dir="$run_dir/fake-df"
+  mkdir -p "$fake_df_dir"
+  cat >"$fake_df_dir/df" <<'STUB'
+#!/usr/bin/env bash
+printf 'Avail\n20971520\n'
+STUB
+  chmod +x "$fake_df_dir/df"
+
   # Provide a writable backup dir so the new mkdir guard passes and the
   # script reaches the pg_dump stage (where the sudo stub fails as intended).
   local backup_dir="$run_dir/backup-tmp"
@@ -374,7 +389,7 @@ run_backup_fail() {
     APEROD_BACKUP_DIR_OVERRIDE="$backup_dir" \
     TELEGRAM_BOT_TOKEN="$bot_token" \
     ADMIN_TELEGRAM_CHAT_ID="$chat_id" \
-    PATH="$fake_curl_dir:$fake_sudo:$fake_rclone:$fake_gpg:$PATH" \
+    PATH="$fake_curl_dir:$fake_df_dir:$fake_sudo:$fake_rclone:$fake_gpg:$PATH" \
     bash "$BACKUP_SH" >/dev/null 2>&1 || exit_code=$?
 
   echo "$exit_code"
@@ -1641,17 +1656,18 @@ else
 fi
 
 # =============================================================================
-# Test 19: pre-export checkpoint reserve gates the request and preserves its parent
+# Test 19: pre-export checkpoint-size estimate and reserve gate the request
 #
 # Scenario A — enough space for checkpoint export:
-#   df reports more than chain.db size + the 5 GiB reserve. The checkpoint is
-#   requested and the backup proceeds to the intentionally failing pg_dump.
+#   The largest retained checkpoint is 3 GiB, the active DB is 2 GiB, and
+#   9 GiB is free. The default 5 GiB reserve fits, so checkpoint is requested.
 #
 # Scenario B — insufficient reserve:
-#   df reports 4 GiB for a 2 GiB chain.db, so the run skips before requesting
-#   the checkpoint. This protects the source filesystem from export exhaustion.
+#   The retained checkpoint is 3 GiB, current staging is 4 GiB, and the
+#   configured reserve is 6 GiB. With only 8 GiB free, the run skips before
+#   requesting the checkpoint and reports exact byte counts.
 # =============================================================================
-section "Test 19: pre-export checkpoint reserve gates checkpoint request"
+section "Test 19: recent checkpoint size and reserve gate checkpoint request"
 
 T19_DIR=$(mktemp -d "$TMPDIR_TEST/run-t19-XXXXXXXX")
 T19_NODE_DATA_DIR=$(mktemp -d "$TMPDIR_TEST/nodedata-t19-XXXXXXXX")
@@ -1690,11 +1706,18 @@ fi
 STUB
 chmod +x "$T19_FAKE_FIND_DIR/find"
 
-# du stub: return 2 GiB for any path (stale dir size + scaled preflight)
+# du stub: active chain.db is 2 GiB, largest retained checkpoint is 3 GiB,
+# and total current staging is 4 GiB.
 T19_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t19-XXXXXXXX")
 cat >"$T19_FAKE_DU_DIR/du" <<'STUB'
 #!/usr/bin/env bash
-echo "2097152	${@: -1}"
+path="${@: -1}"
+case "$path" in
+  */.backup-staging/checkpoint-*) echo "3145728	$path" ;;
+  */.backup-staging) echo "4194304	$path" ;;
+  */chain.db) echo "2097152	$path" ;;
+  *) echo "2097152	$path" ;;
+esac
 exit 0
 STUB
 chmod +x "$T19_FAKE_DU_DIR/du"
@@ -1710,15 +1733,15 @@ fi
 STUB
 chmod +x "$T19_FAKE_RM_DIR/rm"
 
-# df stub: BACKUP_DIR returns 20 GiB; the node filesystem returns 8 GiB, enough
-# for the 2 GiB chain.db fixture plus the 5 GiB reserve.
+# df stub: BACKUP_DIR returns 20 GiB; the node filesystem returns 9 GiB,
+# enough for the 3 GiB retained checkpoint estimate plus the 5 GiB reserve.
 T19_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t19-XXXXXXXX")
 cat >"$T19_FAKE_DF_DIR/df" <<STUB
 #!/usr/bin/env bash
 last_arg="\${@: -1}"
 echo "Avail"
 if [[ "\$last_arg" == "$T19_NODE_DATA_DIR"* ]]; then
-  echo "8388608"     # 8 GiB — covers the fixture DB plus reserve.
+  echo "9437184"     # 9 GiB — covers retained checkpoint estimate + reserve.
 else
   echo "20971520"    # 20 GiB — BACKUP_DIR always passes
 fi
@@ -1821,14 +1844,15 @@ fi
 STUB
 chmod +x "$T19B_FAKE_FIND_DIR/find"
 
-# df stub: BACKUP_DIR returns 20 GiB; NODE_DATA_DIR returns 4 GiB (insufficient, no cleanup)
+# df stub: BACKUP_DIR returns 20 GiB; NODE_DATA_DIR returns 8 GiB,
+# below the 3 GiB recent checkpoint estimate + configured 6 GiB reserve.
 T19B_FAKE_DF_DIR=$(mktemp -d "$TMPDIR_TEST/fake-df-t19b-XXXXXXXX")
 cat >"$T19B_FAKE_DF_DIR/df" <<STUB
 #!/usr/bin/env bash
 last_arg="\${@: -1}"
 echo "Avail"
 if [[ "\$last_arg" == "$T19B_NODE_DATA_DIR"* ]]; then
-  echo "4194304"   # 4 GiB — insufficient, preflight should skip
+  echo "8388608"   # 8 GiB — below the 9 GiB requirement.
 else
   echo "20971520"  # 20 GiB — BACKUP_DIR passes
 fi
@@ -1839,7 +1863,13 @@ chmod +x "$T19B_FAKE_DF_DIR/df"
 T19B_FAKE_DU_DIR=$(mktemp -d "$TMPDIR_TEST/fake-du-t19b-XXXXXXXX")
 cat >"$T19B_FAKE_DU_DIR/du" <<'STUB'
 #!/usr/bin/env bash
-echo "2097152	${@: -1}"
+path="${@: -1}"
+case "$path" in
+  */.backup-staging/checkpoint-*) echo "3145728	$path" ;;
+  */.backup-staging) echo "4194304	$path" ;;
+  */chain.db) echo "2097152	$path" ;;
+  *) echo "2097152	$path" ;;
+esac
 exit 0
 STUB
 chmod +x "$T19B_FAKE_DU_DIR/du"
@@ -1862,6 +1892,7 @@ chmod +x "$T19B_FAKE_TAR_DIR/tar"
 
 T19B_EXIT=99
 APEROD_BACKUP_PASSWORD="test-pass-t19b" \
+  APEROD_BACKUP_CHECKPOINT_RESERVE_BYTES="6442450944" \
   DATA_DIR="$T19B_DIR/data" \
   APEROD_TEXTFILE_DIR="$T19B_DIR/metrics" \
   APEROD_HISTORY_LOG="$T19B_DIR/backup.log" \
@@ -1874,7 +1905,7 @@ APEROD_BACKUP_PASSWORD="test-pass-t19b" \
 [[ "$T19B_EXIT" -eq 99 ]] && T19B_EXIT=0  # script returned 0
 
 if [[ "$T19B_EXIT" -eq 0 ]]; then
-  pass "Scenario B: exits 0 when 4 GiB cannot cover DB plus 5 GiB reserve"
+  pass "Scenario B: exits 0 when 8 GiB cannot cover retained checkpoint plus 6 GiB reserve"
 else
   fail "Scenario B: exited $T19B_EXIT — expected pre-export skip"
 fi
@@ -1889,6 +1920,19 @@ if [[ ! -f "$T19B_CURL_LOG" ]] || ! grep -q '^checkpoint ' "$T19B_CURL_LOG"; the
   pass "Scenario B: Unix checkpoint export was not requested"
 else
   fail "Scenario B: checkpoint export was requested despite insufficient reserve"
+fi
+if grep -q "4294967296 байт" "$T19B_CURL_LOG" \
+   && grep -q "3221225472 байт" "$T19B_CURL_LOG" \
+   && grep -q "7516192768 байт" "$T19B_CURL_LOG"; then
+  pass "Scenario B: alert reports current staging, recent checkpoint estimate, and projected staging bytes"
+else
+  fail "Scenario B: alert omitted current/projected staging byte totals (log: $(cat "$T19B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
+fi
+if grep -q "8589934592 байт" "$T19B_CURL_LOG" \
+   && grep -q "9663676416 байт" "$T19B_CURL_LOG"; then
+  pass "Scenario B: alert reports exact available and required bytes"
+else
+  fail "Scenario B: alert omitted exact available/required byte totals (log: $(cat "$T19B_CURL_LOG" 2>/dev/null || echo '<empty>'))"
 fi
 
 # =============================================================================

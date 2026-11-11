@@ -19,6 +19,7 @@ func TestMintDisplayHintRequiresActualOpening(t *testing.T) {
 	spend, view := keys.Spend.Public, keys.View.Public
 	address := crypto.EncodeAddress(crypto.MainnetByte, spend, view)
 	const n = 55105 * 100000000
+	//nolint:staticcheck // This fixture deliberately covers legacy height-zero mint recovery.
 	blind, err := crypto.DeterministicMintBlind(spend, n)
 	if err != nil {
 		t.Fatal(err)
@@ -62,18 +63,29 @@ func TestMintAuditNeedsCanonicalBodyAndNeverMutates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	defer func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	keys, err := crypto.GenerateWalletKeys()
 	if err != nil {
 		t.Fatal(err)
 	}
 	spend, view := keys.Spend.Public, keys.View.Public
 	address := crypto.EncodeAddress(crypto.MainnetByte, spend, view)
-	blind, _ := crypto.DeterministicMintBlind(spend, 100000000)
-	commit, _ := crypto.Commit(100000000, blind)
+	const blockHeight = uint64(5)
+	blind, err := crypto.DeterministicMintBlindV2(spend, 100000000, blockHeight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := crypto.Commit(100000000, blind)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tx := core.Transaction{Outputs: []core.Output{{AmountCommit: commit}}}
 	hash := tx.Hash()
-	u := &store.StoredUTXO{TxHash: hash, BlockHeight: 5, AmountCommit: commit}
+	u := &store.StoredUTXO{TxHash: hash, BlockHeight: blockHeight, AmountCommit: commit}
 	if err := d.PutUTXO(hash, 0, u); err != nil {
 		t.Fatal(err)
 	}

@@ -91,6 +91,8 @@ func hashToPoint(seed []byte) *edwards25519.Point {
 // RangeProof proves that a committed value v satisfies 0 ≤ v < 2^64
 // without revealing v. Fields are encoded as 32-byte compressed points/scalars.
 type RangeProof struct {
+	// Bits is the proved width. Omitted/zero keeps the historical 64-bit format.
+	Bits uint8           `json:"bits,omitempty"`
 	V    [32]byte        // V = γ·G + v·BpH  (value commitment)
 	A    [32]byte        // A = ⟨aL,Gvec⟩ + ⟨aR,Hvec⟩ + α·G
 	S    [32]byte        // S = ⟨sL,Gvec⟩ + ⟨sR,Hvec⟩ + ρ·G
@@ -235,11 +237,34 @@ func pointSlice(arr [bpBits]*edwards25519.Point) []*edwards25519.Point {
 	return s
 }
 
+func pointSliceN(arr [bpBits]*edwards25519.Point, n int) []*edwards25519.Point {
+	s := make([]*edwards25519.Point, n)
+	copy(s, arr[:n])
+	return s
+}
+
 // ─── ProveRange ────────────────────────────────────────────────────────────────
 
 // ProveRange creates a Bulletproof range proof that value v satisfies
 // 0 ≤ v < 2^64 using blinding factor blind.
 func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
+	return ProveRangeBits(value, blind, 64)
+}
+
+// ProveRangeBits creates a range proof for [0, 2^bits). The 16-bit variant
+// is used to prove each digit of a confidential amount ciphertext.
+func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, error) {
+	if bits != 16 && bits != 64 {
+		return nil, fmt.Errorf("bulletproof: unsupported range width %d", bits)
+	}
+	if bits == 16 && value >= 1<<16 {
+		return nil, fmt.Errorf("bulletproof: value %d exceeds %d-bit range", value, bits)
+	}
+	n := int(bits)
+	rounds := 0
+	for x := n; x > 1; x >>= 1 {
+		rounds++
+	}
 	// 1. Value commitment V = γ·G + v·BpH ────────────────────────────────
 	v := scalarFromUint64(value)
 	// H-2 fix: clampScalar fallback removed — Ed25519 clamping has no meaning
@@ -256,40 +281,64 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 	)
 
 	// 2. Bit decomposition: aL[i] = bit i of v, aR[i] = aL[i] - 1 ────────
-	aL := make([]*edwards25519.Scalar, bpBits)
-	aR := make([]*edwards25519.Scalar, bpBits)
+	aL := make([]*edwards25519.Scalar, n)
+	aR := make([]*edwards25519.Scalar, n)
 	one := scalarOne()
-	for i := 0; i < bpBits; i++ {
+	for i := 0; i < n; i++ {
 		aL[i] = scalarFromUint64((value >> uint(i)) & 1)
 		aR[i] = edwards25519.NewScalar().Subtract(aL[i], one)
 	}
 
 	// 3. Commit to aL, aR: A = ⟨aL,Gvec⟩ + ⟨aR,Hvec⟩ + α·G ─────────────
-	alphaBF, _ := NewBlindFactor()
-	alpha, _ := ScalarFromBytes(alphaBF[:])
-	gv := pointSlice(bpGvec)
-	hv := pointSlice(bpHvec)
+	alphaBF, err := NewBlindFactor()
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof alpha: %w", err)
+	}
+	alpha, err := ScalarFromBytes(alphaBF[:])
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof alpha scalar: %w", err)
+	}
+	gv := pointSliceN(bpGvec, n)
+	hv := pointSliceN(bpHvec, n)
 	A := new(edwards25519.Point).ScalarBaseMult(alpha)
 	A.Add(A, msm(aL, gv))
 	A.Add(A, msm(aR, hv))
 
 	// 4. Blinding vectors sL, sR; S = ⟨sL,Gvec⟩ + ⟨sR,Hvec⟩ + ρ·G ──────
-	sL := make([]*edwards25519.Scalar, bpBits)
-	sR := make([]*edwards25519.Scalar, bpBits)
-	for i := 0; i < bpBits; i++ {
-		bf, _ := NewBlindFactor()
-		sL[i], _ = ScalarFromBytes(bf[:])
-		bf, _ = NewBlindFactor()
-		sR[i], _ = ScalarFromBytes(bf[:])
+	sL := make([]*edwards25519.Scalar, n)
+	sR := make([]*edwards25519.Scalar, n)
+	for i := 0; i < n; i++ {
+		bf, randomErr := NewBlindFactor()
+		if randomErr != nil {
+			return nil, fmt.Errorf("bulletproof sL[%d]: %w", i, randomErr)
+		}
+		sL[i], err = ScalarFromBytes(bf[:])
+		if err != nil {
+			return nil, fmt.Errorf("bulletproof sL[%d] scalar: %w", i, err)
+		}
+		bf, randomErr = NewBlindFactor()
+		if randomErr != nil {
+			return nil, fmt.Errorf("bulletproof sR[%d]: %w", i, randomErr)
+		}
+		sR[i], err = ScalarFromBytes(bf[:])
+		if err != nil {
+			return nil, fmt.Errorf("bulletproof sR[%d] scalar: %w", i, err)
+		}
 	}
-	rhoBF, _ := NewBlindFactor()
-	rho, _ := ScalarFromBytes(rhoBF[:])
+	rhoBF, err := NewBlindFactor()
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof rho: %w", err)
+	}
+	rho, err := ScalarFromBytes(rhoBF[:])
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof rho scalar: %w", err)
+	}
 	S := new(edwards25519.Point).ScalarBaseMult(rho)
 	S.Add(S, msm(sL, gv))
 	S.Add(S, msm(sR, hv))
 
 	// 5. Challenges y, z ───────────────────────────────────────────────────
-	tr := newBPTranscript("range-proof/v2")
+	tr := newBPTranscript(rangeProofTranscriptLabel(bits))
 	tr.absorbPoint(V)
 	tr.absorbPoint(A)
 	tr.absorbPoint(S)
@@ -300,8 +349,8 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 	// l(x) = (aL - z) + sL·x          l₀ = aL-z, l₁ = sL
 	// r(x) = yn⊙(aR + z) + z²·2ⁿ + yn⊙sR·x
 	//                                  r₀ = yn⊙(aR+z)+z²·2ⁿ, r₁ = yn⊙sR
-	yn := powerVec(y, bpBits)
-	town := pow2Vec(bpBits)
+	yn := powerVec(y, n)
+	town := pow2Vec(n)
 	z2 := edwards25519.NewScalar().Multiply(z, z)
 
 	l0 := vecSubS(aL, z)
@@ -315,10 +364,22 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 	t2v := innerProduct(l1, r1)
 
 	// 7. Commit to t₁, t₂: Tᵢ = τᵢ·G + tᵢ·BpH ────────────────────────────
-	tau1BF, _ := NewBlindFactor()
-	tau1, _ := ScalarFromBytes(tau1BF[:])
-	tau2BF, _ := NewBlindFactor()
-	tau2, _ := ScalarFromBytes(tau2BF[:])
+	tau1BF, err := NewBlindFactor()
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof tau1: %w", err)
+	}
+	tau1, err := ScalarFromBytes(tau1BF[:])
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof tau1 scalar: %w", err)
+	}
+	tau2BF, err := NewBlindFactor()
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof tau2: %w", err)
+	}
+	tau2, err := ScalarFromBytes(tau2BF[:])
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof tau2 scalar: %w", err)
+	}
 	T1 := new(edwards25519.Point).Add(
 		new(edwards25519.Point).ScalarBaseMult(tau1),
 		new(edwards25519.Point).ScalarMult(t1v, BpH),
@@ -356,13 +417,13 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 	Uw := new(edwards25519.Point).ScalarMult(w, bpU)
 
 	// H' = y⁻ⁱ · Hvec[i]  (modified generators for IPA)
-	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), bpBits)
-	hPrime := make([]*edwards25519.Point, bpBits)
-	for i := 0; i < bpBits; i++ {
+	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), n)
+	hPrime := make([]*edwards25519.Point, n)
+	for i := 0; i < n; i++ {
 		hPrime[i] = new(edwards25519.Point).ScalarMult(yInvPow[i], bpHvec[i])
 	}
 
-	Gipa := pointSlice(bpGvec)
+	Gipa := pointSliceN(bpGvec, n)
 	Ls, Rs, aFin, bFin, err := ipaProve(Gipa, hPrime, l, r, Uw, tr)
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof IPA: %w", err)
@@ -370,6 +431,9 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 
 	// 11. Assemble proof ───────────────────────────────────────────────────
 	proof := &RangeProof{}
+	if bits != 64 {
+		proof.Bits = bits
+	}
 	copy(proof.V[:], V.Bytes())
 	copy(proof.A[:], A.Bytes())
 	copy(proof.S[:], S.Bytes())
@@ -378,7 +442,7 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 	copy(proof.Taux[:], taux.Bytes())
 	copy(proof.Mu[:], mu.Bytes())
 	copy(proof.Tx[:], txHat.Bytes())
-	for k := 0; k < bpLog; k++ {
+	for k := 0; k < rounds; k++ {
 		copy(proof.Ls[k][:], Ls[k].Bytes())
 		copy(proof.Rs[k][:], Rs[k].Bytes())
 	}
@@ -401,6 +465,23 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	// Tampering either field breaks the proof.
 	if [32]byte(proof.ValueCommit) != proof.V {
 		return false, nil
+	}
+	bits := proof.Bits
+	if bits == 0 {
+		bits = 64
+	}
+	if bits != 16 && bits != 64 {
+		return false, fmt.Errorf("unsupported range proof width %d", bits)
+	}
+	n := int(bits)
+	rounds := 0
+	for x := n; x > 1; x >>= 1 {
+		rounds++
+	}
+	for i := rounds; i < bpLog; i++ {
+		if !isZero32(proof.Ls[i]) || !isZero32(proof.Rs[i]) {
+			return false, fmt.Errorf("non-canonical unused IPA round %d", i)
+		}
 	}
 
 	// Decode proof elements (all must be valid encodings)
@@ -460,9 +541,9 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 		return false, err
 	}
 
-	Ls := make([]*edwards25519.Point, bpLog)
-	Rs := make([]*edwards25519.Point, bpLog)
-	for k := 0; k < bpLog; k++ {
+	Ls := make([]*edwards25519.Point, rounds)
+	Rs := make([]*edwards25519.Point, rounds)
+	for k := 0; k < rounds; k++ {
 		Ls[k], err = decPt(proof.Ls[k], fmt.Sprintf("L%d", k))
 		if err != nil {
 			return false, err
@@ -474,7 +555,7 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	}
 
 	// ── Replay transcript to get challenges ───────────────────────────────
-	tr := newBPTranscript("range-proof/v2")
+	tr := newBPTranscript(rangeProofTranscriptLabel(bits))
 	tr.absorbPoint(V)
 	tr.absorbPoint(A)
 	tr.absorbPoint(S)
@@ -491,8 +572,8 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 
 	z2 := edwards25519.NewScalar().Multiply(z, z)
 	z3 := edwards25519.NewScalar().Multiply(z2, z)
-	yn := powerVec(y, bpBits)
-	town := pow2Vec(bpBits)
+	yn := powerVec(y, n)
+	town := pow2Vec(n)
 
 	// ── Check 1: polynomial commitment ────────────────────────────────────
 	// t̂·BpH + τₓ·G == z²·V + δ(y,z)·BpH + x·T₁ + x²·T₂
@@ -528,9 +609,9 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	// (derived by expanding commitments A and S; the μ·G terms cancel)
 	Uw := new(edwards25519.Point).ScalarMult(w, bpU)
 
-	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), bpBits)
-	hPrime := make([]*edwards25519.Point, bpBits)
-	for i := 0; i < bpBits; i++ {
+	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), n)
+	hPrime := make([]*edwards25519.Point, n)
+	for i := 0; i < n; i++ {
 		hPrime[i] = new(edwards25519.Point).ScalarMult(yInvPow[i], bpHvec[i])
 	}
 
@@ -544,7 +625,7 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	P.Add(P, new(edwards25519.Point).ScalarBaseMult(edwards25519.NewScalar().Negate(mu)))
 	P.Add(P, new(edwards25519.Point).ScalarMult(txHat, Uw))
 	negZ := edwards25519.NewScalar().Negate(z)
-	for i := 0; i < bpBits; i++ {
+	for i := 0; i < n; i++ {
 		P.Add(P, new(edwards25519.Point).ScalarMult(negZ, bpGvec[i]))
 		P.Add(P, new(edwards25519.Point).ScalarMult(z, bpHvec[i]))
 		coeff := edwards25519.NewScalar().Multiply(z2, town[i])
@@ -555,7 +636,7 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	// Replay IPA challenges and fold P: P_{k+1} = P_k + u_k·L_k + u_k⁻¹·R_k
 	ipaU := [bpLog]*edwards25519.Scalar{}
 	ipaUInv := [bpLog]*edwards25519.Scalar{}
-	for k := 0; k < bpLog; k++ {
+	for k := 0; k < rounds; k++ {
 		tr.absorbPoint(Ls[k])
 		tr.absorbPoint(Rs[k])
 		ipaU[k] = tr.challenge()
@@ -567,10 +648,10 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	// P is now P_final
 
 	// Fold generators using the same challenges
-	Gfin := pointSlice(bpGvec)
-	Hfin := make([]*edwards25519.Point, bpBits)
+	Gfin := pointSliceN(bpGvec, n)
+	Hfin := make([]*edwards25519.Point, n)
 	copy(Hfin, hPrime)
-	for k := 0; k < bpLog; k++ {
+	for k := 0; k < rounds; k++ {
 		half := len(Gfin) / 2
 		uInv := ipaUInv[k]
 		uk := ipaU[k]
@@ -600,6 +681,13 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	check.Add(check, new(edwards25519.Point).ScalarMult(ab, Uw))
 
 	return check.Equal(P) == 1, nil
+}
+
+func rangeProofTranscriptLabel(bits uint8) string {
+	if bits == 64 {
+		return "range-proof/v2"
+	}
+	return fmt.Sprintf("range-proof/v3/bits-%d", bits)
 }
 
 // ─── Inner Product Argument (IPA) ─────────────────────────────────────────────

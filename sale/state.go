@@ -17,6 +17,7 @@ type State struct {
 	Sold       uint64        `json:"sold_napro,string"`
 }
 
+// InitialState constructs the ledger state represented by checkpoint c.
 func InitialState(c Checkpoint) State {
 	return State{Checkpoint: c.Message(), Height: c.Height - 1, Hash: c.Parent, Remaining: c.SaleRemaining}
 }

@@ -52,6 +52,10 @@ func (s *Server) avmStatus() map[string]interface{} {
 	}
 	ready := atomic.LoadInt32(&s.syncing) == 0
 	active := ready && s.avmActivationHeight > 0 && next >= s.avmActivationHeight
+	transactionVersion := core.TxVersionAVM
+	if s.mempool != nil {
+		transactionVersion = s.mempool.NextAVMVersion()
+	}
 	return map[string]interface{}{
 		"available":           s.avmStore != nil,
 		"ready":               ready,
@@ -59,7 +63,7 @@ func (s *Server) avmStatus() map[string]interface{} {
 		"activation_height":   s.avmActivationHeight,
 		"chain_height":        height,
 		"next_block_height":   next,
-		"transaction_version": uint8(core.TxVersionAVM),
+		"transaction_version": uint8(transactionVersion),
 		"gas_price_napr":      core.AVMGasPriceNAPR,
 		"min_gas_limit":       core.AVMMinGasLimit,
 		"max_gas_limit":       core.AVMMaxGasLimit,
@@ -405,8 +409,8 @@ func (s *Server) restAVMTransaction(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid signed transaction JSON: "+err.Error())
 		return
 	}
-	if req.Tx.Version != core.TxVersionAVM || req.Tx.AVM == nil {
-		writeJSONError(w, http.StatusBadRequest, "only an already locally signed v6 AVM transaction is accepted")
+	if !req.Tx.IsAVM() || req.Tx.AVM == nil {
+		writeJSONError(w, http.StatusBadRequest, "only an already locally signed AVM transaction is accepted")
 		return
 	}
 	s.broadcastTxMu.RLock()

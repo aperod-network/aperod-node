@@ -7,6 +7,11 @@ p2p:
   bootnodes: []
   max_peers: 50
   min_peers: 4
+  # Limit stalled TLS ClientHello handshakes so slow peers cannot hold pending
+  # handshake slots for long (slowloris/goroutine-exhaustion attack).
+  # Use 2s-3s on normal links; raise for high latency. Restart the node to apply.
+  # Omitted: 3s production default. Explicit 0s: host fallback of 10s.
+  handshake_timeout: 3s
   # Peer IP whitelist (optional). When set, only inbound connections from
   # the listed IPs / CIDR ranges are accepted. Outbound dials to bootnodes
   # are not affected. Leave empty (default) for an open network.
@@ -90,3 +95,10 @@ pruning:
 #   Lower this to keep a tighter mempool; raise it to reduce GC pressure on
 #   nodes with a small mempool load.
 # mempool_evict_interval_sec: 300
+
+# In-process nightly restart scheduler (UTC). The environment gate
+# SCHED_RESTART_ENABLED must also be "true" for the scheduler to run.
+# To disable it in node.yaml, set restart_enabled: false and restart_at: "".
+maintenance:
+  restart_enabled: true
+  restart_at: "04:00"

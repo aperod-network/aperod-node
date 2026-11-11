@@ -21,6 +21,7 @@ class PublicationSecurityTests(unittest.TestCase):
             ".local/source.txt", ".agents/memory.md", ".ssh/known_hosts",
             "artifacts/api-server/source.ts", "deploy/production_known_hosts",
             "p2p_whitelist.json", "backup.tgz", "operator.log",
+            "deploy/sync-public-repo.sh",
         ):
             with self.subTest(path=path):
                 self.assertIsNotNone(policy.path_problem(path))
@@ -64,6 +65,51 @@ class PublicationSecurityTests(unittest.TestCase):
         self.assertIsNotNone(policy.content_problem(
             "config.txt", b"-----BEGIN " + b"PRIVATE KEY-----\nTEST_ONLY\n"
         ))
+
+    def test_renamed_binary_is_refused_by_frozen_tree_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            (root / "aperod").write_bytes(b"\x7fELF" + b"safe-test-fixture")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "binary fixture"], check=True)
+            (root / "aperod").rename(root / "release-notes.txt")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            tree = subprocess.check_output(
+                ["git", "-C", str(root), "write-tree"], text=True
+            ).strip()
+            checked, failures = policy.inspect(root, tree=tree)
+            self.assertEqual(checked, 1)
+            self.assertEqual(failures[0][0], "release-notes.txt")
+            self.assertIn("disguised filename", failures[0][1])
+
+    def test_private_repository_reference_is_detected_without_echoing_marker(self):
+        marker = b"private-owner/" + b"private-source"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+            (root / "README.md").write_bytes(
+                b"Do not publish https://github.com/" + marker + b"\n"
+            )
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            tree = subprocess.check_output(
+                ["git", "-C", str(root), "write-tree"], text=True
+            ).strip()
+            failures = policy.inspect_private_references(root, tree, (marker,))
+            self.assertEqual(failures, [("README.md", "private source repository reference")])
+            self.assertNotIn(marker.decode(), repr(failures))
+
+    def test_private_reference_scan_requires_a_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            with self.assertRaisesRegex(ValueError, "identity unavailable"):
+                policy.inspect_private_references(root, "HEAD", ())
 
     def test_missing_candidate_git_never_falls_back_to_parent(self):
         with tempfile.TemporaryDirectory() as temp:

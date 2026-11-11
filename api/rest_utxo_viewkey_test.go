@@ -2,7 +2,7 @@ package api_test
 
 // Tests for the view-key extension to GET /api/v1/address/{addr}/utxos:
 //   - Stealth UTXO discovered + amount_napr populated via view_key_hex query param
-//   - Stealth UTXO discovered via node-configured view key (SetNodeViewKey)
+//   - Stealth UTXO is not exposed without an explicit request view key
 //   - Transparent/mint UTXO: matched without view key, amount_napr null
 //   - Wrong view key: stealth UTXO not discovered
 
@@ -105,10 +105,10 @@ func TestREST_AddressUTXOs_RejectsMalformedViewKeyHeader(t *testing.T) {
 	}
 }
 
-// TestREST_AddressUTXOs_StealthDiscoveredByNodeViewKey verifies that a stealth
-// output is discovered and decoded when the view key is configured on the node
-// via SetNodeViewKey (as it would be from node.yaml view_key), with no query param.
-func TestREST_AddressUTXOs_StealthDiscoveredByNodeViewKey(t *testing.T) {
+// TestREST_AddressUTXOs_DoesNotUseNodeConfiguredViewKey verifies that the
+// unauthenticated endpoint does not expose stealth outputs unless the caller
+// explicitly supplies its own X-View-Key header.
+func TestREST_AddressUTXOs_DoesNotUseNodeConfiguredViewKey(t *testing.T) {
 	srv, utxos := buildUTXOServer(t)
 
 	wk, err := crypto.GenerateWalletKeys()
@@ -117,30 +117,17 @@ func TestREST_AddressUTXOs_StealthDiscoveredByNodeViewKey(t *testing.T) {
 	}
 	addr := crypto.EncodeAddress(crypto.MainnetByte, wk.Spend.Public, wk.View.Public)
 
-	// Configure view key on the server (simulates node.yaml view_key entry).
-	srv.SetNodeViewKey(hex.EncodeToString(wk.View.Private[:]))
-
 	const wantAmount = uint64(1_000_000_000) // 10 APRO
 	makeStealthUTXO(t, utxos, wk.Spend.Public, wk.View.Public, wantAmount, 0x02)
 
-	// No view_key_hex query param — node config is used automatically.
 	code, resp := restGet(t, srv, "/api/v1/address/"+string(addr)+"/utxos")
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
 
 	list, _ := resp["utxos"].([]interface{})
-	if len(list) != 1 {
-		t.Fatalf("utxos count = %d, want 1 (node-configured view key must discover stealth UTXO)", len(list))
-	}
-	entry := list[0].(map[string]interface{})
-
-	gotAmt, ok := entry["amount_napr"].(string)
-	if !ok || entry["amount_napr"] == nil {
-		t.Fatalf("amount_napr = %v, want %d (node-configured view key must decode amount)", entry["amount_napr"], wantAmount)
-	}
-	if gotAmt != fmt.Sprint(wantAmount) {
-		t.Errorf("amount_napr = %s, want %d", gotAmt, wantAmount)
+	if len(list) != 0 {
+		t.Fatalf("unauthenticated request exposed %d stealth UTXOs; expected none", len(list))
 	}
 }
 

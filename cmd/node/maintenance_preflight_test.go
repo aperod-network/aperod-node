@@ -70,11 +70,15 @@ func createMaintenanceTestDB(t *testing.T, dataDir string, tipHeight uint64) {
 	copy(hash[:], sum[:])
 	block := &store.StoredBlock{Height: tipHeight, Hash: hash}
 	if err := db.PutBlock(hash, block); err != nil {
-		db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close fixture db after block write failure: %v", closeErr)
+		}
 		t.Fatalf("write fixture block: %v", err)
 	}
 	if err := db.PutTip(hash, tipHeight); err != nil {
-		db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close fixture db after tip write failure: %v", closeErr)
+		}
 		t.Fatalf("write fixture tip: %v", err)
 	}
 	if err := db.Close(); err != nil {

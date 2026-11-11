@@ -1,6 +1,6 @@
 module github.com/aperod/aperod
 
-go 1.26.10
+go 1.26.11
 
 require (
 	filippo.io/edwards25519 v1.1.1
@@ -10,9 +10,9 @@ require (
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/tetratelabs/wabin v0.0.0-20230304001439-f6f874872834
 	github.com/tetratelabs/wazero v1.12.0
-	golang.org/x/net v0.60.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/term v0.46.0
+	golang.org/x/net v0.62.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

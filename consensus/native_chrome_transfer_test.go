@@ -47,7 +47,6 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 	}
 	e, db, deposit, action, keys, priv, _ := positionEngineWithOwner(t, owner.Keys)
 	e.cfg.RingCTCLSAGActivationHeight = 2
-	e.utxos.SetCLSAGActivationHeight(2)
 	e.pool.SetVerifier(e.txVerifier)
 	acceptPositionBlock(t, e, priv, 3_000_000_000, *deposit)
 	// These are consensus-authorized payout outputs, not UTXO/decoy mocks.
@@ -175,11 +174,13 @@ func TestNativeChromeCanonicalTransfer(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"tx_hash": fmt.Sprintf("%x", accepted.Hash()), "block_hash": fmt.Sprintf("%x", block.Hash()),
 			"height": block.Header.Height, "fee_napr": accepted.Fee, "finalized": true,
 			"canonical_funding_credit_napr": fmt.Sprint(afterFunding - beforeFunding),
-		})
+		}); err != nil {
+			t.Errorf("encode transfer response: %v", err)
+		}
 	})
 	mux.Handle("/", server)
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

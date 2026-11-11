@@ -150,14 +150,9 @@ forecasts, return projections or guarantees.
 
 ### Quick-start (Linux / Ubuntu 22.04+)
 
-```bash
-# Install and configure the validator service interactively.
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
-
-# Verify the service and local REST API.
-systemctl status aperod-node
-curl -s http://127.0.0.1:8545/api/v1/status
-```
+Use the pinned, reviewed installation procedure in
+[VALIDATORS.md — Setup Guide](VALIDATORS.md#setup-guide). Do not run an installer
+from the mutable `main` branch or pipe a downloaded script to `sudo bash`.
 
 See [install-validator.sh](install-validator.sh) and
 [install-node.sh](install-node.sh) for full automation scripts.

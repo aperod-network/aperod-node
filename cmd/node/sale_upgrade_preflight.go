@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,7 +22,7 @@ import (
 // The normal updater obtains a new completed logical copy via the private Unix
 // socket while the service keeps running. An explicit copy is for offline
 // verification only; it must include the same completed manifest.
-func runSaleUpgradePreflight(cfg *config.Config, stage string, out io.Writer) error {
+func runSaleUpgradePreflight(cfg *config.Config, stage string, out io.Writer) (retErr error) {
 	if stage == "" {
 		socket := filepath.Join(cfg.DataDir, backupSocketName)
 		transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -33,7 +34,11 @@ func runSaleUpgradePreflight(cfg *config.Config, stage string, out io.Writer) er
 		if err != nil {
 			return fmt.Errorf("sale preflight: fresh consistent backup unavailable; service must remain running")
 		}
-		defer response.Body.Close()
+		defer func() {
+			if err := response.Body.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close sale backup response: %w", err))
+			}
+		}()
 		if response.StatusCode != http.StatusOK {
 			return fmt.Errorf("sale preflight: backup refused (%d); service must remain running", response.StatusCode)
 		}
@@ -70,6 +75,7 @@ func decodeSalePreflightJSON(reader io.Reader, value any) error {
 }
 
 func verifySaleUpgradeStage(cfg *config.Config, stage string, reply *checkpointResponse, out io.Writer, disposable bool) error {
+	// #nosec G304 G703 -- stage is a local operator-selected copy or a resolved path under the owned backup directory.
 	file, err := os.Open(filepath.Join(stage, "manifest.json"))
 	if err != nil {
 		return fmt.Errorf("sale preflight: completed backup manifest required")
@@ -102,6 +108,7 @@ func verifySaleUpgradeStage(cfg *config.Config, stage string, reply *checkpointR
 		return err
 	}
 	if disposable {
+		// #nosec G703 -- disposable is true only for the resolved checkpoint-* directory under node-owned .backup-staging.
 		if err := os.RemoveAll(stage); err != nil {
 			return fmt.Errorf("sale preflight: verified temporary copy cleanup failed")
 		}

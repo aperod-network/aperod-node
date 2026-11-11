@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,16 +22,21 @@ type bootstrapKeyImageAnchor struct {
 // This file is an operator-attested public state export, not a signature or an
 // independently authenticated historical spend proof. The operator must derive
 // it from a preserved copied DB whose durable tip is exactly this anchor.
-func loadBootstrapKeyImageAnchor(path, digest string, height uint64, hash string) ([]crypto.KeyImage, error) {
+func loadBootstrapKeyImageAnchor(path, digest string, height uint64, hash string) (keyImages []crypto.KeyImage, retErr error) {
 	expected, err := hex.DecodeString(digest)
 	if err != nil || len(expected) != 32 {
 		return nil, fmt.Errorf("key-image anchor requires SHA-256")
 	}
+	// #nosec G304 G703 -- the local operator-configured file is bound to its required SHA-256 digest.
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close key-image anchor: %w", err))
+		}
+	}()
 	const maxBytes = 64 << 20
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {

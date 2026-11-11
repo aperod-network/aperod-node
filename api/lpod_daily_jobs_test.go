@@ -104,6 +104,115 @@ func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
 	}
 }
 
+func TestDailyJobPrecomputesBeforeClosingWitnessAndFinalizesAfterIt(t *testing.T) {
+	db, s, path, _ := makeDailyAuditBenchmarkFixtureWithTail(t, 2, 0, 0, 1, 0, 0, 1)
+	defer func() { _ = db.Close() }()
+
+	earlyHash, found, err := db.GetCanonicalHash(2)
+	if err != nil || !found {
+		t.Fatalf("load pre-close certificate hash: found=%v err=%v", found, err)
+	}
+	closingHash, found, err := db.GetCanonicalHash(3)
+	if err != nil || !found {
+		t.Fatalf("load closing witness hash: found=%v err=%v", found, err)
+	}
+	earlyCertificate, err := json.Marshal(store.FinalityCertificate{
+		Version: 1, Height: 2, BlockHash: earlyHash,
+		Votes: []store.FinalityVote{{Signature: []byte{1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rawDB, err := leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rawDB.Put([]byte("consensus/finality_certificate/v1"), earlyCertificate, nil); err != nil {
+		_ = rawDB.Close()
+		t.Fatal(err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetStore(db)
+	persistedCertificate, err := db.LoadFinalityCertificate()
+	if err != nil || persistedCertificate == nil || persistedCertificate.Height != 2 ||
+		persistedCertificate.BlockHash != earlyHash {
+		t.Fatalf("pre-close certificate fixture was not persisted: cert=%+v err=%v", persistedCertificate, err)
+	}
+	oracleHeight, oracleHash := uint64(2), earlyHash
+	s.SetLPoDConfig(nil, func(height uint64, hash crypto.Hash32) bool {
+		ok := height == oracleHeight && hash == oracleHash
+		if !ok {
+			t.Logf("finality oracle mismatch: got height=%d hash=%x want height=%d hash=%x", height, hash, oracleHeight, oracleHash)
+		}
+		return ok
+	})
+	enqueueDailyTest(t, s)
+
+	s.runDailyJobBatch(context.Background())
+	j, err := s.loadDailyJob()
+	if err != nil || j == nil || j.State != "queued" || j.Progress == nil ||
+		!j.Progress.Preclosing || j.Progress.Included != 1 ||
+		!dailyJobResultIsWaiting(j.Result) {
+		t.Fatalf("pre-close work did not remain safely queued: job=%+v err=%v", j, err)
+	}
+
+	if err := db.SaveFinalityCertificate(store.FinalityCertificate{
+		Version: 1, Height: 3, BlockHash: closingHash,
+		Votes: []store.FinalityVote{{Signature: []byte{1}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oracleHeight, oracleHash = 3, closingHash
+	for attempt := 0; attempt < 4; attempt++ {
+		s.runDailyJobBatch(context.Background())
+		j, err = s.loadDailyJob()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j.State == "complete" {
+			break
+		}
+	}
+	var result struct {
+		Status   string `json:"status"`
+		Coverage struct {
+			Blocks int `json:"blocks"`
+		} `json:"coverage"`
+	}
+	if err := json.Unmarshal(j.Result, &result); err != nil ||
+		j.State != "complete" || j.Progress.Preclosing ||
+		result.Status != "complete" || result.Coverage.Blocks != 2 {
+		t.Fatalf("closing certificate did not finalize the complete daily audit: job=%+v result=%+v err=%v", j, result, err)
+	}
+}
+
+func TestDailyJobResultWaitingVocabulary(t *testing.T) {
+	for _, reason := range []string{
+		"opening boundary not yet certified",
+		"closing witness not yet present",
+		"verified certificate predates the closing witness",
+		"bounded background verification in progress",
+	} {
+		raw, _ := json.Marshal(map[string]string{"status": "incomplete", "reason": reason})
+		if !dailyJobResultIsWaiting(raw) {
+			t.Errorf("expected %q to remain queued", reason)
+		}
+	}
+	if dailyJobResultIsWaiting([]byte(`{"status":"incomplete","reason":"block audit verification failed"}`)) ||
+		dailyJobResultIsWaiting([]byte(`{"status":"complete","reason":""}`)) {
+		t.Fatal("non-waiting result was treated as retryable")
+	}
+}
+
 func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 	for _, change := range []string{"predecessor", "certificate", "finality", "prune"} {
 		t.Run(change, func(t *testing.T) {
@@ -120,7 +229,9 @@ func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 				if change == "certificate" {
 					height = j.Progress.Certificate.Height
 				}
-				db.Close()
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
 				raw, err := leveldb.OpenFile(path, nil)
 				if err != nil {
 					t.Fatal(err)
@@ -196,7 +307,7 @@ func TestDailyJobCancellationAndShutdown(t *testing.T) {
 	}
 }
 
-func TestDailyJobStorageBudgetAndRetry(t *testing.T) {
+func TestDailyJobStorageBudgetAndFailedResultRequiresExplicitRetry(t *testing.T) {
 	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, 2, 0, 0, 1, 0, 0)
 	defer db.Close()
 	j := enqueueDailyTest(t, s)
@@ -205,8 +316,17 @@ func TestDailyJobStorageBudgetAndRetry(t *testing.T) {
 	if err := s.saveDailyJob(&oversize); err == nil {
 		t.Fatal("accepted oversized job")
 	}
-	j.State, j.Progress = "failed", nil
-	j.Result, _ = json.Marshal(dailyPending(j.Date, "closing witness not yet present"))
+	failedAnchor := crypto.HashBytes([]byte("failed daily audit anchor"))
+	failedProgress := &dailyProgress{
+		Certificate: &store.FinalityCertificate{
+			Version: 1, Height: 2, BlockHash: crypto.HashBytes([]byte("failed daily certificate")),
+		},
+		Anchor: failedAnchor, Witness: crypto.HashBytes([]byte("failed daily witness")),
+		AnchorHeight: 0, WitnessHeight: 1, Marker: crypto.HashBytes([]byte("failed daily marker")),
+		Next: 1, Previous: crypto.HashBytes([]byte("failed daily previous")),
+	}
+	j.State, j.Progress = "failed", failedProgress
+	j.Result, _ = json.Marshal(dailyPending(j.Date, "exact block audit record missing at height 20"))
 	j.Updated = time.Now().Add(-time.Minute).Unix()
 	raw, err := s.encodeDailyJob(j)
 	if err != nil {
@@ -215,7 +335,30 @@ func TestDailyJobStorageBudgetAndRetry(t *testing.T) {
 	if err := db.PutMetaSync(dailyJobKey, raw); err != nil {
 		t.Fatal(err)
 	}
-	enqueueDailyTest(t, s)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, authenticatedDailyAuditRequest())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "exact block audit record missing at height 20") {
+		t.Fatalf("failed result was hidden by automatic retry: %d %s", rec.Code, rec.Body.String())
+	}
+	current, err := s.loadDailyJob()
+	if err != nil || current == nil || current.State != "failed" || current.ID != j.ID {
+		t.Fatalf("GET mutated the failed job: %+v %v", current, err)
+	}
+
+	reset := authenticatedDailyAuditRequest()
+	reset.Method = http.MethodDelete
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, reset)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit retry reset failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if cleared, err := s.loadDailyJob(); err != nil || cleared != nil {
+		t.Fatalf("explicit reset retained failed job: %+v %v", cleared, err)
+	}
+	retry := enqueueDailyTest(t, s)
+	if retry.ID == j.ID {
+		t.Fatal("explicit retry reused the failed job identity")
+	}
 }
 
 // Production retains only 256 finalized heights in memory and restart may
@@ -297,4 +440,71 @@ func TestDailyJobAdvancingCertificateOracleDoesNotResetCursor(t *testing.T) {
 		}
 	}
 	t.Fatal("advancing oracle prevented completion")
+}
+
+func TestDailyOpeningBoundaryFailureDistinguishesBoundedWindow(t *testing.T) {
+	start := time.Unix(1_800_000_000, 0)
+	before := start.Add(-time.Second).UnixNano()
+	after := start.Add(time.Second).UnixNano()
+	tests := []struct {
+		name                   string
+		anchorTimestamp        int64
+		certifiedWindowLimited bool
+		candidateAtSearchFloor bool
+		parentHashMatches      bool
+		want                   string
+	}{
+		{
+			name:                   "bounded certificate window starts after opening",
+			anchorTimestamp:        after,
+			certifiedWindowLimited: true,
+			candidateAtSearchFloor: true,
+			parentHashMatches:      true,
+			want:                   "certified search window starts after interval opening",
+		},
+		{
+			name:              "actual parent mismatch",
+			anchorTimestamp:   before,
+			parentHashMatches: false,
+			want:              "opening boundary is discontinuous",
+		},
+		{
+			name:            "anchor timestamp is not before interval",
+			anchorTimestamp: after,
+			want:            "opening anchor timestamp is not before interval start",
+		},
+		{
+			name:              "valid opening link",
+			anchorTimestamp:   before,
+			parentHashMatches: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dailyOpeningBoundaryFailure(start, tt.anchorTimestamp, tt.certifiedWindowLimited, tt.candidateAtSearchFloor, tt.parentHashMatches)
+			if got != tt.want {
+				t.Fatalf("dailyOpeningBoundaryFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDailyAuditIncompleteOmitsUnverifiedBurnTotals(t *testing.T) {
+	s := &Server{}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/lpod/audit/daily?date=2026-11-05", nil)
+	s.restLPoDAuditDaily(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("incomplete audit status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode incomplete audit: %v", err)
+	}
+	if _, ok := body["burns_napro"]; ok {
+		t.Fatal("incomplete audit exposed unverified burn totals")
+	}
+	if _, ok := dailyPending("2026-11-05", "queued")["burns_napro"]; ok {
+		t.Fatal("pending response exposed unverified burn totals")
+	}
 }

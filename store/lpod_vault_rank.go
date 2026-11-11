@@ -4,6 +4,7 @@
 package store
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/aperod/aperod/lpod"
@@ -88,7 +89,14 @@ func (c *LPoDCheckpoint) LPoDEffectiveGuardianTotals() (map[string]uint64, error
 			continue
 		}
 		id := lpodPositionVaultID(p)
-		n, err := lpodAdd(totals[id], p.Deposit.Amount-p.Withdrawn)
+		principal, err := LPoDPositionPrincipal(p)
+		if err != nil {
+			return nil, err
+		}
+		if principal < p.Withdrawn {
+			return nil, fmt.Errorf("lpod: position withdrawal exceeds principal")
+		}
+		n, err := lpodAdd(totals[id], principal-p.Withdrawn)
 		if err != nil {
 			return nil, err
 		}

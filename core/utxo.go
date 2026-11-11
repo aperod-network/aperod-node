@@ -225,10 +225,6 @@ type UTXOKey struct {
 // the cap without needing to pre-fill 10 000 entries.
 var maxSpentDecoys = 10_000
 
-// maxCLSAGRecentOutputs bounds post-activation output material retained in
-// memory. The complete canonical anonymity set is stored in RingMemberStore.
-var maxCLSAGRecentOutputs = 100_000
-
 // maxRollbackDepth is the number of recent block heights kept in the rollback
 // journal.  Any chain reorganization deeper than this cannot be reversed in
 // memory.  On a PoA chain such deep reorgs are operationally impossible.
@@ -246,16 +242,14 @@ type rollbackEntry struct {
 // UTXOSet is an in-memory UTXO set backed by the persistent store.
 // In production, reads/writes go through store.UTXOStore (LevelDB).
 type UTXOSet struct {
-	mu                    sync.RWMutex
-	utxos                 map[UTXOKey]*UTXO
-	keyImages             compactKeyImageSet         // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
-	byPubKey              map[crypto.Point32]*UTXO   // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
-	stakedUTXOs           map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
-	spentPubKeys          map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
-	rollbackJournal       map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
-	ringMembers           RingMemberStore
-	clsagActivationHeight uint64
-	clsagRecentOutputs    []UTXOKey
+	mu              sync.RWMutex
+	utxos           map[UTXOKey]*UTXO
+	keyImages       compactKeyImageSet         // spent key images — compact sorted slice (32 B/entry vs ~150 B map)
+	byPubKey        map[crypto.Point32]*UTXO   // ACTIVE (unspent) UTXOs by OneTimePub for C-0 check
+	stakedUTXOs     map[UTXOKey]*UTXO          // UTXOs burned for staking (C-1 fix) — stores data for rollback
+	spentPubKeys    map[crypto.Point32]*UTXO   // Phase 2: spent UTXOs removed from byPubKey; used as safe ring decoys
+	rollbackJournal map[uint64][]rollbackEntry // height → UTXOs spent at that height (for RollbackBlock)
+	ringMembers     RingMemberStore
 
 	// OnUTXOSpent, when non-nil, is called from ApplyBlock each time the
 	// real spending input for a ring transaction is identified and removed
@@ -301,13 +295,6 @@ func NewUTXOSetWithDB(kiDB KeyImageStore) *UTXOSet {
 	return s
 }
 
-// SetCLSAGActivationHeight enables bounded post-v5 output caching.
-func (s *UTXOSet) SetCLSAGActivationHeight(height uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.clsagActivationHeight = height
-}
-
 // Add inserts a new UTXO into the set.
 func (s *UTXOSet) Add(u *UTXO) {
 	s.mu.Lock()
@@ -323,7 +310,6 @@ func (s *UTXOSet) Add(u *UTXO) {
 	if !isProtocolLockedUTXO(u) {
 		s.byPubKey[u.OneTimePub] = u
 	}
-	s.trackCLSAGRecentLocked(key, u.BlockHeight)
 }
 
 func cloneUTXO(u *UTXO) *UTXO {
@@ -370,25 +356,6 @@ func (s *UTXOSet) replaceUTXOReferenceLocked(old, replacement *UTXO) {
 			}
 		}
 		s.rollbackJournal[height] = entries
-	}
-}
-
-func (s *UTXOSet) trackCLSAGRecentLocked(key UTXOKey, height uint64) {
-	if isProtocolLockedUTXO(s.utxos[key]) {
-		return
-	}
-	if s.clsagActivationHeight == 0 || height < s.clsagActivationHeight {
-		return
-	}
-	s.clsagRecentOutputs = append(s.clsagRecentOutputs, key)
-	if len(s.clsagRecentOutputs) <= maxCLSAGRecentOutputs {
-		return
-	}
-	oldest := s.clsagRecentOutputs[0]
-	s.clsagRecentOutputs = s.clsagRecentOutputs[1:]
-	if old := s.utxos[oldest]; old != nil {
-		delete(s.byPubKey, old.OneTimePub)
-		delete(s.utxos, oldest)
 	}
 }
 
@@ -824,7 +791,6 @@ func (s *UTXOSet) applyTxsLocked(block *Block) {
 			if !u.ProtocolLocked {
 				s.byPubKey[out.OneTimePub] = u
 			}
-			s.trackCLSAGRecentLocked(key, block.Header.Height)
 		}
 	}
 }

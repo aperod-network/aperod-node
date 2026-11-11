@@ -172,7 +172,7 @@ func (c *Chain) BlocksNewestFirstPage(startHeight uint64, startAtTip bool, maxHe
 		}
 	}
 
-	blocks = make([]*Block, 0, int(startHeight-firstHeight+1))
+	blocks = make([]*Block, 0, maxHeightScan)
 	for height := startHeight; ; height-- {
 		if block := c.byHeight[height]; block != nil {
 			blocks = append(blocks, block)
@@ -533,18 +533,24 @@ func (c *Chain) TailHashes(n int) []crypto.Hash32 {
 	defer c.mu.RUnlock()
 
 	tip := c.tip
-	if tip == nil {
+	if tip == nil || n <= 0 {
 		return nil
 	}
 
-	start := int(tip.Header.Height) - n + 1
-	if start < 0 {
-		start = 0
+	tipHeight := tip.Header.Height
+	// #nosec G115 -- n is checked positive immediately above; int is at most 64 bits on supported targets.
+	count := uint64(n)
+	start := uint64(0)
+	if tipHeight >= count-1 {
+		start = tipHeight - (count - 1)
 	}
 	out := make([]crypto.Hash32, 0, n)
-	for h := uint64(start); h <= tip.Header.Height; h++ {
+	for h := start; ; h++ {
 		if b, ok := c.byHeight[h]; ok {
 			out = append(out, b.Hash())
+		}
+		if h == tipHeight {
+			break
 		}
 	}
 	return out

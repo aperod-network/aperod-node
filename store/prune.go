@@ -3,8 +3,10 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 
+	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 )
 
@@ -78,19 +80,20 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 	}
 
 	protectedVestingHeights := map[uint64]bool{}
-	if hasFunding {
-		checkpoint, err := d.LoadLPoDCheckpoint()
-		if err != nil {
-			return 0, fmt.Errorf("load reserve checkpoint before pruning: %w", err)
-		}
-		if checkpoint != nil && checkpoint.GenesisVesting != nil {
-			protectedVestingHeights[checkpoint.GenesisVesting.FundingHeight] = true
-			for _, h := range checkpoint.GenesisVesting.PaidHeights {
-				if h > 0 {
-					protectedVestingHeights[h] = true
-				}
+	checkpoint, err := d.LoadLPoDCheckpoint()
+	if err != nil {
+		return 0, fmt.Errorf("load reserve checkpoint before pruning: %w", err)
+	}
+	if checkpoint != nil && checkpoint.GenesisVesting != nil {
+		protectedVestingHeights[checkpoint.GenesisVesting.FundingHeight] = true
+		for _, h := range checkpoint.GenesisVesting.PaidHeights {
+			if h > 0 {
+				protectedVestingHeights[h] = true
 			}
 		}
+	}
+	if err := d.validateSaleRetentionIndex(); err != nil {
+		return 0, fmt.Errorf("validate sale retention before pruning: %w", err)
 	}
 	if cursor >= pruneBelow {
 		return 0, nil // nothing new to prune
@@ -106,6 +109,30 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 		raw, err := d.GetRawBlockByHeight(h)
 		if err != nil {
 			return pruned, fmt.Errorf("get block at height %d: %w", h, err)
+		}
+		retainedValue, err := d.get(saleRetainedBlockKey(h))
+		if err != nil {
+			return pruned, fmt.Errorf("read sale retention marker at height %d: %w", h, err)
+		}
+		if flags, retainedHash, retained, err := saleRetentionMarker(retainedValue, h); err != nil {
+			return pruned, err
+		} else if retained {
+			canonicalHash, found, err := d.GetCanonicalHash(h)
+			if err != nil || !found || canonicalHash != retainedHash {
+				return pruned, fmt.Errorf("sale retention marker is not bound to canonical height %d: %v", h, err)
+			}
+			if raw == nil {
+				return pruned, fmt.Errorf("retained sale block body missing at height %d", h)
+			}
+			if flags&saleRetainedDelivery != 0 {
+				err = validateSaleRetentionBody(raw, h, retainedHash)
+			} else {
+				err = validateSaleRetentionHeader(raw, h, retainedHash)
+			}
+			if err != nil {
+				return pruned, err
+			}
+			continue
 		}
 		if hasFunding && h == fundingHeight {
 			canonicalHash, err := d.get(heightKey(h))
@@ -131,26 +158,13 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 			continue
 		}
 
-		// Strip TxData: replace the block bytes with a header-only version.
-		// We encode the pruned marker as the single JSON string `null` appended
-		// to the height key only; the block hash key is left pointing to a
-		// stripped StoredBlock with TxData omitted.
-		sb, err := d.GetBlockByHeight(h)
+		stripped, err := d.stripCanonicalBlockTransactions(h, raw)
 		if err != nil {
-			return pruned, fmt.Errorf("unmarshal block at height %d: %w", h, err)
+			return pruned, err
 		}
-		if sb == nil {
-			continue
+		if stripped {
+			pruned++
 		}
-		if len(sb.TxData) == 0 {
-			// Already pruned or empty block — just advance cursor.
-			continue
-		}
-		sb.TxData = nil // drop transaction payloads
-		if err := d.PutBlock(sb.Hash, sb); err != nil {
-			return pruned, fmt.Errorf("rewrite pruned block at height %d: %w", h, err)
-		}
-		pruned++
 	}
 
 	// Advance cursor.
@@ -160,4 +174,50 @@ func (d *DB) PruneBlocksOlderThan(pruneBelow uint64) (int, error) {
 		return pruned, fmt.Errorf("update prune cursor: %w", err)
 	}
 	return pruned, nil
+}
+
+// stripCanonicalBlockTransactions supports the current core.Block encoding and
+// the older flattened StoredBlock encoding. Either representation must match
+// the canonical height index before it can be rewritten.
+func (d *DB) stripCanonicalBlockTransactions(height uint64, raw []byte) (bool, error) {
+	hash, found, err := d.GetCanonicalHash(height)
+	if err != nil || !found {
+		return false, fmt.Errorf("missing canonical hash while pruning height %d: %v", height, err)
+	}
+
+	var block core.Block
+	if err := json.Unmarshal(raw, &block); err == nil &&
+		block.Header.Height == height && block.Hash() == hash {
+		if len(block.Txs) == 0 {
+			// Empty blocks and blocks already pruned by an interrupted prior run
+			// need no rewrite. Sale delivery bodies were validated above.
+			return false, nil
+		}
+		if block.Header.MerkleRoot != core.MerkleRoot(block.Txs) {
+			return false, fmt.Errorf("block body merkle root mismatch at height %d", height)
+		}
+		block.Txs = nil
+		encoded, err := json.Marshal(&block)
+		if err != nil {
+			return false, fmt.Errorf("marshal pruned block at height %d: %w", height, err)
+		}
+		if err := d.PutRawBlock(hash, height, encoded); err != nil {
+			return false, fmt.Errorf("rewrite pruned block at height %d: %w", height, err)
+		}
+		return true, nil
+	}
+
+	var stored StoredBlock
+	if err := json.Unmarshal(raw, &stored); err != nil ||
+		stored.Height != height || stored.Hash != hash {
+		return false, fmt.Errorf("block at height %d is not bound to its canonical hash", height)
+	}
+	if len(stored.TxData) == 0 {
+		return false, nil
+	}
+	stored.TxData = nil
+	if err := d.PutBlock(hash, &stored); err != nil {
+		return false, fmt.Errorf("rewrite legacy pruned block at height %d: %w", height, err)
+	}
+	return true, nil
 }

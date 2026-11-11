@@ -730,9 +730,8 @@ type AddressUTXO struct {
 	AmountCommitHex string `json:"amount_commit_hex"`
 	EncAmountHex    string `json:"enc_amount_hex"`
 	BlockHeight     uint64 `json:"block_height"`
-	// AmountNapr is the decrypted output amount in nAPRO. Populated when a
-	// view key is available (via X-View-Key header or node.yaml view_key).
-	// Null when no view key is configured.
+	// AmountNapr is the decrypted output amount in nAPRO. Populated only when
+	// the request supplies a view key in the X-View-Key header.
 	AmountNapr *uint64 `json:"amount_napr,string"`
 	// IsCoinbase is true when this UTXO belongs to a per-block validator
 	// reward (coinbase) transaction.  Wallet history displays must filter
@@ -745,8 +744,8 @@ type AddressUTXO struct {
 // Without a view key: returns transparent / mint outputs (OneTimePub matches
 // spend pub directly) with amount_napr=null.
 //
-// With a view key (X-View-Key header or view_key in node.yaml): also
-// discovers stealth outputs via ECDH scan and sets amount_napr for them.
+// With an explicit X-View-Key header: also discovers stealth outputs via
+// ECDH scan and sets amount_napr for them.
 //
 // Note on transparent/mint outputs: BuildMintTx leaves TxPubKey and EncAmount
 // as zero — there is no ECDH shared secret to derive, so amount_napr remains
@@ -765,15 +764,14 @@ func (s *Server) restAddressUTXOs(w http.ResponseWriter, r *http.Request, addrSt
 		return
 	}
 
-	// Resolve view key: X-View-Key header is the only accepted source.
+	// Resolve view key: X-View-Key header is the only accepted source. Never
+	// use a node-configured key here: this endpoint is unauthenticated, so a
+	// configured key would disclose wallet ownership and amounts to any caller.
 	// The view_key_hex query parameter was removed (F5 security fix) because
 	// query parameters are logged by reverse proxies, access logs, and browser
 	// history, leaking the private view scalar to anyone with log access.
 	viewKeyHex := r.Header.Get("X-View-Key")
 	requestViewKey := viewKeyHex != ""
-	if viewKeyHex == "" {
-		viewKeyHex = s.nodeViewKeyHex
-	}
 
 	var viewPriv *crypto.Scalar32
 	var viewKey []byte
@@ -1021,13 +1019,15 @@ func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr
 //   { "outputs": [...], "from_height": N, "next_height": M, "tip_height": T }
 
 type ScanOutput struct {
-	TxHash          string `json:"tx_hash"`
-	OutIdx          int    `json:"out_idx"`
-	BlockHeight     uint64 `json:"block_height"`
-	OneTimePubHex   string `json:"one_time_pub_hex"`
-	TxPubKeyHex     string `json:"tx_pub_key_hex"`
-	AmountCommitHex string `json:"amount_commit_hex"`
-	EncAmountHex    string `json:"enc_amount_hex"`
+	TxHash          string                `json:"tx_hash"`
+	OutIdx          int                   `json:"out_idx"`
+	TxVersion       uint8                 `json:"tx_version"`
+	BlockHeight     uint64                `json:"block_height"`
+	OneTimePubHex   string                `json:"one_time_pub_hex"`
+	TxPubKeyHex     string                `json:"tx_pub_key_hex"`
+	AmountCommitHex string                `json:"amount_commit_hex"`
+	EncAmountHex    string                `json:"enc_amount_hex"`
+	AmountBinding   *crypto.AmountBinding `json:"amount_binding,omitempty"`
 	// IsCoinbase is true when this output belongs to the first (coinbase)
 	// transaction in its block.  Wallet clients must filter these out so
 	// per-block validator rewards do not appear in user history.
@@ -1093,11 +1093,13 @@ func (s *Server) restScanOutputs(w http.ResponseWriter, r *http.Request) {
 				outputs = append(outputs, ScanOutput{
 					TxHash:          hashHex,
 					OutIdx:          j,
+					TxVersion:       uint8(tx.Version),
 					BlockHeight:     h,
 					OneTimePubHex:   fmt.Sprintf("%x", out.OneTimePub[:]),
 					TxPubKeyHex:     fmt.Sprintf("%x", out.TxPubKey[:]),
 					AmountCommitHex: fmt.Sprintf("%x", out.AmountCommit[:]),
 					EncAmountHex:    fmt.Sprintf("%x", out.EncAmount[:]),
+					AmountBinding:   out.AmountBinding,
 					IsCoinbase:      isCoinbase,
 				})
 			}
@@ -1532,10 +1534,15 @@ func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 		baseFeePerByte = core.MinBaseFeePerByte
 	}
 
-	// Typical transfer: 1 input, 2 outputs (payment + change).
+	// Typical transfer: 1 input, 2 outputs (payment + change), using the version
+	// required by the next block's active consensus rules.
 	const typicalInputs = 1
 	const typicalOutputs = 2
-	estimatedFeeNapro := core.ExportedEstimateFee(typicalInputs, typicalOutputs, baseFeePerByte)
+	txVersion := core.TxVersionCommitmentBinding
+	if s.mempool != nil {
+		txVersion = s.mempool.NextSpendVersion()
+	}
+	estimatedFeeNapro := core.ExportedEstimateFeeForVersion(txVersion, typicalInputs, typicalOutputs, baseFeePerByte)
 	txSizeBytes := int(estimatedFeeNapro / baseFeePerByte)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1543,6 +1550,7 @@ func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 		"estimated_fee_napro": estimatedFeeNapro,
 		"estimated_fee_apro":  float64(estimatedFeeNapro) / 1e8,
 		"tx_size_bytes":       txSizeBytes,
+		"transaction_version": uint8(txVersion),
 	})
 }
 
@@ -2390,6 +2398,18 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 		"exists":            true,
 		"block_height":      blockHeight,
 	}
+	binding, version, found := s.amountBindingForOutput(txHash, outIdx, blockHeight)
+	if found {
+		resp["tx_version"] = uint8(version)
+		required := version == core.TxVersionAmountBinding || version == core.TxVersionAVMAmountBinding
+		if required && binding == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "amount-binding proof unavailable for active output")
+			return
+		}
+		if binding != nil {
+			resp["amount_binding"] = binding
+		}
+	}
 	// Once CLSAG is active, absence from su/ cannot prove that a particular
 	// output is unspent: v5 intentionally hides the real ring member. Owners
 	// must derive the output key image and query /api/v1/keyimage/{ki}/is-spent.
@@ -2454,6 +2474,24 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) amountBindingForOutput(txHash crypto.Hash32, outIndex uint32, height uint64) (*crypto.AmountBinding, core.TxVersion, bool) {
+	if s.chain == nil {
+		return nil, 0, false
+	}
+	block := s.chain.GetByHeight(height)
+	if block == nil {
+		return nil, 0, false
+	}
+	for i := range block.Txs {
+		tx := &block.Txs[i]
+		if tx.Hash() != txHash || int(outIndex) >= len(tx.Outputs) {
+			continue
+		}
+		return tx.Outputs[outIndex].AmountBinding, tx.Version, true
+	}
+	return nil, 0, false
+}
+
 func (s *Server) restUTXOSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet {
@@ -2513,7 +2551,7 @@ func (s *Server) restUTXOSnapshot(w http.ResponseWriter, r *http.Request) {
 			spentStatus = "unknown_key_image_required"
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"tx_hash": fmt.Sprintf("%x", txHash[:]), "out_idx": outIndex,
 		"amount_commit_hex": fmt.Sprintf("%x", utxo.AmountCommit[:]),
 		"one_time_pub_hex":  fmt.Sprintf("%x", utxo.OneTimePub[:]),
@@ -2522,7 +2560,20 @@ func (s *Server) restUTXOSnapshot(w http.ResponseWriter, r *http.Request) {
 		"exists":            true, "block_height": utxo.BlockHeight, "spent_status": spentStatus,
 		"snapshot_id": lease.entry.id, "checkpoint_height": lease.entry.height,
 		"checkpoint_hash": fmt.Sprintf("%x", lease.entry.hash[:]),
-	})
+	}
+	binding, version, found := s.amountBindingForOutput(txHash, outIndex, utxo.BlockHeight)
+	if found {
+		resp["tx_version"] = uint8(version)
+		required := version == core.TxVersionAmountBinding || version == core.TxVersionAVMAmountBinding
+		if required && binding == nil {
+			writeWalletSnapshotError(w, http.StatusServiceUnavailable, "SNAPSHOT_QUERY_FAILED", "amount-binding proof unavailable")
+			return
+		}
+		if binding != nil {
+			resp["amount_binding"] = binding
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) restAdminStakeDeposit(w http.ResponseWriter, r *http.Request) {
@@ -2904,6 +2955,11 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid address: "+err.Error())
 		return
 	}
+	if s.rewardAddress != "" && req.Address == s.rewardAddress {
+		writeJSONError(w, http.StatusBadRequest,
+			"cannot admin-mint to the validator reward address: the per-block coinbase reward would collide with the same one-time pub")
+		return
+	}
 	if math.IsNaN(req.AmountAPR) || math.IsInf(req.AmountAPR, 0) || req.AmountAPR <= 0 || req.AmountAPR > 10_000_000_000 {
 		writeJSONError(w, http.StatusBadRequest, "amount_apr must be > 0 and <= 10000000000")
 		return
@@ -3185,6 +3241,7 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"ok":                        true,
 		"height":                    height,
 		"syncing":                   syncing,
+		"next_restart_at":           nil,
 		"syncing_height":            syncingHeight,
 		"tip_height":                tipHeight,
 		"utxo_rebuilding":           atomic.LoadInt32(&s.utxoRebuilding) == 1,
@@ -3195,6 +3252,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
 		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
 		"burn_address":              crypto.MainnetBurnAddress().String(),
+	}
+	if nextRestartAt := s.nextNightlyRestartAt(time.Now()); nextRestartAt != nil {
+		resp["next_restart_at"] = nextRestartAt.UTC().Format(time.RFC3339)
 	}
 	// Use the live whitelist from the P2P layer when wired; fall back to the
 	// startup snapshot so /api/v1/status is never stale after live edits.

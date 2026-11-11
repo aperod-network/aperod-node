@@ -35,6 +35,7 @@ type dailyProgress struct {
 	Certificate                 *store.FinalityCertificate
 	Anchor, Witness             crypto.Hash32
 	AnchorHeight, WitnessHeight uint64
+	Preclosing                  bool
 	Marker                      crypto.Hash32
 	Prune                       []byte
 	Next                        uint64
@@ -163,7 +164,6 @@ func dailyPending(date, reason string) map[string]interface{} {
 		"vaults":             []lpodDailyVault{}, "positions": []lpodDailyPosition{},
 		"coverage":       map[string]int{"blocks": 0, "vaults": 0, "positions": 0},
 		"opening_anchor": nil, "closing_witness": nil, "certificate": nil, "funding": nil,
-		"burns_napro": map[string]string{"protocol_base_fee": "0", "signed_intentional": "0", "avm_gas": "0", "total": "0"},
 	}
 	loc, err := time.LoadLocation("Europe/Moscow")
 	if err != nil {
@@ -228,13 +228,15 @@ func (s *Server) restLPoDDailyJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if j != nil && j.Date == date {
-		missingRewards := dailyRewardsNeedReplay(j.Progress)
-		if missingRewards || (j.State == "failed" && time.Now().Unix()-j.Updated >= 30) ||
-			(j.State == "complete" && (!s.dailyBindingValid(j.Progress) ||
-				!s.lpodFinalized(j.Progress.Certificate.Height, j.Progress.Certificate.BlockHash))) {
+missingRewards := j.State != "failed" && dailyRewardsNeedReplay(j.Progress)
+		invalidComplete := j.State == "complete" &&
+			(!s.dailyBindingValid(j.Progress) ||
+				!s.lpodFinalized(j.Progress.Certificate.Height, j.Progress.Certificate.BlockHash))
+		if missingRewards || invalidComplete {
 			// Re-attest an older complete report by verifying only its unprocessed
-			// descendant tail. Invalidated/failed progress is never reused.
-			if missingRewards || j.State == "failed" || !s.dailyBindingValid(j.Progress) {
+			// descendant tail. Invalidated progress is never reused. Failed results
+			// remain visible until an authenticated DELETE explicitly resets them.
+			if missingRewards || !s.dailyBindingValid(j.Progress) {
 				j.Progress = &dailyProgress{}
 			}
 			j.ID, j.State, j.Result = time.Now().UnixNano(), "queued", nil
@@ -345,7 +347,7 @@ func (s *Server) runDailyJobBatch(ctx context.Context) {
 	}
 	if result.Status == "complete" {
 		j.State = "complete"
-	} else if j.Progress.Next == before {
+	} else if j.Progress.Next == before && !dailyJobResultIsWaiting(j.Result) {
 		j.State = "failed"
 	}
 	d.mu.Lock()
@@ -361,5 +363,24 @@ func (s *Server) runDailyJobBatch(ctx context.Context) {
 		if saveErr := s.saveDailyJob(j); saveErr != nil && s.log != nil {
 			s.log.Error("daily audit progress persistence failed", "err", saveErr)
 		}
+	}
+}
+
+func dailyJobResultIsWaiting(raw []byte) bool {
+	var result struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(raw, &result) != nil || result.Status != "incomplete" {
+		return false
+	}
+	switch result.Reason {
+	case "opening boundary not yet certified",
+		"closing witness not yet present",
+		"verified certificate predates the closing witness",
+		"bounded background verification in progress":
+		return true
+	default:
+		return false
 	}
 }

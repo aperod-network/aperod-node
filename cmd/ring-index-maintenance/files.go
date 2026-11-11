@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,15 +15,17 @@ import (
 )
 
 func syncDirectory(path string) error {
+	// #nosec G304 -- path is a staging directory generated beneath the approved backup root.
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return f.Sync()
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
-func writeControl(path string, value any, exclusive bool) error {
+func writeControl(path string, value any, exclusive bool) (retErr error) {
 	if exclusive {
 		if _, err := os.Lstat(path); err == nil {
 			return fmt.Errorf("existing operation/control must be recovered, not overwritten")
@@ -35,14 +38,16 @@ func writeControl(path string, value any, exclusive bool) error {
 		return err
 	}
 	name := f.Name()
-	defer os.Remove(name)
+	defer func() {
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove temporary control file: %w", err))
+		}
+	}()
 	if err := json.NewEncoder(f).Encode(value); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -74,22 +79,30 @@ type backupEntry struct {
 // Rooted source access cannot escape the approved data tree via raced symlinks.
 // Services/writers and the shared native DB lock must already be quiescent.
 // Destination is a new root-private directory, never a live/overlapping tree.
-func copyTree(source, destination string, manifest *json.Encoder) error {
+func copyTree(source, destination string, manifest *json.Encoder) (retErr error) {
 	root, err := os.OpenRoot(source)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
+	defer func() {
+		if err := root.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close source root: %w", err))
+		}
+	}()
 	if err := os.Mkdir(destination, 0700); err != nil {
 		return err
 	}
 	var visit func(string) error
-	visit = func(relative string) error {
+	visit = func(relative string) (retErr error) {
 		dir, err := root.Open(relative)
 		if err != nil {
 			return err
 		}
-		defer dir.Close()
+		defer func() {
+			if err := dir.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close source directory: %w", err))
+			}
+		}()
 		info, err := dir.Stat()
 		if err != nil {
 			return err
@@ -130,32 +143,25 @@ func copyTree(source, destination string, manifest *json.Encoder) error {
 					return err
 				}
 				opened, err := in.Stat()
-				if err != nil || !os.SameFile(info, opened) {
-					in.Close()
-					return fmt.Errorf("source file identity changed")
+				if err != nil {
+					return errors.Join(err, in.Close())
 				}
+				if !os.SameFile(info, opened) {
+					return errors.Join(fmt.Errorf("source file identity changed"), in.Close())
+				}
+				// #nosec G304 -- target is beneath a new backup root and its relative name comes from the opened source directory.
 				out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 				if err != nil {
-					in.Close()
-					return err
+					return errors.Join(err, in.Close())
 				}
 				hash := sha256.New()
 				n, copyErr := io.Copy(io.MultiWriter(out, hash), in)
 				after, statErr := in.Stat()
-				in.Close()
+				inputCloseErr := in.Close()
 				syncErr := out.Sync()
 				closeErr := out.Close()
-				if copyErr != nil {
-					return copyErr
-				}
-				if statErr != nil {
-					return statErr
-				}
-				if syncErr != nil {
-					return syncErr
-				}
-				if closeErr != nil {
-					return closeErr
+				if err := errors.Join(copyErr, statErr, inputCloseErr, syncErr, closeErr); err != nil {
+					return err
 				}
 				if n != info.Size() || after.Size() != info.Size() || after.ModTime() != info.ModTime() {
 					return fmt.Errorf("source changed during coherent copy")
@@ -182,17 +188,25 @@ func copyTree(source, destination string, manifest *json.Encoder) error {
 
 // Verify every copied file by re-reading the private destination, not only its
 // manifest or tip. This is byte-copy integrity, not a historical-chain proof.
-func verifyBackup(backup string) error {
+func verifyBackup(backup string) (retErr error) {
 	root, err := os.OpenRoot(backup)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
+	defer func() {
+		if err := root.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close backup root: %w", err))
+		}
+	}()
 	f, err := root.Open("manifest.jsonl")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close backup manifest: %w", err))
+		}
+	}()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4096), 16384)
 	header, complete := false, false
@@ -254,9 +268,9 @@ func verifyBackup(backup string) error {
 		}
 		h := sha256.New()
 		_, copyErr := io.Copy(h, in)
-		in.Close()
-		if copyErr != nil {
-			return copyErr
+		closeErr := in.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			return err
 		}
 		if hex.EncodeToString(h.Sum(nil)) != row.SHA256 {
 			return fmt.Errorf("backup file checksum differs")

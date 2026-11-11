@@ -22,14 +22,15 @@ type wasmDecoy struct {
 	AmountCommit string `json:"amount_commit"`
 }
 type wasmRequest struct {
-	Mnemonic   string       `json:"mnemonic"`
-	Account    uint32       `json:"account"`
-	Index      uint32       `json:"index"`
-	Amount     uint64       `json:"amount_napr"`
-	ToAddress  string       `json:"to_address"`
-	FeePerByte uint64       `json:"fee_per_byte"`
-	Outputs    []wasmOutput `json:"outputs"`
-	Decoys     []wasmDecoy  `json:"decoys"`
+	Mnemonic   string         `json:"mnemonic"`
+	Account    uint32         `json:"account"`
+	Index      uint32         `json:"index"`
+	Amount     uint64         `json:"amount_napr"`
+	TxVersion  core.TxVersion `json:"tx_version,omitempty"`
+	ToAddress  string         `json:"to_address"`
+	FeePerByte uint64         `json:"fee_per_byte"`
+	Outputs    []wasmOutput   `json:"outputs"`
+	Decoys     []wasmDecoy    `json:"decoys"`
 	// AVM carries an already locally signed payload. The fee-paying wallet
 	// remains responsible only for the RingCT inputs and never derives or
 	// receives the AVM signer's private key.
@@ -103,7 +104,31 @@ func ownedOutputs(r wasmRequest, keys *wallet.DerivedKeys) ([]core.OwnedUTXO, er
 			if scanErr != nil || found == nil {
 				continue
 			}
-			hs, amount = *found, core.DecryptAmount(enc, found)
+			hs = *found
+			if x.AmountBinding != nil {
+				valid, verifyErr := crypto.VerifyAmountBinding(crypto.Commitment(ac), crypto.Point32(op), x.AmountBinding)
+				if verifyErr != nil || !valid {
+					return nil, fmt.Errorf("outputs[%d] amount binding is invalid: %v", i, verifyErr)
+				}
+				oneTimePriv, keyErr := crypto.AddScalars(hs, keys.Keys.Spend.Private)
+				if keyErr != nil {
+					return nil, fmt.Errorf("outputs[%d] derive one-time spend key: %w", i, keyErr)
+				}
+				amount, err = crypto.DecryptAmountBinding(x.AmountBinding, oneTimePriv)
+				crypto.ZeroBytes(oneTimePriv[:])
+				if err != nil {
+					return nil, fmt.Errorf("outputs[%d] decrypt bound amount: %w", i, err)
+				}
+			} else {
+				if x.TxVersion == uint8(core.TxVersionAmountBinding) ||
+					x.TxVersion == uint8(core.TxVersionAVMAmountBinding) {
+					return nil, fmt.Errorf("outputs[%d] is missing its required amount binding", i)
+				}
+			if x.TxVersion == 0 && enc == ([8]byte{}) {
+				return nil, fmt.Errorf("outputs[%d] is missing transaction-version metadata for a zero legacy amount", i)
+			}
+				amount = core.DecryptAmount(enc, found)
+			}
 			blind, err = crypto.DeterministicPaymentBlind(hs, amount)
 		}
 		if x.BlindHex != "" {
@@ -169,8 +194,12 @@ func localBuilder(r wasmRequest) (*core.TxBuilder, *wallet.DerivedKeys, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	version := r.TxVersion
+	if version == 0 {
+		version = core.TxVersionCLSAG
+	}
 	builder := core.NewTxBuilder(keys.Keys.Spend.Private, keys.Keys.View.Private, keys.Keys.Spend.Public, owned, r.FeePerByte).
-		WithVersion(core.TxVersionCLSAG).
+		WithVersion(version).
 		WithDecoys(decoys)
 	if r.AVM != nil {
 		builder = builder.WithAVM(*r.AVM)

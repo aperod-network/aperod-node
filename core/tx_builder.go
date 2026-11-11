@@ -104,7 +104,11 @@ func (b *TxBuilder) WithAVM(payload AVMPayload) *TxBuilder {
 		}
 	}
 	b.avmPayload = &cloned
-	b.txVersion = TxVersionAVM
+	if b.txVersion == TxVersionAmountBinding || b.txVersion == TxVersionAVMAmountBinding {
+		b.txVersion = TxVersionAVMAmountBinding
+	} else {
+		b.txVersion = TxVersionAVM
+	}
 	return b
 }
 
@@ -209,7 +213,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	if err := crypto.Validate(changeAddr); err != nil {
 		return nil, fmt.Errorf("invalid change address: %w", err)
 	}
-	if b.txVersion == TxVersionAVM {
+	if txVersionIsAVM(b.txVersion) {
 		if b.avmPayload == nil {
 			return nil, fmt.Errorf("AVM transaction requires WithAVM")
 		}
@@ -527,6 +531,21 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 	rangeProofs := make([]*crypto.RangeProof, len(outEntries))
 	for i, e := range outEntries {
 		outputs[i] = e.output
+		if txVersionUsesAmountBinding(b.txVersion) {
+			// The old EncAmount is readable by a static view key and is not
+			// authenticated by RingCT. Keep it zero for the new format.
+			outputs[i].EncAmount = [8]byte{}
+			binding, aggregateCommit, bindingErr := crypto.CreateAmountBinding(
+				e.amount, e.blind, e.output.OneTimePub,
+			)
+			if bindingErr != nil {
+				return nil, fmt.Errorf("amount binding [%d]: %w", i, bindingErr)
+			}
+			if aggregateCommit != e.output.AmountCommit {
+				return nil, fmt.Errorf("amount binding [%d]: aggregate commitment mismatch", i)
+			}
+			outputs[i].AmountBinding = binding
+		}
 		proof, err := crypto.ProveRange(e.amount, e.blind)
 		if err != nil {
 			return nil, fmt.Errorf("range proof [%d]: %w", i, err)
@@ -1018,6 +1037,12 @@ func ExportedEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
 	return size * feePerByte
 }
 
+// ExportedEstimateFeeForVersion uses the wire format's serialized size,
+// including amount-binding proofs when version 13 or 14 is selected.
+func ExportedEstimateFeeForVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {
+	return txEstimateFeeVersion(version, nInputs, nOutputs, feePerByte)
+}
+
 // txEstimateFee is the internal variant used during transaction construction.
 func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
 	return ExportedEstimateFee(nInputs, nOutputs, feePerByte)
@@ -1031,11 +1056,24 @@ func txEstimatedSize(version TxVersion, nInputs, nOutputs int) int {
 		// (32), compact CLSAG (608).
 		inputBytes = 576 + crypto.RingSize*32 + 32 + 608
 	}
-	return txOverheadBytes + nInputs*inputBytes + nOutputs*txBytesPerOutput
+	outputBytes := txBytesPerOutput
+	if txVersionUsesAmountBinding(version) {
+		outputBytes += AmountBindingExtraBytesPerOutput
+	}
+	return txOverheadBytes + nInputs*inputBytes + nOutputs*outputBytes
 }
 
 func txVersionUsesCLSAG(version TxVersion) bool {
-	return version == TxVersionCLSAG || version == TxVersionAVM
+	return version == TxVersionCLSAG || version == TxVersionAVM ||
+		version == TxVersionAmountBinding || version == TxVersionAVMAmountBinding
+}
+
+func txVersionUsesAmountBinding(version TxVersion) bool {
+	return version == TxVersionAmountBinding || version == TxVersionAVMAmountBinding
+}
+
+func txVersionIsAVM(version TxVersion) bool {
+	return version == TxVersionAVM || version == TxVersionAVMAmountBinding
 }
 
 func txEstimateFeeVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {

@@ -333,8 +333,12 @@ func TestRestartSafety_UTXORebuildAndStakeReplay(t *testing.T) {
 	reg1 := core.NewValidatorRegistry()
 	reg1.SetUTXOSet(utxos1)
 
-	utxos1.ApplyBlock(genesisBlock)            // unrelated UTXO added
-	utxos1.ApplyBlock(mintBlock)               // burn UTXO added to active set
+	if err := utxos1.ApplyBlock(genesisBlock); err != nil { // unrelated UTXO added
+		t.Fatal(err)
+	}
+	if err := utxos1.ApplyBlock(mintBlock); err != nil { // burn UTXO added to active set
+		t.Fatal(err)
+	}
 	reg1.ApplyBlockStakeTxs(stakeBlock.Txs, 2) // moves burn UTXO to staked set
 
 	// Sanity check first run.

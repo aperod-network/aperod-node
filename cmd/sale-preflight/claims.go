@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,12 +32,17 @@ func loadClaims(path string) (*operatorClaims, error) {
 	return &claims, nil
 }
 
-func decodeDeclaration(path string, target any) error {
+func decodeDeclaration(path string, target any) (retErr error) {
+	// #nosec G304 -- the declaration path is a local operator-selected input file.
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close declaration: %w", err))
+		}
+	}()
 	info, err := f.Stat()
 	if err != nil {
 		return err

@@ -747,6 +747,13 @@ STUB
 exit 0
 STUB
 
+  # SSH tunnel stub: the host-key policy is exercised in its dedicated test.
+  # This test only needs the secure tunneled API URL and must not contact a host.
+  cat > "${STUB15}/ssh" << 'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+
   # curl stub:
   #   /api/v1/status        → exit 0 (primary reachable)
   #   /api/v1/snapshot/*    → exit 1 (snapshot unavailable — non-fatal warn path)
@@ -759,7 +766,7 @@ done
 exit 0
 STUB
 
-  chmod +x "${STUB15}/id" "${STUB15}/systemctl" "${STUB15}/curl"
+chmod +x "${STUB15}/id" "${STUB15}/systemctl" "${STUB15}/ssh" "${STUB15}/curl"
 
   # Temp dirs that replace the real system paths via env-var overrides.
   CFG15="${TMPDIR_TEST}/node-t15.yaml"
@@ -777,6 +784,7 @@ STUB
     APEROD_DROPIN_DIR="${DROPIN15}" \
     bash "${APEROD_JOIN_SH}" \
       "${PRIMARY_IP}:8545" \
+      --tunnel "root@${PRIMARY_IP}" \
       --p2p-port 30304 \
       --data-dir "${DATA15}" \
       --user nonexistentuser_test15 \

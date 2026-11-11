@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -67,6 +68,14 @@ func recoverAmount(r record, u *store.StoredUTXO, maxWhole uint64, extra []uint6
 	var blind crypto.BlindFactor
 	copy(blind[:], raw)
 	verify := func(n uint64) bool {
+		if u.BlockHeight > 0 {
+			b, err := crypto.DeterministicMintBlindV2(pub, n, u.BlockHeight)
+			if err == nil && bytes.Equal(b[:], blind[:]) {
+				c, err := crypto.Commit(n, b)
+				return err == nil && c == u.AmountCommit
+			}
+		}
+		//nolint:staticcheck // Legacy fallback is required to audit pre-V2 mints and height-zero admin mints.
 		b, err := crypto.DeterministicMintBlind(pub, n)
 		if err != nil || !bytes.Equal(b[:], blind[:]) {
 			return false
@@ -163,7 +172,7 @@ func audit(d *store.DB, r record, maxWhole uint64, extra []uint64) evidence {
 	return out
 }
 
-func run() error {
+func run() (retErr error) {
 	path := flag.String("copied-db", "", "closed, consistent LevelDB COPY only")
 	max := flag.Uint64("max-whole-apro", 2000000, "bounded whole-APRO search, at most 2000000")
 	extraText := flag.String("extra-candidates-napro", "[]", "JSON array of decimal STRINGS; search hints, not evidence")
@@ -208,7 +217,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() {
+		if err := d.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close audit database: %w", err))
+		}
+	}()
 	results := make([]evidence, 0, len(rows))
 	for _, r := range rows {
 		results = append(results, audit(d, r, *max, extra))

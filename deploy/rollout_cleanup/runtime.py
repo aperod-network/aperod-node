@@ -64,6 +64,8 @@ class Runtime:
     live_exe_sha256: Callable[[int], str] | None = None
     api_json: Callable[[str], Any] | None = None
     verify_process_binding: Callable[[int, Path, Path], None] | None = None
+    # Deterministic race-test seam after the artifact fingerprint is verified.
+    after_artifact_fingerprint: Callable[[Path, str], None] | None = None
 
 
 DEFAULT_RUNTIME = Runtime()

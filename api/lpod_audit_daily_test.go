@@ -33,7 +33,7 @@ func TestLPoDAuditDailyFailsClosed(t *testing.T) {
 		wantReason        string
 	}{
 		{name: "missing exact row", certificateHeight: 4, wantReason: "exact block audit record missing"},
-		{name: "certificate before closing witness", certificateHeight: 2, wantReason: "predates the closing witness"},
+		{name: "certificate before closing witness with missing audit row", certificateHeight: 2, wantReason: "exact block audit record missing"},
 		{name: "same-height certificate reorg", certificateHeight: 4, reorg: true, wantReason: "not canonical"},
 		{name: "pruned body", certificateHeight: 4, prune: true, wantReason: "metadata is unavailable"},
 		{name: "partial first day", certificateHeight: 4, markerHeight: 2, wantReason: "starts after the interval opening"},
@@ -745,7 +745,11 @@ func dailyAuditGet(t *testing.T, srv *api.Server, path string) (int, map[string]
 			t.Fatalf("decode response: %v (%s)", err, recorder.Body.String())
 		}
 		reason, _ := body["reason"].(string)
-		if reason == "queued for bounded background verification" || reason == "bounded background verification in progress" {
+		if reason == "queued for bounded background verification" ||
+			reason == "bounded background verification in progress" ||
+			reason == "opening boundary not yet certified" ||
+			reason == "closing witness not yet present" ||
+			reason == "verified certificate predates the closing witness" {
 			if time.Now().After(deadline) {
 				t.Fatal("background audit did not finish")
 			}

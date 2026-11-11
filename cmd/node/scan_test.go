@@ -1,21 +1,22 @@
 package main
 
 // scan_test.go — verifies that the periodic GC hook in runStartupScan fires at
-// the correct cumulative UTXO output boundaries (every gcUTXOInterval = 50 000
-// outputs) regardless of how those outputs are distributed across blocks.
+// the correct cumulative UTXO output boundaries regardless of how outputs are
+// distributed across blocks. Tests use a smaller injected interval than the
+// production 50 000-output cadence to keep the LevelDB integration fixtures fast.
 //
 // Two scenarios are covered:
 //
 //  1. Varied output counts across blocks (TestStartupScanGCCadenceVariedBlocks)
-//     Blocks cycle through [100, 500, 1000] outputs each.  The total is designed
-//     to cross the 50 000-UTXO boundary exactly twice (at 50 000 and 100 000),
+//     Blocks cycle through [1, 5, 10] outputs each. The total is designed
+//     to cross the 50-output boundary exactly twice (at 50 and 100),
 //     and no single block crosses more than one boundary.  The test asserts that
-//     GCHook is called with utxoCount == 50 000 and then 100 000, in that order.
+//     GCHook is called with utxoCount == 50 and then 100, in that order.
 //
 //  2. Single block crossing multiple thresholds
 //     (TestStartupScanGCCadenceSingleBlockMultipleThresholds)
-//     A single block holds 150 001 outputs.  The inner output loop must call
-//     GCHook with utxoCount values 50 000, 100 000, and 150 000, in that order.
+//     A single block holds 151 outputs. The inner output loop must call GCHook
+//     with utxoCount values 50, 100, and 150, in that order.
 
 import (
 	"encoding/json"
@@ -124,24 +125,21 @@ func buildVariedChain(
 	return db, tip
 }
 
-// gcTestInterval mirrors the unexported gcUTXOInterval const from scan.go so
-// that test assertions can reference the same value without hard-coding magic
-// numbers.
-const gcTestInterval = uint64(50000)
+const gcTestInterval = uint64(50)
 
 // TestStartupScanGCCadenceVariedBlocks confirms that the GC hook is called
-// with utxoCount == 50 000 and then 100 000, in that order, when blocks have
-// varying output counts that together cross those boundaries.
+// with utxoCount == 50 and then 100, in that order, when blocks have varying
+// output counts that together cross those boundaries.
 //
 // Chain design:
-//   - Blocks cycle through [100, 500, 1000] outputs (1 600 per 3-block cycle).
-//   - 63 complete cycles → 189 blocks, 100 800 total outputs.
-//   - Max outputs in a single block is 1 000 — well below gcTestInterval —
+//   - Blocks cycle through [1, 5, 10] outputs (16 per 3-block cycle).
+//   - 7 complete cycles → 21 blocks, 112 total outputs.
+//   - Max outputs in a single block is 10 — well below gcTestInterval —
 //     so each boundary is crossed by accumulation across blocks, not within one.
-//   - Expected hook sequence: [50 000, 100 000].
+//   - Expected hook sequence: [50, 100].
 func TestStartupScanGCCadenceVariedBlocks(t *testing.T) {
-	const numCycles = 63 // 63 × 1 600 = 100 800 outputs → crosses 50 k and 100 k
-	outputPattern := []int{100, 500, 1000}
+	const numCycles = 7 // 7 × 16 = 112 outputs → crosses 50 and 100
+	outputPattern := []int{1, 5, 10}
 
 	counts := make([]int, 0, numCycles*len(outputPattern))
 	for c := 0; c < numCycles; c++ {
@@ -153,7 +151,7 @@ func TestStartupScanGCCadenceVariedBlocks(t *testing.T) {
 		totalOutputs += uint64(n)
 	}
 	// Self-check: the chain design must cross gcTestInterval exactly twice.
-	if want := uint64(numCycles * 1600); totalOutputs != want {
+	if want := uint64(numCycles * 16); totalOutputs != want {
 		t.Fatalf("chain design error: totalOutputs=%d, want %d", totalOutputs, want)
 	}
 
@@ -186,17 +184,18 @@ func TestStartupScanGCCadenceVariedBlocks(t *testing.T) {
 
 	var snapWg sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tip.Header.Height,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		InitTxTotal: 0,
-		Log:         discardLog(),
-		SnapshotWg:  &snapWg,
-		GCHook:      hook,
+		DataDir:        dir,
+		TipHeight:      tip.Header.Height,
+		TipHashHex:     tipHashHex,
+		DB:             db,
+		UTXOs:          utxos,
+		Registry:       registry,
+		KiFromIndex:    false,
+		InitTxTotal:    0,
+		Log:            discardLog(),
+		SnapshotWg:     &snapWg,
+		GCHook:         hook,
+		GCHookInterval: gcTestInterval,
 	})
 	snapWg.Wait()
 
@@ -228,16 +227,16 @@ func TestStartupScanGCCadenceVariedBlocks(t *testing.T) {
 // boundary.
 //
 // Chain design:
-//   - One block at height 1 with 150 001 outputs.
-//   - The inner loop must call GCHook(50 000), GCHook(100 000), GCHook(150 000)
+//   - One block at height 1 with 151 outputs.
+//   - The inner loop must call GCHook(50), GCHook(100), GCHook(150)
 //     in that order, all while processing the outputs of this one block.
 func TestStartupScanGCCadenceSingleBlockMultipleThresholds(t *testing.T) {
-	const numOutputs = 150001 // 3 × gcTestInterval + 1 → fires at 50k, 100k, 150k
+	const numOutputs = 151 // 3 × gcTestInterval + 1
 
 	wantSequence := []uint64{
-		1 * gcTestInterval, // 50 000
-		2 * gcTestInterval, // 100 000
-		3 * gcTestInterval, // 150 000
+		1 * gcTestInterval, // 50
+		2 * gcTestInterval, // 100
+		3 * gcTestInterval, // 150
 	}
 
 	priv, pub, err := crypto.GenerateValidatorKey()
@@ -264,17 +263,18 @@ func TestStartupScanGCCadenceSingleBlockMultipleThresholds(t *testing.T) {
 
 	var snapWg sync.WaitGroup
 	_, scanErr := runStartupScan(startupScanParams{
-		DataDir:     dir,
-		TipHeight:   tip.Header.Height,
-		TipHashHex:  tipHashHex,
-		DB:          db,
-		UTXOs:       utxos,
-		Registry:    registry,
-		KiFromIndex: false,
-		InitTxTotal: 0,
-		Log:         discardLog(),
-		SnapshotWg:  &snapWg,
-		GCHook:      hook,
+		DataDir:        dir,
+		TipHeight:      tip.Header.Height,
+		TipHashHex:     tipHashHex,
+		DB:             db,
+		UTXOs:          utxos,
+		Registry:       registry,
+		KiFromIndex:    false,
+		InitTxTotal:    0,
+		Log:            discardLog(),
+		SnapshotWg:     &snapWg,
+		GCHook:         hook,
+		GCHookInterval: gcTestInterval,
 	})
 	snapWg.Wait()
 

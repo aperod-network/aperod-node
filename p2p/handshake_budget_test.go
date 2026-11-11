@@ -44,7 +44,9 @@ func TestInboundHandshakeBudgetConcurrent(t *testing.T) {
 	if h.PendingHandshakes() != 2 {
 		t.Fatalf("one source used %d reservations", h.PendingHandshakes())
 	}
-	if !h.reserveInboundHandshake("other") || !h.reserveInboundHandshake("other") {
+	firstOtherReserved := h.reserveInboundHandshake("other")
+	secondOtherReserved := h.reserveInboundHandshake("other")
+	if !firstOtherReserved || !secondOtherReserved {
 		t.Fatal("reserved capacity unavailable to independent source")
 	}
 	if h.reserveInboundHandshake("third") {

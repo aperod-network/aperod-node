@@ -69,6 +69,11 @@ const (
 	// TxVersionGuardianFund is the one-off, consensus-synthesized Guardian
 	// allocation. It is not a coinbase and can never be admitted to the pool.
 	TxVersionGuardianFund TxVersion = 7
+	// TxVersionAmountBinding (wire version 13) adds privacy-preserving, publicly
+	// verifiable encrypted-amount proofs to CLSAG transfers.
+	TxVersionAmountBinding TxVersion = 13
+	// TxVersionAVMAmountBinding (wire version 14) carries AVM in the same format.
+	TxVersionAVMAmountBinding TxVersion = 14
 )
 
 // Transaction is the core unit of value transfer in Aperod.
@@ -95,7 +100,7 @@ type Transaction struct {
 	// Extra holds optional data: game asset metadata, OP_RETURN-style notes.
 	// Max 255 bytes.
 	Extra []byte
-	// AVM is present only for TxVersionAVM.
+	// AVM is present only for TxVersionAVM or TxVersionAVMAmountBinding.
 	AVM *AVMPayload `json:"avm,omitempty"`
 }
 
@@ -127,9 +132,13 @@ type Output struct {
 	TxPubKey crypto.Point32
 	// AmountCommit is the Pedersen commitment C = r·G + v·H hiding the amount.
 	AmountCommit crypto.Commitment
-	// EncAmount is the amount encrypted with the recipient's view key (for scanning).
-	// 8 bytes XOR-encrypted with the ECDH shared secret.
+	// EncAmount is the legacy view-key-readable amount field. Versions 13/14
+	// require it to be zero and derive the amount only from AmountBinding.
 	EncAmount [8]byte
+	// AmountBinding is present only in versions 13 and 14. It proves that the
+	// encrypted amount matches AmountCommit without revealing the amount or
+	// the recipient's static view key.
+	AmountBinding *crypto.AmountBinding `json:"amount_binding,omitempty"`
 }
 
 // Hash returns the SHA3-256 hash of the transaction (used as transaction ID).
@@ -171,6 +180,12 @@ func (tx *Transaction) Hash() crypto.Hash32 {
 		parts = append(parts, out.AmountCommit[:])
 		parts = append(parts, out.TxPubKey[:])  // F-4: was missing
 		parts = append(parts, out.EncAmount[:]) // F-4: was missing
+		if out.AmountBinding != nil {
+			for i := range out.AmountBinding.Chunks {
+				chunk := &out.AmountBinding.Chunks[i]
+				parts = append(parts, chunk.Commitment[:], chunk.R[:], chunk.E[:])
+			}
+		}
 	}
 	return crypto.HashBytes(parts...)
 }
@@ -189,7 +204,11 @@ func (tx *Transaction) IsStake() bool {
 }
 
 func (tx *Transaction) IsAVM() bool {
-	return tx.Version == TxVersionAVM
+	return tx != nil && (tx.Version == TxVersionAVM || tx.Version == TxVersionAVMAmountBinding)
+}
+
+func (tx *Transaction) UsesAmountBinding() bool {
+	return tx != nil && (tx.Version == TxVersionAmountBinding || tx.Version == TxVersionAVMAmountBinding)
 }
 
 // IsGuardianFund identifies the dedicated, protocol-locked nominal-supply
@@ -197,7 +216,8 @@ func (tx *Transaction) IsAVM() bool {
 func (tx *Transaction) IsGuardianFund() bool { return tx != nil && tx.Version == TxVersionGuardianFund }
 
 func (tx *Transaction) UsesCLSAG() bool {
-	return tx.Version == TxVersionCLSAG || tx.Version == TxVersionAVM
+	return tx != nil && (tx.Version == TxVersionCLSAG || tx.Version == TxVersionAVM ||
+		tx.Version == TxVersionAmountBinding || tx.Version == TxVersionAVMAmountBinding)
 }
 
 // Validate checks structural validity of the transaction.
@@ -207,7 +227,7 @@ func (tx *Transaction) Validate() error {
 		return fmt.Errorf("tx version 0 is invalid")
 	}
 	switch tx.Version {
-	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout, TxVersionSale:
+	case TxVersionBase, TxVersionGameAsset, TxVersionStake, TxVersionCommitmentBinding, TxVersionCLSAG, TxVersionAVM, TxVersionGuardianFund, TxVersionAmountBinding, TxVersionAVMAmountBinding, TxVersionLPoD, TxVersionLPoDPosition, TxVersionLPoDPayout, TxVersionSale, TxVersionLPoDTopUp:
 	default:
 		return fmt.Errorf("unsupported tx version %d", tx.Version)
 	}
@@ -286,7 +306,9 @@ func (tx *Transaction) Validate() error {
 		return burnErr
 	}
 	if burnMarked {
-		if tx.Version != TxVersionCommitmentBinding && tx.Version != TxVersionCLSAG {
+		if tx.Version != TxVersionCommitmentBinding &&
+			tx.Version != TxVersionCLSAG &&
+			tx.Version != TxVersionAmountBinding {
 			return fmt.Errorf("intentional burn requires transaction version %d", TxVersionCommitmentBinding)
 		}
 		if tx.IsCoinbase() {
@@ -308,6 +330,17 @@ func (tx *Transaction) Validate() error {
 	}
 	if len(tx.Extra) > 255 {
 		return fmt.Errorf("tx extra too large: %d bytes (max 255)", len(tx.Extra))
+	}
+	for i := range tx.Outputs {
+		if tx.UsesAmountBinding() && tx.Outputs[i].AmountBinding == nil {
+			return fmt.Errorf("tx: amount-bound output %d is missing amount binding", i)
+		}
+		if tx.UsesAmountBinding() && tx.Outputs[i].EncAmount != ([8]byte{}) {
+			return fmt.Errorf("tx: amount-bound output %d must not carry legacy encrypted amount", i)
+		}
+		if !tx.UsesAmountBinding() && tx.Outputs[i].AmountBinding != nil {
+			return fmt.Errorf("tx: legacy output %d must not carry amount binding", i)
+		}
 	}
 
 	// Coinbase: no inputs required, no signatures or ring proofs.  Only the
@@ -421,6 +454,29 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 	if len(activations) > 1 {
 		avmHeight = activations[1]
 	}
+	amountBindingHeight := uint64(0)
+	if len(activations) > 2 {
+		amountBindingHeight = activations[2]
+	}
+	if amountBindingHeight > 0 {
+		if height >= amountBindingHeight {
+			if tx.IsAVM() {
+				if tx.Version != TxVersionAVMAmountBinding {
+					return fmt.Errorf("amount-bound AVM transaction version %d is required at height %d",
+						TxVersionAVMAmountBinding, height)
+				}
+			} else if tx.Version != TxVersionAmountBinding {
+				return fmt.Errorf("amount-bound transaction version %d is required at height %d",
+					TxVersionAmountBinding, height)
+			}
+		} else if tx.UsesAmountBinding() {
+			return fmt.Errorf("transaction version %d is not active until height %d",
+				tx.Version, amountBindingHeight)
+		}
+	}
+	if tx.UsesAmountBinding() && (clsagHeight == 0 || height < clsagHeight) {
+		return fmt.Errorf("amount-binding transaction requires active CLSAG at height %d", height)
+	}
 	if tx.IsAVM() {
 		if avmHeight == 0 || height < avmHeight {
 			return fmt.Errorf("AVM transaction version %d is not active", tx.Version)
@@ -428,7 +484,17 @@ func ValidateTxVersionAtHeight(tx *Transaction, height, ringCTV4ActivationHeight
 		if clsagHeight == 0 || height < clsagHeight {
 			return fmt.Errorf("AVM requires active CLSAG at height %d", height)
 		}
+		if tx.Version == TxVersionAVM && amountBindingHeight > 0 && height >= amountBindingHeight {
+			return fmt.Errorf("AVM transaction version %d is disabled at amount-binding activation", tx.Version)
+		}
 		return nil
+	}
+	if tx.Version == TxVersionAmountBinding && (amountBindingHeight == 0 || height < amountBindingHeight) {
+		return fmt.Errorf("transaction version %d is not active", tx.Version)
+	}
+	if tx.Version == TxVersionAVMAmountBinding &&
+		(amountBindingHeight == 0 || height < amountBindingHeight) {
+		return fmt.Errorf("transaction version %d is not active", tx.Version)
 	}
 	if tx.Version == TxVersionCLSAG && (clsagHeight == 0 || height < clsagHeight) {
 		return fmt.Errorf("transaction version %d is not active", tx.Version)
@@ -477,6 +543,11 @@ func (tx *Transaction) Size() int {
 	} else {
 		size += len(tx.Signatures) * sigBytes
 	}
+	if tx.UsesAmountBinding() {
+		// The linked ciphertext proofs are substantial; the estimate accounts
+		// for four 16-bit range proofs and four equality proofs per output.
+		size += len(tx.Outputs) * AmountBindingExtraBytesPerOutput
+	}
 	if tx.AVM != nil {
 		size += len(tx.AVM.canonicalBytes(true))
 	}
@@ -495,6 +566,10 @@ const InitialBaseFeePerByte uint64 = 200
 // MinBaseFeePerByte is the floor below which the base fee never drops: 50 nAPRO/byte.
 // A 2 000-byte tx therefore costs at least 100 000 nAPRO = 0.001 APRO.
 const MinBaseFeePerByte uint64 = 50
+
+// AmountBindingExtraBytesPerOutput covers four 16-bit Bulletproofs, four
+// equality proofs, four chunk commitments, and four ElGamal ciphertexts.
+const AmountBindingExtraBytesPerOutput = 4 * (675 + 3*32 + 3*32)
 
 // MinFeeAt returns the minimum acceptable fee for this transaction at the given
 // base fee rate.  Any excess paid above this minimum is a priority tip to the validator.

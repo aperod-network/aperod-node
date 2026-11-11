@@ -45,6 +45,55 @@ func TestNativeLPoDLocalDepositAndPartialFullWithdrawal(t *testing.T) {
 	if strings.Contains(string(body), mnemonic) {
 		t.Fatal("mnemonic leaked")
 	}
+	topUpHS := crypto.ScalarFromUint64(23)
+	topUpPrivate, err := crypto.AddScalars(topUpHS, keys.Keys.Spend.Private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topUpPub, err := crypto.ScalarMulBase(topUpPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topUpSource := core.OwnedUTXO{
+		UTXO:     core.UTXO{TxHash: crypto.HashBytes([]byte("top-up-source")), OutputIndex: 2, OneTimePub: topUpPub},
+		HsScalar: topUpHS, Amount: 700000000, Blind: crypto.BlindFactor(crypto.ScalarFromUint64(29)),
+	}
+	topUpRequest := lpodSignRequest{Action: "topup", Genesis: r.Genesis, DepositJSON: string(body),
+		Nonce: "0", PositionID: hex.EncodeToString(a.PositionID[:])}
+	topUpTx, err := signLPoD(topUpRequest, keys, &topUpSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topUpAction, err := topUpTx.LPoDPositionAction()
+	if err != nil || topUpTx.Version != core.TxVersionLPoDTopUp ||
+		topUpAction.Action != core.LPoDTopUp || topUpAction.PositionID != a.PositionID ||
+		topUpAction.Nonce != 1 || topUpAction.SourceTx != topUpSource.TxHash ||
+		topUpAction.SourceIndex != topUpSource.OutputIndex || topUpAction.Amount != topUpSource.Amount {
+		t.Fatalf("signed top-up did not preserve position and bind the selected output: %v", err)
+	}
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{TxHash: topUpAction.SourceTx, OutputIndex: topUpAction.SourceIndex,
+		OneTimePub: topUpAction.SourcePub, AmountCommit: topUpTx.Inputs[0].AmountCommit})
+	verifier := core.NewTxVerifier(utxos)
+	if err := verifier.VerifyTxAtHeight(topUpTx, 1); err == nil {
+		t.Fatal("top-up was accepted while the protocol gate is disabled")
+	}
+	verifier.SetLPoDDailyUpgradeHeight(3)
+	if err := verifier.VerifyTxAtHeight(topUpTx, 2); err == nil {
+		t.Fatal("top-up was accepted before its activation height")
+	}
+	if err := verifier.VerifyTxAtHeight(topUpTx, 3); err != nil {
+		t.Fatalf("valid top-up rejected at activation height: %v", err)
+	}
+	topUpRequest.PositionID = strings.Repeat("44", 32)
+	if _, err := signLPoD(topUpRequest, keys, &topUpSource); err == nil {
+		t.Fatal("top-up accepted a different position identity")
+	}
+	topUpRequest.PositionID = hex.EncodeToString(a.PositionID[:])
+	topUpSource.HsScalar = crypto.ScalarFromUint64(31)
+	if _, err := signLPoD(topUpRequest, keys, &topUpSource); err == nil {
+		t.Fatal("top-up accepted a source not owned by the signing wallet")
+	}
 	r = lpodSignRequest{Action: "withdraw", Genesis: r.Genesis, DepositJSON: string(body), Nonce: "0",
 		PositionID: hex.EncodeToString(a.PositionID[:]), Withdraw: "123"}
 	partial, err := signLPoD(r, keys, nil)

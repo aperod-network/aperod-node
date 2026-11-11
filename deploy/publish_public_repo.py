@@ -11,8 +11,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
-from publication_security import git, inspect, inspect_history, path_problem
+from publication_security import (
+    git, inspect, inspect_history, inspect_private_references, path_problem,
+)
 from sync_public_repo import API, AUTHOR, make_request
 
 EXTENSIONS = {".go", ".sh", ".py", ".mod", ".sum", ".yaml", ".yml",
@@ -41,9 +44,19 @@ build/
 __pycache__/
 """
 MESSAGE = "chore: maintain verified source distribution"
+DEFAULT_PR_BODY = (
+    "Complete immutable source tree passed artifact policy, redacted secret scanning, "
+    "Go build, vet and dependency vulnerability checks before object upload. "
+    "No production runtime state is changed."
+)
 MERGE_MESSAGE = "Verified source distribution through protected pull request."
 GITHUB_ACTIONS_APP_ID = 15368
 TRUSTED_CHECK_APP_IDS = {"CodeQL": 57789}
+PUBLIC_REPO_ID = 1413008539
+BRANCH_REQUIRED_CHECKS = {
+    ("Whole-tree publication security", GITHUB_ACTIONS_APP_ID),
+    ("go build & vet & test", GITHUB_ACTIONS_APP_ID),
+}
 REQUIRED_CHECKS = {
     "Whole-tree publication security",
     "go build & vet & test",
@@ -58,6 +71,44 @@ REQUIRED_CHECKS = {
     "Analyze (python)",
 }
 CODEQL_NEUTRAL_ALLOWED_TITLE = "1 configuration not found"
+
+
+def private_repository_markers(root):
+    """Resolve the private source identity at runtime; never embed it in public code."""
+    slug = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not slug:
+        result = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if result.returncode:
+            raise RuntimeError("Private source repository identity unavailable")
+        remote = result.stdout.strip()
+        if remote.startswith("git@") and ":" in remote:
+            host, path = remote.split(":", 1)
+            host = host.rsplit("@", 1)[-1]
+        else:
+            parsed = urlsplit(remote)
+            host, path = parsed.hostname or "", parsed.path.lstrip("/")
+        if host.lower() not in ("github.com", "www.github.com"):
+            raise RuntimeError("Private source repository identity unavailable")
+        slug = path
+    slug = slug.removesuffix(".git").strip("/").lower()
+    parts = slug.split("/")
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-._"
+    if (len(parts) != 2 or not all(parts)
+            or any(c not in allowed for part in parts for c in part)
+            or slug == "aperod-network/aperod-node"):
+        raise RuntimeError("Private source repository identity unavailable")
+    raw = slug.encode("utf-8")
+    return (
+        raw,
+        b"github.com/" + raw,
+        b"github.com:" + raw,
+        b"git@github.com:" + raw,
+        b"api.github.com/repos/" + raw,
+        b"raw.githubusercontent.com/" + raw,
+    )
 
 
 def run(*args, cwd=None, test_python_userbase=None):
@@ -156,11 +207,46 @@ def prepare(root, candidate, gate_only=False):
     return git(candidate, "write-tree").decode().strip()
 
 
-def verify(candidate, tree, go_checks=True, with_tests=False):
+def drift_report(candidate):
+    """Explain the candidate-to-public delta without printing file contents."""
+    fields = git(
+        candidate, "diff", "--cached", "--name-status", "--no-renames", "-z"
+    ).split(b"\0")
+    if fields and not fields[-1]:
+        fields.pop()
+    labels = {
+        "A": "MISSING in public repo",
+        "D": "ONLY in public repo",
+        "M": "DIFFERS",
+    }
+    report = []
+    index = 0
+    while index < len(fields):
+        status = fields[index].decode("ascii")
+        index += 1
+        if status not in labels or index >= len(fields):
+            raise RuntimeError("Unexpected source-distribution diff status")
+        path = fields[index].decode("utf-8", errors="backslashreplace")
+        index += 1
+        report.append(f"[WARN] {labels[status]}: {path}")
+    report.append(f"Complete source-distribution drift: {len(report)} files.")
+    return report
+
+
+def verify(candidate, tree, go_checks=True, with_tests=False,
+           private_repo_markers=None):
     checked, failures = inspect(candidate, tree=tree)
     if failures:
         raise RuntimeError("Publication policy refused paths: " +
                            ", ".join(path for path, _ in failures))
+    if not private_repo_markers:
+        raise RuntimeError("Private source repository identity unavailable")
+    private_references = inspect_private_references(
+        candidate, tree, private_repo_markers
+    )
+    if private_references:
+        raise RuntimeError("Publication policy refused private repository references: " +
+                           ", ".join(path for path, _ in private_references))
     if not shutil.which("gitleaks"):
         raise RuntimeError("Secret scanner missing; publication refused")
     commits, pairs, history_failures = inspect_history(candidate)
@@ -185,22 +271,58 @@ def verify(candidate, tree, go_checks=True, with_tests=False):
             if with_tests:
                 with tempfile.TemporaryDirectory(prefix="aperod-test-python-") as python_temp:
                     python_userbase = prepare_test_python_userbase(python_temp)
-                    run("go", "test", "./...", cwd=export,
+                    run("go", "test", "-p=1", "./...", cwd=export,
                         test_python_userbase=python_userbase)
     if git(candidate, "write-tree").decode().strip() != tree:
         raise RuntimeError("Candidate changed during verification")
     print(f"Verified immutable candidate: {checked} files.")
 
 
-def publish(candidate, tree, expected_head, request, with_tests=False):
+def verify_public_repo_policy(request):
+    """Require the live target identity and protected-main policy before writes."""
+    account = request("GET", "https://api.github.com/user")
+    if account.get("login") != "aperod-network":
+        raise RuntimeError("Publication token is not authenticated as aperod-network")
+    repo = request("GET", API)
+    if (repo.get("id") != PUBLIC_REPO_ID or repo.get("private") is not False
+            or repo.get("fork") is not False or repo.get("default_branch") != "main"):
+        raise RuntimeError("Public repository identity or default branch changed")
+    protection = request("GET", f"{API}/branches/main/protection")
+    checks = (protection.get("required_status_checks") or {}).get("checks") or []
+    observed = {(item.get("context"), item.get("app_id")) for item in checks}
+    if (observed != BRANCH_REQUIRED_CHECKS
+            or len(checks) != len(BRANCH_REQUIRED_CHECKS)
+            or not (protection.get("required_status_checks") or {}).get("strict")
+            or not (protection.get("enforce_admins") or {}).get("enabled")
+            or (protection.get("allow_force_pushes") or {}).get("enabled")
+            or (protection.get("allow_deletions") or {}).get("enabled")):
+        raise RuntimeError("Public main protection no longer matches the trusted policy")
+    rulesets = request(
+        "GET",
+        "https://api.github.com/repos/aperod-network/aperod-node/"
+        "rulesets?includes_parents=true&per_page=100",
+    )
+    if not isinstance(rulesets, list) or rulesets:
+        raise RuntimeError("Unreviewed repository rulesets prevent publication")
+
+
+def publish(candidate, tree, expected_head, request, with_tests=False,
+            private_repo_markers=None, commit_message=MESSAGE,
+            pr_title=MESSAGE, pr_body=DEFAULT_PR_BODY):
+    if not all(isinstance(value, str) and value.strip()
+               for value in (commit_message, pr_title, pr_body)):
+        raise ValueError("Commit message, PR title, and PR body must be non-empty")
     # Independently revalidate everything before the first upload; callers
     # cannot bypass verification by invoking this Python API directly.
-    verify(candidate, tree, with_tests=with_tests)
+    verify(candidate, tree, with_tests=with_tests,
+           private_repo_markers=private_repo_markers)
     if request("GET", f"{API}/git/ref/heads/main")["object"]["sha"] != expected_head:
         raise RuntimeError("Public main changed; prepare and verify again")
     changed = git(candidate, "diff", "--cached", "--name-only", "-z").split(b"\0")
     if not any(changed):
         return None
+    verify_public_repo_policy(request)
+    base = request("GET", f"{API}/git/commits/{expected_head}")["tree"]["sha"]
     frozen = {}
     for row in git(candidate, "ls-tree", "-rz", tree).split(b"\0"):
         if row:
@@ -222,27 +344,28 @@ def publish(candidate, tree, expected_head, request, with_tests=False):
         if blob["sha"] != oid:
             raise RuntimeError("Uploaded object integrity mismatch")
         entries.append({"path": rel, "mode": mode, "type": "blob", "sha": oid})
-    base = request("GET", f"{API}/git/commits/{expected_head}")["tree"]["sha"]
     remote_tree = request("POST", f"{API}/git/trees", {"base_tree": base, "tree": entries})
     if remote_tree["sha"] != tree:
         raise RuntimeError("Remote publication tree differs from verified snapshot")
     commit = request("POST", f"{API}/git/commits", {
-        "message": MESSAGE, "tree": tree, "parents": [expected_head], "author": AUTHOR})
+        "message": commit_message, "tree": tree, "parents": [expected_head],
+        "author": AUTHOR, "committer": AUTHOR})
     branch = "verified-publication/" + commit["sha"][:16]
     request("POST", f"{API}/git/refs", {"ref": "refs/heads/" + branch, "sha": commit["sha"]})
     pr = request("POST", f"{API}/pulls", {
-        "title": "chore: maintain verified source distribution",
+        "title": pr_title,
         "head": branch, "base": "main",
-        "body": "Complete immutable source tree passed artifact policy, redacted secret scanning, "
-                "Go build, vet and dependency vulnerability checks before object upload. "
-                "No production runtime state is changed."})
+        "body": pr_body})
     pr["_verified_head_sha"] = commit["sha"]
+    pr["_verified_base_sha"] = expected_head
     print("Verified publication awaiting required checks:", pr["html_url"])
     return pr
 
 
-def await_merge(pr, request, timeout=900, expected_head_sha=None):
+def await_merge(pr, request, timeout=900, expected_head_sha=None,
+                expected_base_sha=None):
     expected_head_sha = expected_head_sha or pr.get("_verified_head_sha")
+    expected_base_sha = expected_base_sha or pr.get("_verified_base_sha")
     if not expected_head_sha:
         raise RuntimeError("Verified uploaded PR head SHA is required")
     deadline = time.monotonic() + timeout
@@ -256,6 +379,9 @@ def await_merge(pr, request, timeout=900, expected_head_sha=None):
             raise RuntimeError("Publication PR closed without merging")
         if pull.get("base", {}).get("ref") != "main":
             raise RuntimeError("Publication PR base is not main")
+        if (expected_base_sha
+                and pull.get("base", {}).get("sha") != expected_base_sha):
+            raise RuntimeError("Publication PR base changed after source verification")
         if pull.get("head", {}).get("sha") != expected_head_sha:
             time.sleep(10)
             continue
@@ -312,8 +438,11 @@ def await_merge(pr, request, timeout=900, expected_head_sha=None):
             latest = request("GET", f"{API}/pulls/{pr['number']}")
             if (latest.get("state") != "open"
                     or latest.get("base", {}).get("ref") != "main"
-                    or latest.get("head", {}).get("sha") != expected_head_sha):
+                    or latest.get("head", {}).get("sha") != expected_head_sha
+                    or (expected_base_sha
+                        and latest.get("base", {}).get("sha") != expected_base_sha)):
                 raise RuntimeError("Publication PR head or base changed after checks")
+            verify_public_repo_policy(request)
             result = request("PUT", f"{API}/pulls/{pr['number']}/merge", {
                 "sha": expected_head_sha, "merge_method": "merge",
                 "commit_title": "chore: maintain verified source distribution",
@@ -334,6 +463,9 @@ def main():
     parser.add_argument("--with-tests", action="store_true")
     parser.add_argument("--no-wait", action="store_true")
     parser.add_argument("--check-drift", action="store_true")
+    parser.add_argument("--commit-message", default=MESSAGE)
+    parser.add_argument("--pr-title", default=MESSAGE)
+    parser.add_argument("--pr-body", default=DEFAULT_PR_BODY)
     args = parser.parse_args()
     token = os.environ.get("PUBLIC_GITHUB_TOKEN")
     if not args.dry_run and not args.check_drift and not token:
@@ -349,18 +481,29 @@ def main():
         head = git(candidate, "rev-parse", "HEAD").decode().strip()
         tree = prepare(args.root.resolve(), candidate, args.gate_only)
         if args.check_drift:
-            changed = [x for x in git(candidate, "diff", "--cached", "--name-only", "-z").split(b"\0") if x]
-            print(f"Complete source-distribution drift: {len(changed)} files.")
-            if changed:
+            report = drift_report(candidate)
+            print("\n".join(report))
+            if len(report) > 1:
                 raise SystemExit(1)
         elif args.dry_run:
-            verify(candidate, tree, with_tests=args.with_tests)
+            markers = private_repository_markers(args.root.resolve())
+            verify(candidate, tree, with_tests=args.with_tests,
+                   private_repo_markers=markers)
             print("Dry-run verified; no objects uploaded.")
         else:
             request = make_request(token)
-            pr = publish(candidate, tree, head, request, args.with_tests)
+            markers = private_repository_markers(args.root.resolve())
+            pr = publish(
+                candidate, tree, head, request, args.with_tests, markers,
+                commit_message=args.commit_message,
+                pr_title=args.pr_title,
+                pr_body=args.pr_body,
+            )
             if pr and not args.no_wait:
-                await_merge(pr, request, expected_head_sha=pr["_verified_head_sha"])
+                await_merge(
+                    pr, request, expected_head_sha=pr["_verified_head_sha"],
+                    expected_base_sha=pr["_verified_base_sha"],
+                )
 
 
 if __name__ == "__main__":

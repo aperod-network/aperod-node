@@ -139,7 +139,6 @@ func TestRingCTV5RejectsStakedCollateralAcrossRestartAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := core.NewUTXOSetWithDB(db)
-	set.SetCLSAGActivationHeight(1)
 	set.Add(&owned[0].UTXO)
 	const stakedCollateralActivationHeight = uint64(2_950_000)
 	verifier := core.NewTxVerifier(set)
@@ -280,13 +279,16 @@ func TestRingCTV5RejectsStakedCollateralAcrossRestartAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close reopened RingCT database: %v", err)
+		}
+	}()
 
 	// Reconstruct the normal restart state from the persistent ring index and
 	// replayed canonical stake event. The retained rm/ record remains available
 	// for historical compatibility; IsStaked is the consensus exclusion.
 	restarted := core.NewUTXOSetWithDB(db)
-	restarted.SetCLSAGActivationHeight(1)
 	restarted.MarkStakedKnown(owned[0].TxHash, owned[0].OutputIndex, &core.UTXO{
 		TxHash: owned[0].TxHash, OutputIndex: owned[0].OutputIndex,
 		AmountCommit: owned[0].AmountCommit,
