@@ -7,11 +7,9 @@
 | Latest `main` | ✅ Active |
 | Older tags | ❌ No patches |
 
-Always run the latest release:
+### Installer security notice
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-node.sh | sudo bash
-```
+No signed, immutable installer release is currently published. Do not pipe an installer fetched from the mutable `main` branch into `sudo bash`. Install only from a reviewed source commit whose identity and deployment-tools checksum have been verified independently; otherwise do not run the installer as root.
 
 ---
 

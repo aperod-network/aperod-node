@@ -35,3 +35,22 @@ func TestRingCTAmountBindingActivationValidationAndLoad(t *testing.T) {
 		t.Fatalf("loaded amount-binding activation height = %d, want 300", got)
 	}
 }
+
+func TestOfflineRehearsalSchedulesStagingAmountBindingOnly(t *testing.T) {
+	cfg, err := Load("rehearsal-offline.yaml")
+	if err != nil {
+		t.Fatalf("load offline rehearsal config: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate offline rehearsal config: %v", err)
+	}
+	if !cfg.Consensus.NonValidator {
+		t.Fatal("offline amount-binding rehearsal must remain non-validator")
+	}
+	if got := cfg.Consensus.RingCTAmountBindingActivationHeight; got != 3_800_000 {
+		t.Fatalf("staging amount-binding activation = %d, want 3800000", got)
+	}
+	if cfg.Consensus.RingCTAmountBindingActivationHeight < cfg.Consensus.RingCTCLSAGActivationHeight {
+		t.Fatal("amount-binding activation must not precede CLSAG activation")
+	}
+}

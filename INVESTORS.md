@@ -152,7 +152,7 @@ forecasts, return projections or guarantees.
 
 ```bash
 # Install and configure the validator service interactively.
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
+# No signed, immutable installer release is published; do not run a mutable-main script as root.
 
 # Verify the service and local REST API.
 systemctl status aperod-node
