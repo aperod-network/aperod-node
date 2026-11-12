@@ -92,11 +92,9 @@ wallets, exchange records, or other network/application-layer information.
 
 ## ⬇ Install a Full Node
 
-### One-line install (Ubuntu / Debian)
+### Installer security notice
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-node.sh | sudo bash
-```
+No signed, immutable installer release is currently published. Do not pipe an installer fetched from the mutable `main` branch into `sudo bash`. Install only from a reviewed source commit whose identity and deployment-tools checksum have been verified independently; otherwise do not run the installer as root.
 
 Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
 
@@ -155,7 +153,7 @@ Block rewards go directly to your **Telegram wallet**. You need an APRO address 
 ### Step 2 — Install the validator node
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
+# No signed, immutable installer release is published; do not run a mutable-main script as root.
 ```
 
 The installer will:
@@ -163,12 +161,7 @@ The installer will:
 - Generate a **consensus key** (signs blocks only — cannot move funds)
 - Configure the node as a `systemd` service and start it
 
-**Non-interactive install (CI / cloud-init):**
-
-```bash
-APEROD_REWARD_ADDRESS=<your-apro-address> \
-  curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
-```
+**CI / cloud-init installation is unavailable** until a signed, immutable installer release is published. Do not execute downloaded scripts with elevated privileges.
 
 ### Step 3 — Register your node
 
