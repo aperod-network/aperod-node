@@ -482,6 +482,17 @@ fi
 # Telegram alert and exit 0 ("skipped") so Prometheus records skipped_low_disk=1
 # rather than a failure, giving admins time to free space before data is lost.
 MIN_AVAIL_KB=$(( 5 * 1024 * 1024 ))   # 5 GiB in kibibytes
+DEFAULT_CHECKPOINT_RESERVE_BYTES=$(( MIN_AVAIL_KB * 1024 ))
+CHECKPOINT_RESERVE_BYTES="${APEROD_BACKUP_CHECKPOINT_RESERVE_BYTES:-${DEFAULT_CHECKPOINT_RESERVE_BYTES}}"
+if [[ ! "$CHECKPOINT_RESERVE_BYTES" =~ ^[0-9]{1,15}$ ]]; then
+  echo "ОШИБКА: APEROD_BACKUP_CHECKPOINT_RESERVE_BYTES должен быть целым числом байт."
+  exit 1
+fi
+CHECKPOINT_RESERVE_BYTES=$((10#$CHECKPOINT_RESERVE_BYTES))
+if [ "$CHECKPOINT_RESERVE_BYTES" -lt "$DEFAULT_CHECKPOINT_RESERVE_BYTES" ]; then
+  echo "ОШИБКА: резерв checkpoint не может быть меньше ${DEFAULT_CHECKPOINT_RESERVE_BYTES} байт (5 GiB)."
+  exit 1
+fi
 
 _disk_preflight() {
   local path="$1"
@@ -545,9 +556,11 @@ if [ ! -S "$BACKUP_SOCKET" ]; then
 fi
 
 # The Go exporter copies the active LevelDB into .backup-staging on this same
-# filesystem. Require room for the active DB's apparent size plus a 5 GiB
-# reserve before asking it to begin; otherwise it could fill the node volume.
+# filesystem. Before requesting it, budget the larger of the active DB and the
+# largest retained checkpoint, plus the configured reserve. Existing staging
+# bytes are already reflected in df availability and are reported separately.
 CHAIN_DB_DIR="${CHAIN_DATA_DIR}/chain.db"
+STAGING_ROOT="${CHAIN_DATA_DIR}/.backup-staging"
 if [ ! -d "$CHAIN_DB_DIR" ] || [ -L "$CHAIN_DB_DIR" ]; then
   echo "ОШИБКА: активная LevelDB chain.db отсутствует или является символической ссылкой: ${CHAIN_DB_DIR}"
   exit 1
@@ -562,12 +575,69 @@ if [[ ! "$CHAIN_DB_KB" =~ ^[0-9]+$ ]] || [[ ! "$CHAIN_AVAIL_KB" =~ ^[0-9]+$ ]]; 
   echo "ОШИБКА: не удалось измерить размер chain.db или свободное место до checkpoint; checkpoint не запрашивался."
   exit 1
 fi
-CHAIN_REQUIRED_KB=$(( CHAIN_DB_KB + MIN_AVAIL_KB ))
-if [ "$CHAIN_AVAIL_KB" -lt "$CHAIN_REQUIRED_KB" ]; then
+
+# Existing staging copies are already reflected in df's available-space value.
+# Measure them separately for the report, and use the largest retained
+# checkpoint as a conservative estimate if it is larger than the live chain.db.
+STAGING_USED_KB=0
+RECENT_CHECKPOINT_KB=0
+if [ -L "$STAGING_ROOT" ]; then
+  echo "ОШИБКА: каталог checkpoint staging является символической ссылкой; checkpoint не запрашивался."
+  exit 1
+elif [ -e "$STAGING_ROOT" ]; then
+  if [ ! -d "$STAGING_ROOT" ]; then
+    echo "ОШИБКА: путь checkpoint staging не является каталогом; checkpoint не запрашивался."
+    exit 1
+  fi
+  if ! STAGING_USED_KB=$(du -sk --apparent-size -- "$STAGING_ROOT" 2>/dev/null | awk 'NR==1{print $1}'); then
+    echo "ОШИБКА: не удалось измерить текущий checkpoint staging; checkpoint не запрашивался."
+    exit 1
+  fi
+  if [[ ! "$STAGING_USED_KB" =~ ^[0-9]+$ ]]; then
+    echo "ОШИБКА: не удалось измерить текущий checkpoint staging; checkpoint не запрашивался."
+    exit 1
+  fi
+  CHECKPOINT_STAGE_LIST="${BACKUP_DIR}/checkpoint-stage-list.nul"
+  if ! find "$STAGING_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' \
+    -print0 >"$CHECKPOINT_STAGE_LIST" 2>/dev/null; then
+    echo "ОШИБКА: не удалось перечислить сохраненные checkpoint; новый checkpoint не запрашивался."
+    exit 1
+  fi
+  mapfile -d '' -t EXISTING_CHECKPOINTS <"$CHECKPOINT_STAGE_LIST"
+  rm -f -- "$CHECKPOINT_STAGE_LIST"
+  for existing_checkpoint in "${EXISTING_CHECKPOINTS[@]}"; do
+    if ! existing_checkpoint_kb=$(du -sk --apparent-size -- "$existing_checkpoint" 2>/dev/null | awk 'NR==1{print $1}'); then
+      echo "ОШИБКА: не удалось измерить сохраненный checkpoint ${existing_checkpoint}; новый checkpoint не запрашивался."
+      exit 1
+    fi
+    if [[ ! "$existing_checkpoint_kb" =~ ^[0-9]+$ ]]; then
+      echo "ОШИБКА: не удалось измерить сохраненный checkpoint ${existing_checkpoint}; новый checkpoint не запрашивался."
+      exit 1
+    fi
+    if [ "$existing_checkpoint_kb" -gt "$RECENT_CHECKPOINT_KB" ]; then
+      RECENT_CHECKPOINT_KB="$existing_checkpoint_kb"
+    fi
+  done
+fi
+
+ESTIMATED_CHECKPOINT_KB="$CHAIN_DB_KB"
+if [ "$RECENT_CHECKPOINT_KB" -gt "$ESTIMATED_CHECKPOINT_KB" ]; then
+  ESTIMATED_CHECKPOINT_KB="$RECENT_CHECKPOINT_KB"
+fi
+STAGING_USED_BYTES=$(( STAGING_USED_KB * 1024 ))
+ESTIMATED_CHECKPOINT_BYTES=$(( ESTIMATED_CHECKPOINT_KB * 1024 ))
+PROJECTED_STAGING_BYTES=$(( STAGING_USED_BYTES + ESTIMATED_CHECKPOINT_BYTES ))
+CHAIN_AVAIL_BYTES=$(( CHAIN_AVAIL_KB * 1024 ))
+CHAIN_REQUIRED_BYTES=$(( ESTIMATED_CHECKPOINT_BYTES + CHECKPOINT_RESERVE_BYTES ))
+if [ "$CHAIN_AVAIL_BYTES" -lt "$CHAIN_REQUIRED_BYTES" ]; then
   CHAIN_FREE_GB=$(awk "BEGIN{printf \"%.1f\", ${CHAIN_AVAIL_KB}/1024/1024}")
-  CHAIN_REQUIRED_GB=$(awk "BEGIN{printf \"%.1f\", ${CHAIN_REQUIRED_KB}/1024/1024}")
+  CHAIN_REQUIRED_GB=$(awk "BEGIN{printf \"%.1f\", ${CHAIN_REQUIRED_BYTES}/1024/1024/1024}")
+  CHECKPOINT_ESTIMATE_GB=$(awk "BEGIN{printf \"%.1f\", ${ESTIMATED_CHECKPOINT_BYTES}/1024/1024/1024}")
+  STAGING_USED_GB=$(awk "BEGIN{printf \"%.1f\", ${STAGING_USED_BYTES}/1024/1024/1024}")
   echo "=== ВНИМАНИЕ: checkpoint пропущен из-за нехватки места на файловой системе ноды ==="
-  echo "  chain.db занимает ${CHAIN_DB_KB} KiB; свободно ${CHAIN_FREE_GB} GiB; требуется ${CHAIN_REQUIRED_GB} GiB (DB + 5 GiB reserve)."
+  echo "  Staging сейчас: ${STAGING_USED_BYTES} байт (${STAGING_USED_GB} GiB); следующий checkpoint: ${ESTIMATED_CHECKPOINT_BYTES} байт (${CHECKPOINT_ESTIMATE_GB} GiB)."
+  echo "  Свободно: ${CHAIN_AVAIL_BYTES} байт (${CHAIN_FREE_GB} GiB); требуется: ${CHAIN_REQUIRED_BYTES} байт, включая резерв ${CHECKPOINT_RESERVE_BYTES} байт."
+  echo "  Прогноз staging после копии: ${PROJECTED_STAGING_BYTES} байт."
   _BACKUP_FINAL_STATUS="skipped"
   _BACKUP_SKIP_REASON="low_checkpoint_space"
   _BACKUP_DISK_PATH="active chain filesystem (${CHAIN_DATA_DIR})"
@@ -576,9 +646,11 @@ if [ "$CHAIN_AVAIL_KB" -lt "$CHAIN_REQUIRED_KB" ]; then
     _checkpoint_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     _checkpoint_text="⚠️ <b>Бэкап Aperod пропущен — недостаточно места для checkpoint</b>%0A%0A"
     _checkpoint_text+="<b>Файловая система:</b> ${CHAIN_DATA_DIR}%0A"
-    _checkpoint_text+="<b>Размер chain.db:</b> ${CHAIN_DB_KB} KiB%0A"
-    _checkpoint_text+="<b>Свободно:</b> ${CHAIN_FREE_GB} GiB%0A"
-    _checkpoint_text+="<b>Требуется:</b> ${CHAIN_REQUIRED_GB} GiB (chain.db + 5 GiB reserve)%0A"
+    _checkpoint_text+="<b>Текущий staging:</b> ${STAGING_USED_BYTES} байт%0A"
+    _checkpoint_text+="<b>Оценка следующего checkpoint:</b> ${ESTIMATED_CHECKPOINT_BYTES} байт%0A"
+    _checkpoint_text+="<b>Прогноз staging после копии:</b> ${PROJECTED_STAGING_BYTES} байт%0A"
+    _checkpoint_text+="<b>Свободно сейчас:</b> ${CHAIN_AVAIL_BYTES} байт (${CHAIN_FREE_GB} GiB)%0A"
+    _checkpoint_text+="<b>Требуется:</b> ${CHAIN_REQUIRED_BYTES} байт (checkpoint + резерв ${CHECKPOINT_RESERVE_BYTES} байт)%0A"
     _checkpoint_text+="<b>Время:</b> ${_checkpoint_ts}%0A"
     curl -s --max-time 15 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -591,6 +663,7 @@ if [ "$CHAIN_AVAIL_KB" -lt "$CHAIN_REQUIRED_KB" ]; then
   write_metrics 0 1
   exit 0
 fi
+echo "  Staging сейчас: ${STAGING_USED_BYTES} байт; оценка следующего checkpoint: ${ESTIMATED_CHECKPOINT_BYTES} байт; резерв: ${CHECKPOINT_RESERVE_BYTES} байт; свободно: ${CHAIN_AVAIL_BYTES} байт — достаточно."
 BACKUP_VERIFY_BIN="${APEROD_BACKUP_VERIFY_BIN:-/usr/local/bin/aperod-backup-verify}"
 if [ -L "$BACKUP_VERIFY_BIN" ] || [ ! -f "$BACKUP_VERIFY_BIN" ] || [ ! -x "$BACKUP_VERIFY_BIN" ]; then
   echo "ОШИБКА: обязательный verifier должен быть исполняемым обычным файлом: ${BACKUP_VERIFY_BIN}; checkpoint не запрашивался."
@@ -669,13 +742,15 @@ fi
 
 echo "=== [1/5] Запрашиваем закрытый логический checkpoint ноды ==="
 CHECKPOINT_RESPONSE="${BACKUP_DIR}/checkpoint-response.json"
-curl --fail --silent --show-error --max-time 900 \
+# A logical export reserializes the entire LevelDB snapshot. Keep it single-flight
+# in the node, but allow a large disk-backed snapshot enough time to finish rather
+# than canceling it at 15 minutes and discarding a nearly complete copy.
+curl --fail --silent --show-error --max-time 3600 \
   --unix-socket "$BACKUP_SOCKET" \
   --request POST \
   --output "$CHECKPOINT_RESPONSE" \
   "http://localhost/checkpoint"
 
-STAGING_ROOT="${CHAIN_DATA_DIR}/.backup-staging"
 SNAPSHOT_DIR=$(python3 - "$CHECKPOINT_RESPONSE" "$STAGING_ROOT" <<'PY'
 import json
 import os
@@ -764,6 +839,39 @@ fi
 CHECKPOINT_TIP_HEIGHT="${CHECKPOINT_TIP[0]}"
 CHECKPOINT_TIP_HASH="${CHECKPOINT_TIP[1]}"
 
+# Validate the exact closed checkpoint before it becomes the archive source.
+# Remote readback is later compared byte-for-byte with the encrypted archive,
+# so this read-only LevelDB check covers the payload without unpacking a second
+# copy of the entire database on the node's root filesystem.
+echo "=== Проверяем закрытый checkpoint до архивации ==="
+LOCAL_VERIFY_OUTPUT=$("$BACKUP_VERIFY_BIN" --stage "$SNAPSHOT_DIR")
+python3 - "$LOCAL_VERIFY_OUTPUT" "$SNAPSHOT_MANIFEST" \
+  "$CHECKPOINT_TIP_HEIGHT" "$CHECKPOINT_TIP_HASH" <<'PY'
+import json, sys
+try:
+    result = json.loads(sys.argv[1])
+except json.JSONDecodeError as error:
+    raise SystemExit(f"backup verifier returned invalid JSON: {error}")
+with open(sys.argv[2], encoding="utf-8") as source:
+    manifest = json.load(source)
+if (not isinstance(result, dict) or result.get("success") is not True
+        or result.get("tip_hash") != manifest.get("tip_hash")
+        or result.get("tip_height") != manifest.get("tip_height")
+        or str(manifest.get("tip_height")) != sys.argv[3]
+        or manifest.get("tip_hash") != sys.argv[4]):
+    raise SystemExit("verified checkpoint tip does not match its manifest and socket response")
+PY
+if [ "$AUTH_ENABLED" -eq 1 ]; then
+  rm -f -- "$AUTH_PROOF_FILE"
+  if ! "$BACKUP_VERIFY_BIN" --stage "$SNAPSHOT_DIR" \
+    --anchors-file "$AUTH_ANCHORS_FILE" --proof-output "$AUTH_PROOF_FILE" >/dev/null \
+    || ! _auth_output_is_safe "$AUTH_PROOF_FILE"; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: checkpoint прошел проверку, но anchor proof не подтвержден; auto-cleanup authorization отключена." >&2
+    rm -f -- "$AUTH_PROOF_FILE"
+    _disable_backup_authorization "backup-proof-failed"
+  fi
+fi
+
 # Both source and destination filesystems get a fixed minimum-space check.
 _disk_preflight "$BACKUP_DIR" "BACKUP_DIR (/opt/aperod/backup-tmp)"
 _disk_preflight "$SNAPSHOT_DB" "closed checkpoint database (${SNAPSHOT_DB})"
@@ -771,6 +879,7 @@ _disk_preflight "$SNAPSHOT_DB" "closed checkpoint database (${SNAPSHOT_DB})"
 echo "=== [2/5] Дамп PostgreSQL и проверка места ==="
 echo "  Дамп PostgreSQL: ${DB_NAME} (user=${DB_USER}) ..."
 sudo -u "$DB_USER" pg_dump -F c -b "$DB_NAME" > "${BACKUP_DIR}/explorer_db.dump"
+pg_restore --file /dev/null "${BACKUP_DIR}/explorer_db.dump"
 
 # Conservatively require enough room for the uncompressed archive (therefore
 # its encrypted output), which includes the immutable snapshot DB, manifest,
@@ -1080,32 +1189,34 @@ PY
 
 _verify_remote_archive() {
   local remote="$1"
-  local download="$2"
+  local download="${2:-}"
   local expected_size="${3:-$ARCHIVE_SIZE}"
   local expected_sha="${4:-$ARCHIVE_SHA256}"
-  local expected_height="${5:-}" expected_hash="${6:-}"
-  local payload_mode="${7:-new}"
-  local proof_anchors="${8:-}" proof_output="${9:-}"
-  local remote_size remote_sha
-  _require_download_space "$expected_size" || return 1
-  _copy_remote_fresh "$remote" "$download" || return 1
-  remote_size=$(rclone size "$remote" --s3-no-check-bucket --json \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); n=d.get("bytes"); assert isinstance(n,int) and n >= 0; print(n)') || return 1
+  local remote_result remote_size remote_sha
+  # The local checkpoint and PostgreSQL dump are verified before archiving.
+  # A fresh remote stream then proves exact byte-for-byte equality without
+  # downloading a second ciphertext copy or unpacking another 11+ GiB LevelDB.
+  # Keep the old download argument for existing recovery/rollback call sites.
+  : "$download"
+  remote_result=$(rclone cat "$remote" --s3-no-check-bucket \
+    | python3 -c 'import hashlib,sys; h=hashlib.sha256(); n=0
+for block in iter(lambda: sys.stdin.buffer.read(1024 * 1024), b""):
+    n += len(block)
+    h.update(block)
+print(n, h.hexdigest())') || return 1
+  read -r remote_size remote_sha <<<"$remote_result" || return 1
+  [[ "$remote_size" =~ ^[0-9]+$ && "$remote_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ОШИБКА: потоковая проверка удаленного архива вернула неверные данные."
+    return 1
+  }
   [ "$remote_size" = "$expected_size" ] || {
-    echo "ОШИБКА: размер загруженного объекта не совпадает с локальным архивом."
+    echo "ОШИБКА: размер удаленного потока не совпадает с локальным архивом."
     return 1
   }
-  [ "$(stat -c '%s' -- "$download")" = "$expected_size" ] || {
-    echo "ОШИБКА: размер скачанного архива не совпадает с локальным."
-    return 1
-  }
-  remote_sha=$(sha256sum -- "$download" | awk '{print $1}') || return 1
   [ "$remote_sha" = "$expected_sha" ] || {
-    echo "ОШИБКА: SHA256 удаленного архива не совпадает."
+    echo "ОШИБКА: SHA256 удаленного потока не совпадает."
     return 1
   }
-  _verify_archive_payload "$download" "$expected_height" "$expected_hash" "$payload_mode" \
-    "$proof_anchors" "$proof_output"
 }
 
 # A successful bucket listing is required to distinguish an absent fixed object
@@ -1351,11 +1462,12 @@ if ! _verify_remote_archive "$CANDIDATE_REMOTE" "$DOWNLOAD_FILE" \
   "$ARCHIVE_SIZE" "$ARCHIVE_SHA256" "$CHECKPOINT_TIP_HEIGHT" "$CHECKPOINT_TIP_HASH"; then
   exit 1
 fi
-echo "  Уникальный удаленный объект проверен: размер, SHA256 и содержимое архива совпадают."
+echo "  Уникальный удаленный объект проверен: размер и SHA256 совпадают с локально проверенными данными."
 
-# Promote only a candidate that passed a full download/decrypt/list validation.
-# If replacement verification fails, restore the preexisting fixed object (or
-# remove the new name if there was no predecessor) before returning failure.
+# Promote only a candidate whose local checkpoint and dump were verified and
+# whose remote ciphertext passed exact size/SHA256 readback. If replacement
+# verification fails, restore the preexisting fixed object (or remove the new
+# name if there was no predecessor) before returning failure.
 _restore_previous_fixed() {
   if [ "$FIXED_EXISTS" = "yes" ]; then
     echo "ОШИБКА: восстанавливаем предыдущую фиксированную копию."

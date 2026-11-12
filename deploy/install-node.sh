@@ -19,7 +19,7 @@ INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
 WALLET_DIR="/etc/aperod/wallet"
-GO_VERSION="1.26.10"
+GO_VERSION="1.26.11"
 REPO_URL="https://github.com/aperod-network/aperod-node.git"
 P2P_PORT=30303
 RPC_PORT=8545
@@ -120,10 +120,26 @@ fi
 if ${need_go}; then
   info "Устанавливаем Go ${GO_VERSION}…"
   ARCH=$( [[ $(uname -m) == "aarch64" ]] && echo "arm64" || echo "amd64" )
-  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -O /tmp/go.tar.gz
+  case "$ARCH" in
+    amd64) GO_SHA256="9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec" ;;
+    arm64) GO_SHA256="6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e" ;;
+    *) die "Неподдерживаемая архитектура Go: ${ARCH}" ;;
+  esac
+  GO_ARCHIVE=$(mktemp /tmp/aperod-go.XXXXXX.tar.gz) || die "Не удалось создать временный файл Go"
+  if ! wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -O "$GO_ARCHIVE"; then
+    rm -f "$GO_ARCHIVE"
+    die "Не удалось скачать архив Go ${GO_VERSION}"
+  fi
+  if ! printf '%s  %s\n' "$GO_SHA256" "$GO_ARCHIVE" | sha256sum --check --status; then
+    rm -f "$GO_ARCHIVE"
+    die "Контрольная сумма Go ${GO_VERSION} не совпала"
+  fi
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tar.gz
-  rm -f /tmp/go.tar.gz
+  if ! tar -C /usr/local -xzf "$GO_ARCHIVE"; then
+    rm -f "$GO_ARCHIVE"
+    die "Не удалось распаковать проверенный архив Go ${GO_VERSION}"
+  fi
+  rm -f "$GO_ARCHIVE"
   echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
   export PATH="$PATH:/usr/local/go/bin"
   ok "Go ${GO_VERSION} установлен"
@@ -250,45 +266,50 @@ if [[ -f "${WALLET_FILE}" ]]; then
   read -rp "Использовать существующий? [Y/n]: " USE_EXISTING
   if [[ "${USE_EXISTING,,}" != "n" ]]; then
     WALLET_ADDR=$(jq -r '.address // empty' "${WALLET_FILE}" 2>/dev/null || "")
+    [[ -n "${WALLET_ADDR}" ]] || die "Существующий файл кошелька не распознан. Он оставлен без изменений; проверьте его резервную копию."
+    aperod wallet validate "${WALLET_ADDR}" >/dev/null \
+      || die "Адрес существующего кошелька недействителен. Файл оставлен без изменений."
     ok "Используем существующий кошелёк"
+  else
+    die "Существующий файл оставлен без изменений. Переместите его в безопасное место и повторите установку, чтобы создать другой кошелёк."
   fi
 fi
 
 if [[ -z "${WALLET_ADDR}" ]]; then
   echo
   echo "  1) Создать новый кошелёк (рекомендуется)"
-  echo "  2) Импортировать существующий приватный ключ (hex, 64 символа)"
+  echo "  2) Восстановить кошелёк по мнемонической фразе"
   echo
   read -rp "Выбор [1/2]: " W_CHOICE
 
   if [[ "${W_CHOICE}" == "2" ]]; then
-    echo
-    read -rsp "  Введите приватный ключ (64 hex-символа, ввод скрыт): " PRIVKEY
-    echo
-    if [[ ! "${PRIVKEY}" =~ ^[0-9a-fA-F]{64}$ ]]; then
-      die "Неверный формат: ожидается 64 hex-символа"
-    fi
-    aperod wallet import --key "${PRIVKEY}" --out "${WALLET_FILE}" 2>/dev/null || \
-      echo -n "${PRIVKEY}" > "${WALLET_FILE}"
-    ok "Приватный ключ импортирован"
+    aperod wallet restore --output "${WALLET_FILE}" \
+      || die "Не удалось восстановить кошелёк. Ключи не были сохранены."
+    [[ -s "${WALLET_FILE}" ]] || die "CLI не создал зашифрованный файл кошелька."
+    WALLET_ADDR=$(jq -r '.address // empty' "${WALLET_FILE}" 2>/dev/null || "")
+    [[ -n "${WALLET_ADDR}" ]] || die "В файле восстановленного кошелька отсутствует адрес."
+    aperod wallet validate "${WALLET_ADDR}" >/dev/null \
+      || die "CLI создал кошелёк с недействительным адресом."
+    ok "Зашифрованный кошелёк восстановлен"
   else
     info "Генерируем новый кошелёк…"
-    aperod wallet create --out "${WALLET_FILE}" 2>/dev/null || true
+    aperod wallet create --output "${WALLET_FILE}" \
+      || die "Не удалось создать зашифрованный кошелёк."
 
     # Если команда создала файл — читаем адрес из него
     if [[ -f "${WALLET_FILE}" ]]; then
       WALLET_ADDR=$(jq -r '.address // empty' "${WALLET_FILE}" 2>/dev/null || "")
     fi
+    [[ -s "${WALLET_FILE}" ]] || die "CLI не создал зашифрованный файл кошелька."
+    [[ -n "${WALLET_ADDR}" ]] || die "В файле нового кошелька отсутствует адрес."
+    aperod wallet validate "${WALLET_ADDR}" >/dev/null \
+      || die "CLI создал кошелёк с недействительным адресом."
     ok "Кошелёк создан"
   fi
 
   chmod 600 "${WALLET_FILE}"
   chown root:root "${WALLET_FILE}"
 
-  # Получить адрес
-  if [[ -z "${WALLET_ADDR}" ]]; then
-    WALLET_ADDR=$(aperod wallet address 2>/dev/null || "см. файл ${WALLET_FILE}")
-  fi
 fi
 
 # ── 7. Определяем внешний IP ──────────────────────────────
@@ -724,10 +745,9 @@ echo
 echo -e "  ${BOLD}Полезные команды:${NC}"
 echo -e "  systemctl status aperod-node         — статус ноды"
 echo -e "  journalctl -u aperod-node -f          — логи в реальном времени"
-echo -e "  aperod wallet balance                 — баланс кошелька"
-echo -e "  aperod wallet address                 — ваш APR-адрес"
-echo -e "  aperod wallet new-address --label X   — создать адрес для платежа"
-echo -e "  aperod wallet send --to <addr> --amount <n> — отправить APR"
+echo -e "  aperod wallet validate <APRO-адрес>   — проверить формат адреса"
+echo -e "  aperod wallet restore --output <файл> — восстановить из мнемоники"
+echo -e "  aperod --help                         — список доступных команд"
 echo
 echo -e "${YELLOW}${BOLD}  ⚠  Не забудьте сделать резервную копию кошелька:${NC}"
 echo -e "  gpg --symmetric --cipher-algo AES256 ${WALLET_FILE}"

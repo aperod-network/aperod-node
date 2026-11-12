@@ -41,6 +41,8 @@ type walletEstimateFeeResult struct {
 	SpendableUTXOCount int `json:"spendable_utxo_count"`
 	// BaseFeePerByte is the fee rate used for the estimate.
 	BaseFeePerByte uint64 `json:"base_fee_per_byte"`
+	// TransactionVersion is the protocol format required for the next block.
+	TransactionVersion uint8 `json:"transaction_version"`
 	// SkippedUTXOs lists candidates excluded from the calculation
 	// (unresolvable / failed the pre-flight commitment check).
 	SkippedUTXOs []skippedUTXOInfo `json:"skipped_utxos,omitempty"`
@@ -74,7 +76,7 @@ func (s *Server) aprWalletEstimateFee(rawParams json.RawMessage) (interface{}, e
 	owned := make([]core.OwnedUTXO, 0, len(p.UTXOs))
 	var skipped []skippedUTXOInfo
 	for _, u := range p.UTXOs {
-		o, resErr := s.resolveOwnedUTXO(u, viewPriv, spendPub)
+		o, resErr := s.resolveOwnedUTXO(u, spendPriv, viewPriv, spendPub)
 		if resErr != nil {
 			skipped = append(skipped, skippedUTXOInfo{
 				TxHash: u.TxHash,
@@ -88,8 +90,9 @@ func (s *Server) aprWalletEstimateFee(rawParams json.RawMessage) (interface{}, e
 
 	// Rate 0 → NewTxBuilder falls back to core.InitialBaseFeePerByte —
 	// exactly what apr_walletSend does, so the quote uses the same rate.
+	txVersion := s.mempool.NextSpendVersion()
 	builder := core.NewTxBuilder(spendPriv, viewPriv, spendPub, owned, 0).
-		WithVersion(s.mempool.NextSpendVersion())
+		WithVersion(txVersion)
 	est := builder.EstimateFeeForAmount(p.AmountNAPR)
 
 	return walletEstimateFeeResult{
@@ -100,6 +103,7 @@ func (s *Server) aprWalletEstimateFee(rawParams json.RawMessage) (interface{}, e
 		SpendableTotalNAPR: est.SpendableTotal,
 		SpendableUTXOCount: est.UTXOCount,
 		BaseFeePerByte:     core.InitialBaseFeePerByte,
+		TransactionVersion: uint8(txVersion),
 		SkippedUTXOs:       skipped,
 	}, nil
 }

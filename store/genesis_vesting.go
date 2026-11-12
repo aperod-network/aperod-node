@@ -11,13 +11,20 @@ import (
 	"github.com/aperod/aperod/lpod"
 )
 
+// GenesisVestingRecipient is the fixed address that receives genesis vesting.
 // This is a consensus schedule, not administrator-editable display metadata.
 // The reserve is reclassified out of the non-circulating genesis remainder
 // bound by the ALREADY attested nominal snapshot. The Guardian's eligible
 // circulating budget is distinct and MUST NOT be debited or reused.
 const GenesisVestingRecipient crypto.Address = "aproegAWbHEE8wunGatJwGLM68f3hskmbQmT8HJik9s827DymS2jScRb2hxqAgD34qfXwfQKKDCoj2okTWeVwsi2CXtA9Ybr76"
+
+// GenesisVestingReserve is the nominal reserve reclassified by the schedule.
 const GenesisVestingReserve uint64 = 849_010_000 * lpod.Unit
+
+// GenesisVestingBasis identifies the versioned genesis allocation policy.
 const GenesisVestingBasis = "attested-genesis-team-allocation-reclassification/v1"
+
+// GenesisNominalTotal is the maximum nominal genesis allocation in nAPRO.
 const GenesisNominalTotal uint64 = 10_000_000_000 * lpod.Unit
 
 // GenesisVestingState is part of the signed accounting checkpoint. Canonical
@@ -41,17 +48,19 @@ type GenesisVestingState struct {
 	LiquidityPaid          uint64                 `json:"liquidity_paid_napro,string,omitempty"`
 }
 
+// GenesisVestingTranche returns the height and amount for a scheduled tranche.
 func GenesisVestingTranche(index int) (int64, uint64, error) {
 	if index < 0 || index >= 10 {
 		return 0, 0, fmt.Errorf("genesis vesting: invalid tranche")
 	}
-	amount := uint64(84_900_000 * lpod.Unit)
+	amount := 84_900_000 * lpod.Unit
 	if index == 9 {
 		amount = 84_910_000 * lpod.Unit
 	}
 	return time.Date(2027+index, time.February, 10, 0, 0, 0, 0, time.UTC).UnixNano(), amount, nil
 }
 
+// Validate checks the vesting state against its genesis hash and activation height.
 func (v *GenesisVestingState) Validate(genesis crypto.Hash32, height uint64) error {
 	if v == nil {
 		return nil

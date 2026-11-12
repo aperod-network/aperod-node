@@ -323,6 +323,55 @@ func TestEngine_AcceptsIncomingBlock(t *testing.T) {
 	}
 }
 
+func TestEngine_InvalidSignedBlockDoesNotPoisonAcceptedHeight(t *testing.T) {
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := makeChainWithGenesis(t, priv, pub)
+	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+
+	tip := chain.Tip()
+	invalidTxs := []core.Transaction{{}, {}}
+	invalidHeader := core.BlockHeader{
+		Height:       1,
+		Round:        1,
+		PrevHash:     tip.Hash(),
+		Timestamp:    time.Now().UnixNano(),
+		ValidatorPub: pub,
+		MerkleRoot:   core.MerkleRoot(invalidTxs),
+	}
+	if err := invalidHeader.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+
+	validHeader := invalidHeader
+	validHeader.Timestamp = time.Now().UnixNano()
+	validHeader.MerkleRoot = core.MerkleRoot(nil)
+	if err := validHeader.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	go eng.Run(stop)
+	defer close(stop)
+	eng.NewBlockCh() <- &core.Block{Header: invalidHeader, Txs: invalidTxs}
+	eng.NewBlockCh() <- &core.Block{Header: validHeader}
+
+	deadline := time.Now().Add(time.Second)
+	for chain.Height() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := chain.Height(); got != 1 {
+		t.Fatalf("valid block after rejected signed candidate left chain at height %d; want 1", got)
+	}
+	if accepted := chain.GetByHeight(1); accepted == nil || len(accepted.Txs) != 0 {
+		t.Fatal("canonical block is not the valid candidate")
+	}
+}
+
 // TestEngine_RejectsBlock_NoVerifier verifies that handleIncomingBlock is fail-closed
 // when no TxVerifier has been set: the block must not be added to the chain.
 // This is a regression guard for the startup ordering bug where engine.Run was

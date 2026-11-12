@@ -12,6 +12,7 @@ package main
 //     restart during a concurrent graceful shutdown).
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -115,6 +116,81 @@ func TestParseRestartAt(t *testing.T) {
 		if _, _, err := config.ParseRestartAt(s); err == nil {
 			t.Errorf("ParseRestartAt(%q): want error, got nil", s)
 		}
+	}
+}
+
+func TestLogNightlyRestartSchedulerStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		restartEnable bool
+		restartAt     string
+		envEnabled    bool
+		wantActive    bool
+		wantReason    string
+	}{
+		{
+			name:          "disabled by node.yaml",
+			restartEnable: false,
+			envEnabled:    true,
+			wantReason:    "maintenance.restart_enabled is false",
+		},
+		{
+			name:          "disabled by empty restart time",
+			restartEnable: true,
+			envEnabled:    true,
+			wantReason:    "maintenance.restart_at is empty",
+		},
+		{
+			name:          "disabled by deployment environment gate",
+			restartEnable: true,
+			restartAt:     "04:00",
+			envEnabled:    false,
+			wantReason:    "SCHED_RESTART_ENABLED is not true",
+		},
+		{
+			name:          "active",
+			restartEnable: true,
+			restartAt:     "04:00",
+			envEnabled:    true,
+			wantActive:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := &captureHandler{}
+			log := slog.New(capture)
+			gotActive := logNightlyRestartSchedulerStatus(
+				log, tc.restartEnable, tc.restartAt, tc.envEnabled,
+			)
+			if gotActive != tc.wantActive {
+				t.Fatalf("active = %t, want %t", gotActive, tc.wantActive)
+			}
+
+			wantMessage := "nightly restart: in-process scheduler disabled"
+			if tc.wantActive {
+				wantMessage = "nightly restart: in-process scheduler active"
+			}
+			rec, ok := capture.find(wantMessage)
+			if !ok {
+				t.Fatalf("expected startup log %q", wantMessage)
+			}
+			if rec.Level != slog.LevelInfo {
+				t.Errorf("startup log level = %v, want INFO", rec.Level)
+			}
+			if tc.wantReason != "" {
+				var gotReason string
+				rec.Attrs(func(attr slog.Attr) bool {
+					if attr.Key == "reason" {
+						gotReason = attr.Value.String()
+					}
+					return true
+				})
+				if gotReason != tc.wantReason {
+					t.Errorf("disabled reason = %q, want %q", gotReason, tc.wantReason)
+				}
+			}
+		})
 	}
 }
 

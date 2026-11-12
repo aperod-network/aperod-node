@@ -34,3 +34,29 @@ func TestValueAuthorizationBindsActualDebitWithoutRevealingBlind(t *testing.T) {
 		t.Fatal("noncanonical commitment accepted")
 	}
 }
+
+func TestValidateAuthorizedOutputPoints(t *testing.T) {
+	var spendScalar, ephemeralScalar Scalar32
+	spendScalar[0] = 1
+	ephemeralScalar[0] = 2
+
+	publicKey, err := PublicKeyFromPrivate(spendScalar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ephemeralKey, err := PublicKeyFromPrivate(ephemeralScalar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuthorizedOutputPoints(publicKey, ephemeralKey); err != nil {
+		t.Fatalf("valid output points rejected: %v", err)
+	}
+
+	var smallOrder Point32
+	if err := ValidateAuthorizedOutputPoints(smallOrder, ephemeralKey); err == nil {
+		t.Fatal("small-order recipient output accepted")
+	}
+	if err := ValidateAuthorizedOutputPoints(publicKey, smallOrder); err == nil {
+		t.Fatal("small-order ephemeral output accepted")
+	}
+}

@@ -169,10 +169,12 @@ func Settle(before State, carries map[string]Carry, height uint64, vaults []Vaul
 		out[id] = c
 	}
 	payments := make([]Payment, 0, len(vaults))
+	var previousID string
 	for i, v := range vaults {
-		if v.ID == "" || (i > 0 && vaults[i-1].ID >= v.ID) {
+		if v.ID == "" || (i > 0 && previousID >= v.ID) {
 			return fail(fmt.Errorf("lpod: vault IDs must be sorted and unique"))
 		}
+		previousID = v.ID
 		t, err := TierFor(v.TotalStake)
 		if err != nil {
 			return fail(err)

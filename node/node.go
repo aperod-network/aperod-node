@@ -538,9 +538,27 @@ func (a *p2pAdapter) ValidateSyncHeader(header core.BlockHeader) error {
 }
 
 func (a *p2pAdapter) OnTransaction(tx *core.Transaction) {
-	if err := a.mempool.Add(*tx); err != nil {
+	if err := a.AdmitTransaction(tx); err != nil {
 		a.log.Debug("p2p: tx rejected", "err", err)
 	}
+}
+
+// AdmitTransaction is called by P2P before gossip relay. A transaction is
+// forwarded only after the mempool has accepted it.
+func (a *p2pAdapter) AdmitTransaction(tx *core.Transaction) error {
+	hash := tx.Hash()
+	if _, alreadyAccepted := a.mempool.Get(hash); alreadyAccepted {
+		return nil
+	}
+	if err := a.mempool.Add(*tx); err != nil {
+		// Resolve a concurrent admission race: a duplicate is safe to relay
+		// only if the exact transaction is now already present in the pool.
+		if _, alreadyAccepted := a.mempool.Get(hash); alreadyAccepted {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *p2pAdapter) OnVote(vote p2p.VoteMsg) {

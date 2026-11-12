@@ -110,6 +110,7 @@ if [[ -n "${BOOTSTRAP_FROM}" ]]; then
     die "--bootstrap-from='${VALIDATOR_IP}' не является IPv4-адресом."
   fi
 
+  [[ -f "${LOCAL_NODE_YAML}" ]] || die "${LOCAL_NODE_YAML} не найден. Сначала установите ноду через install-node.sh; без node.yaml нельзя настроить peer_whitelist."
   command -v rsync >/dev/null 2>&1 || die "rsync не установлен"
   command -v ssh >/dev/null 2>&1   || die "ssh не установлен"
 
@@ -448,13 +449,46 @@ PY
     # Предотвращает накопление bad-block страйков (→ 24-ч бан) пока реле
     # не догонит цепь и не начнёт принимать gossip-блоки валидатора.
     info "Шаг 7.5/9: Прописываем ${VALIDATOR_IP} в p2p.peer_whitelist…"
-    python3 - "${LOCAL_NODE_YAML}" "${VALIDATOR_IP}" <<'PY'
-import sys, yaml, os
+    python3 - "${LOCAL_NODE_YAML}" "${VALIDATOR_IP}" "${LOCAL_DATA_DIR}" <<'PY'
+import sys, yaml, os, json, ipaddress, stat, subprocess, tempfile
 cfg_path     = sys.argv[1]
 validator_ip = sys.argv[2]
+ipaddress.IPv4Address(validator_ip)
 with open(cfg_path) as f:
     cfg = yaml.safe_load(f) or {}
 p2p = cfg.setdefault("p2p", {})
+# A nonempty runtime sidecar overrides YAML. Merge the joining validator into
+# the target's policy too; do not delete existing operator entries or import
+# the source host's policy. "-" explicitly disables sidecar persistence.
+sidecar = p2p.get("whitelist_file") or os.path.join(cfg.get("data_dir") or sys.argv[3], "p2p_whitelist.json")
+if sidecar != "-":
+    if not os.path.isabs(sidecar):
+        cwd = subprocess.check_output(["systemctl", "show", "aperod-node", "--property=WorkingDirectory", "--value"], text=True).strip() or "/"
+        if not os.path.isabs(cwd):
+            raise ValueError("aperod-node WorkingDirectory must be absolute")
+        sidecar = os.path.join(cwd, sidecar)
+    if os.path.lexists(sidecar):
+        with open(sidecar) as f:
+            entries = json.load(f)
+        if not isinstance(entries, list) or any(not isinstance(e, str) for e in entries):
+            raise ValueError("Invalid whitelist sidecar: expected IP/CIDR array")
+        for entry in entries:
+            ipaddress.ip_network(entry, strict=False)
+        if validator_ip not in entries:
+            entries.append(validator_ip)
+            meta = os.stat(sidecar)
+            fd, tmp_sidecar = tempfile.mkstemp(prefix=".join-whitelist-", dir=os.path.dirname(sidecar))
+            try:
+                with os.fdopen(fd, "w") as f:
+                    os.fchown(f.fileno(), meta.st_uid, meta.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(meta.st_mode))
+                    json.dump(entries, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_sidecar, sidecar)
+            finally:
+                if os.path.exists(tmp_sidecar):
+                    os.unlink(tmp_sidecar)
 wl  = list(p2p.get("peer_whitelist") or [])
 if validator_ip not in wl:
     wl.append(validator_ip)
@@ -469,11 +503,7 @@ else:
 PY
     ok "IP валидатора ${VALIDATOR_IP} добавлен в peer_whitelist"
   else
-    warn "${LOCAL_NODE_YAML} не найден — bootnode не прописан."
-    warn "Добавьте вручную в node.yaml:"
-    warn "  p2p:"
-    warn "    bootnodes:"
-    warn "      - ${VALIDATOR_BOOTNODE}"
+    die "${LOCAL_NODE_YAML} не найден — bootnode и peer_whitelist не настроены."
   fi
 
   # ── Шаг 7b: Устанавливаем snapshot.utxo_count_tolerance_pct ──
@@ -623,21 +653,29 @@ fi
 [[ -z "${TARGET_IP}" ]] && die "Укажите IP нового сервера: bash join-network.sh <IP>
 Или используйте: bash join-network.sh --bootstrap-from=<VALIDATOR_IP>"
 
-# PRIMARY_IP — IP-адрес ЭТОГО сервера (откуда запускается скрипт).
-# Переопределите переменной окружения PRIMARY_IP если auto-detect даёт
-# неверный адрес (например, внутренний 10.x вместо внешнего IP).
+# PRIMARY_IP — source IPv4 as observed by the relay's authenticated SSH server.
+# Local interfaces/routes can show a private address behind NAT. Observing the
+# connection at the destination avoids whitelisting that unusable private IP.
+# An explicit override remains available for unusual SSH/P2P routing or proxies.
+command -v ssh >/dev/null 2>&1 || die "ssh не установлен"
 if [[ -z "${PRIMARY_IP:-}" ]]; then
-  # Explicitly pick the first IPv4 address (skip IPv6 addresses).
-  # hostname -I can return IPv6 first on dual-stack hosts, but /ip4/.../tcp/...
-  # multiaddrs require a dotted-quad IPv4 address.
-  PRIMARY_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-  if [[ -z "${PRIMARY_IP}" ]]; then
-    die "Не удалось определить IPv4-адрес этого сервера.
+  if ! PRIMARY_IP=$(ssh "root@${TARGET_IP}" 'printf "%s\n" "${SSH_CONNECTION%% *}"' </dev/null); then
+    die "Не удалось определить исходящий IPv4 через SSH нового сервера.
   Укажите вручную: PRIMARY_IP=<IPv4> bash join-network.sh <TARGET_IP>"
   fi
 fi
-# Validate that PRIMARY_IP is a dotted-quad to catch accidental IPv6 overrides.
-if ! echo "${PRIMARY_IP}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+# Reject empty/malformed observations and invalid IPv4 overrides before stopping
+# either node; never silently fall back to the first local network interface.
+_valid_primary_ipv4() {
+  local part
+  local -a parts
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a parts <<< "$1"
+  for part in "${parts[@]}"; do
+    [[ "${part}" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((10#${part} <= 255)) || return 1
+  done
+}
+if ! _valid_primary_ipv4 "${PRIMARY_IP}"; then
   die "PRIMARY_IP='${PRIMARY_IP}' не является IPv4-адресом.
   /ip4/.../tcp/... multiaddr требует dotted-quad IPv4. Укажите IPv4: PRIMARY_IP=<IPv4> bash join-network.sh <TARGET_IP>"
 fi
@@ -871,8 +909,33 @@ _PUSH_RSYNC_STARTED=1
 # The source does not have this file, so without the exclusion rsync's
 # deletion pass would remove the sentinel from the target BEFORE the data
 # transfer completes — defeating its purpose.
+# The source's authoritative whitelist sidecar is also host-local policy:
+# copying it would override the validator IP we add to the relay's YAML.
+# Preserve an existing target policy; a fresh relay seeds its own from YAML.
+_TARGET_WHITELIST_EXCLUDE=$(ssh "root@${TARGET_IP}" python3 - "${SECONDARY_NODE_YAML}" "${SECONDARY_DATA_DIR}" <<'PY'
+import os, sys, yaml, subprocess
+cfg = {}
+if os.path.exists(sys.argv[1]):
+    with open(sys.argv[1]) as f:
+        cfg = yaml.safe_load(f) or {}
+path = (cfg.get("p2p") or {}).get("whitelist_file") or os.path.join(cfg.get("data_dir") or sys.argv[2], "p2p_whitelist.json")
+if path != "-":
+    if not os.path.isabs(path):
+        cwd = subprocess.check_output(["systemctl", "show", "aperod-node", "--property=WorkingDirectory", "--value"], text=True).strip() or "/"
+        if not os.path.isabs(cwd):
+            raise ValueError("aperod-node WorkingDirectory must be absolute")
+        path = os.path.join(cwd, path)
+    # An anchored exclusion protects a custom sidecar inside the copied data.
+    root = os.path.abspath(sys.argv[2])
+    path = os.path.abspath(path)
+    if os.path.commonpath([root, path]) == root:
+        print("/" + os.path.relpath(path, root))
+PY
+)
 rsync -az --delete --progress --ignore-errors \
   --exclude='p2p_identity.key' \
+  --exclude='p2p_whitelist.json' \
+  --exclude="${_TARGET_WHITELIST_EXCLUDE}" \
   --exclude='.rsync-in-progress' \
   "${PRIMARY_DATA_DIR}/" \
   "root@${TARGET_IP}:${SECONDARY_DATA_DIR}/"
@@ -977,13 +1040,46 @@ ok "Bootnode ${PRIMARY_BOOTNODE} прописан в ${SECONDARY_NODE_YAML}"
 # забанит валидатор на 24 ч — полностью разрывая P2P-синхронизацию.
 # Белый список (peer_whitelist) исключает валидатор из счётчика страйков.
 info "Шаг 5.5/7: Прописываем ${PRIMARY_IP} в p2p.peer_whitelist нового узла…"
-ssh "root@${TARGET_IP}" python3 - "${SECONDARY_NODE_YAML}" "${PRIMARY_IP}" <<'PY'
-import sys, yaml, os
+ssh "root@${TARGET_IP}" python3 - "${SECONDARY_NODE_YAML}" "${PRIMARY_IP}" "${SECONDARY_DATA_DIR}" <<'PY'
+import sys, yaml, os, json, ipaddress, stat, subprocess, tempfile
 cfg_path     = sys.argv[1]
 validator_ip = sys.argv[2]
+ipaddress.IPv4Address(validator_ip)
 with open(cfg_path) as f:
     cfg = yaml.safe_load(f) or {}
 p2p = cfg.setdefault("p2p", {})
+# A nonempty runtime sidecar overrides YAML. Merge the joining validator into
+# the target's policy too; do not delete existing operator entries or import
+# the source host's policy. "-" explicitly disables sidecar persistence.
+sidecar = p2p.get("whitelist_file") or os.path.join(cfg.get("data_dir") or sys.argv[3], "p2p_whitelist.json")
+if sidecar != "-":
+    if not os.path.isabs(sidecar):
+        cwd = subprocess.check_output(["systemctl", "show", "aperod-node", "--property=WorkingDirectory", "--value"], text=True).strip() or "/"
+        if not os.path.isabs(cwd):
+            raise ValueError("aperod-node WorkingDirectory must be absolute")
+        sidecar = os.path.join(cwd, sidecar)
+    if os.path.lexists(sidecar):
+        with open(sidecar) as f:
+            entries = json.load(f)
+        if not isinstance(entries, list) or any(not isinstance(e, str) for e in entries):
+            raise ValueError("Invalid whitelist sidecar: expected IP/CIDR array")
+        for entry in entries:
+            ipaddress.ip_network(entry, strict=False)
+        if validator_ip not in entries:
+            entries.append(validator_ip)
+            meta = os.stat(sidecar)
+            fd, tmp_sidecar = tempfile.mkstemp(prefix=".join-whitelist-", dir=os.path.dirname(sidecar))
+            try:
+                with os.fdopen(fd, "w") as f:
+                    os.fchown(f.fileno(), meta.st_uid, meta.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(meta.st_mode))
+                    json.dump(entries, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_sidecar, sidecar)
+            finally:
+                if os.path.exists(tmp_sidecar):
+                    os.unlink(tmp_sidecar)
 wl  = list(p2p.get("peer_whitelist") or [])
 if validator_ip not in wl:
     wl.append(validator_ip)

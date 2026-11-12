@@ -25,6 +25,7 @@ func valueAuthorizationChallenge(amount uint64, commit Commitment, nonce []byte)
 	return s
 }
 
+// ProveValueAuthorization creates a proof that a commitment opens to amount.
 func ProveValueAuthorization(amount uint64, blind BlindFactor) (Commitment, ValueAuthorization, error) {
 	commit, err := Commit(amount, blind)
 	if err != nil {
@@ -51,6 +52,7 @@ func ProveValueAuthorization(amount uint64, blind BlindFactor) (Commitment, Valu
 	return commit, proof, nil
 }
 
+// VerifyValueAuthorization checks that proof authorizes amount for commit.
 func VerifyValueAuthorization(amount uint64, commit Commitment, proof ValueAuthorization) error {
 	C, err := checkedCLSAGSubgroupPoint(Point32(commit), "sale commitment", true)
 	if err != nil {
@@ -76,6 +78,7 @@ func VerifyValueAuthorization(amount uint64, commit Commitment, proof ValueAutho
 	return nil
 }
 
+// ValidateAuthorizedOutputPoints rejects invalid public and ephemeral output points.
 func ValidateAuthorizedOutputPoints(pub, ephemeral Point32) error {
 	if _, err := checkedCLSAGPrimePoint(pub, "sale recipient output"); err != nil {
 		return err

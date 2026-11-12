@@ -6,8 +6,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-// The initial protocol sale allocation must preserve the separately earmarked
-// Guardian allocation within the primary 10B cap.
+// MinimumGuardianReserveNAPRO is the minimum Guardian reserve protected within the primary 10B cap.
 const MinimumGuardianReserveNAPRO uint64 = 1_000_000_000 * 100_000_000
 
 // Reconciliation is a forward, authority-attested accounting declaration, not
@@ -33,6 +32,7 @@ type Reconciliation struct {
 	OtherReserved     uint64
 }
 
+// Digest returns the canonical commitment to this reconciliation.
 func (r Reconciliation) Digest() crypto.Hash32 {
 	legacy := crypto.HashBytes(
 		[]byte("aperod/sale/disjoint-forward-reconciliation/v1"),
@@ -55,6 +55,7 @@ func (r Reconciliation) Digest() crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/sale/disjoint-forward-reconciliation/v2"), legacy[:], net[:])
 }
 
+// Unassigned returns the remaining Guardian and non-Guardian allocation amounts.
 func (r Reconciliation) Unassigned() (uint64, uint64, error) {
 	if r.AllocationEpoch != nil {
 		if r.NetAllocation != nil {

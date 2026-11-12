@@ -197,7 +197,9 @@ func TestWalletSnapshotLoopbackService(t *testing.T) {
 	go func() {
 		response, err := f.http.Client().Do(req)
 		if response != nil {
-			response.Body.Close()
+			if closeErr := response.Body.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
 		}
 		result <- err
 	}()

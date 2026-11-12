@@ -117,7 +117,7 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 	// ── 3. Build OwnedUTXO slice from caller-provided list ────────────────────
 	ownedUTXOs := make([]core.OwnedUTXO, 0, len(p.UTXOs))
 	for _, u := range p.UTXOs {
-		owned, resErr := s.resolveOwnedUTXO(u, viewPriv, spendPub)
+		owned, resErr := s.resolveOwnedUTXO(u, spendPriv, viewPriv, spendPub)
 		if resErr != nil {
 			return nil, resErr
 		}
@@ -263,7 +263,7 @@ func (s *Server) aprWalletSend(ctx context.Context, rawParams json.RawMessage) (
 // derives or validates the Pedersen blind, and runs the pre-flight commitment
 // check.  Shared by apr_walletSend (fail on error) and apr_walletMaxSpendable
 // (skip on error).
-func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, spendPub crypto.Point32) (core.OwnedUTXO, error) {
+func (s *Server) resolveOwnedUTXO(u walletUTXOInput, spendPriv, viewPriv crypto.Scalar32, spendPub crypto.Point32) (core.OwnedUTXO, error) {
 	txHash, err := hash32FromHex(u.TxHash)
 	if err != nil {
 		return core.OwnedUTXO{}, fmt.Errorf("utxo tx_hash %q: %w", u.TxHash, err)
@@ -358,6 +358,8 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 							if bTx.Hash() == txHash {
 								if int(u.OutIdx) < len(bTx.Outputs) {
 									out = bTx.Outputs[u.OutIdx]
+									tx = bTx
+									txOk = true
 									loc = core.TxLocation{
 										Block:   &blk,
 										TxIndex: ti,
@@ -618,6 +620,49 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, viewPriv crypto.Scalar32, s
 			}
 		}
 	}
+	txVersion := tx.Version
+	if !txOk && loc.Block != nil {
+		if binding, sourceVersion, found := s.amountBindingForOutput(txHash, u.OutIdx, loc.Block.Header.Height); found {
+			txVersion = sourceVersion
+			if out.AmountBinding == nil {
+				out.AmountBinding = binding
+			}
+		} else if out.TxPubKey != (crypto.Point32{}) && out.EncAmount == ([8]byte{}) {
+			return core.OwnedUTXO{}, fmt.Errorf("source transaction is unavailable to validate amount encoding for %s[%d]",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+		}
+	}
+	requiresAmountBinding := txVersion == core.TxVersionAmountBinding || txVersion == core.TxVersionAVMAmountBinding
+	if requiresAmountBinding {
+		if out.AmountBinding == nil {
+			return core.OwnedUTXO{}, fmt.Errorf("amount binding missing for %s[%d]", u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+		}
+		if out.EncAmount != ([8]byte{}) {
+			return core.OwnedUTXO{}, fmt.Errorf("legacy encrypted amount present in bound output %s[%d]",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx)
+		}
+		valid, verifyErr := crypto.VerifyAmountBinding(out.AmountCommit, out.OneTimePub, out.AmountBinding)
+		if verifyErr != nil || !valid {
+			return core.OwnedUTXO{}, fmt.Errorf("invalid amount binding for %s[%d]: %v",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, verifyErr)
+		}
+		oneTimePriv, keyErr := crypto.AddScalars(hsScalar, spendPriv)
+		if keyErr != nil {
+			return core.OwnedUTXO{}, fmt.Errorf("derive bound spend key for %s[%d]: %w",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, keyErr)
+		}
+		boundAmount, decryptErr := crypto.DecryptAmountBinding(out.AmountBinding, oneTimePriv)
+		crypto.ZeroBytes(oneTimePriv[:])
+		if decryptErr != nil {
+			return core.OwnedUTXO{}, fmt.Errorf("decrypt bound amount for %s[%d]: %w",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, decryptErr)
+		}
+		if boundAmount != u.AmountNAPR {
+			return core.OwnedUTXO{}, fmt.Errorf("amount binding mismatch for %s[%d]: supplied %d, authenticated %d",
+				u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, u.AmountNAPR, boundAmount)
+		}
+	}
+
 	// ── Heal stale byPubKey entry ─────────────────────────────────────────
 	// byPubKey is loaded from the snapshot at startup.  After an OOM kill
 	// the snapshot may hold a corrupt AmountCommit for this UTXO while the

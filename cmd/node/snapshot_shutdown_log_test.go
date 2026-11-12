@@ -1298,3 +1298,69 @@ func TestCheckStartupSnapshotTiming_DBRoundtrip_PersistAcrossReopen(t *testing.T
 		t.Fatalf("ratio_pct missing after DB reopen; full output:\n%s", buf.String())
 	}
 }
+
+// TestCheckStartupSnapshotTiming_DBRoundtrip_UsesPersistedTimeout verifies
+// that both values written at shutdown survive a real LevelDB reopen and that
+// the loaded timeout is the denominator used by the startup warning.
+func TestCheckStartupSnapshotTiming_DBRoundtrip_UsesPersistedTimeout(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "chain.db")
+	const (
+		saveMs     = int64(181_000)
+		timeoutSec = 300.0
+	)
+
+	priorDB, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open (prior run): %v", err)
+	}
+	if err := priorDB.StoreSnapshotSaveDuration(saveMs); err != nil {
+		_ = priorDB.Close()
+		t.Fatalf("StoreSnapshotSaveDuration: %v", err)
+	}
+	if err := priorDB.StoreSnapshotTimeoutSec(timeoutSec); err != nil {
+		_ = priorDB.Close()
+		t.Fatalf("StoreSnapshotTimeoutSec: %v", err)
+	}
+	if err := priorDB.Close(); err != nil {
+		t.Fatalf("close prior-run DB: %v", err)
+	}
+
+	restartedDB, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open (after restart): %v", err)
+	}
+	defer restartedDB.Close()
+
+	loadedSaveMs, saveFound, err := restartedDB.LoadSnapshotSaveDuration()
+	if err != nil {
+		t.Fatalf("LoadSnapshotSaveDuration: %v", err)
+	}
+	if !saveFound || loadedSaveMs != saveMs {
+		t.Fatalf("loaded save duration=(%d, found=%t), want (%d, true)", loadedSaveMs, saveFound, saveMs)
+	}
+	loadedTimeoutSec, timeoutFound, err := restartedDB.LoadSnapshotTimeoutSec()
+	if err != nil {
+		t.Fatalf("LoadSnapshotTimeoutSec: %v", err)
+	}
+	if !timeoutFound || loadedTimeoutSec != timeoutSec {
+		t.Fatalf("loaded timeout=(%v, found=%t), want (%v, true)", loadedTimeoutSec, timeoutFound, timeoutSec)
+	}
+
+	// checkStartupSnapshotTiming reads systemd configuration. Use the timeout
+	// loaded from LevelDB as the synthetic effective TimeoutStopSec so this
+	// integration test exercises the persisted duration and denominator together.
+	dropinDir, service := writeTimeoutConfInDir(t, int(loadedTimeoutSec))
+	var buf bytes.Buffer
+	checkStartupSnapshotTiming(loadedSaveMs, dropinDir, service, newCaptureLogger(&buf))
+
+	const wantMsg = "startup: last snapshot save duration exceeds 50% of systemd stop timeout — consider increasing TimeoutStopSec"
+	if !logContainsMsg(&buf, wantMsg) {
+		t.Fatalf("expected startup warning using persisted timeout; full output:\n%s", buf.String())
+	}
+	if got, ok := logFieldValue(&buf, wantMsg, "timeout_stop_sec"); !ok || got != "300" {
+		t.Fatalf("timeout_stop_sec = %q (present=%t), want 300; log:\n%s", got, ok, buf.String())
+	}
+	if got, ok := logFieldValue(&buf, wantMsg, "ratio_pct"); !ok || got != "60.3" {
+		t.Fatalf("ratio_pct = %q (present=%t), want 60.3; log:\n%s", got, ok, buf.String())
+	}
+}

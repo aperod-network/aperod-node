@@ -1,6 +1,9 @@
 package core
 
 import (
+	"encoding/binary"
+	"fmt"
+
 	"github.com/aperod/aperod/crypto"
 )
 
@@ -17,6 +20,8 @@ type OwnedUTXO struct {
 // WalletScanner scans blocks for outputs belonging to a wallet.
 type WalletScanner struct {
 	viewPriv    crypto.Scalar32
+	spendPriv   crypto.Scalar32
+	hasSpendKey bool
 	spendPub    crypto.Point32
 	viewPub     crypto.Point32
 	networkByte crypto.NetworkByte
@@ -32,9 +37,26 @@ func NewWalletScanner(viewPriv crypto.Scalar32, spendPub, viewPub crypto.Point32
 	}
 }
 
+// NewWalletScannerWithSpendKey creates a scanner that can recover version-13+
+// encrypted amounts, which are encrypted to the output's one-time spend key.
+func NewWalletScannerWithSpendKey(spendPriv, viewPriv crypto.Scalar32, spendPub, viewPub crypto.Point32, net crypto.NetworkByte) *WalletScanner {
+	s := NewWalletScanner(viewPriv, spendPub, viewPub, net)
+	s.spendPriv = spendPriv
+	s.hasSpendKey = true
+	return s
+}
+
 // ScanBlock scans a block for outputs belonging to this wallet.
 // Returns a list of owned UTXOs (may be empty if none belong to us).
 func (s *WalletScanner) ScanBlock(block *Block) []OwnedUTXO {
+	owned, _ := s.ScanBlockVerified(block)
+	return owned
+}
+
+// ScanBlockVerified scans outputs and returns an error if the scanner cannot
+// authenticate a version-13 amount. View-only scanners intentionally cannot
+// claim an amount for new-format outputs.
+func (s *WalletScanner) ScanBlockVerified(block *Block) ([]OwnedUTXO, error) {
 	var owned []OwnedUTXO
 	txHash := func(tx Transaction) crypto.Hash32 { return tx.Hash() }
 
@@ -51,7 +73,35 @@ func (s *WalletScanner) ScanBlock(block *Block) []OwnedUTXO {
 				continue // not ours
 			}
 
-			amount := decryptAmount(out.EncAmount, hs)
+			var amount uint64
+			if tx.UsesAmountBinding() {
+				if !s.hasSpendKey {
+					return nil, fmt.Errorf("transaction %x output %d requires a spend key to read its bound amount",
+						hash[:8], i)
+				}
+				valid, verifyErr := crypto.VerifyAmountBinding(out.AmountCommit, out.OneTimePub, out.AmountBinding)
+				if verifyErr != nil {
+					return nil, fmt.Errorf("transaction %x output %d amount-binding proof: %w",
+						hash[:8], i, verifyErr)
+				}
+				if !valid {
+					return nil, fmt.Errorf("transaction %x output %d has an invalid amount-binding proof",
+						hash[:8], i)
+				}
+				oneTimePriv, keyErr := crypto.AddScalars(*hs, s.spendPriv)
+				if keyErr != nil {
+					return nil, fmt.Errorf("transaction %x output %d one-time private key: %w",
+						hash[:8], i, keyErr)
+				}
+				amount, verifyErr = crypto.DecryptAmountBinding(out.AmountBinding, oneTimePriv)
+				crypto.ZeroBytes(oneTimePriv[:])
+				if verifyErr != nil {
+					return nil, fmt.Errorf("transaction %x output %d bound amount: %w",
+						hash[:8], i, verifyErr)
+				}
+			} else {
+				amount = decryptAmount(out.EncAmount, hs)
+			}
 
 			owned = append(owned, OwnedUTXO{
 				UTXO: UTXO{
@@ -68,21 +118,31 @@ func (s *WalletScanner) ScanBlock(block *Block) []OwnedUTXO {
 			})
 		}
 	}
-	return owned
+	return owned, nil
 }
 
 // ScanChain scans all blocks in a range for owned UTXOs.
 // chain.GetByHeight is called for each height from startHeight to endHeight inclusive.
 func (s *WalletScanner) ScanChain(chain *Chain, startHeight, endHeight uint64) []OwnedUTXO {
+	all, _ := s.ScanChainVerified(chain, startHeight, endHeight)
+	return all
+}
+
+// ScanChainVerified scans a range while preserving amount-proof failures.
+func (s *WalletScanner) ScanChainVerified(chain *Chain, startHeight, endHeight uint64) ([]OwnedUTXO, error) {
 	var all []OwnedUTXO
 	for h := startHeight; h <= endHeight; h++ {
 		block := chain.GetByHeight(h)
 		if block == nil {
 			break
 		}
-		all = append(all, s.ScanBlock(block)...)
+		owned, err := s.ScanBlockVerified(block)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, owned...)
 	}
-	return all
+	return all, nil
 }
 
 // Balance sums the amounts of all owned UTXOs.
@@ -120,9 +180,7 @@ func decryptAmount(enc [8]byte, hs *crypto.Scalar32) uint64 {
 // Used by the transaction builder.
 func EncryptAmount(amount uint64, hs *crypto.Scalar32) [8]byte {
 	var plain [8]byte
-	for i := range plain {
-		plain[i] = byte(amount >> (uint(i) * 8))
-	}
+	binary.LittleEndian.PutUint64(plain[:], amount)
 	keyStream := crypto.HashBytes([]byte("aperod/amount-enc/v1"), hs[:])
 	var enc [8]byte
 	for i := range enc {

@@ -44,6 +44,42 @@ func TestRingCTV4ActivationBoundary(t *testing.T) {
 	}
 }
 
+func TestRingCTAmountBindingActivationBoundary(t *testing.T) {
+	const activation = uint64(200)
+	legacy := &core.Transaction{Version: core.TxVersionCLSAG, Inputs: []core.RingInput{{}}}
+	bound := &core.Transaction{Version: core.TxVersionAmountBinding, Inputs: []core.RingInput{{}}}
+	avm := &core.Transaction{Version: core.TxVersionAVM, Inputs: []core.RingInput{{}}}
+	boundAVM := &core.Transaction{Version: core.TxVersionAVMAmountBinding, Inputs: []core.RingInput{{}}}
+
+	args := func(tx *core.Transaction, height uint64) error {
+		return core.ValidateTxVersionAtHeight(tx, height, 1, 1, 100, activation)
+	}
+	if err := args(legacy, activation-1); err != nil {
+		t.Fatalf("legacy CLSAG rejected before amount-binding activation: %v", err)
+	}
+	if err := args(bound, activation-1); err == nil {
+		t.Fatal("amount-binding version accepted before activation")
+	}
+	if err := args(boundAVM, activation-1); err == nil {
+		t.Fatal("amount-binding AVM version accepted before activation")
+	}
+	if err := args(legacy, activation); err == nil {
+		t.Fatal("legacy CLSAG accepted at amount-binding activation")
+	}
+	if err := args(avm, activation); err == nil {
+		t.Fatal("legacy AVM accepted at amount-binding activation")
+	}
+	if err := args(bound, activation); err != nil {
+		t.Fatalf("amount-binding version rejected at activation: %v", err)
+	}
+	if err := args(boundAVM, activation); err != nil {
+		t.Fatalf("amount-binding AVM version rejected at activation: %v", err)
+	}
+	if err := core.ValidateTxVersionAtHeight(bound, activation, 1, 0, 100, activation); err == nil {
+		t.Fatal("amount-binding version accepted without an active CLSAG height")
+	}
+}
+
 func TestStakeTransactionCannotCreateOutputs(t *testing.T) {
 	extra := make([]byte, core.StakePayloadSize)
 	extra[0] = byte(core.StakeWithdraw)

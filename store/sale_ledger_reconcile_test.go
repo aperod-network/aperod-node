@@ -22,7 +22,6 @@ func TestSaleLedgerReconcilePreservesPaidBudgetAndFences(t *testing.T) {
 			activation, p := saleTestBlock(t, d, m, key, address, g.Header.Height+1, g.Hash(), "reconcile")
 			commitSaleFixture(t, d, activation, m, p) // genuinely funded canonical sale
 			before, _ := d.LoadSaleState()
-			old := saleUpgradeRecords(t, d)
 			next := core.Block{Header: activation.Header}
 			next.Header.Height++
 			next.Header.PrevHash = activation.Hash()
@@ -55,13 +54,17 @@ func TestSaleLedgerReconcilePreservesPaidBudgetAndFences(t *testing.T) {
 				t.Fatal(err)
 			}
 			if scenario == "missing-body" {
-				d.db.Delete(append([]byte("b/"), hash[:]...), nil)
+				if err := d.db.Delete(append([]byte("b/"), hash[:]...), nil); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if scenario == "wrong-baseline" {
 				m.Checkpoint.Attestations[0].Signature[0] ^= 1
 			}
 			if scenario == "journal-conflict" {
-				d.db.Put(saleJournalKey(hash), []byte("conflict"), nil)
+				if err := d.db.Put(saleJournalKey(hash), []byte("conflict"), nil); err != nil {
+					t.Fatal(err)
+				}
 			}
 			config := filepath.Join(dir, "sale.json")
 			encoded, _ := json.Marshal(m)
@@ -69,7 +72,6 @@ func TestSaleLedgerReconcilePreservesPaidBudgetAndFences(t *testing.T) {
 				t.Fatal(err)
 			}
 			snapshot := saleUpgradeRecords(t, d)
-			old = snapshot
 			expected := hash
 			if scenario == "wrong-tip" {
 				expected = crypto.HashBytes([]byte("wrong"))
@@ -101,7 +103,7 @@ func TestSaleLedgerReconcilePreservesPaidBudgetAndFences(t *testing.T) {
 					t.Fatal("budget or canonical state changed incorrectly")
 				}
 				after := saleUpgradeRecords(t, d)
-				for k, v := range old {
+				for k, v := range snapshot {
 					if k != string(saleStateKey) && !reflect.DeepEqual(v, after[k]) {
 						t.Fatalf("original financial record changed: %q", k)
 					}
@@ -120,7 +122,7 @@ func TestSaleLedgerReconcilePreservesPaidBudgetAndFences(t *testing.T) {
 					t.Fatal("refusal changed data")
 				}
 			}
-			d.Close()
+			closeStoreTestResource(t, d)
 		})
 	}
 }

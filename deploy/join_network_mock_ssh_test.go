@@ -123,7 +123,7 @@ func TestJoinNetworkMockSSHSkipContract(t *testing.T) {
 		"0 passed",
 		"0 failed",
 		"1 skipped",
-		"M1-M6: python3 not found in PATH",
+"M1-M8: python3 not found in PATH",
 		"SKIP_SUMMARY count=1",
 	} {
 		if !strings.Contains(string(output), marker) {

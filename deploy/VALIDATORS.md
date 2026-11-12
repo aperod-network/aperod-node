@@ -168,13 +168,35 @@ Withdrawals cannot be cancelled once initiated.
 
 Complete installation instructions are in the main [README](README.md).
 
-```bash
-# Install validator node (interactive)
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/install-validator.sh | sudo bash
+Use only a full commit SHA published for a reviewed release. Do not run an
+installer fetched from the mutable `main` branch, and never pipe a downloaded
+script directly to `sudo bash`.
 
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/aperod-network/aperod-node/main/deploy/uninstall-validator.sh | sudo bash
+```bash
+# Replace this with the full SHA from the reviewed release record.
+APEROD_NODE_SOURCE_COMMIT="<reviewed-40-character-commit-sha>"
+if [[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "A reviewed, full 40-character commit SHA is required." >&2
+  exit 1
+fi
+
+git clone --no-checkout https://github.com/aperod-network/aperod-node.git aperod-node
+cd aperod-node
+git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
+git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"
+git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
+test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
+test -z "$(git status --porcelain)"
+
+# Review the checked-out installer before running it as root.
+sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
+
+# Review the checked-out uninstaller before this destructive operation.
+sudo bash deploy/uninstall-validator.sh
 ```
+
+If no reviewed release record supplies the exact commit SHA, do not install or
+uninstall from this guide.
 
 **Key file locations after install:**
 

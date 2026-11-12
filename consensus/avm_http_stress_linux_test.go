@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -84,10 +85,13 @@ func stressRequest(client *http.Client, endpoint, ip string, body []byte) (int, 
 	if err != nil {
 		return 0, err.Error()
 	}
-	defer resp.Body.Close()
 	value, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	closeErr := resp.Body.Close()
 	if err != nil {
-		return 0, err.Error()
+		return 0, errors.Join(err, closeErr).Error()
+	}
+	if closeErr != nil {
+		return 0, closeErr.Error()
 	}
 	return resp.StatusCode, string(value)
 }

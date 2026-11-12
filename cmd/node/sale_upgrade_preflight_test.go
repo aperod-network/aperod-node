@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,7 +65,9 @@ func TestSaleUpgradeStageManifest(t *testing.T) {
 	}
 	manifest.Success = false
 	raw, _ := json.Marshal(manifest)
-	os.WriteFile(filepath.Join(stage, "manifest.json"), raw, 0600)
+	if err := os.WriteFile(filepath.Join(stage, "manifest.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := verifySaleUpgradeStage(cfg, stage, nil, io.Discard, false); err == nil {
 		t.Fatal("incomplete copy accepted")
 	}
@@ -88,10 +91,22 @@ func TestSaleUpgradeFreshSocketCopy(t *testing.T) {
 			w.WriteHeader(400)
 			return
 		}
-		json.NewEncoder(w).Encode(checkpointResponse{Path: stage, TipHeight: manifest.TipHeight, TipHash: manifest.TipHash})
+		if err := json.NewEncoder(w).Encode(checkpointResponse{Path: stage, TipHeight: manifest.TipHeight, TipHash: manifest.TipHash}); err != nil {
+			t.Errorf("encode checkpoint response: %v", err)
+		}
 	})}
-	go server.Serve(listener)
-	defer server.Close()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close test backup server: %v", err)
+		}
+		if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("test backup server: %v", err)
+		}
+	}()
 	cfg := &config.Config{DataDir: dataDir}
 	if err := runSaleUpgradePreflight(cfg, "", io.Discard); err != nil {
 		t.Fatal(err)
@@ -121,14 +136,29 @@ func TestSaleUpgradeCapabilityDoesNotLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
-	defer func() { os.Args, os.Stdout = beforeArgs, beforeStdout; writer.Close() }()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("close capability reader: %v", err)
+		}
+	}()
+	writerClosed := false
+	defer func() {
+		os.Args, os.Stdout = beforeArgs, beforeStdout
+		if !writerClosed {
+			if err := writer.Close(); err != nil {
+				t.Errorf("close capability writer: %v", err)
+			}
+		}
+	}()
 	os.Args = []string{"node", "--sale-upgrade-preflight-capability", "--validate-config", "--config", "/definitely-missing-config"}
 	os.Stdout = writer
 	if err := run(); err != nil {
 		t.Fatal(err)
 	}
-	writer.Close()
+	writerClosed = true
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
 	result, err := io.ReadAll(reader)
 	if err != nil || string(result) != "{\"schema\":1,\"command\":\"sale-upgrade-preflight\"}\n" {
 		t.Fatalf("capability receipt %s: %v", result, err)

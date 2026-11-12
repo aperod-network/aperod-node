@@ -11,11 +11,10 @@ import (
 
 // ─── apr_scanUTXOs ───────────────────────────────────────────────────────────
 //
-// Scans the entire chain for stealth outputs belonging to a wallet identified
-// by (spendPub, viewPriv). Used by the Node.js layer as a fallback when
-// utxo_blinds DB records are missing — the returned UTXOs can be spent with
-// blind_hex="" because the Go spending path derives the blind deterministically
-// from the ECDH shared secret (HsScalar + amount).
+// Scans the chain for stealth outputs belonging to a wallet identified by
+// (spendPub, viewPriv). Version-13 bound amounts require the wallet's spend key,
+// which this RPC deliberately does not accept; clients must scan those outputs
+// locally rather than sending a spend key to the node.
 
 type scanUTXOsParams struct {
 	SpendPubHex string  `json:"spend_pub_hex"` // 32-byte spend public key hex
@@ -81,7 +80,10 @@ func (s *Server) aprScanUTXOs(params json.RawMessage) (interface{}, error) {
 			"tip_height":   tip,
 		}, nil
 	}
-	owned := scanner.ScanChain(s.chain, start, end)
+	owned, err := scanner.ScanChainVerified(s.chain, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("wallet scan: %w; amount-bound outputs require local scanning with the spend key", err)
+	}
 
 	// Check which UTXOs are still unspent (UTXO set membership)
 	result := make([]scannedUTXO, 0, len(owned))

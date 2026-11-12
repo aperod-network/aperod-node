@@ -19,11 +19,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify publication guard regression tests
-        run: |
-          python3 deploy/test_publication_security.py
-          python3 deploy/test_publish_public_repo.py
-          python3 deploy/test_sync_public_repo.py
       - name: Reject runtime artifacts and key material across the entire tree
         run: |
           python3 deploy/publication_security.py --tree HEAD

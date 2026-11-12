@@ -93,12 +93,12 @@ func MLSAGSign(message Hash32, ring []RingMember, realIdx int, privKey Scalar32)
 	}
 
 	// Step 2: compute L_real = alpha·G, R_real = alpha·Hp(P_real)
-	L_real := (&edwards25519.Point{}).ScalarBaseMult(alpha)
+	lReal := (&edwards25519.Point{}).ScalarBaseMult(alpha)
 	HpReal := HashToCurvePoint(ring[realIdx][:])
-	R_real := (&edwards25519.Point{}).ScalarMult(alpha, HpReal)
+	rReal := (&edwards25519.Point{}).ScalarMult(alpha, HpReal)
 
 	// Step 3: compute challenge c_{real+1}
-	cc[nextIdx(realIdx)] = ringChallenge(message, L_real, R_real)
+	cc[nextIdx(realIdx)] = ringChallenge(message, lReal, rReal)
 
 	// Step 4: walk the ring forward from real+1
 	for i := 1; i < RingSize; i++ {
@@ -116,13 +116,13 @@ func MLSAGSign(message Hash32, ring []RingMember, realIdx int, privKey Scalar32)
 		if err != nil {
 			return nil, fmt.Errorf("ring member %d: %w", idx, err)
 		}
-		L_i := ringL(ss[idx], cc[(realIdx+i)%RingSize], Pi)
+		lI := ringL(ss[idx], cc[(realIdx+i)%RingSize], Pi)
 
 		// R_i = ss[i]·Hp(P_i) + cc[i]·I
 		HpI := HashToCurvePoint(ring[idx][:])
-		R_i := ringR(ss[idx], cc[(realIdx+i)%RingSize], HpI, I)
+		rI := ringR(ss[idx], cc[(realIdx+i)%RingSize], HpI, I)
 
-		cc[nextI] = ringChallenge(message, L_i, R_i)
+		cc[nextI] = ringChallenge(message, lI, rI)
 	}
 
 	// Step 5: close the ring — compute s_real = alpha - cc[real]·x (mod order)
@@ -189,7 +189,7 @@ func MLSAGVerify(message Hash32, ring []RingMember, sig *MLSAGSignature) (bool, 
 	cc[0] = c0
 
 	for i := 0; i < RingSize; i++ {
-		s_i, err := ScalarFromBytes(sig.SS[i][:])
+		sI, err := ScalarFromBytes(sig.SS[i][:])
 		if err != nil {
 			return false, fmt.Errorf("ss[%d]: %w", i, err)
 		}
@@ -199,11 +199,11 @@ func MLSAGVerify(message Hash32, ring []RingMember, sig *MLSAGSignature) (bool, 
 			return false, fmt.Errorf("ring[%d]: %w", i, err)
 		}
 
-		L_i := ringL(s_i, cc[i], Pi)
+		lI := ringL(sI, cc[i], Pi)
 		HpI := HashToCurvePoint(ring[i][:])
-		R_i := ringR(s_i, cc[i], HpI, I)
+		rI := ringR(sI, cc[i], HpI, I)
 
-		cc[i+1] = ringChallenge(message, L_i, R_i)
+		cc[i+1] = ringChallenge(message, lI, rI)
 	}
 
 	// Verify that the ring closes: c_0 == cc[RingSize]

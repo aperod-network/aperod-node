@@ -91,6 +91,9 @@ type startupScanParams struct {
 	// Tests inject a recording function here to assert on the exact boundary
 	// sequence without running a real GC cycle.  Production callers leave it nil.
 	GCHook func(utxoCount uint64)
+	// GCHookInterval overrides the production cadence when GCHook is set.
+	// Zero preserves the production interval.
+	GCHookInterval uint64
 }
 
 // runStartupScan performs the unified startup block scan:
@@ -106,8 +109,12 @@ type startupScanParams struct {
 // The caller is responsible for loading the key-image index before calling
 // this function (when KiFromIndex is true).
 func runStartupScan(p startupScanParams) (startupScanResult, error) {
-	const syncProgressInterval = uint64(1000) // report every 1 000 blocks
-	const gcUTXOInterval = uint64(50000)      // force GC every 50 000 UTXOs processed
+	const syncProgressInterval = uint64(1000)   // report every 1 000 blocks
+	const defaultGCUTXOInterval = uint64(50000) // force GC every 50 000 UTXOs processed
+	gcUTXOInterval := defaultGCUTXOInterval
+	if p.GCHook != nil && p.GCHookInterval != 0 {
+		gcUTXOInterval = p.GCHookInterval
+	}
 
 	// ── DB-index fast path ────────────────────────────────────────────────
 	// When UTXOFromIndex is true, both the active UTXO set and the spent

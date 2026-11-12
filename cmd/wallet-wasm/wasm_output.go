@@ -1,17 +1,23 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/aperod/aperod/crypto"
+)
 
 type wasmOutput struct {
-	TxHash       string `json:"tx_hash"`
-	OutIdx       uint32 `json:"out_idx"`
-	OneTimePub   string `json:"one_time_pub"`
-	TxPubKey     string `json:"tx_pub_key"`
-	AmountCommit string `json:"amount_commit"`
-	EncAmount    string `json:"enc_amount"`
-	BlockHeight  uint64 `json:"block_height"`
-	Amount       uint64 `json:"amount_napr,omitempty"`
-	BlindHex     string `json:"blind_hex,omitempty"`
+	TxHash        string                `json:"tx_hash"`
+	OutIdx        uint32                `json:"out_idx"`
+	TxVersion     uint8                 `json:"tx_version,omitempty"`
+	OneTimePub    string                `json:"one_time_pub"`
+	TxPubKey      string                `json:"tx_pub_key"`
+	AmountCommit  string                `json:"amount_commit"`
+	EncAmount     string                `json:"enc_amount"`
+	AmountBinding *crypto.AmountBinding `json:"amount_binding,omitempty"`
+	BlockHeight   uint64                `json:"block_height"`
+	Amount        uint64                `json:"amount_napr,omitempty"`
+	BlindHex      string                `json:"blind_hex,omitempty"`
 }
 
 // UnmarshalJSON keeps uint64 mint values exact when JavaScript supplies them

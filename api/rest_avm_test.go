@@ -83,7 +83,7 @@ func TestAVMNonceAndReceiptLookup(t *testing.T) {
 	}
 }
 
-func TestAVMSubmitRejectsUnsignedOrNonV6Transactions(t *testing.T) {
+func TestAVMSubmitRejectsNonAVMTransactions(t *testing.T) {
 	srv, _ := buildChainServer(t, 0)
 	srv.SetReady()
 	raw, _ := json.Marshal(map[string]interface{}{"tx": map[string]interface{}{"Version": 5}})
@@ -93,7 +93,7 @@ func TestAVMSubmitRejectsUnsignedOrNonV6Transactions(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !bytes.Contains(rec.Body.Bytes(), []byte("locally signed v6")) {
+if !bytes.Contains(rec.Body.Bytes(), []byte("locally signed AVM")) {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
 }

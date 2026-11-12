@@ -16,7 +16,11 @@ func TestWalletHistoryRequiresCanonicalTransactionAndExactOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close wallet history proof database: %v", err)
+		}
+	}()
 	out := core.Output{OneTimePub: crypto.Point32{1}, TxPubKey: crypto.Point32{2}, AmountCommit: crypto.Commitment{3}}
 	tx := core.Transaction{Version: core.TxVersionBase, Outputs: []core.Output{out}}
 	block := core.Block{Header: core.BlockHeader{Height: 1}, Txs: []core.Transaction{tx}}

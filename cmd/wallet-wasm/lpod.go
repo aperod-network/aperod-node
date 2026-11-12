@@ -70,7 +70,7 @@ func signLPoD(r lpodSignRequest, keys *wallet.DerivedKeys, source *core.OwnedUTX
 		if err != nil || pub != source.OneTimePub {
 			return nil, fmt.Errorf("source ownership mismatch")
 		}
-	case "withdraw":
+	case "withdraw", "topup":
 		if len(r.DepositJSON) > 4096 || json.Unmarshal([]byte(r.DepositJSON), &a) != nil {
 			return nil, fmt.Errorf("invalid canonical deposit")
 		}
@@ -87,13 +87,38 @@ func signLPoD(r lpodSignRequest, keys *wallet.DerivedKeys, source *core.OwnedUTX
 		if err != nil || nonce == ^uint64(0) {
 			return nil, fmt.Errorf("invalid current nonce")
 		}
-		amount, err := strconv.ParseUint(r.Withdraw, 10, 64)
-		if err != nil || amount > a.Amount {
-			return nil, fmt.Errorf("invalid withdrawal amount")
+		if r.Action == "withdraw" {
+			amount, err := strconv.ParseUint(r.Withdraw, 10, 64)
+			if err != nil || amount > a.Amount {
+				return nil, fmt.Errorf("invalid withdrawal amount")
+			}
+			a.Action = core.LPoDWithdraw
+		} else {
+			if source == nil || source.Amount == 0 {
+				return nil, fmt.Errorf("select an exact owned top-up output")
+			}
+			sourceKey, err = crypto.AddScalars(source.HsScalar, keys.Keys.Spend.Private)
+			if err != nil {
+				return nil, err
+			}
+			pub, err := crypto.ScalarMulBase(sourceKey)
+			if err != nil || pub != source.OneTimePub {
+				return nil, fmt.Errorf("top-up source ownership mismatch")
+			}
+			a.Action = core.LPoDTopUp
+			a.SourceTx = source.TxHash
+			a.SourceIndex = source.OutputIndex
+			a.SourcePub = source.OneTimePub
+			a.Amount = source.Amount
+			a.Blind = source.Blind
 		}
-		a.Action = core.LPoDWithdraw
 		a.Nonce = nonce + 1
-		a.WithdrawAmount = amount
+		if r.Action == "withdraw" {
+			a.WithdrawAmount, err = strconv.ParseUint(r.Withdraw, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid withdrawal amount")
+			}
+		}
 	default:
 		return nil, fmt.Errorf("invalid LPoD action")
 	}

@@ -32,6 +32,7 @@ type SaleDelivery struct {
 	Height      uint64
 }
 
+// SaleOrderDelivery loads the durable delivery record for an order.
 func (d *DB) SaleOrderDelivery(id crypto.Hash32) (*SaleDelivery, error) {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
@@ -56,7 +57,8 @@ func (d *DB) saleOrderDeliveryLocked(id crypto.Hash32) (*SaleDelivery, error) {
 		return nil, err
 	}
 	var block core.Block
-	if body == nil || json.Unmarshal(body, &block) != nil || block.Hash() != hash {
+	if body == nil || json.Unmarshal(body, &block) != nil || block.Hash() != hash ||
+		block.Header.MerkleRoot != core.MerkleRoot(block.Txs) {
 		return nil, fmt.Errorf("sale: delivery body unavailable")
 	}
 	canonical, err := d.get(heightKey(block.Header.Height))
@@ -87,6 +89,7 @@ func saleOrderPaymentKey(id crypto.Hash32) []byte {
 	return append([]byte("sale/order-payment/"), id[:]...)
 }
 
+// SaleOrder loads the durable order record for an identifier.
 func (d *DB) SaleOrder(id crypto.Hash32) (*SaleOrder, error) {
 	raw, err := d.get(saleOrderKey(id))
 	if err != nil || raw == nil {
@@ -142,6 +145,7 @@ func (d *DB) ReservedSaleOrders() (uint64, error) {
 	return total, nil
 }
 
+// ReserveSaleOrder durably reserves an invoice and its payment identity.
 func (d *DB) ReserveSaleOrder(order SaleOrder, network crypto.NetworkByte) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
@@ -211,6 +215,7 @@ func (d *DB) ReserveSaleOrder(order SaleOrder, network crypto.NetworkByte) error
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
 
+// MarkSaleOrderPaid records the canonical payment transaction for an order.
 func (d *DB) MarkSaleOrderPaid(id, payment crypto.Hash32) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()

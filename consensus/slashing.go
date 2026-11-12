@@ -43,42 +43,59 @@ func newSlashingDetector() *slashingDetector {
 	return &slashingDetector{seen: make(map[evidenceKey]signedSlot)}
 }
 
-// CheckBlock records a signed block header and returns DoubleSignEvidence
-// if this validator has already signed a different block at the same height.
-// Returns nil if no double-sign is detected.
-func (sd *slashingDetector) CheckBlock(height uint64, round uint32, pub crypto.ValidatorPubKey, hash crypto.Hash32, sig []byte) *DoubleSignEvidence {
+// DetectDoubleSign checks a candidate against accepted blocks without
+// recording it. Call this before expensive stateful validation so a known
+// equivocation is rejected, but an invalid candidate cannot poison the slot.
+func (sd *slashingDetector) DetectDoubleSign(height uint64, round uint32, pub crypto.ValidatorPubKey, hash crypto.Hash32, sig []byte) *DoubleSignEvidence {
 	key := evidenceKey{height: height, pubHex: pub.ID()}
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
 	prev, exists := sd.seen[key]
-	if !exists {
-		sd.seen[key] = signedSlot{hash: hash, sig: sig, round: round}
-		// Opportunistically prune entries for heights far below this one to
-		// prevent the seen map from growing unboundedly.  Keep the last 2048
-		// heights of evidence so any delayed double-sign is still caught.
-		if height > 2048 {
-			pruneBelow := height - 2048
-			for k := range sd.seen {
-				if k.height < pruneBelow {
-					delete(sd.seen, k)
-				}
-			}
-		}
+	if !exists || prev.hash == hash {
 		return nil
 	}
-	if prev.hash == hash {
-		return nil // same block, not a double-sign
+	return doubleSignEvidence(height, round, pub, hash, sig, prev)
+}
+
+// RecordAcceptedBlock stores a block only after all consensus checks and the
+// canonical durable commit succeed. It returns evidence if an unexpected
+// conflicting accepted record already exists; callers must fail closed.
+func (sd *slashingDetector) RecordAcceptedBlock(height uint64, round uint32, pub crypto.ValidatorPubKey, hash crypto.Hash32, sig []byte) *DoubleSignEvidence {
+	key := evidenceKey{height: height, pubHex: pub.ID()}
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	prev, exists := sd.seen[key]
+	if exists {
+		if prev.hash == hash {
+			return nil
+		}
+		return doubleSignEvidence(height, round, pub, hash, sig, prev)
 	}
+	sd.seen[key] = signedSlot{hash: hash, sig: append([]byte(nil), sig...), round: round}
+	// Keep a bounded history of accepted slots for delayed equivocation checks.
+	if height > 2048 {
+		pruneBelow := height - 2048
+		for k := range sd.seen {
+			if k.height < pruneBelow {
+				delete(sd.seen, k)
+			}
+		}
+	}
+	return nil
+}
+
+func doubleSignEvidence(height uint64, round uint32, pub crypto.ValidatorPubKey, hash crypto.Hash32, sig []byte, prev signedSlot) *DoubleSignEvidence {
 	return &DoubleSignEvidence{
 		Height:    height,
 		Round1:    prev.round,
 		Validator: pub,
 		Hash1:     prev.hash,
-		Sig1:      prev.sig,
+		Sig1:      append([]byte(nil), prev.sig...),
 		Round2:    round,
 		Hash2:     hash,
-		Sig2:      sig,
+		Sig2:      append([]byte(nil), sig...),
 	}
 }
 

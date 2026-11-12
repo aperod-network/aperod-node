@@ -229,7 +229,7 @@ hdr "7. rclone + S3/Backblaze"
 
 if ! command -v rclone &>/dev/null; then
   err "rclone НЕ установлен"
-  echo "     → curl https://rclone.org/install.sh | sudo bash"
+  echo "     → Установите rclone из подписанного репозитория пакетов вашего дистрибутива."
 else
   RCLONE_VER=$(rclone version 2>/dev/null | head -1)
   ok "rclone установлен: ${RCLONE_VER}"

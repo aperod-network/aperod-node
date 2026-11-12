@@ -25,6 +25,20 @@ import (
 	"github.com/aperod/aperod/p2p"
 )
 
+func closeP2PTestResource(t *testing.T, resource interface{ Close() error }) {
+	t.Helper()
+	if err := resource.Close(); err != nil {
+		t.Errorf("close P2P test resource: %v", err)
+	}
+}
+
+func setP2PTestDeadline(t *testing.T, conn interface{ SetDeadline(time.Time) error }, deadline time.Time) {
+	t.Helper()
+	if err := conn.SetDeadline(deadline); err != nil {
+		t.Errorf("set P2P test deadline: %v", err)
+	}
+}
+
 // ─── 3.5.1 Eclipse attack ────────────────────────────────────────────────────
 
 // TestEclipseAttack_MaxPeers verifies that once MaxPeers slots are filled,
@@ -50,23 +64,23 @@ func TestEclipseAttack_MaxPeers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
-		c.SetDeadline(time.Now().Add(2 * time.Second))
+		setP2PTestDeadline(t, c, time.Now().Add(2*time.Second))
 		// Asymmetric handshake: dialer sends Ping, host replies with Pong.
 		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
 			NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 		}); err != nil {
-			c.Close()
+			closeP2PTestResource(t, c)
 			continue
 		}
 		if _, _, err := p2p.ReadMsg(c); err != nil {
-			c.Close()
+			closeP2PTestResource(t, c)
 			continue
 		}
 		conns = append(conns, c)
 	}
 	defer func() {
 		for _, c := range conns {
-			c.Close()
+			closeP2PTestResource(t, c)
 		}
 	}()
 
@@ -79,8 +93,8 @@ func TestEclipseAttack_MaxPeers(t *testing.T) {
 		t.Log("3.5.1 ✓ 3rd connection refused by OS (MaxPeers enforced)")
 		return
 	}
-	defer attacker.Close()
-	attacker.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	defer closeP2PTestResource(t, attacker)
+	setP2PTestDeadline(t, attacker, time.Now().Add(500*time.Millisecond))
 
 	// Try to handshake — host may drop the conn immediately if MaxPeers exceeded.
 	if err := p2p.WriteMsg(attacker, p2p.MsgPing, p2p.PingMsg{
@@ -202,22 +216,22 @@ func TestRateLimiting_BannedPeerDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "bad-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	}); err != nil {
-		conn.Close()
+		closeP2PTestResource(t, conn)
 		t.Fatalf("write ping: %v", err)
 	}
 	if _, _, err := p2p.ReadMsg(conn); err != nil {
-		conn.Close()
+		closeP2PTestResource(t, conn)
 		t.Fatalf("read pong: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
 
 	// Ban the peer address.
 	host.BanPeer(conn.LocalAddr().String(), "bad behavior", time.Hour)
-	conn.Close()
+	closeP2PTestResource(t, conn)
 
 	// A subsequent connection from the same address should be handled; the ban
 	// is checked at dial/accept time. This test verifies BanPeer does not panic
@@ -227,9 +241,9 @@ func TestRateLimiting_BannedPeerDropped(t *testing.T) {
 		t.Log("3.5.4 ✓ reconnect from banned address refused at OS level")
 		return
 	}
-	defer conn2.Close()
+	defer closeP2PTestResource(t, conn2)
 	// Ban check runs before the Ping wait; the host closes the conn immediately.
-	conn2.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	setP2PTestDeadline(t, conn2, time.Now().Add(500*time.Millisecond))
 	_, _, _ = p2p.ReadMsg(conn2) // expect EOF / connection closed
 
 	t.Log("3.5.4 ✓ ban registered; host operational after ban")
@@ -244,7 +258,7 @@ func TestMsgValidation_OversizedBlock(t *testing.T) {
 	host, _, addr := startHost(t)
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 
 		// Build a block payload with an unrealistically large Txs slice.
 		type fakeBlock struct {
@@ -290,16 +304,16 @@ func TestPeerCountLimit_MaxPeers1(t *testing.T) {
 		if err != nil {
 			return nil, false
 		}
-		c.SetDeadline(time.Now().Add(2 * time.Second))
+		setP2PTestDeadline(t, c, time.Now().Add(2*time.Second))
 		// Asymmetric handshake: dialer sends Ping, host replies with Pong.
 		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
 			NodeID: id, Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 		}); err != nil {
-			c.Close()
+			closeP2PTestResource(t, c)
 			return nil, false
 		}
 		if _, _, err := p2p.ReadMsg(c); err != nil {
-			c.Close()
+			closeP2PTestResource(t, c)
 			return nil, false
 		}
 		return c, true
@@ -307,13 +321,13 @@ func TestPeerCountLimit_MaxPeers1(t *testing.T) {
 
 	c1, ok1 := handshake("peer1")
 	if ok1 {
-		defer c1.Close()
+		defer closeP2PTestResource(t, c1)
 	}
 	time.Sleep(60 * time.Millisecond)
 
 	c2, ok2 := handshake("peer2")
 	if ok2 {
-		defer c2.Close()
+		defer closeP2PTestResource(t, c2)
 	}
 	time.Sleep(80 * time.Millisecond)
 
@@ -333,7 +347,7 @@ func TestMaliciousPacket_NodeStaysAlive(t *testing.T) {
 	host, _, addr := startHost(t)
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 
 		// Craft a raw TCP frame that passes the length prefix but carries
 		// pure binary garbage instead of valid JSON.  This triggers a JSON
@@ -386,11 +400,11 @@ func TestPeerWhitelist_EmptyAllowsAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial failed (should be open): %v", err)
 	}
-	defer conn.Close()
+	defer closeP2PTestResource(t, conn)
 
 	// Perform the Aperod inbound handshake so the connection is accepted into
 	// the peer table.
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	}); err != nil {
@@ -427,9 +441,9 @@ func TestPeerWhitelist_ExactIPAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	defer conn.Close()
+	defer closeP2PTestResource(t, conn)
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	}); err != nil {
@@ -467,9 +481,9 @@ func TestPeerWhitelist_CIDRAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	defer conn.Close()
+	defer closeP2PTestResource(t, conn)
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	}); err != nil {
@@ -511,10 +525,10 @@ func TestPeerWhitelist_NonMatchingIPRejected(t *testing.T) {
 		t.Logf("whitelist reject ✓ connection refused by OS")
 		return
 	}
-	defer conn.Close()
+	defer closeP2PTestResource(t, conn)
 
 	// The host should close the connection immediately without replying.
-	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	setP2PTestDeadline(t, conn, time.Now().Add(500*time.Millisecond))
 	_ = p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "intruder", Height: 0, UserAgent: "evil", Timestamp: time.Now().Unix(),
 	})
@@ -579,12 +593,18 @@ func TestDuplicateP2PIdentity_Rejected(t *testing.T) {
 		}
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		// This case requires the host to reject and close the peer; a reset
+		// during TLS close-notify is therefore an expected cleanup result.
+		if err := conn.Close(); err != nil {
+			t.Logf("duplicate-identity connection already rejected by host: %v", err)
+		}
+	}()
 
 	// TLS handshake completed.  The host's SelfFingerprint guard fires inside
 	// handleConn after Handshake(); the host must close the connection without
 	// ever sending a MsgPong back to the dialer.
-	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+	setP2PTestDeadline(t, conn, time.Now().Add(2*time.Second))
 
 	// Attempt the Aperod application handshake — expect the host to close
 	// the conn before or immediately after it receives our Ping.
@@ -688,7 +708,7 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls.Listen: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { closeP2PTestResource(t, ln) })
 
 	// remoteClosed is signaled when the host closes the connection (the
 	// listener side observes EOF / reset on its first read).
@@ -699,12 +719,12 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
 			remoteClosed <- err
 			return
 		}
-		defer c.Close()
+		defer closeP2PTestResource(t, c)
 		// The server-side TLS handshake completes lazily on first Read.
 		// If the host's identity-conflict guard fires, it closes the conn
 		// right after the handshake, so this Read must fail — and it must
 		// NOT return a valid Aperod Ping frame first.
-		c.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
+		setP2PTestDeadline(t, c, time.Now().Add(3*time.Second))
 		buf := make([]byte, 1)
 		_, readErr := c.Read(buf)
 		remoteClosed <- readErr

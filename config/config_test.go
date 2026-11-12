@@ -797,6 +797,70 @@ func TestMemoryLimitDisabledParsesFromYAML(t *testing.T) {
 	}
 }
 
+func TestMaintenanceRestartConfig(t *testing.T) {
+	if !DefaultConfig().Maintenance.RestartEnabled {
+		t.Fatal("DefaultConfig().Maintenance.RestartEnabled = false, want true")
+	}
+
+	dir := t.TempDir()
+	tests := []struct {
+		name                string
+		yaml                string
+		wantEnabled         bool
+		wantRestartAt       string
+		wantValidationError string
+	}{
+		{
+			name:          "omitted field defaults to enabled",
+			yaml:          "network: testnet\n",
+			wantEnabled:   true,
+			wantRestartAt: "04:00",
+		},
+		{
+			name:          "explicit disable with empty restart time",
+			yaml:          "maintenance:\n  restart_enabled: false\n  restart_at: \"\"\n",
+			wantEnabled:   false,
+			wantRestartAt: "",
+		},
+		{
+			name:                "rejects explicit time while disabled",
+			yaml:                "maintenance:\n  restart_enabled: false\n  restart_at: \"04:00\"\n",
+			wantEnabled:         false,
+			wantRestartAt:       "04:00",
+			wantValidationError: "maintenance.restart_enabled is false",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "_")+".yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			err = cfg.Validate()
+			if tc.wantValidationError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantValidationError) {
+					t.Fatalf("Validate() error = %v, want substring %q", err, tc.wantValidationError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Validate(): %v", err)
+			}
+			if cfg.Maintenance.RestartEnabled != tc.wantEnabled {
+				t.Errorf("restart_enabled = %t, want %t", cfg.Maintenance.RestartEnabled, tc.wantEnabled)
+			}
+			if cfg.Maintenance.RestartAt != tc.wantRestartAt {
+				t.Errorf("restart_at = %q, want %q", cfg.Maintenance.RestartAt, tc.wantRestartAt)
+			}
+		})
+	}
+}
+
 // TestResolveMempoolEvictInterval verifies that the resolved ticker duration
 // matches the operator-configured value, falls back to 5 minutes when the
 // field is absent (YAML zero-value), and falls back to 5 minutes when the

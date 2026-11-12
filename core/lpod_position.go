@@ -62,8 +62,15 @@ func BuildLPoDPayoutOutput(address crypto.Address, amount, height uint64, parent
 
 const TxVersionLPoDPosition TxVersion = 9
 const TxVersionLPoDPayout TxVersion = 10
+
+// TxVersionLPoDTopUp is an independently signed source-output addition to an
+// existing position. Version 9 deposit and withdrawal bytes remain unchanged.
+const TxVersionLPoDTopUp TxVersion = 12
 const LPoDDeposit uint8 = 1
 const LPoDWithdraw uint8 = 2
+
+// LPoDTopUp is the action code for adding an independently signed output to an existing position.
+const LPoDTopUp uint8 = 3
 
 // Position ownership is independent of validator keys. OwnerProof proves knowledge
 // of the beneficiary's wallet spend scalar; DepositProof proves knowledge of the
@@ -88,6 +95,9 @@ type LPoDPositionAction struct {
 
 func (a LPoDPositionAction) Message() crypto.Hash32 {
 	b, _ := json.Marshal(a)
+	if a.Action == LPoDTopUp {
+		return crypto.HashBytes([]byte("aperod/lpod/position-topup/v1"), b)
+	}
 	return crypto.HashBytes([]byte("aperod/lpod/position/v1"), b)
 }
 
@@ -110,8 +120,13 @@ func LPoDOwnershipRing(pub crypto.Point32) []crypto.RingMember {
 	return r
 }
 
-func (tx *Transaction) IsLPoDPosition() bool { return tx != nil && tx.Version == TxVersionLPoDPosition }
-func (tx *Transaction) IsLPoDPayout() bool   { return tx != nil && tx.Version == TxVersionLPoDPayout }
+// IsLPoDPosition reports whether tx is an LPoD position or top-up transaction.
+func (tx *Transaction) IsLPoDPosition() bool {
+	return tx != nil && (tx.Version == TxVersionLPoDPosition || tx.Version == TxVersionLPoDTopUp)
+}
+
+// IsLPoDPayout reports whether tx is an LPoD payout transaction.
+func (tx *Transaction) IsLPoDPayout() bool { return tx != nil && tx.Version == TxVersionLPoDPayout }
 
 func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 	if !tx.IsLPoDPosition() || len(tx.Extra) > 4096 || len(tx.Extra) == 0 {
@@ -125,8 +140,15 @@ func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 	if string(canonical) != string(tx.Extra) {
 		return nil, fmt.Errorf("lpod: noncanonical position encoding")
 	}
-	if a.Genesis == (crypto.Hash32{}) || a.PositionID != LPoDPositionID(a.Genesis, a.SourceTx, a.SourceIndex) ||
-		(a.Action != LPoDDeposit && a.Action != LPoDWithdraw) || a.Amount == 0 {
+	validIdentity := a.Genesis != (crypto.Hash32{}) && a.PositionID != (crypto.Hash32{}) && a.Amount != 0
+	if a.Action != LPoDTopUp {
+		validIdentity = validIdentity && a.PositionID == LPoDPositionID(a.Genesis, a.SourceTx, a.SourceIndex)
+	} else {
+		validIdentity = validIdentity && a.SourceTx != (crypto.Hash32{}) && a.SourcePub != (crypto.Point32{})
+	}
+	validVersion := (tx.Version == TxVersionLPoDPosition && (a.Action == LPoDDeposit || a.Action == LPoDWithdraw)) ||
+		(tx.Version == TxVersionLPoDTopUp && a.Action == LPoDTopUp)
+	if !validIdentity || !validVersion {
 		return nil, fmt.Errorf("lpod: invalid action or position identity")
 	}
 	_, spend, _, err := crypto.DecodeAddress(a.Beneficiary)
@@ -138,7 +160,7 @@ func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 		return nil, fmt.Errorf("lpod: positions cannot mint or contain unaccounted fields")
 	}
 	expectedSignatures := 1
-	if a.Action == LPoDDeposit {
+	if a.Action == LPoDDeposit || a.Action == LPoDTopUp {
 		expectedSignatures = 2
 	}
 	if len(tx.Signatures) != expectedSignatures {
@@ -154,8 +176,10 @@ func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 		}
 		return &a, nil
 	}
-	if a.Nonce != 0 || a.WithdrawAmount != 0 || len(tx.Inputs) != 1 || tx.Signatures[1] == nil {
-		return nil, fmt.Errorf("lpod: invalid deposit")
+	if (a.Action == LPoDDeposit && a.Nonce != 0) ||
+		(a.Action == LPoDTopUp && a.Nonce == 0) ||
+		a.WithdrawAmount != 0 || len(tx.Inputs) != 1 || tx.Signatures[1] == nil {
+		return nil, fmt.Errorf("lpod: invalid source-backed position operation")
 	}
 	commit, err := crypto.Commit(a.Amount, a.Blind)
 	if err != nil {
@@ -181,8 +205,12 @@ func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source cry
 	if err != nil {
 		return nil, err
 	}
-	tx := &Transaction{Version: TxVersionLPoDPosition, Extra: body, Signatures: []*crypto.MLSAGSignature{sig}}
-	if a.Action == LPoDDeposit {
+	version := TxVersionLPoDPosition
+	if a.Action == LPoDTopUp {
+		version = TxVersionLPoDTopUp
+	}
+	tx := &Transaction{Version: version, Extra: body, Signatures: []*crypto.MLSAGSignature{sig}}
+	if a.Action == LPoDDeposit || a.Action == LPoDTopUp {
 		proof, err := crypto.MLSAGSignV4(a.Message(), LPoDOwnershipRing(a.SourcePub), 0, source, a.Blind, a.Amount)
 		if err != nil {
 			return nil, err

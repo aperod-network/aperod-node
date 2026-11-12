@@ -19,7 +19,7 @@ APEROD_USER="aperod"
 INSTALL_DIR="/opt/aperod"
 DATA_DIR="/var/lib/aperod"
 CONFIG_DIR="/etc/aperod"
-GO_VERSION="1.26.10"
+GO_VERSION="1.26.11"
 P2P_PORT=30303
 RPC_PORT=8545
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -126,10 +126,26 @@ fi
 if ${need_go}; then
   info "Устанавливаем Go ${GO_VERSION}…"
   ARCH=$( [[ $(uname -m) == "aarch64" ]] && echo "arm64" || echo "amd64" )
-  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -O /tmp/go.tar.gz
+  case "$ARCH" in
+    amd64) GO_SHA256="9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec" ;;
+    arm64) GO_SHA256="6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e" ;;
+    *) die "Неподдерживаемая архитектура Go: ${ARCH}" ;;
+  esac
+  GO_ARCHIVE=$(mktemp /tmp/aperod-go.XXXXXX.tar.gz) || die "Не удалось создать временный файл Go"
+  if ! wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -O "$GO_ARCHIVE"; then
+    rm -f "$GO_ARCHIVE"
+    die "Не удалось скачать архив Go ${GO_VERSION}"
+  fi
+  if ! printf '%s  %s\n' "$GO_SHA256" "$GO_ARCHIVE" | sha256sum --check --status; then
+    rm -f "$GO_ARCHIVE"
+    die "Контрольная сумма Go ${GO_VERSION} не совпала"
+  fi
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tar.gz
-  rm -f /tmp/go.tar.gz
+  if ! tar -C /usr/local -xzf "$GO_ARCHIVE"; then
+    rm -f "$GO_ARCHIVE"
+    die "Не удалось распаковать проверенный архив Go ${GO_VERSION}"
+  fi
+  rm -f "$GO_ARCHIVE"
   echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
   export PATH="$PATH:/usr/local/go/bin"
   ok "Go ${GO_VERSION} установлен"

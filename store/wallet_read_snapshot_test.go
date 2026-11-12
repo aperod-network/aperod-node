@@ -16,7 +16,7 @@ func TestWalletReadSnapshotPinsWalletReadsAndReleases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	txHash := crypto.Hash32{1}
 	ki := crypto.KeyImage{}
@@ -118,7 +118,7 @@ func TestWalletReadSnapshotPinsLPoDEarningsPagesAndReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	address := crypto.Address("earnings-snapshot-address")
 	funding := crypto.Hash32{1}
@@ -190,7 +190,7 @@ func TestWalletReadSnapshotLPoDEarningsJoinUsesOnlyExactUnspentOutputs(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	address := crypto.Address("earnings-join-address")
 	blockHash := crypto.Hash32{9}
@@ -281,7 +281,7 @@ func TestWalletReadSnapshotLPoDEarningsJoinRejectsConflictingIndexRow(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	address := crypto.Address("earnings-join-conflict-address")
 	blockHash := crypto.Hash32{3}
@@ -342,7 +342,7 @@ func BenchmarkLPoDWalletOutputRewardJoin30kSpentHistory(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(b, db)
 	address := crypto.Address("benchmark-large-reward-wallet")
 	walletPrefix := lpodWalletPrefix(address)
 	earningsPrefix := lpodEarningsPrefix(address)
@@ -466,7 +466,7 @@ func TestReadCanonicalBlockBoundedRejectsMissingAndMalformedBodies(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	block := &core.Block{Header: core.BlockHeader{
 		Height: 0, MerkleRoot: core.MerkleRoot(nil), Timestamp: 1,
@@ -532,7 +532,7 @@ func TestLPoDWalletOutputsResumeCursorSurvivesSnapshotRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	address := crypto.Address("resume-cursor-test")
 	var parent crypto.Hash32
 	blockHashes := make([]crypto.Hash32, 3)
@@ -636,7 +636,7 @@ func TestWalletReadSnapshotCheckpointBudgetBeforeDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 	hash := crypto.Hash32{9}
 	if err := db.put(lpodKey(hash), []byte("not json and larger than the limit")); err != nil {
 		t.Fatal(err)
@@ -654,7 +654,7 @@ func TestWalletReadSnapshotCheckpointBudgetBeforeDecode(t *testing.T) {
 
 func TestWalletReadSnapshotCheckpointBudgetIncludesFundingCheckpoint(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(
@@ -698,7 +698,7 @@ func TestCommitRawBlockWithAVMCommitsKeyImagesAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer closeStoreTestResource(t, db)
 
 	ki := crypto.KeyImage{}
 	block := &core.Block{

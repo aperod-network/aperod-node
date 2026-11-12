@@ -16,6 +16,7 @@ type NetAllocationBasis struct {
 	WalletAccountingRoot crypto.Hash32 `json:"wallet_accounting_root"`
 }
 
+// Consumed returns wallet net plus burns after validating supply bounds.
 func (n NetAllocationBasis) Consumed() (uint64, error) {
 	if n.WalletAccountingRoot == zeroHash || n.Burned > CapNAPRO || n.WalletNet > CapNAPRO-n.Burned {
 		return 0, fmt.Errorf("sale: attested post-burn wallet accounting required")
@@ -23,6 +24,7 @@ func (n NetAllocationBasis) Consumed() (uint64, error) {
 	return n.Burned + n.WalletNet, nil
 }
 
+// Digest returns the canonical commitment to this net allocation basis.
 func (n NetAllocationBasis) Digest() crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/sale/post-burn-wallet-basis/v2"), u64(n.Burned), u64(n.WalletNet), n.WalletAccountingRoot[:])
 }

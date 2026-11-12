@@ -71,7 +71,9 @@ func TestWalletOutputSnapshotQueryFailureKeepsDurablePosition(t *testing.T) {
 		if response.Header.Get("Retry-After") != "5" {
 			t.Fatal("missing retry guidance")
 		}
-		response.Body.Close()
+		if err := response.Body.Close(); err != nil {
+			t.Errorf("close rate-limit response body: %v", err)
+		}
 		status, failure := snapshotRequest(t, httpServer.Client(), http.MethodGet, target, nil)
 		if status != http.StatusServiceUnavailable || failure["code"] != "SNAPSHOT_QUERY_FAILED" ||
 			failure["error"] != "pinned wallet output query temporarily unavailable" {

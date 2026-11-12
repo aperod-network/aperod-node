@@ -55,21 +55,33 @@ def proof(label):
     print("PASS:", label, flush=True)
 
 
+def contains_plaintext_wallet_key(value):
+    if isinstance(value, dict):
+        return any(
+            any(marker in str(key).lower() for marker in ("private", "mnemonic"))
+            or contains_plaintext_wallet_key(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, list):
+        return any(contains_plaintext_wallet_key(item) for item in value)
+    return False
+
+
 def source(name):
     path = ROOT / name
     (path / "cmd/node").mkdir(parents=True)
-    (path / "cmd/aperod").mkdir(parents=True)
+    (path / "cmd/cli").mkdir(parents=True)
     (path / "cmd/store").mkdir(parents=True)
     (path / "config").mkdir()
     (path / "config/genesis-testnet.yaml").write_text("chain_id: synthetic-lifecycle\n")
-    for filename, command in (("service.go", "node"), ("cli.go", "aperod"), ("store.go", "store")):
+    for filename, command in (("service.go", "node"), ("cli.go", "cli"), ("store.go", "store")):
         shutil.copyfile(DEPLOY / "fixtures/node-lifecycle" / filename, path / f"cmd/{command}/main.go")
     (path / "go.mod").write_text("module fixture.invalid/node\n\ngo 1.21\n\n"
                                "require github.com/syndtr/goleveldb v1.0.0\n")
     (path / "Makefile").write_text(
         "deps:\n\tgo mod download\nbuild:\n\tmkdir -p build\n"
         "\tgo build -trimpath -o build/aperod-node ./cmd/node\n"
-        "\tgo build -trimpath -o build/aperod ./cmd/aperod\n"
+        "\tgo build -trimpath -o build/aperod ./cmd/cli\n"
         "\tgo build -trimpath -o build/store ./cmd/store\n")
     (path / ".gitignore").write_text("/build/\n")
     run("go", "-C", path, "mod", "tidy")
@@ -203,6 +215,14 @@ backup = Path("/usr/local/bin/aperod_backup.sh")
 if MODE != "validator":
     assert backup.is_file() and (backup.stat().st_mode & 0o777) == 0o700
     assert backup.read_bytes() == (bootstrap / "aperod_backup.sh").read_bytes()
+    wallet = Path("/etc/aperod/wallet/default.json")
+    assert wallet.is_file() and wallet.stat().st_uid == 0
+    assert (wallet.stat().st_mode & 0o777) == 0o600
+    keystore = json.loads(wallet.read_text())
+    assert keystore.get("address") == "apro" + "A" * 99
+    assert keystore.get("crypto", {}).get("ciphertext") == "synthetic-only"
+    assert not contains_plaintext_wallet_key(keystore)
+    proof("installer preserves the root-only keystore contract in the synthetic fixture")
 proof("fresh install, configuration, drop-ins, account and backup tool")
 for unit in ("aperod-node-watchdog.timer", "aperod-sched-restart.timer", "aperod-mem-watchdog.timer"):
     run("systemctl", "stop", unit, ok=False)

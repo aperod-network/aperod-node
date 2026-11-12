@@ -29,5 +29,5 @@ GOMEMLIMIT="${GOMEMLIMIT:-512MiB}" \
 GOCACHE="${GOCACHE:-${scratch}/go-cache}" \
 TMPDIR="${scratch}" \
 GOSUMDB=sum.golang.org \
-GOTOOLCHAIN=go1.26.10+auto \
+GOTOOLCHAIN=go1.26.11+auto \
 go test -p 1 ./consensus -run '^TestAVMMixedHTTPStress$' -count=1 -v -timeout=8m

@@ -12,7 +12,7 @@ import (
 func saleStoreFixture(t *testing.T) (*core.Block, *SaleMigration, crypto.ValidatorPrivKey, crypto.Address, map[string][]byte) {
 	t.Helper()
 	base, _, lm, lk, la := trustedLPoDV3FundingFixture(t)
-	defer base.Close()
+	defer closeStoreTestResource(t, base)
 	g, settlement, raw := lpodActivationBlock(t, base, lm, lk, la)
 	if err := base.CommitRawBlockWithAVM(g.Hash(), g.Header.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatal(err)
@@ -105,12 +105,31 @@ func TestSaleDurableBatchRestartRollbackAndIndependentStores(t *testing.T) {
 	g, m, key, address, records := saleStoreFixture(t)
 	paths := []string{t.TempDir() + "/node-a", t.TempDir() + "/node-b"}
 	a := seedSaleParent(t, paths[0], records)
-	defer func() { a.Close() }()
+	defer closeStoreTestResource(t, a)
 	b := seedSaleParent(t, paths[1], records)
-	defer b.Close()
+	defer closeStoreTestResource(t, b)
 	block, r := saleTestBlock(t, a, m, key, address, m.Checkpoint.Height, g.Hash(), "first")
 	commitSaleFixture(t, a, block, m, r)
 	commitSaleFixture(t, b, block, m, r)
+	// Simulate a database activated before the retention index existed, then
+	// exercise the startup backfill from its canonical delivery fence.
+	if err := a.db.Delete(saleRetainedBlockKey(block.Header.Height), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.Delete(saleRetentionIndexKey, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureSaleRetention(m); err != nil {
+		t.Fatal("legacy sale retention backfill failed", err)
+	}
+	retained, err := a.get(saleRetainedBlockKey(block.Header.Height))
+	blockHash := block.Hash()
+	flags, retainedHash, found, markerErr := saleRetentionMarker(retained, block.Header.Height)
+	if err != nil || markerErr != nil || !found ||
+		flags&(saleRetainedActivation|saleRetainedDelivery) != saleRetainedActivation|saleRetainedDelivery ||
+		retainedHash != blockHash {
+		t.Fatal("legacy delivery was not indexed for pruning", err)
+	}
 	as, _ := a.LoadSaleState()
 	bs, _ := b.LoadSaleState()
 	if as == nil || bs == nil || *as != *bs || as.Sold != 100*100000000 {
@@ -144,6 +163,12 @@ func TestSaleDurableBatchRestartRollbackAndIndependentStores(t *testing.T) {
 	if err = a.PutTip(g.Hash(), g.Header.Height); err != nil {
 		t.Fatal(err)
 	}
+	if marker, err := a.get(saleRetainedBlockKey(block.Header.Height)); err != nil || marker != nil {
+		t.Fatal("rollback retained an orphan sale-body marker", err)
+	}
+	if index, err := a.get(saleRetentionIndexKey); err != nil || index != nil {
+		t.Fatal("rollback retained an orphan sale activation index", err)
+	}
 	after, err := a.LoadSaleState()
 	if err != nil || after != nil {
 		t.Fatal("rollback did not restore pre-activation allocation")
@@ -161,11 +186,34 @@ func TestSaleDurableBatchRestartRollbackAndIndependentStores(t *testing.T) {
 	if *reapplied != *as {
 		t.Fatal("reapply differs from independent store")
 	}
+	// If a legacy receipt body was already destroyed before migration, do not
+	// claim recovery or let pruning silently continue past the missing evidence.
+	if err := a.db.Delete(saleRetainedBlockKey(block.Header.Height), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.Delete(saleRetentionIndexKey, nil); err != nil {
+		t.Fatal(err)
+	}
+	prunedBody := *block
+	prunedBody.Txs = nil
+	rawBody, err := json.Marshal(&prunedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.PutRawBlock(block.Hash(), block.Header.Height, rawBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EnsureSaleRetention(m); err == nil {
+		t.Fatal("backfill accepted a delivery whose full body was already lost")
+	}
+	if _, err := a.PruneBlocksOlderThan(block.Header.Height + 1); err == nil {
+		t.Fatal("pruning advanced with an incomplete sale-retention index")
+	}
 }
 func TestSaleRejectedCommitLeavesTipBudgetOutputAndFencesUnchanged(t *testing.T) {
 	g, m, key, address, records := saleStoreFixture(t)
 	d := seedSaleParent(t, t.TempDir()+"/node", records)
-	defer d.Close()
+	defer closeStoreTestResource(t, d)
 	b, r := saleTestBlock(t, d, m, key, address, m.Checkpoint.Height, g.Hash(), "rejected")
 	p, err := d.PrepareSaleBlock(b, m)
 	if err != nil {
@@ -195,7 +243,7 @@ func TestSaleRejectedCommitLeavesTipBudgetOutputAndFencesUnchanged(t *testing.T)
 func TestSaleBodyMutationAndMissingRollbackJournalFailClosed(t *testing.T) {
 	g, m, key, address, records := saleStoreFixture(t)
 	d := seedSaleParent(t, t.TempDir()+"/node", records)
-	defer d.Close()
+	defer closeStoreTestResource(t, d)
 	b, r := saleTestBlock(t, d, m, key, address, m.Checkpoint.Height, g.Hash(), "journal")
 	b.Txs[len(b.Txs)-1].Outputs[0].EncAmount[0] ^= 1
 	if _, err := d.PrepareSaleBlock(b, m); err == nil {

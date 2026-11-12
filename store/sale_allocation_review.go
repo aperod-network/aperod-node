@@ -21,6 +21,7 @@ type SaleAllocationReview struct {
 	ActivationAuthorized bool    `json:"activation_authorized"`
 }
 
+// ReviewPostBurnSaleSource checks sale eligibility against the canonical post-burn allocation.
 // OutsideWalletNet includes all already issued value outside the LPoD reward
 // balance and its separately recorded guardian principal: free wallets, own
 // validator stake, and any other issued holdings. It must be a net figure using

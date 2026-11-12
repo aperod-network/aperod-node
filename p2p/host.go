@@ -209,12 +209,19 @@ type Handler interface {
 	GetBlock(hash crypto.Hash32) *core.Block
 }
 
+// TransactionAdmissionHandler lets a node signal whether a transaction has
+// actually entered its mempool before the host relays it to other peers.
+type TransactionAdmissionHandler interface {
+	AdmitTransaction(*core.Transaction) error
+}
+
 // BlockValidationHandler validates gossip without changing asynchronous
 // consensus admission or the wire protocol.
 type BlockValidationHandler interface {
 	ValidateBlock(*core.Block) error
 }
 
+// SyncHeaderValidationHandler validates a peer-provided header before it is accepted.
 type SyncHeaderValidationHandler interface {
 	ValidateSyncHeader(core.BlockHeader) error
 }
@@ -278,12 +285,13 @@ func (b *peerTokenBucket) wait() time.Duration {
 
 // Peer represents a connected remote node.
 type Peer struct {
-	conn     net.Conn
-	addr     string
-	id       string
-	height   uint64
-	mu       sync.Mutex
-	outbound bool
+	conn              net.Conn
+	addr              string
+	id                string
+	height            uint64
+	mu                sync.Mutex
+	outbound          bool
+	peerExchangeCount int
 
 	// lastPongAt is the Unix nanosecond timestamp of the most recent MsgPong
 	// received from this peer.  Initialized to the connection start time so
@@ -492,9 +500,10 @@ type Host struct {
 	handler Handler
 	log     *slog.Logger
 
-	mu       sync.RWMutex
-	peers    map[string]*Peer // addr → Peer
-	peerList []string         // known peer addrs
+	mu                       sync.RWMutex
+	peers                    map[string]*Peer // addr → Peer
+	peerList                 []string         // known peer addrs
+	peerExchangeSourceCounts map[string]int
 
 	listener net.Listener
 	done     chan struct{}
@@ -796,26 +805,27 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 	// cancel in-flight dials via a single cancel func.
 	defaultDialer := &net.Dialer{}
 	h := &Host{
-		cfg:                    cfg,
-		handler:                handler,
-		log:                    log,
-		peers:                  make(map[string]*Peer),
-		done:                   make(chan struct{}),
-		mgr:                    newPeerMgrWithFile(cfg.BanFile),
-		gossip:                 NewGossipFilter(),
-		badBlockCounts:         make(map[string]badBlockStrike),
-		tsStrikeCounts:         make(map[string]badBlockStrike),
-		wlNets:                 wlNets,
-		wlIPs:                  wlIPs,
-		listenFunc:             net.Listen,
-		dialContextFunc:        defaultDialer.DialContext,
-		dialingIPs:             make(map[string]map[uint64]context.CancelFunc),
-		pendingConns:           make(map[string]map[uint64]net.Conn),
-		bootnodeLastResolved:   make(map[string][]string),
-		bootnodeLastResolvedAt: make(map[string]time.Time),
-		bootnodeSet:            make(map[string]struct{}),
-		maintainNow:            make(chan struct{}, 1),
-		bootnodeFailState:      make(map[string]bootnodeFailEntry),
+		cfg:                      cfg,
+		handler:                  handler,
+		log:                      log,
+		peers:                    make(map[string]*Peer),
+		peerExchangeSourceCounts: make(map[string]int),
+		done:                     make(chan struct{}),
+		mgr:                      newPeerMgrWithFile(cfg.BanFile),
+		gossip:                   NewGossipFilter(),
+		badBlockCounts:           make(map[string]badBlockStrike),
+		tsStrikeCounts:           make(map[string]badBlockStrike),
+		wlNets:                   wlNets,
+		wlIPs:                    wlIPs,
+		listenFunc:               net.Listen,
+		dialContextFunc:          defaultDialer.DialContext,
+		dialingIPs:               make(map[string]map[uint64]context.CancelFunc),
+		pendingConns:             make(map[string]map[uint64]net.Conn),
+		bootnodeLastResolved:     make(map[string][]string),
+		bootnodeLastResolvedAt:   make(map[string]time.Time),
+		bootnodeSet:              make(map[string]struct{}),
+		maintainNow:              make(chan struct{}, 1),
+		bootnodeFailState:        make(map[string]bootnodeFailEntry),
 	}
 	h.txRate = newTxRateLimiter(cfg.TxRateBurst, cfg.TxRateSustained, cfg.TxRateBanThreshold)
 	h.keepaliveIntervalNs.Store(int64(cfg.KeepaliveInterval))
@@ -2677,13 +2687,19 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 		}
 	}
 	defer releaseHS() // safety net: covers ban-check return and any other early exit
-	handshakeTimer := time.AfterFunc(h.cfg.HandshakeTimeout, func() { conn.Close() })
+	handshakeTimer := time.AfterFunc(h.cfg.HandshakeTimeout, func() {
+		if err := conn.Close(); err != nil {
+			h.log.Debug("close timed-out handshake connection", "err", err)
+		}
+	})
 	defer handshakeTimer.Stop()
 
 	// Reject banned peers immediately
 	if h.mgr.IsBanned(addr) {
 		h.log.Debug("handleConn: banned peer rejected", "addr", addr)
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			h.log.Debug("close banned peer connection", "err", err)
+		}
 		return
 	}
 
@@ -3556,10 +3572,20 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		if err := unmarshal(data, &tx); err != nil {
 			return err
 		}
-		// Gossip relay: forward to all other peers the first time we see this tx.
+		admitter, canAdmit := h.handler.(TransactionAdmissionHandler)
+		if !canAdmit {
+			// Preserve delivery for observers, but do not relay transactions
+			// unless the handler can confirm mempool acceptance.
+			h.handler.OnTransaction(&tx)
+			return nil
+		}
+		if err := admitter.AdmitTransaction(&tx); err != nil {
+			h.log.Debug("p2p: transaction rejected before gossip relay", "err", err)
+			return nil
+		}
+		// Gossip relay: forward only after mempool admission, and only once.
 		txHash := tx.Hash()
 		isNew := h.gossip.MarkAndCheck(txHash)
-		h.handler.OnTransaction(&tx)
 		if isNew {
 			fromAddr := peer.addr
 			h.mu.RLock()
@@ -3594,7 +3620,11 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		if err := unmarshal(data, &msg); err != nil {
 			return err
 		}
-		h.addKnownPeers(msg.Addrs)
+		if len(msg.Addrs) > maxPeerExchangeAddrsPerMessage {
+			return fmt.Errorf("peer address message has %d entries; maximum is %d",
+				len(msg.Addrs), maxPeerExchangeAddrsPerMessage)
+		}
+		h.addKnownPeers(peer, msg.Addrs)
 		return nil
 
 	default:
@@ -3754,23 +3784,75 @@ func (h *Host) peersToAdvertise() []string {
 // maxKnownPeers caps the peerList to prevent memory exhaustion from
 // unbounded peer-addr accumulation (and outbound dial-flood amplification).
 const maxKnownPeers = 512
+const maxPeerExchangeAddrsPerMessage = 32
+const maxPeerExchangeAddrsPerPeer = 32
+const maxPeerExchangeAddrsPerSource = 16
 
-func (h *Host) addKnownPeers(addrs []string) {
+func (h *Host) addKnownPeers(source *Peer, addrs []string) {
+	if source == nil || len(addrs) == 0 || len(addrs) > maxPeerExchangeAddrsPerMessage {
+		return
+	}
+	sourceIP := connIP(source.addr)
+	if sourceIP == "" {
+		return
+	}
+	candidates := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if normalized := normalizeGossipPeerAddress(addr); normalized != "" {
+			candidates = append(candidates, normalized)
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	source.mu.Lock()
+	remaining := maxPeerExchangeAddrsPerPeer - source.peerExchangeCount
+	if remaining <= 0 {
+		source.mu.Unlock()
+		return
+	}
+	if len(candidates) > remaining {
+		candidates = candidates[:remaining]
+	}
+	source.peerExchangeCount += len(candidates)
+	source.mu.Unlock()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	known := make(map[string]bool, len(h.peerList))
 	for _, a := range h.peerList {
 		known[a] = true
 	}
-	for _, a := range addrs {
+	for _, a := range candidates {
 		if len(h.peerList) >= maxKnownPeers {
 			break // cap reached; ignore excess peer addrs
+		}
+		if h.peerExchangeSourceCounts[sourceIP] >= maxPeerExchangeAddrsPerSource {
+			break
 		}
 		if !known[a] {
 			h.peerList = append(h.peerList, a)
 			known[a] = true
+			h.peerExchangeSourceCounts[sourceIP]++
 		}
 	}
+}
+
+// normalizeGossipPeerAddress accepts only literal IP:port endpoints. Peer
+// exchange must not enqueue arbitrary strings, URL schemes, or DNS names for
+// later outbound dialing.
+func normalizeGossipPeerAddress(addr string) string {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.Atoi(portText)
+	if ip == nil || err != nil || port < 1 || port > 65535 {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
 // ─── Block serialization (simplified JSON) ────────────────────────────────────

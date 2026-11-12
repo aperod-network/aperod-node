@@ -14,6 +14,7 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
+// SetGenesisVestingConfig sets the activation height for genesis vesting.
 func (s *Server) SetGenesisVestingConfig(height uint64) { s.genesisVestingHeight = height }
 
 // Public execution evidence comes from the committed reserve ledger, never

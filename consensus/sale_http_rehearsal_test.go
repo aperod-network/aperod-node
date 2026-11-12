@@ -71,7 +71,11 @@ func (f *saleHTTPRehearsal) request(path string, body any, expected int) map[str
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			f.t.Errorf("close sale response body: %v", err)
+		}
+	}()
 	var result map[string]any
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		f.t.Fatal(err)

@@ -309,6 +309,10 @@ exit 1`,
 		"systemctl": `#!/usr/bin/env bash
 [[ "${1:-}" == "is-active" ]] && exit 1
 exit 0`,
+		// ssh: keep the secure tunnel path local to this test; host-key enforcement
+		// is covered by TestJoinTunnelRequiresPinnedHostKey.
+		"ssh": `#!/usr/bin/env bash
+exit 0`,
 		// curl: /api/v1/snapshot → exit 1 (non-fatal warn path)
 		//       /api/v1/status   → exit 0 (primary reachable)
 		//       everything else  → exit 0
@@ -392,6 +396,7 @@ genesis:
 	// ── Run aperod-join.sh with --p2p-port 30304 ────────────────────────────
 	cmd := exec.Command("bash", joinSh,
 		fmt.Sprintf("%s:8545", primaryIP),
+		"--tunnel", fmt.Sprintf("root@%s", primaryIP),
 		"--p2p-port", nonDefaultPort,
 		"--data-dir", dataDir,
 		"--user", "nonexistentuser_gotest",

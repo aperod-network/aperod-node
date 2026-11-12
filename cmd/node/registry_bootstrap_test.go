@@ -27,7 +27,11 @@ func TestBootstrapDatabaseBackedSpendReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close bootstrap replay database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)
@@ -130,7 +134,11 @@ func TestBootstrapWrongRoundSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close wrong-round-slot database: %v", err)
+		}
+	}()
 	priv1, pub1, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -162,12 +170,94 @@ func TestBootstrapWrongRoundSlot(t *testing.T) {
 	}
 }
 
+func TestBootstrapUsesHeightScopedValidatorAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		configureFork bool
+		signer        string
+		wantSuccess   bool
+	}{
+		{name: "pinned replacement accepted", configureFork: true, signer: "replacement", wantSuccess: true},
+		{name: "old identity rejected after activation", configureFork: true, signer: "identity"},
+		{name: "replacement rejected without pinned fork", signer: "replacement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close authority replay database: %v", err)
+				}
+			}()
+
+			identityPriv, identityPub, err := crypto.GenerateValidatorKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacementPriv, replacementPub, err := crypto.GenerateValidatorKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			anchor := makeSignedBlk(t, 1, crypto.Hash32{}, identityPriv, identityPub)
+			putRawBlk(t, db, anchor)
+
+			registry := core.NewValidatorRegistry()
+			registry.InitFromGenesis([]crypto.ValidatorPubKey{identityPub}, core.MinStakeNAPR*10)
+			fork := &core.ValidatorAuthorityFork{
+				Version:        1,
+				Genesis:        crypto.HashStr("authority-replay-genesis"),
+				Height:         2,
+				Parent:         anchor.Hash(),
+				Identity:       identityPub,
+				Replacement:    replacementPub,
+				RegistrySHA256: crypto.HashStr("authority-replay-registry"),
+			}
+			fork.Possession, err = replacementPriv.Sign(fork.Message())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.configureFork {
+				if err := registry.ConfigureSignatureAuthority(fork, 2); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			signer := identityPriv
+			if tc.signer == "replacement" {
+				signer = replacementPriv
+			}
+			block := makeSignedBlk(t, 2, anchor.Hash(), signer, identityPub)
+			putRawBlk(t, db, block)
+			if err := db.PutTip(block.Hash(), 2); err != nil {
+				t.Fatal(err)
+			}
+
+			snapshot := &startupSnapshot{TipHeight: 1}
+			utxos := core.NewUTXOSetWithDB(db)
+			utxos.RestoreFromSnapshot(snapshot.UTXOs)
+			err = replayOperatorRegistryBootstrap(db, utxos, registry, snapshot, 2, silentLog())
+			if tc.wantSuccess && err != nil {
+				t.Fatalf("pinned replacement signature rejected: %v", err)
+			}
+			if !tc.wantSuccess && err == nil {
+				t.Fatal("block signed by an unauthorized key was accepted")
+			}
+		})
+	}
+}
+
 func TestBootstrapAuthenticationBeforeDecompressionAndNullEntries(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close bootstrap authentication database: %v", err)
+		}
+	}()
 	path := filepath.Join(t.TempDir(), "bad.gz")
 	if err := os.WriteFile(path, []byte("not gzip"), 0600); err != nil {
 		t.Fatal(err)
@@ -198,7 +288,11 @@ func TestBootstrapRealArchiveReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close real archive database: %v", err)
+		}
+	}()
 	_, tip, err := db.GetTip()
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +344,9 @@ func TestBootstrapCopiedDBInventory(t *testing.T) {
 		count := 0
 		kiErr := db.IterKeyImages(func(crypto.KeyImage) error { count++; return nil })
 		t.Logf("%s tip=%d hash=%x key_images=%d errors=%v/%v", path, height, hash, count, err, kiErr)
-		db.Close()
+		if err := db.Close(); err != nil {
+			t.Errorf("close diagnostic registry database: %v", err)
+		}
 	}
 }
 
@@ -261,7 +357,11 @@ func TestBootstrapUTXOValidationTrustBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close bootstrap UTXO validation database: %v", err)
+				}
+			}()
 			original := &core.UTXO{TxHash: crypto.HashStr("pinned-output"), BlockHeight: 1}
 			snap := &startupSnapshot{TipHeight: 1, UTXOs: core.UTXOSnapshot{ActiveUTXOs: []*core.UTXO{original}}}
 			utxos := core.NewUTXOSet()
@@ -304,7 +404,11 @@ func TestBootstrapExpandedLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close gzip reader: %v", err)
+		}
+	}()
 	limited := &io.LimitedReader{R: r, N: 100}
 	if err := json.NewDecoder(limited).Decode(new(startupSnapshot)); err == nil || limited.N != 0 {
 		t.Fatal("expanded bound not enforced")
@@ -333,7 +437,11 @@ func TestOperatorRegistryBootstrapPinsStateAndTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close operator registry bootstrap database: %v", err)
+		}
+	}()
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +540,11 @@ func TestOperatorRegistryReplayEpochAndUnauthorizedProposer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close operator registry replay database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)
@@ -481,7 +593,11 @@ func TestOperatorRegistryReplayRejectsBrokenContinuity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close broken-continuity database: %v", err)
+				}
+			}()
 			priv, pub, err := crypto.GenerateValidatorKey()
 			if err != nil {
 				t.Fatal(err)

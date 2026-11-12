@@ -14,6 +14,37 @@ import (
 	"github.com/aperod/aperod/config"
 )
 
+func TestBuildP2PConfig_HandshakeTimeoutFromYAML(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want time.Duration
+	}{
+		{"production default", "p2p:\n  max_peers: 10\n", 3 * time.Second},
+		{"custom", "p2p:\n  handshake_timeout: 2s\n", 2 * time.Second},
+		{"fractional", "p2p:\n  handshake_timeout: 1500ms\n", 1500 * time.Millisecond},
+		{"explicit host fallback", "p2p:\n  handshake_timeout: 0s\n", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			mapped := buildP2PConfig(cfg, "127.0.0.1:0", nil, "test-node", nil, "")
+			if mapped.HandshakeTimeout != tc.want {
+				t.Fatalf("mapped handshake timeout = %v, want %v", mapped.HandshakeTimeout, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildP2PConfig_GetBlockStallTimeoutFromYAML(t *testing.T) {
 	dir := t.TempDir()
 	yamlPath := filepath.Join(dir, "node.yaml")

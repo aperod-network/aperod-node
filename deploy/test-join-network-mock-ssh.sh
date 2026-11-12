@@ -69,12 +69,12 @@ if [[ ! -f "${JOIN_SH}" ]]; then
 fi
 
 if ! command -v python3 &>/dev/null; then
-  skip "M1-M6: python3 not found in PATH"
+  skip "M1-M8: python3 not found in PATH"
   finish
 fi
 
 if ! python3 -c "import yaml" 2>/dev/null; then
-  skip "M1-M6: python3 pyyaml not available"
+  skip "M1-M8: python3 pyyaml not available"
   finish
 fi
 
@@ -138,9 +138,9 @@ count_lines() { wc -l | tr -d ' '; }
 # Write a canonical nested-schema node.yaml (install-validator.sh output).
 make_nested_config() {
   local path="$1"
-  cat >"$path" <<'YAML'
+  cat >"$path" <<YAML
 network: testnet
-data_dir: /var/lib/aperod
+data_dir: ${path}.data
 log_level: info
 
 p2p:
@@ -164,9 +164,9 @@ YAML
 # Write a node.yaml with a pre-existing bootnode already in p2p.bootnodes.
 make_config_with_existing_bootnode() {
   local path="$1"
-  cat >"$path" <<'YAML'
+  cat >"$path" <<YAML
 network: testnet
-data_dir: /var/lib/aperod
+data_dir: ${path}.data
 
 p2p:
   listen_addr: /ip4/0.0.0.0/tcp/30303
@@ -190,9 +190,9 @@ YAML
 # Write a node.yaml that uses the older root-level bootnodes key (install-node.sh).
 make_toplevel_config() {
   local path="$1"
-  cat >"$path" <<'YAML'
+  cat >"$path" <<YAML
 network: testnet
-data_dir: /var/lib/aperod
+data_dir: ${path}.data
 
 p2p:
   listen_addr: /ip4/0.0.0.0/tcp/30303
@@ -266,12 +266,15 @@ esac
 # Usage: build_ssh_stub BIN_DIR HEIGHT PEER_COUNT
 build_ssh_stub() {
   local dir="$1" height="$2" peer_count="$3"
+  local observed_ip="${4:-${PRIMARY_IP}}"
   make_stub "${dir}" "ssh" "
 shift   # drop 'root@IP'
 CMD=\"\$*\"
 # Step 5/7: bootnode injection heredoc — the remote command is just 'bash'.
 # Real ssh propagates the remote exit status, so the stub must too.
-if [[ \"\${CMD}\" == \"bash\" ]]; then
+if [[ \"\${CMD}\" == *\"SSH_CONNECTION\"* ]]; then
+  echo '${observed_ip}'
+elif [[ \"\${CMD}\" == \"bash\" ]]; then
   bash   # execute the heredoc from stdin locally
   exit \$?
 elif echo \"\${CMD}\" | grep -q 'network/stats'; then
@@ -280,11 +283,29 @@ elif echo \"\${CMD}\" | grep -q 'systemctl show'; then
   # verify-dropin.sh checks these two settings over ssh
   echo 'Environment=GOMEMLIMIT=5905580032'
   echo 'TimeoutStopUSec=15min'
+elif [[ \"\${CMD}\" == *\"systemctl enable --now\"* ]]; then
+  # The new relay must already be protected at its first service start.
+  python3 - \"\${SECONDARY_NODE_YAML}\" '${observed_ip}' <<'PY'
+import sys, yaml, os, json
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f)
+assert cfg['p2p'].get('peer_whitelist'), 'Relay started without peer_whitelist'
+sidecar = cfg['p2p'].get('whitelist_file') or os.path.join(cfg['data_dir'], 'p2p_whitelist.json')
+effective = cfg['p2p']['peer_whitelist']
+if sidecar != '-' and os.path.exists(sidecar):
+    effective = json.load(open(sidecar))
+assert sys.argv[2] in effective, 'Runtime sidecar masks validator IP'
+PY
+  exit \$?
 elif echo \"\${CMD}\" | grep -q 'test -f'; then
   # verify-dropin.sh checks that drop-in files exist on the target
   echo 'yes'
 elif echo \"\${CMD}\" | grep -q 'curl'; then
   echo '{\"ok\":true}'
+elif [[ \"\${1:-}\" == \"python3\" ]]; then
+  # Execute the real step-5.5 whitelist heredoc, not a copied test snippet.
+  \"\$@\"
+  exit \$?
 else
   cat >/dev/null
   printf 'stopped\nremoved\nstarted\n'
@@ -650,4 +671,70 @@ fi
 # =============================================================================
 # ── Summary ───────────────────────────────────────────────────────────────────
 # =============================================================================
+section "M7: SSH observation detects the NAT outbound IP, not a private interface"
+M7_DATA="${TMPDIR_TEST}/m7-data"
+mkdir -p "${M7_DATA}/chain.db"
+M7_YAML="${TMPDIR_TEST}/m7-node.yaml"
+make_nested_config "${M7_YAML}"
+M7_REMOTE="${TMPDIR_TEST}/m7-target"
+mkdir -p "${M7_REMOTE}"
+python3 - "${M7_YAML}" "${M7_REMOTE}" <<'PY'
+import sys, yaml, json, os
+cfg = yaml.safe_load(open(sys.argv[1]))
+cfg['data_dir'] = sys.argv[2]
+cfg['p2p']['whitelist_file'] = os.path.join(sys.argv[2], 'operator-peers.json')
+json.dump(['203.0.113.20'], open(cfg['p2p']['whitelist_file'], 'w'))
+with open(sys.argv[1], 'w') as f:
+    yaml.safe_dump(cfg, f)
+PY
+M7_BIN="${TMPDIR_TEST}/m7-bin"
+build_systemctl_stub "${M7_BIN}"
+build_ssh_stub "${M7_BIN}" 42000 1 198.51.100.8
+make_stub "${M7_BIN}" "rsync" '
+default=0
+custom=0
+for arg in "$@"; do
+  [[ "$arg" == "--exclude=p2p_whitelist.json" ]] && default=1
+  [[ "$arg" == "--exclude=/operator-peers.json" ]] && custom=1
+done
+[[ "$default" == 1 && "$custom" == 1 ]] || {
+  echo "Source sidecars must not overwrite target policy" >&2
+  exit 88
+}'
+make_stub "${M7_BIN}" "sleep" 'exit 0'
+make_stub "${M7_BIN}" "hostname" 'echo "10.1.0.1 10.2.0.1"'
+make_stub "${M7_BIN}" "ip" '[[ "$*" == "-4 route get 192.0.2.55" ]] || exit 1
+echo "192.0.2.55 via 10.1.0.254 dev eth1 src 10.1.0.1 uid 0"'
+if OUTPUT=$(env -u PRIMARY_IP PATH="${M7_BIN}:${PATH}" PRIMARY_DATA_DIR="${M7_DATA}" \
+    SECONDARY_NODE_YAML="${M7_YAML}" SECONDARY_DATA_DIR="${M7_REMOTE}" SECONDARY_NODE_CONFIG_SH=/nonexistent \
+    GOMEMLIMIT_BYTES=5905580032 bash "${JOIN_SH}" "${TARGET_IP}" 2>&1); then
+  if python3 - "${M7_YAML}" <<'PY'
+import sys, yaml, json
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f)
+assert cfg["p2p"]["peer_whitelist"] == ["198.51.100.8"], cfg
+assert "/ip4/198.51.100.8/tcp/30303" in cfg["p2p"]["bootnodes"], cfg
+assert cfg["consensus"]["reward_address"] == "aproecTest", cfg
+assert json.load(open(cfg['p2p']['whitelist_file'])) == ["203.0.113.20", "198.51.100.8"]
+PY
+  then pass "M7: Fresh relay whitelists the SSH-observed outbound source"
+  else fail "M7: Fresh relay has incorrect whitelist/config"; fi
+else
+  fail "M7: Full join failed: ${OUTPUT}"
+fi
+
+section "M8: Failed source observation aborts before any node/config changes"
+make_stub "${M7_BIN}" "ssh" 'exit 1'
+make_stub "${M7_BIN}" "systemctl" "touch '${TMPDIR_TEST}/m8-service-touched'; exit 1"
+BEFORE=$(cat "${M7_YAML}")
+if OUTPUT=$(env -u PRIMARY_IP PATH="${M7_BIN}:${PATH}" PRIMARY_DATA_DIR="${M7_DATA}" \
+    SECONDARY_NODE_YAML="${M7_YAML}" GOMEMLIMIT_BYTES=5905580032 \
+    bash "${JOIN_SH}" "${TARGET_IP}" 2>&1); then
+  fail "M8: Failed observation was accepted"
+elif [[ "$(cat "${M7_YAML}")" == "${BEFORE}" && "${OUTPUT}" == *"PRIMARY_IP=<IPv4>"* &&
+    ! -e "${TMPDIR_TEST}/m8-service-touched" ]]; then
+  pass "M8: Failed source observation rejected before service/configuration changes"
+else
+  fail "M8: Missing diagnostic or existing config changed: ${OUTPUT}"
+fi
 finish

@@ -18,6 +18,7 @@ package main
 //     updated so the background backfill goroutine can resume from that point).
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -513,32 +514,20 @@ func TestScan_CheckpointResume_MarkerAdvancedWhenContiguous(t *testing.T) {
 	}
 }
 
-// TestBackfillTxIdxRange_SkipsMissingBlockData verifies that backfillTxIdxRange
-// skips a height whose raw-block data is absent from the store (GetRawBlockByHeight
-// returns nil, nil) and continues indexing all subsequent blocks.
-//
-// This matters in production: after --repair-db some heights may have their
-// height-index entry (b/ prefix) intact but the corresponding raw-block data
-// (r/ prefix) absent.  The old behavior halted permanently at such a height;
-// the new behavior skips the gap and indexes the remaining chain so the tx
-// index marker eventually reaches tipHeight.
-func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-
+func buildBackfillTxIdxDBWithGap(t *testing.T, totalBlocks, missingHeight int) (*store.DB, map[int]core.Transaction) {
+	t.Helper()
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatalf("GenerateValidatorKey: %v", err)
 	}
 
-	// Build a 5-block chain but deliberately omit block at height 3 to
-	// simulate raw-block data absent for that height.
-	db, err2 := store.Open(fmt.Sprintf("%s/chain.db", dir))
-	if err2 != nil {
-		t.Fatalf("store.Open: %v", err2)
+	db, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
+	txsByHeight := make(map[int]core.Transaction, totalBlocks)
 	makeTx := func(seed int) core.Transaction {
 		blind, berr := crypto.NewBlindFactor()
 		if berr != nil {
@@ -554,6 +543,17 @@ func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 		}
 	}
 
+	storeRaw := func(b *core.Block) {
+		t.Helper()
+		raw, marshalErr := json.Marshal(b)
+		if marshalErr != nil {
+			t.Fatalf("marshal block h=%d: %v", b.Header.Height, marshalErr)
+		}
+		if putErr := db.PutRawBlock(b.Hash(), b.Header.Height, raw); putErr != nil {
+			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, putErr)
+		}
+	}
+
 	genesis := &core.Block{
 		Header: core.BlockHeader{
 			Height:       0,
@@ -565,20 +565,9 @@ func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 	if serr := genesis.Header.Sign(priv); serr != nil {
 		t.Fatalf("Sign genesis: %v", serr)
 	}
-	storeRaw := func(b *core.Block) {
-		raw, _ := json.Marshal(b)
-		h := b.Hash()
-		if perr := db.PutRawBlock(h, b.Header.Height, raw); perr != nil {
-			t.Fatalf("PutRawBlock h=%d: %v", b.Header.Height, perr)
-		}
-	}
 	storeRaw(genesis)
 
 	parent := genesis
-	const totalBlocks = 5
-	const missingHeight = 3
-	// txsByHeight records the transactions stored at each height for later verification.
-	txsByHeight := make(map[int]core.Transaction)
 	for i := 1; i <= totalBlocks; i++ {
 		txs := []core.Transaction{makeTx(i)}
 		hdr := core.BlockHeader{
@@ -594,15 +583,71 @@ func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 		}
 		blk := &core.Block{Header: hdr, Txs: txs}
 		txsByHeight[i] = txs[0]
-		if i != missingHeight { // omit block 3 to simulate a raw-data gap
+		if i != missingHeight {
 			storeRaw(blk)
+		} else {
+			// Keep h→hash but omit the body, matching the retained LevelDB
+			// state that makes GetRawBlockByHeight return (nil, nil).
+			if repairErr := db.RepairHeightIndex(uint64(i), blk.Hash()); repairErr != nil {
+				t.Fatalf("retain height index without body h=%d: %v", i, repairErr)
+			}
 		}
 		parent = blk
 	}
+	return db, txsByHeight
+}
 
-	// Run the backfill from 0 through 5.  Block 3 data is absent but the
-	// backfill should skip it (WARN) and continue indexing 4 and 5.
-	backfillTxIdxRange(0, totalBlocks, db, silentLog())
+func TestTxIndexPruneBelowHeight(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		tipHeight uint64
+		mode      string
+		keep      uint64
+		want      uint64
+	}{
+		{name: "light mode cutoff", tipHeight: 100, mode: "light", keep: 20, want: 80},
+		{name: "light mode not yet prunable", tipHeight: 20, mode: "light", keep: 20, want: 0},
+		{name: "archive mode never skips missing blocks", tipHeight: 100, mode: "archive", keep: 20, want: 0},
+		{name: "zero retained blocks", tipHeight: 100, mode: "light", keep: 0, want: 100},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := txIndexPruneBelowHeight(tc.tipHeight, tc.mode, tc.keep); got != tc.want {
+				t.Errorf("txIndexPruneBelowHeight(%d, %q, %d) = %d, want %d",
+					tc.tipHeight, tc.mode, tc.keep, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBackfillTxIdxRange_SkipsPrunedMissingBlockData verifies that a missing
+// block body below the light-pruning cutoff is warned about and skipped, while
+// later retained blocks are still indexed.
+func TestBackfillTxIdxRange_SkipsPrunedMissingBlockData(t *testing.T) {
+	t.Parallel()
+	const totalBlocks, missingHeight = 5, 3
+	db, txsByHeight := buildBackfillTxIdxDBWithGap(t, totalBlocks, missingHeight)
+	if raw, err := db.GetRawBlockByHeight(missingHeight); err != nil || raw != nil {
+		t.Fatalf("expected height %d to have a missing raw body, got %d bytes, err=%v", missingHeight, len(raw), err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+	// Pruning removes heights strictly below this cutoff, so height 3 is
+	// expected to be absent when the first retained height is 4.
+	backfillTxIdxRange(0, totalBlocks, missingHeight+1, db, log)
+
+	const prunedMsg = "tx index background backfill: block pruned, skipping"
+	if !logContainsMsg(&logBuf, prunedMsg) {
+		t.Fatalf("expected a pruned-block skip warning, got:\n%s", logBuf.String())
+	}
+	if level, ok := logFieldValue(&logBuf, prunedMsg, "level"); !ok || level != "WARN" {
+		t.Fatalf("pruned skip level = %q (present=%t), want WARN; log:\n%s", level, ok, logBuf.String())
+	}
+	if height, ok := logFieldValue(&logBuf, prunedMsg, "height"); !ok || height != "3" {
+		t.Fatalf("pruned skip height = %q (present=%t), want 3; log:\n%s", height, ok, logBuf.String())
+	}
 
 	// Marker must reach totalBlocks (backfill completed despite the gap).
 	marker, found, loadErr := db.LoadTxIdxCompleteHeight()
@@ -638,6 +683,103 @@ func TestBackfillTxIdxRange_SkipsMissingBlockData(t *testing.T) {
 	}
 	if entry3 != nil {
 		t.Errorf("height 3 tx has t/ entry but the block data was absent — should not be indexed")
+	}
+}
+
+// TestBackfillTxIdxRange_SkipsMissingRetainedBlockData verifies that a nil body
+// in the retained range is warned about and skipped, while later blocks are
+// still indexed.
+func TestBackfillTxIdxRange_SkipsMissingRetainedBlockData(t *testing.T) {
+	t.Parallel()
+	const totalBlocks, missingHeight = 5, 3
+	db, txsByHeight := buildBackfillTxIdxDBWithGap(t, totalBlocks, missingHeight)
+	if raw, err := db.GetRawBlockByHeight(missingHeight); err != nil || raw != nil {
+		t.Fatalf("expected height %d to have a missing raw body, got %d bytes, err=%v", missingHeight, len(raw), err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+	// The cutoff is exclusive: height 3 itself is retained, not pruned.
+	backfillTxIdxRange(0, totalBlocks, missingHeight, db, log)
+
+	const skipMsg = "tx index background backfill: missing block data; skipping"
+	if !logContainsMsg(&logBuf, skipMsg) {
+		t.Fatalf("expected the missing retained block to be skipped with a warning, got:\n%s", logBuf.String())
+	}
+	if level, ok := logFieldValue(&logBuf, skipMsg, "level"); !ok || level != "WARN" {
+		t.Fatalf("missing-body skip level = %q (present=%t), want WARN; log:\n%s", level, ok, logBuf.String())
+	}
+	if height, ok := logFieldValue(&logBuf, skipMsg, "height"); !ok || height != "3" {
+		t.Fatalf("missing-body skip height = %q (present=%t), want 3; log:\n%s", height, ok, logBuf.String())
+	}
+
+	const summaryMsg = "tx index background backfill: missing block data range skipped"
+	if !logContainsMsg(&logBuf, summaryMsg) {
+		t.Fatalf("expected a summary for the skipped range, got:\n%s", logBuf.String())
+	}
+	if level, ok := logFieldValue(&logBuf, summaryMsg, "level"); !ok || level != "INFO" {
+		t.Fatalf("missing-body range summary level = %q (present=%t), want INFO; log:\n%s", level, ok, logBuf.String())
+	}
+	if from, ok := logFieldValue(&logBuf, summaryMsg, "from_height"); !ok || from != "3" {
+		t.Fatalf("missing-body range start = %q (present=%t), want 3; log:\n%s", from, ok, logBuf.String())
+	}
+	if to, ok := logFieldValue(&logBuf, summaryMsg, "to_height"); !ok || to != "3" {
+		t.Fatalf("missing-body range end = %q (present=%t), want 3; log:\n%s", to, ok, logBuf.String())
+	}
+	if count, ok := logFieldValue(&logBuf, summaryMsg, "missing_blocks"); !ok || count != "1" {
+		t.Fatalf("missing-body count = %q (present=%t), want 1; log:\n%s", count, ok, logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), `"err":null`) {
+		t.Fatalf("nil body was incorrectly logged as a read error:\n%s", logBuf.String())
+	}
+
+	marker, found, loadErr := db.LoadTxIdxCompleteHeight()
+	if loadErr != nil {
+		t.Fatalf("LoadTxIdxCompleteHeight: %v", loadErr)
+	}
+	if !found || marker != uint64(totalBlocks) {
+		t.Fatalf("txidx_complete_height=(%d, found=%t), want (%d, true)", marker, found, totalBlocks)
+	}
+
+	for _, height := range []int{1, 2, 4, 5} {
+		tx := txsByHeight[height]
+		entry, lookupErr := db.LookupTxIdx(tx.Hash())
+		if lookupErr != nil {
+			t.Errorf("LookupTxIdx at height %d: %v", height, lookupErr)
+		} else if entry == nil {
+			t.Errorf("height %d tx was not indexed after missing block %d", height, missingHeight)
+		}
+	}
+	missingTx := txsByHeight[missingHeight]
+	entry, lookupErr := db.LookupTxIdx(missingTx.Hash())
+	if lookupErr != nil {
+		t.Fatalf("LookupTxIdx for missing block: %v", lookupErr)
+	}
+	if entry != nil {
+		t.Fatal("transaction from absent block body unexpectedly has a tx index entry")
+	}
+}
+
+func TestBackfillTxIdxRange_HaltsOnStoreReadError(t *testing.T) {
+	t.Parallel()
+	db, err := store.Open(filepath.Join(t.TempDir(), "closed-chain.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	log := newCaptureLogger(&logBuf)
+	backfillTxIdxRange(0, 1, 0, db, log)
+
+	const fetchErrMsg = "tx index background backfill: block fetch error — halting; will retry next restart"
+	if !logContainsMsg(&logBuf, fetchErrMsg) {
+		t.Fatalf("expected store read failure to halt backfill, got:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), `"err":`) || strings.Contains(logBuf.String(), `"err":null`) {
+		t.Fatalf("store read error was omitted from the halt log:\n%s", logBuf.String())
 	}
 }
 

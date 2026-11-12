@@ -95,7 +95,29 @@ func HostTriggerMaintain(h *Host) {
 // production peerList is populated by the MsgPeers peer-exchange
 // protocol; tests that skip the exchange call this helper instead.
 func HostAddKnownPeer(h *Host, addr string) {
-	h.addKnownPeers([]string{addr})
+	h.addKnownPeers(&Peer{addr: "192.0.2.1:30303"}, []string{addr})
+}
+
+// HostTryPeerExchange exercises the untrusted MsgPeers admission path.
+func HostTryPeerExchange(h *Host, addrs []string) {
+	h.addKnownPeers(&Peer{addr: "192.0.2.1:30303"}, addrs)
+}
+
+func HostRegisterPeerForTest(h *Host, addr string, conn net.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.peers[addr] = &Peer{addr: addr, conn: conn}
+}
+
+func HostDispatchForTest(h *Host, addr string, msgType MessageType, data []byte) error {
+	return h.dispatch(&Peer{addr: addr}, msgType, data)
+}
+
+// HostKnownPeerCount returns the test host's discovered peer count.
+func HostKnownPeerCount(h *Host) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.peerList)
 }
 
 // HostKeepaliveInterval returns the KeepaliveInterval stored in the host's

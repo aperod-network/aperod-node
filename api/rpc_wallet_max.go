@@ -80,7 +80,7 @@ func (s *Server) aprWalletMaxSpendable(rawParams json.RawMessage) (interface{}, 
 	owned := make([]core.OwnedUTXO, 0, len(p.UTXOs))
 	var skipped []skippedUTXOInfo
 	for _, u := range p.UTXOs {
-		o, resErr := s.resolveOwnedUTXO(u, viewPriv, spendPub)
+		o, resErr := s.resolveOwnedUTXO(u, spendPriv, viewPriv, spendPub)
 		if resErr != nil {
 			// A bad DB record (wrong amount / stale blind / deleted UTXO)
 			// must not block the quote — the send path skips such UTXOs

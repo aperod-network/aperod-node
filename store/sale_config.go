@@ -72,14 +72,18 @@ func (d *DB) LoadSaleMigrationFile(path string) (*SaleMigration, error) {
 }
 
 func readSignedSaleMigrationFile(path string) (*SaleMigration, error) {
+	// #nosec G304 -- the caller supplies a local, operator-managed signed migration path.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 	raw, err := io.ReadAll(io.LimitReader(file, 1_048_577))
+	closeErr := file.Close()
 	if err != nil || len(raw) > 1_048_576 {
 		return nil, fmt.Errorf("sale: configuration size invalid")
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	var m SaleMigration
 	decoder := json.NewDecoder(bytes.NewReader(raw))

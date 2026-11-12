@@ -25,10 +25,11 @@ import (
 // ─── Stub handler ─────────────────────────────────────────────────────────────
 
 type stubHandler struct {
-	mu     sync.Mutex
-	blocks []*core.Block
-	txs    []*core.Transaction
-	votes  []p2p.VoteMsg
+	mu       sync.Mutex
+	blocks   []*core.Block
+	txs      []*core.Transaction
+	votes    []p2p.VoteMsg
+	admitErr error
 }
 
 func (s *stubHandler) OnBlock(b *core.Block) {
@@ -40,6 +41,13 @@ func (s *stubHandler) OnTransaction(tx *core.Transaction) {
 	s.mu.Lock()
 	s.txs = append(s.txs, tx)
 	s.mu.Unlock()
+}
+func (s *stubHandler) AdmitTransaction(tx *core.Transaction) error {
+	if s.admitErr != nil {
+		return s.admitErr
+	}
+	s.OnTransaction(tx)
+	return nil
 }
 func (s *stubHandler) OnVote(v p2p.VoteMsg) {
 	s.mu.Lock()

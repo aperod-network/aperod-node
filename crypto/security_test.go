@@ -42,10 +42,10 @@ func TestMLSAGSign_RingSize2(t *testing.T) {
 func TestMLSAGSign_RingSize16_Valid(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	var msg crypto.Hash32
 	msg[0] = 0xAB
@@ -65,9 +65,9 @@ func TestMLSAGSign_RingSize100(t *testing.T) {
 	ring := make([]crypto.RingMember, 100)
 	for i := range ring {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	var msg crypto.Hash32
 	_, err := crypto.MLSAGSign(msg, ring, 0, wk.Spend.Private)
 	if err == nil {
@@ -83,10 +83,10 @@ func TestMLSAGSign_RingSize100(t *testing.T) {
 func TestTxMalleability_SignatureInvalidatedAfterChange(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 
 	// Sign a message representing a transaction hash
@@ -123,10 +123,10 @@ func TestTxMalleability_SignatureInvalidatedAfterChange(t *testing.T) {
 func TestTxMalleability_KeyImageTampering(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 
 	var msg crypto.Hash32
@@ -148,10 +148,10 @@ func TestTxMalleability_KeyImageTampering(t *testing.T) {
 func TestTxMalleability_RingTampering(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 
 	var msg crypto.Hash32
@@ -162,7 +162,7 @@ func TestTxMalleability_RingTampering(t *testing.T) {
 
 	// Swap a decoy ring member with a fresh random key
 	fresh, _ := crypto.GenerateWalletKeys()
-	ring[1] = crypto.RingMember(fresh.Spend.Public)
+	ring[1] = fresh.Spend.Public
 
 	ok, _ := crypto.MLSAGVerify(msg, ring, sig)
 	if ok {
@@ -180,7 +180,7 @@ func TestMLSAGSign_DuplicateRingKeys(t *testing.T) {
 	// Build a ring of the correct size, but fill with wk's public key twice
 	ring := make([]crypto.RingMember, crypto.RingSize)
 	for i := range ring {
-		ring[i] = crypto.RingMember(wk.Spend.Public) // all identical
+		ring[i] = wk.Spend.Public // all identical
 	}
 
 	var msg crypto.Hash32
@@ -203,10 +203,10 @@ func TestMLSAGSign_DuplicateRingKeys(t *testing.T) {
 func TestMLSAGSign_PartialDuplicateKeys(t *testing.T) {
 	wk, _ := crypto.GenerateWalletKeys()
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	// Duplicate index 1 with index 0
 	ring[1] = ring[0]
