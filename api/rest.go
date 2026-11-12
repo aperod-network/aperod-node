@@ -2474,6 +2474,10 @@ func (s *Server) restUTXO(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func outputIndexInRange(outIndex uint32, outputCount int) bool {
+	return outputCount >= 0 && uint64(outIndex) < uint64(outputCount)
+}
+
 func (s *Server) amountBindingForOutput(txHash crypto.Hash32, outIndex uint32, height uint64) (*crypto.AmountBinding, core.TxVersion, bool) {
 	if s.chain == nil {
 		return nil, 0, false
@@ -2484,7 +2488,7 @@ func (s *Server) amountBindingForOutput(txHash crypto.Hash32, outIndex uint32, h
 	}
 	for i := range block.Txs {
 		tx := &block.Txs[i]
-		if tx.Hash() != txHash || int(outIndex) >= len(tx.Outputs) {
+		if tx.Hash() != txHash || !outputIndexInRange(outIndex, len(tx.Outputs)) {
 			continue
 		}
 		return tx.Outputs[outIndex].AmountBinding, tx.Version, true

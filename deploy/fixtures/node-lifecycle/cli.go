@@ -19,11 +19,19 @@ func main() {
 		fmt.Println(pub)
 		return
 	}
+
+	address := "apro" + strings.Repeat("A", 99)
 	for i, arg := range os.Args {
-		if arg == "--out" && i+1 < len(os.Args) {
-			_ = os.WriteFile(os.Args[i+1], []byte(`{"address":"apro`+strings.Repeat("A", 99)+`"}`), 0600)
+		if arg == "--output" && i+1 < len(os.Args) {
+			keystore := fmt.Sprintf(
+				`{"address":%q,"crypto":{"ciphertext":"synthetic-only"}}`, address)
+			if err := os.WriteFile(os.Args[i+1], []byte(keystore), 0600); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Println(address)
 			return
 		}
 	}
-	fmt.Println("apro" + strings.Repeat("A", 99))
+	fmt.Println(address)
 }
