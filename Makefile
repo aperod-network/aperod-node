@@ -3,7 +3,7 @@ BINARY_CLI=aperod
 BINARY_INDEXER=aperod-explorer-indexer
 BUILD_DIR=build
 GO=go
-GOFLAGS=-ldflags="-s -w"
+LDFLAGS := -s -w
 
 .PHONY: all build build-node build-cli build-explorer-indexer test lint fmt clean docker deps
 
@@ -17,17 +17,17 @@ build: build-node build-cli build-explorer-indexer
 
 build-node:
 	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NODE).new ./cmd/node
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NODE).new ./cmd/node
 	mv -f $(BUILD_DIR)/$(BINARY_NODE).new $(BUILD_DIR)/$(BINARY_NODE)
 
 build-cli:
 	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_CLI).new ./cmd/cli
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_CLI).new ./cmd/cli
 	mv -f $(BUILD_DIR)/$(BINARY_CLI).new $(BUILD_DIR)/$(BINARY_CLI)
 
 build-explorer-indexer:
 	mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_INDEXER).new ./cmd/explorer-indexer
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_INDEXER).new ./cmd/explorer-indexer
 	mv -f $(BUILD_DIR)/$(BINARY_INDEXER).new $(BUILD_DIR)/$(BINARY_INDEXER)
 
 test:

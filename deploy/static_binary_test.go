@@ -412,7 +412,10 @@ func TestUpdateExplorerIndexerStaticGuard(t *testing.T) {
 		cmd.Dir = blockchainDir
 		// The Makefile must override this ambient setting itself. Do not make
 		// the test pass by silently forcing CGO_ENABLED=0 outside the target.
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+		// Mirror the installer, which clears ambient GOFLAGS before invoking
+		// make. Linker flags belong on the build command, not in GOFLAGS:
+		// Makefile quoting there leaks literal quotes into the Go tool.
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=", "LDFLAGS=-not-a-valid-go-linker-flag")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("make build-explorer-indexer failed: %v\n%s", err, out)
 		}
