@@ -159,6 +159,29 @@ class NodeSourceTests(unittest.TestCase):
         binary.write_text("changed live baseline")
         self.assertNotEqual(self.shell('node_source_baseline_guard "$1"', binary, env=env).returncode, 0)
 
+    def test_candidate_info_guard_accepts_go_125_and_126_formats(self):
+        info_formats = [
+            ("Go 1.25", f"build\tCGO_ENABLED=0\nbuild\tvcs.revision={self.pin}\n"
+             f"build\tvcs.modified=false\n"),
+            ("Go 1.26", f"buildCGO_ENABLED=0\nbuildvcs.revision={self.pin}\n"
+             f"buildvcs.modified=false\n"),
+        ]
+        for label, info in info_formats:
+            with self.subTest(label=label):
+                result = self.shell(
+                    'node_source_candidate_info_guard "$1" "$2"', info, self.pin)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        for info in (
+            f"buildCGO_ENABLED=1\nbuildvcs.revision={self.pin}\nbuildvcs.modified=false\n",
+            f"buildCGO_ENABLED=0\nbuildvcs.revision={'0' * 40}\nbuildvcs.modified=false\n",
+            f"buildCGO_ENABLED=0\nbuildvcs.revision={self.pin}\nbuildvcs.modified=true\n",
+        ):
+            with self.subTest(rejected=info):
+                result = self.shell(
+                    'node_source_candidate_info_guard "$1" "$2"', info, self.pin)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_real_static_fixture_build_after_verified_fetch(self):
         self.assertIsNotNone(shutil.which("go"), "Go fixture build is required, not silently skipped")
         self.assertEqual(self.fetch().returncode, 0)

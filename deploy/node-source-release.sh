@@ -110,6 +110,14 @@ node_source_build_context() {
   _node_source_git_env || return 1
 }
 
+node_source_candidate_info_guard() {
+  local info="$1" commit="$2"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  grep -Eq '^[[:space:]]*build[[:space:]]*CGO_ENABLED=0$' <<< "$info" &&
+    grep -Eq "^[[:space:]]*build[[:space:]]*vcs[.]revision=${commit}$" <<< "$info" &&
+    grep -Eq '^[[:space:]]*build[[:space:]]*vcs[.]modified=false$' <<< "$info"
+}
+
 node_source_candidate_guard() (
   local checkout="$1" binary="$2" revision status info segments
   _node_source_git_env || return 1
@@ -125,9 +133,7 @@ node_source_candidate_guard() (
     echo "[node-source] REFUSED: go and readelf are required to verify the candidate." >&2; return 1;
   }
   info="$(go version -m "$binary")" || return 1
-  grep -Eq '^[[:space:]]*build[[:space:]]+CGO_ENABLED=0$' <<< "$info" &&
-    grep -Eq "^[[:space:]]*build[[:space:]]+vcs.revision=${APEROD_NODE_SOURCE_COMMIT}$" <<< "$info" &&
-    grep -Eq '^[[:space:]]*build[[:space:]]+vcs.modified=false$' <<< "$info" || {
+  node_source_candidate_info_guard "$info" "$APEROD_NODE_SOURCE_COMMIT" || {
       echo "[node-source] REFUSED: candidate lacks clean, portable build provenance for the selected commit." >&2
       return 1
     }
