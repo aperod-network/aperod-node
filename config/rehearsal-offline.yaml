@@ -9,6 +9,8 @@ p2p:
   max_peers: 1
   min_peers: 0
 consensus:
+  security_hardening_activation_height: 3800000
+  oracle_max_deviation: 0.05
   non_validator: true
   block_time: "3s"
   block_reward_napro: 300000000

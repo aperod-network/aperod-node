@@ -25,14 +25,17 @@ import (
 // ─── minimal p2p handler backed by a Chain ───────────────────────────────────
 
 type chainHandler struct {
-	chain *core.Chain
+	chain        *core.Chain
+	onBlockError func(error)
 }
 
 func (h *chainHandler) OnBlock(b *core.Block) {
 	if h.chain.GetByHash(b.Hash()) != nil {
 		return // already have it
 	}
-	_ = h.chain.AddBlock(b)
+	if err := h.chain.AddBlock(b); err != nil && h.onBlockError != nil {
+		h.onBlockError(err)
+	}
 }
 func (h *chainHandler) OnTransaction(_ *core.Transaction) {}
 func (h *chainHandler) OnVote(_ p2p.VoteMsg)              {}
@@ -73,7 +76,7 @@ func buildBlock(t *testing.T, parent *core.Block, validatorPriv []byte, validato
 // ─── Test 1.9.7 ───────────────────────────────────────────────────────────────
 
 func TestSync_ThreeNodes_FiveBlocks(t *testing.T) {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	validatorPriv, validatorPub, _ := crypto.GenerateValidatorKey()
 
@@ -291,12 +294,18 @@ func TestSync_RelayNode_FullSync(t *testing.T) {
 	}
 
 	// ── Relay p2p host (non_validator: true — produces no blocks itself) ─────
-	relayHandler := &chainHandler{chain: relayChain}
+	relayHandler := &chainHandler{
+		chain: relayChain,
+		onBlockError: func(err error) {
+			t.Errorf("relay chain AddBlock rejected synced block: %v", err)
+		},
+	}
 	hostRelay := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
 		MaxPeers:   10,
 		NodeID:     "relay",
 		UserAgent:  "aperod/test",
+		Bootnodes:  []string{validatorAddr},
 	}, relayHandler, log)
 	hostRelay.SetHeaderProvider(relayChain)
 	if err := hostRelay.Start(); err != nil {
@@ -405,6 +414,7 @@ func TestSync_RelayNode_LiveBlocks(t *testing.T) {
 		MaxPeers:   10,
 		NodeID:     "relay",
 		UserAgent:  "aperod/test",
+		Bootnodes:  []string{validatorAddr},
 	}, relayHandler, log)
 	hostRelay.SetHeaderProvider(relayChain)
 	if err := hostRelay.Start(); err != nil {
@@ -544,6 +554,7 @@ func TestSync_KeepalivePong_UpdatesPeerHeight(t *testing.T) {
 		MaxPeers:          10,
 		NodeID:            "relay",
 		UserAgent:         "aperod/test",
+		Bootnodes:         []string{validatorAddr},
 		KeepaliveInterval: 200 * time.Millisecond,
 	}, relayHandler, log)
 	hostRelay.SetHeaderProvider(relayChain)
@@ -693,6 +704,7 @@ func TestSync_KeepalivePong_RetriggersHeaderSync(t *testing.T) {
 		MaxPeers:          10,
 		NodeID:            "relay",
 		UserAgent:         "aperod/test",
+		Bootnodes:         []string{validatorAddr},
 		KeepaliveInterval: 200 * time.Millisecond,
 	}, relayHandler, log)
 	hostRelay.SetHeaderProvider(relayChain)
@@ -1003,12 +1015,20 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 	// Default KeepaliveInterval (10 s) and GetBlockStallTimeout (15 s) are kept
 	// intentionally: the test's 5-second convergence deadline proves recovery
 	// came from the post-handshake GetHeaders, not from either fallback timer.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("phase 3: proxy listen: %v", err)
+	}
+	t.Cleanup(func() { proxyLn.Close() })
+	proxyAddr := proxyLn.Addr().String()
+
 	relayHandler := &chainHandler{chain: relayChain}
 	hostRelay := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
 		MaxPeers:   10,
 		NodeID:     "relay",
 		UserAgent:  "aperod/test",
+		Bootnodes:  []string{validatorAddr, proxyAddr},
 	}, relayHandler, log)
 	hostRelay.SetHeaderProvider(relayChain)
 	if err := hostRelay.Start(); err != nil {
@@ -1042,12 +1062,6 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 	// relay→validator direction until gate is closed, pinning the validator's
 	// handleConn between "Pong payload built (height=numInitial)" and "Ping
 	// received" for as long as the test needs.
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("phase 3: proxy listen: %v", err)
-	}
-	t.Cleanup(func() { proxyLn.Close() })
-
 	gate := make(chan struct{})
 	go func() {
 		client, err := proxyLn.Accept()
@@ -1067,7 +1081,6 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 		}()
 	}()
 
-	proxyAddr := proxyLn.Addr().String()
 	hostRelay.DialPeer(proxyAddr)
 
 	// Give the dial time to reach the validator so its handleConn snapshots
@@ -1207,12 +1220,21 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	// trigger a keepalive-timeout disconnect before Stop fires.  Disconnect is
 	// detected immediately via TCP FIN (relay dispatch reads EOF), not by
 	// keepalive timer, so the extended interval does not slow down phase 7.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		hostValidator.Stop()
+		t.Fatalf("phase 2: proxy listen: %v", err)
+	}
+	t.Cleanup(func() { proxyLn.Close() })
+	proxyAddr := proxyLn.Addr().String()
+
 	relayHandler := &chainHandler{chain: relayChain}
 	hostRelay := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
 		MaxPeers:             10,
 		NodeID:               "relay",
 		UserAgent:            "aperod/test",
+		Bootnodes:            []string{validatorAddr, proxyAddr},
 		KeepaliveInterval:    10 * time.Second,
 		GetBlockStallTimeout: 500 * time.Millisecond,
 	}, relayHandler, log)
@@ -1256,13 +1278,6 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	gate := make(chan struct{})             // close to enter intercept mode
 	stalled := make(chan struct{})          // proxy ack: intercept mode is active
 	interceptedFirst := make(chan struct{}) // proxy ack: read ≥1 chunk mid-stream
-
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		hostValidator.Stop()
-		t.Fatalf("phase 2: proxy listen: %v", err)
-	}
-	t.Cleanup(func() { proxyLn.Close() })
 
 	clientConnCh := make(chan net.Conn, 1) // delivers accepted relay-side conn
 
@@ -1326,8 +1341,6 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 			}
 		}()
 	}()
-
-	proxyAddr := proxyLn.Addr().String()
 
 	// Drop direct connection; relay reconnects through the proxy.
 	// Proxy is in forward mode so handshake completes normally.  Validator is
@@ -1518,7 +1531,9 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	// correct tip hash.
 	validatorHandler2 := &chainHandler{chain: validatorChain}
 	hostValidator2 := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
+		// A restarted validator keeps its configured P2P address so the
+		// relay's explicit bootnode admission remains valid.
+		ListenAddr: validatorAddr,
 		MaxPeers:   10,
 		NodeID:     "validator2",
 		UserAgent:  "aperod/test",

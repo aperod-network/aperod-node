@@ -90,12 +90,14 @@ func HostTriggerMaintain(h *Host) {
 	}
 }
 
-// HostAddKnownPeer seeds addr into the host's peerList so that the
-// MinPeers path inside maintainLoop can re-dial it after a drop.  In
-// production peerList is populated by the MsgPeers peer-exchange
-// protocol; tests that skip the exchange call this helper instead.
+// HostAddKnownPeer seeds an address directly into peerList for tests that
+// exercise defense-in-depth behavior on stale or otherwise injected entries.
 func HostAddKnownPeer(h *Host, addr string) {
-	h.addKnownPeers(&Peer{addr: "192.0.2.1:30303"}, []string{addr})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.peerList) < maxKnownPeers {
+		h.peerList = append(h.peerList, addr)
+	}
 }
 
 // HostTryPeerExchange exercises the untrusted MsgPeers admission path.

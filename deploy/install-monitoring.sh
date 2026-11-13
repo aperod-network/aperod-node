@@ -27,7 +27,43 @@ ${BOLD}╔═══════════════════════�
 # ── Версии ────────────────────────────────────────────────
 NODE_EXPORTER_VER="1.8.2"
 NGINX_EXPORTER_VER="1.3.0"
-ARCH=$( [[ $(uname -m) == "aarch64" ]] && echo "arm64" || echo "amd64" )
+case "$(uname -m)" in
+  x86_64|amd64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *) die "Неподдерживаемая архитектура: $(uname -m)" ;;
+esac
+
+# Pin release archive digests in the reviewed installer. Changing either
+# version requires adding independently verified hashes for every supported
+# architecture before the installer can run.
+case "${NODE_EXPORTER_VER}:${NGINX_EXPORTER_VER}:${ARCH}" in
+  "1.8.2:1.3.0:amd64")
+    NODE_EXPORTER_SHA256="6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66"
+    NGINX_EXPORTER_SHA256="4e27d332281e6bda7514f51f5a6e7c62f8bfb7667d459095a4c73d437b2d27ad"
+    ;;
+  "1.8.2:1.3.0:arm64")
+    NODE_EXPORTER_SHA256="627382b9723c642411c33f48861134ebe893e70a63bcc8b3fc0619cd0bfac4be"
+    NGINX_EXPORTER_SHA256="c78cd780d8f3f659cb3c8655f9491dc5ffe90a9bf60a91fc9829cc5afde318fd"
+    ;;
+  *)
+    die "Нет закреплённых SHA-256 для exporter versions/architecture ${NODE_EXPORTER_VER}/${NGINX_EXPORTER_VER}/${ARCH}"
+    ;;
+esac
+
+DOWNLOAD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aperod-monitoring.XXXXXX") \
+  || die "Не удалось создать временную директорию загрузки"
+cleanup_downloads() {
+  rm -rf -- "$DOWNLOAD_DIR"
+}
+trap cleanup_downloads EXIT
+
+verify_release_archive() {
+  local archive="$1" expected_sha256="$2" artifact="$3"
+  [[ "$expected_sha256" =~ ^[[:xdigit:]]{64}$ ]] \
+    || die "Некорректный закреплённый SHA-256 для ${artifact}"
+  printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum -c --status \
+    || die "SHA-256 ${artifact} не совпадает; архив удалён, установка остановлена"
+}
 
 # ── 1. Системные зависимости ─────────────────────────────
 info "Обновляем пакеты…"
@@ -69,11 +105,12 @@ fi
 if ! $APT_NE; then
   info "Устанавливаем node_exporter ${NODE_EXPORTER_VER}…"
   NE_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VER}/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}.tar.gz"
-  wget -q "$NE_URL" -O /tmp/node_exporter.tar.gz
-  tar -xzf /tmp/node_exporter.tar.gz -C /tmp
-  cp "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}/node_exporter" /usr/local/bin/node_exporter
+  NODE_ARCHIVE="${DOWNLOAD_DIR}/node_exporter.tar.gz"
+  wget -q "$NE_URL" -O "$NODE_ARCHIVE"
+  verify_release_archive "$NODE_ARCHIVE" "$NODE_EXPORTER_SHA256" "node_exporter ${NODE_EXPORTER_VER} ${ARCH}"
+  tar -xzf "$NODE_ARCHIVE" -C "$DOWNLOAD_DIR"
+  cp "${DOWNLOAD_DIR}/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}/node_exporter" /usr/local/bin/node_exporter
   chmod +x /usr/local/bin/node_exporter
-  rm -rf /tmp/node_exporter.tar.gz "/tmp/node_exporter-${NODE_EXPORTER_VER}.linux-${ARCH}"
 
   # Останавливаем старый сервис если есть (мог быть запущен без textfile)
   systemctl stop node_exporter 2>/dev/null || true
@@ -127,11 +164,12 @@ fi
 # ── 4. nginx-prometheus-exporter ─────────────────────────
 info "Устанавливаем nginx-prometheus-exporter ${NGINX_EXPORTER_VER}…"
 NE2_URL="https://github.com/nginx/nginx-prometheus-exporter/releases/download/v${NGINX_EXPORTER_VER}/nginx-prometheus-exporter_${NGINX_EXPORTER_VER}_linux_${ARCH}.tar.gz"
-wget -q "$NE2_URL" -O /tmp/nginx_exporter.tar.gz
-tar -xzf /tmp/nginx_exporter.tar.gz -C /tmp
-cp /tmp/nginx-prometheus-exporter /usr/local/bin/nginx-prometheus-exporter
+NGINX_ARCHIVE="${DOWNLOAD_DIR}/nginx_exporter.tar.gz"
+wget -q "$NE2_URL" -O "$NGINX_ARCHIVE"
+verify_release_archive "$NGINX_ARCHIVE" "$NGINX_EXPORTER_SHA256" "nginx-prometheus-exporter ${NGINX_EXPORTER_VER} ${ARCH}"
+tar -xzf "$NGINX_ARCHIVE" -C "$DOWNLOAD_DIR"
+cp "${DOWNLOAD_DIR}/nginx-prometheus-exporter" /usr/local/bin/nginx-prometheus-exporter
 chmod +x /usr/local/bin/nginx-prometheus-exporter
-rm -f /tmp/nginx_exporter.tar.gz /tmp/nginx-prometheus-exporter
 
 useradd --no-create-home --shell /bin/false nginx_exporter 2>/dev/null || true
 

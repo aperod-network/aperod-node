@@ -103,6 +103,7 @@ type GetBlockMsg struct {
 type VoteMsg struct {
 	BlockHash    crypto.Hash32 `json:"block_hash"`
 	Height       uint64        `json:"height"`
+	Version      uint8         `json:"version,omitempty"`
 	ValidatorPub []byte        `json:"validator_pub"`
 	Signature    []byte        `json:"sig"`
 }

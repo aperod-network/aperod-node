@@ -125,7 +125,7 @@ func TestDispatch_Peers(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		peers := p2p.PeersMsg{Addrs: []string{"10.0.0.1:7777", "10.0.0.2:7777"}}
+		peers := p2p.PeersMsg{Addrs: []string{"8.8.8.8:7777", "1.1.1.1:7777"}}
 		p2p.WriteMsg(conn, p2p.MsgPeers, peers)
 		time.Sleep(30 * time.Millisecond) // let host process
 	})
@@ -135,7 +135,7 @@ func TestPeerExchangeCannotFillKnownPeerListWithOneMessage(t *testing.T) {
 	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
 	addrs := make([]string, 32)
 	for i := range addrs {
-		addrs[i] = fmt.Sprintf("10.%d.%d.%d:30303", (i/65536)%256, (i/256)%256, i%256)
+		addrs[i] = fmt.Sprintf("8.8.4.%d:30303", i+1)
 	}
 	p2p.HostTryPeerExchange(host, addrs)
 	if got := p2p.HostKnownPeerCount(host); got > 16 {
@@ -162,6 +162,51 @@ func TestPeerExchangeCannotFillKnownPeerListWithOneMessage(t *testing.T) {
 	p2p.HostTryPeerExchange(invalidHost, []string{"not-an-address", "example.invalid:30303", "10.0.0.1:0"})
 	if got := p2p.HostKnownPeerCount(invalidHost); got != 0 {
 		t.Fatalf("invalid peer addresses admitted: %d", got)
+	}
+}
+
+func TestPeerExchangeRejectsNonPublicAddresses(t *testing.T) {
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	p2p.HostTryPeerExchange(host, []string{
+		"127.0.0.1:30303",
+		"10.1.2.3:30303",
+		"169.254.2.3:30303",
+		"192.0.2.10:30303",
+		"203.0.113.10:30303",
+		"[::1]:30303",
+		"[::ffff:10.0.0.1]:30303",
+		"[fc00::1]:30303",
+		"[fe80::1]:30303",
+		"[2001:db8::1]:30303",
+		"8.8.8.8:30303",
+		"[2606:4700:4700::1111]:30303",
+	})
+	if got := p2p.HostKnownPeerCount(host); got != 2 {
+		t.Fatalf("public addresses admitted = %d, want 2", got)
+	}
+}
+
+func TestUnsafeStalePeerEntryIsNotDialed(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
+	p2p.HostAddKnownPeer(host, listener.Addr().String())
+	host.DialPeer(listener.Addr().String())
+
+	if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := listener.Accept()
+	if err == nil {
+		conn.Close()
+		t.Fatal("dialed a loopback address injected into the peer list")
+	}
+	if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("Accept error = %v, want timeout", err)
 	}
 }
 

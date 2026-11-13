@@ -253,7 +253,7 @@ func verifyOneVote(cert *store.FinalityCertificate, expected crypto.ValidatorPub
 	if len(cert.Votes) != 1 || !bytes.Equal(cert.Votes[0].Validator, expected) {
 		return fmt.Errorf("certificate must contain exactly one vote from the expected validator")
 	}
-	message := crypto.HashBytes([]byte("aperod/finalize/v1"), cert.BlockHash[:])
+	message := crypto.FinalityVoteMessage(cert.Votes[0].VoteVersion, cert.Height, cert.BlockHash)
 	if !cert.Votes[0].Validator.Verify(message, cert.Votes[0].Signature) {
 		return fmt.Errorf("finality certificate has an invalid expected-validator signature")
 	}

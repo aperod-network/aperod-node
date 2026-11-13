@@ -380,27 +380,38 @@ func (s *UTXOSet) GetByPubKey(pub crypto.Point32) *UTXO {
 // member is intentionally undisclosed; key images, not UTXO deletion, prevent
 // double spending.
 func (s *UTXOSet) GetRingMember(pub crypto.Point32) *UTXO {
+	u, _ := s.LookupRingMember(pub)
+	return u
+}
+
+// LookupRingMember returns an active output or retained spent output suitable
+// for ring membership. Unlike GetRingMember, it propagates persistent-index
+// failures so consensus preflights can fail closed.
+func (s *UTXOSet) LookupRingMember(pub crypto.Point32) (*UTXO, error) {
 	s.mu.RLock()
 	if u := s.byPubKey[pub]; u != nil && !isProtocolLockedUTXO(u) {
 		result := cloneUTXO(u)
 		s.mu.RUnlock()
-		return result
+		return result, nil
 	}
 	if u := s.spentPubKeys[pub]; u != nil && !isProtocolLockedUTXO(u) {
 		result := cloneUTXO(u)
 		s.mu.RUnlock()
-		return result
+		return result, nil
 	}
 	store := s.ringMembers
 	s.mu.RUnlock()
 	if store == nil {
-		return nil
+		return nil, nil
 	}
 	u, err := store.LookupRingMember(pub)
-	if err != nil || isProtocolLockedUTXO(u) {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("lookup persistent ring member: %w", err)
 	}
-	return cloneUTXO(u)
+	if isProtocolLockedUTXO(u) {
+		return nil, nil
+	}
+	return cloneUTXO(u), nil
 }
 
 // ClearKeyImages resets the in-memory 'recent' key-image map to empty.

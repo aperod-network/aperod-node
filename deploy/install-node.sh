@@ -346,6 +346,12 @@ p2p:
   # Do NOT start the node until aperod-join.sh has been run.
   bootnodes: []
 
+consensus:
+  # This installer creates a testnet config. Mainnet must explicitly use 3800000.
+  # A zero reward authorization height defers to the security hardening height.
+  reward_authorization_activation_height: 0
+  security_hardening_activation_height: 0
+
 api:
   enabled: true
   # ВАЖНО: только localhost! Никогда не меняйте на 0.0.0.0

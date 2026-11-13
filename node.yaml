@@ -31,8 +31,10 @@ consensus:
   validator_key: "./data/testnet/validator.key"
   reward_address: "aproegZMzXpwdq4q72SZ4Wih2Li9H8eXE5q71MUabckAfaXrnDCZvBuGp547ozRMNTFpUMnrW1DQzQb5kYUdRLnCHxWHYGTFnC"
   block_reward_napro: 300000000
-  # 0 = disabled. Set the same future height on every validator.
+  # Optional explicit height; 0 defers to security_hardening_activation_height.
   reward_authorization_activation_height: 0
+  # Mainnet requires 3800000. Testnet may leave this at 0.
+  security_hardening_activation_height: 0
   # Guardian allocation hard fork remains disabled until an anchored validator
   # rollout is approved. Both fields must be set together.
   guardian_fund_activation_height: 0

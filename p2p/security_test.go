@@ -11,6 +11,7 @@ package p2p_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"log/slog"
@@ -730,8 +731,16 @@ func TestDuplicateP2PIdentity_RejectedOutbound(t *testing.T) {
 		remoteClosed <- readErr
 	}()
 
-	// Host acts as the outbound dialer toward the cloned listener.
-	host.DialPeer(ln.Addr().String())
+	// Route a public synthetic address to the local TLS listener. This keeps
+	// the private-address guard active while isolating the identity check.
+	dialAddr := "8.8.8.8:30303"
+	p2p.SetDialFunc(host, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != dialAddr {
+			return nil, context.Canceled
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+	})
+	host.DialPeer(dialAddr)
 
 	// Wait for the remote side to observe the disconnect.
 	select {

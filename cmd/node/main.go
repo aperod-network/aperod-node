@@ -176,10 +176,8 @@ func (h *nodeHandler) OnVote(vote p2p.VoteMsg) {
 		h.log.Warn("p2p: invalid vote public key", "err", err)
 		return
 	}
-	select {
-	case h.engine.NewVoteCh() <- fm:
-	default:
-		h.log.Warn("p2p: vote channel full — dropped")
+	if !h.engine.SubmitVote(fm) {
+		h.log.Warn("p2p: vote rejected because consensus engine stopped", "height", fm.Height)
 	}
 }
 
@@ -191,6 +189,7 @@ func finalityMsgFromP2P(vote p2p.VoteMsg) (consensus.FinalizeMsg, error) {
 	return consensus.FinalizeMsg{
 		BlockHash:    vote.BlockHash,
 		Height:       vote.Height,
+		Version:      vote.Version,
 		ValidatorPub: pub,
 		Signature:    vote.Signature,
 	}, nil
@@ -2763,6 +2762,7 @@ func run() error {
 		AVMGasBurnActivationHeight:                    cfg.Consensus.AVMGasBurnActivationHeight,
 		AVMExecutor:                                   avm.NewBlockExecutor(avm.LevelStore{DB: db}),
 		RewardAuthorizationActivationHeight:           cfg.Consensus.RewardAuthorizationActivationHeight,
+		SecurityHardeningActivationHeight:             cfg.Consensus.SecurityHardeningActivationHeight,
 		GuardianFundActivationHeight:                  cfg.Consensus.GuardianFundActivationHeight,
 		GuardianFundChainAnchor:                       guardianAnchor,
 		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
@@ -3090,7 +3090,7 @@ func run() error {
 				return
 			}
 			p2pHost.BroadcastVote(p2p.VoteMsg{
-				BlockHash: vote.BlockHash, Height: vote.Height,
+				BlockHash: vote.BlockHash, Height: vote.Height, Version: vote.Version,
 				ValidatorPub: append([]byte(nil), vote.ValidatorPub[:]...),
 				Signature:    append([]byte(nil), vote.Signature...),
 			})

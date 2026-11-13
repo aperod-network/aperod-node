@@ -278,6 +278,16 @@ func buildEngineWithGenesis(t *testing.T) (
 	return
 }
 
+func TestSubmitIncomingBlockReturnsConsensusRejection(t *testing.T) {
+	eng, _, _, _, _ := buildEngineWithGenesis(t)
+	err := eng.SubmitIncomingBlock(&core.Block{
+		Header: core.BlockHeader{Height: 1},
+	})
+	if err == nil {
+		t.Fatal("expected consensus rejection for an unsigned incoming block")
+	}
+}
+
 // buildSignedBlock constructs and signs a block at height 1 extending genesis
 // with the given nanosecond timestamp.
 func buildSignedBlock(t *testing.T, genesis *core.Block, ts int64, validatorPriv crypto.ValidatorPrivKey, validatorPub crypto.ValidatorPubKey) *core.Block {
