@@ -122,6 +122,19 @@ func TestStopProducingAtHeightValidationAndPersistence(t *testing.T) {
 	})
 }
 
+func TestMainnetRequiresCoordinatedSecurityHardeningHeight(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Network = Mainnet
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("mainnet config without the hardening activation height was accepted")
+	}
+
+	cfg.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight - 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("mainnet config with a mismatched hardening height was accepted")
+	}
+}
+
 func TestValidate_AVMGasBurnActivation(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -236,6 +249,8 @@ func TestLoad_AVMGasBurnActivationPersistsAcrossRestart(t *testing.T) {
 	firstStart.Consensus.StakedCollateralRingExclusionActivationHeight = 0
 	firstStart.Network = "mainnet"
 	firstStart.Consensus.NonValidator = true
+	firstStart.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight
+	firstStart.Consensus.OracleMaxDeviation = 0.05
 	if err := firstStart.Validate(); err == nil {
 		t.Fatal("mainnet node without an explicit staked-collateral activation was accepted")
 	}

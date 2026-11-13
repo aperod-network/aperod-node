@@ -96,6 +96,7 @@ type TxVerifier struct {
 	utxos                                         *UTXOSet
 	vestingLock                                   *VestingLock // nil = vesting enforcement disabled
 	stakedCollateralRingExclusionActivationHeight uint64
+	securityHardeningActivationHeight             uint64
 	lpodDailyUpgradeHeight                        uint64
 }
 
@@ -116,6 +117,12 @@ func (v *TxVerifier) SetVestingLock(vl *VestingLock) {
 // the rule disabled so validators cannot activate it accidentally.
 func (v *TxVerifier) SetStakedCollateralRingExclusionActivationHeight(height uint64) {
 	v.stakedCollateralRingExclusionActivationHeight = height
+}
+
+// SetSecurityHardeningActivationHeight activates consensus-level block caps
+// and unique output one-time-key validation at the coordinated fork.
+func (v *TxVerifier) SetSecurityHardeningActivationHeight(height uint64) {
+	v.securityHardeningActivationHeight = height
 }
 
 // SetLPoDDailyUpgradeHeight gates the v12 source-backed top-up operation.
@@ -496,6 +503,12 @@ func (v *TxVerifier) VerifyBlock(block *Block) error {
 	if block == nil {
 		return fmt.Errorf("tx verifier: nil block")
 	}
+	if v.securityHardeningActivationHeight > 0 &&
+		block.Header.Height >= v.securityHardeningActivationHeight {
+		if err := v.verifySecurityHardeningRules(block); err != nil {
+			return err
+		}
+	}
 	if v.stakedCollateralRingExclusionActivationHeight > 0 && block.Header.Height == 0 {
 		return fmt.Errorf("height-aware block verification requires a nonzero block height")
 	}
@@ -529,6 +542,47 @@ func (v *TxVerifier) VerifyBlock(block *Block) error {
 			h := tx.Hash()
 			return fmt.Errorf("block %d tx[%d] %x: %w",
 				block.Header.Height, i, h[:8], err)
+		}
+	}
+	return nil
+}
+
+func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
+	if len(block.Txs) > MaxTransactionsPerBlock {
+		return fmt.Errorf("block %d: too many txs: %d > %d",
+			block.Header.Height, len(block.Txs), MaxTransactionsPerBlock)
+	}
+	if size := block.Size(); size > MaxBlockBytes {
+		return fmt.Errorf("block %d: too large: %d bytes > %d",
+			block.Header.Height, size, MaxBlockBytes)
+	}
+
+	seen := make(map[crypto.Point32]struct{})
+	for txIndex, tx := range block.Txs {
+		for outputIndex, output := range tx.Outputs {
+			pub := output.OneTimePub
+			if _, exists := seen[pub]; exists {
+				return fmt.Errorf(
+					"block %d tx %d output %d: duplicate one-time public key in block",
+					block.Header.Height, txIndex, outputIndex,
+				)
+			}
+			seen[pub] = struct{}{}
+			if v.utxos != nil {
+				existing, err := v.utxos.LookupRingMember(pub)
+				if err != nil {
+					return fmt.Errorf(
+						"block %d tx %d output %d: could not check one-time public key uniqueness: %w",
+						block.Header.Height, txIndex, outputIndex, err,
+					)
+				}
+				if existing != nil {
+					return fmt.Errorf(
+						"block %d tx %d output %d: one-time public key already exists",
+						block.Header.Height, txIndex, outputIndex,
+					)
+				}
+			}
 		}
 	}
 	return nil

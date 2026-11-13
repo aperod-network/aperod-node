@@ -159,6 +159,7 @@ func TestStallTimeout_ConfiguredValueDrivesStallTicker(t *testing.T) {
 	// ── Relay host configured from the yaml-loaded value ────────────────────
 	relayHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		PeerWhitelist:        []string{ln.Addr().String()},
 		MaxPeers:             cfg.P2P.MaxPeers,
 		NodeID:               "relay-stall-cfg-test",
 		UserAgent:            "aperod/test",

@@ -612,15 +612,16 @@ const Phase2StartYear = 2031
 // ValidatorRegistry tracks all validator stakes and drives automatic set
 // selection.  It is thread-safe and is updated as blocks are processed.
 type ValidatorRegistry struct {
-	mu                        sync.RWMutex
-	validators                map[string]*ValidatorEntry // hex(pubkey) → entry
-	dynamicMinNAPR            uint64                     // 0 = use static MinStakeNAPR constant
-	utxos                     *UTXOSet                   // required for C-1 UTXO-backed deposit check
-	stakeWithdrawalGenesis    crypto.Hash32
-	stakeWithdrawalActivation uint64
-	stakeKeyImageActivation   uint64
-	signatureFork             atomic.Pointer[ValidatorAuthorityFork]
-	signatureAdmissionHeight  atomic.Uint64
+	mu                                sync.RWMutex
+	validators                        map[string]*ValidatorEntry // hex(pubkey) → entry
+	dynamicMinNAPR                    uint64                     // 0 = use static MinStakeNAPR constant
+	securityHardeningActivationHeight uint64
+	utxos                             *UTXOSet // required for C-1 UTXO-backed deposit check
+	stakeWithdrawalGenesis            crypto.Hash32
+	stakeWithdrawalActivation         uint64
+	stakeKeyImageActivation           uint64
+	signatureFork                     atomic.Pointer[ValidatorAuthorityFork]
+	signatureAdmissionHeight          atomic.Uint64
 }
 
 // ConfigureStakeWithdrawalV2 binds the registry to the quorum-attested LPoD
@@ -683,6 +684,14 @@ func (r *ValidatorRegistry) SetUTXOSet(utxos *UTXOSet) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.utxos = utxos
+}
+
+// SetSecurityHardeningActivationHeight coordinates deterministic stake-tie
+// breaking with the network's consensus hardening fork.
+func (r *ValidatorRegistry) SetSecurityHardeningActivationHeight(height uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.securityHardeningActivationHeight = height
 }
 
 // UpdateMinStake recalculates the minimum stake from the current APRO market
@@ -2116,6 +2125,8 @@ func (r *ValidatorRegistry) UpdateEpoch(height uint64) []crypto.ValidatorPubKey 
 	defer r.mu.Unlock()
 
 	currentEpoch := height / EpochLength
+	deterministicTies := r.securityHardeningActivationHeight > 0 &&
+		height >= r.securityHardeningActivationHeight
 
 	// 1. Release fully-unbonded validators and clean up completed partial unbonding entries
 	for _, e := range r.validators {
@@ -2149,7 +2160,7 @@ func (r *ValidatorRegistry) UpdateEpoch(height uint64) []crypto.ValidatorPubKey 
 		if slots > ChurnLimit {
 			slots = ChurnLimit
 		}
-		pending := r.sortedPendingLocked()
+		pending := r.sortedPendingLocked(deterministicTies)
 		activated := 0
 		for _, e := range pending {
 			if activated >= slots {
@@ -2163,14 +2174,14 @@ func (r *ValidatorRegistry) UpdateEpoch(height uint64) []crypto.ValidatorPubKey 
 	}
 
 	// 4. Rebalance: demote lowest-stake active validators if > MaxValidators
-	r.rebalanceLocked()
+	r.rebalanceLocked(deterministicTies)
 
 	return r.activeSetLocked()
 }
 
 // rebalanceLocked demotes the lowest-stake active validators if over cap.
 // Must be called with r.mu held for writing.
-func (r *ValidatorRegistry) rebalanceLocked() {
+func (r *ValidatorRegistry) rebalanceLocked(deterministicTies bool) {
 	active := make([]*ValidatorEntry, 0)
 	for _, e := range r.validators {
 		if e.Status == ValidatorActive {
@@ -2181,7 +2192,13 @@ func (r *ValidatorRegistry) rebalanceLocked() {
 		return
 	}
 	sort.Slice(active, func(i, j int) bool {
-		return active[i].StakeNAPR > active[j].StakeNAPR
+		if active[i].StakeNAPR != active[j].StakeNAPR {
+			return active[i].StakeNAPR > active[j].StakeNAPR
+		}
+		if deterministicTies {
+			return active[i].PubKey.Hex() < active[j].PubKey.Hex()
+		}
+		return false
 	})
 	for i := MaxValidators; i < len(active); i++ {
 		active[i].Status = ValidatorPending
@@ -2191,7 +2208,7 @@ func (r *ValidatorRegistry) rebalanceLocked() {
 
 // sortedPendingLocked returns pending entries sorted by stake descending.
 // Must be called with r.mu held.
-func (r *ValidatorRegistry) sortedPendingLocked() []*ValidatorEntry {
+func (r *ValidatorRegistry) sortedPendingLocked(deterministicTies bool) []*ValidatorEntry {
 	out := make([]*ValidatorEntry, 0)
 	for _, e := range r.validators {
 		if e.Status == ValidatorPending {
@@ -2199,7 +2216,13 @@ func (r *ValidatorRegistry) sortedPendingLocked() []*ValidatorEntry {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].StakeNAPR > out[j].StakeNAPR
+		if out[i].StakeNAPR != out[j].StakeNAPR {
+			return out[i].StakeNAPR > out[j].StakeNAPR
+		}
+		if deterministicTies {
+			return out[i].PubKey.Hex() < out[j].PubKey.Hex()
+		}
+		return false
 	})
 	return out
 }

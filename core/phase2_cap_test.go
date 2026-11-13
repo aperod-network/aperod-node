@@ -170,6 +170,98 @@ func TestSpentDecoyPool_CapEnforced_ViaApplyBlock(t *testing.T) {
 		smallCap, smallCap+1)
 }
 
+// CLSAG hides the real ring position, so its state transition must not use the
+// bounded legacy spent-decoy pool as a reason to remove outputs from the active
+// anonymity set. Keep both the hidden spender and unrelated live outputs
+// available even when that pool is already full.
+func TestCLSAGSpendKeepsActiveOutputsWhenSpentDecoyPoolIsFull(t *testing.T) {
+	const smallCap = 1
+	originalCap := maxSpentDecoys
+	maxSpentDecoys = smallCap
+	defer func() { maxSpentDecoys = originalCap }()
+
+	blind, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatalf("NewBlindFactor: %v", err)
+	}
+	commit, err := crypto.Commit(200, blind)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	spender, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys spender: %v", err)
+	}
+	unrelated, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys unrelated: %v", err)
+	}
+	spentDecoy, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatalf("GenerateWalletKeys spent decoy: %v", err)
+	}
+	keyImage, err := crypto.ComputeKeyImage(spender.Spend.Private, spender.Spend.Public)
+	if err != nil {
+		t.Fatalf("ComputeKeyImage: %v", err)
+	}
+
+	utxos := NewUTXOSet()
+	utxos.Add(&UTXO{
+		TxHash: crypto.Hash32{0xA1}, OutputIndex: 0,
+		OneTimePub: spender.Spend.Public, AmountCommit: commit,
+	})
+	utxos.Add(&UTXO{
+		TxHash: crypto.Hash32{0xA2}, OutputIndex: 0,
+		OneTimePub: unrelated.Spend.Public, AmountCommit: commit,
+	})
+	utxos.AddSpentDecoyForTest(&UTXO{
+		TxHash: crypto.Hash32{0xA3}, OutputIndex: 0,
+		OneTimePub: spentDecoy.Spend.Public, AmountCommit: commit,
+	})
+	if got := utxos.SpentDecoyCount(); got != smallCap {
+		t.Fatalf("spent-decoy pool count = %d, want cap %d", got, smallCap)
+	}
+
+	block := &Block{
+		Header: BlockHeader{Height: 2},
+		Txs: []Transaction{{
+			Version: TxVersionCLSAG,
+			Inputs: []RingInput{{
+				Ring:         []crypto.Point32{spender.Spend.Public, spentDecoy.Spend.Public},
+				AmountCommit: commit,
+				KeyImage:     keyImage,
+			}},
+		}},
+	}
+	if err := utxos.ApplyBlock(block); err != nil {
+		t.Fatalf("ApplyBlock CLSAG spend: %v", err)
+	}
+
+	for _, pub := range []crypto.Point32{spender.Spend.Public, unrelated.Spend.Public} {
+		if utxos.GetByPubKey(pub) == nil {
+			t.Fatalf("active CLSAG ring output %x was removed when the decoy pool was full", pub[:4])
+		}
+	}
+	if got := utxos.Count(); got != 2 {
+		t.Fatalf("active UTXO count = %d, want 2", got)
+	}
+	if got := utxos.SpentDecoyCount(); got != smallCap {
+		t.Fatalf("spent-decoy pool count after CLSAG = %d, want cap %d", got, smallCap)
+	}
+
+	sampled := utxos.SampleCLSAGDecoys(3, nil)
+	seen := make(map[crypto.Point32]bool, len(sampled))
+	for _, candidate := range sampled {
+		seen[candidate.OneTimePub] = true
+	}
+	for _, pub := range []crypto.Point32{spender.Spend.Public, unrelated.Spend.Public} {
+		if !seen[pub] {
+			t.Fatalf("active output %x was not eligible for CLSAG sampling", pub[:4])
+		}
+	}
+}
+
 // TestSpentDecoyPool_FallbackDecoyCount_ExactMinimum verifies that when the
 // spent-decoy pool contains exactly RingSize-1 = 15 entries — the minimum
 // needed to fill all decoy slots of one ring — TxBuilder.Build returns

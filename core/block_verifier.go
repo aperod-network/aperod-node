@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+const (
+	MaxTransactionsPerBlock = 2_000
+	MaxBlockBytes           = 4 * 1024 * 1024
+)
+
 // BlockVerifierConfig holds parameters for block validation.
 type BlockVerifierConfig struct {
 	// MaxBlockTime is the maximum allowed future timestamp for a block.
@@ -18,6 +23,9 @@ type BlockVerifierConfig struct {
 	MaxTxsPerBlock int
 	// MaxBlockSize in bytes.
 	MaxBlockSize int
+	// SecurityHardeningActivationHeight delays consensus block limits until
+	// the coordinated fork. Zero preserves the legacy immediate precheck.
+	SecurityHardeningActivationHeight uint64
 }
 
 // DefaultBlockVerifierConfig returns safe production defaults.
@@ -25,8 +33,8 @@ func DefaultBlockVerifierConfig() BlockVerifierConfig {
 	return BlockVerifierConfig{
 		MaxBlockTime:   2 * time.Second,  // reject blocks > 2s in the future
 		MaxPastDrift:   30 * time.Second, // reject blocks > 30s in the past (anti-timejacking)
-		MaxTxsPerBlock: 2000,
-		MaxBlockSize:   4 * 1024 * 1024, // 4 MB
+		MaxTxsPerBlock: MaxTransactionsPerBlock,
+		MaxBlockSize:   MaxBlockBytes,
 	}
 }
 
@@ -88,14 +96,19 @@ func (v *BlockVerifier) VerifyBlock(block *Block) error {
 		}
 	}
 
-	// 4. Tx limits
-	if len(block.Txs) > v.cfg.MaxTxsPerBlock {
-		return fmt.Errorf("block %d: too many txs: %d > %d",
-			block.Header.Height, len(block.Txs), v.cfg.MaxTxsPerBlock)
-	}
-	if size := block.Size(); size > v.cfg.MaxBlockSize {
-		return fmt.Errorf("block %d: too large: %d bytes > %d",
-			block.Header.Height, size, v.cfg.MaxBlockSize)
+	// 4. Tx limits. Mainnet can stage the new consensus limits at a coordinated
+	// height while preserving historical block verification before that height.
+	limitsActive := v.cfg.SecurityHardeningActivationHeight == 0 ||
+		block.Header.Height >= v.cfg.SecurityHardeningActivationHeight
+	if limitsActive {
+		if len(block.Txs) > v.cfg.MaxTxsPerBlock {
+			return fmt.Errorf("block %d: too many txs: %d > %d",
+				block.Header.Height, len(block.Txs), v.cfg.MaxTxsPerBlock)
+		}
+		if size := block.Size(); size > v.cfg.MaxBlockSize {
+			return fmt.Errorf("block %d: too large: %d bytes > %d",
+				block.Header.Height, size, v.cfg.MaxBlockSize)
+		}
 	}
 
 	// 5. Cryptographic tx verification

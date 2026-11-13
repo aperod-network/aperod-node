@@ -48,6 +48,7 @@ type Config struct {
 	APIAddr                                       string
 	APIEnabled                                    bool
 	StakedCollateralRingExclusionActivationHeight uint64
+	SecurityHardeningActivationHeight             uint64
 }
 
 // New creates a fully initialized (but not yet started) node.
@@ -147,7 +148,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	// Wire the verifier into the mempool so P2P-submitted transactions are
 	// fully verified (ring sigs, range proofs, vesting locks) before entering.
 	mempool.SetVerifier(txV)
-	blockV := core.NewBlockVerifier(core.DefaultBlockVerifierConfig(), chain, txV)
+	blockVerifierConfig := core.DefaultBlockVerifierConfig()
+	blockVerifierConfig.SecurityHardeningActivationHeight = cfg.SecurityHardeningActivationHeight
+	blockV := core.NewBlockVerifier(blockVerifierConfig, chain, txV)
 
 	// ── Validator key ─────────────────────────────────────────────────────────
 	var myKey *crypto.LockedValidatorKey
@@ -184,11 +187,12 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	// ── Consensus engine ──────────────────────────────────────────────────────
 	voteBroadcastCh := make(chan consensus.FinalizeMsg, 16)
 	engine := consensus.NewEngine(consensus.Config{
-		BlockTime:    cfg.BlockTime,
-		BFTThreshold: genesisCfg.BFTThreshold,
-		Validators:   validators,
-		MyKey:        myKey,
-		Store:        db,
+		BlockTime:                         cfg.BlockTime,
+		SecurityHardeningActivationHeight: cfg.SecurityHardeningActivationHeight,
+		BFTThreshold:                      genesisCfg.BFTThreshold,
+		Validators:                        validators,
+		MyKey:                             myKey,
+		Store:                             db,
 		// Persist every self-produced block synchronously inside tick()
 		// so the produced-block channel is only used for P2P broadcast.
 		OnBlockProduced: func(b *core.Block) error {
@@ -298,7 +302,7 @@ func (n *Node) broadcastLoop() {
 	defer ticker.Stop()
 	broadcastVote := func(vote consensus.FinalizeMsg) {
 		n.host.BroadcastVote(p2p.VoteMsg{
-			BlockHash: vote.BlockHash, Height: vote.Height,
+			BlockHash: vote.BlockHash, Height: vote.Height, Version: vote.Version,
 			ValidatorPub: append([]byte(nil), vote.ValidatorPub[:]...),
 			Signature:    append([]byte(nil), vote.Signature...),
 		})
@@ -506,12 +510,16 @@ func (a *p2pAdapter) OnBlock(block *core.Block) {
 		a.log.Warn("p2p: invalid block rejected", "height", block.Header.Height, "err", err)
 		return
 	}
-	// Forward to consensus engine
-	select {
-	case a.engine.NewBlockCh() <- block:
-	default:
-		a.log.Warn("p2p: consensus block channel full, dropping block", "height", block.Header.Height)
+	if err := a.OnBlockWithResult(block); err != nil {
+		a.log.Warn("p2p: consensus rejected incoming block", "height", block.Header.Height, "err", err)
 	}
+}
+
+// OnBlockWithResult lets the sync loop distinguish consensus acceptance from
+// merely queueing a block. The host uses this acknowledgement before clearing
+// its outstanding request or relaying the block.
+func (a *p2pAdapter) OnBlockWithResult(block *core.Block) error {
+	return a.engine.SubmitIncomingBlock(block)
 }
 
 func (a *p2pAdapter) ValidateBlock(block *core.Block) error {
@@ -567,15 +575,14 @@ func (a *p2pAdapter) OnVote(vote p2p.VoteMsg) {
 		a.log.Warn("p2p: invalid vote pub key", "err", err)
 		return
 	}
-	select {
-	case a.engine.NewVoteCh() <- consensus.FinalizeMsg{
+	if !a.engine.SubmitVote(consensus.FinalizeMsg{
 		BlockHash:    vote.BlockHash,
 		Height:       vote.Height,
+		Version:      vote.Version,
 		ValidatorPub: pub,
 		Signature:    vote.Signature,
-	}:
-	default:
-		a.log.Warn("p2p: vote channel full")
+	}) {
+		a.log.Warn("p2p: vote rejected because consensus engine stopped", "height", vote.Height)
 	}
 }
 

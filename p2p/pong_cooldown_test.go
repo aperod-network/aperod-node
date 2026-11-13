@@ -50,6 +50,13 @@ func TestPongCooldown_SuppressesRedundantRequestHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	tcpLn, ok := ln.(*net.TCPListener)
+	if !ok {
+		t.Fatalf("listen returned %T, want *net.TCPListener", ln)
+	}
+	if err := tcpLn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set listener deadline: %v", err)
+	}
 	defer ln.Close()
 
 	serverDone := make(chan struct{})
@@ -131,6 +138,7 @@ func TestPongCooldown_SuppressesRedundantRequestHeaders(t *testing.T) {
 	// Catching host: always at height 0 (stubHandler never advances).
 	catchingHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		Bootnodes:            []string{ln.Addr().String()},
 		MaxPeers:             5,
 		NodeID:               "catching-node",
 		UserAgent:            "aperod/test",
@@ -186,6 +194,13 @@ func TestPongCooldown_SelfHealFallback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	tcpLn, ok := ln.(*net.TCPListener)
+	if !ok {
+		t.Fatalf("listen returned %T, want *net.TCPListener", ln)
+	}
+	if err := tcpLn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set listener deadline: %v", err)
 	}
 	defer ln.Close()
 
@@ -274,6 +289,7 @@ func TestPongCooldown_SelfHealFallback(t *testing.T) {
 
 	catchingHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		Bootnodes:            []string{ln.Addr().String()},
 		MaxPeers:             5,
 		NodeID:               "catching-node",
 		UserAgent:            "aperod/test",

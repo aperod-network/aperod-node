@@ -4,6 +4,7 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,15 +92,14 @@ type Config struct {
 	// BlockRewardNAPR is the block reward in base units (nAPRO).
 	// In pool mode the deployed value is 300_000_000 nAPRO = 3 APRO.
 	BlockRewardNAPR uint64
-	// OracleURL is the HTTP endpoint from which the node fetches the current
-	// APRO/USD price before embedding it in each produced block header.
+	// OracleURL is the producer's HTTP endpoint for fetching APRO/USD before
+	// embedding it in a block header. Post-hardening validation does not fetch it.
 	// Expected response: JSON object with a numeric "price_usd" field.
-	// If empty, oracle price embedding is skipped (OraclePrice = 0).
+	// If empty, a producer emits OraclePrice = 0, which is rejected after the fork.
 	OracleURL string
-	// OracleMaxDeviation is the maximum allowed fractional deviation between
-	// a peer's embedded OraclePrice and our own local price (e.g. 0.05 = 5%).
-	// Incoming blocks whose price deviates beyond this are rejected.
-	// Zero (default) disables the deviation check.
+	// OracleMaxDeviation is the legacy pre-hardening fractional deviation against
+	// a node's local feed. Post-hardening consensus uses a fixed 5% parent-price
+	// limit so configuration and feed availability cannot change validation.
 	OracleMaxDeviation float64
 
 	// TimestampBanThreshold is the number of future-timestamped blocks that
@@ -157,10 +158,14 @@ type Config struct {
 	// AVMExecutor performs deterministic block preparation. It is mandatory
 	// once AVMActivationHeight is reached.
 	AVMExecutor *avm.BlockExecutor
-	// RewardAuthorizationActivationHeight is the first height at which
-	// validator rewards must carry a consensus-verifiable on-chain
-	// authorization. Zero keeps the authorization feature disabled.
+	// RewardAuthorizationActivationHeight optionally overrides the first height
+	// at which rewards require on-chain authorization. Zero uses the security
+	// hardening activation height.
 	RewardAuthorizationActivationHeight uint64
+	// SecurityHardeningActivationHeight is the shared height for deterministic
+	// validator tie-breaking, output-key uniqueness, block limits, and oracle
+	// checks that depend only on the canonical parent block.
+	SecurityHardeningActivationHeight uint64
 	// GuardianFundActivationHeight and GuardianFundChainAnchor gate the
 	// consensus-synthesized, protocol-locked 1B APRO allocation. ChainAnchor
 	// is always the canonical genesis block hash, never the activation parent.
@@ -175,9 +180,92 @@ type Config struct {
 type FinalizeMsg struct {
 	BlockHash    crypto.Hash32
 	Height       uint64
+	Version      uint8
 	ValidatorPub crypto.ValidatorPubKey
 	Signature    []byte
 }
+
+type voteSlot struct {
+	hash      crypto.Hash32
+	signature []byte
+	version   uint8
+}
+
+type finalityCommittee struct {
+	validators   []crypto.ValidatorPubKey
+	thresholdPPM uint32
+}
+
+func (e *Engine) expectedFinalityVoteVersion(height uint64) uint8 {
+	if activation := e.cfg.SecurityHardeningActivationHeight; activation > 0 && height >= activation {
+		return crypto.FinalityVoteVersionHeightBound
+	}
+	return crypto.FinalityVoteVersionLegacy
+}
+
+// finalityCommitteeLocked returns the immutable committee snapshot for the
+// epoch containing height. Callers hold e.mu.
+func (e *Engine) finalityCommitteeLocked(height uint64, persist bool) (finalityCommittee, error) {
+	epoch := height / core.EpochLength
+	if e.voteCommittees == nil {
+		e.voteCommittees = make(map[uint64]finalityCommittee)
+	}
+	if snapshot, ok := e.voteCommittees[epoch]; ok {
+		return snapshot, nil
+	}
+	if e.cfg.Store != nil {
+		persisted, err := e.cfg.Store.LoadFinalityCommitteeSnapshot(epoch)
+		if err != nil {
+			return finalityCommittee{}, err
+		}
+		if persisted != nil {
+			snapshot := finalityCommittee{
+				validators: persisted.Validators, thresholdPPM: persisted.BFTThresholdPPM,
+			}
+			e.voteCommittees[epoch] = snapshot
+			return snapshot, nil
+		}
+	}
+
+	validators := append([]crypto.ValidatorPubKey(nil), e.activeValidators()...)
+	if len(validators) == 0 {
+		return finalityCommittee{}, fmt.Errorf("finality: no active validators for epoch %d", epoch)
+	}
+	sort.Slice(validators, func(i, j int) bool {
+		return bytes.Compare(validators[i], validators[j]) < 0
+	})
+	thresholdPPM := uint32(math.Round(e.cfg.BFTThreshold * 1_000_000))
+	if thresholdPPM == 0 || thresholdPPM > 1_000_000 {
+		return finalityCommittee{}, fmt.Errorf("finality: invalid BFT threshold %v", e.cfg.BFTThreshold)
+	}
+	snapshot := finalityCommittee{validators: validators, thresholdPPM: thresholdPPM}
+	if persist && e.cfg.Store != nil {
+		if err := e.cfg.Store.SaveFinalityCommitteeSnapshot(store.FinalityCommitteeSnapshot{
+			Version: 1, Epoch: epoch, Validators: validators, BFTThresholdPPM: thresholdPPM,
+		}); err != nil {
+			return finalityCommittee{}, err
+		}
+	}
+	if persist {
+		e.voteCommittees[epoch] = snapshot
+	}
+	return snapshot, nil
+}
+
+func finalityCommitteeContains(committee finalityCommittee, validator crypto.ValidatorPubKey) bool {
+	for _, member := range committee.validators {
+		if member.Equals(validator) {
+			return true
+		}
+	}
+	return false
+}
+
+func finalityQuorumSize(committee finalityCommittee) int {
+	return int(uint64(len(committee.validators))*uint64(committee.thresholdPPM)/1_000_000) + 1
+}
+
+const candidateVoteLimit = 4096
 
 type futureVoteKey struct {
 	height uint64
@@ -191,6 +279,11 @@ const (
 )
 
 // Engine is the PoA consensus engine.
+type incomingBlockSubmission struct {
+	block  *core.Block
+	result chan error
+}
+
 type Engine struct {
 	lpodFinalizedHashes map[uint64]crypto.Hash32
 	cfg                 Config
@@ -205,6 +298,13 @@ type Engine struct {
 	barrierLogged bool
 	// votes collected for each block hash: pubkey hex → signature
 	votes map[crypto.Hash32]map[string][]byte
+	// votesByHeight retains the first authenticated vote from each validator
+	// at a height so conflicting hashes cannot both contribute to quorum.
+	votesByHeight  map[uint64]map[string]voteSlot
+	voteCommittees map[uint64]finalityCommittee
+	// candidateVotesByHeight holds authenticated, non-canonical vote candidates
+	// separately so they can prove equivocation without blocking canonical votes.
+	candidateVotesByHeight map[uint64]map[string]voteSlot
 	// finalized tracks which heights have been finalized
 	finalized map[uint64]bool
 	// slashing detector for double-sign evidence
@@ -268,9 +368,12 @@ type Engine struct {
 	cachedOraclePrice uint64
 
 	// Channels for external events
-	newBlockCh chan *core.Block // incoming blocks from P2P
-	newVoteCh  chan FinalizeMsg // incoming finalization votes
-	producedCh chan *core.Block // blocks produced by this node (for broadcast)
+	newBlockCh       chan *core.Block // incoming blocks from legacy/internal callers
+	submittedBlockCh chan incomingBlockSubmission
+	newVoteCh        chan FinalizeMsg // incoming finalization votes
+	producedCh       chan *core.Block // blocks produced by this node (for broadcast)
+	done             chan struct{}
+	doneOnce         sync.Once
 
 	// ── Admin mint scheduling ────────────────────────────────────────────────
 	// Admin mints must be built at block-production time so the one-time pub
@@ -353,6 +456,9 @@ const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
 	cfg.ValidatorAuthorityFork = cfg.ValidatorAuthorityFork.Clone()
+	if cfg.Registry != nil {
+		cfg.Registry.SetSecurityHardeningActivationHeight(cfg.SecurityHardeningActivationHeight)
+	}
 	if cfg.SaleTransactions == nil && cfg.SaleMigration != nil && cfg.Store != nil &&
 		cfg.MyKey != nil && cfg.MyKey.Public().Equals(cfg.SaleMigration.Checkpoint.SaleAuthority) {
 		cfg.SaleTransactions = func(height uint64, parent crypto.Hash32) ([]core.Transaction, error) {
@@ -383,23 +489,28 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		adminMintStore = cfg.Store
 	}
 	e := &Engine{
-		cfg:               cfg,
-		chain:             chain,
-		pool:              pool,
-		log:               log,
-		votes:             make(map[crypto.Hash32]map[string][]byte),
-		finalized:         make(map[uint64]bool),
-		pendingVoteHeight: make(map[crypto.Hash32]uint64),
-		futureVotes:       make(map[futureVoteKey]FinalizeMsg),
-		slashing:          newSlashingDetector(),
-		baseFee:           core.InitialBaseFeePerByte,
-		newBlockCh:        make(chan *core.Block, 600),
-		newVoteCh:         make(chan FinalizeMsg, 256),
-		producedCh:        make(chan *core.Block, 64),
-		tsPerValidator:    make(map[string]int),
-		mintByKey:         make(map[string]*adminMintReq),
-		store:             cfg.Store,
-		adminMintStore:    adminMintStore,
+		cfg:                    cfg,
+		chain:                  chain,
+		pool:                   pool,
+		log:                    log,
+		votes:                  make(map[crypto.Hash32]map[string][]byte),
+		votesByHeight:          make(map[uint64]map[string]voteSlot),
+		voteCommittees:         make(map[uint64]finalityCommittee),
+		candidateVotesByHeight: make(map[uint64]map[string]voteSlot),
+		finalized:              make(map[uint64]bool),
+		pendingVoteHeight:      make(map[crypto.Hash32]uint64),
+		futureVotes:            make(map[futureVoteKey]FinalizeMsg),
+		slashing:               newSlashingDetector(),
+		baseFee:                core.InitialBaseFeePerByte,
+		done:                   make(chan struct{}),
+		newBlockCh:             make(chan *core.Block, 600),
+		submittedBlockCh:       make(chan incomingBlockSubmission, 600),
+		newVoteCh:              make(chan FinalizeMsg, 256),
+		producedCh:             make(chan *core.Block, 64),
+		tsPerValidator:         make(map[string]int),
+		mintByKey:              make(map[string]*adminMintReq),
+		store:                  cfg.Store,
+		adminMintStore:         adminMintStore,
 	}
 	if err := e.validateAuthorityFork(); err != nil {
 		e.halted.Store(true)
@@ -418,6 +529,10 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 	if err := e.restoreFinalityCertificate(); err != nil {
 		e.halted.Store(true)
 		log.Warn("finality certificate not restored; finality remains fail-closed", "err", err)
+	}
+	if err := e.restoreFinalityVotes(); err != nil {
+		e.halted.Store(true)
+		log.Warn("persisted finality votes could not be restored; consensus halted", "err", err)
 	}
 	if err := e.restoreLocalFinalityVote(); err != nil {
 		e.halted.Store(true)
@@ -512,7 +627,7 @@ func (e *Engine) RewardMode() string {
 // staking-pool and tail-emission configuration.
 func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 	height := e.chain.Height() + 1
-	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 &&
+	if activation := e.rewardAuthorizationActivationHeight(); activation > 0 &&
 		height >= activation && !e.lpodActive(height) {
 		if e.usesHistoricalMainnetReward(height) {
 			return DefaultPoolBlockRewardNAPR
@@ -520,6 +635,13 @@ func (e *Engine) CurrentBlockRewardNAPR() uint64 {
 		return blockRewardAtHeight(AuthorizedBlockRewardNAPR, height)
 	}
 	return e.blockRewardNAPRAt(height)
+}
+
+func (e *Engine) rewardAuthorizationActivationHeight() uint64 {
+	if e.cfg.RewardAuthorizationActivationHeight > 0 {
+		return e.cfg.RewardAuthorizationActivationHeight
+	}
+	return e.cfg.SecurityHardeningActivationHeight
 }
 
 func (e *Engine) blockRewardNAPRAt(height uint64) uint64 {
@@ -561,7 +683,7 @@ func (e *Engine) DecrementPool(height uint64) {
 	if e.stakingPoolInit == 0 {
 		return // pool disabled
 	}
-	if activation := e.cfg.RewardAuthorizationActivationHeight; activation > 0 && height >= activation {
+	if activation := e.rewardAuthorizationActivationHeight(); activation > 0 && height >= activation {
 		return // legacy local pool accounting is not consensus state in the authorization era
 	}
 	baseReward := e.cfg.BlockRewardNAPR
@@ -614,6 +736,7 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.txVerifier = v
 	e.utxos = utxos
 	if v != nil {
+		v.SetSecurityHardeningActivationHeight(e.cfg.SecurityHardeningActivationHeight)
 		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
 		v.SetLPoDDailyUpgradeHeight(e.cfg.LPoDDailyUpgradeHeight)
 	}
@@ -656,6 +779,7 @@ func (e *Engine) runOracleFetcher(stop <-chan struct{}) {
 
 // Run starts the consensus loop. Blocks until ctx is done.
 func (e *Engine) Run(stop <-chan struct{}) {
+	defer e.doneOnce.Do(func() { close(e.done) })
 	ticker := time.NewTicker(e.cfg.BlockTime)
 	defer ticker.Stop()
 
@@ -671,6 +795,7 @@ func (e *Engine) Run(stop <-chan struct{}) {
 		"bft_threshold", e.cfg.BFTThreshold,
 		"stop_producing_at_height", e.cfg.StopProducingAtHeight,
 	)
+	e.rebroadcastRestoredLocalVote()
 
 	for {
 		select {
@@ -688,12 +813,51 @@ func (e *Engine) Run(stop <-chan struct{}) {
 				e.log.Warn("incoming block rejected", "height", block.Header.Height, "err", err)
 			}
 
+		case submission := <-e.submittedBlockCh:
+			err := e.handleIncomingBlock(submission.block)
+			if err != nil {
+				e.log.Warn("incoming block rejected", "height", submission.block.Header.Height, "err", err)
+			}
+			submission.result <- err
+
 		case vote := <-e.newVoteCh:
 			if err := e.handleVote(vote); err != nil {
 				e.log.Warn("vote rejected", "height", vote.Height, "err", err)
 			}
 		}
 	}
+}
+
+// SubmitVote applies backpressure instead of dropping an authenticated peer
+// vote when the shared engine queue is full. It returns false only after the
+// consensus loop has stopped.
+func (e *Engine) SubmitVote(vote FinalizeMsg) bool {
+	select {
+	case e.newVoteCh <- vote:
+		return true
+	case <-e.done:
+		return false
+	}
+}
+
+func (e *Engine) rebroadcastRestoredLocalVote() {
+	if e.cfg.OnVoteCast == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.latestLocalVote == nil || e.finalized[e.latestLocalVote.Height] {
+		e.mu.Unlock()
+		return
+	}
+	vote := cloneFinalizeMsg(*e.latestLocalVote)
+	tip := e.chain.Tip()
+	e.mu.Unlock()
+	if tip == nil || tip.Header.Height < vote.Height || tip.Header.Height-vote.Height >= 256 {
+		return
+	}
+	// Re-emit the exact persisted signature. Never sign again for a historical
+	// height; the ancestry check ran when the vote was restored.
+	e.cfg.OnVoteCast(vote)
 }
 
 // tick is called once per block slot.
@@ -1173,22 +1337,55 @@ func (e *Engine) fetchOraclePrice() uint64 {
 	return uint64(math.Round(p.PriceUSD * oraclePriceScale))
 }
 
-// checkOraclePriceDeviation returns an error if the block's embedded oracle price
-// deviates from the local price by more than cfg.OracleMaxDeviation.
-// Skipped when OracleURL or OracleMaxDeviation are unset, or when either price is zero.
-func (e *Engine) checkOraclePriceDeviation(blockPrice uint64) error {
+// checkOraclePriceDeviation applies the legacy local-feed check before the
+// hardening fork. After activation, the parent block's committed price is the
+// reference so validators cannot disagree based on HTTP reachability or timing.
+func (e *Engine) checkOraclePriceDeviation(block *core.Block) error {
+	if block == nil {
+		return errors.New("nil block for oracle price check")
+	}
+	blockPrice := block.Header.OraclePrice
+	hardeningActive := e.cfg.SecurityHardeningActivationHeight > 0 &&
+		block.Header.Height >= e.cfg.SecurityHardeningActivationHeight
+	if hardeningActive {
+		if blockPrice == 0 {
+			return fmt.Errorf("oracle price is missing after hardening activation")
+		}
+		parent := e.chain.GetByHash(block.Header.PrevHash)
+		if parent == nil {
+			return fmt.Errorf("parent block unavailable for deterministic oracle price check")
+		}
+		referencePrice := parent.Header.OraclePrice
+		if referencePrice == 0 {
+			return fmt.Errorf("parent oracle price is missing at hardening activation")
+		}
+		difference := blockPrice - referencePrice
+		if blockPrice < referencePrice {
+			difference = referencePrice - blockPrice
+		}
+		// Strictly greater than 5% is rejected. Integer division avoids
+		// floating-point consensus decisions and overflow-prone multiplication.
+		if difference > referencePrice/20 {
+			return fmt.Errorf(
+				"oracle price deviation exceeds fixed 5%% limit: block=%d parent=%d",
+				blockPrice, referencePrice,
+			)
+		}
+		return nil
+	}
+
 	if e.cfg.OracleURL == "" || e.cfg.OracleMaxDeviation <= 0 || blockPrice == 0 {
 		return nil
 	}
-	localPrice := e.fetchOraclePrice()
-	if localPrice == 0 {
-		return nil // can't verify if we can't fetch our own price
+	referencePrice := e.fetchOraclePrice()
+	if referencePrice == 0 {
+		return nil // legacy rule: unavailable external feed cannot be checked
 	}
-	deviation := math.Abs(float64(blockPrice)-float64(localPrice)) / float64(localPrice)
+	deviation := math.Abs(float64(blockPrice)-float64(referencePrice)) / float64(referencePrice)
 	if deviation > e.cfg.OracleMaxDeviation {
 		return fmt.Errorf(
-			"oracle price deviation too large: block=%d local=%d deviation=%.2f%% (max %.2f%%)",
-			blockPrice, localPrice,
+			"oracle price deviation too large: block=%d reference=%d deviation=%.2f%% (max %.2f%%)",
+			blockPrice, referencePrice,
 			deviation*100, e.cfg.OracleMaxDeviation*100,
 		)
 	}
@@ -1259,7 +1456,7 @@ func (e *Engine) validateCoinbasePolicy(block *core.Block) error {
 		}
 	}
 
-	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
+	rewardActivation := e.rewardAuthorizationActivationHeight()
 	if rewardActivation > 0 && block.Header.Height >= rewardActivation {
 		expectedAmount, err := e.expectedAuthorizedRewardAmount(block)
 		if err != nil {
@@ -1691,7 +1888,7 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		return nil, err
 	}
 	raw := e.pool.SelectTxs(2000) // up to 2000 txs per block (verifier hard limit)
-	rewardActivation := e.cfg.RewardAuthorizationActivationHeight
+	rewardActivation := e.rewardAuthorizationActivationHeight()
 	rewardAuthorizationActive := rewardActivation > 0 && height >= rewardActivation
 
 	// Defense-in-depth: strip any NON-PRIVILEGED coinbase (zero-input) txs that
@@ -2103,7 +2300,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 
 	// Oracle price sanity check: reject blocks whose embedded price deviates
 	// too far from our local oracle reading (BFT oracle enforcement).
-	if err := e.checkOraclePriceDeviation(block.Header.OraclePrice); err != nil {
+	if err := e.checkOraclePriceDeviation(block); err != nil {
 		return fmt.Errorf("oracle price check failed: %w", err)
 	}
 
@@ -2410,7 +2607,17 @@ func (e *Engine) prepareAVMOnly(block *core.Block) (*avm.PreparedBlock, error) {
 // castVote signs and broadcasts a finalization vote for a block.
 func (e *Engine) castVote(block *core.Block) error {
 	hash := block.Hash()
-	msg := crypto.HashBytes([]byte("aperod/finalize/v1"), hash[:])
+	voteVersion := e.expectedFinalityVoteVersion(block.Header.Height)
+	e.mu.Lock()
+	committee, committeeErr := e.finalityCommitteeLocked(block.Header.Height, true)
+	if committeeErr == nil && !finalityCommitteeContains(committee, e.localIdentity(block.Header.Height)) {
+		committeeErr = fmt.Errorf("local validator is not in the finality committee at height %d", block.Header.Height)
+	}
+	e.mu.Unlock()
+	if committeeErr != nil {
+		return committeeErr
+	}
+	msg := crypto.FinalityVoteMessage(voteVersion, block.Header.Height, hash)
 	sig, err := e.cfg.MyKey.Sign(msg)
 	if err != nil {
 		return err
@@ -2418,6 +2625,7 @@ func (e *Engine) castVote(block *core.Block) error {
 	vote := FinalizeMsg{
 		BlockHash:    hash,
 		Height:       block.Header.Height,
+		Version:      voteVersion,
 		ValidatorPub: e.localIdentity(block.Header.Height),
 		Signature:    sig,
 	}
@@ -2429,6 +2637,7 @@ func (e *Engine) castVote(block *core.Block) error {
 		if err := e.cfg.Store.SaveLocalFinalityVote(store.LocalFinalityVote{
 			Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
 			Validator: vote.ValidatorPub, Signature: append([]byte(nil), vote.Signature...),
+			VoteVersion: vote.Version,
 		}); err != nil {
 			e.halted.Store(true)
 			return fmt.Errorf("finality: persist local vote: %w", err)
@@ -2446,23 +2655,56 @@ func (e *Engine) castVote(block *core.Block) error {
 
 // handleVote processes a finalization vote from any validator.
 func (e *Engine) handleVote(vote FinalizeMsg) error {
-	if !e.isKnownValidator(vote.ValidatorPub) {
-		return fmt.Errorf("vote from unknown validator %s", vote.ValidatorPub.ID())
+	if vote.Version == 0 {
+		vote.Version = crypto.FinalityVoteVersionLegacy
 	}
-
-	// Verify the vote signature
-	msg := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
+	if vote.Version != e.expectedFinalityVoteVersion(vote.Height) {
+		return fmt.Errorf("finality vote version %d is invalid at height %d",
+			vote.Version, vote.Height)
+	}
+	msg := crypto.FinalityVoteMessage(vote.Version, vote.Height, vote.BlockHash)
 	if !e.authority(vote.ValidatorPub, vote.Height).Verify(msg, vote.Signature) {
 		return fmt.Errorf("invalid vote signature from %s", vote.ValidatorPub.ID())
 	}
 
 	// A vote may race its block over P2P. Authenticate it before bounded staging;
-	// never infer finality until the exact block is accepted canonically.
+	// never persist an equivocation or infer finality until the exact block is
+	// accepted canonically. This prevents a valid signature for an invalid
+	// candidate block from poisoning the per-height vote index.
 	block := e.chain.GetByHeight(vote.Height)
-	if block == nil {
+	canonicalKnown := false
+	if block != nil {
+		if block.Header.Height != vote.Height || block.Hash() != vote.BlockHash {
+			e.noteNoncanonicalVote(vote)
+			return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+		}
+		canonicalKnown = true
+	} else if e.cfg.Store != nil {
+		canonicalHash, found, err := e.cfg.Store.GetCanonicalHash(vote.Height)
+		if err != nil {
+			return fmt.Errorf("finality: read canonical hash for vote height %d: %w", vote.Height, err)
+		}
+		if found {
+			if canonicalHash != vote.BlockHash {
+				e.noteNoncanonicalVote(vote)
+				return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+			}
+			canonicalKnown = true
+		}
+	}
+	if !canonicalKnown {
+		if !e.isKnownValidator(vote.ValidatorPub) {
+			return fmt.Errorf("vote from unknown validator %s", vote.ValidatorPub.ID())
+		}
 		tip := e.chain.Tip()
-		if tip == nil || vote.Height <= tip.Header.Height ||
-			tip.Header.Height > math.MaxUint64-futureVoteWindow ||
+		if tip == nil {
+			return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+		}
+		if vote.Height <= tip.Header.Height {
+			e.noteNoncanonicalVote(vote)
+			return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
+		}
+		if tip.Header.Height > math.MaxUint64-futureVoteWindow ||
 			vote.Height > tip.Header.Height+futureVoteWindow {
 			return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
 		}
@@ -2470,8 +2712,10 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 		// let a valid signature for an already-known block be rebound to a future
 		// height and staged as though it could identify a different block.
 		if e.chain.GetByHash(vote.BlockHash) != nil {
+			e.noteNoncanonicalVote(vote)
 			return fmt.Errorf("finality vote rebinds a known block hash to another height")
 		}
+		e.noteNoncanonicalVote(vote)
 		key := futureVoteKey{height: vote.Height, hash: vote.BlockHash, pub: vote.ValidatorPub.Hex()}
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -2484,30 +2728,77 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 		e.futureVotes[key] = cloneFinalizeMsg(vote)
 		return nil
 	}
-	if block.Header.Height != vote.Height || block.Hash() != vote.BlockHash {
-		return fmt.Errorf("finality vote does not identify a canonical block at its claimed height")
-	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.finalized[vote.Height] {
-		return nil // already finalized
+	epoch := vote.Height / core.EpochLength
+	if _, cached := e.voteCommittees[epoch]; !cached && e.cfg.Store != nil {
+		persisted, err := e.cfg.Store.LoadFinalityCommitteeSnapshot(epoch)
+		if err != nil {
+			return fmt.Errorf("finality: load committee snapshot for epoch %d: %w", epoch, err)
+		}
+		if persisted == nil {
+			tip := e.chain.Tip()
+			if tip == nil || epoch != tip.Header.Height/core.EpochLength {
+				return fmt.Errorf("finality: committee snapshot unavailable for historical epoch %d", epoch)
+			}
+		}
 	}
-
+	committee, err := e.finalityCommitteeLocked(vote.Height, true)
+	if err != nil {
+		return err
+	}
+	if !finalityCommitteeContains(committee, vote.ValidatorPub) {
+		return fmt.Errorf("vote from non-committee validator %s at height %d",
+			vote.ValidatorPub.ID(), vote.Height)
+	}
+	validatorID := vote.ValidatorPub.Hex()
+	if candidates := e.candidateVotesByHeight[vote.Height]; candidates != nil {
+		if candidate, found := candidates[validatorID]; found {
+			if candidate.hash != vote.BlockHash && candidate.version == crypto.FinalityVoteVersionHeightBound {
+				e.persistCandidateEquivocationLocked(vote, candidate)
+			}
+			delete(candidates, validatorID)
+			if len(candidates) == 0 {
+				delete(e.candidateVotesByHeight, vote.Height)
+			}
+		}
+	}
+	if err := e.checkVoteConflictLocked(vote); err != nil {
+		return err
+	}
+	if e.cfg.Store != nil {
+		if err := e.cfg.Store.SaveFinalityVote(store.PersistedFinalityVote{
+			Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
+			Validator: vote.ValidatorPub, Signature: append([]byte(nil), vote.Signature...),
+			VoteVersion: vote.Version,
+		}); err != nil {
+			return fmt.Errorf("finality: persist vote at height %d: %w", vote.Height, err)
+		}
+	}
+	if e.votesByHeight[vote.Height] == nil {
+		e.votesByHeight[vote.Height] = make(map[string]voteSlot)
+	}
+	if _, exists := e.votesByHeight[vote.Height][validatorID]; !exists {
+		e.votesByHeight[vote.Height][validatorID] = voteSlot{
+			hash: vote.BlockHash, signature: append([]byte(nil), vote.Signature...), version: vote.Version,
+		}
+	}
+	if e.finalized[vote.Height] {
+		return nil
+	}
 	if e.votes[vote.BlockHash] == nil {
 		e.votes[vote.BlockHash] = make(map[string][]byte)
 		// Record the height for this block hash so we can prune by height.
 		e.pendingVoteHeight[vote.BlockHash] = vote.Height
 	}
-	validatorID := vote.ValidatorPub.Hex()
-	if _, exists := e.votes[vote.BlockHash][validatorID]; exists {
-		return nil
+	if _, exists := e.votes[vote.BlockHash][validatorID]; !exists {
+		e.votes[vote.BlockHash][validatorID] = append([]byte(nil), vote.Signature...)
 	}
-	e.votes[vote.BlockHash][validatorID] = append([]byte(nil), vote.Signature...)
 
 	// Check if we've reached BFT threshold (2/3 of active validators)
-	needed := int(float64(len(e.activeValidators()))*e.cfg.BFTThreshold) + 1
+	needed := finalityQuorumSize(committee)
 	if len(e.votes[vote.BlockHash]) >= needed {
 		certificate := store.FinalityCertificate{
 			Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
@@ -2519,8 +2810,9 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 				return fmt.Errorf("finality: corrupt in-memory validator identity")
 			}
 			certificate.Votes = append(certificate.Votes, store.FinalityVote{
-				Validator: crypto.ValidatorPubKey(raw),
-				Signature: append([]byte(nil), signature...),
+				Validator:   crypto.ValidatorPubKey(raw),
+				Signature:   append([]byte(nil), signature...),
+				VoteVersion: e.votesByHeight[vote.Height][validatorHex].version,
 			})
 		}
 		if e.cfg.Store != nil {
@@ -2562,9 +2854,173 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 				delete(e.finalized, h)
 			}
 		}
+		for h := range e.votesByHeight {
+			if h < pruneBelow {
+				delete(e.votesByHeight, h)
+			}
+		}
+		for h := range e.candidateVotesByHeight {
+			if h < pruneBelow {
+				delete(e.candidateVotesByHeight, h)
+			}
+		}
+		for epoch := range e.voteCommittees {
+			if epoch < pruneBelow/core.EpochLength {
+				delete(e.voteCommittees, epoch)
+			}
+		}
 	}
 
 	return nil
+}
+
+// checkVoteConflictLocked records and rejects a validator's second distinct
+// height-bound vote. The caller must hold e.mu.
+func (e *Engine) checkVoteConflictLocked(vote FinalizeMsg) error {
+	validatorID := vote.ValidatorPub.Hex()
+	prior, exists := e.votesByHeight[vote.Height][validatorID]
+	if !exists && e.cfg.Store != nil {
+		persisted, err := e.cfg.Store.LoadFinalityVote(vote.Height, vote.ValidatorPub)
+		if err != nil {
+			return fmt.Errorf("finality: load prior vote at height %d: %w", vote.Height, err)
+		}
+		if persisted != nil {
+			prior = voteSlot{
+				hash: persisted.BlockHash, signature: append([]byte(nil), persisted.Signature...),
+				version: persisted.VoteVersion,
+			}
+			if e.votesByHeight[vote.Height] == nil {
+				e.votesByHeight[vote.Height] = make(map[string]voteSlot)
+			}
+			e.votesByHeight[vote.Height][validatorID] = prior
+			exists = true
+		}
+	}
+	if !exists || prior.hash == vote.BlockHash {
+		return nil
+	}
+	if prior.version != crypto.FinalityVoteVersionHeightBound ||
+		vote.Version != crypto.FinalityVoteVersionHeightBound {
+		// Legacy signatures do not bind the height, so a relayed legacy vote
+		// cannot safely prove same-height equivocation.
+		return nil
+	}
+	if e.cfg.Store != nil {
+		if err := e.cfg.Store.SaveVoteEquivocationEvidence(store.VoteEquivocationEvidence{
+			Version: 1, Height: vote.Height, Validator: vote.ValidatorPub,
+			BlockHash1: prior.hash, Signature1: append([]byte(nil), prior.signature...),
+			VoteVersion1: prior.version,
+			BlockHash2:   vote.BlockHash, Signature2: append([]byte(nil), vote.Signature...),
+			VoteVersion2: vote.Version,
+		}); err != nil {
+			e.halted.Store(true)
+			return fmt.Errorf("finality: persist vote equivocation evidence: %w", err)
+		}
+	}
+	e.log.Error("SLASHING: finality vote double-sign detected",
+		"height", vote.Height,
+		"validator", vote.ValidatorPub.ID(),
+		"hash1", fmt.Sprintf("%x", prior.hash[:]),
+		"hash2", fmt.Sprintf("%x", vote.BlockHash[:]),
+	)
+	return fmt.Errorf("vote equivocation detected for validator %s at height %d",
+		vote.ValidatorPub.ID(), vote.Height)
+}
+
+// noteNoncanonicalVote records a valid height-bound signature separately from
+// the canonical vote index. It may produce equivocation evidence, but can never
+// block a later canonical vote from contributing to quorum.
+func (e *Engine) noteNoncanonicalVote(vote FinalizeMsg) {
+	if vote.Version != crypto.FinalityVoteVersionHeightBound || !e.isKnownValidator(vote.ValidatorPub) {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	validatorID := vote.ValidatorPub.Hex()
+	prior, exists := e.votesByHeight[vote.Height][validatorID]
+	if !exists && e.cfg.Store != nil {
+		persisted, err := e.cfg.Store.LoadFinalityVote(vote.Height, vote.ValidatorPub)
+		if err != nil {
+			e.log.Warn("could not load prior finality vote while checking a candidate",
+				"height", vote.Height, "err", err)
+			return
+		}
+		if persisted != nil {
+			prior = voteSlot{
+				hash: persisted.BlockHash, signature: append([]byte(nil), persisted.Signature...),
+				version: persisted.VoteVersion,
+			}
+			exists = true
+		}
+	}
+	if exists {
+		if prior.hash != vote.BlockHash && prior.version == crypto.FinalityVoteVersionHeightBound {
+			e.persistCandidateEquivocationLocked(vote, prior)
+		}
+		return
+	}
+
+	if e.candidateVotesByHeight == nil {
+		e.candidateVotesByHeight = make(map[uint64]map[string]voteSlot)
+	}
+	candidates := e.candidateVotesByHeight[vote.Height]
+	if priorCandidate, found := candidates[validatorID]; found {
+		if priorCandidate.hash != vote.BlockHash {
+			e.persistCandidateEquivocationLocked(vote, priorCandidate)
+		}
+		return
+	}
+	count := 0
+	for _, perHeight := range e.candidateVotesByHeight {
+		count += len(perHeight)
+	}
+	if count >= candidateVoteLimit {
+		e.log.Warn("non-canonical finality candidate queue is full",
+			"height", vote.Height, "limit", candidateVoteLimit)
+		return
+	}
+	if candidates == nil {
+		candidates = make(map[string]voteSlot)
+		e.candidateVotesByHeight[vote.Height] = candidates
+	}
+	candidates[validatorID] = voteSlot{
+		hash: vote.BlockHash, signature: append([]byte(nil), vote.Signature...), version: vote.Version,
+	}
+}
+
+// Candidate evidence is advisory until the candidate block is canonical.
+// Failure to persist it must not halt the node or consume the canonical slot.
+func (e *Engine) persistCandidateEquivocationLocked(vote FinalizeMsg, prior voteSlot) {
+	if prior.version != crypto.FinalityVoteVersionHeightBound || e.cfg.Store == nil {
+		return
+	}
+	existing, err := e.cfg.Store.LoadVoteEquivocationEvidence(vote.Height, vote.ValidatorPub)
+	if err != nil {
+		e.log.Warn("could not load finality candidate equivocation evidence",
+			"height", vote.Height, "err", err)
+		return
+	}
+	if existing != nil {
+		return
+	}
+	if err := e.cfg.Store.SaveVoteEquivocationEvidence(store.VoteEquivocationEvidence{
+		Version: 1, Height: vote.Height, Validator: vote.ValidatorPub,
+		BlockHash1: prior.hash, Signature1: append([]byte(nil), prior.signature...),
+		VoteVersion1: prior.version,
+		BlockHash2:   vote.BlockHash, Signature2: append([]byte(nil), vote.Signature...),
+		VoteVersion2: vote.Version,
+	}); err != nil {
+		e.log.Warn("could not persist finality candidate equivocation evidence",
+			"height", vote.Height, "err", err)
+		return
+	}
+	e.log.Error("SLASHING: height-bound finality equivocation evidence recorded",
+		"height", vote.Height,
+		"validator", vote.ValidatorPub.ID(),
+		"hash1", fmt.Sprintf("%x", prior.hash[:]),
+		"hash2", fmt.Sprintf("%x", vote.BlockHash[:]),
+	)
 }
 
 func (e *Engine) restoreFinalityCertificate() error {
@@ -2628,26 +3084,44 @@ func (e *Engine) restoreFinalityCertificate() error {
 			return fmt.Errorf("finality: certified block body does not match the canonical height index")
 		}
 	}
-	active := e.activeValidators()
-	committeeMembers := active
+	var committeeSnapshot finalityCommittee
 	if e.cfg.FinalityMigration != nil {
 		migrationCommittee, err := e.verifyFinalityCommitteeMigration(certificate)
 		if err != nil {
 			return err
 		}
-		committeeMembers = migrationCommittee
+		committeeSnapshot = finalityCommittee{
+			validators:   migrationCommittee,
+			thresholdPPM: uint32(math.Round(e.cfg.BFTThreshold * 1_000_000)),
+		}
 	} else if len(e.cfg.FinalityMigrationTrustAuthorities) != 0 {
 		return fmt.Errorf("finality: migration authorities configured without a migration file")
+	} else {
+		e.mu.Lock()
+		var err error
+		committeeSnapshot, err = e.finalityCommitteeLocked(certificate.Height, false)
+		e.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
-	committee := make(map[string]bool, len(committeeMembers))
-	for _, validator := range committeeMembers {
+	committee := make(map[string]bool, len(committeeSnapshot.validators))
+	for _, validator := range committeeSnapshot.validators {
 		committee[validator.Hex()] = true
 	}
-	needed := int(float64(len(committeeMembers))*e.cfg.BFTThreshold) + 1
+	needed := finalityQuorumSize(committeeSnapshot)
 	seen := make(map[string]bool, len(certificate.Votes))
-	message := crypto.HashBytes([]byte("aperod/finalize/v1"), certificate.BlockHash[:])
 	for _, vote := range certificate.Votes {
 		id := vote.Validator.Hex()
+		voteVersion := vote.VoteVersion
+		if voteVersion == 0 {
+			voteVersion = crypto.FinalityVoteVersionLegacy
+		}
+		if voteVersion != e.expectedFinalityVoteVersion(certificate.Height) {
+			return fmt.Errorf("finality: certificate vote uses version %d at height %d",
+				voteVersion, certificate.Height)
+		}
+		message := crypto.FinalityVoteMessage(voteVersion, certificate.Height, certificate.BlockHash)
 		if !committee[id] || seen[id] || !e.authority(vote.Validator, certificate.Height).Verify(message, vote.Signature) {
 			return fmt.Errorf("finality: invalid, duplicate, or non-committee certificate vote")
 		}
@@ -2663,6 +3137,73 @@ func (e *Engine) restoreFinalityCertificate() error {
 		e.lpodFinalizedHashes = make(map[uint64]crypto.Hash32)
 	}
 	e.lpodFinalizedHashes[certificate.Height] = certificate.BlockHash
+	return nil
+}
+
+func (e *Engine) restoreFinalityVotes() error {
+	if e.cfg.Store == nil {
+		return nil
+	}
+	tip := e.chain.Tip()
+	if tip == nil {
+		return fmt.Errorf("finality: cannot restore votes without a canonical tip")
+	}
+	currentEpoch := tip.Header.Height / core.EpochLength
+	const votePruneDepth uint64 = 256
+	minHeight := uint64(0)
+	if tip.Header.Height >= votePruneDepth {
+		minHeight = tip.Header.Height - votePruneDepth + 1
+	}
+	votes, err := e.cfg.Store.LoadFinalityVotes(minHeight, tip.Header.Height)
+	if err != nil {
+		return err
+	}
+	for _, persisted := range votes {
+		epoch := persisted.Height / core.EpochLength
+		committeeSnapshot, err := e.cfg.Store.LoadFinalityCommitteeSnapshot(epoch)
+		if err != nil {
+			return fmt.Errorf("restore finality committee at epoch %d: %w", epoch, err)
+		}
+		if committeeSnapshot == nil && epoch != currentEpoch {
+			// Old vote journals may predate committee snapshots. Never replay
+			// them against the current epoch's committee.
+			continue
+		}
+		voteVersion := persisted.VoteVersion
+		if voteVersion == 0 {
+			voteVersion = crypto.FinalityVoteVersionLegacy
+		}
+		if voteVersion != e.expectedFinalityVoteVersion(persisted.Height) {
+			return fmt.Errorf("persisted vote version %d does not match fork rules at height %d",
+				voteVersion, persisted.Height)
+		}
+		vote := FinalizeMsg{
+			Height: persisted.Height, BlockHash: persisted.BlockHash,
+			Version: voteVersion, ValidatorPub: persisted.Validator,
+			Signature: append([]byte(nil), persisted.Signature...),
+		}
+		message := crypto.FinalityVoteMessage(vote.Version, vote.Height, vote.BlockHash)
+		if !e.authority(vote.ValidatorPub, vote.Height).Verify(message, vote.Signature) {
+			return fmt.Errorf("persisted vote signature is invalid at height %d", vote.Height)
+		}
+		block := e.chain.GetByHeight(vote.Height)
+		canonical := block != nil && block.Header.Height == vote.Height && block.Hash() == vote.BlockHash
+		if block == nil {
+			canonicalHash, found, err := e.cfg.Store.GetCanonicalHash(vote.Height)
+			if err != nil {
+				return fmt.Errorf("restore finality vote: read canonical hash at height %d: %w", vote.Height, err)
+			}
+			canonical = found && canonicalHash == vote.BlockHash
+		}
+		if !canonical {
+			// A vote from a block removed by a canonical rollback is never
+			// restored into a new quorum or used to authorize a different tip.
+			continue
+		}
+		if err := e.handleVote(vote); err != nil {
+			return fmt.Errorf("restore finality vote at height %d: %w", vote.Height, err)
+		}
+	}
 	return nil
 }
 
@@ -2708,20 +3249,71 @@ func (e *Engine) restoreLocalFinalityVote() error {
 	if !e.isKnownValidator(vote.Validator) {
 		return fmt.Errorf("local vote signer is not a current validator")
 	}
-	message := crypto.HashBytes([]byte("aperod/finalize/v1"), vote.BlockHash[:])
+	voteVersion := vote.VoteVersion
+	if voteVersion == 0 {
+		voteVersion = crypto.FinalityVoteVersionLegacy
+	}
+	if voteVersion != e.expectedFinalityVoteVersion(vote.Height) {
+		return fmt.Errorf("local vote uses version %d at height %d, expected %d",
+			voteVersion, vote.Height, e.expectedFinalityVoteVersion(vote.Height))
+	}
+	message := crypto.FinalityVoteMessage(voteVersion, vote.Height, vote.BlockHash)
 	if !e.authority(vote.Validator, vote.Height).Verify(message, vote.Signature) {
 		return fmt.Errorf("local vote signature is invalid")
 	}
 	if err := e.verifyLocalVoteAncestry(vote.Height, vote.BlockHash); err != nil {
 		return err
 	}
+	if tip := e.chain.Tip(); tip == nil {
+		return fmt.Errorf("local vote restore requires a canonical tip")
+	} else if vote.Height/core.EpochLength != tip.Header.Height/core.EpochLength {
+		snapshot, err := e.cfg.Store.LoadFinalityCommitteeSnapshot(vote.Height / core.EpochLength)
+		if err != nil {
+			return fmt.Errorf("load local vote committee snapshot: %w", err)
+		}
+		if snapshot == nil {
+			return fmt.Errorf("local vote committee snapshot unavailable for historical epoch")
+		}
+	}
 	restored := FinalizeMsg{
 		Height: vote.Height, BlockHash: vote.BlockHash,
-		ValidatorPub: vote.Validator, Signature: append([]byte(nil), vote.Signature...),
+		Version: voteVersion, ValidatorPub: vote.Validator, Signature: append([]byte(nil), vote.Signature...),
 	}
 	e.mu.Lock()
+	committee, err := e.finalityCommitteeLocked(vote.Height, true)
+	if err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if !finalityCommitteeContains(committee, vote.Validator) {
+		e.mu.Unlock()
+		return fmt.Errorf("local vote signer is not in the persisted finality committee")
+	}
+	if e.votesByHeight[vote.Height] == nil {
+		e.votesByHeight[vote.Height] = make(map[string]voteSlot)
+	}
+	validatorID := vote.Validator.Hex()
+	if prior, exists := e.votesByHeight[vote.Height][validatorID]; exists &&
+		(prior.hash != vote.BlockHash || prior.version != voteVersion) {
+		e.mu.Unlock()
+		return fmt.Errorf("local finality vote conflicts with restored vote index at height %d", vote.Height)
+	}
+	e.votesByHeight[vote.Height][validatorID] = voteSlot{
+		hash: vote.BlockHash, signature: append([]byte(nil), vote.Signature...), version: voteVersion,
+	}
 	e.latestLocalVote = &restored
 	e.mu.Unlock()
+	if err := e.cfg.Store.SaveFinalityVote(store.PersistedFinalityVote{
+		Version: 1, Height: vote.Height, BlockHash: vote.BlockHash,
+		Validator: vote.Validator, Signature: append([]byte(nil), vote.Signature...),
+		VoteVersion: voteVersion,
+	}); err != nil {
+		return err
+	}
+	if tip := e.chain.Tip(); tip != nil &&
+		vote.Height/core.EpochLength == tip.Header.Height/core.EpochLength {
+		return e.handleVote(restored)
+	}
 	return nil
 }
 
@@ -2830,6 +3422,30 @@ func (e *Engine) isKnownValidator(pub crypto.ValidatorPubKey) bool {
 
 // NewBlockCh returns the channel for submitting incoming P2P blocks.
 func (e *Engine) NewBlockCh() chan<- *core.Block { return e.newBlockCh }
+
+// SubmitIncomingBlock submits a peer block and waits for the consensus engine
+// to accept or reject it. P2P sync must not mark a block as processed merely
+// because it was queued: consensus may reject it asynchronously.
+func (e *Engine) SubmitIncomingBlock(block *core.Block) error {
+	if block == nil {
+		return errors.New("cannot submit a nil incoming block")
+	}
+	result := make(chan error, 1)
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case e.submittedBlockCh <- incomingBlockSubmission{block: block, result: result}:
+	case <-timer.C:
+		return fmt.Errorf("timed out queueing incoming block at height %d", block.Header.Height)
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for consensus result at height %d", block.Header.Height)
+	}
+}
 
 // NewVoteCh returns the channel for submitting incoming P2P votes.
 func (e *Engine) NewVoteCh() chan<- FinalizeMsg { return e.newVoteCh }

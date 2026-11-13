@@ -23,6 +23,10 @@ const (
 	Devnet  Network = "devnet"
 )
 
+// MainnetSecurityHardeningActivationHeight is the coordinated height for the
+// consensus hardening bundle approved for mainnet.
+const MainnetSecurityHardeningActivationHeight uint64 = 3_800_000
+
 // SnapshotConfig controls snapshot integrity-check behavior.
 type SnapshotConfig struct {
 	// UTXOCountTolerancePct is the maximum allowed percentage difference
@@ -344,7 +348,7 @@ type ConsensusConfig struct {
 	BlockRewardNAPR              uint64        `yaml:"block_reward_napro"` // legacy pre-authorization reward in nAPRO; ignored after reward authorization activation.
 	BlockTime                    time.Duration `yaml:"block_time"`
 	OracleURL                    string        `yaml:"oracle_url"`           // HTTP endpoint returning {"price_usd": <float>}; empty = skip
-	OracleMaxDeviation           float64       `yaml:"oracle_max_deviation"` // max fractional price deviation (e.g. 0.05 = 5%); 0 = disabled
+	OracleMaxDeviation           float64       `yaml:"oracle_max_deviation"` // pre-hardening local-feed deviation; post-fork consensus uses a fixed 5% parent-price limit
 	// StopProducingAtHeight is an operator safety barrier: this validator will
 	// not propose blocks at or above this height. Zero disables the barrier.
 	// Relay/non-validator nodes should leave this unset.
@@ -383,10 +387,14 @@ type ConsensusConfig struct {
 	// StakedCollateralRingExclusionActivationHeight is the first block height
 	// whose CLSAG rings must exclude staked collateral. Zero disables this fork.
 	StakedCollateralRingExclusionActivationHeight uint64 `yaml:"staked_collateral_ring_exclusion_activation_height"`
-	// RewardAuthorizationActivationHeight is the first block height whose
-	// validator reward must carry an on-chain authorization. Zero disables the
-	// post-RingCT reward path; set the same future value on every validator.
+	// RewardAuthorizationActivationHeight is an optional explicit first block
+	// height for authorized rewards. Zero defers to the security hardening height.
 	RewardAuthorizationActivationHeight uint64 `yaml:"reward_authorization_activation_height"`
+	// SecurityHardeningActivationHeight activates deterministic validator tie
+	// breaking, output-key uniqueness, block limits, a fixed 5% oracle limit
+	// against the parent price, and reward authorization when its explicit
+	// height is zero. Mainnet must use the coordinated height.
+	SecurityHardeningActivationHeight uint64 `yaml:"security_hardening_activation_height"`
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
 	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
@@ -715,9 +723,32 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("stop_producing_at_height is only valid for validator nodes")
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
+	securityHardeningActivation := c.Consensus.SecurityHardeningActivationHeight
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
 	amountBindingActivation := c.Consensus.RingCTAmountBindingActivationHeight
+	if c.Network == Mainnet &&
+		securityHardeningActivation != MainnetSecurityHardeningActivationHeight {
+		return fmt.Errorf(
+			"mainnet security_hardening_activation_height must be %d",
+			MainnetSecurityHardeningActivationHeight,
+		)
+	}
+	if securityHardeningActivation > 0 && ringCTActivation > 0 &&
+		securityHardeningActivation < ringCTActivation {
+		return fmt.Errorf(
+			"security_hardening_activation_height (%d) must be >= ringct_v4_activation_height (%d)",
+			securityHardeningActivation, ringCTActivation,
+		)
+	}
+	if c.Network == Mainnet && securityHardeningActivation > 0 {
+		if c.Consensus.OracleMaxDeviation <= 0 {
+			return fmt.Errorf("oracle_max_deviation must be set for mainnet security hardening")
+		}
+		if !c.Consensus.NonValidator && c.Consensus.OracleURL == "" {
+			return fmt.Errorf("oracle_url must be set for mainnet validators with security hardening")
+		}
+	}
 	stakedRingActivation := c.Consensus.StakedCollateralRingExclusionActivationHeight
 	if c.Network == "mainnet" && stakedRingActivation == 0 {
 		return fmt.Errorf("mainnet nodes must configure staked_collateral_ring_exclusion_activation_height")
@@ -859,12 +890,17 @@ func (c *Config) Validate() error {
 			seen[string(raw)] = struct{}{}
 		}
 	}
-	if rewardActivation > 0 && !c.Consensus.NonValidator && c.Consensus.RewardAddress == "" {
+	rewardAuthorizationEnforcementActivation := rewardActivation
+	if rewardAuthorizationEnforcementActivation == 0 {
+		rewardAuthorizationEnforcementActivation = securityHardeningActivation
+	}
+	if rewardAuthorizationEnforcementActivation > 0 &&
+		!c.Consensus.NonValidator && c.Consensus.RewardAddress == "" {
 		return fmt.Errorf(
-			"reward_address must be set for validator nodes when reward_authorization_activation_height is enabled",
+			"reward_address must be set for validators when reward authorization is active",
 		)
 	}
-	if rewardActivation > 0 && !c.Consensus.NonValidator {
+	if rewardAuthorizationEnforcementActivation > 0 && !c.Consensus.NonValidator {
 		rewardNetwork, _, _, err := crypto.DecodeAddress(crypto.Address(c.Consensus.RewardAddress))
 		if err != nil {
 			return fmt.Errorf("invalid reward_address for reward authorization: %w", err)

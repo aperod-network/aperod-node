@@ -60,13 +60,13 @@ func TestOutboundAdmissionReservationThroughRegistration(t *testing.T) {
 			name: "MaxPeers",
 			cfg:  Config{MaxPeers: 2},
 			targetIP: func(i int) net.IP {
-				return net.IPv4(10, 0, 0, byte(i+1))
+				return net.IPv4(8, 8, 8, byte(i+1))
 			},
 		},
 		{
 			name:     "MaxPeersPerIP",
 			cfg:      Config{MaxPeers: 8, MaxPeersPerIP: 2},
-			targetIP: func(int) net.IP { return net.IPv4(10, 1, 0, 1) },
+			targetIP: func(int) net.IP { return net.IPv4(8, 8, 4, 4) },
 		},
 	}
 
@@ -189,10 +189,10 @@ func TestInboundAdmissionCountsOutboundReservation(t *testing.T) {
 				}
 			}
 		}()
-		return &admissionRemoteConn{Conn: local, remote: &net.TCPAddr{IP: net.IPv4(10, 2, 0, 1), Port: 32001}}, nil
+		return &admissionRemoteConn{Conn: local, remote: &net.TCPAddr{IP: net.IPv4(8, 8, 4, 4), Port: 32001}}, nil
 	}
 
-	h.dialPeer("10.2.0.1:32001")
+	h.dialPeer("8.8.4.4:32001")
 	waitAdmissionSignal(t, outboundAtRegister, "outbound reservation handoff")
 
 	hostSide, clientSide := net.Pipe()

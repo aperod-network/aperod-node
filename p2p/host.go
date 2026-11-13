@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -209,6 +210,18 @@ type Handler interface {
 	GetBlock(hash crypto.Hash32) *core.Block
 }
 
+// BlockAcceptanceHandler optionally reports the consensus result for a peer
+// block. Sync uses it to avoid treating an asynchronously rejected block as
+// successfully processed.
+type BlockAcceptanceHandler interface {
+	OnBlockWithResult(*core.Block) error
+}
+
+const (
+	syncRejectBackoffBase     = 3 * time.Second
+	syncRejectBackoffMaxShift = 4
+)
+
 // TransactionAdmissionHandler lets a node signal whether a transaction has
 // actually entered its mempool before the host relays it to other peers.
 type TransactionAdmissionHandler interface {
@@ -231,6 +244,26 @@ type SyncHeaderValidationHandler interface {
 type pendingBlockEntry struct {
 	sentAt       time.Time
 	headerHeight uint64 // block height from the header, for WARN log context
+}
+
+func (p *Peer) scheduleSyncRejectRetry(now time.Time) (time.Duration, bool) {
+	nowNS := now.UnixNano()
+	if retryAt := p.syncRetryAt.Load(); retryAt > nowNS {
+		return time.Duration(retryAt - nowNS), false
+	}
+	rejects := p.syncRejectCount.Add(1)
+	shift := rejects - 1
+	if shift > syncRejectBackoffMaxShift {
+		shift = syncRejectBackoffMaxShift
+	}
+	delay := syncRejectBackoffBase * time.Duration(uint32(1)<<shift)
+	p.syncRetryAt.Store(now.Add(delay).UnixNano())
+	return delay, true
+}
+
+func (p *Peer) resetSyncRejectRetry() {
+	p.syncRejectCount.Store(0)
+	p.syncRetryAt.Store(0)
 }
 
 // peerTokenBucket is a simple token-bucket rate limiter used to cap the
@@ -332,9 +365,18 @@ type Peer struct {
 	// automatically when the Peer is dereferenced on disconnect.
 	pendingBlocks map[crypto.Hash32]pendingBlockEntry
 
+	// syncRetryAt and syncRejectCount prevent immediate repeated requests from a
+	// peer whose blocks are being rejected by local consensus.
+	syncRetryAt     atomic.Int64
+	syncRejectCount atomic.Uint32
+
 	// ingestBucket throttles block ingestion from this peer.  Owned
 	// exclusively by the dispatch goroutine; no mutex needed.
 	ingestBucket peerTokenBucket
+	// voteBucket applies per-connection backpressure to MsgVote before
+	// deserialization or engine-channel admission. One validator normally
+	// emits no more than one vote per block interval.
+	voteBucket peerTokenBucket
 
 	// poisoned is set (under mu, atomically with the failing write) when a
 	// send left a partial frame on the wire.  Once poisoned the stream
@@ -504,6 +546,11 @@ type Host struct {
 	peers                    map[string]*Peer // addr → Peer
 	peerList                 []string         // known peer addrs
 	peerExchangeSourceCounts map[string]int
+	// whitelistDialTargets maps resolved host:port entries from the explicit
+	// startup whitelist to their original config entry. It is never populated
+	// from peer exchange, so private-address dial permission cannot be injected
+	// by MsgPeers.
+	whitelistDialTargets map[string]string
 
 	listener net.Listener
 	done     chan struct{}
@@ -794,6 +841,9 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 			wlNets = append(wlNets, ipNet)
 		} else if ip := net.ParseIP(entry); ip != nil {
 			wlIPs = append(wlIPs, ip)
+		} else if _, ok := dialableWhitelistAddr(entry); ok {
+			// A host:port entry is an outbound startup peer, not an inbound
+			// address/CIDR whitelist rule.
 		} else {
 			log.Warn("peer_whitelist: ignoring unparseable entry", "entry", entry)
 		}
@@ -810,6 +860,7 @@ func NewHost(cfg Config, handler Handler, log *slog.Logger) *Host {
 		log:                      log,
 		peers:                    make(map[string]*Peer),
 		peerExchangeSourceCounts: make(map[string]int),
+		whitelistDialTargets:     make(map[string]string),
 		done:                     make(chan struct{}),
 		mgr:                      newPeerMgrWithFile(cfg.BanFile),
 		gossip:                   NewGossipFilter(),
@@ -1642,6 +1693,11 @@ func (h *Host) Start() error {
 				h.log.Debug("whitelist peer resolve failed", "addr", a, "err", err)
 				return
 			}
+			h.mu.Lock()
+			for _, r := range resolved {
+				h.whitelistDialTargets[r] = a
+			}
+			h.mu.Unlock()
 			for _, r := range resolved {
 				h.dialPeer(r)
 			}
@@ -2330,6 +2386,29 @@ func (h *Host) isBootnode(addr string) bool {
 	return ok
 }
 
+// isExplicitWhitelistDialTarget accepts private addresses only when the exact
+// host:port was explicitly configured, or when it is the resolved form of such
+// an entry during startup redial. A peer-exchanged address cannot create this
+// exception; a match can only refer to an address the operator configured.
+func (h *Host) isExplicitWhitelistDialTarget(addr string) bool {
+	h.mu.RLock()
+	source, ok := h.whitelistDialTargets[addr]
+	h.mu.RUnlock()
+	for _, configured := range h.GetPeerWhitelist() {
+		configured = strings.TrimSpace(configured)
+		if _, valid := dialableWhitelistAddr(configured); !valid {
+			continue
+		}
+		if strings.EqualFold(configured, strings.TrimSpace(addr)) {
+			return true
+		}
+		if ok && strings.EqualFold(configured, strings.TrimSpace(source)) {
+			return true
+		}
+	}
+	return false
+}
+
 // DialPeer initiates an outbound connection to addr.  The dial happens in a
 // background goroutine; use PeerCount() after a short wait to confirm it
 // succeeded.  Outbound connections are not subject to the inbound cap
@@ -2340,6 +2419,19 @@ func (h *Host) DialPeer(addr string) {
 }
 
 func (h *Host) dialPeer(addr string) {
+	// Gossip admission already requires a public literal IP. Recheck here so
+	// stale or otherwise injected peer-list entries cannot trigger private,
+	// loopback, link-local, or special-use dials. Only bootnodes and exact
+	// host:port entries explicitly configured in the startup whitelist may use
+	// private networks; peer-exchange data never grants this exception.
+	if !h.isBootnode(addr) && !h.isExplicitWhitelistDialTarget(addr) {
+		host, _, splitErr := net.SplitHostPort(addr)
+		ip, parseErr := netip.ParseAddr(host)
+		if splitErr != nil || parseErr != nil || !isPublicPeerIP(ip.Unmap()) {
+			h.log.Warn("refusing unsafe peer dial target", "addr", addr)
+			return
+		}
+	}
 	// Outbound admission gate (#2008): both the total MaxPeers cap and the
 	// per-IP MaxPeersPerIP cap are enforced atomically under dialGateMu, which
 	// counts established peers PLUS in-flight outbound reservations (dialingIPs).
@@ -2774,6 +2866,12 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 			rate:     ingestRate,
 			burst:    ingestRate,
 		},
+		voteBucket: peerTokenBucket{
+			tokens:   voteMessageBurst,
+			lastTime: time.Now(),
+			rate:     maxVoteMessagesPerSecond,
+			burst:    voteMessageBurst,
+		},
 	}
 
 	// Handshake — asymmetric:
@@ -3022,7 +3120,8 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 				peer.pendingBlocksMu.Lock()
 				hasPendingBlocks := len(peer.pendingBlocks) > 0
 				peer.pendingBlocksMu.Unlock()
-				if h.handler.CurrentHeight() < peer.height && !hasPendingBlocks {
+				retryAllowed := peer.syncRetryAt.Load() <= time.Now().UnixNano()
+				if h.handler.CurrentHeight() < peer.height && !hasPendingBlocks && retryAllowed {
 					h.requestHeaders(peer)
 				}
 			case <-stall.C:
@@ -3496,21 +3595,37 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					"block_height", block.Header.Height)
 			}
 
-			// Clear the pending-block entry for this peer so the
-			// stall-detection ticker does not log a false warning for a
-			// block that arrived normally.  Each Peer tracks only the
-			// requests it sent, so deleting here is always safe.
-			// batchDone is true when the last block of the current
-			// GetHeaders batch has arrived; it gates the re-trigger below.
 			blockHash = block.Hash()
+			if acceptanceHandler, ok := h.handler.(BlockAcceptanceHandler); ok {
+				if err := acceptanceHandler.OnBlockWithResult(block); err != nil {
+					peer.pendingBlocksMu.Lock()
+					delete(peer.pendingBlocks, blockHash)
+					peer.pendingBlocksMu.Unlock()
+					delay, shouldLog := peer.scheduleSyncRejectRetry(time.Now())
+					if shouldLog {
+						h.log.Warn("p2p sync block rejected by local consensus; backing off this peer",
+							"peer", peer.addr,
+							"block_height", block.Header.Height,
+							"block_hash", fmt.Sprintf("%x", blockHash[:8]),
+							"retry_after", delay,
+							"err", err)
+					}
+					return nil
+				}
+				peer.resetSyncRejectRetry()
+			} else {
+				h.handler.OnBlock(block)
+			}
+
+			// Clear the pending-block entry only after the handler has accepted the block.
+			// batchDone gates the next header request for the completed response batch.
 			peer.pendingBlocksMu.Lock()
 			delete(peer.pendingBlocks, blockHash)
 			batchDone := len(peer.pendingBlocks) == 0
 			peer.pendingBlocksMu.Unlock()
 
-			// Gossip relay: forward to all other peers the first time we see this block.
+			// Only consensus-accepted blocks are marked for gossip relay.
 			isNew := h.gossip.MarkAndCheck(blockHash)
-			h.handler.OnBlock(block)
 			// Re-trigger requestHeaders exactly once per received batch —
 			// only when pendingBlocks drains to zero (all blocks in the
 			// current GetHeaders batch have arrived).  Firing on every
@@ -3605,6 +3720,17 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		return nil
 
 	case MsgVote:
+		// Apply per-peer TCP backpressure before parsing or queueing votes.
+		// A single authenticated peer can therefore not monopolize the
+		// engine's shared bounded vote channel.
+		if waited := peer.voteBucket.wait(); waited > 0 {
+			h.log.Warn("p2p: vote message rate limit fired — applying backpressure",
+				"peer", peer.addr,
+				"waited_ms", waited.Milliseconds(),
+				"limit_per_sec", maxVoteMessagesPerSecond,
+				"burst", voteMessageBurst,
+			)
+		}
 		var vote VoteMsg
 		if err := unmarshal(data, &vote); err != nil {
 			return err
@@ -3787,6 +3913,8 @@ const maxKnownPeers = 512
 const maxPeerExchangeAddrsPerMessage = 32
 const maxPeerExchangeAddrsPerPeer = 32
 const maxPeerExchangeAddrsPerSource = 16
+const maxVoteMessagesPerSecond = 2
+const voteMessageBurst = 8
 
 func (h *Host) addKnownPeers(source *Peer, addrs []string) {
 	if source == nil || len(addrs) == 0 || len(addrs) > maxPeerExchangeAddrsPerMessage {
@@ -3839,20 +3967,60 @@ func (h *Host) addKnownPeers(source *Peer, addrs []string) {
 	}
 }
 
-// normalizeGossipPeerAddress accepts only literal IP:port endpoints. Peer
-// exchange must not enqueue arbitrary strings, URL schemes, or DNS names for
-// later outbound dialing.
+// normalizeGossipPeerAddress accepts only globally routable literal IP:port
+// endpoints. Peer exchange must not enqueue arbitrary strings, private or
+// special-use addresses, URL schemes, or DNS names for later outbound dialing.
 func normalizeGossipPeerAddress(addr string) string {
 	host, portText, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
 		return ""
 	}
-	ip := net.ParseIP(host)
 	port, err := strconv.Atoi(portText)
-	if ip == nil || err != nil || port < 1 || port > 65535 {
+	if err != nil || port < 1 || port > 65535 {
+		return ""
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || ip.Zone() != "" {
+		return ""
+	}
+	ip = ip.Unmap()
+	if !isPublicPeerIP(ip) {
 		return ""
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port))
+}
+
+var nonPublicPeerPrefixes = func() []netip.Prefix {
+	raw := []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		"64:ff9b:1::/48", "2001:2::/48", "2001:10::/28", "2001:20::/28",
+		"2001:db8::/32", "2002::/16",
+	}
+	prefixes := make([]netip.Prefix, 0, len(raw))
+	for _, value := range raw {
+		prefix, err := netip.ParsePrefix(value)
+		if err == nil {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes
+}()
+
+func isPublicPeerIP(ip netip.Addr) bool {
+	if !ip.IsValid() || !ip.IsGlobalUnicast() || ip.IsPrivate() ||
+		ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, prefix := range nonPublicPeerPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // ─── Block serialization (simplified JSON) ────────────────────────────────────

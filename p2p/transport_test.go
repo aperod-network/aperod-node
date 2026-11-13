@@ -628,12 +628,13 @@ func TestTLS_ConnectionSurvivesIdleSilence(t *testing.T) {
 	t.Cleanup(hostA.Stop)
 
 	hostB := p2p.NewHost(p2p.Config{
-		ListenAddr:   "127.0.0.1:0",
-		MaxPeers:     5,
-		NodeID:       "silence-node-b",
-		UserAgent:    "aperod/test",
-		TLSConfig:    cfgB,
-		AllowedPeers: []string{fpA},
+		ListenAddr:    "127.0.0.1:0",
+		PeerWhitelist: []string{hostA.ListenAddr()},
+		MaxPeers:      5,
+		NodeID:        "silence-node-b",
+		UserAgent:     "aperod/test",
+		TLSConfig:     cfgB,
+		AllowedPeers:  []string{fpA},
 	}, &stubHandler{}, newTestLogger())
 	if err := hostB.Start(); err != nil {
 		t.Fatalf("T-12: hostB.Start: %v", err)

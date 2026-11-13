@@ -292,6 +292,7 @@ func TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive(t *testing.T) {
 	const initialInterval = 100 * time.Millisecond
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:        "127.0.0.1:0",
+		PeerWhitelist:     []string{ln.Addr().String()},
 		MaxPeers:          5,
 		NodeID:            "ka-decrease-test",
 		UserAgent:         "aperod/test",
@@ -399,6 +400,7 @@ func TestHost_KeepalivePongDeadline_EvictsDeadPeer(t *testing.T) {
 	const keepalive = 100 * time.Millisecond
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:        "127.0.0.1:0",
+		PeerWhitelist:     []string{ln.Addr().String()},
 		MaxPeers:          5,
 		NodeID:            "pong-deadline-test",
 		UserAgent:         "aperod/test",
@@ -519,6 +521,7 @@ func TestHost_KeepaliveTickRate_MatchesConfiguredInterval(t *testing.T) {
 
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:        "127.0.0.1:0",
+		PeerWhitelist:     []string{ln.Addr().String()},
 		MaxPeers:          5,
 		NodeID:            "tick-rate-test",
 		UserAgent:         "aperod/test",
@@ -1097,7 +1100,14 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 	// ── Key assertion ──────────────────────────────────────────────────────────
 	// Dial from hA to the trusted peer hB.  Even though the inbound cap is full,
 	// MinOutbound slots remain available, so this outbound dial must succeed.
-	hA.DialPeer(addrB)
+	dialAddr := "8.8.8.8:30303"
+	p2p.SetDialFunc(hA, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != dialAddr {
+			return nil, fmt.Errorf("unexpected outbound target %q", addr)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addrB)
+	})
+	hA.DialPeer(dialAddr)
 	time.Sleep(400 * time.Millisecond)
 
 	afterDial := hA.PeerCount()
@@ -1141,22 +1151,23 @@ func TestHost_ValidatorHeightDivergence_NoBan(t *testing.T) {
 	}
 	defer hA.Stop()
 
+	addrA := hA.ListenAddr()
+	if addrA == "" {
+		t.Skip("ListenAddr not exposed — skipping")
+	}
+
 	// hB: the "ahead" validator.  Default config is fine here.
 	hB := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		NodeID:     "node-b",
-		UserAgent:  "aperod/test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "node-b",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{addrA},
 	}, &stubHandler{}, newTestLogger())
 	if err := hB.Start(); err != nil {
 		t.Fatalf("hB.Start: %v", err)
 	}
 	defer hB.Stop()
-
-	addrA := hA.ListenAddr()
-	if addrA == "" {
-		t.Skip("ListenAddr not exposed — skipping")
-	}
 
 	// hB dials hA.  hB is outbound; hA accepts inbound.
 	// With the asymmetric handshake (outbound sends Ping, inbound waits) this
@@ -1428,7 +1439,14 @@ func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
 	}()
 
 	// Trigger an outbound dial despite the restrictive whitelist.
-	h.DialPeer(peerLn.Addr().String())
+	dialAddr := "8.8.4.4:30303"
+	p2p.SetDialFunc(h, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != dialAddr {
+			return nil, fmt.Errorf("unexpected outbound target %q", addr)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, peerLn.Addr().String())
+	})
+	h.DialPeer(dialAddr)
 
 	// Wait for the TCP-level connection to arrive at the peer server.
 	select {
@@ -2417,10 +2435,11 @@ func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
 	target := ln.Addr().String()
 
 	host := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		NodeID:     "backoff-test",
-		UserAgent:  "aperod-test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "backoff-test",
+		UserAgent:     "aperod-test",
+		PeerWhitelist: []string{target},
 	}, &stubHandler{}, newTestLogger())
 
 	// First dial: TCP connects, listener drops connection, handleConn returns
@@ -2725,6 +2744,7 @@ func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
 	relayHandler := newGapSyncHandler(validatorChain[0])
 	relayHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		PeerWhitelist:        []string{ln.Addr().String()},
 		MaxPeers:             10,
 		NodeID:               "relay-gap-test",
 		UserAgent:            "aperod/test",
@@ -3058,6 +3078,7 @@ func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
 	relayHandler := newGapSyncHandler(genesis)
 	relayHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		PeerWhitelist:        []string{ln.Addr().String()},
 		MaxPeers:             10,
 		NodeID:               "relay-live-prod-test",
 		UserAgent:            "aperod/test",
@@ -3267,6 +3288,7 @@ func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
 	// ── Relay host with a short stall timeout ────────────────────────────────
 	relayHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		PeerWhitelist:        []string{ln.Addr().String()},
 		MaxPeers:             10,
 		NodeID:               "relay-stall-test",
 		UserAgent:            "aperod/test",
@@ -3502,6 +3524,7 @@ func TestSync_RelayStall_Recovers(t *testing.T) {
 	relayHandler := newGapSyncHandler(peerChain[0])
 	relayHost := p2p.NewHost(p2p.Config{
 		ListenAddr:           "127.0.0.1:0",
+		PeerWhitelist:        []string{ln.Addr().String()},
 		MaxPeers:             10,
 		NodeID:               "relay-recover-test",
 		UserAgent:            "aperod/test",
@@ -3785,10 +3808,11 @@ func TestHost_RelayNode_SelfHeals_AfterMissedSyncWindow(t *testing.T) {
 	// ── 3. Catching host: start at height 0. ─────────────────────────────────
 	catchHandler := &heightTrackingHandler{}
 	catchingHost := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   5,
-		NodeID:     "catching-node",
-		UserAgent:  "aperod/test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      5,
+		NodeID:        "catching-node",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{ln.Addr().String()},
 		// High threshold so block height 1 (above tip 0) never earns a
 		// rogue-fork strike while our tip is still at 0.
 		BadBlockHeightLead:   1_000,
@@ -4112,6 +4136,7 @@ func TestHost_SetKeepaliveInterval_MidConnection_AdoptsNewRate(t *testing.T) {
 
 	host := p2p.NewHost(p2p.Config{
 		ListenAddr:        "127.0.0.1:0",
+		PeerWhitelist:     []string{ln.Addr().String()},
 		MaxPeers:          5,
 		NodeID:            "rate-change-test",
 		UserAgent:         "aperod/test",

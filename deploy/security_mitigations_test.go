@@ -87,6 +87,40 @@ func TestGoToolchainInstallersVerifyOfficialChecksumsBeforeExtraction(t *testing
 	}
 }
 
+func TestMonitoringExporterArchivesArePinnedBeforeExtraction(t *testing.T) {
+	script, err := os.ReadFile("install-monitoring.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66",
+		"627382b9723c642411c33f48861134ebe893e70a63bcc8b3fc0619cd0bfac4be",
+		"4e27d332281e6bda7514f51f5a6e7c62f8bfb7667d459095a4c73d437b2d27ad",
+		"c78cd780d8f3f659cb3c8655f9491dc5ffe90a9bf60a91fc9829cc5afde318fd",
+		`verify_release_archive "$NODE_ARCHIVE" "$NODE_EXPORTER_SHA256"`,
+		`verify_release_archive "$NGINX_ARCHIVE" "$NGINX_EXPORTER_SHA256"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("monitoring installer is missing pinned archive verification %q", required)
+		}
+	}
+	for _, pair := range [][2]string{
+		{`verify_release_archive "$NODE_ARCHIVE"`, `tar -xzf "$NODE_ARCHIVE"`},
+		{`verify_release_archive "$NGINX_ARCHIVE"`, `tar -xzf "$NGINX_ARCHIVE"`},
+	} {
+		verifyAt := strings.Index(text, pair[0])
+		extractAt := strings.Index(text, pair[1])
+		if verifyAt < 0 || extractAt < 0 || verifyAt > extractAt {
+			t.Errorf("monitoring installer extracts an archive before verifying it: %q", pair[0])
+		}
+	}
+	if strings.Contains(text, `-O /tmp/node_exporter.tar.gz`) ||
+		strings.Contains(text, `-O /tmp/nginx_exporter.tar.gz`) {
+		t.Fatal("monitoring installer still downloads root-owned archives to predictable /tmp paths")
+	}
+}
+
 func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 	validators, err := os.ReadFile("VALIDATORS.md")
 	if err != nil {

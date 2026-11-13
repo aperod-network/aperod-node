@@ -69,16 +69,13 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 	targetAddr := ln.Addr().String()
 
 	h := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		MinPeers:   1,
-		NodeID:     "test-post-connect-ban",
-		UserAgent:  "aperod/test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		MinPeers:      1,
+		NodeID:        "test-post-connect-ban",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{targetAddr},
 	}, &stubHandler{}, newTestLogger())
-	if err := h.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer h.Stop()
 
 	// Replace the dial function with one that returns a live conn immediately
 	// (no context-cancellation check on return) so the raw TCP connection
@@ -99,9 +96,12 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 		<-hookRelease    // block until test has called BanPeer
 	})
 
-	// Seed the target and trigger a maintainLoop tick to launch the dial.
-	p2p.HostAddKnownPeer(h, targetAddr)
-	p2p.HostTriggerMaintain(h)
+	// Start launches the configured explicit whitelist dial after hooks are
+	// installed, so the test can pause it before handleConn admits the peer.
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
 
 	// Wait for the dial goroutine to reach the post-connect hook (conn
 	// established, registered in pendingConns).
@@ -202,16 +202,13 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 	targetAddr := ln.Addr().String()
 
 	h := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		MinPeers:   1,
-		NodeID:     "test-concurrent-ban-known",
-		UserAgent:  "aperod/test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		MinPeers:      1,
+		NodeID:        "test-concurrent-ban-known",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{targetAddr},
 	}, &stubHandler{}, newTestLogger())
-	if err := h.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer h.Stop()
 
 	// dialStarted is closed by the injected dialContextFunc the moment it is
 	// entered — i.e. after dialPeer has passed IsBanned and registered its
@@ -236,10 +233,12 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 		}
 	})
 
-	// Seed the target into peerList so dialPeer is triggered by MinPeers path.
-	p2p.HostAddKnownPeer(h, targetAddr)
-	// Trigger one immediate maintain tick to launch the dialPeer goroutine.
-	p2p.HostTriggerMaintain(h)
+	// Start's explicitly configured whitelist dial exercises the same dial
+	// gate without trusting private addresses injected through peer exchange.
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer h.Stop()
 
 	// Wait until the dial goroutine has entered dialContextFunc (IsBanned was
 	// false, cancel func is registered in the dial gate).

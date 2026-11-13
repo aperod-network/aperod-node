@@ -108,7 +108,7 @@ func main() {
 	}
 	seen := make(map[string]bool)
 	for _, vote := range cert.Votes {
-		message := crypto.HashBytes([]byte("aperod/finalize/v1"), cert.BlockHash.Bytes())
+		message := crypto.FinalityVoteMessage(vote.VoteVersion, cert.Height, cert.BlockHash)
 		if !vote.Validator.Verify(message, vote.Signature) {
 			fatal("certificate contains an invalid vote signature")
 		}

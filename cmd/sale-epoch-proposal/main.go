@@ -110,8 +110,8 @@ func run() (retErr error) {
 			return fmt.Errorf("exact canonical parent finality certificate required before signing")
 		}
 		producerVote := false
-		message := crypto.HashBytes([]byte("aperod/finalize/v1"), parent[:])
 		for _, vote := range certificate.Votes {
+			message := crypto.FinalityVoteMessage(vote.VoteVersion, certificate.Height, parent)
 			if vote.Validator.Equals(head.Header.ValidatorPub) && authority.Authority(vote.Validator, height).Verify(message, vote.Signature) {
 				producerVote = true
 			}

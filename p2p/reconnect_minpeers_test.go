@@ -78,19 +78,6 @@ func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
 		prev = block
 	}
 
-	aheadHandler := &minimalChainHandler{chain: aheadChain}
-	aheadHost := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		NodeID:     "ahead",
-		UserAgent:  "aperod/test",
-	}, aheadHandler, log)
-	aheadHost.SetHeaderProvider(aheadChain)
-	if err := aheadHost.Start(); err != nil {
-		t.Fatalf("aheadHost.Start: %v", err)
-	}
-	t.Cleanup(aheadHost.Stop)
-
 	behindHandler := &minimalChainHandler{chain: behindChain}
 	behindHost := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
@@ -103,6 +90,20 @@ func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
 		t.Fatalf("behindHost.Start: %v", err)
 	}
 	t.Cleanup(behindHost.Stop)
+
+	aheadHandler := &minimalChainHandler{chain: aheadChain}
+	aheadHost := p2p.NewHost(p2p.Config{
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		NodeID:        "ahead",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{behindHost.ListenAddr()},
+	}, aheadHandler, log)
+	aheadHost.SetHeaderProvider(aheadChain)
+	if err := aheadHost.Start(); err != nil {
+		t.Fatalf("aheadHost.Start: %v", err)
+	}
+	t.Cleanup(aheadHost.Stop)
 
 	aheadHost.DialPeer(behindHost.ListenAddr())
 
@@ -231,11 +232,12 @@ func TestSync_RelayNode_ReconnectViaMinPeers(t *testing.T) {
 	// re-dials the peer from peerList.
 	relayHandler := &minimalChainHandler{chain: relayChain}
 	hostRelay := p2p.NewHost(p2p.Config{
-		ListenAddr: "127.0.0.1:0",
-		MaxPeers:   10,
-		MinPeers:   1,
-		NodeID:     "relay",
-		UserAgent:  "aperod/test",
+		ListenAddr:    "127.0.0.1:0",
+		MaxPeers:      10,
+		MinPeers:      1,
+		NodeID:        "relay",
+		UserAgent:     "aperod/test",
+		PeerWhitelist: []string{validatorAddr},
 		// No Bootnodes — this is the key difference from the existing
 		// TestSync_RelayNode_ReconnectAfterDrop test which bypasses back-off
 		// by registering the validator as a bootnode.
@@ -247,8 +249,9 @@ func TestSync_RelayNode_ReconnectViaMinPeers(t *testing.T) {
 	}
 	t.Cleanup(hostRelay.Stop)
 
-	// ── Phase 1: initial sync via explicit DialPeer ───────────────────────────
-	hostRelay.DialPeer(validatorAddr)
+	// Start's explicit whitelist redial establishes the initial connection.
+	// Avoid a second concurrent DialPeer here so the measured backoff reflects
+	// a single failed connection.
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
