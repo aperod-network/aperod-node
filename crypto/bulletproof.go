@@ -161,17 +161,20 @@ func scalarOne() *edwards25519.Scalar {
 }
 
 // powerVec returns [base⁰, base¹, …, baseⁿ⁻¹].
-func powerVec(base *edwards25519.Scalar, n int) []*edwards25519.Scalar {
+func powerVec(base *edwards25519.Scalar, n int) ([]*edwards25519.Scalar, error) {
+	if n < 1 || n > bpBits {
+		return nil, fmt.Errorf("bulletproof: power vector length %d outside [1,%d]", n, bpBits)
+	}
 	v := make([]*edwards25519.Scalar, n)
 	v[0] = scalarOne()
 	for i := 1; i < n; i++ {
 		v[i] = edwards25519.NewScalar().Multiply(v[i-1], base)
 	}
-	return v
+	return v, nil
 }
 
 // pow2Vec returns [1, 2, 4, …, 2ⁿ⁻¹].
-func pow2Vec(n int) []*edwards25519.Scalar {
+func pow2Vec(n int) ([]*edwards25519.Scalar, error) {
 	two := scalarFromUint64(2)
 	return powerVec(two, n)
 }
@@ -350,8 +353,14 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	// l(x) = (aL - z) + sL·x          l₀ = aL-z, l₁ = sL
 	// r(x) = yn⊙(aR + z) + z²·2ⁿ + yn⊙sR·x
 	//                                  r₀ = yn⊙(aR+z)+z²·2ⁿ, r₁ = yn⊙sR
-	yn := powerVec(y, n)
-	town := pow2Vec(n)
+	yn, err := powerVec(y, n)
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof y powers: %w", err)
+	}
+	town, err := pow2Vec(n)
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof powers of two: %w", err)
+	}
 	z2 := edwards25519.NewScalar().Multiply(z, z)
 
 	l0 := vecSubS(aL, z)
@@ -418,7 +427,10 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	Uw := new(edwards25519.Point).ScalarMult(w, bpU)
 
 	// H' = y⁻ⁱ · Hvec[i]  (modified generators for IPA)
-	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), n)
+	yInvPow, err := powerVec(edwards25519.NewScalar().Invert(y), n)
+	if err != nil {
+		return nil, fmt.Errorf("bulletproof inverse y powers: %w", err)
+	}
 	hPrime := make([]*edwards25519.Point, n)
 	for i := 0; i < n; i++ {
 		hPrime[i] = new(edwards25519.Point).ScalarMult(yInvPow[i], bpHvec[i])
@@ -573,8 +585,14 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 
 	z2 := edwards25519.NewScalar().Multiply(z, z)
 	z3 := edwards25519.NewScalar().Multiply(z2, z)
-	yn := powerVec(y, n)
-	town := pow2Vec(n)
+	yn, err := powerVec(y, n)
+	if err != nil {
+		return false, fmt.Errorf("bulletproof y powers: %w", err)
+	}
+	town, err := pow2Vec(n)
+	if err != nil {
+		return false, fmt.Errorf("bulletproof powers of two: %w", err)
+	}
 
 	// ── Check 1: polynomial commitment ────────────────────────────────────
 	// t̂·BpH + τₓ·G == z²·V + δ(y,z)·BpH + x·T₁ + x²·T₂
@@ -610,7 +628,10 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 	// (derived by expanding commitments A and S; the μ·G terms cancel)
 	Uw := new(edwards25519.Point).ScalarMult(w, bpU)
 
-	yInvPow := powerVec(edwards25519.NewScalar().Invert(y), n)
+	yInvPow, err := powerVec(edwards25519.NewScalar().Invert(y), n)
+	if err != nil {
+		return false, fmt.Errorf("bulletproof inverse y powers: %w", err)
+	}
 	hPrime := make([]*edwards25519.Point, n)
 	for i := 0; i < n; i++ {
 		hPrime[i] = new(edwards25519.Point).ScalarMult(yInvPow[i], bpHvec[i])
