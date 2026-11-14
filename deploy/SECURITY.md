@@ -150,11 +150,10 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 ## Dependency & Static Analysis
 
-The repository CI runs:
-
-- **`golangci-lint`**, including `gosec`, and Go race tests
-- **`govulncheck`** — reachable Go vulnerability scanning
-- **`pnpm audit`** — dependency advisories at every severity
+The repository CI runs Go build, vet, tests, and pinned
+**`govulncheck v1.9.0`** for reachable Go vulnerabilities. The protected public
+publication process also runs a pinned `govulncheck` against the immutable
+candidate before upload. Do not treat these checks as a complete security audit.
 
 Replit SAST and HoundDog scans are run on demand, not as CI gates. Security
 findings must be checked against a fresh, dated scan before each release; this
