@@ -20,7 +20,8 @@ consensus:
   block_reward_napro: 10000000  # 0.1 APRO (10_000_000 nAPRO); 0 = use default
   # Optional explicit height; 0 defers to security_hardening_activation_height.
   reward_authorization_activation_height: 0
-  # Mainnet requires 3800000. Testnet may leave this at 0.
+  # Mainnet requires an explicit coordinated height selected after staging replay.
+  # Do not reuse the historical height on a chain whose tip has passed it.
   security_hardening_activation_height: 0
   block_time: "3s"
   # non_validator: true      # Set to true to run a sync-only / relay / RPC node.

@@ -97,9 +97,10 @@ func ZeroBytes(b []byte) {
 }
 
 // LockedValidatorKey holds an ED25519 private key in a memory-locked buffer.
-// The underlying bytes are pinned in physical RAM via mlock(2) so they cannot
-// be swapped to disk or appear in a core dump.  Call Destroy when done to zero
-// and unlock the buffer.
+// The underlying bytes are pinned in physical RAM via mlock(2), which prevents
+// swapping but does not exclude them from core dumps. Production services must
+// disable core dumps separately. Call Destroy when done to zero and unlock the
+// buffer.
 type LockedValidatorKey struct {
 	mu  sync.Mutex
 	buf []byte // 64-byte ed25519 private key, mlocked

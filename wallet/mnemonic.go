@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Strength in bits for mnemonic entropy. 128 = 12 words, 256 = 24 words.
@@ -92,8 +94,8 @@ func mnemonicToEntropyWithIndex(mnemonic string, index map[string]uint32) ([]byt
 // MnemonicToSeed converts a BIP39 mnemonic + optional passphrase to a 64-byte
 // BIP39 seed using PBKDF2-HMAC-SHA512 with 2048 iterations (BIP39 standard).
 func MnemonicToSeed(mnemonic, passphrase string) []byte {
-	mnemonic = strings.TrimSpace(mnemonic)
-	salt := "mnemonic" + passphrase
+	mnemonic = norm.NFKD.String(strings.TrimSpace(mnemonic))
+	salt := "mnemonic" + norm.NFKD.String(passphrase)
 	return pbkdf2SHA512([]byte(mnemonic), []byte(salt), 2048, 64)
 }
 

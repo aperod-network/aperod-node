@@ -33,6 +33,31 @@ const (
 // MaxMessageSize is the maximum allowed message size (10 MB).
 const MaxMessageSize = 10 * 1024 * 1024
 
+const (
+	maxControlPayloadBytes         = 64 * 1024
+	maxHeadersPayloadBytes         = 1 * 1024 * 1024
+	maxPeersPayloadBytes           = 16 * 1024
+	maxHeadersPerMessage           = 500
+	maxKnownHashesPerHeaderRequest = 32
+)
+
+func maxMessagePayloadBytes(msgType MessageType) uint32 {
+	switch msgType {
+	case MsgBlock, MsgTx:
+		return MaxMessageSize - 1 // MaxMessageSize includes the type byte.
+	case MsgHeaders:
+		return maxHeadersPayloadBytes
+	case MsgPeers:
+		return maxPeersPayloadBytes
+	case MsgPing, MsgPong, MsgGetHeaders, MsgGetBlock, MsgVote, MsgGetPeers:
+		return maxControlPayloadBytes
+	default:
+		// Keep malformed/unknown-message handling bounded while allowing the
+		// dispatcher to return its normal unknown-type error.
+		return 4 * 1024
+	}
+}
+
 // DialTimeout for outbound connections.
 const DialTimeout = 5 * time.Second
 
@@ -143,6 +168,10 @@ func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, er
 	if err != nil {
 		return 0, fmt.Errorf("marshal: %w", err)
 	}
+	if uint32(len(data)) > maxMessagePayloadBytes(msgType) {
+		return 0, fmt.Errorf("message payload too large for type 0x%02x: %d bytes",
+			msgType, len(data))
+	}
 
 	// [1 byte type][payload]
 	body := append([]byte{byte(msgType)}, data...)
@@ -172,13 +201,21 @@ func readMsg(conn net.Conn) (MessageType, []byte, error) {
 		return 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
 
-	body := make([]byte, length)
-	if _, err := io.ReadFull(conn, body); err != nil {
+	var typeBuf [1]byte
+	if _, err := io.ReadFull(conn, typeBuf[:]); err != nil {
+		return 0, nil, fmt.Errorf("read message type: %w", err)
+	}
+	msgType := MessageType(typeBuf[0])
+	payloadLength := length - 1
+	if payloadLength > maxMessagePayloadBytes(msgType) {
+		return 0, nil, fmt.Errorf("message payload too large for type 0x%02x: %d bytes",
+			msgType, payloadLength)
+	}
+	payload := make([]byte, payloadLength)
+	if _, err := io.ReadFull(conn, payload); err != nil {
 		return 0, nil, fmt.Errorf("read body: %w", err)
 	}
-
-	msgType := MessageType(body[0])
-	return msgType, body[1:], nil
+	return msgType, payload, nil
 }
 
 // unmarshal decodes a JSON payload into v.

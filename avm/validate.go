@@ -50,6 +50,9 @@ func validateModule(code []byte, maxDepth int) (ValidationReport, error) {
 	if len(code) > MaxCodeSize {
 		return report, fmt.Errorf("avm: Wasm module is %d bytes, max %d", len(code), MaxCodeSize)
 	}
+	if err := validateWasmSectionVectors(code); err != nil {
+		return report, fmt.Errorf("avm: invalid Wasm section bounds: %w", err)
+	}
 
 	module, err := wabinbinary.DecodeModule(code, wasm.CoreFeaturesV2)
 	if err != nil {
@@ -101,6 +104,61 @@ func validateModule(code []byte, maxDepth int) (ValidationReport, error) {
 	// Control-flow restrictions below make this exact upper-bound finite.
 	report.StaticGas = 100 + report.InstructionCount
 	return report, nil
+}
+
+// validateWasmSectionVectors checks section envelopes before wabin decodes
+// them. The decoder allocates slices using vector counts from untrusted bytes;
+// every vector element consumes at least one byte, so a count larger than its
+// remaining section payload is necessarily malformed and must not be decoded.
+func validateWasmSectionVectors(code []byte) error {
+	// Leave short or non-Wasm headers to the canonical decoder, which returns
+	// the normal format error without allocating from section counts.
+	if len(code) < 8 ||
+		code[0] != 0x00 || code[1] != 'a' || code[2] != 's' || code[3] != 'm' ||
+		code[4] != 0x01 || code[5] != 0x00 || code[6] != 0x00 || code[7] != 0x00 {
+		return nil
+	}
+
+	for offset := 8; offset < len(code); {
+		sectionID := code[offset]
+		offset++
+
+		payloadSize, sizeBytes, err := readU32(code[offset:])
+		if err != nil {
+			return fmt.Errorf("section %d size: %w", sectionID, err)
+		}
+		offset += sizeBytes
+		if uint64(payloadSize) > uint64(len(code)-offset) {
+			return fmt.Errorf("section %d payload exceeds module bounds", sectionID)
+		}
+		payloadEnd := offset + int(payloadSize)
+
+		if isWasmVectorSection(sectionID) {
+			count, countBytes, err := readU32(code[offset:payloadEnd])
+			if err != nil {
+				return fmt.Errorf("section %d vector count: %w", sectionID, err)
+			}
+			remaining := payloadEnd - (offset + countBytes)
+			if uint64(count) > uint64(remaining) {
+				return fmt.Errorf(
+					"section %d vector count %d exceeds remaining payload bytes %d",
+					sectionID, count, remaining,
+				)
+			}
+		}
+
+		offset = payloadEnd
+	}
+	return nil
+}
+
+func isWasmVectorSection(sectionID byte) bool {
+	switch sectionID {
+	case 1, 2, 3, 4, 5, 6, 7, 9, 10, 11:
+		return true
+	default:
+		return false
+	}
 }
 
 func hasFloatType(types []wasm.ValueType) bool {
@@ -225,6 +283,9 @@ func readU32(data []byte) (uint32, int, error) {
 	var value uint32
 	for i := 0; i < len(data) && i < 5; i++ {
 		b := data[i]
+		if i == 4 && b&0xf0 != 0 {
+			return 0, 0, fmt.Errorf("u32 LEB128 overflows 32 bits")
+		}
 		value |= uint32(b&0x7f) << (7 * i)
 		if b&0x80 == 0 {
 			return value, i + 1, nil

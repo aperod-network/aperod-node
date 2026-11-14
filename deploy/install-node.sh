@@ -347,7 +347,9 @@ p2p:
   bootnodes: []
 
 consensus:
-  # This installer creates a testnet config. Mainnet must explicitly use 3800000.
+  # This installer creates a testnet config. Mainnet requires an explicitly
+  # coordinated height selected after a full staging replay; do not reuse a
+  # historical activation height without proving canonical replay compatibility.
   # A zero reward authorization height defers to the security hardening height.
   reward_authorization_activation_height: 0
   security_hardening_activation_height: 0
@@ -469,6 +471,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=aperod
+LimitCORE=0
 ExecStart=/usr/local/bin/aperod-node --config ${CONFIG_DIR}/node.yaml
 Restart=always
 RestartSec=5

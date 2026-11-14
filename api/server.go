@@ -1047,15 +1047,21 @@ func (s *Server) Start() error {
 	}()
 	cors := CORSConfig{AllowedOrigins: s.corsOrigins}
 	handler := cors.Middleware(s.rateLimiter.Middleware(s.mux))
-	srv := &http.Server{
-		Addr:         s.addr,
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
+	srv := newAPHTTPServer(s.addr, handler)
 	s.log.Info("API server listening", "addr", s.addr)
 	return srv.ListenAndServe()
+}
+
+func newAPHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 
 // ─── JSON-RPC 2.0 types ───────────────────────────────────────────────────────

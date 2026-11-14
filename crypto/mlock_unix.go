@@ -5,7 +5,8 @@ package crypto
 import "golang.org/x/sys/unix"
 
 // MlockBytes locks the memory pages containing b into RAM, preventing them
-// from being swapped to disk or appearing in a core dump.
+// from being swapped to disk. Mlock does not exclude memory from core dumps;
+// production services must disable core dumps or use an OS-specific exclusion.
 // This is a best-effort operation: the call is non-fatal if it fails
 // (e.g. when the process lacks CAP_IPC_LOCK or the kernel limits are low).
 // Callers should still zero the buffer with ZeroBytes before releasing it.

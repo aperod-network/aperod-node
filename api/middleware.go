@@ -19,8 +19,10 @@ import (
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
 
 const (
-	rlRate  = 100 // tokens per second
-	rlBurst = 200 // bucket capacity
+	rlRate                 = 100 // tokens per second
+	rlBurst                = 200 // bucket capacity
+	maxRateLimiterBuckets  = 65536
+	maxHeavyLimiterBuckets = 65536
 )
 
 type tokenBucket struct {
@@ -48,12 +50,20 @@ func (tb *tokenBucket) allow() bool {
 
 // RateLimiter holds per-IP token buckets and prunes stale entries every minute.
 type RateLimiter struct {
-	mu      sync.RWMutex
-	buckets map[string]*tokenBucket
+	mu         sync.RWMutex
+	buckets    map[string]*tokenBucket
+	maxBuckets int
+	// overflow is shared by unseen IPs after maxBuckets is reached, so
+	// attacker-controlled address churn cannot grow the map without bound.
+	overflow *tokenBucket
 }
 
 func NewRateLimiter() *RateLimiter {
-	rl := &RateLimiter{buckets: make(map[string]*tokenBucket)}
+	rl := &RateLimiter{
+		buckets:    make(map[string]*tokenBucket),
+		maxBuckets: maxRateLimiterBuckets,
+		overflow:   &tokenBucket{tokens: rlBurst, lastFill: time.Now()},
+	}
 	go rl.prune()
 	return rl
 }
@@ -88,6 +98,16 @@ func (rl *RateLimiter) bucket(ip string) *tokenBucket {
 	if tb, ok = rl.buckets[ip]; ok {
 		return tb
 	}
+	maxBuckets := rl.maxBuckets
+	if maxBuckets <= 0 {
+		maxBuckets = maxRateLimiterBuckets
+	}
+	if len(rl.buckets) >= maxBuckets {
+		if rl.overflow == nil {
+			rl.overflow = &tokenBucket{tokens: rlBurst, lastFill: time.Now()}
+		}
+		return rl.overflow
+	}
 	tb = &tokenBucket{tokens: rlBurst, lastFill: time.Now()}
 	rl.buckets[ip] = tb
 	return tb
@@ -97,12 +117,19 @@ func (rl *RateLimiter) bucket(ip string) *tokenBucket {
 // address scan.  It uses a separate token bucket (2 req/s, burst 5) so a
 // single client cannot drive 100% CPU by hammering the endpoint.
 type heavyRL struct {
-	mu      sync.RWMutex
-	buckets map[string]*tokenBucket
+	mu         sync.RWMutex
+	buckets    map[string]*tokenBucket
+	maxBuckets int
+	// Keep heavy-endpoint rate-limit state bounded independently.
+	overflow *tokenBucket
 }
 
 func newHeavyRL() *heavyRL {
-	h := &heavyRL{buckets: make(map[string]*tokenBucket)}
+	h := &heavyRL{
+		buckets:    make(map[string]*tokenBucket),
+		maxBuckets: maxHeavyLimiterBuckets,
+		overflow:   &tokenBucket{tokens: heavyBurst, lastFill: time.Now()},
+	}
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -129,17 +156,7 @@ const (
 )
 
 func (h *heavyRL) allow(ip string) bool {
-	h.mu.RLock()
-	tb, ok := h.buckets[ip]
-	h.mu.RUnlock()
-	if !ok {
-		h.mu.Lock()
-		if tb, ok = h.buckets[ip]; !ok {
-			tb = &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
-			h.buckets[ip] = tb
-		}
-		h.mu.Unlock()
-	}
+	tb := h.bucket(ip)
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	now := time.Now()
@@ -154,6 +171,33 @@ func (h *heavyRL) allow(ip string) bool {
 	}
 	tb.tokens--
 	return true
+}
+
+func (h *heavyRL) bucket(ip string) *tokenBucket {
+	h.mu.RLock()
+	tb, ok := h.buckets[ip]
+	h.mu.RUnlock()
+	if ok {
+		return tb
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if tb, ok = h.buckets[ip]; ok {
+		return tb
+	}
+	maxBuckets := h.maxBuckets
+	if maxBuckets <= 0 {
+		maxBuckets = maxHeavyLimiterBuckets
+	}
+	if len(h.buckets) >= maxBuckets {
+		if h.overflow == nil {
+			h.overflow = &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
+		}
+		return h.overflow
+	}
+	tb = &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
+	h.buckets[ip] = tb
+	return tb
 }
 
 // globalHeavyRL is shared across all rate-limiter middleware instances.

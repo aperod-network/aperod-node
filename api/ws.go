@@ -104,19 +104,14 @@ func (h *Hub) BroadcastConfirmed(tx *core.Transaction, blockHeight uint64) {
 
 func (h *Hub) broadcast(evt WSEvent) {
 	h.mu.RLock()
-	clients := make([]*wsClient, 0, len(h.clients))
 	for c := range h.clients {
-		clients = append(clients, c)
-	}
-	h.mu.RUnlock()
-
-	for _, c := range clients {
 		select {
 		case c.send <- evt:
 		default:
 			// Channel full — drop event for this slow client
 		}
 	}
+	h.mu.RUnlock()
 }
 
 // heartbeat pings all clients every 15 s to detect dead connections.
@@ -135,19 +130,30 @@ func (h *Hub) ClientCount() int {
 	return len(h.clients)
 }
 
-// register adds a client to the hub and increments the per-IP counter.
-func (h *Hub) register(c *wsClient) {
+// register atomically enforces connection caps and adds a client to the hub.
+func (h *Hub) register(c *wsClient) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.clients) >= MaxWSClients {
+		return false
+	}
+	if c.ip != "" && h.connPerIP[c.ip] >= MaxWSClientsPerIP {
+		return false
+	}
 	h.clients[c] = struct{}{}
 	if c.ip != "" {
 		h.connPerIP[c.ip]++
 	}
-	h.mu.Unlock()
+	return true
 }
 
 // unregister removes a client and decrements the per-IP counter.
 func (h *Hub) unregister(c *wsClient) {
 	h.mu.Lock()
+	if _, ok := h.clients[c]; !ok {
+		h.mu.Unlock()
+		return
+	}
 	delete(h.clients, c)
 	if c.ip != "" {
 		h.connPerIP[c.ip]--
@@ -187,7 +193,11 @@ func (h *Hub) Handler() http.Handler {
 			topics: map[string]bool{"new_block": true, "new_transaction": true, "confirmed_transaction": true},
 			ip:     clientIP,
 		}
-		h.register(c)
+		if !h.register(c) {
+			h.log.Warn("ws client rejected: connection cap reached")
+			conn.Close()
+			return
+		}
 		defer h.unregister(c)
 
 		h.log.Info("ws client connected")

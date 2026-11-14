@@ -225,9 +225,10 @@ func vecScale(s *edwards25519.Scalar, v []*edwards25519.Scalar) []*edwards25519.
 	return out
 }
 
-// msm is a convenience alias for variable-time multi-scalar multiplication.
+// msm uses constant-time multi-scalar multiplication. The prover passes
+// witness-dependent scalars here, so input-dependent execution time is unsafe.
 func msm(scalars []*edwards25519.Scalar, points []*edwards25519.Point) *edwards25519.Point {
-	return new(edwards25519.Point).VarTimeMultiScalarMult(scalars, points)
+	return new(edwards25519.Point).MultiScalarMult(scalars, points)
 }
 
 // pointSlice converts a fixed array of *Point to a slice.

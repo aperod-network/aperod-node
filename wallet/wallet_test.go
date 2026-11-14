@@ -201,6 +201,19 @@ func TestMnemonicToSeedKnownVector(t *testing.T) {
 	}
 }
 
+func TestMnemonicToSeedUsesNFKDForMnemonicAndPassphrase(t *testing.T) {
+	base := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+	composed := "\u00e9"
+	decomposed := "e\u0301"
+
+	if got, want := MnemonicToSeed(base+" "+composed, ""), MnemonicToSeed(base+" "+decomposed, ""); string(got) != string(want) {
+		t.Fatal("canonically equivalent mnemonic text produced different seeds")
+	}
+	if got, want := MnemonicToSeed(base, "caf"+composed), MnemonicToSeed(base, "cafe\u0301"); string(got) != string(want) {
+		t.Fatal("canonically equivalent passphrases produced different seeds")
+	}
+}
+
 // ─── HD Derivation ────────────────────────────────────────────────────────
 
 func TestDeriveFromMnemonic(t *testing.T) {
