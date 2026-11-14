@@ -22,8 +22,10 @@ import (
 // KDF parameters for PBKDF2-SHA256.
 // 200000 iterations matches 2024 OWASP recommendations for PBKDF2-SHA256.
 const (
-	pbkdf2Iter = 200000
-	keyLen     = 32 // AES-256
+	pbkdf2Iter           = 200000
+	maxPBKDF2Iterations  = 1000000
+	maxKeystoreJSONBytes = 1 << 20
+	keyLen               = 32 // AES-256
 )
 
 // KeystoreV1 is the JSON-serialisable encrypted wallet record. Version 1 is
@@ -179,6 +181,31 @@ func DecryptMnemonic(ks *KeystoreV1, password string) (string, error) {
 	if ks.Crypto.Cipher != "aes-256-gcm" {
 		return "", fmt.Errorf("keystore: unsupported cipher %q", ks.Crypto.Cipher)
 	}
+	// Bound the most expensive operation before decoding attacker-controlled
+	// fields. Older records with a missing/zero value retain the legacy default.
+	iter := ks.Crypto.KDFParams.Iter
+	if iter <= 0 {
+		iter = pbkdf2Iter
+	}
+	if iter > maxPBKDF2Iterations {
+		return "", fmt.Errorf("keystore: PBKDF2 iteration count %d exceeds maximum %d",
+			iter, maxPBKDF2Iterations)
+	}
+	// Reject malformed field sizes before decoding hex or running PBKDF2. The
+	// keystore file-size limit protects JSON callers; these checks also protect
+	// callers that construct KeystoreV1 values directly.
+	if len(ks.Crypto.KDFParams.Salt) != 64 {
+		return "", errors.New("keystore: salt must be 32 bytes")
+	}
+	if len(ks.Crypto.Nonce) != 24 {
+		return "", errors.New("keystore: nonce must be 12 bytes")
+	}
+	if len(ks.Crypto.MAC) != 64 {
+		return "", errors.New("keystore: MAC must be 32 bytes")
+	}
+	if len(ks.Crypto.CipherText) < 32 || len(ks.Crypto.CipherText) > maxKeystoreJSONBytes {
+		return "", fmt.Errorf("keystore: ciphertext length is outside the accepted range")
+	}
 
 	salt, err := hex.DecodeString(ks.Crypto.KDFParams.Salt)
 	if err != nil {
@@ -198,10 +225,6 @@ func DecryptMnemonic(ks *KeystoreV1, password string) (string, error) {
 	}
 
 	// Derive key using PBKDF2-SHA256
-	iter := ks.Crypto.KDFParams.Iter
-	if iter <= 0 {
-		iter = pbkdf2Iter // default for old keystores
-	}
 	aesKey := pbkdf2SHA256([]byte(password), salt, iter, keyLen)
 
 	// Verify the legacy or derivation-bound MAC before decryption.
@@ -248,11 +271,28 @@ func (ks *KeystoreV1) Marshal() ([]byte, error) {
 
 // UnmarshalKeystore parses a JSON-encoded KeystoreV1 record.
 func UnmarshalKeystore(data []byte) (*KeystoreV1, error) {
+	if len(data) > maxKeystoreJSONBytes {
+		return nil, fmt.Errorf("keystore: JSON exceeds maximum size of %d bytes", maxKeystoreJSONBytes)
+	}
 	var ks KeystoreV1
 	if err := json.Unmarshal(data, &ks); err != nil {
 		return nil, fmt.Errorf("keystore: unmarshal: %w", err)
 	}
 	return &ks, nil
+}
+
+// UnmarshalKeystoreReader reads and parses at most the maximum permitted JSON
+// size. Use this for files or other untrusted streams so an oversized input is
+// rejected before it can be fully allocated in memory.
+func UnmarshalKeystoreReader(r io.Reader) (*KeystoreV1, error) {
+	if r == nil {
+		return nil, errors.New("keystore: missing input")
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxKeystoreJSONBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("keystore: read: %w", err)
+	}
+	return UnmarshalKeystore(data)
 }
 
 // ─── internal helpers ─────────────────────────────────────────────────────────

@@ -341,12 +341,13 @@ var walletUnlockCmd = &cobra.Command{
 	Short: "Decrypt a keystore file and show wallet info",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		raw, err := os.ReadFile(args[0])
+		file, err := os.Open(args[0])
 		if err != nil {
 			return fmt.Errorf("read keystore: %w", err)
 		}
+		defer file.Close()
 
-		ks, err := wallet.UnmarshalKeystore(raw)
+		ks, err := wallet.UnmarshalKeystoreReader(file)
 		if err != nil {
 			return fmt.Errorf("parse keystore: %w", err)
 		}

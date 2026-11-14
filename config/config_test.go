@@ -122,16 +122,29 @@ func TestStopProducingAtHeightValidationAndPersistence(t *testing.T) {
 	})
 }
 
-func TestMainnetRequiresCoordinatedSecurityHardeningHeight(t *testing.T) {
+func TestMainnetSecurityHardeningHeightRequiresCoordinationForValidators(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Network = Mainnet
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("mainnet config without the hardening activation height was accepted")
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "security_hardening_activation_height must be explicitly configured") {
+		t.Fatalf("mainnet config without a hardening height error = %v", err)
 	}
 
-	cfg.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight - 1
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("mainnet config with a mismatched hardening height was accepted")
+	// Validators remain pinned to the coordinated value until a staged replay
+	// supports changing the consensus release.
+	cfg.Consensus.SecurityHardeningActivationHeight = 9_876_543
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must match the coordinated height") {
+		t.Fatalf("mainnet validator with an uncoordinated height error = %v", err)
+	}
+
+	// A non-validator staging node may test a candidate height. It must still
+	// fail closed on other required mainnet settings.
+	cfg.Consensus.OracleMaxDeviation = 0.05
+	cfg.Consensus.NonValidator = true
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "staked_collateral_ring_exclusion_activation_height") {
+		t.Fatalf("mainnet config with an explicit height should proceed to other required checks, got %v", err)
 	}
 }
 

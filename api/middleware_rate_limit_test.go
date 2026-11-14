@@ -62,3 +62,47 @@ func TestHeavyRateLimiter429IncludesRetryAfter(t *testing.T) {
 		t.Fatalf("Retry-After = %q, want 1", got)
 	}
 }
+
+func TestRateLimiterBucketMapsHaveHardBounds(t *testing.T) {
+	rlOverflow := &tokenBucket{tokens: rlBurst, lastFill: time.Now()}
+	rl := &RateLimiter{
+		buckets:    make(map[string]*tokenBucket),
+		maxBuckets: 2,
+		overflow:   rlOverflow,
+	}
+	rl.bucket("198.51.100.1")
+	rl.bucket("198.51.100.2")
+	if got := len(rl.buckets); got != 2 {
+		t.Fatalf("general buckets = %d, want 2", got)
+	}
+	if got := rl.bucket("198.51.100.3"); got != rlOverflow {
+		t.Fatal("new IP after the general cap did not use the shared overflow bucket")
+	}
+	if got := rl.bucket("198.51.100.4"); got != rlOverflow {
+		t.Fatal("overflow IPs did not share the bounded fallback bucket")
+	}
+	if got := len(rl.buckets); got != 2 {
+		t.Fatalf("general buckets grew past cap: %d", got)
+	}
+
+	heavyOverflow := &tokenBucket{tokens: heavyBurst, lastFill: time.Now()}
+	heavy := &heavyRL{
+		buckets:    make(map[string]*tokenBucket),
+		maxBuckets: 2,
+		overflow:   heavyOverflow,
+	}
+	heavy.bucket("198.51.100.11")
+	heavy.bucket("198.51.100.12")
+	if got := len(heavy.buckets); got != 2 {
+		t.Fatalf("heavy buckets = %d, want 2", got)
+	}
+	if got := heavy.bucket("198.51.100.13"); got != heavyOverflow {
+		t.Fatal("new IP after the heavy cap did not use the shared overflow bucket")
+	}
+	if got := heavy.bucket("198.51.100.14"); got != heavyOverflow {
+		t.Fatal("heavy overflow IPs did not share the bounded fallback bucket")
+	}
+	if got := len(heavy.buckets); got != 2 {
+		t.Fatalf("heavy buckets grew past cap: %d", got)
+	}
+}

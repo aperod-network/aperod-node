@@ -62,13 +62,13 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 | RPC endpoint vulnerabilities | `/api/v1/*` public endpoints |
 | Install script supply-chain | Installer integrity |
 | Wallet key generation | Entropy, derivation path |
+| Dependency CVEs | Go and npm/pnpm dependencies, including reachable impact |
+| Server hardening | OS updates, SSH, firewall, reverse proxy, and backup-agent configuration |
 
 ### Out of Scope
 
 | Area |
 |------|
-| Third-party Go dependency CVEs (report upstream) |
-| Validator server operating system hygiene |
 | Social engineering |
 
 ---
@@ -113,20 +113,19 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 ### RPC / REST API (`/api/v1/*`)
 
 - **EIP-1559 fee model**: every protocol base fee is burned 100%; an explicit priority tip may compensate the proposer. Dynamic ±12.5%/block base-fee adjustment
-- **Rate limiting**: per-IP token-bucket limits — general 30-burst/1-per-sec; heavy endpoints (`/v1/blocks`, `/v1/network/stats`, `/v1/transactions`, `/v1/oracle`, `/v1/tokenomics`) capped at 10 req/min
-- **DDoS auto-ban**: any IP triggering the rate limiter 5+ times within 60 seconds is **permanently** blocked with no expiry. Bans persist across restarts (stored in DB). Applies to both heavy and general flood paths. Admin Telegram notification sent on every auto-ban.
+- **Rate limiting**: per-IP token buckets — general 100 tokens/second with a 200-token burst; heavy endpoints 2 tokens/second with a 5-token burst. Bucket state is capped at 65,536 IPs per limiter; additional IPs share a bounded overflow bucket.
+- **Rate-limit response**: rejected requests receive HTTP 429. Do not assume a rate-limit event creates a permanent IP ban.
 - **Input validation**: all user-supplied values validated and sanitised before DB writes or file operations
 - **File path safety**: all server-side file operations use `safeResolvePath()` — no user-controlled input can escape the designated directory
 
 ### Admin Interface
 
-- **Non-standard path**: admin UI is not served at any predictable or enumerable URL
-- **IP allowlist**: `/api/admin/*` routes reject requests outside the configured CIDR before session checks
-- **Brute-force lockout**: configurable threshold (default 5 attempts); auto-IP-ban at hard limit; Telegram alert on each lockout
-- **TOTP mandatory**: all admin accounts require TOTP; setup enforced at first login
+- **Secret-cookie gate**: the browser gate runs before CORS, body parsing, and password/TOTP routes
+- **Independent authentication**: password and TOTP checks remain separate; IP restrictions are secondary and must not replace the cookie gate
+- **TOTP mandatory**: admin accounts require TOTP
 - **JWT rotation**: short-lived access tokens (15 min) + refresh tokens; jti revocation on logout/ban
 - **All paths validated**: file reads/writes inside admin routes use `safeResolvePath()` — path traversal impossible
-- **Security headers**: `helmet`, HSTS (2 years), `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`
+- **Security headers**: the API middleware sets `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy`; HTML routes own their document CSP. Verify the deployed proxy and Cloudflare headers together to avoid duplicates.
 
 ---
 
@@ -151,14 +150,15 @@ All reward amounts are at the sole discretion of the Aperod team and subject to 
 
 ## Dependency & Static Analysis
 
-The codebase is continuously checked by:
+The repository CI runs:
 
-- **`gosec`** — Go static analysis for security anti-patterns
-- **SAST** — JavaScript/TypeScript static analysis on all API routes
-- **Dependency audit** — npm/pnpm CVE scanning on every CI run
-- **HoundDog** — dataflow analysis for secrets and PII exposure
+- **`golangci-lint`**, including `gosec`, and Go race tests
+- **`govulncheck`** — reachable Go vulnerability scanning
+- **`pnpm audit`** — dependency advisories at every severity
 
-Current status: **0 critical / 0 high findings** across all scanners.
+Replit SAST and HoundDog scans are run on demand, not as CI gates. Security
+findings must be checked against a fresh, dated scan before each release; this
+policy does not claim that the current tree has zero findings.
 
 ---
 

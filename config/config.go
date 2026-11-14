@@ -23,8 +23,9 @@ const (
 	Devnet  Network = "devnet"
 )
 
-// MainnetSecurityHardeningActivationHeight is the coordinated height for the
-// consensus hardening bundle approved for mainnet.
+// MainnetSecurityHardeningActivationHeight is the currently coordinated height
+// for mainnet validator configurations. Change it only after a full staging
+// replay and an explicitly coordinated consensus release.
 const MainnetSecurityHardeningActivationHeight uint64 = 3_800_000
 
 // SnapshotConfig controls snapshot integrity-check behavior.
@@ -393,7 +394,9 @@ type ConsensusConfig struct {
 	// SecurityHardeningActivationHeight activates deterministic validator tie
 	// breaking, output-key uniqueness, block limits, a fixed 5% oracle limit
 	// against the parent price, and reward authorization when its explicit
-	// height is zero. Mainnet must use the coordinated height.
+	// height is zero. Mainnet validators must use the coordinated height. A
+	// non-validator staging node may test a candidate height before that value is
+	// coordinated for validators.
 	SecurityHardeningActivationHeight uint64 `yaml:"security_hardening_activation_height"`
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
@@ -727,12 +730,17 @@ func (c *Config) Validate() error {
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
 	amountBindingActivation := c.Consensus.RingCTAmountBindingActivationHeight
-	if c.Network == Mainnet &&
-		securityHardeningActivation != MainnetSecurityHardeningActivationHeight {
-		return fmt.Errorf(
-			"mainnet security_hardening_activation_height must be %d",
-			MainnetSecurityHardeningActivationHeight,
-		)
+	if c.Network == Mainnet {
+		if securityHardeningActivation == 0 {
+			return fmt.Errorf("mainnet security_hardening_activation_height must be explicitly configured")
+		}
+		if !c.Consensus.NonValidator &&
+			securityHardeningActivation != MainnetSecurityHardeningActivationHeight {
+			return fmt.Errorf(
+				"mainnet validator security_hardening_activation_height must match the coordinated height %d",
+				MainnetSecurityHardeningActivationHeight,
+			)
+		}
 	}
 	if securityHardeningActivation > 0 && ringCTActivation > 0 &&
 		securityHardeningActivation < ringCTActivation {

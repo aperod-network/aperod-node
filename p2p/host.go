@@ -2067,8 +2067,6 @@ func (h *Host) acceptLoop() {
 			}
 			h.mu.RUnlock()
 			if ipCount >= h.cfg.MaxPeersPerIP {
-				h.log.Debug("inbound connection rejected: MaxPeersPerIP reached",
-					"max", h.cfg.MaxPeersPerIP)
 				conn.Close()
 				continue
 			}
@@ -2510,8 +2508,6 @@ func (h *Host) dialPeer(addr string) {
 		if h.cfg.MaxPeersPerIP > 0 && perIPPeers+perIPInflight >= h.cfg.MaxPeersPerIP {
 			h.dialGateMu.Unlock()
 			cancel()
-			h.log.Debug("dialPeer: MaxPeersPerIP reached (incl. in-flight dials)",
-				"ip_peers", perIPPeers, "ip_inflight", perIPInflight, "max", h.cfg.MaxPeersPerIP)
 			return
 		}
 	}
@@ -3298,12 +3294,20 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 		if err := unmarshal(data, &msg); err != nil {
 			return err
 		}
+		if len(msg.KnownHashes) > maxKnownHashesPerHeaderRequest {
+			return fmt.Errorf("header request has %d known hashes; maximum is %d",
+				len(msg.KnownHashes), maxKnownHashesPerHeaderRequest)
+		}
 		return h.handleGetHeaders(peer, msg)
 
 	case MsgHeaders:
 		var msg HeadersMsg
 		if err := unmarshal(data, &msg); err != nil {
 			return err
+		}
+		if len(msg.Headers) > maxHeadersPerMessage {
+			return fmt.Errorf("header response has %d headers; maximum is %d",
+				len(msg.Headers), maxHeadersPerMessage)
 		}
 		h.handleHeaders(peer, msg)
 		return nil
@@ -3849,21 +3853,46 @@ func (h *Host) handleHeaders(peer *Peer, msg HeadersMsg) {
 	if len(msg.Headers) == 0 {
 		return
 	}
-	// Request each unknown block and record it as pending so the per-peer
-	// stall-detection ticker can detect if MsgBlock never arrives.
+	// Request each unknown block at most once and record it before sending.
+	// This bounds duplicate-request amplification and makes a fast response
+	// observable to the stall detector.
 	now := time.Now()
 	for _, sh := range msg.Headers {
 		hash := crypto.Hash32(sh.Hash)
-		if h.handler.GetBlock(hash) == nil {
-			peer.Send(MsgGetBlock, GetBlockMsg{Hash: hash})
-			peer.pendingBlocksMu.Lock()
-			if _, already := peer.pendingBlocks[hash]; !already {
-				peer.pendingBlocks[hash] = pendingBlockEntry{
-					sentAt:       now,
-					headerHeight: sh.Height,
-				}
-			}
+		if h.handler.GetBlock(hash) != nil {
+			continue
+		}
+
+		peer.pendingBlocksMu.Lock()
+		if peer.pendingBlocks == nil {
+			peer.pendingBlocks = make(map[crypto.Hash32]pendingBlockEntry)
+		}
+		if _, already := peer.pendingBlocks[hash]; already {
 			peer.pendingBlocksMu.Unlock()
+			continue
+		}
+		if len(peer.pendingBlocks) >= maxHeadersPerMessage {
+			peer.pendingBlocksMu.Unlock()
+			h.log.Debug("peer exceeded pending block request limit",
+				"peer", peer.addr,
+				"limit", maxHeadersPerMessage)
+			return
+		}
+		peer.pendingBlocks[hash] = pendingBlockEntry{
+			sentAt:       now,
+			headerHeight: sh.Height,
+		}
+		peer.pendingBlocksMu.Unlock()
+
+		if err := peer.Send(MsgGetBlock, GetBlockMsg{Hash: hash}); err != nil {
+			peer.pendingBlocksMu.Lock()
+			delete(peer.pendingBlocks, hash)
+			peer.pendingBlocksMu.Unlock()
+			h.log.Warn("failed to request block announced by peer",
+				"peer", peer.addr,
+				"height", sh.Height,
+				"err", err)
+			return
 		}
 	}
 }
@@ -3996,7 +4025,8 @@ var nonPublicPeerPrefixes = func() []netip.Prefix {
 		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
 		"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
 		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-		"64:ff9b:1::/48", "2001:2::/48", "2001:10::/28", "2001:20::/28",
+		"64:ff9b:1::/48", "100::/64", "2001::/32", "2001:2::/48",
+		"2001:10::/28", "2001:20::/28",
 		"2001:db8::/32", "2002::/16",
 	}
 	prefixes := make([]netip.Prefix, 0, len(raw))
@@ -4009,11 +4039,23 @@ var nonPublicPeerPrefixes = func() []netip.Prefix {
 	return prefixes
 }()
 
+var wellKnownNAT64Prefix = netip.MustParsePrefix("64:ff9b::/96")
+
 func isPublicPeerIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
 	if !ip.IsValid() || !ip.IsGlobalUnicast() || ip.IsPrivate() ||
 		ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() || ip.IsUnspecified() {
 		return false
+	}
+	// The well-known NAT64 prefix embeds an IPv4 destination in the final
+	// 32 bits. Classify that destination too, so private IPv4 targets cannot
+	// bypass the peer-IP filter through its globally scoped IPv6 translation.
+	if wellKnownNAT64Prefix.Contains(ip) {
+		embedded := ip.As16()
+		return isPublicPeerIP(netip.AddrFrom4([4]byte{
+			embedded[12], embedded[13], embedded[14], embedded[15],
+		}))
 	}
 	for _, prefix := range nonPublicPeerPrefixes {
 		if prefix.Contains(ip) {

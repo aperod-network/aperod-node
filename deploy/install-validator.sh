@@ -355,6 +355,7 @@ Wants=network-online.target
 Type=simple
 User=${APEROD_USER}
 Group=${APEROD_USER}
+LimitCORE=0
 ExecStart=/usr/local/bin/aperod-node --config ${CONFIG_DIR}/node.yaml
 Restart=always
 RestartSec=5
