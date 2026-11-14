@@ -3617,6 +3617,10 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					return nil
 				}
 				peer.resetSyncRejectRetry()
+				// A successful synchronous acknowledgement is the authoritative
+				// validation result for this production handler, even when it does
+				// not implement the optional preflight BlockValidationHandler.
+				blockValidated = true
 			} else {
 				h.handler.OnBlock(block)
 			}
