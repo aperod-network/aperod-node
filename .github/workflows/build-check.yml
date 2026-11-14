@@ -23,6 +23,10 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Install pinned Go vulnerability scanner
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      - name: Scan reachable Go vulnerabilities
+        run: govulncheck ./...
       - name: Test application packages
         shell: bash
         run: |
