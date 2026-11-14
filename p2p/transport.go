@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -42,7 +43,15 @@ import (
 // The key file contains the raw 64-byte Ed25519 private key (seed || public).
 func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, string, bool, error) {
 	if !resetIdentity {
-		if data, err := os.ReadFile(keyPath); err == nil {
+		info, err := os.Lstat(keyPath)
+		if err == nil {
+			if err := validateP2PIdentityFile(keyPath, info); err != nil {
+				return nil, "", false, err
+			}
+			data, err := os.ReadFile(keyPath)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("p2p/transport: read identity key %s: %w", keyPath, err)
+			}
 			if len(data) == ed25519.PrivateKeySize {
 				priv := ed25519.PrivateKey(data)
 				pub := priv.Public().(ed25519.PublicKey)
@@ -50,7 +59,21 @@ func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, str
 				return cfg, fp, false, err
 			}
 			// File exists but is corrupt — fall through and regenerate.
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, "", false, fmt.Errorf("p2p/transport: inspect identity key %s: %w", keyPath, err)
 		}
+	} else if info, err := os.Lstat(keyPath); err == nil {
+		if err := validateP2PIdentityFile(keyPath, info); err != nil {
+			return nil, "", false, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, "", false, fmt.Errorf("p2p/transport: inspect identity key %s: %w", keyPath, err)
+	}
+
+	if info, err := os.Lstat(keyPath); err == nil && !info.Mode().IsRegular() {
+		return nil, "", false, fmt.Errorf("p2p/transport: identity key path %s is not a regular file", keyPath)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, "", false, fmt.Errorf("p2p/transport: inspect identity key path %s: %w", keyPath, err)
 	}
 
 	// Generate a new identity key.
@@ -66,6 +89,19 @@ func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, str
 	}
 	cfg, fp, err := nodeConfigFromKey(priv, pub)
 	return cfg, fp, true, err
+}
+
+func validateP2PIdentityFile(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("p2p/transport: identity key %s must be a regular file", path)
+	}
+	if info.Mode().Perm() != 0600 {
+		return fmt.Errorf("p2p/transport: identity key %s must have mode 0600 (found %04o)", path, info.Mode().Perm())
+	}
+	if err := validateP2PIdentityOwner(info); err != nil {
+		return fmt.Errorf("p2p/transport: identity key %s: %w", path, err)
+	}
+	return nil
 }
 
 // GenerateNodeTLSConfig creates an ephemeral Ed25519 identity and returns a
