@@ -28,6 +28,21 @@ func EnsureCanonicalState(
 	tipHeight uint64,
 	tipHash crypto.Hash32,
 ) (bool, error) {
+	return EnsureCanonicalStateWithSecurityHardening(
+		ctx, db, activationHeight, tipHeight, tipHash, 0,
+	)
+}
+
+// EnsureCanonicalStateWithSecurityHardening replays canonical AVM state using
+// the same height-gated nesting rule as the production consensus executor.
+func EnsureCanonicalStateWithSecurityHardening(
+	ctx context.Context,
+	db *store.DB,
+	activationHeight uint64,
+	tipHeight uint64,
+	tipHash crypto.Hash32,
+	securityHardeningActivationHeight uint64,
+) (bool, error) {
 	if activationHeight > 0 && tipHeight >= activationHeight {
 		replayCount := tipHeight - activationHeight + 1
 		if replayCount > MaxAVMCheckpointReplay {
@@ -37,7 +52,10 @@ func EnsureCanonicalState(
 			)
 		}
 	}
-	return ensureCanonicalState(ctx, db, activationHeight, tipHeight, tipHash, nil)
+	return ensureCanonicalState(
+		ctx, db, activationHeight, tipHeight, tipHash, nil,
+		securityHardeningActivationHeight,
+	)
 }
 
 // EnsureCanonicalStateWithCheckpoint resumes from a legacy v1
@@ -55,6 +73,26 @@ func EnsureCanonicalStateWithCheckpoint(
 	authorities []crypto.ValidatorPubKey,
 	signer CheckpointSigner,
 	maxReplayBlocks uint64,
+) (bool, error) {
+	return EnsureCanonicalStateWithCheckpointAndSecurityHardening(
+		ctx, db, activationHeight, tipHeight, tipHash, checkpointPath,
+		authorities, signer, maxReplayBlocks, 0,
+	)
+}
+
+// EnsureCanonicalStateWithCheckpointAndSecurityHardening is the legacy
+// operator-attested recovery path with explicit consensus-rule replay height.
+func EnsureCanonicalStateWithCheckpointAndSecurityHardening(
+	ctx context.Context,
+	db *store.DB,
+	activationHeight uint64,
+	tipHeight uint64,
+	tipHash crypto.Hash32,
+	checkpointPath string,
+	authorities []crypto.ValidatorPubKey,
+	signer CheckpointSigner,
+	maxReplayBlocks uint64,
+	securityHardeningActivationHeight uint64,
 ) (bool, error) {
 	if activationHeight == 0 || tipHeight < activationHeight {
 		return false, nil
@@ -79,6 +117,7 @@ func EnsureCanonicalStateWithCheckpoint(
 			signer:          signer,
 			maxReplayBlocks: maxReplayBlocks,
 		},
+		securityHardeningActivationHeight,
 	)
 }
 
@@ -96,6 +135,27 @@ func EnsureCanonicalStateWithQuorumCheckpoint(
 	authorities []crypto.ValidatorPubKey,
 	threshold int,
 	maxReplayBlocks uint64,
+) (bool, error) {
+	return EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
+		ctx, db, activationHeight, tipHeight, tipHash, checkpointPath,
+		authorities, threshold, maxReplayBlocks, 0,
+	)
+}
+
+// EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening verifies a
+// quorum checkpoint and replays canonical AVM state with the configured
+// security-hardening activation height.
+func EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
+	ctx context.Context,
+	db *store.DB,
+	activationHeight uint64,
+	tipHeight uint64,
+	tipHash crypto.Hash32,
+	checkpointPath string,
+	authorities []crypto.ValidatorPubKey,
+	threshold int,
+	maxReplayBlocks uint64,
+	securityHardeningActivationHeight uint64,
 ) (bool, error) {
 	if activationHeight == 0 || tipHeight < activationHeight {
 		return false, nil
@@ -117,6 +177,7 @@ func EnsureCanonicalStateWithQuorumCheckpoint(
 			witnessThreshold: threshold,
 			maxReplayBlocks:  maxReplayBlocks,
 		},
+		securityHardeningActivationHeight,
 	)
 }
 
@@ -135,6 +196,7 @@ func ensureCanonicalState(
 	tipHeight uint64,
 	tipHash crypto.Hash32,
 	checkpoint *checkpointRecovery,
+	securityHardeningActivationHeight uint64,
 ) (rebuilt bool, err error) {
 	if db == nil {
 		return false, fmt.Errorf("avm startup: nil database")
@@ -271,6 +333,7 @@ func ensureCanonicalState(
 			previousHash,
 			havePreviousHash,
 			strictHistory,
+			securityHardeningActivationHeight,
 		)
 		if err != nil {
 			return false, err
@@ -369,8 +432,11 @@ func replayCanonicalRange(
 	previousHash crypto.Hash32,
 	havePreviousHash bool,
 	verifySignatures bool,
+	securityHardeningActivationHeight uint64,
 ) (crypto.Hash32, error) {
-	executor := NewBlockExecutor(replay)
+	executor := NewBlockExecutorWithSecurityHardening(
+		replay, securityHardeningActivationHeight,
+	)
 	var tipCommitment crypto.Hash32
 	for height := startHeight; ; height++ {
 		if err := ctx.Err(); err != nil {
@@ -446,6 +512,21 @@ func BuildCheckpointDraftFromCanonical(
 	tipHeight uint64,
 	tipHash crypto.Hash32,
 ) (*AVMCheckpoint, error) {
+	return BuildCheckpointDraftFromCanonicalWithSecurityHardening(
+		ctx, db, activationHeight, tipHeight, tipHash, 0,
+	)
+}
+
+// BuildCheckpointDraftFromCanonicalWithSecurityHardening replays canonical
+// state under the exact hardening activation rule configured for the network.
+func BuildCheckpointDraftFromCanonicalWithSecurityHardening(
+	ctx context.Context,
+	db *store.DB,
+	activationHeight uint64,
+	tipHeight uint64,
+	tipHash crypto.Hash32,
+	securityHardeningActivationHeight uint64,
+) (*AVMCheckpoint, error) {
 	if db == nil {
 		return nil, fmt.Errorf("avm checkpoint: nil database")
 	}
@@ -483,6 +564,7 @@ func BuildCheckpointDraftFromCanonical(
 	replay := NewMemoryStore()
 	writeSetCommitment, err := replayCanonicalRange(
 		ctx, db, replay, activationHeight, tipHeight, tipHash, parentHash, true, true,
+		securityHardeningActivationHeight,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("avm checkpoint: verify canonical history: %w", err)
@@ -508,6 +590,23 @@ func BuildVerifiedCheckpointFromCanonical(
 	tipHash crypto.Hash32,
 	signer CheckpointSigner,
 	authorities []crypto.ValidatorPubKey,
+) (*AVMCheckpoint, error) {
+	return BuildVerifiedCheckpointFromCanonicalWithSecurityHardening(
+		ctx, db, activationHeight, tipHeight, tipHash, signer, authorities, 0,
+	)
+}
+
+// BuildVerifiedCheckpointFromCanonicalWithSecurityHardening verifies history
+// and signs the resulting state under the network's configured hardening rule.
+func BuildVerifiedCheckpointFromCanonicalWithSecurityHardening(
+	ctx context.Context,
+	db *store.DB,
+	activationHeight uint64,
+	tipHeight uint64,
+	tipHash crypto.Hash32,
+	signer CheckpointSigner,
+	authorities []crypto.ValidatorPubKey,
+	securityHardeningActivationHeight uint64,
 ) (*AVMCheckpoint, error) {
 	if db == nil {
 		return nil, fmt.Errorf("avm checkpoint: nil database")
@@ -542,6 +641,7 @@ func BuildVerifiedCheckpointFromCanonical(
 	replay := NewMemoryStore()
 	writeSetCommitment, err := replayCanonicalRange(
 		ctx, db, replay, activationHeight, tipHeight, tipHash, parentHash, true, true,
+		securityHardeningActivationHeight,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("avm checkpoint: verify canonical history: %w", err)

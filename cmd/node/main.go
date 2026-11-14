@@ -141,6 +141,9 @@ type nodeHandler struct {
 	log    *slog.Logger
 }
 
+var _ p2p.BlockAcceptanceHandler = (*nodeHandler)(nil)
+var _ p2p.TransactionAdmissionHandler = (*nodeHandler)(nil)
+
 func (h *nodeHandler) CurrentHeight() uint64 {
 	return h.chain.Height()
 }
@@ -162,11 +165,34 @@ func (h *nodeHandler) OnBlock(block *core.Block) {
 	}
 }
 
+// OnBlockWithResult acknowledges a peer block only after the consensus engine
+// has accepted or rejected it. The sync loop uses this result to avoid
+// endlessly requesting a block that the engine rejects.
+func (h *nodeHandler) OnBlockWithResult(block *core.Block) error {
+	return h.engine.SubmitIncomingBlock(block)
+}
+
 // OnTransaction adds an externally received transaction to the mempool.
 func (h *nodeHandler) OnTransaction(tx *core.Transaction) {
-	if err := h.pool.Add(*tx); err != nil {
+	if err := h.AdmitTransaction(tx); err != nil {
 		h.log.Debug("p2p: mempool rejected tx", "err", err)
 	}
+}
+
+// AdmitTransaction lets P2P relay only transactions accepted by the mempool.
+// Treat a concurrent duplicate as accepted only if the exact hash is present.
+func (h *nodeHandler) AdmitTransaction(tx *core.Transaction) error {
+	hash := tx.Hash()
+	if _, exists := h.pool.Get(hash); exists {
+		return nil
+	}
+	if err := h.pool.Add(*tx); err != nil {
+		if _, exists := h.pool.Get(hash); exists {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // OnVote forwards a p2p vote to the consensus engine.
@@ -1561,7 +1587,7 @@ func run() error {
 		var avmRebuilt bool
 		var avmErr error
 		if len(avmCheckpointAuthorities) > 0 {
-			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithQuorumCheckpoint(
+			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
 				context.Background(),
 				db,
 				cfg.Consensus.AVMActivationHeight,
@@ -1571,11 +1597,12 @@ func run() error {
 				avmCheckpointAuthorities,
 				avmCheckpointThreshold,
 				avm.MaxAVMCheckpointReplay,
+				cfg.Consensus.SecurityHardeningActivationHeight,
 			)
 		} else {
-			avmRebuilt, avmErr = avm.EnsureCanonicalState(
+			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithSecurityHardening(
 				context.Background(), db, cfg.Consensus.AVMActivationHeight,
-				tipHeight, tipHash,
+				tipHeight, tipHash, cfg.Consensus.SecurityHardeningActivationHeight,
 			)
 		}
 		if avmErr != nil {
@@ -2760,11 +2787,13 @@ func run() error {
 		StakedCollateralRingExclusionActivationHeight: cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 		AVMActivationHeight:                           cfg.Consensus.AVMActivationHeight,
 		AVMGasBurnActivationHeight:                    cfg.Consensus.AVMGasBurnActivationHeight,
-		AVMExecutor:                                   avm.NewBlockExecutor(avm.LevelStore{DB: db}),
-		RewardAuthorizationActivationHeight:           cfg.Consensus.RewardAuthorizationActivationHeight,
-		SecurityHardeningActivationHeight:             cfg.Consensus.SecurityHardeningActivationHeight,
-		GuardianFundActivationHeight:                  cfg.Consensus.GuardianFundActivationHeight,
-		GuardianFundChainAnchor:                       guardianAnchor,
+		AVMExecutor: avm.NewBlockExecutorWithSecurityHardening(
+			avm.LevelStore{DB: db}, cfg.Consensus.SecurityHardeningActivationHeight,
+		),
+		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
+		SecurityHardeningActivationHeight:   cfg.Consensus.SecurityHardeningActivationHeight,
+		GuardianFundActivationHeight:        cfg.Consensus.GuardianFundActivationHeight,
+		GuardianFundChainAnchor:             guardianAnchor,
 		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
 			raw, err := json.Marshal(block)
 			if err != nil {

@@ -16,7 +16,8 @@ const (
 	MaxInputSize             = 64 << 10
 	MaxStateKeySize          = 64
 	MaxStateValue            = 64 << 10
-	MaxAdmissionNestingDepth = 128 // Local pool policy; not a historical consensus limit.
+	MaxConsensusNestingDepth = 128 // Activated consensus limit for bounded Wasm compilation.
+	MaxAdmissionNestingDepth = MaxConsensusNestingDepth
 )
 
 var allowedImports = map[string]struct{}{

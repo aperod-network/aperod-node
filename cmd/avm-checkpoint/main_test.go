@@ -112,7 +112,7 @@ func TestRunSignRequiresMatchingIndependentCanonicalReplay(t *testing.T) {
 	witnessDBPath := copyDatabaseForWitness(t, dbPath)
 	dir := t.TempDir()
 	candidatePath := filepath.Join(dir, "draft.json")
-	if err := runBuild(dbPath, 1, candidatePath); err != nil {
+	if err := runBuild(dbPath, 1, 0, candidatePath); err != nil {
 		t.Fatalf("build draft: %v", err)
 	}
 	witnessKey, _, err := crypto.GenerateValidatorKey()
@@ -124,7 +124,7 @@ func TestRunSignRequiresMatchingIndependentCanonicalReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	signedPath := filepath.Join(dir, "partial.json")
-	if err := runSign(witnessDBPath, 1, candidatePath, keyPath, signedPath); err != nil {
+	if err := runSign(witnessDBPath, 1, 0, candidatePath, keyPath, signedPath); err != nil {
 		t.Fatalf("sign independently replayed candidate: %v", err)
 	}
 	partial, err := readWitnessSignature(signedPath)
@@ -141,7 +141,7 @@ func TestRunSignRequiresMatchingIndependentCanonicalReplay(t *testing.T) {
 	if err := avm.WriteCheckpointFile(forgedPath, draft); err != nil {
 		t.Fatal(err)
 	}
-	if err := runSign(witnessDBPath, 1, forgedPath, keyPath, filepath.Join(dir, "forged-signature.json")); err == nil ||
+	if err := runSign(witnessDBPath, 1, 0, forgedPath, keyPath, filepath.Join(dir, "forged-signature.json")); err == nil ||
 		!strings.Contains(err.Error(), "not canonical") {
 		t.Fatalf("witness signed a draft not found in its own canonical chain: %v", err)
 	}

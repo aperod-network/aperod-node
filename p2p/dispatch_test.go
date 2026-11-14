@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,6 +294,68 @@ func TestDispatch_Block(t *testing.T) {
 
 	if handler.blockCount() == 0 {
 		t.Error("OnBlock not called")
+	}
+}
+
+type blockAcceptanceAckHandler struct {
+	*stubHandler
+	err   error
+	calls atomic.Int32
+}
+
+func (h *blockAcceptanceAckHandler) OnBlockWithResult(*core.Block) error {
+	h.calls.Add(1)
+	return h.err
+}
+
+func TestDispatch_BlockUsesConsensusAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "accepted"},
+		{name: "rejected", err: errors.New("consensus rejection")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &blockAcceptanceAckHandler{
+				stubHandler: &stubHandler{},
+				err:         tc.err,
+			}
+			host := p2p.NewHost(p2p.Config{
+				ListenAddr: "127.0.0.1:0",
+				MaxPeers:   10,
+				NodeID:     "acceptance-test-host",
+				UserAgent:  "aperod/test",
+			}, handler, newTestLogger())
+			if err := host.Start(); err != nil {
+				t.Fatalf("host.Start: %v", err)
+			}
+			t.Cleanup(host.Stop)
+
+			priv, pub, _ := crypto.GenerateValidatorKey()
+			header := core.BlockHeader{
+				Height:       0,
+				ValidatorPub: pub,
+				Timestamp:    time.Now().UnixNano(),
+				MerkleRoot:   core.MerkleRoot(nil),
+			}
+			_ = header.Sign(priv)
+			block := &core.Block{Header: header}
+
+			connectAndHandshake(t, host.ListenAddr(), func(conn net.Conn) {
+				conn.SetDeadline(time.Now().Add(2 * time.Second))
+				if err := p2p.WriteMsg(conn, p2p.MsgBlock, p2p.BlockToMsg(block)); err != nil {
+					t.Fatalf("send block: %v", err)
+				}
+			})
+
+			if got := handler.calls.Load(); got != 1 {
+				t.Fatalf("OnBlockWithResult calls = %d, want 1", got)
+			}
+			if got := handler.blockCount(); got != 0 {
+				t.Fatalf("legacy asynchronous OnBlock calls = %d, want 0", got)
+			}
+		})
 	}
 }
 

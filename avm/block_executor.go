@@ -39,11 +39,22 @@ type PreparedBlock struct {
 }
 
 type BlockExecutor struct {
-	store Store
+	store                             Store
+	securityHardeningActivationHeight uint64
 }
 
 func NewBlockExecutor(store Store) *BlockExecutor {
 	return &BlockExecutor{store: store}
+}
+
+// NewBlockExecutorWithSecurityHardening activates the bounded consensus AVM
+// nesting rule at the coordinated hardening height. A zero height preserves
+// historical replay behavior.
+func NewBlockExecutorWithSecurityHardening(store Store, activationHeight uint64) *BlockExecutor {
+	return &BlockExecutor{
+		store:                             store,
+		securityHardeningActivationHeight: activationHeight,
+	}
 }
 
 func (e *BlockExecutor) PrepareBlock(ctx context.Context, block *core.Block) (*PreparedBlock, error) {
@@ -102,14 +113,19 @@ func (e *BlockExecutor) PrepareBlock(ctx context.Context, block *core.Block) (*P
 		for i, access := range payload.AccessList {
 			accessList[i] = Access{Key: bytes.Clone(access.Key), Write: access.Write}
 		}
-		result, executeErr := engine.Execute(ctx, ExecutionRequest{
+		maxNestingDepth := 0
+		if e.securityHardeningActivationHeight > 0 &&
+			block.Header.Height >= e.securityHardeningActivationHeight {
+			maxNestingDepth = MaxConsensusNestingDepth
+		}
+		result, executeErr := engine.executeWithNestingLimit(ctx, ExecutionRequest{
 			ContractID: [32]byte(payload.ContractID),
 			Code:       code,
 			Entry:      payload.Entry,
 			Input:      payload.Calldata,
 			GasLimit:   payload.GasLimit,
 			AccessList: accessList,
-		})
+		}, maxNestingDepth)
 		if executeErr != nil {
 			return nil, fmt.Errorf("avm: block %d tx[%d] execution: %w", block.Header.Height, index, executeErr)
 		}
