@@ -166,45 +166,18 @@ Withdrawals cannot be cancelled once initiated.
 
 ## Setup Guide
 
-Complete installation instructions are in the main [README](README.md).
+Follow [mainnet onboarding](MAINNET.md) for the release prerequisites,
+configuration checks, canonical-state verification and activation sequence.
 
-Use the reviewed, signed source commit below. Do not run an installer fetched
-from the mutable `main` branch, and never pipe a downloaded script directly to
-`sudo bash`. This is a pinned source checkout, not a standalone installer
-archive.
+**A verified self-service mainnet bootstrap release is not yet published.**
+These participation rules are not a claim that an arbitrary public source
+revision can join the running chain. In particular, `deploy/install-validator.sh`
+must not be used as a mainnet installer or made into one by replacing the
+network name. Never pipe mutable remote scripts into a root shell.
 
-The public validator installer supports testnet only. Do not use it to join
-mainnet; mainnet requires a verified canonical genesis and existing chain state.
-
-```bash
-# Reviewed source commit; GitHub reports its commit signature as valid.
-APEROD_NODE_SOURCE_COMMIT="de38c4b084c4377b5925d501d853cfe3da555a92"
-[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] && { echo "Invalid source commit / Неверный коммит исходного кода" >&2; exit 1; }
-curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
-
-INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git python3
-git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
-cd "$INSTALLER_DIR"
-git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
-git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"
-git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
-test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
-test -z "$(git status --porcelain)"
-
-# The script requires root and runs from this pinned local checkout.
-sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
-
-# Review the checked-out uninstaller before this destructive operation.
-sudo bash deploy/uninstall-validator.sh
-```
-
-The source commit above was signature-verified and its publication checks
-passed. If GitHub reports an invalid/missing signature, the checkout differs,
-or the installer refuses the pin, stop and do not bypass the checks.
+Registration, eligible on-chain locked stake and active-set inclusion are
+separate checks. Installing a service, submitting an API application, or
+holding APRO in a wallet does not by itself establish active validator status.
 
 **Key file locations after install:**
 
@@ -212,7 +185,7 @@ or the installer refuses the pin, stop and do not bypass the checks.
 |------|------|
 | Node config | `/etc/aperod/node.yaml` |
 | Consensus key | `/etc/aperod/validator.key` |
-| Blockchain data | `/var/lib/aperod/` |
+| Blockchain data | The verified profile's `data_dir` (normally `/var/lib/aperod/` for new installations) |
 | Service logs | `journalctl -u aperod-node -f` |
 
 ---
@@ -236,7 +209,7 @@ sudo ls -la /etc/aperod/validator.key
 # expected: -rw------- aperod aperod ...
 ```
 
-Newly installed validators (using the current `install-validator.sh`) have the
+Installations created by the existing `install-validator.sh` have the
 correct ownership set automatically.
 
 ---

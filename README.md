@@ -121,40 +121,30 @@ wallets, exchange records, or other network/application-layer information.
 
 ---
 
-## ⬇ Install a Full Node
+## ⬇ Mainnet Node Onboarding
 
-### Install from a pinned, signed source commit
+### Mainnet release prerequisites
 
-A standalone installer archive is not published. The reviewed installer source
-is commit `de38c4b084c4377b5925d501d853cfe3da555a92`. Verify GitHub's signature
-status for that exact commit, fetch it by its full SHA, and run the installer
-from the clean detached checkout. Never pipe a script from mutable `main` into
-a root shell.
-
-```bash
-set -euo pipefail
-APEROD_NODE_SOURCE_COMMIT=de38c4b084c4377b5925d501d853cfe3da555a92
-INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
-
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git python3
-
-curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
-
-git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
-cd "$INSTALLER_DIR"
-git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
-git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
-test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
-test -z "$(git status --porcelain)"
-sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-node.sh
-```
+Read [MAINNET.md](deploy/MAINNET.md). A verified self-service mainnet bootstrap release
+is not yet published. The release must bind compatible software, the canonical
+genesis, a consistent chain snapshot and the live consensus profile. Source
+signatures and passing CI alone do not prove compatibility with the running chain.
+Do not run a different network's installer or pipe mutable scripts into a root shell.
 
 Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
 
-The node installs as a `systemd` service and connects to the Aperod network automatically.
+Installation and automatic mainnet connection are not yet a verified public
+procedure. For an existing installation, this read-only check validates its
+configuration without starting a node or signing blocks:
+
+```bash
+(
+  set -euo pipefail
+  test -x /usr/local/bin/aperod-node
+  test -f /etc/aperod/node.yaml
+  sudo /usr/local/bin/aperod-node --config /etc/aperod/node.yaml --validate-config
+)
+```
 
 ### Verify the node is running
 
@@ -206,23 +196,18 @@ Block rewards go directly to your **Telegram wallet**. You need an APRO address 
 2. Tap **Create wallet**
 3. Copy your APRO address (≈ 95 characters, starts with `apr…`)
 
-### Step 2 — Install the validator node
+### Step 2 — Mainnet validator onboarding
 
-Use the same pinned, signed source checkout shown above, then run:
+Follow [MAINNET.md](deploy/MAINNET.md). Mainnet onboarding must use a compatible,
+verified release, canonical chain state and a new local consensus key.
+The current `deploy/install-validator.sh` is not a mainnet bootstrap procedure.
+Do not bypass its network guard or assume changing a network label makes its
+genesis compatible.
 
-```bash
-cd "$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
-```
-
-The installer will:
-- Prompt for your APRO reward address
-- Generate a **consensus key** (signs blocks only — cannot move funds)
-- Configure the node as a `systemd` service and start it
-
-Unattended CI / cloud-init validator installation remains disabled; use the
-interactive procedure above so an operator can inspect the target host and
-provide the reward address.
+The registration/staking steps below describe the intended participation flow,
+not a verified clean-server installation procedure. Do not transfer funds based
+only on these examples; verify the release's owner-authorized on-chain stake
+flow and active-set inclusion first.
 
 ### Step 3 — Register your node
 
@@ -254,7 +239,7 @@ Your node enters the active set automatically at the next epoch (~100 blocks · 
 
 ## 📋 Validator Rules
 
-See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol specification.
+See [**VALIDATORS.md**](deploy/VALIDATORS.md) for the complete rule set and protocol specification.
 
 **Quick reference:**
 
@@ -491,8 +476,8 @@ Outputs:
 ### Common commands
 
 ```bash
-# Start a full node
-./build/aperod-node --config config/testnet.yaml
+# Validate an existing mainnet profile without starting a node
+./build/aperod-node --config /etc/aperod/node.yaml --validate-config
 
 # Generate a new wallet (mnemonic + addresses)
 ./build/aperod wallet create

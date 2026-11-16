@@ -1,3 +1,5 @@
+> **Mainnet onboarding:** a verified self-service bootstrap release is not yet published. Read [the mainnet guide](MAINNET.md) before installing or funding a new validator. Source-build and CI success alone do not prove compatibility with the live chain.
+
 <div align="center">
 
 <img src="https://raw.githubusercontent.com/aperod-network/aperod-node/main/.github/images/og.png" alt="Aperod APRO — privacy-first Layer-1 network" width="1280" />
@@ -150,18 +152,14 @@ Block rewards go directly to your **Telegram wallet**. You need an APRO address 
 2. Tap **Create wallet**
 3. Copy your APRO address (≈ 95 characters, starts with `apr…`)
 
-### Step 2 — Install the validator node
+### Step 2 — Mainnet validator onboarding
 
-```bash
-# No signed, immutable installer release is published; do not run a mutable-main script as root.
-```
-
-The installer will:
-- Prompt for your APRO reward address
-- Generate a **consensus key** (signs blocks only — cannot move funds)
-- Configure the node as a `systemd` service and start it
-
-**CI / cloud-init installation is unavailable** until a signed, immutable installer release is published. Do not execute downloaded scripts with elevated privileges.
+Follow [MAINNET.md](MAINNET.md) and [VALIDATORS.md](VALIDATORS.md).
+A verified self-service mainnet release is not yet published.
+Do not run `deploy/install-validator.sh` as a mainnet installer or bypass its
+network guard. A mainnet validator requires verified synchronization, a unique
+consensus key, eligible on-chain locked stake and canonical active-set inclusion.
+An API application or a wallet balance alone does not activate a validator.
 
 ### Step 3 — Register your node
 
@@ -351,7 +349,7 @@ Outputs:
 
 ```bash
 # Start a full node
-./build/aperod-node --config config/testnet.yaml
+./build/aperod-node --config /etc/aperod/node.yaml --validate-config
 
 # Generate a new wallet (mnemonic + addresses)
 ./build/aperod wallet create
