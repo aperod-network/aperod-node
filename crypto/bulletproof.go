@@ -470,6 +470,18 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 // VerifyRange checks that the range proof is valid.
 // Returns (true, nil) only for proofs created by ProveRange.
 func VerifyRange(proof *RangeProof) (bool, error) {
+	return verifyRange(proof, false)
+}
+
+// VerifyRangeStrict checks the proof and requires every encoded curve point
+// to be canonical and in the prime-order subgroup. Consensus uses this at the
+// coordinated security-hardening activation; VerifyRange remains available for
+// historical block replay.
+func VerifyRangeStrict(proof *RangeProof) (bool, error) {
+	return verifyRange(proof, true)
+}
+
+func verifyRange(proof *RangeProof, requirePrimeSubgroup bool) (bool, error) {
 	if proof == nil {
 		return false, fmt.Errorf("nil proof")
 	}
@@ -499,6 +511,9 @@ func VerifyRange(proof *RangeProof) (bool, error) {
 
 	// Decode proof elements (all must be valid encodings)
 	decPt := func(b [32]byte, name string) (*edwards25519.Point, error) {
+		if requirePrimeSubgroup {
+			return checkedCLSAGSubgroupPoint(Point32(b), name, true)
+		}
 		p, err := new(edwards25519.Point).SetBytes(b[:])
 		if err != nil {
 			return nil, fmt.Errorf("decode %s: %w", name, err)

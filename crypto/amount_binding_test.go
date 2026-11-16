@@ -31,9 +31,20 @@ func TestAmountBindingRoundTripAndTamperRejection(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("VerifyAmountBinding = %v, %v", ok, err)
 	}
+	if ok, err := crypto.VerifyAmountBindingStrict(commitment, recipient.Spend.Public, binding); err != nil || !ok {
+		t.Fatalf("VerifyAmountBindingStrict = %v, %v", ok, err)
+	}
 	decoded, err := crypto.DecryptAmountBinding(binding, recipient.Spend.Private)
 	if err != nil || decoded != amount {
 		t.Fatalf("DecryptAmountBinding = %d, %v; want %d", decoded, err, amount)
+	}
+
+	strictTampered := *binding
+	strictChunk := strictTampered.Chunks[0]
+	strictChunk.E = crypto.Point32{}
+	strictTampered.Chunks[0] = strictChunk
+	if ok, err := crypto.VerifyAmountBindingStrict(commitment, recipient.Spend.Public, &strictTampered); err == nil || ok {
+		t.Fatalf("strict amount verifier accepted torsion ciphertext point: ok=%v err=%v", ok, err)
 	}
 
 	tampered := *binding

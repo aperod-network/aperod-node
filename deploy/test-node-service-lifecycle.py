@@ -160,6 +160,10 @@ for name, body in {
     p.chmod(0o755)
 env["PATH"] = str(stubs) + ":" + env["PATH"]
 env["APEROD_NODE_SOURCE_COMMIT"] = pin
+if MODE == "validator":
+    # The lifecycle guest uses a synthetic testnet genesis. Keep the real
+    # installer fail-closed, and explicitly select the fixture's network.
+    env["APEROD_NETWORK"] = "testnet"
 env["APEROD_REWARD_ADDRESS"] = "apro" + "A" * 99
 other_job = Path("/var/tmp/aperod-node-source.KEEPKEEP")
 other_job.mkdir()

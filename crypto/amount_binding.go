@@ -119,17 +119,35 @@ func CreateAmountBinding(value uint64, outputBlind BlindFactor, outputPub Point3
 // VerifyAmountBinding verifies chunk ranges, ciphertext/commitment equality,
 // and the weighted sum against the output's canonical Pedersen commitment.
 func VerifyAmountBinding(outputCommit Commitment, outputPub Point32, binding *AmountBinding) (bool, error) {
+	return verifyAmountBinding(outputCommit, outputPub, binding, false)
+}
+
+// VerifyAmountBindingStrict additionally requires all proof and ciphertext
+// points to be canonical prime-subgroup points. It is used by consensus after
+// the security-hardening activation; the non-strict form remains for replay.
+func VerifyAmountBindingStrict(outputCommit Commitment, outputPub Point32, binding *AmountBinding) (bool, error) {
+	return verifyAmountBinding(outputCommit, outputPub, binding, true)
+}
+
+func verifyAmountBinding(outputCommit Commitment, outputPub Point32, binding *AmountBinding, strict bool) (bool, error) {
 	if binding == nil {
 		return false, fmt.Errorf("nil amount binding")
 	}
 	pub, err := PointFromBytes(outputPub[:])
+	if strict {
+		pub, err = checkedCLSAGSubgroupPoint(outputPub, "amount-binding output public key", false)
+	}
 	if err != nil || pub.Equal(edwards25519.NewIdentityPoint()) == 1 {
 		return false, fmt.Errorf("invalid amount-binding output public key")
 	}
 	aggregate := new(edwards25519.Point).Set(edwards25519.NewIdentityPoint())
 	for i := range binding.Chunks {
 		chunk := &binding.Chunks[i]
-		ok, proofErr := VerifyRange(chunk.RangeProof)
+		verifyRange := VerifyRange
+		if strict {
+			verifyRange = VerifyRangeStrict
+		}
+		ok, proofErr := verifyRange(chunk.RangeProof)
 		if proofErr != nil {
 			return false, fmt.Errorf("amount-binding chunk %d range proof: %w", i, proofErr)
 		}
@@ -137,7 +155,7 @@ func VerifyAmountBinding(outputCommit Commitment, outputPub Point32, binding *Am
 			chunk.RangeProof.ValueCommit != chunk.Commitment {
 			return false, nil
 		}
-		ok, proofErr = verifyAmountLink(outputPub, chunk.Commitment, chunk.R, chunk.E, chunk.LinkProof)
+		ok, proofErr = verifyAmountLinkWithSubgroupPolicy(outputPub, chunk.Commitment, chunk.R, chunk.E, chunk.LinkProof, strict)
 		if proofErr != nil {
 			return false, fmt.Errorf("amount-binding chunk %d link proof: %w", i, proofErr)
 		}
@@ -145,12 +163,18 @@ func VerifyAmountBinding(outputCommit Commitment, outputPub Point32, binding *Am
 			return false, nil
 		}
 		commitPoint, parseErr := PointFromBytes(chunk.Commitment[:])
+		if strict {
+			commitPoint, parseErr = checkedCLSAGSubgroupPoint(Point32(chunk.Commitment), "amount-binding chunk commitment", true)
+		}
 		if parseErr != nil {
 			return false, fmt.Errorf("amount-binding chunk %d commitment: %w", i, parseErr)
 		}
 		aggregate.Add(aggregate, new(edwards25519.Point).ScalarMult(amountChunkWeight(i), commitPoint))
 	}
 	target, err := PointFromBytes(outputCommit[:])
+	if strict {
+		target, err = checkedCLSAGSubgroupPoint(Point32(outputCommit), "output commitment", true)
+	}
 	if err != nil {
 		return false, fmt.Errorf("invalid output commitment: %w", err)
 	}
@@ -239,31 +263,41 @@ func proveAmountLink(pub Point32, commitment Commitment, rPoint, ePoint Point32,
 }
 
 func verifyAmountLink(pub Point32, commitment Commitment, rPoint, ePoint Point32, proof AmountLinkProof) (bool, error) {
-	p, err := PointFromBytes(pub[:])
+	return verifyAmountLinkWithSubgroupPolicy(pub, commitment, rPoint, ePoint, proof, false)
+}
+
+func verifyAmountLinkWithSubgroupPolicy(pub Point32, commitment Commitment, rPoint, ePoint Point32, proof AmountLinkProof, strict bool) (bool, error) {
+	decodePoint := func(encoded Point32, name string, allowIdentity bool) (*edwards25519.Point, error) {
+		if strict {
+			return checkedCLSAGSubgroupPoint(encoded, name, allowIdentity)
+		}
+		return PointFromBytes(encoded[:])
+	}
+	p, err := decodePoint(pub, "encryption key", false)
 	if err != nil || p.Equal(edwards25519.NewIdentityPoint()) == 1 {
 		return false, fmt.Errorf("invalid encryption key")
 	}
-	c, err := PointFromBytes(commitment[:])
+	c, err := decodePoint(Point32(commitment), "chunk commitment", true)
 	if err != nil {
 		return false, fmt.Errorf("invalid chunk commitment: %w", err)
 	}
-	r, err := PointFromBytes(rPoint[:])
+	r, err := decodePoint(rPoint, "ciphertext R", false)
 	if err != nil || r.Equal(edwards25519.NewIdentityPoint()) == 1 {
 		return false, fmt.Errorf("invalid ciphertext R")
 	}
-	e, err := PointFromBytes(ePoint[:])
+	e, err := decodePoint(ePoint, "ciphertext E", true)
 	if err != nil {
 		return false, fmt.Errorf("invalid ciphertext E: %w", err)
 	}
-	t1, err := PointFromBytes(proof.TCommit[:])
+	t1, err := decodePoint(proof.TCommit, "link commitment", true)
 	if err != nil {
 		return false, fmt.Errorf("invalid link commitment: %w", err)
 	}
-	t2, err := PointFromBytes(proof.TCipher[:])
+	t2, err := decodePoint(proof.TCipher, "link ciphertext commitment", true)
 	if err != nil {
 		return false, fmt.Errorf("invalid link ciphertext commitment: %w", err)
 	}
-	t3, err := PointFromBytes(proof.TRandom[:])
+	t3, err := decodePoint(proof.TRandom, "link randomness commitment", true)
 	if err != nil {
 		return false, fmt.Errorf("invalid link randomness commitment: %w", err)
 	}

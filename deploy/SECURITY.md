@@ -7,10 +7,11 @@
 | Latest `main` | ✅ Active |
 | Older tags | ❌ No patches |
 
-Use only an installer from a signed, immutable release after independently
-verifying its source revision and checksum. Do not fetch scripts from mutable
-`main` and pipe them to a root shell. No signed installer release is currently
-published.
+No standalone signed installer archive is currently published. For an
+interactive install, use the pinned, GitHub-signature-verified source commit
+and clean-checkout procedure in [`README-public.md`](README-public.md).
+The installer independently checks the source commit and its ancestry. Never
+fetch a script from mutable `main` and pipe it to a root shell.
 
 ---
 

@@ -123,12 +123,34 @@ wallets, exchange records, or other network/application-layer information.
 
 ## ⬇ Install a Full Node
 
-### Installer security notice
+### Install from a pinned, signed source commit
 
-Do not pipe an installer fetched from the mutable `main` branch into `sudo bash`.
-No signed, immutable installer release is currently published. Install only from
-a reviewed source commit whose identity and deployment-tools checksum have been
-verified independently; otherwise do not run the installer as root.
+A standalone installer archive is not published. The reviewed installer source
+is commit `de38c4b084c4377b5925d501d853cfe3da555a92`. Verify GitHub's signature
+status for that exact commit, fetch it by its full SHA, and run the installer
+from the clean detached checkout. Never pipe a script from mutable `main` into
+a root shell.
+
+```bash
+set -euo pipefail
+APEROD_NODE_SOURCE_COMMIT=de38c4b084c4377b5925d501d853cfe3da555a92
+INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
+test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
+
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git python3
+
+curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
+
+git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
+cd "$INSTALLER_DIR"
+git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
+git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
+test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
+test -z "$(git status --porcelain)"
+sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-node.sh
+```
 
 Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
 
@@ -186,17 +208,21 @@ Block rewards go directly to your **Telegram wallet**. You need an APRO address 
 
 ### Step 2 — Install the validator node
 
-Do not run `install-validator.sh` from mutable `main` as root. A signed,
-immutable installer release is not currently published.
+Use the same pinned, signed source checkout shown above, then run:
+
+```bash
+cd "$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
+sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
+```
 
 The installer will:
 - Prompt for your APRO reward address
 - Generate a **consensus key** (signs blocks only — cannot move funds)
 - Configure the node as a `systemd` service and start it
 
-**CI / cloud-init installation is unavailable** until a signed, immutable
-installer release is published. Do not execute a downloaded script with elevated
-privileges.
+Unattended CI / cloud-init validator installation remains disabled; use the
+interactive procedure above so an operator can inspect the target host and
+provide the reward address.
 
 ### Step 3 — Register your node
 

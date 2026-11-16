@@ -3,6 +3,7 @@ package avm
 import (
 	"context"
 	stded25519 "crypto/ed25519"
+	"strings"
 	"testing"
 
 	"github.com/aperod/aperod/core"
@@ -46,6 +47,28 @@ func TestBlockExecutorRejectsReplayAndLeavesBaseUnchanged(t *testing.T) {
 	}
 	if len(store.data) != 0 {
 		t.Fatalf("failed block mutated base state: %d entries", len(store.data))
+	}
+}
+
+func TestBlockExecutorAppliesConsensusNestingLimitAtActivation(t *testing.T) {
+	const activationHeight = 10
+	code := nestedModuleCode(t, MaxConsensusNestingDepth+1)
+
+	beforeActivation := NewBlockExecutorWithSecurityHardening(NewMemoryStore(), activationHeight)
+	tx := signedAVMTransaction(t, core.AVMDeployContract, [32]byte{}, 0, code)
+	if _, err := beforeActivation.PrepareBlock(
+		context.Background(),
+		&core.Block{Header: core.BlockHeader{Height: activationHeight - 1}, Txs: []core.Transaction{tx}},
+	); err != nil {
+		t.Fatalf("historical block rejected before activation: %v", err)
+	}
+
+	afterActivation := NewBlockExecutorWithSecurityHardening(NewMemoryStore(), activationHeight)
+	if _, err := afterActivation.PrepareBlock(
+		context.Background(),
+		&core.Block{Header: core.BlockHeader{Height: activationHeight}, Txs: []core.Transaction{tx}},
+	); err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("post-activation block error = %v, want bounded nesting rejection", err)
 	}
 }
 

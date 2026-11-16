@@ -141,7 +141,7 @@ type Output struct {
 	AmountBinding *crypto.AmountBinding `json:"amount_binding,omitempty"`
 }
 
-// Hash returns the SHA3-256 hash of the transaction (used as transaction ID).
+// Hash returns the SHA-256-based transaction hash (used as transaction ID).
 func (tx *Transaction) Hash() crypto.Hash32 {
 	// F-4 fix: hash covers ALL fields that determine what the transaction does,
 	// so that the MLSAG signing message H(txHash||inputIdx) binds the signature
