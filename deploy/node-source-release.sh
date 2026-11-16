@@ -14,7 +14,7 @@ _node_source_git_env() {
 
 node_source_pin_guard() {
   [[ "${APEROD_NODE_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "[node-source] REFUSED: set APEROD_NODE_SOURCE_COMMIT to an explicitly reviewed full public commit." >&2
+    echo "[node-source] REFUSED / ОТКАЗ: set APEROD_NODE_SOURCE_COMMIT to an explicitly reviewed full public commit / укажите явно проверенный полный публичный коммит." >&2
     return 1
   }
 }
@@ -23,13 +23,13 @@ node_source_fresh_state_guard() {
   local path entries
   for path in "$@"; do
     _source_guard_has_symlink_component "$path" && {
-      echo "[node-source] REFUSED: fresh-install state path has a symlink component." >&2; return 1;
+      echo "[node-source] REFUSED / ОТКАЗ: fresh-install state path has a symlink component / путь состояния новой установки содержит символьную ссылку." >&2; return 1;
     }
     if [[ -e "$path" ]]; then
       [[ -d "$path" ]] || return 1
       entries="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
       [[ -z "$entries" ]] || {
-        echo "[node-source] REFUSED: state/configuration already exists; use a baseline-approved update or isolated recovery." >&2
+        echo "[node-source] REFUSED / ОТКАЗ: state/configuration already exists; use a baseline-approved update or isolated recovery / данные или конфигурация уже существуют; используйте одобренное обновление или изолированное восстановление." >&2
         return 1
       }
     fi
@@ -47,7 +47,7 @@ node_source_baseline_guard() {
   [[ "${APEROD_BASELINE_APPROVED_SOURCE:-}" == "$APEROD_NODE_SOURCE_COMMIT" &&
      "${APEROD_BASELINE_APPROVED_BINARY_SHA256:-}" =~ ^[0-9a-f]{64}$ &&
      "${APEROD_BASELINE_APPROVED_BINARY_SHA256}" == "$actual" ]] || {
-    echo "[node-source] REFUSED: baseline approval must bind this running binary SHA256 to the requested public source commit; rehearse compatibility first." >&2
+    echo "[node-source] REFUSED / ОТКАЗ: baseline approval must bind this running binary SHA256 to the requested public source commit; rehearse compatibility first / разрешение должно связать SHA256 работающего бинарника с публичным коммитом; сначала проверьте совместимость." >&2
     return 1
   }
 }
@@ -60,11 +60,11 @@ node_source_fetch_verified() (
   [[ "$origin" == "$expected_origin" && "$commit" =~ ^[0-9a-f]{40}$ &&
      "$root" =~ ^[0-9a-f]{40}$ && "$destination" == /* &&
      ! -e "$destination" && ! -L "$destination" ]] || {
-    echo "[node-source] REFUSED: wrong origin/commit or destination already exists." >&2
+    echo "[node-source] REFUSED / ОТКАЗ: wrong origin/commit or destination already exists / неверный источник или коммит, либо каталог назначения уже существует." >&2
     exit 1
   }
   _source_guard_has_symlink_component "$destination" && {
-    echo "[node-source] REFUSED: symlink destination component." >&2; exit 1;
+    echo "[node-source] REFUSED / ОТКАЗ: symlink destination component / путь назначения содержит символьную ссылку." >&2; exit 1;
   }
   _node_source_git_env || exit 1
   mkdir -m 700 -- "$destination" || exit 1
@@ -77,7 +77,7 @@ node_source_fetch_verified() (
   [[ "$(git -C "$destination" rev-parse --verify "$commit^{commit}")" == "$commit" ]] || exit 1
   git -C "$destination" merge-base --is-ancestor "$commit" refs/remotes/origin/main || exit 1
   [[ "$(git -C "$destination" rev-list --max-parents=0 "$commit")" == "$root" ]] || {
-    echo "[node-source] REFUSED: commit is not descended from the reviewed public root." >&2
+    echo "[node-source] REFUSED / ОТКАЗ: commit is not descended from the reviewed public root / коммит не является потомком проверенной публичной основы." >&2
     exit 1
   }
   git -c core.hooksPath=/dev/null -C "$destination" checkout --detach -q "$commit" || exit 1
@@ -88,7 +88,7 @@ node_source_fetch_verified() (
   local status
   status="$(git -C "$destination" status --porcelain --untracked-files=all)" || exit 1
   [[ -z "$status" ]] || exit 1
-  printf '[node-source] verified public commit %s\n' "$commit"
+  printf '[node-source] verified public commit / проверен публичный коммит %s\n' "$commit"
 )
 
 node_source_prepare() {
@@ -127,19 +127,19 @@ node_source_candidate_guard() (
   revision="$(git -c safe.directory="$checkout" -C "$checkout" rev-parse --verify HEAD)" || return 1
   status="$(git -c safe.directory="$checkout" -C "$checkout" status --porcelain --untracked-files=no)" || return 1
   [[ "$revision" == "$APEROD_NODE_SOURCE_COMMIT" && -z "$status" ]] || {
-    echo "[node-source] REFUSED: selected source changed during the build." >&2; return 1;
+    echo "[node-source] REFUSED / ОТКАЗ: selected source changed during the build / выбранный исходный код изменился во время сборки." >&2; return 1;
   }
   command -v go >/dev/null && command -v readelf >/dev/null || {
-    echo "[node-source] REFUSED: go and readelf are required to verify the candidate." >&2; return 1;
+    echo "[node-source] REFUSED / ОТКАЗ: go and readelf are required to verify the candidate / для проверки нужны Go и readelf." >&2; return 1;
   }
   info="$(go version -m "$binary")" || return 1
   node_source_candidate_info_guard "$info" "$APEROD_NODE_SOURCE_COMMIT" || {
-      echo "[node-source] REFUSED: candidate lacks clean, portable build provenance for the selected commit." >&2
+      echo "[node-source] REFUSED / ОТКАЗ: candidate lacks clean, portable build provenance for the selected commit / у сборки нет подтверждения чистого и переносимого происхождения из выбранного коммита." >&2
       return 1
     }
   segments="$(readelf -l "$binary")" || return 1
   [[ "$segments" != *INTERP* ]] || {
-    echo "[node-source] REFUSED: candidate has a dynamic ELF interpreter." >&2; return 1;
+    echo "[node-source] REFUSED / ОТКАЗ: candidate has a dynamic ELF interpreter / бинарник зависит от динамического ELF-интерпретатора." >&2; return 1;
   }
 )
 

@@ -53,7 +53,7 @@ func EncodeAddress(net NetworkByte, spend, view Point32) Address {
 	copy(payload[1:33], spend[:])
 	copy(payload[33:65], view[:])
 
-	// Append 4-byte checksum (first 4 bytes of double-SHA3)
+	// Append a 4-byte checksum (first 4 bytes of the legacy double-SHA-256 helper).
 	checksum := DoubleSHA3(payload)
 	full := append(payload, checksum[:4]...)
 

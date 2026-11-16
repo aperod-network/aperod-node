@@ -53,6 +53,8 @@ class NodeSourceTests(unittest.TestCase):
         (path / "Makefile").write_text("build:\n\tCGO_ENABLED=0 go build -o build/aperod-node ./cmd/node\n")
         (path / ".gitignore").write_text("/build/\n")
         (path / "cmd/node").mkdir(parents=True)
+        (path / "data").mkdir()
+        (path / "data/favicon.png").write_bytes(b"public static asset")
         (path / "cmd/node/main.go").write_text(
             'package main\nimport "fmt"\nfunc main(){fmt.Println("independent-public-node")}\n')
         self.git(path, "add", ".")
@@ -223,7 +225,7 @@ class NodeSourceTests(unittest.TestCase):
         pin = self.git(self.new, "rev-parse", "HEAD").strip()
         deploy = HELPER.parent
 
-        def sandbox(name, missing=None):
+        def sandbox(name, missing=None, network="testnet"):
             base = self.root / name
             host = base / "host"
             bootstrap = base / "bootstrap"
@@ -275,6 +277,7 @@ exit 0
                 file.chmod(0o755)
             env = {**self.env, "PATH": str(mocks) + ":" + str(host / "usr/local/bin") + ":" + self.env["PATH"],
                    "HOST": str(host), "APEROD_NODE_SOURCE_COMMIT": pin,
+                   "APEROD_NETWORK": network,
                    "APEROD_REWARD_ADDRESS": "synthetic-fixture-address-" * 5,
                    "GOTOOLCHAIN": "local", "GOTELEMETRY": "off"}
             result = subprocess.run(["bash", str(bootstrap / "install-validator.sh")], env=env,
@@ -293,6 +296,12 @@ exit 0
         self.assertIn("start aperod-node", calls)
         self.assertIn("enable --now aperod-node-watchdog.timer", calls)
         self.assertEqual(list((host / "var/tmp").iterdir()), [], "owned source job leaked")
+        wrong_network, network_refused = sandbox("mainnet-refused", network="mainnet")
+        self.assertNotEqual(network_refused.returncode, 0)
+        self.assertIn("testnet only", network_refused.stdout)
+        self.assertFalse((wrong_network / "commands").exists(), "mainnet refusal reached apt")
+        self.assertFalse((wrong_network / "etc/aperod/validator.key").exists())
+        self.assertFalse((wrong_network / "usr/local/bin/aperod-node").exists())
         broken, failed = sandbox("fresh-missing-bootstrap", missing="ensure-dropin.sh")
         self.assertNotEqual(failed.returncode, 0)
         self.assertFalse((broken / "commands").exists(), "missing bootstrap reached apt")

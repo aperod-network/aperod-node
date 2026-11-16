@@ -7,15 +7,15 @@
 #    sudo bash aperod-join.sh <PRIMARY_IP>:<API_PORT> [OPTIONS]
 #
 #  Примеры:
-#    # Remote sync is only supported through an SSH tunnel with a pinned host key:
-#    sudo bash aperod-join.sh 89.169.53.128:8545 --tunnel aperod@89.169.53.128
+#    # Remote sync requires an SSH tunnel with a pinned host key:
+#    sudo bash aperod-join.sh 89.169.53.128:8545 --tunnel operator@89.169.53.128
 #
 #    # Нестандартная директория данных:
 #    sudo bash aperod-join.sh 89.169.53.128:8545 --data-dir /opt/aperod/data/testnet
 #
 #  Опции:
-#    --api-key    <key>      X-API-Key для аутентификации на основном узле
-#    --tunnel     <user@host> Поднять SSH-туннель (рекомендуется при --api-key)
+#    --api-key    <key>      X-API-Key (предпочтительно задать через APEROD_API_KEY)
+#    --tunnel     <user@host> SSH-туннель; обязателен для удалённой загрузки
 #    --data-dir   <path>     Директория данных (по умолчанию /var/lib/aperod)
 #    --user       <name>     Пользователь-владелец данных (по умолчанию aperod)
 #    --p2p-port   <port>     P2P-порт основного узла (по умолчанию 30303)
@@ -50,7 +50,7 @@ die()   { echo -e "${RED}[ERR]${NC}   $*" >&2; exit 1; }
 # ── Параметры по умолчанию ────────────────────────────────
 DATA_DIR="/var/lib/aperod"
 DATA_USER="aperod"
-API_KEY=""
+API_KEY="${APEROD_API_KEY:-}"
 TUNNEL_HOST=""
 SKIP_START=false
 NO_CHAINDB=false
