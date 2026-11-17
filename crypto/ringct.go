@@ -413,6 +413,29 @@ func MLSAGVerifyV4(message Hash32, ring []RingMember, amountCommit Commitment,
 	return subtle.ConstantTimeCompare(expectedR.Bytes(), linkR.Bytes()) == 1, nil
 }
 
+// ValidateMLSAGPrimeOrderPoints rejects legacy MLSAG inputs containing
+// non-canonical or torsion points. It is called by consensus only after the
+// coordinated hardening activation so historical transactions remain replayable.
+func ValidateMLSAGPrimeOrderPoints(ring []RingMember, keyImage KeyImage, amountCommit *Commitment) error {
+	if len(ring) != RingSize {
+		return fmt.Errorf("ring size must be %d, got %d", RingSize, len(ring))
+	}
+	for i, member := range ring {
+		if _, err := checkedCLSAGPrimePoint(Point32(member), fmt.Sprintf("ring member %d", i)); err != nil {
+			return err
+		}
+	}
+	if _, err := checkedCLSAGPrimePoint(Point32(keyImage), "key image"); err != nil {
+		return err
+	}
+	if amountCommit != nil {
+		if _, err := checkedCLSAGSubgroupPoint(Point32(*amountCommit), "amount commitment", true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func validateRingForV4(ring []RingMember, realIdx int) error {
 	if len(ring) != RingSize {
 		return fmt.Errorf("ring size must be %d, got %d", RingSize, len(ring))

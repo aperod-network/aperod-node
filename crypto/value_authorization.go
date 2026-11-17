@@ -78,6 +78,21 @@ func VerifyValueAuthorization(amount uint64, commit Commitment, proof ValueAutho
 	return nil
 }
 
+// ValidateOutputPoints rejects invalid one-time output keys and nonzero
+// ephemeral transaction keys. A zero ephemeral key remains valid for legacy
+// transparent and protocol-generated outputs.
+func ValidateOutputPoints(oneTimePub, txPub Point32) error {
+	if _, err := checkedCLSAGPrimePoint(oneTimePub, "one-time output key"); err != nil {
+		return err
+	}
+	if txPub != (Point32{}) {
+		if _, err := checkedCLSAGPrimePoint(txPub, "output transaction public key"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ValidateAuthorizedOutputPoints rejects invalid public and ephemeral output points.
 func ValidateAuthorizedOutputPoints(pub, ephemeral Point32) error {
 	if _, err := checkedCLSAGPrimePoint(pub, "sale recipient output"); err != nil {

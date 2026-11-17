@@ -60,3 +60,19 @@ func TestValidateAuthorizedOutputPoints(t *testing.T) {
 		t.Fatal("small-order ephemeral output accepted")
 	}
 }
+
+func TestValidateOutputPointsAllowsTransparentKeyAndRejectsInvalidKeys(t *testing.T) {
+	publicKey, err := PublicKeyFromPrivate(ScalarFromUint64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateOutputPoints(publicKey, Point32{}); err != nil {
+		t.Fatalf("valid transparent output key rejected: %v", err)
+	}
+	if err := ValidateOutputPoints(Point32{1}, Point32{}); err == nil {
+		t.Fatal("identity one-time output key accepted")
+	}
+	if err := ValidateOutputPoints(publicKey, Point32{1}); err == nil {
+		t.Fatal("identity ephemeral transaction key accepted")
+	}
+}

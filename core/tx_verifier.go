@@ -164,6 +164,8 @@ func (v *TxVerifier) VerifyTxAtHeight(tx *Transaction, height uint64) error {
 }
 
 func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struct{}, height uint64) error {
+	hardeningActive := v.securityHardeningActivationHeight > 0 &&
+		height >= v.securityHardeningActivationHeight
 	// 1. Structural check
 	if err := tx.Validate(); err != nil {
 		return err
@@ -394,6 +396,18 @@ func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struc
 			if sig == nil {
 				return fmt.Errorf("tx %x: nil signature at input %d", txHashPrefix[:8], i)
 			}
+			if hardeningActive {
+				var amountCommit *crypto.Commitment
+				if tx.Version == TxVersionCommitmentBinding {
+					amountCommit = &inp.AmountCommit
+				}
+				if sig.KeyImage != inp.KeyImage {
+					return fmt.Errorf("tx %x: key image mismatch at input %d", txHashPrefix[:8], i)
+				}
+				if err := crypto.ValidateMLSAGPrimeOrderPoints(inp.Ring, sig.KeyImage, amountCommit); err != nil {
+					return fmt.Errorf("tx %x: input %d signature key-image subgroup validation: %w", txHashPrefix[:8], i, err)
+				}
+			}
 			if tx.Version == TxVersionCommitmentBinding {
 				ok, err = crypto.MLSAGVerifyV4(msg, inp.Ring, inp.AmountCommit, int(inp.RealIndex), sig)
 			} else {
@@ -413,7 +427,11 @@ func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struc
 
 	// 5. Range proofs for all outputs
 	for i, proof := range tx.RangeProofs {
-		ok, err := crypto.VerifyRange(proof)
+		verifyRange := crypto.VerifyRange
+		if hardeningActive {
+			verifyRange = crypto.VerifyRangeStrict
+		}
+		ok, err := verifyRange(proof)
 		if err != nil {
 			return fmt.Errorf("tx %x: range proof error at output %d: %w", txHashPrefix[:8], i, err)
 		}
@@ -428,7 +446,11 @@ func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struc
 	if tx.UsesAmountBinding() {
 		for i := range tx.Outputs {
 			output := &tx.Outputs[i]
-			ok, err := crypto.VerifyAmountBinding(output.AmountCommit, output.OneTimePub, output.AmountBinding)
+			verifyAmountBinding := crypto.VerifyAmountBinding
+			if hardeningActive {
+				verifyAmountBinding = crypto.VerifyAmountBindingStrict
+			}
+			ok, err := verifyAmountBinding(output.AmountCommit, output.OneTimePub, output.AmountBinding)
 			if err != nil {
 				return fmt.Errorf("tx %x: amount binding proof error at output %d: %w", txHashPrefix[:8], i, err)
 			}
@@ -561,6 +583,12 @@ func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
 	for txIndex, tx := range block.Txs {
 		for outputIndex, output := range tx.Outputs {
 			pub := output.OneTimePub
+			if err := crypto.ValidateOutputPoints(output.OneTimePub, output.TxPubKey); err != nil {
+				return fmt.Errorf(
+					"block %d tx %d output %d: invalid output point: %w",
+					block.Header.Height, txIndex, outputIndex, err,
+				)
+			}
 			if _, exists := seen[pub]; exists {
 				return fmt.Errorf(
 					"block %d tx %d output %d: duplicate one-time public key in block",
@@ -589,7 +617,7 @@ func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
 }
 
 // ringSignMessage computes the message hash for an MLSAG ring signature.
-// msg = SHA3(txHash || inputIndex) — binds the signature to a specific input.
+// msg = SHA-256(txHash || inputIndex) — binds the signature to a specific input.
 func ringSignMessage(txHash crypto.Hash32, inputIdx uint32) crypto.Hash32 {
 	idx := []byte{byte(inputIdx >> 24), byte(inputIdx >> 16), byte(inputIdx >> 8), byte(inputIdx)}
 	return crypto.HashBytes([]byte("aperod/ring-sign/v1"), txHash[:], idx)

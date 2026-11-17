@@ -34,3 +34,23 @@ func TestVerifyRangeRejectsUnsupportedWidthsBeforeAllocation(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyRangeStrictRequiresPrimeSubgroupPoints(t *testing.T) {
+	blind, err := NewBlindFactor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := ProveRange(17, blind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := VerifyRangeStrict(proof); err != nil || !ok {
+		t.Fatalf("valid proof rejected by strict verifier: ok=%v err=%v", ok, err)
+	}
+
+	tampered := *proof
+	tampered.A = [32]byte{} // canonical encoding of a small-order point
+	if ok, err := VerifyRangeStrict(&tampered); err == nil || ok {
+		t.Fatalf("strict verifier accepted a torsion proof point: ok=%v err=%v", ok, err)
+	}
+}

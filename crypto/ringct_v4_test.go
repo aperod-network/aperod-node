@@ -27,6 +27,35 @@ func buildV4Ring(t *testing.T) ([]crypto.RingMember, *crypto.WalletKeyPair) {
 	return ring, real
 }
 
+func TestValidateMLSAGPrimeOrderPointsRejectsTorsion(t *testing.T) {
+	ring, real := buildV4Ring(t)
+	blind, err := crypto.NewBlindFactor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitment, err := crypto.Commit(7, blind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyImage := crypto.KeyImage(real.Spend.Public)
+	if err := crypto.ValidateMLSAGPrimeOrderPoints(ring, keyImage, &commitment); err != nil {
+		t.Fatalf("valid prime-order controls rejected: %v", err)
+	}
+
+	torsionRing := append([]crypto.RingMember(nil), ring...)
+	torsionRing[0] = crypto.RingMember{}
+	if err := crypto.ValidateMLSAGPrimeOrderPoints(torsionRing, keyImage, &commitment); err == nil {
+		t.Fatal("torsion ring member accepted")
+	}
+	if err := crypto.ValidateMLSAGPrimeOrderPoints(ring, crypto.KeyImage{}, &commitment); err == nil {
+		t.Fatal("torsion key image accepted")
+	}
+	torsionCommitment := crypto.Commitment{}
+	if err := crypto.ValidateMLSAGPrimeOrderPoints(ring, keyImage, &torsionCommitment); err == nil {
+		t.Fatal("torsion amount commitment accepted")
+	}
+}
+
 func TestMLSAGV4BindsKeyAndCommitmentOpening(t *testing.T) {
 	ring, real := buildV4Ring(t)
 	blind, err := crypto.NewBlindFactor()

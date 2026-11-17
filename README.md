@@ -121,18 +121,38 @@ wallets, exchange records, or other network/application-layer information.
 
 ---
 
-## ⬇ Install a Full Node
+## ⬇ Mainnet Node Onboarding
 
-### Installer security notice
+### Mainnet release prerequisites
 
-Do not pipe an installer fetched from the mutable `main` branch into `sudo bash`.
-No signed, immutable installer release is currently published. Install only from
-a reviewed source commit whose identity and deployment-tools checksum have been
-verified independently; otherwise do not run the installer as root.
+Read [MAINNET.md](deploy/MAINNET.md). A verified self-service mainnet bootstrap release
+is not yet published. The release must bind compatible software, the canonical
+genesis, a consistent chain snapshot and the live consensus profile. Source
+signatures and passing CI alone do not prove compatibility with the running chain.
+Do not run a different network's installer or pipe mutable scripts into a root shell.
+
+The current `install-validator.sh` is testnet-only; pinning a source commit does
+not make it a mainnet installer. Do not set a network variable or rename a
+genesis file to bypass that guard. If an earlier source checkout already exists,
+preserve it rather than deleting it or rerunning the clone step. A failed
+preflight stops before package installation. Run shell blocks containing
+`set -e` or `exit` inside a child shell (`(...)`) so a failed check cannot close
+the SSH session.
 
 Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
 
-The node installs as a `systemd` service and connects to the Aperod network automatically.
+Installation and automatic mainnet connection are not yet a verified public
+procedure. For an existing installation, this read-only check validates its
+configuration without starting a node or signing blocks:
+
+```bash
+(
+  set -euo pipefail
+  test -x /usr/local/bin/aperod-node
+  test -f /etc/aperod/node.yaml
+  sudo /usr/local/bin/aperod-node --config /etc/aperod/node.yaml --validate-config
+)
+```
 
 ### Verify the node is running
 
@@ -184,19 +204,18 @@ Block rewards go directly to your **Telegram wallet**. You need an APRO address 
 2. Tap **Create wallet**
 3. Copy your APRO address (≈ 95 characters, starts with `apr…`)
 
-### Step 2 — Install the validator node
+### Step 2 — Mainnet validator onboarding
 
-Do not run `install-validator.sh` from mutable `main` as root. A signed,
-immutable installer release is not currently published.
+Follow [MAINNET.md](deploy/MAINNET.md). Mainnet onboarding must use a compatible,
+verified release, canonical chain state and a new local consensus key.
+The current `deploy/install-validator.sh` is not a mainnet bootstrap procedure.
+Do not bypass its network guard or assume changing a network label makes its
+genesis compatible.
 
-The installer will:
-- Prompt for your APRO reward address
-- Generate a **consensus key** (signs blocks only — cannot move funds)
-- Configure the node as a `systemd` service and start it
-
-**CI / cloud-init installation is unavailable** until a signed, immutable
-installer release is published. Do not execute a downloaded script with elevated
-privileges.
+The registration/staking steps below describe the intended participation flow,
+not a verified clean-server installation procedure. Do not transfer funds based
+only on these examples; verify the release's owner-authorized on-chain stake
+flow and active-set inclusion first.
 
 ### Step 3 — Register your node
 
@@ -228,7 +247,7 @@ Your node enters the active set automatically at the next epoch (~100 blocks · 
 
 ## 📋 Validator Rules
 
-See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol specification.
+See [**VALIDATORS.md**](deploy/VALIDATORS.md) for the complete rule set and protocol specification.
 
 **Quick reference:**
 
@@ -465,8 +484,8 @@ Outputs:
 ### Common commands
 
 ```bash
-# Start a full node
-./build/aperod-node --config config/testnet.yaml
+# Validate an existing mainnet profile without starting a node
+./build/aperod-node --config /etc/aperod/node.yaml --validate-config
 
 # Generate a new wallet (mnemonic + addresses)
 ./build/aperod wallet create

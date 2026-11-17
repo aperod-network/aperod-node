@@ -121,9 +121,28 @@ func TestMonitoringExporterArchivesArePinnedBeforeExtraction(t *testing.T) {
 	}
 }
 
-func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
+func TestPublicValidatorGuidesRequireVerifiedMainnetReadiness(t *testing.T) {
 	validators, err := os.ReadFile("VALIDATORS.md")
 	if err != nil {
+		t.Fatal(err)
+	}
+	mainnet, err := os.ReadFile("MAINNET.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicReadme, err := os.ReadFile("README-public.md")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	// The published tree may retain an older deploy/README-public.md while the
+	// current public-facing copy is at the repository root. Prefer that root
+	// copy when it contains the current mainnet safety notice.
+	publicRootReadme, rootErr := os.ReadFile("../README.md")
+	if rootErr == nil && strings.Contains(string(publicRootReadme), "current `install-validator.sh` is testnet-only") {
+		publicReadme = publicRootReadme
+	} else if err != nil {
 		t.Fatal(err)
 	}
 	investors, err := os.ReadFile("INVESTORS.md")
@@ -159,19 +178,49 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"APEROD_NODE_SOURCE_COMMIT",
-		`[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]`,
-		"git checkout --detach",
-		`git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"`,
-		"test \"$(git rev-parse HEAD)\" = \"$APEROD_NODE_SOURCE_COMMIT\"",
-		"sudo env APEROD_NODE_SOURCE_COMMIT=",
+		"[mainnet onboarding](MAINNET.md)",
+		"A verified self-service mainnet bootstrap release is not yet published.",
+		"must not be used as a mainnet installer",
 	} {
 		if !strings.Contains(string(validators), required) {
-			t.Errorf("pinned installation procedure is missing %q", required)
+			t.Errorf("validator guide is missing the mainnet readiness boundary %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"APEROD_NETWORK=testnet",
+		"sudo env APEROD_NETWORK=",
+	} {
+		if strings.Contains(string(validators), forbidden) {
+			t.Errorf("validator guide still advertises a non-mainnet install command: %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"existing Aperod mainnet",
+		"verified, self-service",
+		"canonical genesis",
+		"consistent, hash-verified bootstrap snapshot",
+		"on-chain stake",
+		"active set",
+		"source-pinning shell block is not a mainnet installer",
+		"Preserve that directory and its contents",
+		"child shell (`(...)`)",
+	} {
+		if !strings.Contains(string(mainnet), required) {
+			t.Errorf("mainnet onboarding guide is missing required release or activation guidance %q", required)
+		}
+	}
+	for _, required := range []string{
+		"current `install-validator.sh` is testnet-only",
+		"not make it a mainnet installer",
+		"preserve it rather than deleting it",
+		"child shell (`(...)`)",
+	} {
+		if !strings.Contains(string(publicReadme), required) {
+			t.Errorf("public node guide is missing installation safety guidance %q", required)
 		}
 	}
 	if !strings.Contains(string(investors), "VALIDATORS.md#setup-guide") {
-		t.Fatal("investor quick-start does not link to the pinned validator setup")
+		t.Fatal("investor quick-start does not link to the validator setup")
 	}
 	if !strings.Contains(string(morningReport), "install -o root -g root -m 0755 deploy/aperod-morning-report.sh") {
 		t.Fatal("morning-report installation does not use the checked-out source")

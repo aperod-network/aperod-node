@@ -1,6 +1,7 @@
 package avm
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -71,5 +72,36 @@ func TestModuleAdmissionUsesDepthPolicyForDeployAndCall(t *testing.T) {
 				t.Fatalf("action %d depth %d: %v", action, depth, err)
 			}
 		}
+	}
+}
+
+func nestedModuleCode(t *testing.T, depth int) []byte {
+	t.Helper()
+	module, err := wabinbinary.DecodeModule(stateWriteModule(false), wasm.CoreFeaturesV2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := make([]byte, 0, depth*3)
+	for i := 0; i < depth; i++ {
+		prefix = append(prefix, 0x02, 0x40)
+	}
+	for i := 0; i < depth; i++ {
+		prefix = append(prefix, 0x0b)
+	}
+	module.CodeSection[0].Body = append(prefix, module.CodeSection[0].Body...)
+	return wabinbinary.EncodeModule(module)
+}
+
+func TestExecuteBoundedRejectsDeepModuleBeforeCompilation(t *testing.T) {
+	engine := NewEngine(NewMemoryStore())
+	defer engine.Close(context.Background())
+
+	_, err := engine.ExecuteBounded(context.Background(), ExecutionRequest{
+		Code:     nestedModuleCode(t, MaxAdmissionNestingDepth+1),
+		Entry:    "run",
+		GasLimit: core.AVMMaxGasLimit,
+	})
+	if err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("ExecuteBounded error = %v, want nesting rejection", err)
 	}
 }

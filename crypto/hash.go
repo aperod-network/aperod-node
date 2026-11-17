@@ -1,6 +1,6 @@
 // Package crypto provides cryptographic primitives for the Aperod blockchain.
-// All hashing uses SHA3-256. Block hashes, transaction hashes, and key images
-// are all 32-byte arrays to avoid aliasing bugs.
+// HashBytes uses SHA-256. Block hashes, transaction hashes, and key images are
+// all 32-byte arrays to avoid aliasing bugs.
 package crypto
 
 import (
@@ -41,7 +41,9 @@ func HashConcat(parts ...[]byte) Hash32 {
 	return HashBytes(parts...)
 }
 
-// DoubleSHA3 applies SHA3-256 twice (used for checksums).
+// DoubleSHA3 is a legacy name for applying SHA-256 twice.
+// It is used for address checksums; changing the algorithm would require a
+// coordinated protocol migration.
 func DoubleSHA3(data []byte) Hash32 {
 	first := HashBytes(data)
 	return HashBytes(first[:])

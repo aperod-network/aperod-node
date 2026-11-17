@@ -4,13 +4,18 @@
 # to infer whether a file below the source root is disposable.
 
 _source_guard_die() {
-  printf '[source-safety] REFUSED: %s\n' "$*" >&2
+  printf '[source-safety] REFUSED / ОТКАЗ: %s\n' "$*" >&2
   return 1
 }
 
 _source_guard_is_runtime_path() {
   case "$1" in
-    data|data/*|blockchain/data|blockchain/data/*|*/data/testnet|*/data/testnet/*|\
+    data/mainnet|data/mainnet/*|data/testnet|data/testnet/*|data/devnet|data/devnet/*|\
+    blockchain/data/mainnet|blockchain/data/mainnet/*|\
+    blockchain/data/testnet|blockchain/data/testnet/*|\
+    blockchain/data/devnet|blockchain/data/devnet/*|\
+    */data/mainnet|*/data/mainnet/*|*/data/testnet|*/data/testnet/*|\
+    */data/devnet|*/data/devnet/*|\
     chain.db|chain.db/*|*/chain.db|*/chain.db/*|snapshots|snapshots/*|\
     */snapshots|*/snapshots/*|*.db|*.sqlite|*.sqlite3|*.ldb|*.sst|\
     */CURRENT|*/MANIFEST-[0-9]*|\
@@ -126,9 +131,12 @@ source_checkout_guard() {
 
   local candidate
   for candidate in \
-    "$checkout_real/data" \
-    "$checkout_real/blockchain/data" \
+    "$checkout_real/data/mainnet" \
     "$checkout_real/data/testnet" \
+    "$checkout_real/data/devnet" \
+    "$checkout_real/blockchain/data/mainnet" \
+    "$checkout_real/blockchain/data/testnet" \
+    "$checkout_real/blockchain/data/devnet" \
     "$checkout_real/chain.db" \
     "$checkout_real/snapshots"
   do

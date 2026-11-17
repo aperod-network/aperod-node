@@ -7,10 +7,11 @@
 | Latest `main` | ✅ Active |
 | Older tags | ❌ No patches |
 
-Use only an installer from a signed, immutable release after independently
-verifying its source revision and checksum. Do not fetch scripts from mutable
-`main` and pipe them to a root shell. No signed installer release is currently
-published.
+A verified self-service mainnet bootstrap release is not yet published.
+Follow the release prerequisites in [`MAINNET.md`](MAINNET.md); a signed source
+commit alone does not prove compatibility with the live chain. Never fetch a
+script from mutable `main` and pipe it to a root shell, or bypass network and
+source-identity guards to turn a different network's installer into a mainnet one.
 
 ---
 
