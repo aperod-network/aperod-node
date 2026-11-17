@@ -130,6 +130,21 @@ func TestPublicValidatorGuidesRequireVerifiedMainnetReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	publicReadme, err := os.ReadFile("README-public.md")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	// The published tree may retain an older deploy/README-public.md while the
+	// current public-facing copy is at the repository root. Prefer that root
+	// copy when it contains the current mainnet safety notice.
+	publicRootReadme, rootErr := os.ReadFile("../README.md")
+	if rootErr == nil && strings.Contains(string(publicRootReadme), "current `install-validator.sh` is testnet-only") {
+		publicReadme = publicRootReadme
+	} else if err != nil {
+		t.Fatal(err)
+	}
 	investors, err := os.ReadFile("INVESTORS.md")
 	if err != nil {
 		t.Fatal(err)
@@ -186,9 +201,22 @@ func TestPublicValidatorGuidesRequireVerifiedMainnetReadiness(t *testing.T) {
 		"consistent, hash-verified bootstrap snapshot",
 		"on-chain stake",
 		"active set",
+		"source-pinning shell block is not a mainnet installer",
+		"Preserve that directory and its contents",
+		"child shell (`(...)`)",
 	} {
 		if !strings.Contains(string(mainnet), required) {
 			t.Errorf("mainnet onboarding guide is missing required release or activation guidance %q", required)
+		}
+	}
+	for _, required := range []string{
+		"current `install-validator.sh` is testnet-only",
+		"not make it a mainnet installer",
+		"preserve it rather than deleting it",
+		"child shell (`(...)`)",
+	} {
+		if !strings.Contains(string(publicReadme), required) {
+			t.Errorf("public node guide is missing installation safety guidance %q", required)
 		}
 	}
 	if !strings.Contains(string(investors), "VALIDATORS.md#setup-guide") {

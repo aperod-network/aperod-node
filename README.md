@@ -131,6 +131,14 @@ genesis, a consistent chain snapshot and the live consensus profile. Source
 signatures and passing CI alone do not prove compatibility with the running chain.
 Do not run a different network's installer or pipe mutable scripts into a root shell.
 
+The current `install-validator.sh` is testnet-only; pinning a source commit does
+not make it a mainnet installer. Do not set a network variable or rename a
+genesis file to bypass that guard. If an earlier source checkout already exists,
+preserve it rather than deleting it or rerunning the clone step. A failed
+preflight stops before package installation. Run shell blocks containing
+`set -e` or `exit` inside a child shell (`(...)`) so a failed check cannot close
+the SSH session.
+
 Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
 
 Installation and automatic mainnet connection are not yet a verified public

@@ -13,6 +13,19 @@ The automatic `install-validator.sh` currently bootstraps a different network.
 It is not the mainnet installation procedure. Do not bypass its network guard,
 replace a network name in its template, or start a new empty chain.
 
+## Failed source-only installation attempts
+
+The source-pinning shell block is not a mainnet installer. A source commit can
+be fetched and verified while its installer still supports only testnet; changing
+the directory name, choosing another source path, or setting a network variable
+does not supply the missing canonical mainnet genesis or bootstrap state.
+
+If a preflight reports that `~/aperod-node-<commit>` already exists, it stops
+before package installation. Preserve that directory and its contents; do not
+delete it or rerun the same clone command over it. Any multi-line shell block
+containing `set -e` or `exit` must be run inside a child shell (`(...)`) so a
+failed check cannot close the operator's interactive SSH session.
+
 ## What a mainnet release must supply
 
 Before installing, obtain a reviewed release which binds all of these together:
