@@ -121,8 +121,12 @@ func TestMonitoringExporterArchivesArePinnedBeforeExtraction(t *testing.T) {
 	}
 }
 
-func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
+func TestPublicValidatorGuidesRequireVerifiedMainnetReadiness(t *testing.T) {
 	validators, err := os.ReadFile("VALIDATORS.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainnet, err := os.ReadFile("MAINNET.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,21 +163,36 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"APEROD_NODE_SOURCE_COMMIT",
-		`[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]`,
-		"git checkout --detach",
-		`git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"`,
-		"test \"$(git rev-parse HEAD)\" = \"$APEROD_NODE_SOURCE_COMMIT\"",
-		"sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT=",
-		"APEROD_NETWORK=testnet",
-		"supports testnet only",
+		"[mainnet onboarding](MAINNET.md)",
+		"A verified self-service mainnet bootstrap release is not yet published.",
+		"must not be used as a mainnet installer",
 	} {
 		if !strings.Contains(string(validators), required) {
-			t.Errorf("pinned installation procedure is missing %q", required)
+			t.Errorf("validator guide is missing the mainnet readiness boundary %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"APEROD_NETWORK=testnet",
+		"sudo env APEROD_NETWORK=",
+	} {
+		if strings.Contains(string(validators), forbidden) {
+			t.Errorf("validator guide still advertises a non-mainnet install command: %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"existing Aperod mainnet",
+		"verified, self-service",
+		"canonical genesis",
+		"consistent, hash-verified bootstrap snapshot",
+		"on-chain stake",
+		"active set",
+	} {
+		if !strings.Contains(string(mainnet), required) {
+			t.Errorf("mainnet onboarding guide is missing required release or activation guidance %q", required)
 		}
 	}
 	if !strings.Contains(string(investors), "VALIDATORS.md#setup-guide") {
-		t.Fatal("investor quick-start does not link to the pinned validator setup")
+		t.Fatal("investor quick-start does not link to the validator setup")
 	}
 	if !strings.Contains(string(morningReport), "install -o root -g root -m 0755 deploy/aperod-morning-report.sh") {
 		t.Fatal("morning-report installation does not use the checked-out source")
