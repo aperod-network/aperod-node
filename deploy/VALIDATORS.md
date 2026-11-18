@@ -168,35 +168,43 @@ Withdrawals cannot be cancelled once initiated.
 
 Complete installation instructions are in the main [README](README.md).
 
-Use only a full commit SHA published for a reviewed release. Do not run an
-installer fetched from the mutable `main` branch, and never pipe a downloaded
-script directly to `sudo bash`.
+Use the reviewed, signed source commit below. Do not run an installer fetched
+from the mutable `main` branch, and never pipe a downloaded script directly to
+`sudo bash`. This is a pinned source checkout, not a standalone installer
+archive.
+
+The public validator installer supports testnet only. Do not use it to join
+mainnet; mainnet requires a verified canonical genesis and existing chain state.
 
 ```bash
-# Replace this with the full SHA from the reviewed release record.
-APEROD_NODE_SOURCE_COMMIT="<reviewed-40-character-commit-sha>"
-if [[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "A reviewed, full 40-character commit SHA is required." >&2
-  exit 1
-fi
+# Reviewed source commit; GitHub reports its commit signature as valid.
+APEROD_NODE_SOURCE_COMMIT="de38c4b084c4377b5925d501d853cfe3da555a92"
+[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] && { echo "Invalid source commit / Неверный коммит исходного кода" >&2; exit 1; }
+curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
 
-git clone --no-checkout https://github.com/aperod-network/aperod-node.git aperod-node
-cd aperod-node
+INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
+test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git python3
+git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
+cd "$INSTALLER_DIR"
 git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
 git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"
 git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
 test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
 test -z "$(git status --porcelain)"
 
-# Review the checked-out installer before running it as root.
-sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
+# The script requires root and runs from this pinned local checkout.
+sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
 
 # Review the checked-out uninstaller before this destructive operation.
 sudo bash deploy/uninstall-validator.sh
 ```
 
-If no reviewed release record supplies the exact commit SHA, do not install or
-uninstall from this guide.
+The source commit above was signature-verified and its publication checks
+passed. If GitHub reports an invalid/missing signature, the checkout differs,
+or the installer refuses the pin, stop and do not bypass the checks.
 
 **Key file locations after install:**
 

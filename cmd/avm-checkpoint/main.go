@@ -38,6 +38,7 @@ func main() {
 	mode := flag.String("mode", "build", "build, sign, or assemble")
 	dbPath := flag.String("db", "", "path to a canonical chain.db copy")
 	activationHeight := flag.Uint64("activation-height", 0, "configured AVM activation height")
+	securityHardeningHeight := flag.Uint64("security-hardening-height", 0, "configured consensus security-hardening activation height (required for build/sign; use 0 before activation)")
 	candidatePath := flag.String("candidate", "", "unsigned v2 checkpoint draft")
 	keyPath := flag.String("key", "", "0600 witness private-key file (sign mode only)")
 	outputPath := flag.String("out", "", "output draft, partial signature, or final checkpoint")
@@ -47,21 +48,31 @@ func main() {
 	flag.Var(&authorityKeys, "authority", "trusted witness public key in hex (repeat for each key)")
 	flag.Var(&signatureFiles, "signature", "detached witness signature file (repeat for each signer)")
 	flag.Parse()
+	securityHardeningHeightProvided := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "security-hardening-height" {
+			securityHardeningHeightProvided = true
+		}
+	})
 	var err error
 	switch *mode {
 	case "build":
-		if *dbPath == "" || *activationHeight == 0 || *outputPath == "" {
+		if *dbPath == "" || *activationHeight == 0 || *outputPath == "" ||
+			!securityHardeningHeightProvided {
 			flag.Usage()
 			os.Exit(2)
 		}
-		err = runBuild(*dbPath, *activationHeight, *outputPath)
+		err = runBuild(*dbPath, *activationHeight, *securityHardeningHeight, *outputPath)
 	case "sign":
 		if *dbPath == "" || *activationHeight == 0 || *candidatePath == "" ||
-			*keyPath == "" || *outputPath == "" {
+			*keyPath == "" || *outputPath == "" || !securityHardeningHeightProvided {
 			flag.Usage()
 			os.Exit(2)
 		}
-		err = runSign(*dbPath, *activationHeight, *candidatePath, *keyPath, *outputPath)
+		err = runSign(
+			*dbPath, *activationHeight, *securityHardeningHeight,
+			*candidatePath, *keyPath, *outputPath,
+		)
 	case "assemble":
 		if *candidatePath == "" || *outputPath == "" || *threshold < 2 ||
 			len(authorityKeys) < *threshold || len(signatureFiles) < *threshold {
@@ -79,7 +90,7 @@ func main() {
 	}
 }
 
-func runBuild(dbPath string, activationHeight uint64, outputPath string) (retErr error) {
+func runBuild(dbPath string, activationHeight, securityHardeningHeight uint64, outputPath string) (retErr error) {
 	db, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		return fmt.Errorf("open chain database read-only: %w", err)
@@ -93,12 +104,13 @@ func runBuild(dbPath string, activationHeight uint64, outputPath string) (retErr
 	if err != nil {
 		return fmt.Errorf("read canonical tip: %w", err)
 	}
-	draft, err := avm.BuildCheckpointDraftFromCanonical(
+	draft, err := avm.BuildCheckpointDraftFromCanonicalWithSecurityHardening(
 		context.Background(),
 		db,
 		activationHeight,
 		tipHeight,
 		tipHash,
+		securityHardeningHeight,
 	)
 	if err != nil {
 		return err
@@ -115,7 +127,7 @@ func runBuild(dbPath string, activationHeight uint64, outputPath string) (retErr
 	return nil
 }
 
-func runSign(dbPath string, activationHeight uint64, candidatePath, keyPath, outputPath string) (retErr error) {
+func runSign(dbPath string, activationHeight, securityHardeningHeight uint64, candidatePath, keyPath, outputPath string) (retErr error) {
 	draft, found, err := avm.ReadCheckpointFile(candidatePath)
 	if err != nil {
 		return err
@@ -136,8 +148,9 @@ func runSign(dbPath string, activationHeight uint64, candidatePath, keyPath, out
 			retErr = errors.Join(retErr, fmt.Errorf("close checkpoint verification database: %w", err))
 		}
 	}()
-	localDraft, err := avm.BuildCheckpointDraftFromCanonical(
+	localDraft, err := avm.BuildCheckpointDraftFromCanonicalWithSecurityHardening(
 		context.Background(), db, activationHeight, draft.Height, draft.BlockHash,
+		securityHardeningHeight,
 	)
 	if err != nil {
 		return fmt.Errorf("independent canonical replay: %w", err)

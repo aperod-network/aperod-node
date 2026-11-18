@@ -73,6 +73,21 @@ func (e *Engine) Close(ctx context.Context) error {
 }
 
 func (e *Engine) Execute(ctx context.Context, request ExecutionRequest) (ExecutionResult, error) {
+	return e.executeWithNestingLimit(ctx, request, 0)
+}
+
+// ExecuteBounded applies the local AVM admission nesting limit. Use this for
+// untrusted simulations; consensus replay selects its height-gated rule in
+// BlockExecutor instead.
+func (e *Engine) ExecuteBounded(ctx context.Context, request ExecutionRequest) (ExecutionResult, error) {
+	return e.executeWithNestingLimit(ctx, request, MaxAdmissionNestingDepth)
+}
+
+func (e *Engine) executeWithNestingLimit(
+	ctx context.Context,
+	request ExecutionRequest,
+	maxNestingDepth int,
+) (ExecutionResult, error) {
 	var result ExecutionResult
 	if request.Entry == "" {
 		request.Entry = "run"
@@ -80,7 +95,7 @@ func (e *Engine) Execute(ctx context.Context, request ExecutionRequest) (Executi
 	if len(request.Input) > MaxInputSize {
 		return result, fmt.Errorf("avm: input is %d bytes, max %d", len(request.Input), MaxInputSize)
 	}
-	report, err := ValidateModule(request.Code)
+	report, err := validateModule(request.Code, maxNestingDepth)
 	if err != nil {
 		return result, err
 	}

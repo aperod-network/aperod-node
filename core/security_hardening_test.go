@@ -11,6 +11,15 @@ import (
 
 const testSecurityHardeningHeight = 3_800_000
 
+func securityHardeningTestPoint(t *testing.T) crypto.Point32 {
+	t.Helper()
+	pub, err := crypto.PublicKeyFromPrivate(crypto.ScalarFromUint64(1))
+	if err != nil {
+		t.Fatalf("create valid test point: %v", err)
+	}
+	return pub
+}
+
 func TestSecurityHardeningRejectsOversizedBlocksAtActivation(t *testing.T) {
 	verifier := NewTxVerifier(nil)
 	verifier.SetSecurityHardeningActivationHeight(testSecurityHardeningHeight)
@@ -45,8 +54,7 @@ func TestSecurityHardeningRejectsOversizedSerializedBlock(t *testing.T) {
 }
 
 func TestSecurityHardeningRejectsDuplicateOutputKeys(t *testing.T) {
-	var pub crypto.Point32
-	pub[0] = 1
+	pub := securityHardeningTestPoint(t)
 	block := &Block{Header: BlockHeader{Height: testSecurityHardeningHeight}}
 	block.Txs = []Transaction{
 		{Outputs: []Output{{OneTimePub: pub}}},
@@ -60,8 +68,7 @@ func TestSecurityHardeningRejectsDuplicateOutputKeys(t *testing.T) {
 }
 
 func TestSecurityHardeningRejectsExistingOutputKeyCollision(t *testing.T) {
-	var pub crypto.Point32
-	pub[0] = 9
+	pub := securityHardeningTestPoint(t)
 	utxos := NewUTXOSet()
 	utxos.Add(&UTXO{TxHash: crypto.Hash32{1}, OneTimePub: pub})
 
@@ -79,8 +86,7 @@ func TestSecurityHardeningRejectsExistingOutputKeyCollision(t *testing.T) {
 func TestSecurityHardeningFailsClosedWhenRingIndexCannotBeRead(t *testing.T) {
 	utxos := NewUTXOSet()
 	utxos.ringMembers = hardeningFailingRingMemberStore{}
-	var pub crypto.Point32
-	pub[0] = 12
+	pub := securityHardeningTestPoint(t)
 	block := &Block{
 		Header: BlockHeader{Height: testSecurityHardeningHeight},
 		Txs:    []Transaction{{Outputs: []Output{{OneTimePub: pub}}}},
@@ -89,6 +95,25 @@ func TestSecurityHardeningFailsClosedWhenRingIndexCannotBeRead(t *testing.T) {
 	if err := verifier.verifySecurityHardeningRules(block); err == nil ||
 		!strings.Contains(err.Error(), "could not check one-time public key uniqueness") {
 		t.Fatalf("ring-index lookup error = %v, want fail-closed error", err)
+	}
+}
+
+func TestSecurityHardeningRejectsInvalidOutputPoints(t *testing.T) {
+	var identity crypto.Point32
+	identity[0] = 1
+	block := &Block{
+		Header: BlockHeader{Height: testSecurityHardeningHeight},
+		Txs:    []Transaction{{Outputs: []Output{{OneTimePub: identity}}}},
+	}
+	verifier := NewTxVerifier(nil)
+	verifier.SetSecurityHardeningActivationHeight(testSecurityHardeningHeight)
+	if err := verifier.VerifyBlock(block); err == nil ||
+		!strings.Contains(err.Error(), "invalid output point") {
+		t.Fatalf("VerifyBlock error = %v, want invalid output-point rejection", err)
+	}
+	block.Header.Height--
+	if err := verifier.VerifyBlock(block); err != nil {
+		t.Fatalf("historical block before activation was rejected: %v", err)
 	}
 }
 

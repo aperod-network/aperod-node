@@ -9,22 +9,29 @@
 Запустите **на НОВОМ сервере** (не на основном):
 
 ```bash
-sudo bash /opt/aperod/deploy/aperod-join.sh <PRIMARY_IP>:<API_PORT>
+PRIMARY_IP=192.0.2.10
+SSH_USER=operator
+sudo bash /opt/aperod/deploy/aperod-join.sh "${PRIMARY_IP}:8545" \
+  --tunnel "${SSH_USER}@${PRIMARY_IP}"
 ```
 
 **Пример для тестнета:**
 
 ```bash
-sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
+sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 \
+  --tunnel operator@89.169.53.128
 ```
 
-Если основной узел настроен с API-ключом (`api.key` в `node.yaml`):
+Если на основном узле задан API-ключ (`api.key` в `node.yaml`), введите его скрыто
+и передайте скрипту через окружение — не вставляйте значение в команду или историю:
 
 ```bash
-sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --api-key <ваш_api_key>
+sudo bash -c 'read -rsp "API key: " APEROD_API_KEY; printf "\n"; export APEROD_API_KEY; exec bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --tunnel operator@89.169.53.128'
 ```
 
-Скрипт сделает всё автоматически за 5–10 минут. Если хотите понять процесс — читайте ниже.
+Перед запуском SSH host key основного сервера должен быть проверен через доверенный
+канал и закреплён в `/root/.ssh/known_hosts`. Скрипт откажется от удалённого
+незашифрованного HTTP. Если хотите понять процесс — читайте ниже.
 
 ---
 
@@ -32,7 +39,7 @@ sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --api-key <ваш
 
 | Шаг | Действие |
 |-----|----------|
-| 1 | Проверяет доступность основного узла по HTTP |
+| 1 | Проверяет API основного узла через SSH-туннель (HTTP только на loopback) |
 | 2 | Останавливает `aperod-node` на **новом** сервере |
 | 3 | Очищает старые данные в `data_dir` |
 | 4 | Скачивает `chain.db` через `GET /api/v1/chaindb/export` (~1–2 ГБ) |
@@ -62,7 +69,8 @@ sudo bash /opt/aperod/deploy/install-node.sh --primary-ip 89.169.53.128
 sudo bash /opt/aperod/deploy/install-node.sh
 
 # Затем, когда IP станет известен — подключение к сети:
-sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
+sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 \
+  --tunnel operator@89.169.53.128
 ```
 
 > ⚠️ **Не запускайте ноду до выполнения одного из двух шагов выше.**
@@ -77,12 +85,13 @@ sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
 - Ubuntu 22.04 / 24.04 или Debian 12
 - `aperod-node` уже установлен (`install-node.sh` запущен ранее)
 - Порт **30303/tcp** открыт в firewall
-- HTTP-доступ к API основного узла (порт 8545 по умолчанию)
+- SSH-доступ с нового узла к основному и заранее закреплённый SSH host key
+- API-порт основного узла доступен только на его loopback через SSH-туннель
 
 **На основном узле:**
 - Запущен `aperod-node` версии с поддержкой экспорта
-- Порт API (8545) доступен с нового сервера (или туннель)
-- API-ключ совпадает с `--api-key` в команде join (если настроен)
+- API доступен на loopback (8545 по умолчанию)
+- API-ключ настроен, если требуется; вводите его скрыто через `APEROD_API_KEY`
 
 ---
 
@@ -92,7 +101,8 @@ sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545
 aperod-join.sh <PRIMARY_IP>:<PORT> [OPTIONS]
 
 Опции:
-  --api-key  <key>   X-API-Key для аутентификации на основном узле
+  --api-key  <key>   X-API-Key (совместимость; не указывайте секрет прямо в команде)
+  --tunnel   <user@host> SSH-туннель с проверкой host key из /root/.ssh/known_hosts
   --data-dir <path>  Директория данных (по умолчанию: /var/lib/aperod)
   --user     <name>  Пользователь-владелец данных (по умолчанию: aperod)
   --p2p-port <port>  P2P-порт основного узла (по умолчанию: 30303)
@@ -103,10 +113,13 @@ aperod-join.sh <PRIMARY_IP>:<PORT> [OPTIONS]
 **Пример с нестандартными путями:**
 ```bash
 sudo bash aperod-join.sh 89.169.53.128:8545 \
-  --api-key secret123 \
+  --tunnel operator@89.169.53.128 \
   --data-dir /opt/aperod/data/testnet \
   --user aperod
 ```
+
+`APEROD_API_KEY` может быть задан скрытым интерактивным вводом; не сохраняйте
+ключ в shell history, скриптах или обычных текстовых файлах.
 
 ---
 
@@ -130,7 +143,8 @@ Snapshot ускоряет запуск новой ноды — без него �
 
 **Безопасность:**
 - Оба эндпоинта требуют `X-API-Key`, если в `node.yaml` настроен `api.key`
-- В dev-режиме (без ключа) — открыты
+- При отсутствии ключа эндпоинты не защищены прикладной авторизацией — не публикуйте
+  API-порт в интернет; удалённый доступ выполняйте только через SSH-туннель
 
 ---
 
@@ -148,85 +162,28 @@ Snapshot ускоряет запуск новой ноды — без него �
 
 У Aperod есть особенность: **genesis-блок включает публичный ключ первого валидатора**. Если два сервера используют разные ключи, их genesis-хэши будут различаться, и они никогда не синхронизируются — даже если данные идентичны.
 
-**Решение:** Новый узел получает копию `chain.db` с существующего узла через HTTP. Это гарантирует идентичный genesis-блок.
+**Решение:** Новый узел получает копию `chain.db` с существующего узла через API
+по проверенному SSH-туннелю. HTTP используется только внутри локального туннеля;
+прямой удалённый HTTP запрещён.
 
 ---
 
-## Пошаговый процесс вручную
+## Ручное копирование
 
-Если по каким-то причинам скрипт не подходит:
+Ручной `curl` по адресу `http://<PRIMARY_IP>:8545` больше не поддерживается:
+он передаёт данные без защиты от подмены. Не копируйте открытые примеры из старых
+инструкций и не публикуйте API-порт.
 
-### Шаг 1: Остановить ноду на новом сервере
+Используйте `aperod-join.sh` с `--tunnel`. Он закрепляет SSH host key через
+`StrictHostKeyChecking=yes`, открывает локальный туннель и отклоняет удалённый
+HTTP без туннеля. Перед запуском проверьте отпечаток SSH в OVH/другом доверенном
+канале и внесите host key в `/root/.ssh/known_hosts`; `ssh-keyscan` сам по себе
+не подтверждает подлинность ключа.
 
-```bash
-systemctl disable --now aperod-node
-```
+Не копируйте работающую LevelDB напрямую (`cp`/`rsync`): согласованный перенос
+должен использовать штатную процедуру экспорта и проверку состояния цепочки.
 
-> ⚠️ Используйте `disable --now`, а не просто `stop` — без этого systemd автоматически перезапустит ноду.
-
-### Шаг 2: Скачать chain.db
-
-```bash
-# Без API-ключа
-curl -f http://<PRIMARY_IP>:8545/api/v1/chaindb/export \
-  -o /tmp/chaindb.tar.gz
-
-# С API-ключом
-curl -f -H "X-API-Key: <key>" \
-  http://<PRIMARY_IP>:8545/api/v1/chaindb/export \
-  -o /tmp/chaindb.tar.gz
-
-# Распаковать
-tar -xzf /tmp/chaindb.tar.gz -C /var/lib/aperod/
-rm /tmp/chaindb.tar.gz
-```
-
-### Шаг 3: Скачать snapshot
-
-```bash
-# Определяем имя файла из заголовков
-SNAP_FILE=$(curl -sI -H "X-API-Key: <key>" \
-  http://<PRIMARY_IP>:8545/api/v1/snapshot/export \
-  | grep -i X-Snapshot-Filename | tr -d '\r' | awk '{print $2}')
-
-# Скачиваем
-curl -f -H "X-API-Key: <key>" \
-  http://<PRIMARY_IP>:8545/api/v1/snapshot/export \
-  -o "/var/lib/aperod/${SNAP_FILE}"
-```
-
-### Шаг 4: Удалить скопированный p2p identity
-
-```bash
-rm -f /var/lib/aperod/p2p_identity.key
-```
-
-> ⚠️ Без этого оба сервера используют одинаковый TLS-ключ и видят друг друга как self-connection. `peer_count` останется 0 навсегда.
-
-### Шаг 5: Прописать bootnode в node.yaml
-
-```bash
-# Через node-config.sh (рекомендуется)
-sudo bash /opt/aperod/blockchain/deploy/node-config.sh \
-  add-bootnode /ip4/<PRIMARY_IP>/tcp/30303
-
-# Или вручную — добавить в /etc/aperod/node.yaml:
-# p2p:
-#   bootnodes:
-#     - /ip4/<PRIMARY_IP>/tcp/30303
-```
-
-> ⚠️ Без bootnode оба узла ждут **входящего** подключения и никогда не устанавливают соединение — `peer_count` остаётся 0 бесконечно.
-> Подробнее: [раздел «Bootnode — почему он обязателен»](#bootnode--почему-он-обязателен).
-
-### Шаг 6: Настроить права и запустить
-
-```bash
-chown -R aperod:aperod /var/lib/aperod/
-systemctl enable --now aperod-node
-```
-
-### Шаг 6: Дождаться готовности (~5 минут)
+### Проверить готовность после выполнения скрипта
 
 ```bash
 # Следить за логами

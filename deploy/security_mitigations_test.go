@@ -164,7 +164,9 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 		"git checkout --detach",
 		`git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"`,
 		"test \"$(git rev-parse HEAD)\" = \"$APEROD_NODE_SOURCE_COMMIT\"",
-		"sudo env APEROD_NODE_SOURCE_COMMIT=",
+		"sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT=",
+		"APEROD_NETWORK=testnet",
+		"supports testnet only",
 	} {
 		if !strings.Contains(string(validators), required) {
 			t.Errorf("pinned installation procedure is missing %q", required)

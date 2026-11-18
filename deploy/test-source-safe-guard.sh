@@ -123,6 +123,28 @@ if source_checkout_guard "$CLEAN" "$EXTERNAL"; then
 else
   fail "external runtime data permits safe source checkout"
 fi
+STATIC_DATA="$TMP/static-data"
+make_repo "$STATIC_DATA"
+mkdir -p "$STATIC_DATA/data"
+printf 'public website asset\n' > "$STATIC_DATA/data/favicon.png"
+git -C "$STATIC_DATA" add data/favicon.png
+git -C "$STATIC_DATA" commit -qm 'include a public static asset'
+if source_checkout_guard "$STATIC_DATA"; then
+  pass "public static data assets do not block a clean source checkout"
+else
+  fail "public static data assets do not block a clean source checkout"
+fi
+mkdir -p "$STATIC_DATA/data/testnet/chain.db"
+printf 'runtime chain state\n' > "$STATIC_DATA/data/testnet/chain.db/CURRENT"
+assert_rejected "chain state under data/testnet is still rejected" \
+  source_checkout_guard "$STATIC_DATA"
+for network in mainnet devnet; do
+  mkdir -p "$STATIC_DATA/data/$network/chain.db"
+  printf 'runtime chain state\n' > "$STATIC_DATA/data/$network/chain.db/CURRENT"
+  assert_rejected "chain state under data/$network is rejected" \
+    source_checkout_guard "$STATIC_DATA"
+  rm -rf "$STATIC_DATA/data/$network"
+done
 FRESH="$TMP/fresh"
 mkdir -p "$FRESH"
 if source_checkout_guard "$FRESH" "$EXTERNAL"; then
