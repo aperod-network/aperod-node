@@ -25,8 +25,9 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
 canonical accounting and confirmed Guardian-principal refunds. **Current public
-network status:** LPoD v3 is active on Aperod from canonical height **2493218**,
-and its pool is funded. This live status is distinct from the repository's
+network status:** LPoD v3 is active on Aperod from canonical height **2,493,218**,
+and its pool is funded. The current public mainnet also has funded, active LPoD v3
+at this canonical height; this live status is distinct from the repository's
 fail-closed, default-disabled configuration and historical development/rehearsal
 snapshots; neither is a report that the current public network is inactive.
 The validator stake lock remains governed separately by the validator protocol.
