@@ -126,10 +126,7 @@ wallets, exchange records, or other network/application-layer information.
 
 ### Mainnet release prerequisites
 
-Read [MAINNET.md](MAINNET.md). A verified self-service mainnet bootstrap release
-is not yet published. The release must bind compatible software, the canonical
-genesis, a consistent chain snapshot and the live consensus profile. Source
-signatures and passing CI alone do not prove compatibility with the running chain.
+Read [MAINNET.md](MAINNET.md). The existing chain anchors and AVM checkpoint have been signed and verified on the new OVH server under the selected single-operator trust policy. The signed JSON evidence is published beside that guide and can be signature-checked with `mainnet-bootstrap-attest evidence-verify`. This is not validator-quorum evidence and is not a software-and-snapshot release. A verified self-service mainnet bootstrap release is not yet published. The current `install-validator.sh` must not be used as a Mainnet installer. A release must bind compatible software, the canonical genesis, a consistent chain snapshot and the coordinated consensus profile. Source signatures and passing CI alone do not prove compatibility with the running chain.
 Do not run a different network's installer or pipe mutable scripts into a root shell.
 
 The current `install-validator.sh` is not a verified mainnet installer; pinning
@@ -196,10 +193,13 @@ The `60 s` default is preserved for all existing deployments — only nodes that
 
 ## 🛡 Mainnet validator onboarding
 
-**A verified self-service procedure for joining the existing mainnet is not
-available yet.** This repository does not currently provide a verified
-clean-server installer, canonical mainnet bootstrap, on-chain stake-locking
-flow, or proof of active-set inclusion.
+**The bootstrap and AVM signatures verify on the new OVH server, but a
+self-service Mainnet release is not yet published. The current
+`install-validator.sh` must not be used as a Mainnet installer.** The signed
+chain anchor uses a single operator key rather than validator quorum. This
+repository does not yet provide a clean-server install that syncs through an
+authenticated Mainnet peer, locks stake on-chain, and proves active-set
+inclusion.
 
 The public `POST /api/validators/apply` endpoint exists, but it only creates an
 off-chain application record in the API database. It does not register a
@@ -208,11 +208,11 @@ The former instructions to transfer APRO to a wallet and expect automatic
 activation did not establish those operations and have been removed. Do not
 send APRO or expose a consensus key based on them.
 
-Read [MAINNET.md](MAINNET.md) for the prerequisites and read-only checks. It is
-not an installer. A working operator guide requires an exact reviewed release
-and an isolated clean-server rehearsal that proves the node joins the existing
-chain without creating another genesis, then completes registration, stake
-locking, and active-set verification.
+Read [MAINNET.md](MAINNET.md) for the verified chain anchors, public Explorer
+checks, and remaining release requirements. It is not an installer. A working
+operator guide requires an exact reviewed release and a clean-server rehearsal
+that proves the node joins the existing chain without creating another genesis,
+then completes registration, stake locking, and active-set verification.
 
 ---
 

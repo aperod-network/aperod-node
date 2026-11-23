@@ -158,12 +158,13 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 			}
 		}
 	}
+	validatorText := strings.Join(strings.Fields(string(validators)), " ")
 	for _, required := range []string{
 		"[mainnet onboarding](MAINNET.md)",
 		"A verified self-service mainnet bootstrap release is not yet published.",
 		"must not be used as a mainnet installer",
 	} {
-		if !strings.Contains(string(validators), required) {
+		if !strings.Contains(validatorText, required) {
 			t.Errorf("mainnet readiness notice is missing %q", required)
 		}
 	}
@@ -171,7 +172,7 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 		"APEROD_NETWORK=testnet",
 		"sudo env APEROD_NETWORK=",
 	} {
-		if strings.Contains(string(validators), forbidden) {
+		if strings.Contains(validatorText, forbidden) {
 			t.Errorf("public validator guide advertises a non-mainnet install command: %q", forbidden)
 		}
 	}
