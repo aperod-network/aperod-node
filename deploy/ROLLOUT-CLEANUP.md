@@ -106,41 +106,16 @@ so the root scanner can inspect the unprivileged `aperod` process's `/proc`
 `cwd`, `fd`, and `exe`. If a process reference is unreadable, the core refuses
 cleanup rather than treating that process as inactive.
 
-## Historical copies: exact archive before retirement
+## Historical artifacts: Mainnet data is not a cleanup target
 
-Historical `rollback/stopped-data` copies use a distinct registration, not a
-fabricated rollout job:
+The historical-retirement workflow is not approved for the canonical Mainnet
+tree. Do not run `retirement-register`, `retirement-scan`, or an apply-enabled
+cleanup against live Mainnet data. Preserve `chain.db`, snapshots, validator
+keys, identity files, migration witnesses, and recovery receipts.
 
-```sh
-aperod-rollout-cleanup retirement-register --release /opt/aperod/releases/RELEASE \
-  --data-dir /opt/aperod/data/testnet --config /etc/aperod/node.yaml \
-  --service aperod-node --api-url http://127.0.0.1:8545
-aperod-rollout-cleanup retirement-scan --dry-run
-```
-
-Registration requires closed root-owned parent directories and selected files,
-unchanged live source identity, and no host process references. Only `chain.db`
-and top-level snapshot `.gz` files with their checksum sidecars are selected.
-Keys, identity files, metadata, witnesses outside that selection, API sources,
-previous binaries and the release itself remain in place. Adoption of old
-application-owned copies is a separate reviewed ownership operation; never
-normalize ownership of live node data to make registration pass.
-
-The installed historical-retirement timer honors the same root-owned apply
-policy and runs around 05:50 UTC. It loads the existing backup encryption
-password from the protected backup environment file. Apply creates an exact
-archive of the selected historical content, encrypts it, uploads to the unique
-`historical-retirement/UUID/archive.tar.gz.gpg` object, pins the native B2
-`fileId`, downloads that exact version, decrypts it, and checks every member's
-path, type, size and SHA-256. It never extracts an untrusted archive into the
-application tree. A newer live backup is not historical coverage evidence.
-
-Before every unlink, it repeats source, references, content and immutable
-remote-version checks. It refuses lifecycle rules covering the archive namespace,
-unexpected archive members, altered files, unavailable remote evidence, unsafe
-ownership/links/mounts, or missing encryption credentials. Root-owned receipts
-retain the manifests, archive identities and successful deletion records.
-Archives are outside ordinary backup rotation and are intentionally retained:
-this transfers recovery evidence off-host, not an authorization to erase it.
-If a process is interrupted after partial unlink, unknown missing targets block
-further deletion rather than being treated as completed.
+Any future retirement must name exact files from a separately verified
+off-host backup and restore rehearsal, prove that no service or process uses
+them, and receive explicit authorization. A path change or older timestamp is
+not evidence that chain data can be deleted. Temporary build or test artifacts
+on the new OVH server may be removed only by exact path after the check finishes;
+never use broad globs against a live data directory.

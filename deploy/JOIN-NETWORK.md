@@ -1,336 +1,50 @@
-# Подключение нового узла к сети Aperod
-
-> **Этот документ** — пошаговое руководство для операторов, которые хотят присоединить новый сервер к работающей сети Aperod.
-
----
-
-## Быстрый старт — одна команда (рекомендуется)
-
-Запустите **на НОВОМ сервере** (не на основном):
-
-```bash
-PRIMARY_IP=192.0.2.10
-SSH_USER=operator
-sudo bash /opt/aperod/deploy/aperod-join.sh "${PRIMARY_IP}:8545" \
-  --tunnel "${SSH_USER}@${PRIMARY_IP}"
-```
-
-**Пример для тестнета:**
-
-```bash
-sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 \
-  --tunnel operator@89.169.53.128
-```
-
-Если на основном узле задан API-ключ (`api.key` в `node.yaml`), введите его скрыто
-и передайте скрипту через окружение — не вставляйте значение в команду или историю:
-
-```bash
-sudo bash -c 'read -rsp "API key: " APEROD_API_KEY; printf "\n"; export APEROD_API_KEY; exec bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 --tunnel operator@89.169.53.128'
-```
-
-Перед запуском SSH host key основного сервера должен быть проверен через доверенный
-канал и закреплён в `/root/.ssh/known_hosts`. Скрипт откажется от удалённого
-незашифрованного HTTP. Если хотите понять процесс — читайте ниже.
-
----
-
-## Что делает aperod-join.sh
-
-| Шаг | Действие |
-|-----|----------|
-| 1 | Проверяет API основного узла через SSH-туннель (HTTP только на loopback) |
-| 2 | Останавливает `aperod-node` на **новом** сервере |
-| 3 | Очищает старые данные в `data_dir` |
-| 4 | Скачивает `chain.db` через `GET /api/v1/chaindb/export` (~1–2 ГБ) |
-| 5 | Скачивает UTXO-snapshot через `GET /api/v1/snapshot/export` |
-| 6 | Удаляет `p2p_identity.key` (нода генерирует новый при старте) |
-| 7 | Прописывает `/ip4/<PRIMARY_IP>/tcp/30303` в `p2p.bootnodes` в `/etc/aperod/node.yaml` |
-| 8 | Применяет drop-in конфиги systemd (TimeoutStopSec, GOMEMLIMIT) |
-| 9 | Запускает `aperod-node` и ждёт готовности API |
-
----
-
-## Рекомендуемый порядок установки
-
-Если IP основного (primary) узла известен заранее, передайте его флагом `--primary-ip`
-прямо при установке — это сразу пропишет bootnode и избавит от шага join:
-
-```bash
-# Установка + автоматическое добавление bootnode
-sudo bash /opt/aperod/deploy/install-node.sh --primary-ip 89.169.53.128
-```
-
-Если IP стал известен позже или нужна полная синхронизация chain.db — запустите
-`aperod-join.sh` отдельно (он заменит данные и пропишет bootnode сам):
-
-```bash
-# Сначала установка без флага (bootnode не прописан — нода не стартует в сеть)
-sudo bash /opt/aperod/deploy/install-node.sh
-
-# Затем, когда IP станет известен — подключение к сети:
-sudo bash /opt/aperod/deploy/aperod-join.sh 89.169.53.128:8545 \
-  --tunnel operator@89.169.53.128
-```
-
-> ⚠️ **Не запускайте ноду до выполнения одного из двух шагов выше.**
-> Нода без bootnode может сформировать блок с несовместимым genesis-хэшем,
-> после чего ре-join потребует полного удаления данных.
-
----
-
-## Требования
-
-**На новом сервере:**
-- Ubuntu 22.04 / 24.04 или Debian 12
-- `aperod-node` уже установлен (`install-node.sh` запущен ранее)
-- Порт **30303/tcp** открыт в firewall
-- SSH-доступ с нового узла к основному и заранее закреплённый SSH host key
-- API-порт основного узла доступен только на его loopback через SSH-туннель
-
-**На основном узле:**
-- Запущен `aperod-node` версии с поддержкой экспорта
-- API доступен на loopback (8545 по умолчанию)
-- API-ключ настроен, если требуется; вводите его скрыто через `APEROD_API_KEY`
-
----
-
-## Опции скрипта
-
-```
-aperod-join.sh <PRIMARY_IP>:<PORT> [OPTIONS]
-
-Опции:
-  --api-key  <key>   X-API-Key (совместимость; не указывайте секрет прямо в команде)
-  --tunnel   <user@host> SSH-туннель с проверкой host key из /root/.ssh/known_hosts
-  --data-dir <path>  Директория данных (по умолчанию: /var/lib/aperod)
-  --user     <name>  Пользователь-владелец данных (по умолчанию: aperod)
-  --p2p-port <port>  P2P-порт основного узла (по умолчанию: 30303)
-  --skip-start       Не запускать ноду после загрузки (только данные)
-  --no-chaindb       Пропустить загрузку chain.db (только snapshot)
-```
-
-**Пример с нестандартными путями:**
-```bash
-sudo bash aperod-join.sh 89.169.53.128:8545 \
-  --tunnel operator@89.169.53.128 \
-  --data-dir /opt/aperod/data/testnet \
-  --user aperod
-```
-
-`APEROD_API_KEY` может быть задан скрытым интерактивным вводом; не сохраняйте
-ключ в shell history, скриптах или обычных текстовых файлах.
-
----
-
-## HTTP-эндпоинты экспорта (на основном узле)
-
-Скрипт использует два новых эндпоинта API основного узла:
-
-### `GET /api/v1/snapshot/export`
-
-Отдаёт последний UTXO-snapshot (файл `snapshot-v2-<height>.json.gz`).  
-Snapshot ускоряет запуск новой ноды — без него пересборка key-image индекса займёт 5–10 минут.
-
-Заголовки ответа:
-- `X-Snapshot-Height` — высота блока, для которого сделан snapshot
-- `X-Snapshot-Filename` — имя файла (`snapshot-v2-<height>.json.gz`)
-
-### `GET /api/v1/chaindb/export`
-
-Стримит директорию `chain.db` (LevelDB) как tar.gz-архив.  
-Распаковывается в `data_dir` командой `tar -xzf chaindb.tar.gz -C <data_dir>`.
-
-**Безопасность:**
-- Оба эндпоинта требуют `X-API-Key`, если в `node.yaml` настроен `api.key`
-- При отсутствии ключа эндпоинты не защищены прикладной авторизацией — не публикуйте
-  API-порт в интернет; удалённый доступ выполняйте только через SSH-туннель
-
----
-
-## Типы узлов
-
-| Тип | `validator_key` | `non_validator` | Что делает |
-|-----|----------------|-----------------|------------|
-| **Полный валидатор** | ✅ установлен | `false` (по умолчанию) | Производит блоки, голосует, получает награды |
-| **Синхронизирующий узел** | не важно | `true` | Синхронизирует цепь, ретранслирует блоки, не производит |
-| **RPC/API нода** | не важно | `true` | То же + API для внешних запросов |
-
----
-
-## Почему нельзя просто запустить ноду?
-
-У Aperod есть особенность: **genesis-блок включает публичный ключ первого валидатора**. Если два сервера используют разные ключи, их genesis-хэши будут различаться, и они никогда не синхронизируются — даже если данные идентичны.
-
-**Решение:** Новый узел получает копию `chain.db` с существующего узла через API
-по проверенному SSH-туннелю. HTTP используется только внутри локального туннеля;
-прямой удалённый HTTP запрещён.
-
----
-
-## Ручное копирование
-
-Ручной `curl` по адресу `http://<PRIMARY_IP>:8545` больше не поддерживается:
-он передаёт данные без защиты от подмены. Не копируйте открытые примеры из старых
-инструкций и не публикуйте API-порт.
-
-Используйте `aperod-join.sh` с `--tunnel`. Он закрепляет SSH host key через
-`StrictHostKeyChecking=yes`, открывает локальный туннель и отклоняет удалённый
-HTTP без туннеля. Перед запуском проверьте отпечаток SSH в OVH/другом доверенном
-канале и внесите host key в `/root/.ssh/known_hosts`; `ssh-keyscan` сам по себе
-не подтверждает подлинность ключа.
-
-Не копируйте работающую LevelDB напрямую (`cp`/`rsync`): согласованный перенос
-должен использовать штатную процедуру экспорта и проверку состояния цепочки.
-
-### Проверить готовность после выполнения скрипта
-
-```bash
-# Следить за логами
-journalctl -u aperod-node -f --no-pager
-# Искать: "API server ready" → "p2p started" → "peer connected"
-
-# Проверить статус
-curl -s http://127.0.0.1:8545/api/v1/network/stats | python3 -m json.tool
-```
-
----
-
-## Конфигурация node.yaml
-
-### Валидатор с собственным ключом (полный участник консенсуса)
-
-```yaml
-consensus:
-  validator_key: /etc/aperod/validator.key   # ваш собственный Ed25519 ключ
-  reward_address: aproec<ваш_адрес>
-  block_time: 3s
-```
-
-> Чтобы производить блоки, ваш ключ должен быть в **validator set** (зарегистрирован через StakeTx).
-
-### Синхронизирующий узел без производства блоков
-
-```yaml
-consensus:
-  non_validator: true    # отключает производство блоков
-  # validator_key не нужен
-  reward_address: aproec<ваш_адрес>
-```
-
-> Используйте `non_validator: true` для RPC-нод, explorer-нод и резервных серверов.
-
----
-
-## Bootnode — почему он обязателен
-
-После копирования цепи у нового узла в `node.yaml` нет записей в `p2p.bootnodes`.
-Без хотя бы одного bootnode оба узла (основной и новый) ждут **входящего** подключения
-и никогда не устанавливают соединение — `peer_count` остаётся 0 бесконечно.
-
-**Оба скрипта** автоматически прописывают основной узел как bootnode:
-
-- `aperod-join.sh` — шаг 7/8, на новом сервере (использует IP из первого аргумента)
-- `join-network.sh` — шаг 5/7, по SSH с основного сервера
-
-Результирующий `node.yaml`:
-
-```yaml
-p2p:
-  bootnodes:
-    - /ip4/<PRIMARY_IP>/tcp/30303
-```
-
-Оба формата адреса — `host:port` и `/ip4/…/tcp/…` — принимаются `resolveBootnode()`
-в `p2p/dns.go`.
-
-**Если нестандартный P2P-порт** (не 30303), передайте его явно при вызове `aperod-join.sh`:
-
-```bash
-sudo bash aperod-join.sh 89.169.53.128:8545 --p2p-port 30304
-```
-
-**Для `join-network.sh`** (rsync-путь): если PRIMARY_IP определяется неверно (например,
-возвращается внутренний 10.x вместо внешнего адреса), переопределите его явно:
-
-```bash
-PRIMARY_IP=89.169.53.128 sudo bash join-network.sh <TARGET_IP>
-```
-
----
-
-## Частые ошибки
-
-| Ошибка | Причина | Решение |
-|--------|---------|---------|
-| `403 Forbidden` при скачивании | API-ключ не совпадает | Добавьте `--api-key` или проверьте `node.yaml` |
-| `connection refused` | Основной узел недоступен | Откройте порт 8545 в firewall основного узла |
-| `permission denied` при старте | Файлы принадлежат root | `chown -R aperod:aperod /var/lib/aperod/` |
-| `block at height N missing` | Неполная загрузка chain.db | Запустите скрипт заново (он очищает старые данные) |
-| `peer_count: 0` навсегда | Нет bootnode **или** скопированный `p2p_identity.key` | Проверьте `p2p.bootnodes` в `/etc/aperod/node.yaml`; `rm /var/lib/aperod/p2p_identity.key`, restart |
-| Нода расходится с сетью | Нет `non_validator: true`, ключ не в validator set | Добавить `non_validator: true` в node.yaml |
-
----
-
-## Регистрация как валидатор
-
-Чтобы ваш узел производил блоки и получал награды:
-
-1. Получите APRO на `reward_address` (минимум **100 000 APRO**)
-2. Отправьте **StakeTx** через кошелёк (Telegram Wallet → Staking)
-3. Дождитесь следующего epoch (~100 блоков ≈ 5 минут)
-4. Уберите `non_validator: true` из `node.yaml` (или убедитесь что он отсутствует)
-5. Перезапустите ноду: `systemctl restart aperod-node`
-
-После включения в активный validator set нода начнёт получать задания на производство блоков.
-
----
-
-## Проверка подключения
-
-```bash
-# Статус текущего узла
-curl -s http://127.0.0.1:8545/api/v1/network/stats | python3 -m json.tool
-
-# Ожидаемые значения:
-# "peer_count": 1,      ← подключён к сети
-# "height": 958XXX,     ← синхронизирован
-
-# Статус валидаторов
-curl -s http://127.0.0.1:8545/api/v1/validators
-```
-
----
-
-## Старый способ (rsync с основного узла)
-
-Если `aperod-join.sh` недоступен или нужен rsync:
-
-```bash
-# На ОСНОВНОМ УЗЛЕ (89.169.53.128)
-sudo bash /opt/aperod/deploy/join-network.sh <IP_НОВОГО_СЕРВЕРА>
-```
-
-Этот скрипт требует SSH-доступ с основного узла на новый. Используйте `aperod-join.sh` (HTTP) как предпочтительный метод.
-
-### ⚠ Кратковременный простой (~60 с)
-
-`join-network.sh` **останавливает `aperod-node` на основном узле** перед rsync и
-перезапускает его сразу после завершения.
-
-**Почему это необходимо:** LevelDB небезопасно копировать в работающем состоянии.
-Во время rsync движок непрерывно пишет WAL-записи и компактирует `.ldb`-файлы.
-Скопированная директория оказывается внутренне несогласованной: при старте LevelDB
-откатывается на меньшую высоту, чем источник, и блок на этой высоте имеет другой
-хэш. P2P-протокол не может автоматически устранить такое расхождение — нода
-застревает в цикле «подключиться → отвергнуть → отключиться».
-
-Если остановить основную ноду не удаётся (нет SSH-доступа, ошибка systemctl),
-скрипт **прерывается** вместо того, чтобы выполнять rsync поверх живой базы.
-
-**Типичное время простоя:** остановка (`TimeoutStopSec=300`, фактически ~5–15 с) +
-rsync (~30–60 с) + запуск (~5 с) = **≈60–90 с**.
-
----
-
-*Последнее обновление: Август 2026 · [aperod-network](https://github.com/aperod-network/aperod-node)*
+# Mainnet node connection / Подключение узла к mainnet
+
+## Status
+
+This legacy join procedure is retired. It stopped the source node, replaced
+destination chain data, and used a data path whose name does not prove network
+identity. Do not run old `aperod-join.sh` or `join-network.sh` examples to add a
+mainnet validator.
+
+The verified, self-service mainnet bootstrap release is not yet available.
+Follow [MAINNET.md](MAINNET.md) for the current release gates and
+[VALIDATORS.md](VALIDATORS.md) for the separately verified participation rules.
+Do not move chain data, start signing, or fund a new validator until the
+canonical mainnet identity and a matching trusted checkpoint are published and
+successfully rehearsed.
+
+## Peer admission
+
+The joining node must pin the relay's SHA-256 TLS SPKI fingerprint. The
+relay must also admit the joining node's distinct TLS fingerprint; an IP
+allowlist entry does not replace that check. Exchange only public
+fingerprints over an authenticated operator channel. Never send a peer
+private key, validator signing key or wallet mnemonic. Before staking,
+confirm the authenticated connection and compare a post-checkpoint block
+hash with the canonical reference. Public self-service relay admission is
+not yet verified.
+
+## Статус
+
+Старая процедура подключения выведена из эксплуатации. Она останавливала
+исходный узел, заменяла данные целевого узла и использовала каталог, название
+которого не доказывает идентичность сети. Не запускайте старые примеры
+`aperod-join.sh` или `join-network.sh` для подключения валидатора mainnet.
+
+Проверенный релиз для самостоятельной установки mainnet ещё не опубликован.
+Текущие условия готовности указаны в [MAINNET.md](MAINNET.md), а подтверждённые
+правила участия — отдельно в [VALIDATORS.md](VALIDATORS.md). Не переносите
+данные цепи, не включайте подпись и не переводите залог, пока каноническая
+идентичность mainnet и соответствующая доверенная контрольная точка не будут
+опубликованы и успешно проверены на отдельной репетиции.
+
+## Допуск узла к relay
+
+Новый узел закрепляет SHA-256-отпечаток открытого TLS-ключа relay (SPKI).
+Relay также должен разрешить отдельный TLS-отпечаток нового узла: добавление
+IP-адреса не заменяет эту проверку. Передавайте только публичные отпечатки
+по подтверждённому каналу связи с оператором. Не передавайте закрытый
+TLS-ключ, ключ валидатора или мнемонику кошелька. До внесения залога
+подтвердите TLS-подключение и совпадение хеша блока после контрольной точки
+с канонической цепью. Самостоятельный публичный допуск к relay ещё не проверен.
