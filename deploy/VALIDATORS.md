@@ -51,14 +51,19 @@ send funds.
 
 | Parameter | Source value |
 |---|---:|
-| Active validator capacity | 21 |
-| Minimum stake | 100,000 APRO |
-| Epoch length | 100 blocks |
-| Churn limit | 3 new validators per epoch |
-| Full unbonding | 144,000 blocks |
-| Double-sign slash | 10% |
-| Validator reward pool | 300,000,000 nAPRO per block |
-| Tail emission | 100,000,000 nAPRO per block |
+| Active validators | **21** (maximum) |
+| Stake | ≥ **100,000 APRO** locked on-chain |
+| Epoch length | **100 blocks** (~300 seconds at 3 seconds per block) |
+| Churn limit | **3** new validators per epoch |
+| 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
+| Pool-phase block reward | **300,000,000 nAPRO (3 APRO)** |
+| Tail emission | **1 APRO** (100,000,000 nAPRO) per block |
+
+## Double-sign penalty
+
+The source specifies a penalty of **10 % of total stake** burned immediately.
+This is a source-level value, not proof that the rule is active at the current
+Mainnet height.
 
 Validator capacity is unrelated to the 10-billion APRO nominal supply.
 Consensus activation heights must come from one reviewed Mainnet release and
