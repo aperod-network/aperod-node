@@ -13,9 +13,33 @@ installer. Do not bypass its network guard, run an unpinned script as root, or
 send APRO based on an API application or a wallet balance.
 
 The canonical chain anchors and the read-only public API check are in
-[MAINNET.md](MAINNET.md). The checkpoint is signed under the selected
+[mainnet onboarding](MAINNET.md). The checkpoint is signed under the selected
 `operator_1_of_1` trust model; that is one operator signature, not a
 multi-validator quorum or proof of current validator participation.
+
+## Setup guide
+
+Use [MAINNET.md](MAINNET.md) for the canonical genesis, checkpoint, and
+read-only endpoint checks. A verified self-service mainnet bootstrap release
+is not yet published. The existing `install-validator.sh` must not be used as
+a mainnet installer; do not bypass its network guard or substitute another
+chain's configuration.
+
+## Protocol parameters
+
+These values are protocol parameters in the reviewed source. They are not a
+promise that a new validator can currently register or become active.
+
+| Parameter | Mainnet value |
+|---|---|
+| Active validators | **21** maximum; validator capacity, not token supply |
+| Minimum stake | ≥ **100,000 APRO** locked on-chain |
+| Epoch length | **100 blocks** (~300 seconds at 3 seconds per block) |
+| Churn limit | **3** new validators per epoch (prevents instability) |
+| 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
+| Stake penalty | **10 % of total stake** burned immediately |
+| Pool reward | **300,000,000 nAPRO (3 APRO)** per block, from the pre-allocated pool |
+| Tail emission | **1 APRO** per block after the pool is exhausted; no halving |
 
 ## What a verified release must establish
 
@@ -49,6 +73,8 @@ does not prove that Mainnet accepted it.
   validator's runtime data.
 - Do not treat a balance, application response, or advertised minimum stake as
   proof of locked stake or active-set membership.
+- Validator capacity is 21 active validators; this is unrelated to the APRO
+  supply, which is 10 billion APRO at genesis.
 
 ## Penalties and rewards
 
