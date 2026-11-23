@@ -158,18 +158,22 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 			}
 		}
 	}
+	validatorText := strings.Join(strings.Fields(string(validators)), " ")
 	for _, required := range []string{
-		"APEROD_NODE_SOURCE_COMMIT",
-		`[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]`,
-		"git checkout --detach",
-		`git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"`,
-		"test \"$(git rev-parse HEAD)\" = \"$APEROD_NODE_SOURCE_COMMIT\"",
-		"sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT=",
-		"APEROD_NETWORK=testnet",
-		"supports testnet only",
+		"[mainnet onboarding](MAINNET.md)",
+		"A verified self-service mainnet bootstrap release is not yet published.",
+		"must not be used as a mainnet installer",
 	} {
-		if !strings.Contains(string(validators), required) {
-			t.Errorf("pinned installation procedure is missing %q", required)
+		if !strings.Contains(validatorText, required) {
+			t.Errorf("mainnet readiness notice is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"APEROD_NETWORK=testnet",
+		"sudo env APEROD_NETWORK=",
+	} {
+		if strings.Contains(validatorText, forbidden) {
+			t.Errorf("public validator guide advertises a non-mainnet install command: %q", forbidden)
 		}
 	}
 	if !strings.Contains(string(investors), "VALIDATORS.md#setup-guide") {

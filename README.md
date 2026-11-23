@@ -8,13 +8,13 @@
 
 RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic base-fee burn &nbsp;·&nbsp; Permissionless BFT-PoS
 
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
+[![Go](https://img.shields.io/badge/Go-1.26.11-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/install)
 [![License](https://img.shields.io/badge/License-Mixed-blue.svg)](#-license)
 [![Network](https://img.shields.io/badge/Network-Mainnet-brightgreen)](https://aperod.com)
 [![Explorer](https://img.shields.io/badge/Explorer-explorer.aperod.com-informational)](https://explorer.aperod.com)
 [![Telegram](https://img.shields.io/badge/Support-@sup__apro__bot-2CA5E0?logo=telegram&logoColor=white)](https://t.me/sup_apro_bot)
 
-**[⬇ Install Node](#-install-a-full-node) &nbsp;·&nbsp; [🛡 Become Validator](#-become-a-validator) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com) &nbsp;·&nbsp; [💬 Support](https://t.me/sup_apro_bot)**
+**[⬇ Mainnet node status](#-mainnet-node-onboarding) &nbsp;·&nbsp; [🛡 Validator onboarding status](#-mainnet-validator-onboarding) &nbsp;·&nbsp; [🌐 Explorer](https://explorer.aperod.com) &nbsp;·&nbsp; [💬 Support](https://t.me/sup_apro_bot)**
 
 </div>
 
@@ -25,8 +25,9 @@ RingCT transaction privacy &nbsp;·&nbsp; CLSAG v5 active &nbsp;·&nbsp; Dynamic
 LPoD is an Aperod protocol subsystem developed and owned by the web3
 **Aperod APRO team**. It coordinates opt-in positions, validator-linked accrual,
 canonical accounting and confirmed Guardian-principal refunds. **Current public
-network status:** LPoD v3 is active on Aperod from canonical height **2493218**,
-and its pool is funded. This live status is distinct from the repository's
+network status:** LPoD v3 is active on Aperod from canonical height **2,493,218**,
+and its pool is funded. The current public mainnet also has funded, active LPoD v3
+at this canonical height; this live status is distinct from the repository's
 fail-closed, default-disabled configuration and historical development/rehearsal
 snapshots; neither is a report that the current public network is inactive.
 The validator stake lock remains governed separately by the validator protocol.
@@ -72,8 +73,8 @@ compatibility migration from the former restrictive notice.
 
 - [Why Aperod](#-why-aperod)
 - [Protocol Status](#-protocol-status)
-- [Install a Full Node](#-install-a-full-node)
-- [Become a Validator](#-become-a-validator)
+- [Mainnet Node Onboarding](#-mainnet-node-onboarding)
+- [Mainnet Validator Onboarding](#-mainnet-validator-onboarding)
 - [Validator Rules](#-validator-rules)
 - [Tokenomics & Fee Burn](#-tokenomics--fee-burn)
 - [LPoD functionality, authorship, and licensing](#lpod--functionality-authorship-and-licensing)
@@ -95,7 +96,7 @@ compatibility migration from the former restrictive notice.
 | **Stealth addresses** | Every payment generates a one-time address; receiver identity is never revealed |
 | **Telegram wallet** | Full wallet inside Telegram — create, send, receive, and stake APRO without any app download |
 | **Dynamic base-fee burn** | 100% of the protocol base fee is burned; any priority tip remains validator compensation |
-| **Permissionless validators** | Anyone holding ≥ 100,000 APRO can run a validator — no whitelist, no approval needed |
+| **Validator participation** | Stake-weighted participation is described in [`VALIDATORS.md`](deploy/VALIDATORS.md); a verified public mainnet onboarding release is not yet available |
 | **Block rewards** | 3 APRO/block from a pre-allocated 2B APRO pool; then 1 APRO/block tail emission; no halving |
 | **Game integration** | Native protocol support for in-game asset transfers and micropayments |
 | **Source licensing** | Go source and tests, including LPoD, are Apache 2.0; original LPoD documentation is CC BY 4.0; dependencies retain their own terms |
@@ -121,40 +122,37 @@ wallets, exchange records, or other network/application-layer information.
 
 ---
 
-## ⬇ Install a Full Node
+## ⬇ Mainnet Node Onboarding
 
-### Install from a pinned, signed source commit
+### Mainnet release prerequisites
 
-A standalone installer archive is not published. The reviewed installer source
-is commit `de38c4b084c4377b5925d501d853cfe3da555a92`. Verify GitHub's signature
-status for that exact commit, fetch it by its full SHA, and run the installer
-from the clean detached checkout. Never pipe a script from mutable `main` into
-a root shell.
+Read [MAINNET.md](deploy/MAINNET.md). The existing chain anchors and AVM checkpoint have been signed and verified on the new OVH server under the selected single-operator trust policy. The signed JSON evidence is published beside that guide and can be signature-checked with `mainnet-bootstrap-attest evidence-verify`. This is not validator-quorum evidence and is not a software-and-snapshot release. A verified self-service mainnet bootstrap release is not yet published. The current `install-validator.sh` must not be used as a Mainnet installer. A release must bind compatible software, the canonical genesis, a consistent chain snapshot and the coordinated consensus profile. Source signatures and passing CI alone do not prove compatibility with the running chain.
+Do not run a different network's installer or pipe mutable scripts into a root shell.
+
+The current `install-validator.sh` is not a verified mainnet installer; pinning
+a source commit does not make it one. Do not set a network variable or rename a
+genesis file to bypass its guard. If an earlier source checkout already exists,
+preserve it rather than deleting it or rerunning the clone step. A failed
+preflight stops before package installation. Run shell blocks containing
+`set -e` or `exit` inside a child shell (`(...)`) so a failed check cannot close
+the SSH session.
+
+The public `v0.1.1-p2p` binary is Linux amd64 only, and its release notes state
+that production compatibility has not been claimed or deployed. No
+OS/architecture is currently verified for self-service mainnet onboarding.
+
+Installation and automatic mainnet connection are not yet a verified public
+procedure. For an existing installation, this read-only check validates its
+configuration without starting a node or signing blocks:
 
 ```bash
-set -euo pipefail
-APEROD_NODE_SOURCE_COMMIT=de38c4b084c4377b5925d501d853cfe3da555a92
-INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
-
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git python3
-
-curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
-
-git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
-cd "$INSTALLER_DIR"
-git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
-git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
-test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
-test -z "$(git status --porcelain)"
-sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-node.sh
+(
+  set -euo pipefail
+  test -x /usr/local/bin/aperod-node
+  test -f /etc/aperod/node.yaml
+  sudo /usr/local/bin/aperod-node --config /etc/aperod/node.yaml --validate-config
+)
 ```
-
-Supported platforms: **Ubuntu 22.04 · Ubuntu 24.04 LTS · Debian 12 · x86\_64 · ARM64**
-
-The node installs as a `systemd` service and connects to the Aperod network automatically.
 
 ### Verify the node is running
 
@@ -193,82 +191,39 @@ The `60 s` default is preserved for all existing deployments — only nodes that
 
 ---
 
-## 🛡 Become a Validator
+## 🛡 Mainnet validator onboarding
 
-Aperod uses **stake-weighted, permissionless validator selection.**  
-The top 21 nodes by staked APRO form the active validator set — no operator approval, no whitelist.
+**The bootstrap and AVM signatures verify on the new OVH server, but a
+self-service Mainnet release is not yet published. The current
+`install-validator.sh` must not be used as a Mainnet installer.** The signed
+chain anchor uses a single operator key rather than validator quorum. This
+repository does not yet provide a clean-server install that syncs through an
+authenticated Mainnet peer, locks stake on-chain, and proves active-set
+inclusion.
 
-### Step 1 — Get your Aperod wallet address
+The public `POST /api/validators/apply` endpoint exists, but it only creates an
+off-chain application record in the API database. It does not register a
+validator on-chain, lock stake, whitelist a P2P peer, or activate block signing.
+The former instructions to transfer APRO to a wallet and expect automatic
+activation did not establish those operations and have been removed. Do not
+send APRO or expose a consensus key based on them.
 
-Block rewards go directly to your **Telegram wallet**. You need an APRO address before installing the node.
-
-1. Open **[@sup_apro_bot](https://t.me/sup_apro_bot)**
-2. Tap **Create wallet**
-3. Copy your APRO address (≈ 95 characters, starts with `apr…`)
-
-### Step 2 — Install the validator node
-
-Use the same pinned, signed source checkout shown above, then run:
-
-```bash
-cd "$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-sudo env APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
-```
-
-The installer will:
-- Prompt for your APRO reward address
-- Generate a **consensus key** (signs blocks only — cannot move funds)
-- Configure the node as a `systemd` service and start it
-
-Unattended CI / cloud-init validator installation remains disabled; use the
-interactive procedure above so an operator can inspect the target host and
-provide the reward address.
-
-### Step 3 — Register your node
-
-After install, the script prints your registration command. Run it:
-
-```bash
-curl -s -X POST https://aperod.com/api/validators/apply \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "pubKey":   "<consensus-public-key>",
-    "alias":    "my-validator",
-    "endpoint": "/ip4/<server-ip>/tcp/30303",
-    "address":  "<apro-reward-address>"
-  }'
-```
-
-### Step 4 — Stake APRO
-
-Transfer **≥ 100,000 APRO** to your wallet address via [@sup_apro_bot](https://t.me/sup_apro_bot).
-Your node enters the active set automatically at the next epoch (~100 blocks · ≈ 5 min).
-
-### Step 5 — You're live
-
-- Block rewards accumulate in your Telegram wallet
-- You receive a Telegram notification for **every reward payment**
-- Check balance and staking status anytime in the bot
+Read [MAINNET.md](deploy/MAINNET.md) for the verified chain anchors, public Explorer
+checks, and remaining release requirements. It is not an installer. A working
+operator guide requires an exact reviewed release and a clean-server rehearsal
+that proves the node joins the existing chain without creating another genesis,
+then completes registration, stake locking, and active-set verification.
 
 ---
 
 ## 📋 Validator Rules
 
-See [**VALIDATORS.md**](VALIDATORS.md) for the complete rule set and protocol specification.
+See [**VALIDATORS.md**](deploy/VALIDATORS.md) for the complete rule set and protocol specification.
 
-**Quick reference:**
-
-| Parameter | Value |
-|-----------|-------|
-| Minimum stake | **100,000 APRO** |
-| Maximum active validators | **21** |
-| Epoch length | 100 blocks (~5 min) |
-| Churn limit per epoch | 3 new validators |
-| Full unbonding period | 144,000 blocks (~5 days) |
-| Liveness requirement | Sign ≥ 2/3 of blocks per epoch |
-| Slashing — double-sign | **10 % of stake, permanent ban** |
-| Slashing — extended downtime | **5 % of stake** |
-| Reward destination | Validator's APRO wallet address |
+The values in `VALIDATORS.md` are a protocol reference, not proof that the
+corresponding registration, stake-locking, slashing, or active-set behavior is
+available on the current public mainnet. Verify those behaviors against a
+reviewed release before relying on the values or transferring funds.
 
 ---
 
@@ -375,8 +330,9 @@ Base-fee destination:  🔥 complete base fee — burned 100%
 Priority tip:          optional proposer compensation
 ```
 
-Validators earn the pool reward and, after pool exhaustion, tail emission.
-Transaction fees never reach validator wallets.
+The protocol reference describes the pool reward and later tail emission;
+it does not prove a specific validator is active or that any particular
+operator will receive a payout. Transaction fees never reach validator wallets.
 The burn is enforced at the consensus layer — not a governance parameter, not toggleable.
 
 See [**BURN\_POLICY.md**](BURN_POLICY.md) for full tokenomics and deflationary mechanics.
@@ -415,23 +371,13 @@ The burn is consensus-enforced — not a governance parameter, not toggleable.
 
 ---
 
-### Your APRO Validator Reward Grows in USD as Price Rises
+### Validator onboarding status
 
-During the pool phase, an equally productive member of a 21-validator set earns
-a theoretical reward of **≈ 1,501,714 APRO / year**, before missed slots.
-As deflation drives the price up, that fixed reward becomes worth exponentially more in USD:
-
-| APRO price | Annual validator income (USD) |
-|-----------|------------------------------|
-| $0.001 (illustrative) | **≈ $50 / year** |
-| $0.0011 (illustrative) | **≈ $55 / year** |
-| $0.011 (illustrative) | **≈ $551 / year** |
-| $0.15 (illustrative) | **≈ $7,509 / year** |
-| $0.30 (illustrative) | **≈ $15,017 / year** |
-
-Run the node, earn APRO. Let deflation do the rest.
-
-> **Stake requirement:** ≥ 100,000 APRO &nbsp;·&nbsp; **Reward destination:** your Telegram wallet &nbsp;·&nbsp; **No approval needed**
+No verified procedure currently establishes that a new operator can register,
+lock eligible stake, enter the Mainnet active set, and produce an accepted
+block. Do not rely on projected validator income or transfer funds based on
+the protocol reference alone. See [Mainnet onboarding](deploy/MAINNET.md) for the
+checks still required before public validator instructions can be published.
 
 ---
 
@@ -470,7 +416,7 @@ aperod-node/
 
 ### Prerequisites
 
-- **Go 1.25+** — [install](https://go.dev/doc/install)
+- **Go 1.26.11** (required by `go.mod`) — [install](https://go.dev/doc/install)
 - `make`, `git`
 
 ### Clone & build
@@ -491,8 +437,8 @@ Outputs:
 ### Common commands
 
 ```bash
-# Start a full node
-./build/aperod-node --config config/testnet.yaml
+# Validate an existing mainnet profile without starting a node
+./build/aperod-node --config /etc/aperod/node.yaml --validate-config
 
 # Generate a new wallet (mnemonic + addresses)
 ./build/aperod wallet create
@@ -621,7 +567,7 @@ go tool pprof http://127.0.0.1:8546/debug/pprof/profile?seconds=30
 - **RPC (port 8545) binds to `127.0.0.1` by default** — never expose externally without a firewall
 - **pprof (port 8546) disabled by default** — enable only for active diagnosis, loopback only
 - **Consensus key stored with `chmod 600`** — readable only by the `aperod` system user
-- **Double-sign protection** — automatic on-chain slashing (10 % of stake, permanent ban from validator set)
+- **Double-sign detection** — conflicting signatures are detected; the current source does not implement the documented 10% stake debit, so slashing must not be treated as enforced
 - **View key sharing** — share your view key for read-only auditing without granting spending ability
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
