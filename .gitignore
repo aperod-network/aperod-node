@@ -1,5 +1,5 @@
 blockchain/aperod-node
-explorer-indexer
+/explorer-indexer
 aperod-explorer-indexer
 
 # Runtime state and credentials never belong in a source distribution.
@@ -14,8 +14,8 @@ snapshots/
 .env.*
 !.env.example
 !.env.sample
-aperod
-cli
-aperod-node
+/aperod
+/cli
+/aperod-node
 build/
 __pycache__/
