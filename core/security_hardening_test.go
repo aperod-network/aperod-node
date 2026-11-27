@@ -144,9 +144,7 @@ func TestUpdateEpochBreaksStakeTiesDeterministicallyAtActivation(t *testing.T) {
 	}
 
 	var want []crypto.ValidatorPubKey
-	for _, pub := range pubs {
-		want = append(want, pub)
-	}
+	want = append(want, pubs...)
 	sortValidatorKeys(want)
 	want = want[:MaxValidators]
 

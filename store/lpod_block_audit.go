@@ -890,7 +890,7 @@ func lpodAuditInitialCheckpoint(after *LPoDCheckpoint, height uint64, migration 
 	var saleRemaining uint64
 	switch migration.Version {
 	case 1:
-		const publicAllocation = uint64(9_000_000_000 * lpod.Unit)
+		const publicAllocation = 9_000_000_000 * lpod.Unit
 		if migration.ValidatorRemaining > publicAllocation ||
 			migration.HistoricalIssued > publicAllocation-migration.ValidatorRemaining {
 			return nil, fmt.Errorf("lpod audit: invalid version 1 migration allocation")

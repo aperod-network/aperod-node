@@ -12,6 +12,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestExportLogicalBackupConcurrentAtomicWrites(t *testing.T) {
@@ -19,7 +20,7 @@ func TestExportLogicalBackupConcurrentAtomicWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer source.Close()
+	defer testutil.CleanupClose(t, source)
 	if err := writeBackupTestTip(source, 0, make([]byte, 64*1024)); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +59,7 @@ func TestExportLogicalBackupConcurrentAtomicWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open exported database: %v", err)
 	}
-	defer copyDB.Close()
+	defer testutil.CleanupClose(t, copyDB)
 	copiedTipHash, err := copyDB.Get(append(append([]byte(nil), prefixMeta...), []byte("tip/hash")...), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +133,7 @@ func TestExportLogicalBackupRejectsInvalidSnapshotTipAndCleansDestination(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer source.Close()
+			defer testutil.CleanupClose(t, source)
 			if err := writeBackupTestTip(source, 0, []byte("initial block")); err != nil {
 				t.Fatal(err)
 			}
@@ -155,7 +156,7 @@ func TestExportLogicalBackupRequiresAbsentDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer source.Close()
+	defer testutil.CleanupClose(t, source)
 	dst := filepath.Join(t.TempDir(), "existing")
 	if err := os.Mkdir(dst, 0700); err != nil {
 		t.Fatal(err)
@@ -173,7 +174,7 @@ func TestExportLogicalBackupCancelledRemovesPartialDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer source.Close()
+	defer testutil.CleanupClose(t, source)
 	if err := writeBackupTestTip(source, 0, []byte("tip body")); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +197,7 @@ func TestExportLogicalBackupRejectsDestinationInsideLiveDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer source.Close()
+	defer testutil.CleanupClose(t, source)
 	dst := filepath.Join(livePath, "nested-backup")
 	if _, _, err := source.exportLogicalBackup(context.Background(), dst, testBackupFreeBytes); err == nil {
 		t.Fatal("ExportLogicalBackup succeeded inside the live database directory")
@@ -220,7 +221,7 @@ func TestExportLogicalBackupRejectsLowFreeSpaceAndCleansDestination(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer source.Close()
+			defer testutil.CleanupClose(t, source)
 			if err := writeBackupTestTip(source, 0, []byte("tip body")); err != nil {
 				t.Fatal(err)
 			}

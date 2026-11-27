@@ -73,6 +73,7 @@ func verifyEvidence(manifestPath, avmCheckpointPath string, avmActivationHeight 
 	if (avmCheckpointPath == "") != (avmActivationHeight == 0) {
 		return nil, errors.New("--avm-checkpoint and a nonzero --avm-activation-height must be supplied together")
 	}
+	// #nosec G304 -- Operator-selected offline evidence manifest, not a remotely supplied filename.
 	file, err := os.Open(manifestPath)
 	if err != nil {
 		return nil, fmt.Errorf("open signed manifest: %w", err)
@@ -272,6 +273,7 @@ func runSign(args []string) error {
 }
 
 func loadOperatorKey(path string) (*crypto.LockedValidatorKey, error) {
+	// #nosec G703 -- Signing-key path is explicitly selected by the local operator; regular-file and mode checks follow.
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("inspect operator key: %w", err)
@@ -279,6 +281,7 @@ func loadOperatorKey(path string) (*crypto.LockedValidatorKey, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0600 {
 		return nil, errors.New("operator key must be a regular, non-symlink file with mode 0600")
 	}
+	// #nosec G304 G703 -- Operator-selected local signing key after non-symlink/0600 checks; no server-side request selects it.
 	privateBytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read operator key: %w", err)

@@ -277,7 +277,7 @@ func (b *TxBuilder) BuildMulti(recipients []BatchRecipient, changeAddr crypto.Ad
 			KeyImage:     ki,
 			Ring:         ring,
 			AmountCommit: u.AmountCommit,
-			RealIndex:    uint8(realIdx),
+			RealIndex:    uint8(realIdx), // #nosec G115 -- Shared canonical ring selection bounds this index to [0, crypto.RingSize), currently 16.
 		}
 		if txVersionUsesCLSAG(b.txVersion) {
 			commits := make([]crypto.Commitment, crypto.RingSize)

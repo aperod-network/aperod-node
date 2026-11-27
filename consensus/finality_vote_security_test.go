@@ -8,6 +8,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -50,7 +51,7 @@ func TestPendingFinalityVotesRestoreAndCompleteQuorumAfterRestart(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	chain, block := finalityTestChain(t, "pending-votes")
 	engine := finalityVoteEngineForTest(t, chain, pubs, db)
 	for i := 0; i < 2; i++ {
@@ -110,7 +111,7 @@ func TestHeightBoundVoteEquivocationPersistsAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	chain, block := finalityTestChain(t, "equivocation")
 	engine := finalityVoteEngineForTest(t, chain, pubs, db)
 	first := signedFinalityVoteForTest(t, privs[0], pubs[0], 1, block.Hash())
@@ -159,7 +160,7 @@ func TestInvalidCandidateVoteDoesNotPoisonCanonicalVote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	chain, block := finalityTestChain(t, "invalid-candidate")
 	engine := finalityVoteEngineForTest(t, chain, pubs, db)
 	invalidHash := crypto.HashStr("signed-but-noncanonical-block")

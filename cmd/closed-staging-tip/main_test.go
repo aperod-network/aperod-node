@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -378,7 +379,7 @@ type parsedSyntheticTarMember struct {
 	data []byte
 }
 
-func extractSyntheticTar(archiveBytes []byte, destination string) error {
+func extractSyntheticTar(archiveBytes []byte, destination string) (extractErr error) {
 	parent := filepath.Dir(destination)
 	parentInfo, err := os.Lstat(parent)
 	if err != nil {
@@ -424,7 +425,7 @@ func extractSyntheticTar(archiveBytes []byte, destination string) error {
 			if header.Size != 0 {
 				return fmt.Errorf("directory archive member %q has a payload", header.Name)
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg, 0: // Includes the historical NUL regular-file flag.
 			if header.Size < 0 || header.Size > int64(len(archiveBytes)) {
 				return fmt.Errorf("archive member %q has invalid size %d", header.Name, header.Size)
 			}
@@ -471,7 +472,7 @@ func extractSyntheticTar(archiveBytes []byte, destination string) error {
 	if err != nil {
 		return fmt.Errorf("create restore staging directory: %w", err)
 	}
-	defer os.RemoveAll(stage)
+	defer func() { extractErr = errors.Join(extractErr, os.RemoveAll(stage)) }()
 
 	directories := make([]parsedSyntheticTarMember, 0)
 	for _, member := range members {
@@ -552,7 +553,7 @@ func syntheticTarBytes(t *testing.T, members ...syntheticTarMember) []byte {
 		if err := writer.WriteHeader(header); err != nil {
 			t.Fatalf("write synthetic tar header %q: %v", member.name, err)
 		}
-		if member.typeflag == tar.TypeReg || member.typeflag == tar.TypeRegA {
+		if member.typeflag == tar.TypeReg || member.typeflag == 0 {
 			if _, err := writer.Write(member.data); err != nil {
 				t.Fatalf("write synthetic tar member %q: %v", member.name, err)
 			}

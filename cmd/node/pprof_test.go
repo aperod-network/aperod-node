@@ -27,6 +27,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // freePprofPort returns a random free TCP port on loopback.
@@ -37,7 +39,7 @@ func freePprofPort(t *testing.T) int {
 		t.Fatalf("freePprofPort: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	testutil.Close(t, ln)
 	return port
 }
 
@@ -72,7 +74,7 @@ func startPprofServer(t *testing.T, addr string) {
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			testutil.Close(t, conn)
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -95,7 +97,7 @@ func TestPprofIndexReachable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /debug/pprof/ returned %d, want 200", resp.StatusCode)
@@ -132,7 +134,7 @@ func TestPprofGoroutineProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /debug/pprof/goroutine returned %d, want 200", resp.StatusCode)
@@ -177,7 +179,7 @@ func TestPprofCPUProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
@@ -200,7 +202,7 @@ func TestPprofCPUProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CPU profile is not a valid gzip stream: %v\n(first 16 bytes: %x)", err, compressed[:min16(len(compressed))])
 	}
-	defer gr.Close()
+	defer testutil.CleanupClose(t, gr)
 
 	decompressed, err := io.ReadAll(gr)
 	if err != nil {

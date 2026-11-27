@@ -100,7 +100,7 @@ func TestMemWatchdogSavesSnapshotBeforeKill(t *testing.T) {
 
 	// performShutdown closes engineStop; the fake engine goroutine (step 2)
 	// closes engineDone in response, so the wait inside performShutdown returns.
-	performShutdown(engineStop, engineDone, db, utxos, registry, dir, log, nil)
+	performShutdown(engineStop, engineDone, db, utxos, registry, dir, log)
 
 	// The watchdog goroutine is still alive (blocked on ticks / engineStop);
 	// wait for it to exit now that engineStop is closed.

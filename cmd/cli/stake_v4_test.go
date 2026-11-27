@@ -51,7 +51,7 @@ func TestBuildWalletStakeV4(t *testing.T) {
 	if err != nil || hs == nil {
 		t.Fatalf("scan: %v", err)
 	}
-	amount := uint64(core.MinStakeNAPR)
+	amount := core.MinStakeNAPR
 	blind, err := crypto.DeterministicPaymentBlind(*hs, amount)
 	if err != nil {
 		t.Fatal(err)

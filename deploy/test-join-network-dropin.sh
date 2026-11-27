@@ -40,6 +40,7 @@ _make_env() {
 
     # Primary data dir (required by join-network.sh pre-flight check)
     mkdir -p "$tmpdir/primary_data/chain.db"
+    printf 'network: testnet\n' > "$tmpdir/primary-node.yaml"
 
     # Canonical drop-in file: verify-dropin.sh reads GOMEMLIMIT from here.
     printf '[Service]\nEnvironment="GOMEMLIMIT=%s"\n' "$canon_gomemlimit" \
@@ -136,6 +137,7 @@ run_case() {
     local actual_exit=0
     PATH="$tmpdir:$PATH" \
     PRIMARY_DATA_DIR="$tmpdir/primary_data" \
+    PRIMARY_NODE_YAML="$tmpdir/primary-node.yaml" \
     PRIMARY_IP="10.0.0.1" \
     SECONDARY_DATA_DIR="$tmpdir/secondary_data" \
     SECONDARY_NODE_YAML="$tmpdir/node.yaml" \

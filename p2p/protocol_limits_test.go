@@ -5,12 +5,14 @@ import (
 	"net"
 	"strings"
 	"testing"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestReadMsgRejectsOversizedControlPayloadBeforeReadingBody(t *testing.T) {
 	reader, writer := net.Pipe()
-	defer reader.Close()
-	defer writer.Close()
+	defer testutil.CleanupClose(t, reader)
+	defer testutil.CleanupClose(t, writer)
 
 	writeErr := make(chan error, 1)
 	go func() {
@@ -32,8 +34,8 @@ func TestReadMsgRejectsOversizedControlPayloadBeforeReadingBody(t *testing.T) {
 
 func TestWriteMsgRejectsOversizedControlPayload(t *testing.T) {
 	reader, writer := net.Pipe()
-	defer reader.Close()
-	defer writer.Close()
+	defer testutil.CleanupClose(t, reader)
+	defer testutil.CleanupClose(t, writer)
 
 	err := WriteMsg(writer, MsgPing, PingMsg{UserAgent: strings.Repeat("x", maxControlPayloadBytes)})
 	if err == nil || !strings.Contains(err.Error(), "message payload too large") {

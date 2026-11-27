@@ -11,6 +11,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -527,7 +528,7 @@ func TestFinalityCertificateForCanonicalAncestorDoesNotFinalizeTip(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	raw, err := json.Marshal(ancestor)
 	if err != nil {
 		t.Fatal(err)

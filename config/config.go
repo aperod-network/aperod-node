@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 // Network identifies which chain this node is on.
 type Network string
 
+// Network names identify the configured chain environment.
 const (
 	Mainnet Network = "mainnet"
 	Testnet Network = "testnet"
@@ -69,6 +71,7 @@ func validateMainnetBootstrapRelease(
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("%w: manifest must be a regular, non-symlink file", ErrMainnetBootstrapUnavailable)
 	}
+	// #nosec G304 -- Operator-configured startup manifest; no remote filename input reaches config validation.
 	file, err := os.Open(manifestPath)
 	if err != nil {
 		return fmt.Errorf("%w: open manifest: %v", ErrMainnetBootstrapUnavailable, err)
@@ -576,6 +579,8 @@ type ConsensusConfig struct {
 	RegistryBootstrap *RegistryBootstrapConfig `yaml:"registry_bootstrap"`
 }
 
+// RegistryBootstrapConfig describes operator-attested offline recovery inputs.
+// It is not independent authentication of the historical committee.
 type RegistryBootstrapConfig struct {
 	Trust        string `yaml:"trust"`
 	SnapshotFile string `yaml:"snapshot_file"`
@@ -676,6 +681,7 @@ func DefaultConfig() *Config {
 func Load(path string) (*Config, error) {
 	cfg := DefaultConfig()
 
+	// #nosec G304 -- Explicit local startup configuration path selected by the node operator.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
@@ -808,6 +814,9 @@ func (c *Config) Warnings() []string {
 
 // Validate checks that required fields are present and valid.
 func (c *Config) Validate() error {
+	if c.MempoolEvictIntervalSec > maxMempoolEvictIntervalSec {
+		return fmt.Errorf("mempool_evict_interval_sec exceeds time.Duration range (maximum %d)", maxMempoolEvictIntervalSec)
+	}
 	switch c.Network {
 	case Mainnet, Testnet, Devnet:
 		// Only the exact canonical spellings are supported. In particular,
@@ -1270,15 +1279,22 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+const maxMempoolEvictIntervalSec = uint64(math.MaxInt64) / uint64(time.Second)
+
 // ResolveMempoolEvictInterval converts MempoolEvictIntervalSec into a
 // time.Duration, applying the 5-minute default when the value is zero.
 // A zero value arises either because the field was omitted from node.yaml
 // (YAML leaves the field at its zero value, overriding the DefaultConfig
 // value of 300) or because the operator explicitly wrote
 // mempool_evict_interval_sec: 0 to request the default behavior.
+// It panics on an out-of-range direct argument; Config.Validate rejects such
+// operator configuration before node startup, without reaching this resolver.
 func ResolveMempoolEvictInterval(sec uint64) time.Duration {
 	if sec == 0 {
 		return 5 * time.Minute
+	}
+	if sec > maxMempoolEvictIntervalSec {
+		panic("mempool eviction interval exceeds time.Duration range")
 	}
 	return time.Duration(sec) * time.Second
 }

@@ -16,7 +16,7 @@ import (
 	"github.com/aperod/aperod/lpod"
 )
 
-// LPoD checkpoints are immutable and keyed by canonical block hash. Selecting
+// LPoDCheckpoint records immutable, canonical-hash-keyed ledger state. Selecting
 // an earlier tip therefore selects that exact earlier reserve AND rounding
 // carry, rather than an independently persisted mutable "remaining" counter.
 // Initial funding requires a fully reconciled, quorum-attested allocation debit.
@@ -329,6 +329,7 @@ type legacyLPoDAllocation struct {
 	TailIssued                uint64        `json:"tail_issued_napro,string"`
 }
 
+// PreviewLPoD computes pending settlement effects without committing a block.
 func (d *DB) PreviewLPoD(height uint64, request *LPoDSettlement) (*LPoDCheckpoint, []lpod.Payment, error) {
 	if err := d.checkSaleGenesisFundingTransition(height, request, false); err != nil {
 		return nil, nil, err
@@ -393,6 +394,7 @@ func lpodRewardDebit(before *LPoDAllocation, vaults []lpod.Vault) (*LPoDAllocati
 	return &a, nil
 }
 
+// LPoDRewardFor selects the legacy reserve draw or its separately recorded tail.
 func LPoDRewardFor(remaining uint64) uint64 {
 	if remaining == 0 {
 		return lpod.Unit
@@ -534,6 +536,7 @@ func (d *DB) validateLPoDBlock(data []byte, hash crypto.Hash32, height uint64, r
 	return fmt.Errorf("lpod: funded blocks require the authenticated position protocol")
 }
 
+// LoadLPoDCheckpointAt reads the checkpoint bound to a specific block hash.
 func (d *DB) LoadLPoDCheckpointAt(hash crypto.Hash32) (*LPoDCheckpoint, error) {
 	return d.lpodCheckpoint(hash)
 }

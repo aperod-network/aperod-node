@@ -46,6 +46,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -81,7 +82,7 @@ func TestRPC_WalletSend_InMemoryUTXOFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// ── 3. Build the mint tx for Alice at height=mintHeight ──────────────────
 	// BuildMintTx produces a transparent mint output:

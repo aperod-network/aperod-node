@@ -3,6 +3,7 @@
 package api
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,7 @@ import (
 func evictDailyBenchmarkFiles(path string) (int, int64, error) {
 	var files int
 	var bytes int64
-	err := filepath.WalkDir(path, func(name string, entry os.DirEntry, err error) error {
+	err := filepath.WalkDir(path, func(name string, entry os.DirEntry, err error) (retErr error) {
 		if err != nil {
 			return err
 		}
@@ -26,7 +27,7 @@ func evictDailyBenchmarkFiles(path string) (int, int64, error) {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { retErr = errors.Join(retErr, f.Close()) }()
 		info, err := f.Stat()
 		if err != nil {
 			return err

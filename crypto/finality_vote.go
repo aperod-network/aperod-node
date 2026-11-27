@@ -2,6 +2,7 @@ package crypto
 
 import "encoding/binary"
 
+// Finality vote versions distinguish historical and height-bound signing formats.
 const (
 	FinalityVoteVersionLegacy      uint8 = 1
 	FinalityVoteVersionHeightBound uint8 = 2

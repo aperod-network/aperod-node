@@ -308,7 +308,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, spendPriv, viewPriv crypto.
 		// blocks predating PutTxIdx (the tx-hash index introduced later).
 		s.log.Info("WALLET_SEND_TRACE: trying blockStore.GetUTXO",
 			"tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx)
-		su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
+		su, suErr := s.blockStore.GetUTXO(txHash, u.OutIdx)
 		if suErr != nil {
 			s.log.Warn("WALLET_SEND_TRACE: blockStore.GetUTXO error",
 				"tx", u.TxHash[:min(16, len(u.TxHash))], "out_idx", u.OutIdx, "err", suErr)
@@ -338,7 +338,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, spendPriv, viewPriv crypto.
 			return false
 		}() {
 			// unreachable — the closure always returns false
-		} else if memUTXO := s.utxos.Get(txHash, uint32(u.OutIdx)); memUTXO != nil {
+		} else if memUTXO := s.utxos.Get(txHash, u.OutIdx); memUTXO != nil {
 			// Fallback 4: in-memory UTXOSet told us the block height; now
 			// read the block from disk to get the authoritative AmountCommit.
 			// The snapshot AmountCommit may be stale/corrupt after an OOM
@@ -513,7 +513,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, spendPriv, viewPriv crypto.
 				} else {
 					// V2 mismatch: this UTXO was created before the F-049 blind migration.
 					// Fall back to V1 for backward compatibility.
-					blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+					blindV1, errV1 := crypto.LegacyMintBlind(spendPub, u.AmountNAPR)
 					if errV1 != nil {
 						return core.OwnedUTXO{}, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
 							u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
@@ -538,7 +538,7 @@ func (s *Server) resolveOwnedUTXO(u walletUTXOInput, spendPriv, viewPriv crypto.
 				}
 			} else {
 				// Legacy/admin mint (height == 0): always use V1.
-				blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+				blind, err = crypto.LegacyMintBlind(spendPub, u.AmountNAPR)
 				if err != nil {
 					return core.OwnedUTXO{}, fmt.Errorf("deterministic blind for %s[%d]: %w",
 						u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)
@@ -884,11 +884,4 @@ func hash32FromHex(s string) (crypto.Hash32, error) {
 	var out crypto.Hash32
 	copy(out[:], b)
 	return out, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

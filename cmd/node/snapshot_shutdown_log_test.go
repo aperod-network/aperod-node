@@ -24,6 +24,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -64,7 +65,7 @@ func TestLogSnapshotStartupReason_NoSnapshot(t *testing.T) {
 
 	logSnapshotStartupReason(os.ErrNotExist, 12345, log)
 
-const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
+	const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&buf, wantMsg) {
 		t.Fatalf("expected log message %q not found in:\n%s", wantMsg, buf.String())
 	}
@@ -92,7 +93,7 @@ func TestLogSnapshotStartupReason_WrappedNotExist(t *testing.T) {
 	wrapped := fmt.Errorf("outer: %w", os.ErrNotExist)
 	logSnapshotStartupReason(wrapped, 0, log)
 
-const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
+	const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&buf, wantMsg) {
 		t.Fatalf("expected log message %q for wrapped ErrNotExist, got:\n%s", wantMsg, buf.String())
 	}
@@ -159,7 +160,7 @@ func buildMinimalChainForShutdown(t *testing.T, dir string) (*store.DB, *core.UT
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	for _, b := range []*core.Block{genesis, blk1} {
 		raw, merr := json.Marshal(b)
@@ -373,7 +374,7 @@ func TestFallbackClassification_PrimaryAbsentNoPrevBackup(t *testing.T) {
 	var reasonBuf bytes.Buffer
 	logSnapshotStartupReason(err, height, newCaptureLogger(&reasonBuf))
 
-reason, ok := logFieldValue(&reasonBuf, "no exact-tip snapshot found — checking older snapshots before replay", "startup_reason")
+	reason, ok := logFieldValue(&reasonBuf, "no exact-tip snapshot found — checking older snapshots before replay", "startup_reason")
 	if !ok || reason != "no_snapshot" {
 		t.Errorf("startup_reason = %q (ok=%v), want no_snapshot; log:\n%s",
 			reason, ok, reasonBuf.String())
@@ -858,7 +859,7 @@ func TestRunWiring_NoSnapshot(t *testing.T) {
 	}
 
 	// ── Assertions. ──────────────────────────────────────────────────────────
-const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
+	const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&logBuf, wantMsg) {
 		t.Fatalf("expected log %q not found;\nlog:\n%s", wantMsg, logBuf.String())
 	}
@@ -954,7 +955,7 @@ func assertStartupReasonInBuf(t *testing.T, buf *bytes.Buffer, want string) {
 	t.Helper()
 	wantMsg := "snapshot corrupt or unreadable — falling back to full block scan"
 	if want == "no_snapshot" {
-wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
+		wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	}
 	if !logContainsMsg(buf, wantMsg) {
 		t.Fatalf("expected log %q emitted by tryLoadStartupSnapshot, got:\n%s", wantMsg, buf.String())
@@ -1088,7 +1089,7 @@ func openTempDB(t *testing.T) *store.DB {
 	if err != nil {
 		t.Fatalf("openTempDB: store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	return db
 }
 
@@ -1258,17 +1259,17 @@ func TestCheckStartupSnapshotTiming_DBRoundtrip_PersistAcrossReopen(t *testing.T
 		t.Fatalf("store.Open (first): %v", err)
 	}
 	if err := db1.StoreSnapshotSaveDuration(saveMs); err != nil {
-		db1.Close()
+		testutil.Close(t, db1)
 		t.Fatalf("StoreSnapshotSaveDuration: %v", err)
 	}
-	db1.Close()
+	testutil.Close(t, db1)
 
 	// Second "run": reopen and load; must find the stored value.
 	db2, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open (second): %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	got, found, err := db2.LoadSnapshotSaveDuration()
 	if err != nil {
@@ -1329,7 +1330,7 @@ func TestCheckStartupSnapshotTiming_DBRoundtrip_UsesPersistedTimeout(t *testing.
 	if err != nil {
 		t.Fatalf("store.Open (after restart): %v", err)
 	}
-	defer restartedDB.Close()
+	defer testutil.CleanupClose(t, restartedDB)
 
 	loadedSaveMs, saveFound, err := restartedDB.LoadSnapshotSaveDuration()
 	if err != nil {

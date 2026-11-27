@@ -1,0 +1,63 @@
+LPoD LICENSING COMPATIBILITY NOTICE
+
+This file replaces the former restrictive LPoD notice for the current release.
+It is retained under the historical filename so links to LICENSE-LPOD explain
+the migration instead of presenting obsolete permission requirements.
+
+1. Code and tests
+
+The original LPoD source code and tests authored by the web3 Aperod APRO team
+are licensed under the Apache License, Version 2.0. The complete license is in
+the repository root LICENSE file:
+
+https://www.apache.org/licenses/LICENSE-2.0
+
+Dedicated LPoD source files carry:
+
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) web3 Aperod APRO team
+
+Apache License 2.0 permits use, reproduction, modification, distribution, and
+other activities under its terms without separate prior approval. Its grants
+are governed by the license, including its conditions and irrevocability
+language.
+
+2. Documentation
+
+LPOD.md and other original LPoD documentation identified by the project are
+licensed under Creative Commons Attribution 4.0 International (CC BY 4.0). The
+complete license is in LICENSE-DOCS:
+
+https://creativecommons.org/licenses/by/4.0/
+
+Attribution applies when exercising rights in the licensed documentation. A
+suggested attribution is:
+
+"LPoD documentation by the web3 Aperod APRO team, licensed under CC BY 4.0."
+
+Include a link to the source and license and indicate changes when required by
+CC BY 4.0.
+
+3. Authorship and ideas
+
+The official LPoD authorship section is:
+
+https://aperod.com/vaults#lpod-authorship
+
+These notices identify authorship of the published implementation and
+documentation. They do not claim ownership of abstract ideas, methods,
+algorithms, facts, or protocol concepts. Independently developed clean-room
+implementations are not restricted by these notices. Attribution is not
+required merely for using an idea; it applies only as required by the license
+for Aperod code or documentation actually used.
+
+4. Historical notice
+
+Earlier repository history may contain a restrictive LPoD notice. That notice
+does not govern the current release. The copyright holders now offer the
+current LPoD code and tests under Apache License 2.0 and the current original
+LPoD documentation under CC BY 4.0. These current grants are governed only by
+those published licenses.
+
+Dependencies and third-party material remain subject to their own licenses and
+notices.

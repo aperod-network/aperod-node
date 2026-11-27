@@ -19,8 +19,11 @@ package explorer
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/aperod/aperod/internal/checkedio"
 
 	_ "github.com/lib/pq"
 )
@@ -103,14 +106,12 @@ func New(connStr string) (*Indexer, error) {
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("explorer: ping db: %w", err)
+		return nil, fmt.Errorf("explorer: ping db: %w", errors.Join(err, db.Close()))
 	}
 
 	idx := &Indexer{db: db}
 	if err := idx.migrate(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("explorer: migrate: %w", err)
+		return nil, fmt.Errorf("explorer: migrate: %w", errors.Join(err, db.Close()))
 	}
 	return idx, nil
 }
@@ -437,7 +438,7 @@ func (idx *Indexer) GetBlockByHash(hash string) (*BlockRow, error) {
 
 // ListBlocks returns blocks ordered newest-first with limit/offset pagination.
 // Also returns the total count of indexed blocks.
-func (idx *Indexer) ListBlocks(limit, offset int) ([]*BlockRow, int, error) {
+func (idx *Indexer) ListBlocks(limit, offset int) (_ []*BlockRow, _ int, readCloseErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -455,7 +456,7 @@ func (idx *Indexer) ListBlocks(limit, offset int) ([]*BlockRow, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer checkedio.CloseReadResult(rows, &readCloseErr)
 
 	var result []*BlockRow
 	for rows.Next() {
@@ -501,7 +502,7 @@ func (idx *Indexer) GetTxByHash(hash string) (*TxRow, error) {
 }
 
 // GetAddrTxs retrieves transactions for an address, newest-first.
-func (idx *Indexer) GetAddrTxs(address string, limit, offset int) ([]AddrTxData, error) {
+func (idx *Indexer) GetAddrTxs(address string, limit, offset int) (_ []AddrTxData, readCloseErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -513,7 +514,7 @@ func (idx *Indexer) GetAddrTxs(address string, limit, offset int) ([]AddrTxData,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer checkedio.CloseReadResult(rows, &readCloseErr)
 
 	var result []AddrTxData
 	for rows.Next() {
@@ -521,6 +522,9 @@ func (idx *Indexer) GetAddrTxs(address string, limit, offset int) ([]AddrTxData,
 		var h int64
 		if err := rows.Scan(&a.Address, &a.TxHash, &h, &a.TxIndex, &a.OutputIndex); err != nil {
 			return nil, err
+		}
+		if h < 0 {
+			return nil, fmt.Errorf("explorer: negative block height in address index")
 		}
 		a.BlockHeight = uint64(h)
 		result = append(result, a)

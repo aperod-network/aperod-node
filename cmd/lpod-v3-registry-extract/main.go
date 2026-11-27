@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 const tailLimit = 4 << 20
@@ -79,29 +81,53 @@ func regularNoSymlink(path string) (*os.File, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s must be a regular non-symlink file", path)
 	}
+	// #nosec G304 -- Offline snapshot input selected by the operator; this helper also enforces regular-file and symlink checks.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	opened, err := file.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		file.Close()
-		return nil, fmt.Errorf("%s changed or is not a regular file", path)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("stat opened %s: %w", path, err), file.Close())
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.Join(fmt.Errorf("%s changed or is not a regular file", path), file.Close())
 	}
 	return file, nil
 }
 
 func verifySidecar(snapshotPath string) error {
-	source, err := regularNoSymlink(snapshotPath)
+	source, err := openVerifiedSnapshot(snapshotPath)
 	if err != nil {
 		return err
 	}
-	defer source.Close()
+	return source.Close()
+}
+
+// openVerifiedSnapshot returns the same descriptor whose bytes were hashed,
+// rewound for parsing. Reopening the path after verification would permit a
+// replacement file to be parsed without checking its checksum.
+func openVerifiedSnapshot(snapshotPath string) (*os.File, error) {
+	source, err := regularNoSymlink(snapshotPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyOpenSnapshotSidecar(source, snapshotPath); err != nil {
+		return nil, errors.Join(err, source.Close())
+	}
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return nil, errors.Join(fmt.Errorf("rewind verified snapshot: %w", err), source.Close())
+	}
+	return source, nil
+}
+
+// verifyOpenSnapshotSidecar borrows source and owns only the sidecar descriptor.
+func verifyOpenSnapshotSidecar(source io.Reader, snapshotPath string) (readCloseErr error) {
 	sidecar, err := regularNoSymlink(snapshotPath + ".sha256")
 	if err != nil {
 		return fmt.Errorf("checksum sidecar: %w", err)
 	}
-	defer sidecar.Close()
+	defer checkedio.CloseReadResult(sidecar, &readCloseErr)
 	checksum := sha256.New()
 	if _, err := io.Copy(checksum, source); err != nil {
 		return fmt.Errorf("hash snapshot: %w", err)
@@ -124,51 +150,57 @@ func verifySidecar(snapshotPath string) error {
 	return nil
 }
 
-func extract(snapshotPath string, height uint64, expected crypto.Hash32, outputPath string) error {
-	if err := verifySidecar(snapshotPath); err != nil {
-		return err
-	}
-	input, err := regularNoSymlink(snapshotPath)
+func extract(snapshotPath string, height uint64, expected crypto.Hash32, outputPath string) (extractErr error) {
+	input, err := openVerifiedSnapshot(snapshotPath)
 	if err != nil {
 		return err
 	}
-	defer input.Close()
+	inputClosed := false
+	defer func() {
+		if !inputClosed {
+			extractErr = errors.Join(extractErr, input.Close())
+		}
+	}()
 	gz, err := gzip.NewReader(input)
 	if err != nil {
 		return fmt.Errorf("open gzip snapshot: %w", err)
 	}
+	gzipClosed := false
+	defer func() {
+		if !gzipClosed {
+			extractErr = errors.Join(extractErr, gz.Close())
+		}
+	}()
 
 	headerPrefix, err := readHeaderPrefix(gz)
 	if err != nil {
-		gz.Close()
 		return err
 	}
 	header, err := decodeHeader(headerPrefix)
 	if err != nil {
-		gz.Close()
 		return err
 	}
 	if header.Version != 2 {
-		gz.Close()
 		return fmt.Errorf("snapshot version is %d, want v2", header.Version)
 	}
 	if header.TipHeight != height {
-		gz.Close()
 		return fmt.Errorf("snapshot height %d does not match expected anchor height %d", header.TipHeight, height)
 	}
 	headerHash, err := parseHash(header.TipHash)
 	if err != nil || headerHash != expected {
-		gz.Close()
 		return fmt.Errorf("snapshot tip hash does not match expected anchor hash")
 	}
 
 	tail, scan, err := readTailAndScan(gz, headerPrefix)
+	gzipClosed = true
 	closeErr := gz.Close()
+	inputClosed = true
+	inputCloseErr := input.Close()
 	if err != nil {
-		return err
+		return errors.Join(err, closeErr, inputCloseErr)
 	}
-	if closeErr != nil {
-		return fmt.Errorf("finish gzip snapshot (CRC/stream): %w", closeErr)
+	if closeErr != nil || inputCloseErr != nil {
+		return fmt.Errorf("finish snapshot readers: %w", errors.Join(closeErr, inputCloseErr))
 	}
 	registry, err := extractRegistry(tail, scan)
 	if err != nil {
@@ -176,6 +208,7 @@ func extract(snapshotPath string, height uint64, expected crypto.Hash32, outputP
 	}
 
 	result := anchoredRegistry{Height: height, Hash: expected, Registry: registry}
+	// #nosec G304 -- Operator-selected offline evidence output, created exclusively without overwriting existing files.
 	out, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("create output exclusively: %w", err)
@@ -184,7 +217,7 @@ func extract(snapshotPath string, height uint64, expected crypto.Hash32, outputP
 	writeErr := enc.Encode(result)
 	closeErr = out.Close()
 	if writeErr != nil {
-		return fmt.Errorf("write output: %w", writeErr)
+		return fmt.Errorf("write output: %w", errors.Join(writeErr, closeErr))
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close output: %w", closeErr)
@@ -433,11 +466,18 @@ func skipJSONValue(decoder *json.Decoder) error {
 
 func extractRegistry(tail []byte, scan jsonScan) (core.RegistrySnapshot, error) {
 	var registry core.RegistrySnapshot
+	if scan.offset < uint64(len(tail)) {
+		return registry, fmt.Errorf("registry tail offset precedes buffered bytes")
+	}
 	tailStart := scan.offset - uint64(len(tail))
 	if !scan.found || scan.rootRegistry < tailStart {
 		return registry, fmt.Errorf("registry cannot be extracted: registry field is absent or exceeds the 4 MiB tail bound")
 	}
-	keyOffset := int(scan.rootRegistry - tailStart)
+	offset := scan.rootRegistry - tailStart
+	if offset > 4<<20 {
+		return registry, fmt.Errorf("registry offset exceeds the 4 MiB tail bound")
+	}
+	keyOffset := int(offset)
 	if keyOffset < 0 || keyOffset+len(`"registry"`) > len(tail) ||
 		string(tail[keyOffset:keyOffset+len(`"registry"`)]) != `"registry"` {
 		return registry, fmt.Errorf("registry cannot be extracted from snapshot tail")

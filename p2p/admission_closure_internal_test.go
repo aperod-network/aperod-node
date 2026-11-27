@@ -14,6 +14,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 type admissionTestHandler struct{}
@@ -101,7 +102,7 @@ func TestOutboundAdmissionReservationThroughRegistration(t *testing.T) {
 				}
 				local, peer := net.Pipe()
 				go func() {
-					defer peer.Close()
+					defer testutil.CleanupClose(t, peer)
 					msgType, _, err := readMsg(peer)
 					if err != nil || msgType != MsgPing {
 						return
@@ -173,7 +174,7 @@ func TestInboundAdmissionCountsOutboundReservation(t *testing.T) {
 	h.dialContextFunc = func(context.Context, string, string) (net.Conn, error) {
 		local, peer := net.Pipe()
 		go func() {
-			defer peer.Close()
+			defer testutil.CleanupClose(t, peer)
 			if msgType, _, err := readMsg(peer); err != nil || msgType != MsgPing {
 				return
 			}

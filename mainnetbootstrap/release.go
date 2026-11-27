@@ -18,6 +18,7 @@ import (
 const releaseSchema = "aperod-mainnet-release-v1"
 const releaseDomain = "aperod/mainnet-release/v1\x00"
 
+// ReleaseHistoricalCommitteeFile names the operator-attested committee bundle member.
 const ReleaseHistoricalCommitteeFile = "finality-committee-operator-v2.json"
 const releaseHistoricalCommitteePath = "state/mainnet/" + ReleaseHistoricalCommitteeFile
 
@@ -77,12 +78,13 @@ func checkReleaseLayout(root string) error {
 		return err
 	}
 	if startupSnapshot != startupChecksum {
-		return errors.New("Mainnet release startup snapshot and SHA-256 sidecar must be a matched pair")
+		return errors.New("mainnet release startup snapshot and SHA-256 sidecar must be a matched pair")
 	}
 	return nil
 }
 
 func checkReleaseNetworkProfile(root string) error {
+	// #nosec G304 -- Fixed release-config basename inside the offline release root explicitly selected by its operator.
 	raw, err := os.ReadFile(filepath.Join(root, "config", "node.yaml"))
 	if err != nil {
 		return err
@@ -100,10 +102,10 @@ func checkReleaseNetworkProfile(root string) error {
 		return errors.New("invalid node.yaml in Mainnet release payload")
 	}
 	if profile.Network != "mainnet" {
-		return errors.New("Mainnet release node.yaml must set network: mainnet")
+		return errors.New("mainnet release node.yaml must set network: mainnet")
 	}
 	if profile.Consensus.RehearsalFinalityV2Height != 0 {
-		return errors.New("Mainnet releases cannot use rehearsal_finality_v2_height")
+		return errors.New("mainnet releases cannot use rehearsal_finality_v2_height")
 	}
 	path := filepath.Join(root, filepath.FromSlash(releaseHistoricalCommitteePath))
 	_, statErr := os.Lstat(path)
@@ -117,7 +119,7 @@ func checkReleaseNetworkProfile(root string) error {
 	}
 	if profile.DataDir != "state/mainnet" || migration != ReleaseHistoricalCommitteeFile ||
 		len(trust) != 1 || trust[0] != HistoricalCommitteeOperatorPublicKeyHex {
-		return errors.New("Mainnet release historical committee must configure the bundle-local data directory, statement and pinned operator")
+		return errors.New("mainnet release historical committee must configure the bundle-local data directory, statement and pinned operator")
 	}
 	if _, err := ReadReleaseHistoricalCommittee(root); err != nil {
 		return err
@@ -134,6 +136,7 @@ type ReleaseStatement struct {
 	PayloadSHA256 string `json:"payload_tree_sha256"`
 }
 
+// SignedRelease pairs a release manifest with the pinned operator's signature.
 type SignedRelease struct {
 	Release   ReleaseStatement `json:"release"`
 	Signature string           `json:"signature"`
@@ -185,6 +188,7 @@ func InspectRelease(root, revision string) (ReleaseStatement, error) {
 	return r, err
 }
 
+// SignRelease signs a release statement using the pinned operator's key.
 func SignRelease(r ReleaseStatement, key signer) (SignedRelease, error) {
 	return signRelease(r, key, BootstrapSignerPublicKeyHex)
 }
@@ -201,6 +205,8 @@ func signRelease(r ReleaseStatement, key signer, authority string) (SignedReleas
 	return SignedRelease{Release: r, Signature: hex.EncodeToString(sig)}, err
 }
 
+// Verify checks the operator signature, expected source revision and payload tree.
+// Release authenticity is separate from historical chain-state verification.
 func (s SignedRelease) Verify(root, expectedRevision string) error {
 	return s.verify(root, expectedRevision, BootstrapSignerPublicKeyHex)
 }

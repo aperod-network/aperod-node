@@ -25,6 +25,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -38,7 +39,7 @@ func buildCoinbaseBlockInStore(t *testing.T) (*store.DB, *core.Block) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	spendPt := crypto.Point32(pub)

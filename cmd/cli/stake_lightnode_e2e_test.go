@@ -130,10 +130,8 @@ func buildLightNodeE2EServer(t *testing.T, tipHeight int, keepBlocks uint64) (*h
 // rejection error rather than a warning — the commitment cannot be verified
 // before unbonding completes.
 func TestStakeLightNodeE2E_WarningWhenClose(t *testing.T) {
-	const (
-		keepBlocks uint64 = 50
-		tipHeight         = 46 // blocksLeft = 50−46 = 4 < PartialUnbondingBlocks → rejected
-	)
+	const keepBlocks uint64 = 50
+	const tipHeight = 46 // blocksLeft = 50−46 = 4 < PartialUnbondingBlocks → rejected
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
@@ -160,10 +158,8 @@ func TestStakeLightNodeE2E_WarningWhenClose(t *testing.T) {
 // blocksLeft=199995 >> PartialUnbondingBlocks(43200), so the server omits
 // blocks_until_pruned and the CLI must NOT error or print ⚠️ WARNING.
 func TestStakeLightNodeE2E_NoWarningWhenFar(t *testing.T) {
-	const (
-		keepBlocks uint64 = 200_000
-		tipHeight         = 5 // blocksLeft = 200 000−5 = 199 995 >> PartialUnbondingBlocks
-	)
+	const keepBlocks uint64 = 200_000
+	const tipHeight = 5 // blocksLeft = 200 000−5 = 199 995 >> PartialUnbondingBlocks
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
@@ -189,10 +185,8 @@ func TestStakeLightNodeE2E_NoWarningWhenFar(t *testing.T) {
 // a hard rejection when the UTXO's originating block is exactly at the pruning
 // boundary (tipHeight == pruneAt), i.e. blocks_until_pruned=0.
 func TestStakeLightNodeE2E_RejectsAtPruneBoundary(t *testing.T) {
-	const (
-		keepBlocks uint64 = 50
-		tipHeight         = 50 // == pruneAt → blocks_until_pruned=0 → rejected
-	)
+	const keepBlocks uint64 = 50
+	const tipHeight = 50 // == pruneAt → blocks_until_pruned=0 → rejected
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
@@ -211,10 +205,8 @@ func TestStakeLightNodeE2E_RejectsAtPruneBoundary(t *testing.T) {
 // a hard rejection when the UTXO's originating block is past the pruning
 // boundary (tipHeight > pruneAt), i.e. blocks_until_pruned=0.
 func TestStakeLightNodeE2E_RejectsPastPruneBoundary(t *testing.T) {
-	const (
-		keepBlocks uint64 = 50
-		tipHeight         = 52 // > pruneAt=50 → blocks_until_pruned=0 → rejected
-	)
+	const keepBlocks uint64 = 50
+	const tipHeight = 52 // > pruneAt=50 → blocks_until_pruned=0 → rejected
 
 	httpSrv, fix := buildLightNodeE2EServer(t, tipHeight, keepBlocks)
 
@@ -233,10 +225,8 @@ func TestStakeLightNodeE2E_RejectsPastPruneBoundary(t *testing.T) {
 // is deep inside the danger zone, archive mode never emits blocks_until_pruned,
 // so the CLI produces no warning against an archive node.
 func TestStakeLightNodeE2E_ArchiveModeNoWarning(t *testing.T) {
-	const (
-		keepBlocks uint64 = 50
-		tipHeight         = 48 // blocksLeft = 2 — would warn in light mode
-	)
+	const keepBlocks uint64 = 50
+	const tipHeight = 48 // blocksLeft = 2 — would warn in light mode
 
 	// Build server in archive mode (overriding the fixture).
 	fix := newStakeFixture(t)

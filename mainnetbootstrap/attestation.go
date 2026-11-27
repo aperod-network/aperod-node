@@ -19,9 +19,11 @@ import (
 
 	"github.com/aperod/aperod/core"
 	chaincrypto "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
+// Bootstrap schema and identity constants describe the operator-pinned Mainnet bundle.
 const (
 	SchemaVersion = "aperod-mainnet-bootstrap-v2"
 	Network       = "mainnet"
@@ -98,6 +100,7 @@ type signer interface {
 	Sign(chaincrypto.Hash32) ([]byte, error)
 }
 
+// Validate checks the statement against the pinned Mainnet authority and schema.
 func (s Statement) Validate() error {
 	return s.validateWithAuthority(BootstrapSignerPublicKeyHex)
 }
@@ -120,7 +123,7 @@ func (s Statement) validateWithAuthority(authority string) error {
 		"lpod_migration_witness_sha256":   s.LPoDMigrationWitnessSHA256,
 		"snapshot_tree_sha256":            s.SnapshotTreeSHA256,
 	} {
-		if !isLowerHex(value, 64) {
+		if !isLowerHash(value) {
 			return fmt.Errorf("%s must be 64 lowercase hex characters", name)
 		}
 	}
@@ -150,7 +153,7 @@ func (s Statement) validateWithAuthority(authority string) error {
 	if s.CheckpointHeight == 0 {
 		return errors.New("checkpoint height must be greater than zero")
 	}
-	if s.RegistrySHA256 != "" && !isLowerHex(s.RegistrySHA256, 64) {
+	if s.RegistrySHA256 != "" && !isLowerHash(s.RegistrySHA256) {
 		return errors.New("registry_sha256 must be 64 lowercase hex characters")
 	}
 	hasKeyImageDigest := s.KeyImageAnchorSHA256 != ""
@@ -160,8 +163,8 @@ func (s Statement) validateWithAuthority(authority string) error {
 		if !hasKeyImageDigest || !hasKeyImageHeight || !hasKeyImageHash {
 			return errors.New("key-image anchor digest, height, and block hash must be provided together")
 		}
-		if !isLowerHex(s.KeyImageAnchorSHA256, 64) ||
-			!isLowerHex(s.KeyImageAnchorBlockHash, 64) {
+		if !isLowerHash(s.KeyImageAnchorSHA256) ||
+			!isLowerHash(s.KeyImageAnchorBlockHash) {
 			return errors.New("key-image anchor digest and block hash must be 64 lowercase hex characters")
 		}
 		if s.KeyImageAnchorHeight >= s.CheckpointHeight {
@@ -171,8 +174,8 @@ func (s Statement) validateWithAuthority(authority string) error {
 	return nil
 }
 
-func isLowerHex(value string, length int) bool {
-	if len(value) != length || strings.ToLower(value) != value {
+func isLowerHash(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(value)
@@ -264,7 +267,7 @@ func (signed SignedStatement) verifyWithAuthority(authority string) error {
 		return err
 	}
 	if !publicKey.Verify(hash, signature) {
-		return errors.New("Mainnet bootstrap operator signature is invalid")
+		return errors.New("mainnet bootstrap operator signature is invalid")
 	}
 	return nil
 }
@@ -273,13 +276,25 @@ func (signed SignedStatement) verifyWithAuthority(authority string) error {
 // regular file under root in sorted order. Symlinks and special files fail
 // closed. The directory must be a closed snapshot and must not change while it
 // is measured.
-func SnapshotTreeSHA256(root string) (string, error) {
+func SnapshotTreeSHA256(root string) (digest string, resultErr error) {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return "", fmt.Errorf("inspect snapshot root: %w", err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("snapshot root must be a real directory")
+	}
+	snapshotRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer checkedio.CloseReadResult(snapshotRoot, &resultErr)
+	openedRoot, err := snapshotRoot.Stat(".")
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(info, openedRoot) {
+		return "", errors.New("snapshot root changed while opening")
 	}
 
 	type fileDigest struct {
@@ -288,11 +303,11 @@ func SnapshotTreeSHA256(root string) (string, error) {
 		hash [32]byte
 	}
 	var files []fileDigest
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = fs.WalkDir(snapshotRoot.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == root {
+		if path == "." {
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -304,16 +319,12 @@ func SnapshotTreeSHA256(root string) (string, error) {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("snapshot contains unsupported file %q", path)
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
+		rel := filepath.ToSlash(path)
 		if rel == "." || strings.ContainsAny(rel, "\r\n") {
 			return fmt.Errorf("snapshot has an invalid relative path %q", rel)
 		}
 
-		f, err := os.Open(path)
+		f, err := checkedio.OpenRootedRegular(snapshotRoot, path)
 		if err != nil {
 			return err
 		}
@@ -384,14 +395,14 @@ func InspectSnapshotDB(
 	dbPath, snapshotDigest string,
 	authorityFork *core.ValidatorAuthorityFork, authorityForkSHA256 string,
 	saleMigrationSHA256, lpodWitnessSHA256 string,
-) (Statement, error) {
-	if !isLowerHex(snapshotDigest, 64) {
+) (_ Statement, readCloseErr error) {
+	if !isLowerHash(snapshotDigest) {
 		return Statement{}, errors.New("snapshot tree digest must be 64 lowercase hex characters")
 	}
-	if authorityFork == nil || !isLowerHex(authorityForkSHA256, 64) {
+	if authorityFork == nil || !isLowerHash(authorityForkSHA256) {
 		return Statement{}, errors.New("pinned validator authority fork is required")
 	}
-	if !isLowerHex(saleMigrationSHA256, 64) || !isLowerHex(lpodWitnessSHA256, 64) {
+	if !isLowerHash(saleMigrationSHA256) || !isLowerHash(lpodWitnessSHA256) {
 		return Statement{}, errors.New("pinned sale and LPoD migration file digests are required")
 	}
 	if err := authorityFork.Validate(); err != nil {
@@ -401,7 +412,7 @@ func InspectSnapshotDB(
 	if err != nil {
 		return Statement{}, fmt.Errorf("open snapshot database read-only: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	tipHash, tipHeight, err := db.GetTip()
 	if err != nil {
@@ -605,6 +616,7 @@ func FileSHA256(path string) (string, error) {
 		info.Size() < 1 || info.Size() > 16<<20 {
 		return "", fmt.Errorf("artifact %q is not a regular file within size limits", path)
 	}
+	// #nosec G304 -- Offline operator-selected attestation document; strict decoding and signature verification establish its trust separately.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read artifact %q: %w", path, err)
@@ -618,7 +630,7 @@ func FileSHA256(path string) (string, error) {
 // authorization; its complete file hash must match the independently pinned
 // digest.
 func LoadPinnedAuthorityFork(path, expectedSHA256 string) (*core.ValidatorAuthorityFork, error) {
-	if !isLowerHex(expectedSHA256, 64) {
+	if !isLowerHash(expectedSHA256) {
 		return nil, errors.New("authority fork SHA-256 pin must be 64 lowercase hex characters")
 	}
 	info, err := os.Lstat(path)
@@ -631,6 +643,7 @@ func LoadPinnedAuthorityFork(path, expectedSHA256 string) (*core.ValidatorAuthor
 	if info.Size() < 1 || info.Size() > 65536 {
 		return nil, errors.New("authority fork file size is outside the allowed range")
 	}
+	// #nosec G304 -- Offline operator-selected bootstrap manifest, not a remotely supplied filesystem path.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read authority fork: %w", err)
@@ -690,7 +703,7 @@ func historicalHeaderHash(header *core.BlockHeader, includeOraclePrice, includeB
 	encoded.Write(u64[:])
 	encoded.Write(header.PrevHash[:])
 	encoded.Write(header.MerkleRoot[:])
-	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	encoded.Write(u64[:])
 	var u32 [4]byte
 	binary.LittleEndian.PutUint32(u32[:], header.Round)

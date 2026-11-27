@@ -17,15 +17,30 @@ import (
 	"github.com/aperod/aperod/lpod"
 )
 
-// Nominal public baseline before any validator-pool draw. Reconciliation uses
+// LPoDPublicAllocationNAPRO is the nominal public baseline before validator-pool draws.
+// Reconciliation uses
 // the attested REMAINING validator budget, not this fixed pre-issuance baseline.
 const LPoDPublicAllocationNAPRO uint64 = 7_000_000_000 * lpod.Unit
+
+// LPoDV2ActivationHeight identifies the historical V2 migration height.
 const LPoDV2ActivationHeight uint64 = 2_450_000
+
+// LPoDV2TrustAssumption identifies the explicitly attested V2 trust model.
 const LPoDV2TrustAssumption = "TRUST_ATTESTED_SNAPSHOT_AND_HISTORICAL_ALLOCATION"
+
+// LPoDV3TrustAssumption identifies the explicitly attested V3 trust model.
 const LPoDV3TrustAssumption = "TRUST_ATTESTED_NOMINAL_ALLOCATION_RECLASSIFICATION"
+
+// LPoDV3NominalAllocationMaxNAPRO caps the nominal eligible public allocation.
 const LPoDV3NominalAllocationMaxNAPRO uint64 = 7_000_000_000 * lpod.Unit
+
+// LPoDV3NominalCirculationMaxNAPRO preserves the nominal 10B APRO supply boundary.
 const LPoDV3NominalCirculationMaxNAPRO uint64 = 10_000_000_000 * lpod.Unit
+
+// LPoDV3NominalBasis names the nominal allocation and vesting accounting basis.
 const LPoDV3NominalBasis = "nominal_genesis_allocation_and_vesting"
+
+// LPoDV3EligibilityRule names the exclusions required for nominal reclassification.
 const LPoDV3EligibilityRule = "UNISSUED_UNLOCKED_PUBLIC_ALLOCATION_EXCLUDING_ISSUED_WALLET_UTXOS_VALIDATOR_BUDGET_DEVELOPER_VESTING_GUARDIAN_AND_ALL_OTHER_RESERVES"
 
 // This code does not coordinate a network upgrade. A signed witness does not
@@ -42,6 +57,8 @@ type LPoDOpening struct {
 	Blind       crypto.BlindFactor `json:"blind"`
 }
 
+// LPoDMigration carries the versioned allocation transition and its attestations.
+// Attestation trust does not itself prove a coordinated network rollout.
 type LPoDMigration struct {
 	Version uint8 `json:"version"`
 	// PositionLifecycleVersion is quorum-attested separately from the historical
@@ -91,6 +108,7 @@ type LPoDNominalSnapshot struct {
 	EligibilityRule                string `json:"eligibility_rule"`
 }
 
+// Root hashes the nominal snapshot metadata; it is not proof of spendable custody.
 func (s LPoDNominalSnapshot) Root() crypto.Hash32 {
 	raw, _ := json.Marshal(s)
 	return crypto.HashBytes([]byte("aperod/lpod/nominal-reclassification/snapshot/v3"), raw)
@@ -107,11 +125,13 @@ func (s LPoDNominalSnapshot) valid(eligible, validatorRemaining uint64, root cry
 		s.Root() == root
 }
 
+// LPoDAttestation records a validator's signature over a migration message.
 type LPoDAttestation struct {
 	Validator crypto.ValidatorPubKey `json:"validator"`
 	Signature []byte                 `json:"signature"`
 }
 
+// AttestationMessage derives the version-specific migration signing digest.
 func (m *LPoDMigration) AttestationMessage() crypto.Hash32 {
 	if m != nil && m.Version == 2 {
 		root := m.Root()
@@ -150,6 +170,7 @@ func (m *LPoDMigration) verifyAttestations() error {
 	return nil
 }
 
+// VerifyAuthorization checks the migration's versioned attestation envelope.
 func (m *LPoDMigration) VerifyAuthorization() error {
 	if m == nil || (m.Version != 1 && m.Version != 2 && m.Version != 3) || m.PositionLifecycleVersion != 1 || m.Height == 0 {
 		return fmt.Errorf("lpod: invalid reconciliation authorization")
@@ -291,6 +312,7 @@ func isZeroMigrationAuthority(p crypto.ValidatorPubKey) bool {
 	return true
 }
 
+// LPoDAllocation records the migration-bound funding ledger and remaining budgets.
 type LPoDAllocation struct {
 	Version                  uint8         `json:"version"`
 	PositionLifecycleVersion uint8         `json:"position_lifecycle_version"`
@@ -441,7 +463,8 @@ func ReconcileLPoD(m *LPoDMigration, read func(uint64) (*core.Block, error)) (ui
 	return issued, parent, nil
 }
 
-// Length-framed canonical full-body serialization is independently attested.
+// LPoDBodyRootStep extends the length-framed full-body commitment.
+// Its authentication requires an independent attestation.
 // Legacy transaction hashes are NOT unambiguous body commitments.
 func LPoDBodyRootStep(parent crypto.Hash32, b *core.Block) crypto.Hash32 {
 	raw, _ := json.Marshal(b)
@@ -499,7 +522,7 @@ func (d *DB) verifyLPoDV2Genesis(expected crypto.Hash32) error {
 	}
 	height, timestamp, round := make([]byte, 8), make([]byte, 8), make([]byte, 4)
 	binary.LittleEndian.PutUint64(height, h.Height)
-	binary.LittleEndian.PutUint64(timestamp, uint64(h.Timestamp))
+	binary.LittleEndian.PutUint64(timestamp, uint64(h.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	binary.LittleEndian.PutUint32(round, h.Round)
 	historical := crypto.HashBytes(height, h.PrevHash[:], h.MerkleRoot[:],
 		timestamp, round, h.ValidatorPub)

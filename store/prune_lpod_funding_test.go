@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -79,7 +80,7 @@ func TestPruneBlocksOlderThanPreservesLPoDFundingBodyAcrossRestart(t *testing.T)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	pruned, err = db.PruneBlocksOlderThan(5)
 	if err != nil {
@@ -147,7 +148,7 @@ func TestPruneBlocksOlderThanFailsClosedOnMalformedLPoDActivation(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer testutil.CleanupClose(t, db)
 			hash := putPruneTestBlock(t, db, 1)
 			before, err := db.GetRawBlock(hash)
 			if err != nil {

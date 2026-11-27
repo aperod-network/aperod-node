@@ -52,7 +52,7 @@ func TestStakeDeposit_E2E_ProducedBlock(t *testing.T) {
 	// This is a height=0 style admin/legacy mint UTXO, so we use the V1 blind.
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, err := crypto.DeterministicMintBlind(spendPub, stakeAmountNAPR)
+	burnBlind, err := crypto.LegacyMintBlind(spendPub, stakeAmountNAPR)
 	if err != nil {
 		t.Fatal("DeterministicMintBlind:", err)
 	}
@@ -240,7 +240,7 @@ func TestStakeDeposit_IncomingBlock_BadSig(t *testing.T) {
 	const stakeAmt uint64 = 10_000_000_000_000
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	commit, _ := crypto.Commit(stakeAmt, burnBlind)
 
 	var burnTxHash crypto.Hash32
@@ -293,7 +293,7 @@ func TestStakeDeposit_IncomingBlock_UTXONotFound(t *testing.T) {
 	const stakeAmt uint64 = 10_000_000_000_000
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	commit, _ := crypto.Commit(stakeAmt, burnBlind)
 
 	// UTXO set does NOT contain the burn UTXO — simulate missing UTXO.
@@ -349,7 +349,7 @@ func TestStakeDeposit_IncomingBlock_DuplicateBurnUTXO(t *testing.T) {
 	const stakeAmt uint64 = 10_000_000_000_000
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(staker1Pub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	commit, _ := crypto.Commit(stakeAmt, burnBlind)
 
 	var burnTxHash crypto.Hash32
@@ -407,7 +407,7 @@ func TestStakeDeposit_IncomingBlock_BelowMinimum(t *testing.T) {
 	const tinyStake uint64 = 1
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, tinyStake)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, tinyStake)
 	commit, _ := crypto.Commit(tinyStake, burnBlind)
 
 	var burnTxHash crypto.Hash32
@@ -460,7 +460,7 @@ func TestStakeDeposit_SelfProduced_InvalidStakeEvicted(t *testing.T) {
 	const stakeAmt uint64 = 10_000_000_000_000
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	// commit must match so the payload passes sig check; but UTXO won't be added.
 	commit, _ := crypto.Commit(stakeAmt, burnBlind)
 	_ = commit
@@ -539,11 +539,11 @@ func TestStakeDeposit_IncomingBlock_CommitMismatch(t *testing.T) {
 	copy(spendPub[:], []byte(stakerPub))
 
 	// Real blind used for the UTXO commitment.
-	realBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	realBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	realCommit, _ := crypto.Commit(stakeAmt, realBlind)
 
 	// Attacker claims a different blind — commitment mismatch.
-	fakeBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt+1) // different amount → different blind
+	fakeBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt+1) // different amount → different blind
 
 	var burnTxHash crypto.Hash32
 	for i := range burnTxHash {
@@ -597,7 +597,7 @@ func TestStakeDeposit_IncomingBlock_TopupBelowMinimum(t *testing.T) {
 
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, tinyTopup)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, tinyTopup)
 	commit, _ := crypto.Commit(tinyTopup, burnBlind)
 
 	var burnTxHash crypto.Hash32
@@ -677,7 +677,7 @@ func TestStakeDeposit_BadCommit_E2E_NeverReachesChain(t *testing.T) {
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(stakerPub))
 
-	realBlind, err := crypto.DeterministicMintBlind(spendPub, stakeAmountNAPR)
+	realBlind, err := crypto.LegacyMintBlind(spendPub, stakeAmountNAPR)
 	if err != nil {
 		t.Fatal("DeterministicMintBlind:", err)
 	}
@@ -806,7 +806,7 @@ func TestStakeDeposit_SelfProduced_ResumesAfterDuplicateEviction(t *testing.T) {
 	const stakeAmt uint64 = 10_000_000_000_000
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(staker1Pub))
-	burnBlind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	burnBlind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	commit, _ := crypto.Commit(stakeAmt, burnBlind)
 
 	var burnTxHash crypto.Hash32

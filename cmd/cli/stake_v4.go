@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,10 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/wallet"
-	"github.com/spf13/cobra"
 )
 
 type stakeV4Source struct {
@@ -153,7 +156,7 @@ func stakeNodeJSON(ctx context.Context, client *http.Client, endpoint, method, p
 	if err != nil {
 		return fmt.Errorf("local node request failed: %w", err)
 	}
-	defer res.Body.Close()
+	defer checkedio.LogClose(slog.Default(), res.Body, "local node response body")
 	if res.StatusCode != status {
 		return fmt.Errorf("local node rejected %s (HTTP %d)", method, res.StatusCode)
 	}
@@ -273,10 +276,12 @@ func runStakeV4(cmd *cobra.Command, _ []string) error {
 	if spent.Value == nil || *spent.Value {
 		return fmt.Errorf("collateral is spent or the node did not verify its spentness")
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Collateral: %x:%d, %d nAPRO; validator: %s\n", ref, index, amount, signer.Public().Hex())
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Collateral: %x:%d, %d nAPRO; validator: %s\n", ref, index, amount, signer.Public().Hex()); err != nil {
+		return fmt.Errorf("write stake preflight output; no deposit submitted: %w", err)
+	}
 	if !submit {
-		fmt.Fprintln(cmd.OutOrStdout(), "Preflight only. Local v4 activation checked; network-wide activation and inclusion are not verified.")
-		return nil
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "Preflight only. Local v4 activation checked; network-wide activation and inclusion are not verified.")
+		return err
 	}
 	// The operator may have spent time unlocking the wallet. Recheck before
 	// sending any signed stake payload to the node.
@@ -298,16 +303,26 @@ func runStakeV4(cmd *cobra.Command, _ []string) error {
 	if result.Status != "pending" || !strings.EqualFold(result.Hash, fmt.Sprintf("%x", tx.Hash())) {
 		return fmt.Errorf("deposit response did not confirm the expected pending transaction")
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Pending: %s. Verify canonical inclusion and active-set selection separately.\n", result.Hash)
+	reportPendingStake(cmd.OutOrStdout(), slog.Default(), result.Hash)
 	return nil
 }
 
-func unlockStakeWallet(path string) (*crypto.WalletKeyPair, error) {
+// reportPendingStake must not convert an accepted submission into a retryable
+// failure just because terminal output failed. The diagnostic retains its hash.
+func reportPendingStake(out io.Writer, log *slog.Logger, hash string) {
+	if _, err := fmt.Fprintf(out, "Pending: %s. Verify canonical inclusion and active-set selection separately.\n", hash); err != nil {
+		log.Warn("stake transaction is pending but terminal output failed; do not resubmit",
+			"tx_hash", hash, "err", err)
+	}
+}
+
+func unlockStakeWallet(path string) (_ *crypto.WalletKeyPair, readCloseErr error) {
+	// #nosec G304 -- Explicit local keystore selected by the CLI operator; its contents are separately decrypted and validated.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	ks, err := wallet.UnmarshalKeystoreReader(file)
 	if err != nil {
 		return nil, err
@@ -340,12 +355,13 @@ func unlockStakeWallet(path string) (*crypto.WalletKeyPair, error) {
 	return dk.Keys, nil
 }
 
-func loadStakeSigner(path string) (crypto.ValidatorPrivKey, error) {
+func loadStakeSigner(path string) (_ crypto.ValidatorPrivKey, readCloseErr error) {
+	// #nosec G304 -- Explicit local collateral input selected by the CLI operator.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err

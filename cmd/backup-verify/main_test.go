@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -543,12 +544,12 @@ func writeAnchorFixture(t *testing.T, genesis crypto.Hash32, anchors []anchor) s
 	return path
 }
 
-func jsonFile(path string, target any) error {
+func jsonFile(path string, target any) (readCloseErr error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)

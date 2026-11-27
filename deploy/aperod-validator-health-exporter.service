@@ -1,0 +1,40 @@
+[Unit]
+Description=Aperod Mainnet local validator health metrics exporter
+After=network-online.target aperod-node.service
+PartOf=aperod-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+Environment=APEROD_NODE_API_URL=http://127.0.0.1:18545
+Environment=APEROD_EXPORTER_LISTEN=127.0.0.1:18547
+Environment=APEROD_EXPORTER_POLL_SECONDS=15
+Environment=APEROD_EXPORTER_REQUEST_TIMEOUT_SECONDS=3
+Environment=APEROD_EXPORTER_MAX_SYNC_LAG_BLOCKS=100
+Environment=APEROD_VALIDATOR_MODE_FILE=/run/aperod-validator-health/validator-mode
+RuntimeDirectory=aperod-validator-health
+RuntimeDirectoryMode=0750
+ReadWritePaths=/run/aperod-validator-health
+ExecStartPre=+/usr/bin/python3 /usr/local/lib/aperod/validator_health_exporter.py --write-validator-mode-file /run/aperod-validator-health/validator-mode --node-config /var/lib/aperod/mainnet/node.yaml
+ExecStart=/usr/bin/python3 /usr/local/lib/aperod/validator_health_exporter.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=64M
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

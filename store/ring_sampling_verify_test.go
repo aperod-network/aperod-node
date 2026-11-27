@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/aperod/aperod/core"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/core"
 )
 
 func TestLPoDRingBatchMultiOutputCommitAndRewind(t *testing.T) {

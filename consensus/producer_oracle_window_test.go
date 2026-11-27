@@ -52,10 +52,10 @@ func TestProducedBlockUsesPeerOracleWindow(t *testing.T) {
 			cfg := Config{
 				MyKey: key, Validators: []crypto.ValidatorPubKey{pub},
 				RewardAddress:                       string(crypto.AddressFromKeys(crypto.MainnetByte, wallet)),
-				BlockRewardNAPR:                      DefaultBlockRewardNAPR,
-				SecurityHardeningActivationHeight:    1,
+				BlockRewardNAPR:                     DefaultBlockRewardNAPR,
+				SecurityHardeningActivationHeight:   1,
 				RewardAuthorizationActivationHeight: ^uint64(0),
-				RingCTV4ActivationHeight:             ^uint64(0),
+				RingCTV4ActivationHeight:            ^uint64(0),
 			}
 			engine := NewEngine(cfg, chain, core.NewMempool(core.DefaultMempoolConfig()),
 				slog.New(slog.NewTextHandler(io.Discard, nil)))

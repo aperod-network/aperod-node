@@ -25,7 +25,7 @@ func (s *Server) SetMainnetBootstrapIdentity(signed mainnetbootstrap.SignedState
 		return fmt.Errorf("verify Mainnet bootstrap identity: %w", err)
 	}
 	if s.blockStore == nil {
-		return fmt.Errorf("Mainnet API identity requires canonical storage")
+		return fmt.Errorf("mainnet API identity requires canonical storage")
 	}
 	statement := signed.Statement
 	identity := &mainnetGenesisIdentity{

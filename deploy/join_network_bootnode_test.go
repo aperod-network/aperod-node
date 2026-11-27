@@ -19,6 +19,7 @@
 package deploy_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/config"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // TestJoinNetworkBootnode shells out to test-join-network-bootnode.sh and
@@ -186,13 +188,18 @@ genesis:
 				t.Fatalf("create temp file: %v", err)
 			}
 			cfgPath := f.Name()
-			defer os.Remove(cfgPath)
-			defer os.Remove(cfgPath + ".tmp")
+			defer func(paths ...string) {
+				for _, path := range paths {
+					if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("remove temporary bootnode fixture: %v", err)
+					}
+				}
+			}(cfgPath+".tmp", cfgPath)
 
 			if _, err := f.WriteString(strings.TrimSpace(tc.yaml) + "\n"); err != nil {
 				t.Fatalf("write yaml: %v", err)
 			}
-			f.Close()
+			testutil.Close(t, f)
 
 			// Run the Python injection (mirrors join-network.sh step 5/7).
 			runPythonInject(t, cfgPath, bootnode)
@@ -340,7 +347,7 @@ python3 -m pip "$@"`,
 		t.Fatalf("create temp config: %v", err)
 	}
 	cfgPath := cfgFile.Name()
-	t.Cleanup(func() { os.Remove(cfgPath) })
+	t.Cleanup(func() { testutil.NoError(t, os.Remove(cfgPath)) })
 
 	// nestedYAML matches the config produced by install-validator.sh.
 	nestedYAML := strings.TrimSpace(`
@@ -364,7 +371,7 @@ genesis:
 	if _, err := cfgFile.WriteString(nestedYAML); err != nil {
 		t.Fatalf("write config yaml: %v", err)
 	}
-	cfgFile.Close()
+	testutil.Close(t, cfgFile)
 
 	dataDir := t.TempDir()
 	dropinDir := t.TempDir()

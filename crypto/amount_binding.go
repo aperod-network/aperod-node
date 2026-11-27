@@ -8,6 +8,7 @@ import (
 	"filippo.io/edwards25519"
 )
 
+// AmountCipherChunkCount is the fixed number of encrypted 16-bit amount chunks.
 const AmountCipherChunkCount = 4
 const amountCipherChunkBits = 16
 
@@ -260,10 +261,6 @@ func proveAmountLink(pub Point32, commitment Commitment, rPoint, ePoint Point32,
 	alphaValue.Set(edwards25519.NewScalar())
 	alphaRandom.Set(edwards25519.NewScalar())
 	return proof, nil
-}
-
-func verifyAmountLink(pub Point32, commitment Commitment, rPoint, ePoint Point32, proof AmountLinkProof) (bool, error) {
-	return verifyAmountLinkWithSubgroupPolicy(pub, commitment, rPoint, ePoint, proof, false)
 }
 
 func verifyAmountLinkWithSubgroupPolicy(pub Point32, commitment Commitment, rPoint, ePoint Point32, proof AmountLinkProof, strict bool) (bool, error) {

@@ -126,35 +126,35 @@ func TestMonitoringEntrypointUsesExistingVerifiedBinaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(script)
-if !strings.Contains(text, `exec bash "$SCRIPT_DIR/setup-monitoring-ovh.sh" "$@"`) {
-t.Fatal("compatibility entrypoint must delegate only to the adjacent checked-out script")
-}
-setup, err := os.ReadFile("setup-monitoring-ovh.sh")
-if err != nil {
-t.Fatal(err)
-}
-text += "\n" + string(setup)
+	if !strings.Contains(text, `exec bash "$SCRIPT_DIR/setup-monitoring-ovh.sh" "$@"`) {
+		t.Fatal("compatibility entrypoint must delegate only to the adjacent checked-out script")
+	}
+	setup, err := os.ReadFile("setup-monitoring-ovh.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text += "\n" + string(setup)
 	for _, required := range []string{
-"/usr/local/bin/prometheus --version",
-"/usr/local/bin/prometheus-alertmanager --version",
-"/usr/local/bin/prometheus-node-exporter --version",
-"The verified monitoring binary is missing",
-"Expected Prometheus 3.16.0",
-"Expected Alertmanager 0.35.1",
-"Expected node_exporter 1.13.1",
+		"/usr/local/bin/prometheus --version",
+		"/usr/local/bin/prometheus-alertmanager --version",
+		"/usr/local/bin/prometheus-node-exporter --version",
+		"The verified monitoring binary is missing",
+		"Expected Prometheus 3.16.0",
+		"Expected Alertmanager 0.35.1",
+		"Expected node_exporter 1.13.1",
 	} {
 		if !strings.Contains(text, required) {
-t.Errorf("monitoring setup is missing an existing-binary verification guard %q", required)
+			t.Errorf("monitoring setup is missing an existing-binary verification guard %q", required)
 		}
 	}
-// Archives are no longer downloaded by this entrypoint. Keep the absence of
-// extraction and mutable release URLs covered, not obsolete checksum strings.
-for _, forbidden := range []string{
-"tar -", "wget ", "/releases/download/", "/releases/latest/",
-"curl |", "| bash", "| sudo bash",
+	// Archives are no longer downloaded by this entrypoint. Keep the absence of
+	// extraction and mutable release URLs covered, not obsolete checksum strings.
+	for _, forbidden := range []string{
+		"tar -", "wget ", "/releases/download/", "/releases/latest/",
+		"curl |", "| bash", "| sudo bash",
 	} {
-if strings.Contains(text, forbidden) {
-t.Errorf("monitoring setup reintroduced an unchecked archive or remote script: %q", forbidden)
+		if strings.Contains(text, forbidden) {
+			t.Errorf("monitoring setup reintroduced an unchecked archive or remote script: %q", forbidden)
 		}
 	}
 	if strings.Contains(text, `-O /tmp/node_exporter.tar.gz`) ||

@@ -128,6 +128,8 @@ func (s *Server) StartDailyAuditWorker() {
 	if d.cancel != nil || d.stopped {
 		return
 	}
+	// #nosec G118 -- The worker owns the context beyond this call; shutdown
+	// transfers through d.cancel and StopDailyAuditWorker waits for d.done.
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel, d.done = cancel, make(chan struct{})
 	go func() {
@@ -144,6 +146,8 @@ func (s *Server) StartDailyAuditWorker() {
 		}
 	}()
 }
+
+// StopDailyAuditWorker cancels the worker and waits for its current batch.
 func (s *Server) StopDailyAuditWorker() {
 	d := &s.dailyJobs
 	d.mu.Lock()
@@ -228,7 +232,7 @@ func (s *Server) restLPoDDailyJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if j != nil && j.Date == date {
-missingRewards := j.State != "failed" && dailyRewardsNeedReplay(j.Progress)
+		missingRewards := j.State != "failed" && dailyRewardsNeedReplay(j.Progress)
 		invalidComplete := j.State == "complete" &&
 			(!s.dailyBindingValid(j.Progress) ||
 				!s.lpodFinalized(j.Progress.Certificate.Height, j.Progress.Certificate.BlockHash))
@@ -249,7 +253,9 @@ missingRewards := j.State != "failed" && dailyRewardsNeedReplay(j.Progress)
 		}
 		if len(j.Result) > 0 {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write(j.Result)
+			if _, err := w.Write(j.Result); err != nil {
+				s.log.Debug("write stored daily audit result failed", "err", err)
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, dailyPending(date, "queued for bounded background verification"))

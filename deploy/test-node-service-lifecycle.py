@@ -260,7 +260,14 @@ try:
     assert run("systemctl", "is-active", "aperod-restart-policy-fixture.service").stdout.strip() == "active"
     proof("systemd retries a transient failure and the fixture recovers")
     run("systemctl", "stop", "aperod-restart-policy-fixture.service")
-    run("systemctl", "reset-failed", "aperod-restart-policy-fixture.service")
+    reset = run("systemctl", "reset-failed", "aperod-restart-policy-fixture.service", ok=False)
+    if reset.returncode:
+        # A cleanly stopped, inactive unit may already have been garbage
+        # collected. That is not a failure to clear failed state; accept only
+        # this exact case, and still require the permanent-error proof below.
+        assert "not loaded" in reset.stdout, reset.stdout
+        state = run("systemctl", "is-active", "aperod-restart-policy-fixture.service", ok=False)
+        assert state.stdout.strip() in ("inactive", "unknown"), state.stdout
 
     run_policy_fixture(78, permanent_count, restart_prevent=True)
     time.sleep(2.5)
@@ -335,7 +342,7 @@ key.write_bytes(bytes([0x33]) * 32)
 key.chmod(0o600)
 run("chown", "-R", "aperod:aperod", data)
 config = Path("/etc/aperod/node.yaml")
-config.write_text("data_dir: /var/lib/aperod/data\nconsensus:\n"
+config.write_text("network: testnet\ndata_dir: /var/lib/aperod/data\nconsensus:\n"
                   "  validator_key: /var/lib/aperod/data/validator.key\n")
 ring_tool = Path("/usr/local/libexec/aperod-ring-index-maintenance")
 ring_policy = Path("/etc/aperod/ring-index-maintenance/policy.json")

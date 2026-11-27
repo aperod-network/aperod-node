@@ -48,6 +48,7 @@ func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, str
 			if err := validateP2PIdentityFile(keyPath, info); err != nil {
 				return nil, "", false, err
 			}
+			// #nosec G304 -- Local transport identity path from node startup; peers cannot select filesystem paths.
 			data, err := os.ReadFile(keyPath)
 			if err != nil {
 				return nil, "", false, fmt.Errorf("p2p/transport: read identity key %s: %w", keyPath, err)
@@ -81,7 +82,7 @@ func LoadOrSaveP2PIdentity(keyPath string, resetIdentity bool) (*tls.Config, str
 	if err != nil {
 		return nil, "", false, fmt.Errorf("p2p/transport: generate ed25519 identity key: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
 		return nil, "", false, fmt.Errorf("p2p/transport: create identity key dir: %w", err)
 	}
 	if err := os.WriteFile(keyPath, []byte(priv), 0600); err != nil {

@@ -55,7 +55,7 @@ func buildStakeServerFull(t *testing.T) stakeServerFixture {
 	// Derive the deterministic blind the same way the CLI does.
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, err := crypto.DeterministicMintBlind(spendPub, amount)
+	blind, err := crypto.LegacyMintBlind(spendPub, amount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}
@@ -155,7 +155,7 @@ func makeV2StakeExtra(t *testing.T) ([]byte, crypto.ValidatorPubKey) {
 
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, err := crypto.DeterministicMintBlind(spendPub, amount)
+	blind, err := crypto.LegacyMintBlind(spendPub, amount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestREST_StakeBroadcast_V4WalletCollateral(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	amount := uint64(core.MinStakeNAPR)
+	amount := core.MinStakeNAPR
 	blind := crypto.BlindFactor(crypto.ScalarFromUint64(17))
 	commit, err := crypto.Commit(amount, blind)
 	if err != nil {
@@ -396,7 +396,7 @@ func TestREST_StakeBroadcast_V4WalletCollateral(t *testing.T) {
 	if !ok || entry.StakeNAPR != amount || registry.IsActive(pub) {
 		t.Fatalf("expected locked stake pending activation; got %+v", entry)
 	}
-	registry.UpdateEpoch(uint64(core.EpochLength))
+	registry.UpdateEpoch(core.EpochLength)
 	if !registry.IsActive(pub) {
 		t.Fatal("eligible validator did not enter the next epoch's active set")
 	}

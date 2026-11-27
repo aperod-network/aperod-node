@@ -10,13 +10,14 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
 
 // Diagnostic only: report authenticated vote format separately from committee
 // evidence. A verified individual signature is not by itself finality.
-func runFinality(args []string) error {
+func runFinality(args []string) (readCloseErr error) {
 	flags := flag.NewFlagSet("finality", flag.ContinueOnError)
 	snapshot := flags.String("snapshot", "", "path to a closed, isolated chain.db copy (never the live database)")
 	forkFile := flags.String("authority-fork", "", "path to the pinned validator authority fork")
@@ -41,6 +42,7 @@ func runFinality(args []string) error {
 	if err != nil || !manifestInfo.Mode().IsRegular() || manifestInfo.Size() > 4096 {
 		return errors.New("completed checkpoint manifest is required; do not open the live database")
 	}
+	// #nosec G304 -- Operator-selected offline bootstrap manifest; signature and identity checks remain separate.
 	rawManifest, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return err
@@ -61,7 +63,7 @@ func runFinality(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 	readBlock := func(height uint64) (crypto.Hash32, core.Block, error) {
 		hash, ok, err := db.GetCanonicalHash(height)
 		var block core.Block
@@ -83,7 +85,7 @@ func runFinality(args []string) error {
 	}
 	if genesisHash != fork.Genesis || fmt.Sprintf("%x", genesis.Hash()) != *genesisHeader ||
 		genesis.Header.ValidatorPub.Hex() != mainnetbootstrap.GenesisSignerPublicKeyHex ||
-		!(genesis.Header.VerifySignature() || genesis.Header.ValidatorPub.Verify(genesisHash, genesis.Header.Signature)) {
+		(!genesis.Header.VerifySignature() && !genesis.Header.ValidatorPub.Verify(genesisHash, genesis.Header.Signature)) {
 		return errors.New("genesis does not match the independently pinned Mainnet identity")
 	}
 	tip, tipHeight, err := db.GetTip()

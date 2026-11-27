@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -39,7 +40,7 @@ func TestTxRateDispatch_FloodIsThrottled(t *testing.T) {
 	h, handler := startTxRateHost(t, 0) // throttle only, never ban
 
 	conn, _ := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
 	}
@@ -73,7 +74,7 @@ func TestTxRateDispatch_PersistentFlooderIsBanned(t *testing.T) {
 	h, handler := startTxRateHost(t, 5) // ban after 5 dropped txs
 
 	conn, peerIP := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
 	}
@@ -114,8 +115,8 @@ func TestTxRateDispatch_PersistentFlooderIsBanned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("host unreachable on reconnect: %v", err)
 	}
-	defer conn2.Close()
-	conn2.SetDeadline(time.Now().Add(time.Second))
+	defer testutil.CleanupClose(t, conn2)
+	testutil.NoError(t, conn2.SetDeadline(time.Now().Add(time.Second)))
 	_ = p2p.WriteMsg(conn2, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "tx-flooder-reconnect", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
@@ -145,7 +146,7 @@ func TestTxRateDispatch_DisabledByDefaultInTests(t *testing.T) {
 	defer h.Stop()
 
 	conn, _ := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
 	}

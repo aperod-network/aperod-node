@@ -9,6 +9,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -22,7 +23,7 @@ func TestBootstrapSnapshotMustMatchImportedDatabaseTip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sourceDB.Close()
+	defer testutil.CleanupClose(t, sourceDB)
 
 	tipHash := crypto.HashBytes([]byte("isolated-bootstrap-rehearsal-genesis"))
 	if err := sourceDB.PutRawBlock(tipHash, 0, []byte("synthetic genesis body")); err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
@@ -451,7 +452,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -489,7 +490,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	parent := &core.Block{Header: core.BlockHeader{Height: deadline - 1, Timestamp: 1, ValidatorPub: pub},
 		Txs: []core.Transaction{{Version: core.TxVersionLPoDPayout}, core.LPoDCheckpointTx(checkpoint.Digest())}}
 	parent.Header.MerkleRoot = core.MerkleRoot(parent.Txs)
-	parent.Header.Sign(priv)
+	testutil.NoError(t, parent.Header.Sign(priv))
 	raw, _ := json.Marshal(parent)
 	if err := db.PutRawBlock(parent.Hash(), parent.Header.Height, raw); err != nil {
 		t.Fatal(err)
@@ -538,7 +539,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	block := &core.Block{Header: core.BlockHeader{Height: deadline, PrevHash: parent.Hash(), Timestamp: request.Timestamp, ValidatorPub: pub},
 		Txs: []core.Transaction{payout, core.LPoDCheckpointTx(c.Digest()), *withdraw}}
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
-	block.Header.Sign(priv)
+	testutil.NoError(t, block.Header.Sign(priv))
 	raw, _ = json.Marshal(block)
 	if err := db.CommitRawBlockWithAVM(block.Hash(), deadline, raw, nil, crypto.Hash32{}, request); err != nil {
 		t.Fatal(err)

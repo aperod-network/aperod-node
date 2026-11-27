@@ -234,13 +234,6 @@ func msm(scalars []*edwards25519.Scalar, points []*edwards25519.Point) *edwards2
 	return new(edwards25519.Point).MultiScalarMult(scalars, points)
 }
 
-// pointSlice converts a fixed array of *Point to a slice.
-func pointSlice(arr [bpBits]*edwards25519.Point) []*edwards25519.Point {
-	s := make([]*edwards25519.Point, bpBits)
-	copy(s, arr[:])
-	return s
-}
-
 func pointSliceN(arr [bpBits]*edwards25519.Point, n int) []*edwards25519.Point {
 	s := make([]*edwards25519.Point, n)
 	copy(s, arr[:n])

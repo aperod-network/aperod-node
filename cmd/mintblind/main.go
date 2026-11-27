@@ -48,7 +48,7 @@ func main() {
 		}
 		napr := uint64(apro*1e8 + 0.5)
 
-		blind, err := crypto.DeterministicMintBlind(spendPub, napr)
+		blind, err := crypto.LegacyMintBlind(spendPub, napr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mint blind for %s: %v\n", arg, err)
 			os.Exit(1)

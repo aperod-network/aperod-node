@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -202,9 +203,17 @@ func (s *Server) restGuardianFund(w http.ResponseWriter, r *http.Request) {
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	if err := writeJSONResponse(w, code, v); err != nil {
+		// Headers or a body prefix may already have reached the client.
+		// Never retry an effectful request or attempt a second response here.
+		slog.Debug("write REST JSON response failed", "err", err)
+	}
+}
+
+func writeJSONResponse(w http.ResponseWriter, code int, v interface{}) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	return json.NewEncoder(w).Encode(v)
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
@@ -624,24 +633,6 @@ func prunedBlockDetailResponse(sb *store.StoredBlock) map[string]interface{} {
 		"burn_evidence_status":      "unavailable: block transactions pruned",
 		"pruned":                    true,
 	}
-}
-
-// resolveBlock looks up a block by height or hash; writes error and returns nil on failure.
-// Kept for RPC handlers that don't need store fallback.
-func (s *Server) resolveBlock(w http.ResponseWriter, id string) *core.Block {
-	if b := s.lookupBlockMem(id); b != nil {
-		return b
-	}
-	// Validate id syntax before returning 404 vs 400.
-	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
-		raw, hexErr := hex.DecodeString(id)
-		if hexErr != nil || len(raw) != 32 {
-			writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
-			return nil
-		}
-	}
-	writeJSONError(w, http.StatusNotFound, "block not found")
-	return nil
 }
 
 // BlockTxItem is one transaction summary inside a block.
@@ -1138,6 +1129,7 @@ func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr
 // Response:
 //   { "outputs": [...], "from_height": N, "next_height": M, "tip_height": T }
 
+// ScanOutput contains public output fields needed for client-side wallet scanning.
 type ScanOutput struct {
 	TxHash          string                `json:"tx_hash"`
 	OutIdx          int                   `json:"out_idx"`
@@ -1663,7 +1655,7 @@ func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 		txVersion = s.mempool.NextSpendVersion()
 	}
 	estimatedFeeNapro := core.ExportedEstimateFeeForVersion(txVersion, typicalInputs, typicalOutputs, baseFeePerByte)
-	txSizeBytes := int(estimatedFeeNapro / baseFeePerByte)
+	txSizeBytes := estimatedFeeNapro / baseFeePerByte
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"base_fee_per_byte":   baseFeePerByte,
@@ -1696,14 +1688,14 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 
 		// Count txs in last 10 blocks for TPS approximation
 		const window = 10
-		windowStart := int64(height) - window + 1
-		if windowStart < 0 {
-			windowStart = 0
+		windowStart := uint64(0)
+		if height >= window {
+			windowStart = height - window + 1
 		}
 		windowTxs := 0
 		windowBlocks := 0
-		for h2 := windowStart; h2 <= int64(height); h2++ {
-			b := s.chain.GetByHeight(uint64(h2))
+		for h2 := windowStart; ; h2++ {
+			b := s.chain.GetByHeight(h2)
 			if b != nil {
 				for txIdx, tx := range b.Txs {
 					// Skip block-reward coinbase (always index 0, no inputs).
@@ -1714,6 +1706,9 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 					windowTxs++
 				}
 				windowBlocks++
+			}
+			if h2 == height {
+				break
 			}
 		}
 		// Use cached counter — maintained atomically as blocks arrive.
@@ -1818,25 +1813,25 @@ type validatorResponse struct {
 
 // unbondingEntryResponse is one entry in a validator's partial unbonding queue.
 type unbondingEntryResponse struct {
-	AmountNAPR     uint64  `json:"amount_napr"`
-	AmountAPR      float64 `json:"amount_apr"`
-	EndBlock       uint64  `json:"end_block"`
-	EndEstimatedMs int64   `json:"end_estimated_ms"` // wall-clock estimate at 1 block/s
+	AmountNAPR     uint64      `json:"amount_napr"`
+	AmountAPR      float64     `json:"amount_apr"`
+	EndBlock       uint64      `json:"end_block"`
+	EndEstimatedMs json.Number `json:"end_estimated_ms"` // exact numeric wall-clock estimate at 1 block/s
 }
 
 func validatorToResponse(e core.ValidatorEntry, currentHeight uint64, genesis crypto.Hash32, activation uint64, active bool) validatorResponse {
 	queue := make([]unbondingEntryResponse, 0, len(e.UnbondingQueue))
 	nowMs := time.Now().UnixMilli()
 	for _, ub := range e.UnbondingQueue {
-		blocksLeft := int64(0)
+		blocksLeft := uint64(0)
 		if ub.EndBlock > currentHeight {
-			blocksLeft = int64(ub.EndBlock - currentHeight)
+			blocksLeft = ub.EndBlock - currentHeight
 		}
 		queue = append(queue, unbondingEntryResponse{
 			AmountNAPR:     ub.Amount,
 			AmountAPR:      float64(ub.Amount) / 1e8,
 			EndBlock:       ub.EndBlock,
-			EndEstimatedMs: nowMs + blocksLeft*1000, // 1 block ≈ 1 second
+			EndEstimatedMs: estimatedUnbondTime(nowMs, blocksLeft),
 		})
 	}
 	pending := e.PendingUnbondingNAPR()
@@ -3148,7 +3143,7 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
 	if mintHeight > 0 {
 		mintBlind, err = crypto.DeterministicMintBlindV2(spendPub, amountNAPR, mintHeight)
 	} else {
-		mintBlind, err = crypto.DeterministicMintBlind(spendPub, amountNAPR)
+		mintBlind, err = crypto.LegacyMintBlind(spendPub, amountNAPR)
 	}
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "compute mint blind: "+err.Error())
@@ -3390,9 +3385,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		height = tip.Header.Height
 	}
 	syncing := atomic.LoadInt32(&s.syncing) == 1
-	syncingHeight := atomic.LoadInt64(&s.syncingHeight)
-	tipHeight := atomic.LoadInt64(&s.tipHeight)
-	storeMissing := atomic.LoadInt64(&s.storeMissingBlocks)
+	syncingHeight := atomic.LoadUint64(&s.syncingHeight)
+	tipHeight := atomic.LoadUint64(&s.tipHeight)
+	storeMissing := atomic.LoadUint64(&s.storeMissingBlocks)
 	resp := map[string]interface{}{
 		"ok":                        true,
 		"height":                    height,
@@ -3404,8 +3399,8 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"startup_rescue":            atomic.LoadInt32(&s.startupRescue) == 1,
 		"phantom_ki_count":          atomic.LoadInt64(&s.phantomKICount),
 		"store_missing_blocks":      storeMissing,
-		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
-		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
+		"store_missing_first_block": atomic.LoadUint64(&s.storeMissingFirstBlock),
+		"store_missing_last_block":  atomic.LoadUint64(&s.storeMissingLastBlock),
 		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
 		"burn_address":              crypto.MainnetBurnAddress().String(),
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
@@ -42,7 +43,7 @@ func lpodMigrationFixture(t *testing.T) (*DB, *LPoDMigration, crypto.ValidatorPr
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +232,7 @@ func TestLPoDPayoutFailureIsAtomic(t *testing.T) {
 	}
 	b.Txs[0] = *full
 	b.Header.MerkleRoot = core.MerkleRoot(b.Txs)
-	b.Header.Sign(priv)
+	testutil.NoError(t, b.Header.Sign(priv))
 	raw, _ := json.Marshal(b)
 	if err := db.CommitRawBlockWithAVM(b.Hash(), 2, raw, []AVMWrite{{Key: []byte("bad"), Value: []byte("bad")}}, crypto.Hash32{}, r); err == nil {
 		t.Fatal("extra reward minted")
@@ -262,7 +263,7 @@ func TestLPoDReconciliationRejectsEqualHashHistoricalBodySubstitution(t *testing
 	}
 	raw, _ := json.Marshal(original)
 	var substituted core.Block
-	json.Unmarshal(raw, &substituted)
+	testutil.NoError(t, json.Unmarshal(raw, &substituted))
 	tx := &substituted.Txs[0]
 	output := tx.Outputs[0]
 	tx.Extra = append(tx.Extra, output.OneTimePub[:]...)
@@ -596,7 +597,7 @@ func TestLPoDTrustedNominalV3FundingRestartRollbackAndUTXOConservation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.CheckLPoDConfig(m); err != nil {
 		t.Fatalf("same v3 binding rejected after restart: %v", err)
 	}
@@ -626,7 +627,7 @@ func TestLPoDTrustedNominalV3FundingRestartRollbackAndUTXOConservation(t *testin
 
 func TestLPoDTrustedNominalV3FundingRequiresMatchingPool(t *testing.T) {
 	db, _, m, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.StoreStakingPoolRemaining(m.ValidatorRemaining - 1); err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +650,7 @@ func TestLPoDTrustedNominalV3FundingRequiresMatchingPool(t *testing.T) {
 
 func TestLPoDTrustedNominalV3RejectsConflictingMigrationBinding(t *testing.T) {
 	db, _, m, _, _ := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.put([]byte("lpod/activation/v2"), []byte("preexisting-v2-activation")); err != nil {
 		t.Fatal(err)
 	}
@@ -992,7 +993,7 @@ func TestLPoDTrustedCheckpointV2FundingRestartRollbackAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.CheckLPoDConfig(m); err != nil {
 		t.Fatalf("same authority/checkpoint binding rejected after restart: %v", err)
 	}
@@ -1031,7 +1032,7 @@ func TestLPoDTrustedCheckpointV2FundingRestartRollbackAndReplay(t *testing.T) {
 
 func TestLPoDV2FundingRequiresMatchingExistingValidatorPool(t *testing.T) {
 	db, _, m, priv, address := trustedLPoDV2FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.StoreStakingPoolRemaining(m.ValidatorRemaining - 1); err != nil {
 		t.Fatal(err)
 	}
@@ -1057,7 +1058,7 @@ func TestLPoDCheckpointRejectsOverflowingAllocationBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	tests := []struct {
 		name      string
 		validator uint64

@@ -14,6 +14,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -26,9 +27,9 @@ func connectAndHandshake(t *testing.T, addr string, fn func(conn net.Conn)) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
 
 	// Send ping to host (dialer goes first under the asymmetric protocol)
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
@@ -93,8 +94,8 @@ func TestDispatch_Ping(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
 		// After handshake, send another ping — host should respond with pong
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{NodeID: "X", Height: 0, Timestamp: time.Now().Unix()})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{NodeID: "X", Height: 0, Timestamp: time.Now().Unix()}))
 		msgType, _, _ := readMsgSkipGetHeaders(conn)
 		if msgType != p2p.MsgPong {
 			t.Errorf("expected pong after ping, got %v", msgType)
@@ -107,8 +108,8 @@ func TestDispatch_Ping(t *testing.T) {
 func TestDispatch_GetPeers(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{}))
 		msgType, _, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg after GetPeers: %v (may have closed)", err)
@@ -125,9 +126,9 @@ func TestDispatch_GetPeers(t *testing.T) {
 func TestDispatch_Peers(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 		peers := p2p.PeersMsg{Addrs: []string{"8.8.8.8:7777", "1.1.1.1:7777"}}
-		p2p.WriteMsg(conn, p2p.MsgPeers, peers)
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgPeers, peers))
 		time.Sleep(30 * time.Millisecond) // let host process
 	})
 }
@@ -192,7 +193,7 @@ func TestUnsafeStalePeerEntryIsNotDialed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer testutil.CleanupClose(t, listener)
 
 	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, &stubHandler{}, newTestLogger())
 	p2p.HostAddKnownPeer(host, listener.Addr().String())
@@ -203,7 +204,7 @@ func TestUnsafeStalePeerEntryIsNotDialed(t *testing.T) {
 	}
 	conn, err := listener.Accept()
 	if err == nil {
-		conn.Close()
+		testutil.Close(t, conn)
 		t.Fatal("dialed a loopback address injected into the peer list")
 	}
 	if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
@@ -215,10 +216,10 @@ func TestRejectedTransactionIsNotRelayed(t *testing.T) {
 	handler := &stubHandler{admitErr: errors.New("mempool rejected")}
 	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, handler, newTestLogger())
 	hostConn, relayConn := net.Pipe()
-	defer hostConn.Close()
-	defer relayConn.Close()
+	defer testutil.CleanupClose(t, hostConn)
+	defer testutil.CleanupClose(t, relayConn)
 	p2p.HostRegisterPeerForTest(host, "10.0.0.2:30303", hostConn)
-	relayConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	testutil.NoError(t, relayConn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
 
 	body, err := json.Marshal(core.Transaction{Fee: 1})
 	if err != nil {
@@ -236,8 +237,8 @@ func TestAcceptedTransactionCanBeRelayed(t *testing.T) {
 	handler := &stubHandler{}
 	host := p2p.NewHost(p2p.Config{MaxPeers: 10}, handler, newTestLogger())
 	hostConn, relayConn := net.Pipe()
-	defer hostConn.Close()
-	defer relayConn.Close()
+	defer testutil.CleanupClose(t, hostConn)
+	defer testutil.CleanupClose(t, relayConn)
 	p2p.HostRegisterPeerForTest(host, "10.0.0.2:30303", hostConn)
 
 	type result struct {
@@ -286,9 +287,9 @@ func TestDispatch_Block(t *testing.T) {
 	block := &core.Block{Header: hdr}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 		sb := p2p.BlockToMsg(block)
-		p2p.WriteMsg(conn, p2p.MsgBlock, sb)
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgBlock, sb))
 		time.Sleep(80 * time.Millisecond)
 	})
 
@@ -343,7 +344,7 @@ func TestDispatch_BlockUsesConsensusAcknowledgement(t *testing.T) {
 			block := &core.Block{Header: header}
 
 			connectAndHandshake(t, host.ListenAddr(), func(conn net.Conn) {
-				conn.SetDeadline(time.Now().Add(2 * time.Second))
+				testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 				if err := p2p.WriteMsg(conn, p2p.MsgBlock, p2p.BlockToMsg(block)); err != nil {
 					t.Fatalf("send block: %v", err)
 				}
@@ -367,8 +368,8 @@ func TestDispatch_Tx(t *testing.T) {
 	tx := core.Transaction{Version: core.TxVersionBase}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgTx, tx)
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgTx, tx))
 		time.Sleep(80 * time.Millisecond)
 	})
 
@@ -387,8 +388,8 @@ func TestDispatch_Vote(t *testing.T) {
 	vote := p2p.VoteMsg{BlockHash: bh, Height: 1, ValidatorPub: []byte{1}, Signature: []byte{2}}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgVote, vote)
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgVote, vote))
 		time.Sleep(80 * time.Millisecond)
 	})
 
@@ -402,8 +403,8 @@ func TestDispatch_Vote(t *testing.T) {
 func TestDispatch_GetHeaders(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 100})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 100}))
 		msgType, _, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg GetHeaders response: %v", err)
@@ -432,11 +433,15 @@ func TestDispatch_Headers_WithBlock(t *testing.T) {
 	}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgHeaders, headers)
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgHeaders, headers))
 		// Host will try to send MsgGetBlock back to us — read it
 		time.Sleep(50 * time.Millisecond)
-		p2p.ReadMsg(conn) // may or may not arrive in time
+		msgType, _, err := readMsgSkipGetHeaders(conn)
+		testutil.NoError(t, err)
+		if msgType != p2p.MsgGetBlock {
+			t.Errorf("headers follow-up=%v, want MsgGetBlock", msgType)
+		}
 	})
 }
 
@@ -447,8 +452,8 @@ func TestDispatch_GetBlock_NotFound(t *testing.T) {
 	var hash crypto.Hash32
 	hash[0] = 0xBB
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgGetBlock, p2p.GetBlockMsg{Hash: hash})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetBlock, p2p.GetBlockMsg{Hash: hash}))
 		time.Sleep(50 * time.Millisecond)
 	})
 }
@@ -458,9 +463,9 @@ func TestDispatch_GetBlock_NotFound(t *testing.T) {
 func TestDispatch_UnknownMsgType(t *testing.T) {
 	_, _, addr := startHost(t)
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 		// Write raw unknown message type 0xFF
-		p2p.WriteMsg(conn, p2p.MessageType(0xFF), map[string]string{"x": "y"})
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MessageType(0xFF), map[string]string{"x": "y"}))
 		time.Sleep(50 * time.Millisecond)
 		// Host logs a dispatch error but doesn't disconnect
 	})
@@ -487,12 +492,12 @@ func TestHandshake_BadPong(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 	// Asymmetric handshake: dialer must send MsgPing first.
 	// Send wrong type (MsgGetPeers instead of MsgPing) → host should drop conn.
-	p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{})
+	testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{}))
 	time.Sleep(100 * time.Millisecond)
 }
 

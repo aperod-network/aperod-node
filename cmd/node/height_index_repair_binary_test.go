@@ -45,6 +45,8 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 const heightIndexRepairMsg = "startup integrity: height index was missing/zeroed — repaired from tip pointer"
@@ -134,7 +136,7 @@ func startAperodNode(t *testing.T, bin, cfgPath string) *runningNode {
 	t.Helper()
 	cmd := exec.Command(bin, "--config", cfgPath)
 	cmd.Dir = filepath.Dir(cfgPath)
-	// Keep the child away from operator-scoped behaviour switches.
+	// Keep the child away from operator-scoped behavior switches.
 	env := []string{}
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, "SCHED_RESTART") || strings.HasPrefix(kv, "APEROD_") || strings.HasPrefix(kv, "GOMEMLIMIT=") {
@@ -305,15 +307,15 @@ func TestAperodNodeBinary_ZeroedHeightIndex_RepairsAtINFOAndContinues(t *testing
 	}
 	tipHash, tipHeight, err := db.GetTip()
 	if err != nil {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("GetTip: %v", err)
 	}
 	if tipHeight < 3 {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("tip height %d after run 1, want >= 3", tipHeight)
 	}
 	if blk, err := db.GetBlockByHeight(tipHeight); err != nil || blk == nil || blk.Hash != tipHash {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("pre-corruption h/%d not consistent with tip (blk=%v err=%v)", tipHeight, blk, err)
 	}
 	if err := db.Close(); err != nil {
@@ -326,7 +328,7 @@ func TestAperodNodeBinary_ZeroedHeightIndex_RepairsAtINFOAndContinues(t *testing
 	}
 	var zero crypto.Hash32
 	if err := raw.Put(rawHeightKey(tipHeight), zero[:], &opt.WriteOptions{Sync: true}); err != nil {
-		raw.Close()
+		testutil.Close(t, raw)
 		t.Fatalf("zero h/%d: %v", tipHeight, err)
 	}
 	if err := raw.Close(); err != nil {
@@ -339,10 +341,10 @@ func TestAperodNodeBinary_ZeroedHeightIndex_RepairsAtINFOAndContinues(t *testing
 		t.Fatalf("reopen store after corruption: %v", err)
 	}
 	if blk, err := db.GetBlockByHeight(tipHeight); err != nil || blk != nil {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("zeroed h/%d still resolves (blk=%v err=%v)", tipHeight, blk, err)
 	}
-	db.Close()
+	testutil.Close(t, db)
 
 	// ── Run 2: the real binary must self-heal at INFO and keep starting. ────
 	second := startAperodNode(t, bin, cfgPath)
@@ -397,7 +399,7 @@ func TestAperodNodeBinary_ZeroedHeightIndex_RepairsAtINFOAndContinues(t *testing
 	if err != nil {
 		t.Fatalf("open store after run 2: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	blk, err := db.GetBlockByHeight(tipHeight)
 	if err != nil || blk == nil {
 		t.Fatalf("h/%d still unresolved after repaired startup (blk=%v err=%v)", tipHeight, blk, err)

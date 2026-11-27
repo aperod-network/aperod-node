@@ -316,20 +316,20 @@ type Server struct {
 	// /api/v1/status can report how far along the replay is.
 	// syncingHeight is the last block processed; tipHeight is the total to load.
 	// Both are updated atomically by SetSyncProgress in cmd/node/main.go.
-	syncingHeight int64
-	tipHeight     int64
+	syncingHeight uint64
+	tipHeight     uint64
 
 	// storeMissingBlocks is the number of heights in the in-memory window
 	// (startLoad..tipHeight) for which no block was found in the LevelDB
 	// store at startup.  Set once by SetStoreMissingBlocks immediately after
 	// loadRecentBlocksFromStore; 0 means no gaps detected.
-	storeMissingBlocks int64
+	storeMissingBlocks uint64
 
 	// storeMissingFirstBlock and storeMissingLastBlock are the lowest and
 	// highest heights at which missing blocks were detected during the startup
 	// window scan. Both are 0 when storeMissingBlocks is 0.
-	storeMissingFirstBlock int64
-	storeMissingLastBlock  int64
+	storeMissingFirstBlock uint64
+	storeMissingLastBlock  uint64
 
 	// utxoStoreMissing is the number of unspent transaction outputs in the
 	// sampled tail of the chain whose u/ (UTXO store) LevelDB entry is absent.
@@ -550,6 +550,7 @@ func (s *Server) SetSnapshotFailed(err error) {
 	s.snapshotMu.Unlock()
 }
 
+// StartupSnapshotLoaded and the other outcome names describe startup recovery.
 const (
 	StartupSnapshotLoaded  = "snapshot_loaded"
 	StartupNoSnapshot      = "no_snapshot"
@@ -575,15 +576,15 @@ func (s *Server) SetStartupSnapshotOutcome(reason string, tipHeight uint64, err 
 // Call this periodically inside the startup scan loop so /api/v1/status can
 // report meaningful progress to operators while the node is still loading.
 func (s *Server) SetSyncProgress(current, tip uint64) {
-	atomic.StoreInt64(&s.syncingHeight, int64(current))
-	atomic.StoreInt64(&s.tipHeight, int64(tip))
+	atomic.StoreUint64(&s.syncingHeight, current)
+	atomic.StoreUint64(&s.tipHeight, tip)
 }
 
 // SyncingHeight returns the last block height processed by the startup scan.
-func (s *Server) SyncingHeight() int64 { return atomic.LoadInt64(&s.syncingHeight) }
+func (s *Server) SyncingHeight() uint64 { return atomic.LoadUint64(&s.syncingHeight) }
 
 // TipHeight returns the chain tip height that the startup scan is working toward.
-func (s *Server) TipHeight() int64 { return atomic.LoadInt64(&s.tipHeight) }
+func (s *Server) TipHeight() uint64 { return atomic.LoadUint64(&s.tipHeight) }
 
 // SetRegistry wires the live PoS validator registry so the API can serve
 // /api/v1/validators and include validator_count in network stats.
@@ -607,8 +608,8 @@ func (s *Server) validatorKeySnapshot() *crypto.LockedValidatorKey {
 	return s.myKey
 }
 
-// APIKeyConfig optionally sets the required API key for write operations.
-// Call before Start(). Empty string disables key enforcement (dev mode).
+// SetAPIKey sets the credential checked by privileged operations.
+// Call before Start. An empty key does not authorize privileged requests.
 func (s *Server) SetAPIKey(key string) { s.apiKey = key }
 
 // SetAllowedOrigins configures the CORS origin whitelist.
@@ -989,9 +990,15 @@ func (s *Server) TimestampRejectedCount() int64 {
 // in-memory window that had no block in the LevelDB store.
 // Call once after loadRecentBlocksFromStore completes in cmd/node.
 // 0 means no gaps were detected.
-func (s *Server) SetStoreMissingBlocks(n int64)     { atomic.StoreInt64(&s.storeMissingBlocks, n) }
-func (s *Server) SetStoreMissingFirstBlock(n int64) { atomic.StoreInt64(&s.storeMissingFirstBlock, n) }
-func (s *Server) SetStoreMissingLastBlock(n int64)  { atomic.StoreInt64(&s.storeMissingLastBlock, n) }
+func (s *Server) SetStoreMissingBlocks(n uint64) { atomic.StoreUint64(&s.storeMissingBlocks, n) }
+
+// SetStoreMissingFirstBlock records the first missing height in the startup window.
+func (s *Server) SetStoreMissingFirstBlock(n uint64) {
+	atomic.StoreUint64(&s.storeMissingFirstBlock, n)
+}
+
+// SetStoreMissingLastBlock records the last missing height in the startup window.
+func (s *Server) SetStoreMissingLastBlock(n uint64) { atomic.StoreUint64(&s.storeMissingLastBlock, n) }
 
 // SetUTXOStoreMissing records the number of unspent outputs in the sampled
 // chain tail whose u/ LevelDB entry was absent at startup.  Call once from
@@ -1133,7 +1140,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		resp["stale_bootnodes"] = stale
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		s.log.Debug("write health response failed", "err", err)
+	}
 }
 
 // handleMetrics exposes a minimal Prometheus text-format snapshot of node
@@ -1148,65 +1157,33 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
-	fmt.Fprintf(w, "# HELP aperod_chain_height Current chain tip height.\n")
-	fmt.Fprintf(w, "# TYPE aperod_chain_height gauge\n")
-	fmt.Fprintf(w, "aperod_chain_height %d\n", s.chain.Height())
-
-	fmt.Fprintf(w, "# HELP aperod_mempool_size Number of transactions currently in the mempool.\n")
-	fmt.Fprintf(w, "# TYPE aperod_mempool_size gauge\n")
-	fmt.Fprintf(w, "aperod_mempool_size %d\n", s.mempool.Count())
-
-	fmt.Fprintf(w, "# HELP aperod_mempool_bytes Total byte size of all transactions currently in the mempool.\n")
-	fmt.Fprintf(w, "# TYPE aperod_mempool_bytes gauge\n")
-	fmt.Fprintf(w, "aperod_mempool_bytes %d\n", s.mempool.TotalBytes())
-
-	fmt.Fprintf(w, "# HELP aperod_mempool_evictions_total Transactions evicted from the mempool since process start (TTL + capacity pressure).\n")
-	fmt.Fprintf(w, "# TYPE aperod_mempool_evictions_total counter\n")
-	fmt.Fprintf(w, "aperod_mempool_evictions_total %d\n", s.mempool.EvictionsTotal())
-
-	fmt.Fprintf(w, "# HELP aperod_utxo_count Number of unspent outputs tracked in memory.\n")
-	fmt.Fprintf(w, "# TYPE aperod_utxo_count gauge\n")
-	fmt.Fprintf(w, "aperod_utxo_count %d\n", s.utxos.Count())
-
-	fmt.Fprintf(w, "# HELP aperod_peer_count Number of connected P2P peers.\n")
-	fmt.Fprintf(w, "# TYPE aperod_peer_count gauge\n")
-	fmt.Fprintf(w, "aperod_peer_count %d\n", state.PeerCount)
-
-	fmt.Fprintf(w, "# HELP aperod_validator_count_active Number of currently active PoA/PoS validators.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_count_active gauge\n")
-	fmt.Fprintf(w, "aperod_validator_count_active %d\n", activeValidators)
-
-	fmt.Fprintf(w, "# HELP aperod_validator_count_total Total number of registered PoA/PoS validators.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_count_total gauge\n")
-	fmt.Fprintf(w, "aperod_validator_count_total %d\n", totalValidators)
-
-	fmt.Fprintf(w, "# HELP aperod_validator_local_key_loaded Whether this node has a validator signing key loaded.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_local_key_loaded gauge\n")
-	fmt.Fprintf(w, "aperod_validator_local_key_loaded %d\n", boolMetric(state.KeyLoaded))
-
-	fmt.Fprintf(w, "# HELP aperod_validator_local_active Whether this node's loaded validator identity is active in the on-chain registry.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_local_active gauge\n")
-	fmt.Fprintf(w, "aperod_validator_local_active %d\n", boolMetric(state.RegistryActive))
-
-	fmt.Fprintf(w, "# HELP aperod_validator_p2p_connected Whether this validator node has at least one established P2P peer.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_p2p_connected gauge\n")
-	fmt.Fprintf(w, "aperod_validator_p2p_connected %d\n", boolMetric(state.P2PConnected))
-
-	fmt.Fprintf(w, "# HELP aperod_validator_online Whether the local validator key is active on-chain and this node has an established P2P peer.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_online gauge\n")
-	fmt.Fprintf(w, "aperod_validator_online %d\n", boolMetric(state.Online))
-
-	fmt.Fprintf(w, "# HELP aperod_validator_sync_healthy Whether an online validator has a peer within 100 blocks of its local tip.\n")
-	fmt.Fprintf(w, "# TYPE aperod_validator_sync_healthy gauge\n")
-	fmt.Fprintf(w, "aperod_validator_sync_healthy %d\n", boolMetric(state.SyncHealthy))
-
-	fmt.Fprintf(w, "# HELP aperod_peer_sync_lag_blocks_max Maximum reported block-height lag among connected peers; zero when no peer is behind.\n")
-	fmt.Fprintf(w, "# TYPE aperod_peer_sync_lag_blocks_max gauge\n")
-	fmt.Fprintf(w, "aperod_peer_sync_lag_blocks_max %d\n", state.MaxPeerLagBlocks)
-
-	fmt.Fprintf(w, "# HELP aperod_up Whether the API server is reachable (always 1 when scraped successfully).\n")
-	fmt.Fprintf(w, "# TYPE aperod_up gauge\n")
-	fmt.Fprintf(w, "aperod_up 1\n")
+	metrics := []struct {
+		name, help, kind string
+		value            interface{}
+	}{
+		{"aperod_chain_height", "Current chain tip height.", "gauge", s.chain.Height()},
+		{"aperod_mempool_size", "Number of transactions currently in the mempool.", "gauge", s.mempool.Count()},
+		{"aperod_mempool_bytes", "Total byte size of all transactions currently in the mempool.", "gauge", s.mempool.TotalBytes()},
+		{"aperod_mempool_evictions_total", "Transactions evicted from the mempool since process start (TTL + capacity pressure).", "counter", s.mempool.EvictionsTotal()},
+		{"aperod_utxo_count", "Number of unspent outputs tracked in memory.", "gauge", s.utxos.Count()},
+		{"aperod_peer_count", "Number of connected P2P peers.", "gauge", state.PeerCount},
+		{"aperod_validator_count_active", "Number of currently active PoA/PoS validators.", "gauge", activeValidators},
+		{"aperod_validator_count_total", "Total number of registered PoA/PoS validators.", "gauge", totalValidators},
+		{"aperod_validator_local_key_loaded", "Whether this node has a validator signing key loaded.", "gauge", boolMetric(state.KeyLoaded)},
+		{"aperod_validator_local_active", "Whether this node's loaded validator identity is active in the on-chain registry.", "gauge", boolMetric(state.RegistryActive)},
+		{"aperod_validator_p2p_connected", "Whether this validator node has at least one established P2P peer.", "gauge", boolMetric(state.P2PConnected)},
+		{"aperod_validator_online", "Whether the local validator key is active on-chain and this node has an established P2P peer.", "gauge", boolMetric(state.Online)},
+		{"aperod_validator_sync_healthy", "Whether an online validator has a peer within 100 blocks of its local tip.", "gauge", boolMetric(state.SyncHealthy)},
+		{"aperod_peer_sync_lag_blocks_max", "Maximum reported block-height lag among connected peers; zero when no peer is behind.", "gauge", state.MaxPeerLagBlocks},
+		{"aperod_up", "Whether the API server is reachable (always 1 when scraped successfully).", "gauge", 1},
+	}
+	for _, metric := range metrics {
+		if _, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n",
+			metric.name, metric.help, metric.name, metric.kind, metric.name, metric.value); err != nil {
+			s.log.Debug("write metrics response failed", "err", err)
+			return
+		}
+	}
 }
 
 const peerSyncHealthyMaxLagBlocks = uint64(100)
@@ -1329,11 +1306,13 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, req.ID, errCodeInternal, err.Error())
 		return
 	}
-	json.NewEncoder(w).Encode(rpcResponse{
+	if err := json.NewEncoder(w).Encode(rpcResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result:  result,
-	})
+	}); err != nil {
+		s.log.Debug("write RPC result failed", "err", err)
+	}
 }
 
 const maxPrivilegedRequestBody int64 = 1 << 20
@@ -1700,10 +1679,11 @@ func (s *Server) aprGetBalance(params json.RawMessage) (interface{}, error) {
 		return nil, fmt.Errorf("invalid address: %w", err)
 	}
 
-	// If view key provided, scan for balance; otherwise report 0 (privacy model)
+	// This public RPC does not implement private wallet scanning. Do not
+	// misrepresent an unsupported scan as a measured zero balance.
 	balance := uint64(0)
 	if args.ViewKey != "" {
-		// TODO Phase 2: instantiate WalletScanner and scan chain
+		return nil, fmt.Errorf("view-key balance scanning is not supported by apr_getBalance")
 	}
 
 	return map[string]interface{}{
@@ -1853,9 +1833,11 @@ func (s *Server) aprEstimateFee(params json.RawMessage) (interface{}, error) {
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 func (s *Server) writeError(w http.ResponseWriter, id interface{}, code int, msg string) {
-	json.NewEncoder(w).Encode(rpcResponse{
+	if err := json.NewEncoder(w).Encode(rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error:   &rpcError{Code: code, Message: msg},
-	})
+	}); err != nil {
+		s.log.Debug("write RPC error response failed", "err", err)
+	}
 }

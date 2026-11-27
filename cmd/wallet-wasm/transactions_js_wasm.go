@@ -124,9 +124,9 @@ func ownedOutputs(r wasmRequest, keys *wallet.DerivedKeys) ([]core.OwnedUTXO, er
 					x.TxVersion == uint8(core.TxVersionAVMAmountBinding) {
 					return nil, fmt.Errorf("outputs[%d] is missing its required amount binding", i)
 				}
-			if x.TxVersion == 0 && enc == ([8]byte{}) {
-				return nil, fmt.Errorf("outputs[%d] is missing transaction-version metadata for a zero legacy amount", i)
-			}
+				if x.TxVersion == 0 && enc == ([8]byte{}) {
+					return nil, fmt.Errorf("outputs[%d] is missing transaction-version metadata for a zero legacy amount", i)
+				}
 				amount = core.DecryptAmount(enc, found)
 			}
 			blind, err = crypto.DeterministicPaymentBlind(hs, amount)

@@ -17,6 +17,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -229,7 +230,7 @@ func extractCheckpointArchive(t *testing.T, r io.Reader, destination string) {
 	if err != nil {
 		t.Fatalf("gzip.NewReader: %v", err)
 	}
-	defer gzr.Close()
+	defer testutil.CleanupClose(t, gzr)
 	tr := tar.NewReader(gzr)
 	for {
 		hdr, err := tr.Next()
@@ -249,7 +250,8 @@ func extractCheckpointArchive(t *testing.T, r io.Reader, destination string) {
 			}
 			continue
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		// Keep accepting the historical NUL regular-file flag.
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != 0 {
 			t.Fatalf("unsupported checkpoint archive member type %d at %q", hdr.Typeflag, hdr.Name)
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
@@ -281,7 +283,7 @@ func TestChainDBExport_ProducesPointInTimeLogicalCheckpoint(t *testing.T) {
 		t.Skipf("logical checkpoint needs more than 5 GiB plus working headroom; currently %d bytes free", freeBytes)
 	}
 	db, tipHash := writeExportFixture(t, dir)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	srv := buildExportServer(t, dir, "")
 	srv.SetStore(db)

@@ -9,6 +9,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
@@ -19,7 +20,7 @@ func TestProductionV3CompatibilityVectors(t *testing.T) {
 	crand.Reader = &productionV3Entropy{}
 	t.Cleanup(func() { crand.Reader = old })
 	db, m, priv, address := productionV3Fixture(t)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	if err := db.CheckLPoDConfig(m); err != nil {
 		t.Fatal(err)
 	}

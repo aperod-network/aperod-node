@@ -16,6 +16,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // makeMinimalBlock creates a lightweight block for chain eviction tests.
@@ -273,7 +274,7 @@ func TestChain_MemoryCapTipIntact(t *testing.T) {
 
 	c := core.NewChain()
 	genesis := makeBlock(t, priv, pub, 0, crypto.Hash32{})
-	c.SetGenesis(genesis)
+	testutil.NoError(t, c.SetGenesis(genesis))
 
 	prev := genesis
 	for h := uint64(1); h <= uint64(total); h++ {

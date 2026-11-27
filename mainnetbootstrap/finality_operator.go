@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -42,6 +43,8 @@ func HistoricalCommitteeDraft() store.FinalityCommitteeMigration {
 	}
 }
 
+// VerifyHistoricalCommitteeOperator checks the fixed migration's pinned operator attestation.
+// This is operator trust, not independently recovered historical committee evidence.
 func VerifyHistoricalCommitteeOperator(m store.FinalityCommitteeMigration, pinned []crypto.ValidatorPubKey) error {
 	draft := HistoricalCommitteeDraft()
 	expected, err := draft.SigningMessage()
@@ -63,7 +66,7 @@ func VerifyHistoricalCommitteeOperator(m store.FinalityCommitteeMigration, pinne
 
 // ReadReleaseHistoricalCommittee authenticates the optional statement at its
 // fixed bundle path. Callers must still bind it to the closed chain snapshot.
-func ReadReleaseHistoricalCommittee(root string) (store.FinalityCommitteeMigration, error) {
+func ReadReleaseHistoricalCommittee(root string) (_ store.FinalityCommitteeMigration, readCloseErr error) {
 	var statement store.FinalityCommitteeMigration
 	path := filepath.Join(root, filepath.FromSlash(releaseHistoricalCommitteePath))
 	info, err := os.Lstat(path)
@@ -74,11 +77,12 @@ func ReadReleaseHistoricalCommittee(root string) (store.FinalityCommitteeMigrati
 	if !info.Mode().IsRegular() || info.Size() > maxStatement {
 		return statement, fmt.Errorf("historical committee statement must be a bounded regular file")
 	}
+	// #nosec G304 -- Offline operator-selected finality evidence; bounded decode and cryptographic verification remain mandatory.
 	file, err := os.Open(path)
 	if err != nil {
 		return statement, err
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	dec := json.NewDecoder(io.LimitReader(file, maxStatement+1))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&statement); err != nil {

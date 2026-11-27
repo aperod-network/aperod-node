@@ -344,7 +344,10 @@ func verifyIdentityFinalityEvidence(
 		committeeKeys = append(committeeKeys, key)
 	}
 
-	required := int(uint64(len(committee.Validators))*uint64(committee.BFTThresholdPPM)/1_000_000) + 1
+	required, err := core.RequiredFinalityVotes(len(committee.Validators), committee.BFTThresholdPPM)
+	if err != nil {
+		return identityFinalityEvidence{}, err
+	}
 	if len(certificate.Votes) > len(committee.Validators) {
 		return identityFinalityEvidence{}, fmt.Errorf("certificate has more votes than committee members")
 	}

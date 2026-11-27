@@ -120,7 +120,7 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 			out = tx.Outputs[u.OutIdx]
 		} else if s.blockStore != nil {
 			// Fallback 3: UTXO store — written for every output in every block.
-			su, suErr := s.blockStore.GetUTXO(txHash, uint32(u.OutIdx))
+			su, suErr := s.blockStore.GetUTXO(txHash, u.OutIdx)
 			if suErr != nil {
 				return nil, fmt.Errorf("utxo store fallback for tx %s[%d]: %w",
 					u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, suErr)
@@ -185,7 +185,7 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 						blind = blindV2
 					} else {
 						// Fall back to V1 for pre-migration UTXOs.
-						blindV1, errV1 := crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+						blindV1, errV1 := crypto.LegacyMintBlind(spendPub, u.AmountNAPR)
 						if errV1 != nil {
 							return nil, fmt.Errorf("deterministic mint blind v1 for %s[%d]: %w",
 								u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, errV1)
@@ -194,7 +194,7 @@ func (s *Server) aprWalletBatchSend(rawParams json.RawMessage) (interface{}, err
 					}
 				} else {
 					// Legacy/admin mint (height == 0): always use V1.
-					blind, err = crypto.DeterministicMintBlind(spendPub, u.AmountNAPR)
+					blind, err = crypto.LegacyMintBlind(spendPub, u.AmountNAPR)
 					if err != nil {
 						return nil, fmt.Errorf("deterministic blind for %s[%d]: %w",
 							u.TxHash[:min(16, len(u.TxHash))], u.OutIdx, err)

@@ -39,7 +39,7 @@ func TestCheckpointRegistryEvidenceBindsStakeAndRejectsInvalidRecords(t *testing
 		RegistryAfter: &core.RegistrySnapshot{Validators: map[string]*core.ValidatorEntry{pub.Hex(): entry}},
 	}
 	first, err := checkpointRegistryDigest(s, tip, &audit)
-	if err != nil || !isLowerHex(first, 64) {
+	if err != nil || !isLowerHash(first) {
 		t.Fatalf("valid registry rejected: %q %v", first, err)
 	}
 	s.CheckpointIndexHash = hex.EncodeToString(tip[:])
@@ -354,7 +354,7 @@ func TestFileSHA256RejectsSymlinksAndEmptyFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest, err := FileSHA256(regular)
-	if err != nil || !isLowerHex(digest, 64) {
+	if err != nil || !isLowerHash(digest) {
 		t.Fatalf("regular file digest=%q err=%v", digest, err)
 	}
 	empty := filepath.Join(dir, "empty.json")

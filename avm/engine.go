@@ -5,17 +5,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
 
+// ErrOutOfGas and ErrReadOnlyWrite identify gas and read-only execution failures.
 var (
 	ErrOutOfGas      = errors.New("avm: out of gas")
 	ErrReadOnlyWrite = errors.New("avm: write attempted in read-only execution")
 )
 
+// GasStateRead and the other host-call charges are measured in AVM gas units.
 const (
 	GasStateRead   uint64 = 25
 	GasStateWrite  uint64 = 100
@@ -23,6 +26,7 @@ const (
 	GasOutputWrite uint64 = 10
 )
 
+// ExecutionRequest supplies contract code, input, gas limits and state access.
 type ExecutionRequest struct {
 	ContractID [32]byte
 	Code       []byte
@@ -33,11 +37,13 @@ type ExecutionRequest struct {
 	AccessList []Access
 }
 
+// Access describes a state key and whether the call may write to it.
 type Access struct {
 	Key   []byte
 	Write bool
 }
 
+// ExecutionResult reports gas, return bytes and the number of state writes.
 type ExecutionResult struct {
 	GasUsed      uint64
 	ReturnData   []byte
@@ -54,6 +60,7 @@ type Engine struct {
 	mu    sync.Mutex
 }
 
+// NewEngine creates an execution engine, using memory storage when store is nil.
 func NewEngine(store Store) *Engine {
 	if store == nil {
 		store = NewMemoryStore()
@@ -61,6 +68,7 @@ func NewEngine(store Store) *Engine {
 	return &Engine{store: store, cache: wazero.NewCompilationCache()}
 }
 
+// Close releases the engine's shared compilation cache.
 func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -72,6 +80,8 @@ func (e *Engine) Close(ctx context.Context) error {
 	return err
 }
 
+// Execute runs a contract request using the historical nesting policy.
+// Admission callers should use ExecuteBounded for the local nesting limit.
 func (e *Engine) Execute(ctx context.Context, request ExecutionRequest) (ExecutionResult, error) {
 	return e.executeWithNestingLimit(ctx, request, 0)
 }
@@ -133,7 +143,7 @@ func (e *Engine) executeWithNestingLimit(
 		WithCloseOnContextDone(true).
 		WithDebugInfoEnabled(false)
 	runtime := wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
-	defer runtime.Close(ctx)
+	defer closeRuntimeResource(ctx, runtime, "runtime", slog.Default())
 
 	if err := instantiateHost(ctx, runtime, session); err != nil {
 		return result, fmt.Errorf("avm: instantiate host ABI: %w", err)
@@ -142,14 +152,14 @@ func (e *Engine) executeWithNestingLimit(
 	if err != nil {
 		return result, fmt.Errorf("avm: compile module: %w", err)
 	}
-	defer compiled.Close(ctx)
+	defer closeRuntimeResource(ctx, compiled, "compiled module", slog.Default())
 
 	instance, err := runtime.InstantiateModule(ctx, compiled,
 		wazero.NewModuleConfig().WithName("contract").WithStartFunctions())
 	if err != nil {
 		return result, fmt.Errorf("avm: instantiate module: %w", err)
 	}
-	defer instance.Close(ctx)
+	defer closeRuntimeResource(ctx, instance, "module instance", slog.Default())
 
 	entry := instance.ExportedFunction(request.Entry)
 	if entry == nil {
@@ -237,11 +247,12 @@ func instantiateHost(ctx context.Context, runtime wazero.Runtime, session *execu
 		if !found {
 			return ^uint32(0)
 		}
-		if uint32(len(value)) > outCap || !module.Memory().Write(outPtr, value) {
+		valueLength := uint64(len(value))
+		if valueLength > uint64(outCap) || !module.Memory().Write(outPtr, value) {
 			session.fail(ctx, module, fmt.Errorf("avm: state read output buffer too small"))
 			return ^uint32(0)
 		}
-		return uint32(len(value))
+		return uint32(valueLength) // #nosec G115 -- Dominating guard proves valueLength <= uint64(outCap), and outCap is uint32.
 	}).Export("state_read")
 	builder.NewFunctionBuilder().WithFunc(func(ctx context.Context, module api.Module, keyPtr, keyLen, valuePtr, valueLen uint32) uint32 {
 		if !session.charge(GasStateWrite + uint64(keyLen) + uint64(valueLen)) {
@@ -271,11 +282,12 @@ func instantiateHost(ctx context.Context, runtime wazero.Runtime, session *execu
 			session.fail(ctx, module, ErrOutOfGas)
 			return ^uint32(0)
 		}
-		if uint32(len(session.request.Input)) > outCap || !module.Memory().Write(outPtr, session.request.Input) {
+		inputLength := uint64(len(session.request.Input))
+		if inputLength > uint64(outCap) || !module.Memory().Write(outPtr, session.request.Input) {
 			session.fail(ctx, module, fmt.Errorf("avm: input buffer too small"))
 			return ^uint32(0)
 		}
-		return uint32(len(session.request.Input))
+		return uint32(inputLength) // #nosec G115 -- Dominating guard proves inputLength <= uint64(outCap), and outCap is uint32.
 	}).Export("input_read")
 	builder.NewFunctionBuilder().WithFunc(func(ctx context.Context, module api.Module, ptr, length uint32) uint32 {
 		if !session.charge(GasOutputWrite + uint64(length)) {

@@ -14,6 +14,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -61,7 +62,7 @@ func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	restarted := NewServer(":0", nil, nil, nil, slog.Default())
 	restarted.SetStore(db)
 	reloadedKey, err := crypto.NewLockedValidatorKey(s.myKey.PrivKey().Bytes(), nil)
@@ -95,8 +96,8 @@ func TestDailyJobRestartBudgetAndQueue(t *testing.T) {
 	baseline := httptest.NewRecorder()
 	restarted.restLPoDAuditDaily(baseline, authenticatedDailyAuditRequest())
 	var got, want map[string]interface{}
-	json.Unmarshal(j.Result, &got)
-	json.Unmarshal(baseline.Body.Bytes(), &want)
+	testutil.NoError(t, json.Unmarshal(j.Result, &got))
+	testutil.NoError(t, json.Unmarshal(baseline.Body.Bytes(), &want))
 	gotBytes, _ := json.Marshal(got)
 	wantBytes, _ := json.Marshal(want)
 	if string(gotBytes) != string(wantBytes) {
@@ -243,7 +244,7 @@ func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 				if err := raw.Put(key, hash[:], nil); err != nil {
 					t.Fatal(err)
 				}
-				raw.Close()
+				testutil.Close(t, raw)
 				db, err = store.Open(path)
 				if err != nil {
 					t.Fatal(err)
@@ -258,7 +259,7 @@ func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			defer db.Close()
+			defer testutil.CleanupClose(t, db)
 			s.runDailyJobBatch(context.Background())
 			j, err = s.loadDailyJob()
 			if err != nil || j.State != "failed" || strings.Contains(string(j.Result), `"status":"complete"`) {
@@ -270,7 +271,7 @@ func TestDailyJobReorgAndFinalityFailClosed(t *testing.T) {
 
 func TestDailyJobCancellationAndShutdown(t *testing.T) {
 	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, dailyBatchBlocks+40, 0, 0, 1, 0, 0)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	enqueueDailyTest(t, s)
 	s.runDailyJobBatch(context.Background())
 	req := authenticatedDailyAuditRequest()
@@ -309,7 +310,7 @@ func TestDailyJobCancellationAndShutdown(t *testing.T) {
 
 func TestDailyJobStorageBudgetAndFailedResultRequiresExplicitRetry(t *testing.T) {
 	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, 2, 0, 0, 1, 0, 0)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	j := enqueueDailyTest(t, s)
 	oversize := *j
 	oversize.Result = json.RawMessage(`"` + strings.Repeat("x", dailyJobMaxBytes) + `"`)
@@ -367,7 +368,7 @@ func TestDailyJobStorageBudgetAndFailedResultRequiresExplicitRetry(t *testing.T)
 func TestDailyJobAdvancingCertificateOracleDoesNotResetCursor(t *testing.T) {
 	const intervalBlocks = 4 * dailyBatchBlocks
 	db, s, _, _ := makeDailyAuditBenchmarkFixtureWithTail(t, intervalBlocks, 1, 128, 4, 0, 4, intervalBlocks)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	certificate, err := db.LoadFinalityCertificate()
 	if err != nil {
 		t.Fatal(err)

@@ -20,6 +20,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -100,7 +101,7 @@ func TestTLS_MutualAuth_HostAndRawPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("T-2: tls.DialWithDialer failed — TLS handshake not established: %v", err)
 	}
-	defer tlsConn.Close()
+	defer testutil.CleanupClose(t, tlsConn)
 	tlsConn.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
 
 	// Asymmetric handshake: dialer (us) sends MsgPing first; host replies MsgPong.
@@ -169,12 +170,12 @@ func TestTLS_PlaintextClientRejected(t *testing.T) {
 		t.Logf("T-3 ✓ plain-TCP connection refused at OS level: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	// The TLS host must reject the plain-text connection during its eager
 	// TLS handshake.  It should either close the connection or never respond
 	// with valid application data.
-	conn.SetDeadline(time.Now().Add(time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
 	buf := make([]byte, 256)
 	n, readErr := conn.Read(buf)
 
@@ -265,7 +266,7 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 		// Host closed the connection during TLS handshake itself — also acceptable.
 		t.Logf("T-6 ✓ unlisted peer rejected at TLS handshake level: %v", err)
 	} else {
-		defer badConn.Close()
+		defer testutil.CleanupClose(t, badConn)
 		badConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
 		// The host should close the connection without sending a MsgPing.
 		buf := make([]byte, 8)
@@ -292,7 +293,7 @@ func TestTLS_AllowedPeers_UnlistedRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("T-6: allowed peer TLS dial failed: %v", err)
 	}
-	defer goodConn.Close()
+	defer testutil.CleanupClose(t, goodConn)
 	goodConn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 
 	// Complete the Aperod handshake: dialer sends MsgPing, host replies MsgPong.
@@ -407,8 +408,8 @@ func TestLoadOrSaveP2PIdentity_Persistence(t *testing.T) {
 
 func TestTLS_PeerFingerprint_PlainConn(t *testing.T) {
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
+	defer testutil.CleanupClose(t, a)
+	defer testutil.CleanupClose(t, b)
 
 	fp := p2p.PeerFingerprint(a)
 	if fp != "" {
@@ -476,7 +477,7 @@ func TestTLS_BannedIPRejectedDespiteValidCert(t *testing.T) {
 		// is an acceptable (and stronger) form of rejection.
 		t.Logf("T-10 ✓ banned attacker rejected at/before TLS handshake: %v", err)
 	} else {
-		defer attackConn.Close()
+		defer testutil.CleanupClose(t, attackConn)
 		// TLS handshake completed; the host must close the connection immediately
 		// at the ban check without sending any Aperod data.
 		attackConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
@@ -546,7 +547,7 @@ func TestTLS_HandshakeFlood(t *testing.T) {
 			t.Fatalf("T-11: slow conn %d dial: %v", i, dialErr)
 		}
 		slowConns[i] = c
-		t.Cleanup(func() { c.Close() })
+		t.Cleanup(func() { testutil.CleanupClose(t, c) })
 	}
 
 	// Give acceptLoop time to accept all slow connections and for each
@@ -560,7 +561,7 @@ func TestTLS_HandshakeFlood(t *testing.T) {
 	if dialErr != nil {
 		t.Fatalf("T-11: extra conn dial: %v", dialErr)
 	}
-	defer extra.Close()
+	defer testutil.CleanupClose(t, extra)
 
 	// Use a short deadline so we can distinguish an immediate close (EOF /
 	// connection reset) from the connection simply hanging open — a timeout
@@ -738,11 +739,12 @@ func TestTLS_ForgedCert_CannotInjectBlock(t *testing.T) {
 		}
 		return
 	}
-	defer attackConn.Close()
-
 	// TLS handshake completed — the host will now reject the connection at the
 	// application layer (AllowedPeers check) and close it.  The attacker
 	// attempts to inject a block by sending MsgBlock immediately.
+	// Rejection may reset TCP before a TLS closeNotify can be written. Cleanup
+	// therefore closes the raw transport without requiring another TLS write.
+	defer testutil.CleanupClose(t, attackConn.NetConn())
 	attackConn.SetDeadline(time.Now().Add(time.Second)) //nolint:errcheck
 
 	// Build a minimal but structurally valid block to send.
@@ -842,7 +844,7 @@ func TestTLS_HandshakeTimeout_SlotFreedOnDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("T-14: slow conn dial: %v", err)
 	}
-	defer slow.Close()
+	defer testutil.CleanupClose(t, slow)
 
 	// Give acceptLoop time to accept the connection and start the goroutine
 	// (which will then block in tlsConn.Handshake until the deadline fires).
@@ -912,7 +914,7 @@ func TestTLS_HandshakeFlood_AllSlotsFreedAfterTimeout(t *testing.T) {
 		}
 		// Keep every client open until assertions finish: local cleanup must
 		// not be what releases the server's pending-handshake slots.
-		defer slow.Close()
+		defer testutil.CleanupClose(t, slow)
 		if err := slow.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
@@ -939,7 +941,7 @@ func TestTLS_HandshakeFlood_AllSlotsFreedAfterTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legitimate TLS peer cannot connect after drain: %v", err)
 	}
-	defer legitimate.Close()
+	defer testutil.CleanupClose(t, legitimate)
 	// ReadMsg overwrites deadlines, so separately bound a stalled handshake.
 	stall := time.AfterFunc(time.Second, func() { _ = legitimate.Close() })
 	defer stall.Stop()
@@ -988,7 +990,7 @@ func TestKeepalive_SilentPeerEvicted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("T-13: dial: %v", err)
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	// Complete the Aperod handshake: dialer sends MsgPing, host replies MsgPong.
 	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"github.com/aperod/aperod/store"
 )
 
-func read0600RegularFile(path string) ([]byte, error) {
+func read0600RegularFile(path string) (result []byte, readCloseErr error) {
 	if path == "" {
 		return nil, fmt.Errorf("validator key path is required")
 	}
@@ -28,27 +29,38 @@ func read0600RegularFile(path string) ([]byte, error) {
 	if info.Size() != 32 && info.Size() != 64 {
 		return nil, fmt.Errorf("key file must contain exactly 32 or 64 raw bytes")
 	}
+	// #nosec G304 -- Operator-selected offline input; O_NOFOLLOW and subsequent metadata checks reject unsafe key-file forms.
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	var raw []byte
+	defer func() {
+		readCloseErr = errors.Join(readCloseErr, file.Close())
+		if readCloseErr != nil {
+			crypto.ZeroBytes(raw)
+			result = nil
+		}
+	}()
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+	if err != nil {
+		return nil, fmt.Errorf("stat opened key file: %w", err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
 		return nil, fmt.Errorf("key file changed during validation")
 	}
-	raw, err := io.ReadAll(io.LimitReader(file, 65))
+	raw, err = io.ReadAll(io.LimitReader(file, 65))
 	if err != nil {
 		return nil, err
 	}
 	if len(raw) != 32 && len(raw) != 64 {
-		crypto.ZeroBytes(raw)
 		return nil, fmt.Errorf("key file must contain exactly 32 or 64 raw bytes")
 	}
 	return raw, nil
 }
 
 func writeExclusive0600(path string, migration *store.LPoDMigration) (err error) {
+	// #nosec G304 -- Operator-selected witness output, exclusively created with owner-only permissions.
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create output exclusively: %w", err)

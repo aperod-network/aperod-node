@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -634,8 +635,9 @@ func (v *TxVerifier) verifyOutputKeyUniqueness(txs []Transaction, height uint64)
 // ringSignMessage computes the message hash for an MLSAG ring signature.
 // msg = SHA-256(txHash || inputIndex) — binds the signature to a specific input.
 func ringSignMessage(txHash crypto.Hash32, inputIdx uint32) crypto.Hash32 {
-	idx := []byte{byte(inputIdx >> 24), byte(inputIdx >> 16), byte(inputIdx >> 8), byte(inputIdx)}
-	return crypto.HashBytes([]byte("aperod/ring-sign/v1"), txHash[:], idx)
+	var idx [4]byte
+	binary.BigEndian.PutUint32(idx[:], inputIdx)
+	return crypto.HashBytes([]byte("aperod/ring-sign/v1"), txHash[:], idx[:])
 }
 
 // RingSignMessage is exported for use in tx building.

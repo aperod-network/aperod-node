@@ -177,6 +177,7 @@ func readLPoDMigrationWitness(path string, v2TrustAuthorities, v3TrustAuthoritie
 		}
 		return nil, nil
 	}
+	// #nosec G304 -- Operator-configured local consensus witness; authenticated contents are validated separately, not a request-selected file.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("lpod reconciliation witness: %w", err)

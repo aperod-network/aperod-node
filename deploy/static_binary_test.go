@@ -40,6 +40,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // TestNodeBinaryIsStatic builds aperod-node via `make build-node` and then
@@ -208,7 +210,7 @@ func assertNoInterp(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("cannot open %s as ELF: %v", path, err)
 	}
-	defer f.Close()
+	defer testutil.CleanupClose(t, f)
 
 	for _, prog := range f.Progs {
 		if prog.Type == elf.PT_INTERP {
@@ -383,7 +385,7 @@ func TestUpdateExplorerIndexerStaticGuard(t *testing.T) {
 					break
 				}
 			}
-			f.Close()
+			testutil.Close(t, f)
 			if dynamicBin != "" {
 				break
 			}
@@ -456,7 +458,7 @@ func TestUpdateExplorerIndexerStaticGuard(t *testing.T) {
 		guard := position(`(?m)^[ \t]*explorer_indexer_static_guard "\$preflight_dir/aperod-explorer-indexer" \|\| exit 1$`)
 		stopNode := position(`(?m)^systemctl stop aperod-node\b`)
 		stopIndexer := position(`(?m)^systemctl stop aperod-explorer-indexer\b`)
-		if !(source < build && build < guard && guard < stopNode && guard < stopIndexer) {
+		if source >= build || build >= guard || guard >= stopNode || guard >= stopIndexer {
 			t.Fatal("the built candidate must pass the guard before either running service is stopped")
 		}
 		finalGuard := position(`(?m)^explorer_indexer_static_guard "\$APP_DIR/blockchain/build/aperod-explorer-indexer" \|\| error `)

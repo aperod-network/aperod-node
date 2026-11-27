@@ -15,12 +15,13 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
 func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 	db, path, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	parent, _, err := db.GetTip()
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen already-funded v3 database: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	if err := db.BackfillLPoDEarningsIndex(migration); err != nil {
 		t.Fatalf("backfill an already-funded v3 database: %v", err)
 	}
@@ -179,7 +180,7 @@ func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 
 func TestLPoDDailyValidatorPayoutBackfillIndexesOnlyCanonicalBoundaryOutput(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	secondPriv, _, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -416,7 +417,7 @@ func TestLPoDRegistryEvidenceReplaysWithdrawalButNotDepositTopUp(t *testing.T) {
 
 func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	db, path, migration, priv, _ := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	addressKeys, err := crypto.GenerateWalletKeys()
 	if err != nil {
 		t.Fatal(err)
@@ -553,7 +554,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after audit persistence: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	restartedAudit, err := db.LoadLPoDAuditAt(mixedBlock.Hash())
 	if err != nil || restartedAudit == nil || !reflect.DeepEqual(restartedAudit, mixedAudit) {
 		t.Fatalf("audit did not survive restart: audit=%+v err=%v", restartedAudit, err)
@@ -579,7 +580,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after orphan rollback: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	rolledStart, found, err = db.LoadLPoDAuditStart()
 	if err != nil || !found || !reflect.DeepEqual(rolledStart, start) {
 		t.Fatalf("orphan rollback baseline did not survive restart: start=%+v found=%t err=%v", rolledStart, found, err)
@@ -617,7 +618,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 
 func TestLPoDAuditMissingRegistrySnapshotsIsUnavailable(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	block, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(block.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -641,7 +642,7 @@ func TestLPoDAuditMissingRegistrySnapshotsIsUnavailable(t *testing.T) {
 
 func TestLPoDAuditStartOrphanRecoveryRestartsAtCurrentRecord(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -696,7 +697,7 @@ func TestLPoDAuditStartOrphanRecoveryRestartsAtCurrentRecord(t *testing.T) {
 
 func TestLPoDAuditStartRecoveryDoesNotScanFundingGap(t *testing.T) {
 	db, _, _, _, _ := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	const highBlockHeight = uint64(1) << 60
 	orphan := LPoDAuditStart{
 		Height: highBlockHeight, Hash: crypto.HashBytes([]byte("stale marker")),
@@ -730,7 +731,7 @@ func TestLPoDAuditStartRecoveryDoesNotScanFundingGap(t *testing.T) {
 
 func TestLPoDAuditPersistenceFailureLeavesCoverageIncomplete(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -766,7 +767,7 @@ func TestLPoDAuditPersistenceFailureLeavesCoverageIncomplete(t *testing.T) {
 
 func TestLPoDEarningsBackfillRejectsStaleTipHeightIndex(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)

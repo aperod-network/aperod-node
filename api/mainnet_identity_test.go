@@ -11,6 +11,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
@@ -20,7 +21,7 @@ func TestMainnetAPIRejectsDatabaseConsistentForeignGenesis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open fixture store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	private, public, err := crypto.GenerateValidatorKey()
 	if err != nil {

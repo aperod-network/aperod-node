@@ -18,6 +18,7 @@ import "math/big"
 // VestingType identifies the unlock curve for a genesis allocation.
 type VestingType string
 
+// Vesting types select immediate, linear or cliff-then-linear unlocking.
 const (
 	VestingImmediate   VestingType = "immediate"    // unlock everything at genesis
 	VestingLinear      VestingType = "linear"       // linear from genesis, no cliff
@@ -58,28 +59,21 @@ func (v *VestingSchedule) VestedAmount(totalAmount uint64, genesisTime, now int6
 		if v.VestSeconds <= 0 {
 			return totalAmount
 		}
-		elapsed := now - genesisTime
-		if elapsed <= 0 {
-			return 0
-		}
-		if elapsed >= v.VestSeconds {
-			return totalAmount
-		}
-		return mulDiv(totalAmount, uint64(elapsed), uint64(v.VestSeconds))
+		elapsed := new(big.Int).Sub(big.NewInt(now), big.NewInt(genesisTime))
+		return linearVestedAfterElapsed(totalAmount, elapsed, v.VestSeconds)
 
 	case VestingCliffLinear:
-		cliffEnd := genesisTime + v.CliffSeconds
-		if now < cliffEnd {
+		// Clock arithmetic needs the same overflow protection as the amount:
+		// a wrapped cliff must not turn a future unlock into an early payout.
+		cliffEnd := new(big.Int).Add(big.NewInt(genesisTime), big.NewInt(v.CliffSeconds))
+		elapsed := new(big.Int).Sub(big.NewInt(now), cliffEnd)
+		if elapsed.Sign() < 0 {
 			return 0
 		}
 		if v.VestSeconds <= 0 {
 			return totalAmount
 		}
-		elapsed := now - cliffEnd
-		if elapsed >= v.VestSeconds {
-			return totalAmount
-		}
-		return mulDiv(totalAmount, uint64(elapsed), uint64(v.VestSeconds))
+		return linearVestedAfterElapsed(totalAmount, elapsed, v.VestSeconds)
 
 	default:
 		// F-17 fix: unknown vesting type → fail-closed (0 tokens unlocked).
@@ -87,6 +81,21 @@ func (v *VestingSchedule) VestedAmount(totalAmount uint64, genesisTime, now int6
 		// a typo or unknown future type to bypass all vesting restrictions.
 		return 0
 	}
+}
+
+// linearVestedAfterElapsed is called only for a strictly positive duration.
+// Keep both clock differences and the multiplication exact before narrowing a
+// result already bounded by totalAmount.
+func linearVestedAfterElapsed(totalAmount uint64, elapsed *big.Int, duration int64) uint64 {
+	if elapsed.Sign() <= 0 {
+		return 0
+	}
+	window := big.NewInt(duration)
+	if elapsed.Cmp(window) >= 0 {
+		return totalAmount
+	}
+	unlocked := new(big.Int).Mul(new(big.Int).SetUint64(totalAmount), elapsed)
+	return unlocked.Div(unlocked, window).Uint64()
 }
 
 // LockedAmount returns how many base-unit tokens are still locked at `now`.
@@ -130,18 +139,4 @@ func (v *VestingSchedule) FullUnlockAt(genesisTime int64) int64 {
 		// F-17 fix: unknown type → never unlocks (max int64 timestamp).
 		return 1<<62 - 1
 	}
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-// mulDiv computes floor(a * b / c) using big.Int to avoid overflow.
-func mulDiv(a, b, c uint64) uint64 {
-	ab := new(big.Int).Mul(new(big.Int).SetUint64(a), new(big.Int).SetUint64(b))
-	result := new(big.Int).Div(ab, new(big.Int).SetUint64(c))
-	if !result.IsUint64() {
-		return a // saturate — should not happen in practice
-	}
-	return result.Uint64()
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/config"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -98,7 +99,7 @@ func TestStallTimeout_ConfiguredValueDrivesStallTicker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	var tsMu sync.Mutex
 	var firstGetHeadersAt time.Time
@@ -108,7 +109,7 @@ func TestStallTimeout_ConfiguredValueDrivesStallTicker(t *testing.T) {
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Asymmetric handshake: the relay dials us outbound → sends Ping first.
 		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck

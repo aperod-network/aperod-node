@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -18,7 +19,7 @@ func openTestDB(t *testing.T) *store.DB {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	return db
 }
 

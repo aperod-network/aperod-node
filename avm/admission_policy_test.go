@@ -9,6 +9,7 @@ import (
 	"github.com/tetratelabs/wabin/wasm"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestInstructionAdmissionDepthBound(t *testing.T) {
@@ -94,7 +95,7 @@ func nestedModuleCode(t *testing.T, depth int) []byte {
 
 func TestExecuteBoundedRejectsDeepModuleBeforeCompilation(t *testing.T) {
 	engine := NewEngine(NewMemoryStore())
-	defer engine.Close(context.Background())
+	defer func() { testutil.NoError(t, engine.Close(context.Background())) }()
 
 	_, err := engine.ExecuteBounded(context.Background(), ExecutionRequest{
 		Code:     nestedModuleCode(t, MaxAdmissionNestingDepth+1),

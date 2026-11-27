@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
@@ -37,7 +38,7 @@ func TestMainnetAnchorIndexes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer testutil.CleanupClose(t, db)
 			for h, hash := range tt.index {
 				if err := db.RepairHeightIndex(h, hash); err != nil {
 					t.Fatal(err)

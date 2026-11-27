@@ -8,31 +8,10 @@ package core_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 )
-
-// makeTestBlock builds a minimal signed block at the given height.
-func makeChainTestBlock(t *testing.T, height uint64, prev crypto.Hash32) (*core.Block, crypto.ValidatorPrivKey, crypto.ValidatorPubKey) {
-	t.Helper()
-	priv, pub, err := crypto.GenerateValidatorKey()
-	if err != nil {
-		t.Fatalf("GenerateValidatorKey: %v", err)
-	}
-	hdr := core.BlockHeader{
-		Height:       height,
-		PrevHash:     prev,
-		Timestamp:    time.Now().UnixNano(),
-		ValidatorPub: pub,
-		MerkleRoot:   core.MerkleRoot(nil),
-	}
-	if err := hdr.Sign(priv); err != nil {
-		t.Fatalf("Sign h=%d: %v", height, err)
-	}
-	return &core.Block{Header: hdr}, priv, pub
-}
 
 // makeChainBlocks builds nBlocks signed blocks starting at height 1
 // (genesis at height 0 is prepended internally).

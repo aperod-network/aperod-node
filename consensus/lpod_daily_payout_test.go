@@ -17,6 +17,7 @@ import (
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 	"github.com/aperod/aperod/wallet"
 )
@@ -144,7 +145,7 @@ func TestLPoDDailyValidatorPayoutIsOwnerOpenableAndReorgSafe(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer response.Body.Close()
+		defer testutil.CleanupClose(t, response.Body)
 		var body struct {
 			State   string `json:"state"`
 			Outputs []struct {

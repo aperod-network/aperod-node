@@ -48,12 +48,18 @@ func (s *Server) SetConsensusActivationSchedule(
 	s.consensusSchedule = snapshot
 }
 
-func consensusMigrationWitnessDigest(path string) (string, error) {
+func consensusMigrationWitnessDigest(path string) (digest string, retErr error) {
+	// #nosec G304 -- Consensus manifest path comes from the node operator's startup configuration, not the API request.
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			digest = ""
+			retErr = errors.Join(retErr, err)
+		}
+	}()
 
 	info, err := file.Stat()
 	if err != nil {

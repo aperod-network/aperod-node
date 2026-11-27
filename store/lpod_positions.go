@@ -19,14 +19,21 @@ import (
 	"github.com/aperod/aperod/lpod"
 )
 
+// LPoDMaxPositions bounds the number of positions processed by settlement.
 const LPoDMaxPositions = 4096
+
+// LPoDMaxElapsedNS bounds a single settlement's elapsed-time accrual.
 const LPoDMaxElapsedNS uint64 = 15_000_000_000
 const lpodAPRDenominator uint64 = 100 * lpod.YearSeconds * 1_000_000_000
 
+// LPoDValidatorStake supplies a validator's recorded amount and registry state.
+// Active is not independent network liveness evidence.
 type LPoDValidatorStake struct {
 	Amount uint64
 	Active bool
 }
+
+// LPoDPosition tracks a signed deposit and its checkpoint-bound lifecycle state.
 type LPoDPosition struct {
 	Deposit      core.LPoDPositionAction   `json:"deposit"`
 	Nonce        uint64                    `json:"nonce"`
@@ -479,6 +486,7 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 	if parent.Hash() != r.Parent || r.Timestamp <= parent.Header.Timestamp {
 		return nil, nil, nil, fmt.Errorf("lpod: nonmonotonic or noncanonical accrual clock")
 	}
+	// #nosec G115 -- Strict monotonicity above makes the mathematical delta unsigned; preserve its full 64-bit value before applying the elapsed cap below.
 	elapsed := uint64(r.Timestamp - parent.Header.Timestamp)
 	if elapsed > LPoDMaxElapsedNS {
 		elapsed = LPoDMaxElapsedNS

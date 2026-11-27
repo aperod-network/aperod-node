@@ -9,6 +9,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	chaincrypto "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -17,12 +18,12 @@ const registryDomain = "aperod/mainnet-checkpoint-registry/v1\x00"
 // InspectRegistryEvidence reads an auxiliary operator record from a closed
 // database. Its digest can be signed independently of the database layout.
 // A successful inspection is not proof of historical replay or validator eligibility.
-func InspectRegistryEvidence(dbPath string, statement Statement) (string, error) {
+func InspectRegistryEvidence(dbPath string, statement Statement) (_ string, readCloseErr error) {
 	db, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 	snapshot, tip, err := readCheckpointRegistry(db, statement)
 	if err != nil {
 		return "", err
@@ -34,12 +35,12 @@ func InspectRegistryEvidence(dbPath string, statement Statement) (string, error)
 // the canonical checkpoint. It is used only to construct a height-scoped
 // consensus transition; the caller must verify the snapshot's checkpoint
 // height and hash before signing.
-func InspectCheckpointRegistrySnapshot(dbPath string, statement Statement) (core.RegistrySnapshot, error) {
+func InspectCheckpointRegistrySnapshot(dbPath string, statement Statement) (_ core.RegistrySnapshot, readCloseErr error) {
 	db, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		return core.RegistrySnapshot{}, err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 	snapshot, _, err := readCheckpointRegistry(db, statement)
 	return snapshot, err
 }
@@ -51,7 +52,7 @@ func VerifyCheckpointRegistry(db *store.DB, signed SignedStatement) (core.Regist
 		return core.RegistrySnapshot{}, err
 	}
 	if signed.Statement.RegistrySHA256 == "" {
-		return core.RegistrySnapshot{}, errors.New("Mainnet bootstrap does not attest to the registry")
+		return core.RegistrySnapshot{}, errors.New("mainnet bootstrap does not attest to the registry")
 	}
 	snapshot, tip, err := readCheckpointRegistry(db, signed.Statement)
 	if err != nil {

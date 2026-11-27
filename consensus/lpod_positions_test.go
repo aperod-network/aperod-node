@@ -14,6 +14,7 @@ import (
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -49,11 +50,11 @@ func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	chain := core.NewChain()
 	utxos := core.NewUTXOSet()
 	g := &core.Block{Header: core.BlockHeader{Height: 0, Timestamp: 1, ValidatorPub: pub, MerkleRoot: core.MerkleRoot(nil)}}
-	g.Header.Sign(priv)
+	testutil.NoError(t, g.Header.Sign(priv))
 	if err := chain.SetGenesis(g); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine
 	}
 	parent := &core.Block{Header: core.BlockHeader{Height: 1, Round: 1, Timestamp: 2, PrevHash: g.Hash(), ValidatorPub: pub}, Txs: []core.Transaction{*source}}
 	parent.Header.MerkleRoot = core.MerkleRoot(parent.Txs)
-	parent.Header.Sign(priv)
+	testutil.NoError(t, parent.Header.Sign(priv))
 	if err := chain.AddBlock(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine
 	if err := db.CommitRawBlockWithAVM(parent.Hash(), 1, raw, nil, crypto.Hash32{}); err != nil {
 		t.Fatal(err)
 	}
-	utxos.ApplyBlock(parent)
+	testutil.NoError(t, utxos.ApplyBlock(parent))
 	blind, err := crypto.DeterministicMintBlindV2(wallet.Spend.Public, principal, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ func positionEngineWithOwner(t *testing.T, owner *crypto.WalletKeyPair) (*Engine
 	m.ReconciliationRoot = m.Root()
 	sig, _ := priv.Sign(m.AttestationMessage())
 	m.Attestations = []store.LPoDAttestation{{Validator: pub, Signature: sig}}
-	db.StoreStakingPoolRemaining(m.ValidatorRemaining)
+	testutil.NoError(t, db.StoreStakingPoolRemaining(m.ValidatorRemaining))
 	registry := core.NewValidatorRegistry()
 	registry.InitFromGenesis([]crypto.ValidatorPubKey{pub}, 100_000*lpod.Unit)
 	verifier := core.NewTxVerifier(utxos)
@@ -139,7 +140,7 @@ func acceptPositionBlock(t *testing.T, e *Engine, priv crypto.ValidatorPrivKey, 
 	}
 	b.Txs = append([]core.Transaction{payout, core.LPoDCheckpointTx(c.Digest())}, operations...)
 	b.Header.MerkleRoot = core.MerkleRoot(b.Txs)
-	b.Header.Sign(priv)
+	testutil.NoError(t, b.Header.Sign(priv))
 	if err := e.handleIncomingBlock(b); err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +549,7 @@ func TestLPoDPositionRejectsForgedOwnershipAndChain(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			raw, _ := json.Marshal(deposit)
 			var tx core.Transaction
-			json.Unmarshal(raw, &tx)
+			testutil.NoError(t, json.Unmarshal(raw, &tx))
 			switch name {
 			case "signature":
 				tx.Signatures[0].SS[0][0] ^= 1
@@ -639,12 +640,12 @@ func TestLPoDPositionsRestartRollbackAndWithdrawalReplay(t *testing.T) {
 		t.Fatal("canonical replay did not restore precisely one immediate refund")
 	}
 	want, _ = json.Marshal(before)
-	db.Close()
+	testutil.Close(t, db)
 	reopened, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer testutil.CleanupClose(t, reopened)
 	after, err := reopened.LoadLPoDCheckpoint()
 	if err != nil {
 		t.Fatal(err)
@@ -672,7 +673,7 @@ func TestLPoDPositionsRestartRollbackAndWithdrawalReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		utxos.ApplyBlock(&b)
+		testutil.NoError(t, utxos.ApplyBlock(&b))
 	}
 	cfg := e.cfg
 	cfg.Store = reopened

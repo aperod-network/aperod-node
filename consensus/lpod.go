@@ -445,6 +445,7 @@ func (e *Engine) validateLPoD(block *core.Block) error {
 	return nil
 }
 
+// IsFinalizedHash reports whether the engine recorded this exact height/hash as finalized.
 func (e *Engine) IsFinalizedHash(height uint64, hash crypto.Hash32) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()

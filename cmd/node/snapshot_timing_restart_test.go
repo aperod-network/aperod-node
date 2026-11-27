@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -22,7 +23,7 @@ func fetchSnapshotTimingStatus(t *testing.T, client *http.Client, url string) ma
 	if err != nil {
 		t.Fatalf("GET /api/v1/status: %v", err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("GET /api/v1/status status=%d, want %d: %s", resp.StatusCode, http.StatusOK, body)
@@ -77,7 +78,7 @@ func TestSnapshotTimingFromPreviousShutdownOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open restarted DB: %v", err)
 	}
-	defer restartedDB.Close()
+	defer testutil.CleanupClose(t, restartedDB)
 
 	savedMs, found, err := restartedDB.LoadSnapshotSaveDuration()
 	if err != nil {

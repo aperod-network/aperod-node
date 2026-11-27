@@ -10,6 +10,7 @@ import (
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
@@ -229,7 +230,7 @@ func TestCheckReleaseVoteJournal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer testutil.CleanupClose(t, db)
 			err = checkReleaseVoteJournal(db, tip, activation)
 			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("got %v; want %q", err, tc.want)

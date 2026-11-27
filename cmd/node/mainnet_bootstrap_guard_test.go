@@ -8,9 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/crypto"
-	"gopkg.in/yaml.v3"
 )
 
 func TestMainnetBootstrapRefusalUsesPermanentConfigurationExit(t *testing.T) {

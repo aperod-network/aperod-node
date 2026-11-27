@@ -6,8 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/aperod/aperod/crypto"
 	"github.com/syndtr/goleveldb/leveldb/util"
+
+	"github.com/aperod/aperod/crypto"
 )
 
 var finalityCertificateKey = []byte("consensus/finality_certificate/v1")
@@ -20,6 +21,7 @@ var finalityCommitteePrefix = []byte("consensus/finality_committee/v1/")
 // FinalityVoteJournalDepth is the retention and startup replay window.
 const FinalityVoteJournalDepth uint64 = 256
 
+// FinalityVote records a validator signature and its signing-format version.
 type FinalityVote struct {
 	Validator   crypto.ValidatorPubKey `json:"validator"`
 	Signature   []byte                 `json:"signature"`
@@ -112,6 +114,7 @@ func validateFinalityCommitteeSnapshot(snapshot FinalityCommitteeSnapshot, epoch
 	return nil
 }
 
+// SaveFinalityCommitteeSnapshot persists the supplied epoch committee snapshot.
 func (d *DB) SaveFinalityCommitteeSnapshot(snapshot FinalityCommitteeSnapshot) error {
 	if err := validateFinalityCommitteeSnapshot(snapshot, snapshot.Epoch); err != nil {
 		return err
@@ -145,6 +148,7 @@ func (d *DB) SaveFinalityCommitteeSnapshot(snapshot FinalityCommitteeSnapshot) e
 	return d.putSync(key, raw)
 }
 
+// LoadFinalityCommitteeSnapshot reads the persisted committee snapshot for epoch.
 func (d *DB) LoadFinalityCommitteeSnapshot(epoch uint64) (*FinalityCommitteeSnapshot, error) {
 	raw, err := d.get(finalityCommitteeKey(epoch))
 	if err != nil || raw == nil {
@@ -175,6 +179,7 @@ func finalityCertificateHeightKey(height uint64) []byte {
 	return key
 }
 
+// SaveFinalityVote persists a validator's height-scoped vote record.
 func (d *DB) SaveFinalityVote(v PersistedFinalityVote) error {
 	if v.Version != 1 || v.BlockHash == (crypto.Hash32{}) ||
 		len(v.Validator) != 32 || len(v.Signature) != 64 ||
@@ -204,6 +209,7 @@ func (d *DB) SaveFinalityVote(v PersistedFinalityVote) error {
 	return d.putSync(key, raw)
 }
 
+// LoadFinalityVote reads the stored vote for a height and validator.
 func (d *DB) LoadFinalityVote(height uint64, validator crypto.ValidatorPubKey) (*PersistedFinalityVote, error) {
 	if len(validator) != 32 {
 		return nil, fmt.Errorf("finality: invalid validator key")
@@ -225,6 +231,7 @@ func (d *DB) LoadFinalityVote(height uint64, validator crypto.ValidatorPubKey) (
 	return &vote, nil
 }
 
+// LoadFinalityVotes reads vote records in the requested inclusive height window.
 func (d *DB) LoadFinalityVotes(minHeight, maxHeight uint64) ([]PersistedFinalityVote, error) {
 	if maxHeight < minHeight {
 		return nil, nil
@@ -260,6 +267,7 @@ func (d *DB) LoadFinalityVotes(minHeight, maxHeight uint64) ([]PersistedFinality
 	return votes, nil
 }
 
+// SaveVoteEquivocationEvidence persists conflicting-vote evidence.
 func (d *DB) SaveVoteEquivocationEvidence(e VoteEquivocationEvidence) error {
 	if e.Version != 1 || e.BlockHash1 == (crypto.Hash32{}) ||
 		e.BlockHash2 == (crypto.Hash32{}) || e.BlockHash1 == e.BlockHash2 ||
@@ -284,6 +292,7 @@ func (d *DB) SaveVoteEquivocationEvidence(e VoteEquivocationEvidence) error {
 	return d.putSync(key, raw)
 }
 
+// LoadVoteEquivocationEvidence reads stored evidence for a height and validator.
 func (d *DB) LoadVoteEquivocationEvidence(height uint64, validator crypto.ValidatorPubKey) (*VoteEquivocationEvidence, error) {
 	raw, err := d.get(voteEquivocationKey(height, validator))
 	if err != nil || raw == nil {
@@ -304,6 +313,7 @@ func (d *DB) LoadVoteEquivocationEvidence(height uint64, validator crypto.Valida
 	return &evidence, nil
 }
 
+// SaveLocalFinalityVote persists the local validator's vote fence.
 func (d *DB) SaveLocalFinalityVote(v LocalFinalityVote) error {
 	if v.Version != 1 || v.BlockHash == (crypto.Hash32{}) || len(v.Signature) == 0 {
 		return fmt.Errorf("finality: invalid local vote")
@@ -331,6 +341,7 @@ func (d *DB) SaveLocalFinalityVote(v LocalFinalityVote) error {
 	return d.putSync(localFinalityVoteKey, raw)
 }
 
+// LoadLocalFinalityVote reads the local validator's persisted vote fence.
 func (d *DB) LoadLocalFinalityVote() (*LocalFinalityVote, error) {
 	raw, err := d.get(localFinalityVoteKey)
 	if err != nil || raw == nil {
@@ -378,6 +389,8 @@ func (d *DB) SaveFinalityCertificate(c FinalityCertificate) error {
 	return nil
 }
 
+// LoadFinalityCertificate reads the latest persisted certificate.
+// Loading alone does not authenticate the historical committee.
 func (d *DB) LoadFinalityCertificate() (*FinalityCertificate, error) {
 	raw, err := d.get(finalityCertificateKey)
 	if err != nil || raw == nil {
@@ -393,6 +406,7 @@ func (d *DB) LoadFinalityCertificate() (*FinalityCertificate, error) {
 	return &c, nil
 }
 
+// LoadFinalityCertificateAt reads the certificate persisted for a height.
 func (d *DB) LoadFinalityCertificateAt(height uint64) (*FinalityCertificate, error) {
 	raw, err := d.get(finalityCertificateHeightKey(height))
 	if err != nil {

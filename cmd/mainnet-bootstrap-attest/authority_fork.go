@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/mainnetbootstrap"
 )
 
@@ -98,6 +99,7 @@ func runAuthorityFork(args []string) error {
 	if err != nil {
 		return fmt.Errorf("encode successor authority fork: %w", err)
 	}
+	// #nosec G302 -- Public signed authority statement; the serialized payload contains no private signing key.
 	file, err := os.OpenFile(*outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("create authority fork without overwriting existing files: %w", err)
@@ -139,7 +141,7 @@ func runAuthorityFork(args []string) error {
 	return err
 }
 
-func readSuccessorPrivateKey(path string) (crypto.ValidatorPrivKey, error) {
+func readSuccessorPrivateKey(path string) (_ crypto.ValidatorPrivKey, readCloseErr error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("inspect successor private key: %w", err)
@@ -148,11 +150,12 @@ func readSuccessorPrivateKey(path string) (crypto.ValidatorPrivKey, error) {
 		info.Mode().Perm() != 0o600 {
 		return nil, errors.New("successor private key must be a regular non-symlink file with mode 0600")
 	}
+	// #nosec G304 -- Explicit local successor-signing key selected by the offline CLI operator.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open successor private key: %w", err)
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	raw, err := io.ReadAll(io.LimitReader(file, 65))
 	if err != nil {
 		crypto.ZeroBytes(raw)

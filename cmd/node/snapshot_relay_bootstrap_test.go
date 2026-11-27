@@ -31,6 +31,7 @@ import (
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -53,7 +54,7 @@ func TestRelayBootstrap_UTXOCountDivergenceAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	tipHashHex := fmt.Sprintf("%064x", 42)
 
@@ -104,7 +105,7 @@ func TestRelayBootstrap_RestorePopulatesRegistryAndUTXOs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	// Generate a validator key to embed in the snapshot.
 	_, valPub, err := crypto.GenerateValidatorKey()
@@ -329,7 +330,7 @@ func TestRelayBootstrap_IncomingBlockAccepted(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("store.Open: %v", derr)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	// Donor's DB metadata recorded 95 active UTXOs; snapshot has 100 — 5% divergence.
 	// Configured tolerance is 1%; nonValidator floor of 10% must apply.

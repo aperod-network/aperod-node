@@ -6,6 +6,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // ─── Block ────────────────────────────────────────────────────────────────────
@@ -504,7 +505,7 @@ func TestMempool_AddGet(t *testing.T) {
 func TestMempool_Duplicate(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	tx := makeValidTx(t)
-	mp.Add(tx)
+	testutil.NoError(t, mp.Add(tx))
 	if err := mp.Add(tx); err == nil {
 		t.Fatal("adding duplicate tx should fail")
 	}
@@ -513,7 +514,7 @@ func TestMempool_Duplicate(t *testing.T) {
 func TestMempool_Remove(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
 	tx := makeValidTx(t)
-	mp.Add(tx)
+	testutil.NoError(t, mp.Add(tx))
 	mp.Remove(tx.Hash())
 	if mp.Count() != 0 {
 		t.Fatal("mempool should be empty after remove")
@@ -522,11 +523,18 @@ func TestMempool_Remove(t *testing.T) {
 
 func TestMempool_SelectByFeeRate(t *testing.T) {
 	mp := core.NewMempool(core.DefaultMempoolConfig())
-	// Add two txs with different fees (higher fee wins); both must meet MinFee.
-	tx1 := makeValidTxWithFee(t, core.InitialBaseFeePerByte*1000)
-	tx2 := makeValidTxWithFee(t, core.InitialBaseFeePerByte*2000)
-	mp.Add(tx1)
-	mp.Add(tx2)
+	// Selection-policy fixtures only: this pool has no UTXO verifier. Funded
+	// cryptographic admission is covered separately. Derive fees from the
+	// actual fixed-size fixture instead of accidentally rejecting the first.
+	shape := makeValidTxWithFee(t, 0)
+	minimum := shape.MinFeeAt(core.InitialBaseFeePerByte)
+	tx1 := makeValidTxWithFee(t, minimum*2)
+	tx2 := makeValidTxWithFee(t, minimum*3)
+	testutil.NoError(t, mp.Add(tx1))
+	testutil.NoError(t, mp.Add(tx2))
+	if mp.Count() != 2 {
+		t.Fatalf("fee selection needs two admitted fixtures, got %d", mp.Count())
+	}
 
 	selected := mp.SelectTxs(1)
 	if len(selected) != 1 {
@@ -556,7 +564,7 @@ func TestChain_AddBlock(t *testing.T) {
 	c := core.NewChain()
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	genesis := makeBlock(t, priv, pub, 0, crypto.Hash32{})
-	c.SetGenesis(genesis)
+	testutil.NoError(t, c.SetGenesis(genesis))
 
 	block1 := makeBlock(t, priv, pub, 1, genesis.Hash())
 	if err := c.AddBlock(block1); err != nil {
@@ -577,7 +585,7 @@ func TestChain_AddBlock_WrongHeight(t *testing.T) {
 	c := core.NewChain()
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	genesis := makeBlock(t, priv, pub, 0, crypto.Hash32{})
-	c.SetGenesis(genesis)
+	testutil.NoError(t, c.SetGenesis(genesis))
 
 	// Try to add block at height 2 (skipping height 1)
 	block2 := makeBlock(t, priv, pub, 2, genesis.Hash())
@@ -590,13 +598,13 @@ func TestChain_Reorg(t *testing.T) {
 	c := core.NewChain()
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	genesis := makeBlock(t, priv, pub, 0, crypto.Hash32{})
-	c.SetGenesis(genesis)
+	testutil.NoError(t, c.SetGenesis(genesis))
 
 	// Build old chain: genesis → b1 → b2
 	b1 := makeBlock(t, priv, pub, 1, genesis.Hash())
 	b2 := makeBlock(t, priv, pub, 2, b1.Hash())
-	c.AddBlock(b1)
-	c.AddBlock(b2)
+	testutil.NoError(t, c.AddBlock(b1))
+	testutil.NoError(t, c.AddBlock(b2))
 	if c.Height() != 2 {
 		t.Fatalf("expected height 2, got %d", c.Height())
 	}
@@ -641,7 +649,7 @@ func TestBlockVerifier_ValidGenesis(t *testing.T) {
 	c := core.NewChain()
 	priv, pub, _ := crypto.GenerateValidatorKey()
 	genesis := makeBlock(t, priv, pub, 0, crypto.Hash32{})
-	c.SetGenesis(genesis)
+	testutil.NoError(t, c.SetGenesis(genesis))
 
 	v := core.NewBlockVerifier(core.DefaultBlockVerifierConfig(), c, nil)
 	// Genesis block is already in chain; verify a new block
@@ -727,8 +735,8 @@ func TestWalletScanner_MissOtherOutput(t *testing.T) {
 		},
 		Txs: []core.Transaction{tx},
 	}
-	block.Header.Sign(priv)
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
+	testutil.NoError(t, block.Header.Sign(priv))
 
 	scanner := core.NewWalletScanner(
 		receiver.View.Private,

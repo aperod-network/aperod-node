@@ -273,6 +273,7 @@ func MLSAGSignV4(message Hash32, ring []RingMember, realIdx int,
 		(&edwards25519.Point{}).ScalarBaseMult(alphaR),
 		(&edwards25519.Point{}).ScalarMult(alphaV, hGenerator),
 	)
+	// #nosec G115 -- MLSAGSignV4 validates 0 <= realIdx < RingSize before indexing the ring or hashing this transcript.
 	cc[nextIdx(realIdx)] = ringChallengeV4(message, uint32(realIdx), lReal, rReal, qReal)
 
 	for i := 1; i < RingSize; i++ {
@@ -298,6 +299,7 @@ func MLSAGSignV4(message Hash32, ring []RingMember, realIdx int,
 		hp := HashToCurvePoint(ring[idx][:])
 		ri := ringR(ssX[idx], cc[(realIdx+i)%RingSize], hp, I)
 		qi := ringCommitmentQ(ssR[idx], ssV[idx], cc[(realIdx+i)%RingSize], claimed)
+		// #nosec G115 -- idx is reduced modulo the fixed positive RingSize, not an unbounded external integer.
 		cc[nextI] = ringChallengeV4(message, uint32(idx), l, ri, qi)
 	}
 
@@ -325,6 +327,7 @@ func MLSAGSignV4(message Hash32, ring []RingMember, realIdx int,
 		return nil, fmt.Errorf("random link alpha: %w", err)
 	}
 	linkR := (&edwards25519.Point{}).ScalarBaseMult(linkAlpha)
+	// #nosec G115 -- Same validated realIdx in [0, RingSize) as the signing transcript above.
 	linkC := ringLinkChallenge(message, uint32(realIdx), ring[realIdx], amountCommit, ki, linkR)
 	linkCX := edwards25519.NewScalar().Multiply(linkC, x)
 	linkS := edwards25519.NewScalar().Subtract(linkAlpha, linkCX)
@@ -421,7 +424,7 @@ func ValidateMLSAGPrimeOrderPoints(ring []RingMember, keyImage KeyImage, amountC
 		return fmt.Errorf("ring size must be %d, got %d", RingSize, len(ring))
 	}
 	for i, member := range ring {
-		if _, err := checkedCLSAGPrimePoint(Point32(member), fmt.Sprintf("ring member %d", i)); err != nil {
+		if _, err := checkedCLSAGPrimePoint(member, fmt.Sprintf("ring member %d", i)); err != nil {
 			return err
 		}
 	}

@@ -18,7 +18,7 @@ func verifyBuiltPayment(result *core.BuildResult, amount uint64, recipient crypt
 	}
 	defer result.DiscardPaymentRecipientProof()
 	tx := &result.Tx
-	if int(result.PayOutIdx) < 0 || result.PayOutIdx >= len(tx.Outputs) {
+	if result.PayOutIdx < 0 || result.PayOutIdx >= len(tx.Outputs) {
 		return "", fmt.Errorf("payment output index %d is outside transaction outputs", result.PayOutIdx)
 	}
 

@@ -65,7 +65,7 @@ func signHistoricalBeneficiaryAction(t *testing.T, action LPoDPositionAction, ow
 	}
 	tx := &Transaction{Version: version, Extra: body,
 		Signatures: []*crypto.MLSAGSignature{ownerProof, proof},
-		Inputs: []RingInput{{Ring: LPoDOwnershipRing(action.SourcePub), AmountCommit: commit, KeyImage: proof.KeyImage}}}
+		Inputs:     []RingInput{{Ring: LPoDOwnershipRing(action.SourcePub), AmountCommit: commit, KeyImage: proof.KeyImage}}}
 	if err := tx.Validate(); err != nil {
 		t.Fatalf("signed historical control is invalid: %v", err)
 	}

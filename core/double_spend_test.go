@@ -106,10 +106,10 @@ func TestDoubleSpend_ApplyBlock(t *testing.T) {
 	// ── Craft a RingCT tx that would use a known key image ────────────────────
 	// Build a ring signature to get a deterministic key image.
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(alice.Spend.Public)
+	ring[0] = alice.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, _ := crypto.GenerateWalletKeys()
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	var msg crypto.Hash32
 	msg[0] = 0xAB

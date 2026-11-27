@@ -93,7 +93,7 @@ func TestAVMSubmitRejectsNonAVMTransactions(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-if !bytes.Contains(rec.Body.Bytes(), []byte("locally signed AVM")) {
+	if !bytes.Contains(rec.Body.Bytes(), []byte("locally signed AVM")) {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
 }

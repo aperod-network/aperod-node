@@ -106,13 +106,13 @@ func TestRollbackBlock_FullDecoyPool(t *testing.T) {
 	// ── Build block 1: a ring tx that spends Alice's UTXO ────────────────────
 	// Ring member 0 is Alice's real pub key; others are random valid keys.
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(alice.Spend.Public)
+	ring[0] = alice.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, dErr := crypto.GenerateWalletKeys()
 		if dErr != nil {
 			t.Fatalf("GenerateWalletKeys (ring %d): %v", i, dErr)
 		}
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	var msg crypto.Hash32
 	msg[0] = 0xAB
@@ -294,13 +294,13 @@ func TestRollbackBlock_AfterSnapshotRestore(t *testing.T) {
 	// Decoy pool is already full (3/3) — Alice's spent UTXO must go to the
 	// journal, not the pool.
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(alice.Spend.Public)
+	ring[0] = alice.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, dErr := crypto.GenerateWalletKeys()
 		if dErr != nil {
 			t.Fatalf("GenerateWalletKeys (ring %d): %v", i, dErr)
 		}
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	var msg crypto.Hash32
 	msg[0] = 0xCD

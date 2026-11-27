@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
@@ -22,7 +23,7 @@ func identityEvidenceTestLogger() *slog.Logger {
 
 func TestChainIdentityEvidenceExportsVerifiedGenesisAndOperatorOneOfOne(t *testing.T) {
 	db, chain, checkpoint := makeIdentityEvidenceFixture(t, true, false, false)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	server := NewServer(":0", chain, nil, nil, identityEvidenceTestLogger())
 	server.SetStore(db)
@@ -71,7 +72,7 @@ func TestChainIdentityEvidenceExportsVerifiedGenesisAndOperatorOneOfOne(t *testi
 
 func TestMainnetIdentityEvidenceUsesSignedCheckpointWithoutCommitteeQuorum(t *testing.T) {
 	db, chain, checkpoint := makeIdentityEvidenceFixture(t, false, false, false)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	genesis := chain.GetByHeight(0)
 	if genesis == nil {
@@ -135,7 +136,7 @@ func TestChainIdentityEvidenceUsesCollateralIdentityAcrossSignerRotation(t *test
 	if err != nil {
 		t.Fatalf("open fixture store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	identityKey, identity, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -257,7 +258,7 @@ func TestChainIdentityEvidenceUsesCollateralIdentityAcrossSignerRotation(t *test
 
 func TestChainIdentityEvidenceFailsClosedWithoutCertificate(t *testing.T) {
 	db, chain, _ := makeIdentityEvidenceFixture(t, false, false, false)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	server := NewServer(":0", chain, nil, nil, identityEvidenceTestLogger())
 	server.SetStore(db)
@@ -290,7 +291,7 @@ func TestChainIdentityEvidenceServesDiskBackedLegacyAndHeightBoundVotes(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer testutil.CleanupClose(t, db)
 			server := NewServer(":0", nil, nil, nil, identityEvidenceTestLogger())
 			server.SetStore(db)
 			listener := httptest.NewServer(server)
@@ -300,7 +301,7 @@ func TestChainIdentityEvidenceServesDiskBackedLegacyAndHeightBoundVotes(t *testi
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer response.Body.Close()
+			defer testutil.CleanupClose(t, response.Body)
 			if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "no-store" {
 				t.Fatalf("unexpected HTTP result: %s, cache-control %q",
 					response.Status, response.Header.Get("Cache-Control"))
@@ -331,7 +332,7 @@ func TestChainIdentityEvidenceServesDiskBackedLegacyAndHeightBoundVotes(t *testi
 
 func TestChainIdentityEvidenceRejectsBadQuorumSignature(t *testing.T) {
 	db, chain, _ := makeIdentityEvidenceFixture(t, true, true, false)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	server := NewServer(":0", chain, nil, nil, identityEvidenceTestLogger())
 	server.SetStore(db)
@@ -344,7 +345,7 @@ func TestChainIdentityEvidenceRejectsBadQuorumSignature(t *testing.T) {
 
 func TestChainIdentityEvidenceReportsLegacyGenesisIndexHashSeparately(t *testing.T) {
 	db, chain, _ := makeIdentityEvidenceFixture(t, true, false, true)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	server := NewServer(":0", chain, nil, nil, identityEvidenceTestLogger())
 	server.SetStore(db)
@@ -450,7 +451,7 @@ func makeIdentityEvidenceFixtureAt(t *testing.T, dbPath string, withCertificate,
 		t.Fatalf("open fixture store: %v", err)
 	}
 	fail := func(format string, args ...any) {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf(format, args...)
 	}
 	priv, pub, err := crypto.GenerateValidatorKey()

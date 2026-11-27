@@ -29,6 +29,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -89,7 +90,7 @@ func TestPhantomKICheck_CountsCorrectly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var kiConfirmed, kiPhantom1, kiPhantom2, kiOnlyDB crypto.KeyImage
 	kiConfirmed[0] = 0xC0
@@ -125,7 +126,7 @@ func TestPhantomKICheck_NoneWhenAllConfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var ki1, ki2 crypto.KeyImage
 	ki1[0] = 0xA1
@@ -158,7 +159,7 @@ func TestPhantomKICheck_SubTipPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// kiConfirmed: in snapshot + in LevelDB (confirmed spend from a block
 	// that was replayed by gap-fill).
@@ -192,7 +193,7 @@ func TestPhantomKICheck_RescuePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var kiReal1, kiReal2, kiGhost crypto.KeyImage
 	kiReal1[0] = 0xA1
@@ -225,7 +226,7 @@ func TestPhantomKICheck_ExactTipCleanPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var ki1, ki2 crypto.KeyImage
 	ki1[0] = 0xB1

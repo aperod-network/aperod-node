@@ -19,6 +19,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -72,7 +73,7 @@ func TestReplayPostSnapshotGap_OutputAdded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -145,7 +146,7 @@ func TestReplayPostSnapshotGap_KeyImageMarkedSpent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -226,7 +227,7 @@ func TestReplayPostSnapshotGap_NoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	utxos := core.NewUTXOSet()
 	// snapTipHeight == chainTipHeight → nothing to replay.
@@ -250,7 +251,7 @@ func TestReplayPostSnapshotGap_MissingBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	// Gap is heights 1..3 but LevelDB is empty — all blocks are missing.
 	utxos := core.NewUTXOSet()
@@ -279,7 +280,7 @@ func TestReplayPostSnapshotGap_SnapshotUTXOSpentInGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -408,7 +409,7 @@ func TestReplayPostSnapshotGap_FailureAtomicity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -515,7 +516,7 @@ func TestReplayPostSnapshotGap_CorruptBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -553,7 +554,7 @@ func TestReplayPostSnapshotGap_StakeInGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -608,7 +609,7 @@ func TestSnapshotGapFill_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -750,7 +751,7 @@ func TestReplayPostSnapshotGap_MultiBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {

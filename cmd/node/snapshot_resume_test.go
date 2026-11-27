@@ -26,6 +26,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -59,7 +60,7 @@ func buildChainResume(t *testing.T, dir string, nBlocks int) (*store.DB, []*core
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var blocks []*core.Block
 	genesis := makeBlk(0, crypto.Hash32{})

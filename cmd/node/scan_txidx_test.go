@@ -29,6 +29,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -51,7 +52,7 @@ func buildScanTxIdxChain(
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	putBlk := func(b *core.Block) {
 		raw, merr := json.Marshal(b)
@@ -316,7 +317,7 @@ func TestScan_MissingBlock_HighWaterStopsBeforeGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db2.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db2) })
 
 	makeTx2 := func(seed int) core.Transaction {
 		blind, _ := crypto.NewBlindFactor()
@@ -525,7 +526,7 @@ func buildBackfillTxIdxDBWithGap(t *testing.T, totalBlocks, missingHeight int) (
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	txsByHeight := make(map[int]core.Transaction, totalBlocks)
 	makeTx := func(seed int) core.Transaction {

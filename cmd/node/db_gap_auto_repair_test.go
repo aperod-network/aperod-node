@@ -34,6 +34,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -58,10 +59,10 @@ func deleteHeightIndexEntry(t *testing.T, dbDir string, db *store.DB, height uin
 	copy(hKey, []byte("h/"))
 	binary.BigEndian.PutUint64(hKey[2:], height)
 	if err := raw.Delete(hKey, &opt.WriteOptions{Sync: true}); err != nil {
-		raw.Close()
+		testutil.Close(t, raw)
 		t.Fatalf("delete h/%d: %v", height, err)
 	}
-	raw.Close()
+	testutil.Close(t, raw)
 	db2, err := store.Open(dbDir)
 	if err != nil {
 		t.Fatalf("reopen after height-key delete: %v", err)
@@ -100,7 +101,7 @@ func TestAutoRepairFixesCrashKillGap(t *testing.T) {
 	// ── Step 2: delete h/<gapHeight> to simulate crash-kill ───────────────
 	// b/<hash_at_5> still exists; only the height-index entry is removed.
 	db = deleteHeightIndexEntry(t, dbDir, db, gapHeight)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// ── Step 3: verify the gap is detected ────────────────────────────────
 	missing, firstMissing, lastMissing := countMissingBlocksInWindow(db, tipHeight, 0)
@@ -179,7 +180,7 @@ func TestAutoRepairSentinelClearedOnGapDetection(t *testing.T) {
 
 	// Delete h/<gapHeight> to simulate post-sentinel crash.
 	db = deleteHeightIndexEntry(t, dbDir, db, gapHeight)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// Confirm gap is detected despite sentinel being present.
 	missing, _, _ := countMissingBlocksInWindow(db, tipHeight, 0)
@@ -215,7 +216,7 @@ func TestAutoRepairMultipleGaps(t *testing.T) {
 	for _, h := range crashLostHeights {
 		db = deleteHeightIndexEntry(t, dbDir, db, h)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// All deleted heights must be detected.
 	missing, _, _ := countMissingBlocksInWindow(db, tipHeight, 0)
@@ -260,7 +261,7 @@ func TestAutoRepairNoOpWhenNoGaps(t *testing.T) {
 
 	dir := t.TempDir()
 	db, _ := buildChainWithGap(t, dir, nBlocks, 999 /* no gap */)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// No gaps expected.
 	missing, _, _ := countMissingBlocksInWindow(db, tipHeight, 0)

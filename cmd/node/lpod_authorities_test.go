@@ -11,6 +11,7 @@ import (
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -241,7 +242,7 @@ func TestLPoDV2TrustOptInRequiresWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	_, authority, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +259,7 @@ func TestLPoDV3TrustOptInRequiresWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	_, authority, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +279,7 @@ func TestLPoDPastUnfundedWitnessFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	m := &store.LPoDMigration{Version: 2, Height: 20}
 	for _, tip := range []uint64{20, 21} {
 		hash := crypto.HashBytes([]byte{byte(tip)})

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
@@ -18,7 +19,7 @@ func TestLPoDDurableCanonicalCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { db.Close() }()
+	defer func() { testutil.CleanupClose(t, db) }()
 	parent := crypto.HashBytes([]byte("accounting-test-only-parent"))
 	block := crypto.HashBytes([]byte("accounting-test-only-block"))
 	if err := db.PutTip(parent, 0); err != nil {

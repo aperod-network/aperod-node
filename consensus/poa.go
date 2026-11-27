@@ -22,6 +22,7 @@ import (
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -33,6 +34,7 @@ type AdminMintRecordStore interface {
 	LoadAdminMintRecord(idempotencyKey string) (record store.AdminMintRecord, found bool, err error)
 }
 
+// AdminMintRecordLister exposes persisted administrative mint records.
 type AdminMintRecordLister interface {
 	ListAdminMintRecords() ([]store.AdminMintRecordEntry, error)
 }
@@ -278,7 +280,13 @@ func finalityCommitteeContains(committee finalityCommittee, validator crypto.Val
 }
 
 func finalityQuorumSize(committee finalityCommittee) int {
-	return int(uint64(len(committee.validators))*uint64(committee.thresholdPPM)/1_000_000) + 1
+	required, err := core.RequiredFinalityVotes(len(committee.validators), committee.thresholdPPM)
+	if err != nil {
+		// An invalid persisted/internal committee must never become a
+		// nonpositive quorum through integer wrapping.
+		panic(fmt.Errorf("consensus finality committee: %w", err))
+	}
+	return required
 }
 
 const candidateVoteLimit = 4096
@@ -300,6 +308,7 @@ type incomingBlockSubmission struct {
 	result chan error
 }
 
+// Engine coordinates block production, verification and finality.
 type Engine struct {
 	lpodFinalizedHashes map[uint64]crypto.Hash32
 	cfg                 Config
@@ -477,6 +486,8 @@ func (e *Engine) StartupError() error { return e.startupErr }
 
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
+	// Validate before registering hooks or loading a persistent monetary pool.
+	initialPoolBalance := checkedPoolBalance(cfg.StakingPoolNAPR)
 	cfg.ValidatorAuthorityFork = cfg.ValidatorAuthorityFork.Clone()
 	if cfg.Registry != nil {
 		cfg.Registry.SetSecurityHardeningActivationHeight(cfg.SecurityHardeningActivationHeight)
@@ -581,25 +592,26 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		// do not re-initialize to the full 2 B.
 		if cfg.Store != nil {
 			if rem, found, err := cfg.Store.LoadStakingPoolRemaining(); err != nil {
-				log.Warn("staking pool: failed to load from store; using config value", "err", err)
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+				panic(fmt.Errorf("staking pool: cannot safely restore persisted balance: %w", err))
 			} else if found {
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(rem))
+				atomic.StoreInt64(&e.stakingPoolRemaining, checkedPoolBalance(rem))
 				log.Info("staking pool: restored from store",
 					"remaining_napro", rem,
 					"remaining_apro", float64(rem)/1e8,
 				)
 			} else {
 				// First boot with pool enabled — persist initial balance.
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
-				_ = cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR)
+				if err := cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR); err != nil {
+					panic(fmt.Errorf("staking pool: cannot persist initial balance: %w", err))
+				}
+				atomic.StoreInt64(&e.stakingPoolRemaining, initialPoolBalance)
 				log.Info("staking pool: initialized",
 					"total_napro", cfg.StakingPoolNAPR,
 					"total_apro", float64(cfg.StakingPoolNAPR)/1e8,
 				)
 			}
 		} else {
-			atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+			atomic.StoreInt64(&e.stakingPoolRemaining, initialPoolBalance)
 		}
 	} else {
 		// Pool disabled — -1 signals legacy mint behavior.
@@ -707,7 +719,7 @@ func (e *Engine) DecrementPool(height uint64) {
 		// The validator debit and LPoD credit already committed in the same
 		// block batch. Refresh RAM only; never deduct the reward a second time.
 		if c, err := e.store.LoadLPoDCheckpoint(); err == nil && c != nil && c.Allocation != nil {
-			atomic.StoreInt64(&e.stakingPoolRemaining, int64(c.Allocation.ValidatorRemaining))
+			atomic.StoreInt64(&e.stakingPoolRemaining, checkedPoolBalance(c.Allocation.ValidatorRemaining))
 		}
 		return
 	}
@@ -734,10 +746,11 @@ func (e *Engine) DecrementPool(height uint64) {
 		if uint64(cur) < deduct {
 			deduct = uint64(cur) // clamp to remaining
 		}
-		next := int64(uint64(cur) - deduct)
+		remaining := uint64(cur) - deduct
+		next := checkedPoolBalance(remaining)
 		if atomic.CompareAndSwapInt64(&e.stakingPoolRemaining, cur, next) {
 			if e.store != nil {
-				if err := e.store.StoreStakingPoolRemaining(uint64(next)); err != nil {
+				if err := e.store.StoreStakingPoolRemaining(remaining); err != nil {
 					e.log.Warn("staking pool: failed to persist remaining", "height", height, "err", err)
 				}
 			}
@@ -1100,7 +1113,7 @@ func (e *Engine) tick() error {
 	e.mu.Unlock()
 	e.pool.SetBaseFee(newFee)
 
-	// Stake txs already applied above — no processStakeTxs call needed.
+	// Stake changes were already applied above.
 	if e.cfg.Registry != nil {
 		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
 	}
@@ -1370,7 +1383,7 @@ func (e *Engine) fetchOraclePrice() uint64 {
 		}
 		return 0
 	}
-	defer resp.Body.Close()
+	defer checkedio.LogClose(e.log, resp.Body, "oracle response body")
 	var p oraclePriceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
 		fails := atomic.AddInt64(&e.oracleConsecFails, 1)
@@ -1800,6 +1813,8 @@ func legacyAdminMintAuthorizationAvailable() bool {
 	return false
 }
 
+// ScheduleAdminMint rejects new legacy mints without consensus-authenticated
+// authorization. Local credentials or configuration cannot enable that path.
 func (e *Engine) ScheduleAdminMint(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
 	// Legacy admin mints have no consensus-authenticated envelope.  In
 	// particular, the idempotency key authenticates nothing: the resulting
@@ -2043,6 +2058,9 @@ func (e *Engine) resolveAdminMintsPersistenceFailed(err error) {
 	e.mintMu.Unlock()
 }
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
+	if round > math.MaxUint32 {
+		return nil, fmt.Errorf("block round exceeds uint32 wire range")
+	}
 	if e.cfg.MyKey == nil || !e.authority(e.localIdentity(height), height).Equals(e.cfg.MyKey.Public()) {
 		return nil, fmt.Errorf("configured key is not the signing authority at height %d", height)
 	}
@@ -2629,7 +2647,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 		e.halted.Store(true)
 		return fmt.Errorf("fatal slashing detector conflict after canonical persistence: %s", ev.String())
 	}
-	// Stake txs already applied above — no processStakeTxs call needed.
+	// Stake changes were already applied above.
 	if e.cfg.Registry != nil {
 		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
 	}
@@ -3690,25 +3708,6 @@ func (e *Engine) ProposerAt(round uint32) crypto.ValidatorPubKey {
 
 // Registry returns the validator registry (may be nil for legacy static config).
 func (e *Engine) Registry() *core.ValidatorRegistry { return e.cfg.Registry }
-
-// processStakeTxs scans a block for stake transactions and applies them to the registry.
-func (e *Engine) processStakeTxs(block *core.Block) {
-	if e.cfg.Registry == nil {
-		return
-	}
-	for _, tx := range block.Txs {
-		if !tx.IsStake() {
-			continue
-		}
-		if err := e.cfg.Registry.ProcessStakeTx(tx, block.Header.Height); err != nil {
-			e.log.Warn("stake tx rejected",
-				"height", block.Header.Height,
-				"tx", tx.Hash(),
-				"err", err,
-			)
-		}
-	}
-}
 
 // HandleVote processes a finalization vote (exported for testing and P2P).
 func (e *Engine) HandleVote(vote FinalizeMsg) error {

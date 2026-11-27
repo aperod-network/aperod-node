@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/explorer"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // Integration tests run only when DATABASE_URL is set.
@@ -22,7 +23,7 @@ func testIndexer(t *testing.T) *explorer.Indexer {
 	if err != nil {
 		t.Fatalf("explorer.New: %v", err)
 	}
-	t.Cleanup(func() { idx.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, idx) })
 	return idx
 }
 

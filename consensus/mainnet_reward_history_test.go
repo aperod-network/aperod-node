@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -63,7 +64,7 @@ func TestCanonicalMainnetRewardHistoryOnCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open copied chain read-only: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	tipHash, tipHeight, err := db.GetTip()
 	if err != nil || tipHeight != 2_478_718 ||
 		fmt.Sprintf("%x", tipHash[:]) != "5d056ebbcf94cd3ebe97b0cddd62cd4803c960b5821dc4f1883711e1a38d1ab3" {

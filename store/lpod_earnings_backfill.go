@@ -315,6 +315,7 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 			block.Header.Timestamp <= parentBlock.Header.Timestamp {
 			return nil, fmt.Errorf("invalid canonical accrual clock")
 		}
+		// #nosec G115 -- Strict monotonicity above makes the mathematical delta unsigned; the cast preserves a possible signed subtraction wrap before the elapsed cap below.
 		elapsed := uint64(block.Header.Timestamp - parentBlock.Header.Timestamp)
 		if elapsed > LPoDMaxElapsedNS {
 			elapsed = LPoDMaxElapsedNS

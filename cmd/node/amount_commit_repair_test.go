@@ -24,6 +24,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -92,7 +93,7 @@ func TestValidateAmountCommits_PatchesInMemoryAndStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	var oneTimePub crypto.Point32
 	oneTimePub[0] = 0x02 // non-zero sentinel
@@ -154,7 +155,7 @@ func TestValidateAmountCommits_RepairSurvivesNextCleanStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	var oneTimePub crypto.Point32
 	oneTimePub[0] = 0x03
@@ -245,7 +246,7 @@ func TestValidateAmountCommits_CorrectCommitIsNoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	var oneTimePub crypto.Point32
 	oneTimePub[0] = 0x04

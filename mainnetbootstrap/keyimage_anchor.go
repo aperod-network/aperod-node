@@ -11,6 +11,7 @@ import (
 	"os"
 
 	chaincrypto "github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -34,11 +35,12 @@ func InspectKeyImageAnchor(snapshotDB, anchorPath string, checkpointHeight uint6
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxKeyImageAnchorBytes {
 		return "", "", 0, errors.New("key-image anchor must be a regular non-symlink file <=64 MiB")
 	}
+	// #nosec G304 -- Offline operator-selected anchor; non-symlink, size, same-inode and canonical hash checks surround this read.
 	f, err := os.Open(anchorPath)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("open key-image anchor: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &err)
 	openedInfo, err := f.Stat()
 	if err != nil || !os.SameFile(info, openedInfo) {
 		return "", "", 0, errors.New("key-image anchor changed while opening")
@@ -53,14 +55,14 @@ func InspectKeyImageAnchor(snapshotDB, anchorPath string, checkpointHeight uint6
 		return "", "", 0, err
 	}
 	if doc.Height == 0 || doc.Height >= checkpointHeight ||
-		!isLowerHex(doc.BlockHash, 64) {
+		!isLowerHash(doc.BlockHash) {
 		return "", "", 0, errors.New("key-image anchor height/hash is invalid or not earlier than checkpoint")
 	}
 	db, err := store.OpenReadOnly(snapshotDB)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("open copied snapshot for key-image anchor: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &err)
 	canonical, found, err := db.GetCanonicalHash(doc.Height)
 	if err != nil || !found || hex.EncodeToString(canonical[:]) != doc.BlockHash {
 		return "", "", 0, errors.New("key-image anchor block hash does not match the copied database")

@@ -18,6 +18,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -501,7 +502,7 @@ func TestWalletChangesMissingWitnessHeightRequiresReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	read, err := db.NewWalletReadSnapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -547,7 +548,7 @@ func TestWalletChangesEmptyBlocksReturnBoundedResumeProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	var parent crypto.Hash32
 	hashes := make([]crypto.Hash32, 130)
 	for height := uint64(0); height <= 130; height++ {

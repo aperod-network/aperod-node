@@ -11,7 +11,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -354,18 +353,3 @@ func TestREST_ProposerSlotEnforced_SeeConsensusTests(t *testing.T) {
 	t.Log("proposer-slot enforcement tested in blockchain/consensus/consensus_test.go " +
 		"(TestEngine_HandleIncomingBlock_WrongProposerRejected)")
 }
-
-// ─── helper: build a test mempool + mint registry server ─────────────────────
-
-// mintTestBody encodes a minimal admin mint request body for address + amount.
-func mintTestBody(t *testing.T, addr crypto.Address, amtAPR float64) []byte {
-	t.Helper()
-	b, _ := json.Marshal(map[string]interface{}{
-		"address":    string(addr),
-		"amount_apr": amtAPR,
-	})
-	return b
-}
-
-// sprintHex formats bytes as lowercase hex — used in test error messages.
-func sprintHex(b []byte) string { return fmt.Sprintf("%x", b) }

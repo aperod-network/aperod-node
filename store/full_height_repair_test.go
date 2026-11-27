@@ -32,6 +32,8 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // putChainBlocks writes n blocks at heights 0..n-1 to db, records the
@@ -86,7 +88,7 @@ func TestRepairAllHeightIndex_DanglingEntry(t *testing.T) {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
-	db.Close()
+	testutil.Close(t, db)
 
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: unexpected error: %v", repErr)
@@ -126,7 +128,7 @@ func TestRepairAllHeightIndex_AbsentAndDangling(t *testing.T) {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
-	db.Close()
+	testutil.Close(t, db)
 
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: unexpected error: %v", repErr)
@@ -147,7 +149,7 @@ func TestRepairAllHeightIndex_FullyConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	putChainBlocks(t, db, 4)
 	_, tipHeight, err := db.GetTip()
@@ -197,12 +199,12 @@ func TestRepairAllHeightIndex_AbsentEntry(t *testing.T) {
 	// written; skipped>0 means it MUST NOT be written.  We test the store's
 	// side of this (the actual write is gated in runRepairHeightIndex / startup).
 	// Re-read via a fresh open to confirm the repaired entry persisted.
-	db.Close()
+	testutil.Close(t, db)
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 	got, err := db2.GetBlockByHeight(1)
 	if err != nil {
 		t.Fatalf("GetBlockByHeight after repair: %v", err)
@@ -234,7 +236,7 @@ func TestRepairAllHeightIndex_SentinelGating(t *testing.T) {
 	}
 
 	_, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
-	db.Close()
+	testutil.Close(t, db)
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", repErr)
 	}
@@ -260,7 +262,7 @@ func TestCheckAllHeightIndex_Consistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	putChainBlocks(t, db, 5)
 	_, tipHeight, err := db.GetTip()
@@ -295,7 +297,7 @@ func TestCheckAllHeightIndex_AbsentEntry(t *testing.T) {
 	}
 
 	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
-	db.Close()
+	testutil.Close(t, db)
 
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
@@ -328,7 +330,7 @@ func TestCheckAllHeightIndex_DanglingEntry(t *testing.T) {
 	}
 
 	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
-	db.Close()
+	testutil.Close(t, db)
 
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
@@ -370,7 +372,7 @@ func TestCheckAllHeightIndex_CountMissingHeightsMissesIt(t *testing.T) {
 
 	// CheckAllHeightIndex catches the dangling entry.
 	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
-	db.Close()
+	testutil.Close(t, db)
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
 	}
@@ -407,14 +409,14 @@ func TestRepairAllHeightIndex_PersistenceAfterRepair(t *testing.T) {
 	if skipped != 0 {
 		t.Errorf("skipped = %d, want 0", skipped)
 	}
-	db.Close()
+	testutil.Close(t, db)
 
 	// Reopen and confirm both repaired entries are readable.
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	for _, h := range []uint64{0, 1} {
 		got, err := db2.GetBlockByHeight(h)
@@ -473,7 +475,7 @@ func TestRepairAllHeightIndex_TwoBodiesAtOneHeight(t *testing.T) {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
-	db.Close()
+	testutil.Close(t, db)
 
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", repErr)
@@ -492,7 +494,7 @@ func TestRepairAllHeightIndex_TwoBodiesAtOneHeight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 	got, err := db2.GetBlockByHeight(1)
 	if err != nil {
 		t.Fatalf("GetBlockByHeight(1): %v", err)
@@ -537,7 +539,7 @@ func TestRepairAllHeightIndex_TwoBodiesAbsentEntry(t *testing.T) {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, nil)
-	db.Close()
+	testutil.Close(t, db)
 
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", repErr)
@@ -574,7 +576,7 @@ func TestCheckAllHeightIndex_SwappedValidHashes(t *testing.T) {
 	}
 
 	broken, _, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
-	db.Close()
+	testutil.Close(t, db)
 
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
@@ -605,7 +607,7 @@ func TestCheckAllHeightIndex_WrongHeightBody(t *testing.T) {
 	}
 
 	broken, firstBroken, chkErr := db.CheckAllHeightIndex(tipHeight, 0)
-	db.Close()
+	testutil.Close(t, db)
 
 	if chkErr != nil {
 		t.Fatalf("CheckAllHeightIndex: %v", chkErr)
@@ -630,7 +632,7 @@ func writeHeightKey(t *testing.T, dir string, db *store.DB, height uint64, hash 
 		t.Fatalf("open raw leveldb: %v", err)
 	}
 	if err := raw.Put(heightKeyRaw(height), hash[:], &opt.WriteOptions{Sync: true}); err != nil {
-		raw.Close()
+		testutil.Close(t, raw)
 		t.Fatalf("raw put h/%d: %v", height, err)
 	}
 	if err := raw.Close(); err != nil {
@@ -658,7 +660,7 @@ func writeDanglingHeightEntry(t *testing.T, dir string, db *store.DB, height uin
 		t.Fatalf("open raw leveldb: %v", err)
 	}
 	if err := raw.Put(heightKeyRaw(height), danglingHash[:], &opt.WriteOptions{Sync: true}); err != nil {
-		raw.Close()
+		testutil.Close(t, raw)
 		t.Fatalf("raw put h/%d: %v", height, err)
 	}
 	if err := raw.Close(); err != nil {
@@ -697,7 +699,7 @@ func TestRepairAllHeightIndex_DanglingViaRawWrite(t *testing.T) {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(1, nil)
-	db.Close()
+	testutil.Close(t, db)
 
 	if repErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", repErr)

@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -85,7 +87,7 @@ func exportCertificate(dbPath, outputPath string, expected crypto.ValidatorPubKe
 	if err != nil {
 		return fmt.Errorf("open offline database read-only: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "certificate export database")
 	cert, err := db.LoadFinalityCertificate()
 	if err != nil {
 		return fmt.Errorf("read source finality certificate: %w", err)
@@ -110,6 +112,7 @@ func exportCertificate(dbPath, outputPath string, expected crypto.ValidatorPubKe
 		return fmt.Errorf("encode certificate: %w", err)
 	}
 	raw = append(raw, '\n')
+	// #nosec G304 -- Operator-selected offline export destination; exclusive creation forbids overwriting an existing target.
 	f, err := os.OpenFile(outputAbs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("create new exclusive certificate file: %w", err)
@@ -185,7 +188,7 @@ func importCertificate(dbPath, certPath, registryPath string, expected crypto.Va
 	if err != nil {
 		return fmt.Errorf("open relay writable (must be stopped and exclusively unlocked): %w", err)
 	}
-	defer writable.Close()
+	defer checkedio.LogClose(slog.Default(), writable, "certificate import database")
 	recheckedHash, recheckedHeight, err := writable.GetTip()
 	if err != nil || recheckedHash != tipHash || recheckedHeight != tipHeight {
 		return fmt.Errorf("relay canonical tip changed after preflight; refusing write")
@@ -248,7 +251,7 @@ func verifyCertificateAtTip(db *store.DB, cert *store.FinalityCertificate, expec
 		len(committee.Validators) != 1 || !committee.Validators[0].Equals(expected) {
 		return fmt.Errorf("checkpoint committee is not the expected single-operator 1-of-1 committee")
 	}
-	requiredVotes := int(uint64(len(committee.Validators))*uint64(committee.BFTThresholdPPM)/1_000_000) + 1
+	requiredVotes := uint64(len(committee.Validators))*uint64(committee.BFTThresholdPPM)/1_000_000 + 1
 	if requiredVotes != 1 {
 		return fmt.Errorf("checkpoint committee threshold requires %d votes, not one", requiredVotes)
 	}
@@ -336,19 +339,19 @@ func legacyGenesisID(header *core.BlockHeader) crypto.Hash32 {
 	var height, timestamp [8]byte
 	var round [4]byte
 	binary.LittleEndian.PutUint64(height[:], header.Height)
-	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	binary.LittleEndian.PutUint32(round[:], header.Round)
 	return crypto.HashBytes(height[:], header.PrevHash[:], header.MerkleRoot[:],
 		timestamp[:], round[:], header.ValidatorPub)
 }
 
-func readCertificate(path string) (store.FinalityCertificate, error) {
+func readCertificate(path string) (_ store.FinalityCertificate, readCloseErr error) {
 	var cert store.FinalityCertificate
 	f, err := openRegularNoFollow(path, maxCertificateFile)
 	if err != nil {
 		return cert, fmt.Errorf("open certificate JSON: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 	raw, err := io.ReadAll(io.LimitReader(f, maxCertificateFile+1))
 	if err != nil || len(raw) > maxCertificateFile {
 		return cert, fmt.Errorf("certificate JSON exceeds %d bytes or could not be read", maxCertificateFile)
@@ -367,12 +370,12 @@ func readCertificate(path string) (store.FinalityCertificate, error) {
 	return cert, nil
 }
 
-func readAnchoredRegistry(path string) (*anchoredRegistry, error) {
+func readAnchoredRegistry(path string) (_ *anchoredRegistry, readCloseErr error) {
 	f, err := openRegularNoFollow(path, maxRegistryFile)
 	if err != nil {
 		return nil, fmt.Errorf("open validator-set snapshot: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 	raw, err := io.ReadAll(io.LimitReader(f, maxRegistryFile+1))
 	if err != nil || len(raw) > maxRegistryFile {
 		return nil, fmt.Errorf("validator-set snapshot exceeds %d bytes or could not be read", maxRegistryFile)
@@ -394,6 +397,7 @@ func openRegularNoFollow(path string, maxBytes int64) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// #nosec G115 -- syscall.Open succeeded; fd is a nonnegative native descriptor, which fits uintptr.
 	f := os.NewFile(uintptr(fd), path)
 	info, err := f.Stat()
 	if err != nil {

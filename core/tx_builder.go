@@ -9,6 +9,7 @@ import (
 	cryptorand "crypto/rand"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"sort"
 
@@ -287,10 +288,14 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		}
 	}
 	initialSize := txEstimatedSize(b.txVersion, 1, initialOutputs) + burnExtraBytes + avmPayloadBytes
-	if uint64(initialSize) > (^uint64(0)-avmGasFee)/b.feePerByte {
+	if initialSize < 0 {
+		return nil, fmt.Errorf("transaction fee size is invalid")
+	}
+	initialBytes := uint64(initialSize)
+	if initialBytes > (^uint64(0)-avmGasFee)/b.feePerByte {
 		return nil, fmt.Errorf("transaction fee estimate overflows uint64")
 	}
-	estimatedFee = uint64(initialSize)*b.feePerByte + avmGasFee
+	estimatedFee = initialBytes*b.feePerByte + avmGasFee
 	if amount > ^uint64(0)-estimatedFee {
 		return nil, fmt.Errorf("amount plus fee overflows uint64")
 	}
@@ -312,10 +317,14 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 		nOut = 1 // possible change output
 	}
 	actualSize := txEstimatedSize(b.txVersion, len(selected), nOut) + burnExtraBytes + avmPayloadBytes
-	if uint64(actualSize) > (^uint64(0)-avmGasFee)/b.feePerByte {
+	if actualSize < 0 {
+		return nil, fmt.Errorf("transaction fee size is invalid")
+	}
+	actualBytes := uint64(actualSize)
+	if actualBytes > (^uint64(0)-avmGasFee)/b.feePerByte {
 		return nil, fmt.Errorf("transaction fee estimate overflows uint64")
 	}
-	estimatedFee = uint64(actualSize)*b.feePerByte + avmGasFee
+	estimatedFee = actualBytes*b.feePerByte + avmGasFee
 	if amount > ^uint64(0)-estimatedFee {
 		return nil, fmt.Errorf("amount plus fee overflows uint64")
 	}
@@ -508,7 +517,7 @@ func (b *TxBuilder) Build(amount uint64, recipient, changeAddr crypto.Address) (
 			KeyImage:     ki,
 			Ring:         ring,
 			AmountCommit: u.AmountCommit,
-			RealIndex:    uint8(realIdx),
+			RealIndex:    uint8(realIdx), // #nosec G115 -- Canonical ring selection returns an index in [0, crypto.RingSize), currently 16.
 		}
 		if txVersionUsesCLSAG(b.txVersion) {
 			commits := make([]crypto.Commitment, crypto.RingSize)
@@ -712,7 +721,7 @@ func txBuildOutputWithEphemeral(addr crypto.Address, amount uint64, blind *crypt
 	if err != nil {
 		return Output{}, crypto.BlindFactor{}, crypto.Scalar32{}, fmt.Errorf("stealth output: %w", err)
 	}
-	payBlind := crypto.BlindFactor{}
+	var payBlind crypto.BlindFactor
 	if blind == nil {
 		payBlind, err = crypto.DeterministicPaymentBlind(so.HsScalar, amount)
 		if err != nil {
@@ -1030,22 +1039,13 @@ const (
 // The estimate scales linearly with the number of inputs/outputs and with the
 // fee rate, making it suitable for fee-bumping and wallet UI display.
 func ExportedEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
-	if feePerByte == 0 {
-		feePerByte = 1
-	}
-	size := uint64(txOverheadBytes + nInputs*txBytesPerInput + nOutputs*txBytesPerOutput)
-	return size * feePerByte
+	return feeForCheckedSize(checkedTxSize(nInputs, nOutputs, txBytesPerInput, txBytesPerOutput), feePerByte)
 }
 
 // ExportedEstimateFeeForVersion uses the wire format's serialized size,
 // including amount-binding proofs when version 13 or 14 is selected.
 func ExportedEstimateFeeForVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {
 	return txEstimateFeeVersion(version, nInputs, nOutputs, feePerByte)
-}
-
-// txEstimateFee is the internal variant used during transaction construction.
-func txEstimateFee(nInputs, nOutputs int, feePerByte uint64) uint64 {
-	return ExportedEstimateFee(nInputs, nOutputs, feePerByte)
 }
 
 // txEstimatedSize mirrors Transaction.Size for builder fee convergence.
@@ -1060,7 +1060,36 @@ func txEstimatedSize(version TxVersion, nInputs, nOutputs int) int {
 	if txVersionUsesAmountBinding(version) {
 		outputBytes += AmountBindingExtraBytesPerOutput
 	}
-	return txOverheadBytes + nInputs*inputBytes + nOutputs*outputBytes
+	return checkedTxSize(nInputs, nOutputs, inputBytes, outputBytes)
+}
+
+// checkedTxSize returns -1 instead of allowing signed count arithmetic to
+// wrap. All byte widths are positive protocol constants supplied above.
+func checkedTxSize(nInputs, nOutputs, inputBytes, outputBytes int) int {
+	if nInputs < 0 || nOutputs < 0 || nInputs > (math.MaxInt-txOverheadBytes)/inputBytes {
+		return -1
+	}
+	size := txOverheadBytes + nInputs*inputBytes
+	if nOutputs > (math.MaxInt-size)/outputBytes {
+		return -1
+	}
+	return size + nOutputs*outputBytes
+}
+
+// feeForCheckedSize saturates invalid/overflowing quotes, never wrapping them
+// into a smaller payable fee. The builder separately rejects invalid sizes.
+func feeForCheckedSize(size int, feePerByte uint64) uint64 {
+	if size < 0 {
+		return math.MaxUint64
+	}
+	if feePerByte == 0 {
+		feePerByte = 1
+	}
+	n := uint64(size)
+	if n > math.MaxUint64/feePerByte {
+		return math.MaxUint64
+	}
+	return n * feePerByte
 }
 
 func txVersionUsesCLSAG(version TxVersion) bool {
@@ -1077,8 +1106,5 @@ func txVersionIsAVM(version TxVersion) bool {
 }
 
 func txEstimateFeeVersion(version TxVersion, nInputs, nOutputs int, feePerByte uint64) uint64 {
-	if feePerByte == 0 {
-		feePerByte = 1
-	}
-	return uint64(txEstimatedSize(version, nInputs, nOutputs)) * feePerByte
+	return feeForCheckedSize(txEstimatedSize(version, nInputs, nOutputs), feePerByte)
 }

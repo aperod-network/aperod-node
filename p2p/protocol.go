@@ -17,6 +17,7 @@ import (
 // MessageType identifies the purpose of a network message.
 type MessageType uint8
 
+// Message type identifiers are encoded in the P2P frame's type byte.
 const (
 	MsgPing       MessageType = 0x01
 	MsgPong       MessageType = 0x02
@@ -163,12 +164,14 @@ func writeMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
 // The 4-byte length prefix and the body are written with a single
 // conn.Write call so a successful write is always a complete frame.
 func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, error) {
-	conn.SetWriteDeadline(time.Now().Add(WriteTimeout)) //nolint:errcheck
+	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return 0, fmt.Errorf("set write deadline: %w", err)
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("marshal: %w", err)
 	}
-	if uint32(len(data)) > maxMessagePayloadBytes(msgType) {
+	if uint64(len(data)) > uint64(maxMessagePayloadBytes(msgType)) {
 		return 0, fmt.Errorf("message payload too large for type 0x%02x: %d bytes",
 			msgType, len(data))
 	}
@@ -176,13 +179,14 @@ func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, er
 	// [1 byte type][payload]
 	body := append([]byte{byte(msgType)}, data...)
 
-	if len(body) > MaxMessageSize {
+	bodySize := uint64(len(body))
+	if bodySize > MaxMessageSize {
 		return 0, fmt.Errorf("message too large: %d bytes", len(body))
 	}
 
 	// [4-byte length prefix][body] in one buffer → one Write call.
 	frame := make([]byte, 4+len(body))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
+	binary.BigEndian.PutUint32(frame[:4], uint32(bodySize))
 	copy(frame[4:], body)
 
 	return conn.Write(frame)
@@ -190,7 +194,9 @@ func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, er
 
 // readMsg reads the next message from conn.
 func readMsg(conn net.Conn) (MessageType, []byte, error) {
-	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		return 0, nil, fmt.Errorf("set read deadline: %w", err)
+	}
 
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {

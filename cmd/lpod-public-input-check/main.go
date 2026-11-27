@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -46,7 +48,7 @@ func main() {
 	if err != nil {
 		fail("open copied DB: %v", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "offline public-input database")
 	if err := db.CheckLPoDConfig(nil); err == nil {
 		fail("archive does not require an existing activation binding")
 	}
@@ -66,6 +68,7 @@ func main() {
 }
 
 func readJSON(path string, target any) {
+	// #nosec G304 -- Offline evidence file explicitly selected by the CLI operator.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		fail("read public input: %v", err)

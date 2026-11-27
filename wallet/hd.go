@@ -46,7 +46,7 @@ func masterFromSeed(seed []byte) (*extKey, error) {
 
 // child derives a hardened child key. For Ed25519 (SLIP-0010) all children
 // must be hardened; if index < hardenedOffset it is promoted automatically.
-func (ek *extKey) child(index uint32) (*extKey, error) {
+func (ek *extKey) child(index uint32) *extKey {
 	if index < hardenedOffset {
 		index |= hardenedOffset
 	}
@@ -63,7 +63,7 @@ func (ek *extKey) child(index uint32) (*extKey, error) {
 	var child extKey
 	copy(child.key[:], I[:32])
 	copy(child.chainCode[:], I[32:])
-	return &child, nil
+	return &child
 }
 
 // DerivedKeys holds the Aperod spend + view key pair at a specific BIP44 path.
@@ -100,10 +100,7 @@ func DeriveKeys(seed []byte, account, index uint32) (*DerivedKeys, error) {
 	}
 	cur := master
 	for _, idx := range levels {
-		cur, err = cur.child(idx)
-		if err != nil {
-			return nil, fmt.Errorf("hd derive: %w", err)
-		}
+		cur = cur.child(idx)
 	}
 
 	// Use first 32 bytes as the spend seed; view seed is HMAC("view", key)

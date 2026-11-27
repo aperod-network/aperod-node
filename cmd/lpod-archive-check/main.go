@@ -6,13 +6,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -26,30 +28,7 @@ func main() {
 		fail("require copied-db and a positive interval of at most 50000 blocks")
 	}
 	if *evict {
-		err := filepath.WalkDir(*path, func(path string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			if !entry.Type().IsRegular() {
-				return fmt.Errorf("refuse nonregular entry: %s", path)
-			}
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			err = f.Sync()
-			if err == nil {
-				err = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
-			}
-			closeErr := f.Close()
-			if err != nil {
-				return err
-			}
-			return closeErr
-		})
+		err := evictArchiveCopy(*path)
 		if err != nil {
 			fail("copy-only eviction: %v", err)
 		}
@@ -62,7 +41,7 @@ func main() {
 	if err != nil {
 		fail("open copy: %v", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "offline archive audit database")
 	previous, found, err := db.GetCanonicalHash(*start - 1)
 	if err != nil || !found {
 		fail("missing preceding index: %v", err)
@@ -122,6 +101,50 @@ func main() {
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fail("encode: %v", err)
 	}
+}
+
+// evictArchiveCopy confines advisory operations to the operator-selected cold
+// copy, including when an entry is replaced after directory enumeration.
+// Successful advice does not establish that later reads reach physical media.
+func evictArchiveCopy(path string) (retErr error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer checkedio.CloseReadResult(root, &retErr)
+	return fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("refuse nonregular copy entry: %s", name)
+		}
+		return evictArchiveCopyFile(root, name)
+	})
+}
+
+func evictArchiveCopyFile(root *os.Root, name string) (retErr error) {
+	f, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer checkedio.CloseReadResult(f, &retErr)
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("opened copy entry is not a regular file: %s", name)
+	}
+	syncErr := f.Sync()
+	if syncErr != nil {
+		return syncErr
+	}
+	// #nosec G115 -- This owned, still-open descriptor originated in root.Open; it is a native fd, not an arbitrary uintptr.
+	return unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 }
 
 func fail(format string, args ...any) {

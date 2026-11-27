@@ -153,7 +153,7 @@ func TestReplayBlockStakeTxs_RestartSafety(t *testing.T) {
 
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, blindErr := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	blind, blindErr := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	if blindErr != nil {
 		t.Fatalf("DeterministicMintBlind: %v", blindErr)
 	}
@@ -279,7 +279,7 @@ func TestRestartSafety_UTXORebuildAndStakeReplay(t *testing.T) {
 
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, _ := crypto.DeterministicMintBlind(spendPub, stakeAmt)
+	blind, _ := crypto.LegacyMintBlind(spendPub, stakeAmt)
 	commit, _ := crypto.Commit(stakeAmt, blind)
 
 	// A different UTXO that should survive untouched after restart (unrelated to stake).
@@ -339,7 +339,9 @@ func TestRestartSafety_UTXORebuildAndStakeReplay(t *testing.T) {
 	if err := utxos1.ApplyBlock(mintBlock); err != nil { // burn UTXO added to active set
 		t.Fatal(err)
 	}
-	reg1.ApplyBlockStakeTxs(stakeBlock.Txs, 2) // moves burn UTXO to staked set
+	if _, err := reg1.ApplyBlockStakeTxs(stakeBlock.Txs, 2); err != nil { // moves burn UTXO to staked set
+		t.Fatalf("apply stake fixture: %v", err)
+	}
 
 	// Sanity check first run.
 	if utxos1.Get(burnHash, 0) != nil {
@@ -418,7 +420,7 @@ func TestReplayBlockStakeTxs_GenesisValidatorTopup(t *testing.T) {
 
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, _ := crypto.DeterministicMintBlind(spendPub, topupAmt)
+	blind, _ := crypto.LegacyMintBlind(spendPub, topupAmt)
 	commit, _ := crypto.Commit(topupAmt, blind)
 
 	var burnHash crypto.Hash32
@@ -546,7 +548,7 @@ func TestApplyBlockStakeTxs_RollbackOnPartialFailure(t *testing.T) {
 	// UTXO-A: will be staked by tx[0] and must be returned to active set on rollback.
 	var spendPub0 crypto.Point32
 	copy(spendPub0[:], []byte(pub0))
-	blind0, err := crypto.DeterministicMintBlind(spendPub0, amt)
+	blind0, err := crypto.LegacyMintBlind(spendPub0, amt)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}
@@ -587,7 +589,7 @@ func TestApplyBlockStakeTxs_RollbackOnPartialFailure(t *testing.T) {
 	// Build tx[1]: valid payload but UTXO-B does not exist in the set.
 	var spendPub1 crypto.Point32
 	copy(spendPub1[:], []byte(pub1))
-	blind1, _ := crypto.DeterministicMintBlind(spendPub1, amt)
+	blind1, _ := crypto.LegacyMintBlind(spendPub1, amt)
 	tx1 := buildDepositTx(priv1, pub1, amt, utxoHashB, 0, blind1)
 
 	// Set up registry (no genesis validators — empty state).

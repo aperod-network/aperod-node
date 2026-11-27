@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -48,7 +49,7 @@ type report struct {
 	Matches                 []outputMatch `json:"matches"`
 }
 
-func run() error {
+func run() (readCloseErr error) {
 	path := flag.String("copied-db", "", "existing isolated LevelDB copy (read-only)")
 	height := flag.Uint64("height", 0, "claimed block height")
 	hashHex := flag.String("tx-hash", "", "recorded transaction hash (64 hex characters)")
@@ -68,7 +69,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	indexedHash, found, err := db.GetCanonicalHash(*height)
 	if err != nil {
@@ -183,7 +184,7 @@ func legacyTxHash(tx *core.Transaction) crypto.Hash32 {
 func historicalHeaderHashes(h *core.BlockHeader) (crypto.Hash32, crypto.Hash32) {
 	height, timestamp, round, oracle := make([]byte, 8), make([]byte, 8), make([]byte, 4), make([]byte, 8)
 	binary.LittleEndian.PutUint64(height, h.Height)
-	binary.LittleEndian.PutUint64(timestamp, uint64(h.Timestamp))
+	binary.LittleEndian.PutUint64(timestamp, uint64(h.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	binary.LittleEndian.PutUint32(round, h.Round)
 	binary.LittleEndian.PutUint64(oracle, h.OraclePrice)
 	parts := [][]byte{height, h.PrevHash[:], h.MerkleRoot[:], timestamp, round, h.ValidatorPub}

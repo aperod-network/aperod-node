@@ -34,6 +34,11 @@ type SyncState struct{ s *syncState }
 // NewSyncState returns an exported SyncState for use in tests.
 func NewSyncState() *SyncState { return &SyncState{s: newSyncState()} }
 
+// MarkRequested tracks a requested block hash.
 func (ss *SyncState) MarkRequested(h crypto.Hash32) { ss.s.markRequested(h) }
-func (ss *SyncState) MarkReceived(h crypto.Hash32)  { ss.s.markReceived(h) }
-func (ss *SyncState) Pending() int                  { return ss.s.pending() }
+
+// MarkReceived removes a received hash from the outstanding requests.
+func (ss *SyncState) MarkReceived(h crypto.Hash32) { ss.s.markReceived(h) }
+
+// Pending reports the number of outstanding block requests.
+func (ss *SyncState) Pending() int { return ss.s.pending() }

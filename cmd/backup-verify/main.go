@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -133,7 +135,7 @@ func writeChainProof(dbPath, anchorsPath, outputPath, tipHash string, tipHeight 
 	if err != nil {
 		return fmt.Errorf("open closed chain.db read-only: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "proof source database")
 
 	genesisIndexHash, found, err := db.GetCanonicalHash(0)
 	if err != nil {
@@ -253,11 +255,6 @@ func hexHash(value string) (crypto.Hash32, error) {
 	return hash, nil
 }
 
-func verifyStoredBlock(db *store.DB, hash crypto.Hash32, height uint64, genesis bool) error {
-	_, err := readStoredBlock(db, hash, height, genesis)
-	return err
-}
-
 func readCanonicalGenesis(db *store.DB, indexed, expectedHeaderHash crypto.Hash32) (*core.Block, error) {
 	raw, err := db.GetRawBlock(indexed)
 	if err != nil {
@@ -297,7 +294,7 @@ func legacyGenesisID(header *core.BlockHeader) crypto.Hash32 {
 	var height, timestamp [8]byte
 	var round [4]byte
 	binary.LittleEndian.PutUint64(height[:], header.Height)
-	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	binary.LittleEndian.PutUint32(round[:], header.Round)
 	return crypto.HashBytes(height[:], header.PrevHash[:], header.MerkleRoot[:],
 		timestamp[:], round[:], header.ValidatorPub)
@@ -324,12 +321,13 @@ func readStoredBlock(db *store.DB, hash crypto.Hash32, height uint64, genesis bo
 	return &block, nil
 }
 
-func readAnchors(path string) (anchorsFile, error) {
+func readAnchors(path string) (_ anchorsFile, readCloseErr error) {
+	// #nosec G304 -- Offline CLI input explicitly selected by the operator, not an HTTP-supplied filename.
 	file, err := os.Open(path)
 	if err != nil {
 		return anchorsFile{}, fmt.Errorf("open anchors file: %w", err)
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	var result anchorsFile
@@ -381,20 +379,17 @@ func writeProofAtomic(path string, document proof) error {
 		return fmt.Errorf("create proof temporary file: %w", err)
 	}
 	tempPath := file.Name()
-	defer os.Remove(tempPath)
+	defer checkedio.LogRemoveStaging(slog.Default(), tempPath)
 	if err := file.Chmod(0600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("secure proof temporary file: %w", err)
+		return fmt.Errorf("secure proof temporary file: %w", errors.Join(err, file.Close()))
 	}
 	encoder := json.NewEncoder(file)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(document); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("encode proof: %w", err)
+		return fmt.Errorf("encode proof: %w", errors.Join(err, file.Close()))
 	}
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync proof: %w", err)
+		return fmt.Errorf("sync proof: %w", errors.Join(err, file.Close()))
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close proof: %w", err)
@@ -402,11 +397,12 @@ func writeProofAtomic(path string, document proof) error {
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("publish proof atomically: %w", err)
 	}
+	// #nosec G304 -- Directory of the operator-selected proof output; opened for durability sync, never selected by a remote request.
 	dir, err := os.Open(directory)
 	if err != nil {
 		return fmt.Errorf("open proof directory: %w", err)
 	}
-	defer dir.Close()
+	defer checkedio.LogClose(slog.Default(), dir, "published proof directory")
 	if err := dir.Sync(); err != nil {
 		return fmt.Errorf("sync proof directory: %w", err)
 	}
@@ -516,12 +512,13 @@ func verifyLegacyStage(root string) (string, uint64, error) {
 	return fmt.Sprintf("%x", tipHash[:]), tipHeight, nil
 }
 
-func readManifest(path string) (manifest, error) {
+func readManifest(path string) (_ manifest, readCloseErr error) {
+	// #nosec G304 -- Offline CLI manifest explicitly selected by the operator.
 	f, err := os.Open(path)
 	if err != nil {
 		return manifest{}, fmt.Errorf("open manifest.json: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 
 	decoder := json.NewDecoder(f)
 	decoder.UseNumber()

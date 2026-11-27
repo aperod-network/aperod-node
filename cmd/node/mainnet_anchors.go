@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
 
-func verifyStartupMainnetAnchors(db *store.DB, manifestPath string) (mainnetbootstrap.SignedStatement, error) {
+func verifyStartupMainnetAnchors(db *store.DB, manifestPath string) (_ mainnetbootstrap.SignedStatement, readCloseErr error) {
+	// #nosec G304 -- Node operator's startup trust-manifest path, not an HTTP parameter.
 	f, err := os.Open(manifestPath)
 	if err != nil {
 		return mainnetbootstrap.SignedStatement{}, fmt.Errorf("open bootstrap manifest: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 	signed, err := mainnetbootstrap.ReadStrict(f)
 	if err != nil {
 		return mainnetbootstrap.SignedStatement{}, fmt.Errorf("decode bootstrap manifest: %w", err)

@@ -112,7 +112,7 @@ func TestSnapshotTipMatchesEngineFinalHeight(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 1}))
 	utxos := core.NewUTXOSet()
 	registry := core.NewValidatorRegistry()
-	performShutdown(stop, engineDone, db, utxos, registry, dir, log, nil)
+	performShutdown(stop, engineDone, db, utxos, registry, dir, log)
 
 	// ── Assert 1: snapshot exists at the engine's final committed height (N+1).
 	wantPath := snapshotPath(dir, finalHeight)
@@ -179,7 +179,7 @@ func TestSnapshotReloadNoFullScanAfterShutdown(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 1}))
 	utxos := core.NewUTXOSet()
 	registry := core.NewValidatorRegistry()
-	performShutdown(stop, engineDone, db, utxos, registry, dir, log, nil)
+	performShutdown(stop, engineDone, db, utxos, registry, dir, log)
 
 	// ── Simulate startup: run the fast-path logic with a captured logger.
 	// This mirrors the loadStartupSnapshot + log calls in main.go run().

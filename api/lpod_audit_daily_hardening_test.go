@@ -16,6 +16,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -313,7 +314,7 @@ func TestVerifyDailyPositionRowsRejectsAmountShiftWithSameAggregate(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)

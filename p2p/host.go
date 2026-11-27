@@ -407,13 +407,14 @@ func (p *Peer) sendN(msgType MessageType, payload interface{}) (wrote int, err e
 	if p.poisoned {
 		return 0, net.ErrClosed
 	}
-	p.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	wrote, err = writeMsgN(p.conn, msgType, payload)
 	if err != nil && wrote > 0 {
 		// Partial frame on the wire: poison and close BEFORE releasing
 		// p.mu so no interleaving sender can write into the broken stream.
 		p.poisoned = true
-		p.conn.Close()
+		if closeErr := p.conn.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close poisoned peer: %w", closeErr))
+		}
 	}
 	return wrote, err
 }
@@ -1431,17 +1432,16 @@ func (h *Host) saveWhitelistToFile(entries []string) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("p2p: whitelist persist: write to %q failed: %w", tmpName, err)
+		return fmt.Errorf("p2p: whitelist persist: write to %q failed: %w",
+			tmpName, errors.Join(err, tmp.Close(), os.Remove(tmpName)))
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("p2p: whitelist persist: close %q failed: %w", tmpName, err)
+		return fmt.Errorf("p2p: whitelist persist: close %q failed: %w",
+			tmpName, errors.Join(err, os.Remove(tmpName)))
 	}
 	if err := os.Rename(tmpName, h.cfg.WhitelistFile); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("p2p: whitelist persist: rename %q→%q failed: %w", tmpName, h.cfg.WhitelistFile, err)
+		return fmt.Errorf("p2p: whitelist persist: rename %q→%q failed: %w",
+			tmpName, h.cfg.WhitelistFile, errors.Join(err, os.Remove(tmpName)))
 	}
 	h.log.Debug("p2p: whitelist persisted", "entries", len(entries), "file", h.cfg.WhitelistFile)
 	return nil
@@ -1456,7 +1456,7 @@ func (h *Host) DropPeer(addr string) bool {
 	h.mu.Lock()
 	p, ok := h.peers[addr]
 	if ok {
-		p.conn.Close()
+		h.closeTransport(p.conn, "DropPeer")
 		delete(h.peers, addr)
 	}
 	h.mu.Unlock()
@@ -1483,7 +1483,7 @@ func (h *Host) cancelInFlightDials(ip string) {
 	}
 	delete(h.dialingIPs, ip)
 	for _, conn := range h.pendingConns[ip] {
-		conn.Close()
+		h.closeTransport(conn, "cancelInFlightDials")
 	}
 	delete(h.pendingConns, ip)
 }
@@ -1512,7 +1512,7 @@ func (h *Host) BanPeer(addr, reason string, d time.Duration) {
 	h.mu.Lock()
 	for a, p := range h.peers {
 		if connIP(a) == bannedIP {
-			p.conn.Close()
+			h.closeTransport(p.conn, "BanPeer")
 			delete(h.peers, a)
 		}
 	}
@@ -1553,7 +1553,7 @@ func (h *Host) banTxFlooder(peerIP string, peer *Peer, violations int) {
 	h.mu.Lock()
 	for addr, p := range h.peers {
 		if connIP(addr) == peerIP {
-			p.conn.Close()
+			h.closeTransport(p.conn, "banTxFlooder")
 			delete(h.peers, addr)
 		}
 	}
@@ -1729,12 +1729,12 @@ func dialableWhitelistAddr(entry string) (addr string, ok bool) {
 func (h *Host) Stop() {
 	close(h.done)
 	if h.listener != nil {
-		h.listener.Close()
+		h.closeTransport(h.listener, "Stop")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, p := range h.peers {
-		p.conn.Close()
+		h.closeTransport(p.conn, "Stop")
 	}
 }
 
@@ -1771,7 +1771,7 @@ func (h *Host) BroadcastBlock(block *core.Block) {
 			// disconnect/reconnect lifecycle takes over.
 			h.log.Warn("broadcast block partial write; connection closed (no retry)",
 				"peer", p.addr, "wrote", wrote, "err", err)
-			p.conn.Close()
+			h.closeTransport(p.conn, "BroadcastBlock")
 			continue
 		}
 		if !isRetryableSendErr(err) {
@@ -1863,7 +1863,7 @@ func (h *Host) retryBlockSend(p *Peer, sb interface{}) {
 		// takes no host locks.)
 		h.log.Warn("broadcast block retry partial write; connection closed",
 			"peer", p.addr, "wrote", wrote, "err", err)
-		p.conn.Close()
+		h.closeTransport(p.conn, "retryBlockSend")
 		return
 	}
 	h.log.Warn("broadcast block retry failed; relying on keepalive/stall fallback",
@@ -2009,7 +2009,7 @@ func (h *Host) acceptLoop() {
 			remoteIP := net.ParseIP(connIP(conn.RemoteAddr().String()))
 			if remoteIP == nil || !ipInWhitelist(remoteIP, wlNets, wlIPs) {
 				h.log.Info("inbound connection rejected: source not in peer_whitelist")
-				conn.Close()
+				h.closeTransport(conn, "acceptLoop")
 				continue
 			}
 		}
@@ -2033,7 +2033,7 @@ func (h *Host) acceptLoop() {
 			if total >= h.cfg.MaxPeers {
 				h.log.Debug("inbound connection rejected: MaxPeers reached",
 					"max", h.cfg.MaxPeers)
-				conn.Close()
+				h.closeTransport(conn, "acceptLoop")
 				continue
 			}
 			// MinOutbound: reserve slots exclusively for outbound dial-outs
@@ -2048,7 +2048,7 @@ func (h *Host) acceptLoop() {
 						"inbound", inboundCount,
 						"cap", inboundCap,
 						"min_outbound", h.cfg.MinOutbound)
-					conn.Close()
+					h.closeTransport(conn, "acceptLoop")
 					continue
 				}
 			}
@@ -2067,7 +2067,7 @@ func (h *Host) acceptLoop() {
 			}
 			h.mu.RUnlock()
 			if ipCount >= h.cfg.MaxPeersPerIP {
-				conn.Close()
+				h.closeTransport(conn, "acceptLoop")
 				continue
 			}
 		}
@@ -2081,7 +2081,7 @@ func (h *Host) acceptLoop() {
 			if !h.reserveInboundHandshake(connIP(conn.RemoteAddr().String())) {
 				h.log.Info("MaxPendingHandshakes reached — inbound connection rejected",
 					"limit", h.cfg.MaxPendingHandshakes)
-				conn.Close()
+				h.closeTransport(conn, "acceptLoop")
 				continue
 			}
 		}
@@ -2568,7 +2568,7 @@ func (h *Host) dialPeer(addr string) {
 		// phase also aborts cleanly.
 		tlsConn := tls.Client(tcpConn, h.cfg.TLSConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			tcpConn.Close()
+			h.closeTransport(tcpConn, "dialPeer")
 			if ctx.Err() != nil {
 				h.log.Debug("tls handshake aborted (peer banned during dial)", "addr", addr)
 			} else {
@@ -2605,7 +2605,7 @@ func (h *Host) dialPeer(addr string) {
 	remoteAddr := conn.RemoteAddr().String()
 	if h.mgr.IsBanned(addr) || h.mgr.IsBanned(remoteAddr) {
 		h.dialGateMu.Unlock()
-		conn.Close()
+		h.closeTransport(conn, "dialPeer")
 		h.log.Debug("dropping connection to just-banned peer", "addr", addr)
 		return
 	}
@@ -2706,7 +2706,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 				"peer", addr,
 				"panic", fmt.Sprintf("%v", r),
 				"stack", string(debug.Stack()))
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			h.mu.Lock()
 			// Identity-safe: do not evict a replacement peer registered
 			// at the same address after a DropPeer / reconnect race.
@@ -2798,15 +2798,13 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 	//      application handshake, and
 	//   b) PeerFingerprint is available before any application data flows.
 	if tlsConn, ok := conn.(*tls.Conn); ok {
-		tlsConn.SetDeadline(time.Now().Add(h.cfg.HandshakeTimeout)) //nolint:errcheck
-		if err := tlsConn.Handshake(); err != nil {
+		if err := completeTLSHandshake(tlsConn, h.cfg.HandshakeTimeout); err != nil {
 			// releaseHS() via defer; no explicit call needed here.
-			h.log.Debug("tls handshake failed — plaintext or unauthorized peer rejected",
+			h.log.Debug("tls connection setup failed",
 				"addr", addr, "err", err)
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
-		tlsConn.SetDeadline(time.Time{}) //nolint:errcheck
 		fp := PeerFingerprint(conn)
 		h.log.Debug("tls handshake ok", "addr", addr, "fingerprint", fp)
 
@@ -2826,7 +2824,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 				"hint", "delete the p2p_identity.key file in your data directory and restart, or restart the node with --reset-p2p-identity",
 			)
 			h.recordDuplicateIdentityEvent(addr, fp)
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 
@@ -2843,7 +2841,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 			if !allowed {
 				h.log.Info("peer rejected: fingerprint not in allowed_peers list",
 					"addr", addr, "fingerprint", fp)
-				conn.Close()
+				h.closeTransport(conn, "handleConn")
 				return
 			}
 			h.log.Debug("peer fingerprint allowed", "addr", addr, "fingerprint", fp)
@@ -2888,17 +2886,17 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 	if outbound {
 		// Dialer: send Ping, wait for Pong
 		if err := writeMsg(conn, MsgPing, selfMsg); err != nil {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 		msgType, data, err := readMsg(conn)
 		if err != nil || msgType != MsgPong {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 		var pong PingMsg
 		if err := unmarshal(data, &pong); err != nil {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 		peerID = pong.NodeID
@@ -2907,18 +2905,18 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 		// Acceptor: wait for Ping, send Pong
 		msgType, data, err := readMsg(conn)
 		if err != nil || msgType != MsgPing {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 		var theirPing PingMsg
 		if err := unmarshal(data, &theirPing); err != nil {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 		peerID = theirPing.NodeID
 		peerHeight = theirPing.Height
 		if err := writeMsg(conn, MsgPong, selfMsg); err != nil {
-			conn.Close()
+			h.closeTransport(conn, "handleConn")
 			return
 		}
 	}
@@ -3012,7 +3010,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 	h.dialGateMu.Unlock()
 	if rejectReason != "" {
 		h.log.Debug("connection rejected after handshake: "+rejectReason, rejectFields...)
-		conn.Close()
+		h.closeTransport(conn, "handleConn")
 		return
 	}
 
@@ -3094,7 +3092,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 						"deadline", pongDeadline,
 						"since_last_pong", time.Since(lastPong).Round(time.Millisecond),
 					)
-					conn.Close()
+					h.closeTransport(conn, "handleConn")
 					return
 				}
 				if err := peer.Send(MsgPing, PingMsg{
@@ -3192,7 +3190,7 @@ func (h *Host) handleConn(conn net.Conn, outbound bool, dialID, pendingID uint64
 
 	// Message loop
 	defer func() {
-		conn.Close()
+		h.closeTransport(conn, "handleConn")
 		h.mu.Lock()
 		// Identity-safe cleanup: only remove the peer if it is still
 		// the same *Peer object registered at startup of this
@@ -3413,7 +3411,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 						h.mu.Lock()
 						for addr, p := range h.peers {
 							if connIP(addr) == peerIP {
-								p.conn.Close()
+								h.closeTransport(p.conn, "dispatch")
 								delete(h.peers, addr)
 							}
 						}
@@ -3539,7 +3537,7 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 					h.mu.Lock()
 					for addr, p := range h.peers {
 						if connIP(addr) == peerIP {
-							p.conn.Close()
+							h.closeTransport(p.conn, "dispatch")
 							delete(h.peers, addr)
 						}
 					}
@@ -3768,10 +3766,12 @@ func (h *Host) dispatch(peer *Peer, msgType MessageType, data []byte) error {
 
 func (h *Host) requestHeaders(peer *Peer) {
 	tail := h.handler.CurrentTailHashes(32)
-	peer.Send(MsgGetHeaders, GetHeadersMsg{
+	if err := peer.Send(MsgGetHeaders, GetHeadersMsg{
 		KnownHashes: tail,
 		Limit:       500,
-	})
+	}); err != nil {
+		h.log.Debug("send header request failed", "err", err)
+	}
 }
 
 func (h *Host) handleGetHeaders(peer *Peer, msg GetHeadersMsg) error {

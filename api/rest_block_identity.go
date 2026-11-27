@@ -136,7 +136,7 @@ func historicalHeaderHash(header core.BlockHeader, includeOraclePrice, includeBa
 	encoded.Write(u64[:])
 	encoded.Write(header.PrevHash[:])
 	encoded.Write(header.MerkleRoot[:])
-	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp)) // #nosec G115 -- Canonical two's-complement signed timestamp bits; narrowing or rejecting negatives would change historical header identity.
 	encoded.Write(u64[:])
 	var u32 [4]byte
 	binary.LittleEndian.PutUint32(u32[:], header.Round)

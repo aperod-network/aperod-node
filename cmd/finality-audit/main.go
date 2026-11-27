@@ -9,12 +9,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -49,7 +51,7 @@ func main() {
 	if err != nil {
 		fatal("open offline DB: %v", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "offline finality audit database")
 	if err := verifyAuthorityForkAnchor(db, authorityFork); err != nil {
 		fatal("verify validator authority fork: %v", err)
 	}
@@ -155,6 +157,7 @@ func loadAuthorityFork(path, expectedSHA256 string) (*core.ValidatorAuthorityFor
 	if err != nil || len(want) != sha256.Size {
 		return nil, fmt.Errorf("invalid expected authority fork SHA-256")
 	}
+	// #nosec G304 -- Offline authority file selected by the operator; digest and authorization are checked separately.
 	raw, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("read authority fork: %w", err)
@@ -219,11 +222,16 @@ func verifyAuthorityForkAnchor(db *store.DB, fork *core.ValidatorAuthorityFork) 
 }
 
 func readHistoricalRegistry(path string, height uint64, hash string) core.RegistrySnapshot {
+	// #nosec G304 -- Offline registry input explicitly selected by the operator, not a remotely supplied path.
 	file, err := os.Open(path)
 	if err != nil {
 		fatal("open historical snapshot: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			fatal("close historical registry snapshot: %v", err)
+		}
+	}()
 	prefix := make([]byte, 512)
 	n, err := file.Read(prefix)
 	if err != nil && err != io.EOF {

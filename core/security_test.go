@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // makeTestBlock wraps a list of transactions into a signed block at height h.
@@ -199,7 +200,7 @@ func TestVerifyBlock_Timejacking_Rejected(t *testing.T) {
 		t.Fatalf("Sign genesis: %v", err)
 	}
 	genesis := &core.Block{Header: genesisHdr}
-	chain.SetGenesis(genesis)
+	testutil.NoError(t, chain.SetGenesis(genesis))
 
 	cfg := core.DefaultBlockVerifierConfig()
 	cfg.MaxPastDrift = 30 * time.Second

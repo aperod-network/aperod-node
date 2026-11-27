@@ -32,15 +32,19 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 var (
@@ -94,18 +98,19 @@ func safePrefix(s string, n int) string {
 }
 
 // readSnapshot reads and decodes a gzip-compressed JSON snapshot from path.
-func readSnapshot(path string) (*startupSnapshot, error) {
+func readSnapshot(path string) (_ *startupSnapshot, readCloseErr error) {
+	// #nosec G304 -- Offline recovery snapshot explicitly selected by the CLI operator.
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 
 	gzr, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("open gzip reader: %w", err)
 	}
-	defer gzr.Close()
+	defer checkedio.CloseReadResult(gzr, &readCloseErr)
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
@@ -118,6 +123,7 @@ func readSnapshot(path string) (*startupSnapshot, error) {
 // (temp file + rename).
 func writeSnapshot(path string, snap *startupSnapshot) error {
 	tmp := path + ".tmp"
+	// #nosec G304 -- Temporary sibling of the operator-selected recovery output; no remote request controls this path.
 	f, err := os.Create(tmp)
 	if err != nil {
 		return fmt.Errorf("create tmp file: %w", err)
@@ -130,21 +136,17 @@ func writeSnapshot(path string, snap *startupSnapshot) error {
 	fCloseErr := f.Close()
 
 	if encErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("encode snapshot: %w", encErr)
+		return fmt.Errorf("encode snapshot: %w", errors.Join(encErr, gzCloseErr, fCloseErr, os.Remove(tmp)))
 	}
 	if gzCloseErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close gzip writer: %w", gzCloseErr)
+		return fmt.Errorf("close gzip writer: %w", errors.Join(gzCloseErr, fCloseErr, os.Remove(tmp)))
 	}
 	if fCloseErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close tmp file: %w", fCloseErr)
+		return fmt.Errorf("close tmp file: %w", errors.Join(fCloseErr, os.Remove(tmp)))
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename tmp to final: %w", err)
+		return fmt.Errorf("rename tmp to final: %w", errors.Join(err, os.Remove(tmp)))
 	}
 	return nil
 }
@@ -237,7 +239,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("FATAL: cannot open LevelDB: %v", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "tip recovery database")
 
 	// Read current tip for display.
 	curHashB, _ := db.Get(metaKey("tip/hash"), nil)

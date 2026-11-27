@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -278,7 +279,7 @@ func TestBootnodeDialBackoff_ClearedAfterBriefConnect(t *testing.T) {
 		// so the session drops before stableConnTime (60 s).
 		server, client := net.Pipe()
 		go func() {
-			defer server.Close()
+			defer testutil.CleanupClose(t, server)
 			server.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 			mt, _, err := p2p.ReadMsg(server)
 			if err != nil || mt != p2p.MsgPing {

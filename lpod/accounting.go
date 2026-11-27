@@ -12,8 +12,13 @@ import (
 	"math/big"
 )
 
+// InitialNAPRO is the nominal 1B APRO accounting basis, not proof of funding.
 const InitialNAPRO uint64 = 100_000_000_000_000_000
+
+// Unit is the number of nAPRO in one APRO.
 const Unit uint64 = 100_000_000
+
+// YearSeconds is the fixed 365-day denominator used by the accounting rules.
 const YearSeconds uint64 = 365 * 24 * 60 * 60
 const denominator uint64 = 100 * YearSeconds
 
@@ -36,6 +41,7 @@ var tiers = [...]Tier{
 	{100_000_000 * Unit, 200_000 * Unit, 20, 10},
 }
 
+// TierFor selects the configured tier for a vault's total stake.
 func TierFor(total uint64) (Tier, error) {
 	if total < tiers[0].Threshold || total > tiers[len(tiers)-1].Threshold {
 		return Tier{}, fmt.Errorf("lpod: vault stake outside 100K–100M APRO")
@@ -48,7 +54,7 @@ func TierFor(total uint64) (Tier, error) {
 	panic("unreachable")
 }
 
-// All externally serialized monetary values are decimal strings. A State is an
+// State stores monetary values as decimal strings when serialized. It is an
 // accounting checkpoint, NOT evidence of an authorized allocation or payment.
 // FundingDebit may only originate from a future audited available-allocation
 // ledger debit, never validator reserves, arbitrary wallets, or issuance.
@@ -74,6 +80,7 @@ type Carry struct {
 	Leader uint64 `json:"leader_remainder,string"`
 }
 
+// Vault supplies one vault's stake, income and accrual inputs to settlement.
 type Vault struct {
 	ID             string  `json:"id"`
 	TotalStake     uint64  `json:"total_stake_napro,string"`
@@ -84,6 +91,7 @@ type Vault struct {
 	Arrears        uint64  `json:"arrears_napro,string"`
 }
 
+// Payment records the funded shares and remaining unfunded liability of a vault.
 type Payment struct {
 	VaultID  string `json:"vault_id"`
 	Leader   uint64 `json:"leader_napro,string"`

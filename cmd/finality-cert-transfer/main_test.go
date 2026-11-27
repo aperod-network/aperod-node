@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -150,7 +151,7 @@ func TestValidCertificateTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	got, err := db.LoadFinalityCertificate()
 	if err != nil || got == nil || got.Height != fixture.cert.Height || got.BlockHash != fixture.cert.BlockHash {
 		t.Fatalf("imported certificate = %#v, error %v", got, err)
@@ -190,7 +191,7 @@ func copyCanonicalChain(t *testing.T, sourcePath, targetPath string, tipHeight u
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer target.Close()
+	defer testutil.CleanupClose(t, target)
 	for height, block := range blocks {
 		if err := target.PutRawBlock(block.hash, uint64(height), block.raw); err != nil {
 			t.Fatal(err)
@@ -219,7 +220,7 @@ func copyFinalityCommitteeSnapshot(t *testing.T, sourcePath, targetPath string, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer target.Close()
+	defer testutil.CleanupClose(t, target)
 	if err := target.SaveFinalityCommitteeSnapshot(*snapshot); err != nil {
 		t.Fatalf("copy committee snapshot: %v", err)
 	}
@@ -309,7 +310,7 @@ func TestVerifyLegacyIndexedGenesis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	if err := db.PutRawBlock(legacyHash, 0, raw); err != nil {
 		t.Fatal(err)
 	}

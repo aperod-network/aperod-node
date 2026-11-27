@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
@@ -48,10 +50,12 @@ func runRelease(command string, args []string) error {
 		return err
 	}
 	if command == "release-sign" {
+		// #nosec G703 -- Local offline attestation command's explicit --input flag.
 		info, err := os.Stat(*input)
 		if err != nil {
 			return err
 		}
+		// #nosec G703 -- Offline release root explicitly selected by its operator; entries are validated below.
 		if err := filepath.WalkDir(*root, func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -84,11 +88,12 @@ func runRelease(command string, args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(signed)
 	}
+	// #nosec G703 -- Operator-selected offline artifact input, not a remote caller's path.
 	file, err := os.Open(*input)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer checkedio.LogClose(slog.Default(), file, "bootstrap release input")
 	dec := json.NewDecoder(io.LimitReader(file, 8193))
 	dec.DisallowUnknownFields()
 	var s mainnetbootstrap.SignedRelease
@@ -131,6 +136,7 @@ func checkReleaseStartupSnapshot(root string) error {
 			continue
 		}
 		sidecar := filepath.Join(state, name)
+		// #nosec G304 G703 -- Fixed checksum sidecar name derived from the offline operator-selected snapshot.
 		f, err := os.Open(sidecar)
 		if err != nil {
 			return err
@@ -201,7 +207,7 @@ func checkReleaseWitnessProfile(root, authorityDigest string, avmHeight uint64) 
 
 // This checks certificate compatibility, not signatures or committee quorum.
 // Call only after authenticating the closed payload and its existing LOCK file.
-func checkReleaseFinalitySchedule(root string) error {
+func checkReleaseFinalitySchedule(root string) (readCloseErr error) {
 	cfg, err := config.Load(filepath.Join(root, "config", "node.yaml"))
 	if err != nil {
 		return err
@@ -214,7 +220,7 @@ func checkReleaseFinalitySchedule(root string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 	cert, err := db.LoadFinalityCertificate()
 	if err != nil {
 		return err

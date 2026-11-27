@@ -29,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 const chainDBExportWriteTimeout = 2 * time.Hour
@@ -109,14 +111,16 @@ func (s *Server) restSnapshotExport(w http.ResponseWriter, r *http.Request) {
 		return candidates[i].height > candidates[j].height
 	})
 	best := candidates[0]
-	snapPath := filepath.Join(dataDir, best.name)
-
-	f, err := os.Open(snapPath)
+	f, err := openSnapshotForExport(dataDir, best.name)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "open snapshot: "+err.Error())
 		return
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			s.log.Debug("close exported snapshot reader failed", "err", err)
+		}
+	}()
 
 	// Stat via the open fd to get an accurate, race-free size.
 	info, err := f.Stat()
@@ -133,7 +137,9 @@ func (s *Server) restSnapshotExport(w http.ResponseWriter, r *http.Request) {
 	// selection logic above; no path traversal is possible.
 	w.Header().Set("X-Snapshot-Filename", best.name)
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
+	if _, err := io.Copy(w, f); err != nil {
+		s.log.Debug("snapshot export stream interrupted", "err", err)
+	}
 }
 
 // restChainDBExport creates an isolated logical checkpoint through LevelDB's
@@ -175,6 +181,8 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "export staging path is not a safe directory")
 		return
 	}
+	// #nosec G302 -- Lstat above proves this is a directory. Owner traversal
+	// is required; group/other permissions remain zero.
 	if err := os.Chmod(stagingRoot, 0700); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "cannot secure export staging directory")
 		return
@@ -184,7 +192,11 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "cannot create private export stage")
 		return
 	}
-	defer os.RemoveAll(stage)
+	defer func() {
+		if err := os.RemoveAll(stage); err != nil {
+			s.log.Error("cannot remove private chain export staging", "err", err)
+		}
+	}()
 
 	chainDBPath := filepath.Join(stage, "chain.db")
 	tipHash, tipHeight, err := s.blockStore.ExportLogicalBackup(r.Context(), chainDBPath)
@@ -196,6 +208,13 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, status, "logical chain checkpoint could not be completed")
 		return
 	}
+
+	exportRoot, err := os.OpenRoot(stage)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "cannot open isolated checkpoint root")
+		return
+	}
+	defer checkedio.LogClose(s.log, exportRoot, "logical checkpoint export root")
 
 	gw, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	if err != nil {
@@ -243,9 +262,16 @@ func (s *Server) restChainDBExport(w http.ResponseWriter, r *http.Request) {
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		f, err := os.Open(path)
+		f, err := checkedio.OpenRootedRegular(exportRoot, rel)
 		if err != nil {
 			return err
+		}
+		opened, statErr := f.Stat()
+		if statErr != nil {
+			return errors.Join(statErr, f.Close())
+		}
+		if !os.SameFile(info, opened) {
+			return errors.Join(fmt.Errorf("logical checkpoint changed while archiving %q", rel), f.Close())
 		}
 		_, copyErr := io.CopyN(tw, f, info.Size())
 		closeErr := f.Close()

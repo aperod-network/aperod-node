@@ -12,6 +12,7 @@ type LevelStore struct {
 	DB *store.DB
 }
 
+// Get reads a value from the AVM namespace in the backing database.
 func (s LevelStore) Get(key []byte) ([]byte, bool, error) {
 	if s.DB == nil {
 		return nil, false, fmt.Errorf("avm: nil LevelDB store")
@@ -19,6 +20,7 @@ func (s LevelStore) Get(key []byte) ([]byte, bool, error) {
 	return s.DB.GetAVMState(key)
 }
 
+// Apply persists the supplied changes through the database's AVM state batch.
 func (s LevelStore) Apply(writes []Write) error {
 	if s.DB == nil {
 		return fmt.Errorf("avm: nil LevelDB store")

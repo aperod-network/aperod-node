@@ -17,6 +17,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -58,7 +59,7 @@ func TestLPoDAuditDailyFailsClosed(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(func() { db.Close() })
+				t.Cleanup(func() { testutil.CleanupClose(t, db) })
 				srv.SetStore(db)
 			}
 			certHash := hashes[tc.certificateHeight]
@@ -204,7 +205,7 @@ func TestLPoDAuditDailyFailsClosedOnRegistryEvidenceGaps(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { db.Close() })
+			t.Cleanup(func() { testutil.CleanupClose(t, db) })
 			srv.SetStore(db)
 			certHash := hashes[14]
 			if err := db.SaveFinalityCertificate(store.FinalityCertificate{
@@ -318,7 +319,7 @@ func TestLPoDAuditDailyFailsClosedWhenTimestampProbeBodyIsPruned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	certHash := hashes[14]
 	if err := db.SaveFinalityCertificate(store.FinalityCertificate{
 		Version: 1, Height: 14, BlockHash: certHash, Votes: []store.FinalityVote{{Signature: []byte{1}}},
@@ -389,7 +390,7 @@ func TestLPoDAuditDailyUsesStoredBlockHintForPrunedSearchProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	srv.SetStore(db)
 	var pruneCursor [8]byte
 	binary.LittleEndian.PutUint64(pruneCursor[:], 7)
@@ -491,7 +492,7 @@ func TestLPoDAuditDailyRequiresCoverageMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	srv.SetStore(db)
 	srv.SetLPoDConfig(nil, func(uint64, crypto.Hash32) bool { return true })
 	code, body := dailyAuditGet(t, srv, "/api/v1/lpod/audit/daily?date=2024-01-02")
@@ -567,7 +568,7 @@ func dailyAuditFixture(t *testing.T, markerHeight uint64) (*api.Server, *store.D
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	srv := api.NewServer(":0", nil, nil, nil, testLogger())
 	srv.SetStore(db)
 	srv.SetAPIKey(dailyAuditTestAPIKey)
@@ -715,7 +716,7 @@ func dailyAuditCompleteFixture(t *testing.T) (*api.Server, *store.DB, []crypto.H
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	srv := api.NewServer(":0", nil, nil, nil, testLogger())
 	srv.SetStore(db)
 	srv.SetAPIKey(dailyAuditTestAPIKey)

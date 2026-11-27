@@ -29,6 +29,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -325,7 +326,7 @@ func TestActiveUTXOCountMetadataRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	hashHex := fmt.Sprintf("%064x", 42)
 
