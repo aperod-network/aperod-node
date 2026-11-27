@@ -76,7 +76,9 @@ func (k ValidatorPubKey) ID() string {
 
 // Verify checks an ED25519 signature against a hash.
 func (k ValidatorPubKey) Verify(hash Hash32, sig []byte) bool {
-	if len(sig) != ed25519.SignatureSize {
+	// ed25519.Verify panics for malformed public-key lengths. A missing
+	// height-bound authority must reject a vote, not terminate the node.
+	if len(k) != ed25519.PublicKeySize || len(sig) != ed25519.SignatureSize {
 		return false
 	}
 	return ed25519.Verify(ed25519.PublicKey(k), hash[:], sig)
