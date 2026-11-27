@@ -171,23 +171,21 @@ func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, er
 	if err != nil {
 		return 0, fmt.Errorf("marshal: %w", err)
 	}
-	if uint64(len(data)) > uint64(maxMessagePayloadBytes(msgType)) {
+	// Bound the native-int arithmetic directly, before adding the type byte
+	// and length prefix. The wire cap fits even a 32-bit int.
+	if len(data) > MaxMessageSize-1 || uint64(len(data)) > uint64(maxMessagePayloadBytes(msgType)) {
 		return 0, fmt.Errorf("message payload too large for type 0x%02x: %d bytes",
 			msgType, len(data))
 	}
 
-	// [1 byte type][payload]
-	body := append([]byte{byte(msgType)}, data...)
-
-	bodySize := uint64(len(body))
-	if bodySize > MaxMessageSize {
-		return 0, fmt.Errorf("message too large: %d bytes", len(body))
-	}
-
-	// [4-byte length prefix][body] in one buffer → one Write call.
-	frame := make([]byte, 4+len(body))
+	// [4-byte length prefix][1-byte type][payload], in one bounded buffer
+	// and one Write call. Avoid a second allocation/copy for the body.
+	bodySize := len(data) + 1
+	frame := make([]byte, 4+bodySize)
+	// #nosec G115 -- the direct payload guard bounds bodySize to [1, 10 MiB], well within uint32.
 	binary.BigEndian.PutUint32(frame[:4], uint32(bodySize))
-	copy(frame[4:], body)
+	frame[4] = byte(msgType)
+	copy(frame[5:], data)
 
 	return conn.Write(frame)
 }
