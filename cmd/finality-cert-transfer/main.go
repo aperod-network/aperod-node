@@ -237,6 +237,21 @@ func verifyCertificateAtTip(db *store.DB, cert *store.FinalityCertificate, expec
 	if err := verifyOneVote(cert, expected); err != nil {
 		return err
 	}
+	committee, err := db.LoadFinalityCommitteeSnapshot(cert.Height / core.EpochLength)
+	if err != nil {
+		return fmt.Errorf("load checkpoint committee snapshot: %w", err)
+	}
+	if committee == nil {
+		return fmt.Errorf("checkpoint committee snapshot is unavailable")
+	}
+	if committee.Version != 1 || committee.Epoch != cert.Height/core.EpochLength ||
+		len(committee.Validators) != 1 || !committee.Validators[0].Equals(expected) {
+		return fmt.Errorf("checkpoint committee is not the expected single-operator 1-of-1 committee")
+	}
+	requiredVotes := int(uint64(len(committee.Validators))*uint64(committee.BFTThresholdPPM)/1_000_000) + 1
+	if requiredVotes != 1 {
+		return fmt.Errorf("checkpoint committee threshold requires %d votes, not one", requiredVotes)
+	}
 	if err := verifyBlockAt(db, tipHeight, tipHash, expected); err != nil {
 		return fmt.Errorf("certified canonical block: %w", err)
 	}

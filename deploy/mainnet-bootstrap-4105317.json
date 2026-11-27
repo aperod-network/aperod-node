@@ -1,0 +1,31 @@
+{
+  "statement": {
+    "schema_version": "aperod-mainnet-bootstrap-v2",
+    "network": "mainnet",
+    "chain_id": "aperod-mainnet-1",
+    "trust_model": "operator_1_of_1",
+    "bootstrap_signer_public_key": "b4c0efdb8b08110d933461c61a24892a9eeb1eb810bd2c3e1d31012f448b50df",
+    "genesis_header_hash": "c8fde86c1764a5603eabd6d9c56c9e47b4cf06d88d299a55665694473e2c512f",
+    "genesis_index_hash": "da452e4c9d3bd8a21d73289c88a3583960eb774d0fa312206b72020b5dc54de1",
+    "genesis_signature_hash_kind": "canonical_index_hash",
+    "genesis_signer_public_key": "08fd38ba8857d32d2ac807f0246a0fd298c9edf336fbd0fea3bb7bd818c91137",
+    "checkpoint_height": 4105317,
+    "checkpoint_header_hash": "9c8998d9e55110d9630a70258b0e4f32e62a7dd9a528460519433d09c1fb0a60",
+    "checkpoint_index_hash": "9c8998d9e55110d9630a70258b0e4f32e62a7dd9a528460519433d09c1fb0a60",
+    "checkpoint_validator_public_key": "08fd38ba8857d32d2ac807f0246a0fd298c9edf336fbd0fea3bb7bd818c91137",
+    "checkpoint_signature_length": 64,
+    "checkpoint_signature_hash_kind": "header_hash",
+    "checkpoint_oracle_price": 56759000,
+    "checkpoint_base_fee": 50,
+    "validator_authority_fork_sha256": "eba603fc797e2b6a6b7a8b951b689870e0be32de2eceb4257d22eba29176fa55",
+    "protocol_sale_migration_sha256": "f3344da9cfb502a68b9c38d5c02c6feb17cd9169f2759e1e2a17b34615c98384",
+    "lpod_migration_witness_sha256": "b25f546a2bd00a40afc3ed8f0a17ff5b73fd7a8ef1765e8fabe9436ab8519dc0",
+    "snapshot_tree_sha256": "cd561650b83ba130a4914e7c6bae912402c02f3234a62eaa59db29831c4c9580",
+    "registry_sha256": "0dafb32cf794e5c53f0a23331bf11209c840d07a4f56c6373b0bf65e15ddaead",
+    "key_image_anchor_sha256": "946f9addbda2644a3ee200b9a9f343bea90812684dd1501782df53e995f29829",
+    "key_image_anchor_height": 3770756,
+    "key_image_anchor_block_hash": "6e56c3a514aee6e650ec0c98a7324e7a33b7dacb64526a2abcf10dc9248f7d91"
+  },
+  "signer_public_key": "b4c0efdb8b08110d933461c61a24892a9eeb1eb810bd2c3e1d31012f448b50df",
+  "signature": "32800d066b3ad311ea49c25d44cadbf874ba7e8a21ca88b4e787d4b1afd81ea5d1d5112c18d869dcd478653ca2c37eef84b344ab645dcba1db2351135e90a70b"
+}

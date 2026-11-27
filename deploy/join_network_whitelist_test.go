@@ -133,8 +133,12 @@ func TestJoinWhitelistMissingConfigDoesNotTouchData(t *testing.T) {
 				"APEROD_NODE_YAML="+missing, "SECONDARY_DATA_DIR="+data,
 				"JOIN_EXTERNAL_CALLS="+calls, "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			out, err := cmd.CombinedOutput()
-			if err == nil || !strings.Contains(string(out), "peer_whitelist") ||
-				!strings.Contains(string(out), "install-node.sh") {
+			output := string(out)
+			legacyGuidance := strings.Contains(output, "peer_whitelist") &&
+				strings.Contains(output, "install-node.sh")
+			failClosedGuidance := strings.Contains(output, "Конфигурация локальной ноды не найдена") &&
+				strings.Contains(output, "перенос данных запрещён")
+			if err == nil || (!legacyGuidance && !failClosedGuidance) {
 				t.Fatalf("missing config must fail with install guidance: %v\n%s", err, out)
 			}
 			body, err := os.ReadFile(marker)

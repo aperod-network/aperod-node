@@ -137,18 +137,9 @@ func TLSConfigWithAllowedPeerFingerprints(base *tls.Config, allowedPeers []strin
 	if base == nil {
 		return nil, fmt.Errorf("p2p TLS config is required")
 	}
-	if len(allowedPeers) == 0 {
-		return nil, fmt.Errorf("p2p TLS requires at least one allowed peer fingerprint")
-	}
-
-	pinned := make(map[string]struct{}, len(allowedPeers))
-	for _, value := range allowedPeers {
-		fingerprint := strings.ToLower(strings.TrimSpace(value))
-		decoded, err := hex.DecodeString(fingerprint)
-		if err != nil || len(decoded) != sha256.Size {
-			return nil, fmt.Errorf("invalid allowed peer fingerprint")
-		}
-		pinned[fingerprint] = struct{}{}
+	pinned, err := parseAllowedPeerFingerprints(allowedPeers)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := base.Clone()
@@ -166,6 +157,29 @@ func TLSConfigWithAllowedPeerFingerprints(base *tls.Config, allowedPeers []strin
 		return nil
 	}
 	return cfg, nil
+}
+
+// ValidateAllowedPeerFingerprints checks the mandatory TLS pins without
+// opening sockets, generating a node key, or contacting any peer.
+func ValidateAllowedPeerFingerprints(allowedPeers []string) error {
+	_, err := parseAllowedPeerFingerprints(allowedPeers)
+	return err
+}
+
+func parseAllowedPeerFingerprints(allowedPeers []string) (map[string]struct{}, error) {
+	if len(allowedPeers) == 0 {
+		return nil, fmt.Errorf("p2p TLS requires at least one allowed peer fingerprint")
+	}
+	pinned := make(map[string]struct{}, len(allowedPeers))
+	for _, value := range allowedPeers {
+		fingerprint := strings.ToLower(strings.TrimSpace(value))
+		decoded, err := hex.DecodeString(fingerprint)
+		if err != nil || len(decoded) != sha256.Size {
+			return nil, fmt.Errorf("invalid allowed peer fingerprint")
+		}
+		pinned[fingerprint] = struct{}{}
+	}
+	return pinned, nil
 }
 
 func nodeConfigFromKey(priv ed25519.PrivateKey, pub ed25519.PublicKey) (*tls.Config, string, error) {

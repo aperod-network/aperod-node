@@ -161,7 +161,7 @@ exec "$@"`
 				t.Fatalf("expected read-only maintenance refusal (exit 1), got %v\n%s", err, output)
 			}
 			text := string(output)
-			warned := strings.Contains(text, "WARNING: --config was not supplied; defaulting to /etc/aperod/node.yaml")
+		warned := strings.Contains(text, "WARNING: --config was not supplied; using /etc/aperod/node.yaml")
 			if warned != (!tc.explicit && !tc.missingSystem && !tc.requireDataDir) {
 				t.Fatalf("unexpected auto-switch warning (present=%v):\n%s", warned, text)
 			}

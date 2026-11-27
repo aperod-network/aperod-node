@@ -369,7 +369,7 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 	if len(settlement.Vaults) != 0 && !reflect.DeepEqual(settlement.Vaults, derivedVaults) {
 		return fmt.Errorf("lpod audit: supplied vault amounts differ from authenticated derivation")
 	}
-	nextState, nextCarries, payments, err := lpod.Settle(before.State, before.Carries, height, derivedVaults)
+	payments, err := settleLPoDPositionAccounting(before, accrued, height, settlement, derivedVaults)
 	if err != nil {
 		return err
 	}
@@ -382,7 +382,7 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 	for id, position := range accrued.Positions {
 		expectedAfter.Positions[id] = position
 	}
-	expectedAfter.State, expectedAfter.Carries, expectedAfter.Allocation = nextState, nextCarries, nextAllocation
+	expectedAfter.Allocation = nextAllocation
 	// Match the deterministic proportional distribution used by the canonical
 	// position payout transition, without calling PayoutLPoD (which reads tip).
 	ids := make([]string, 0, len(expectedAfter.Positions))
@@ -425,6 +425,13 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 			return fmt.Errorf("lpod audit: position payment does not conserve")
 		}
 	}
+	expectedAfter.PendingLiability = 0
+	for _, position := range expectedAfter.Positions {
+		expectedAfter.PendingLiability, err = lpodAdd(expectedAfter.PendingLiability, position.PendingDue)
+		if err != nil {
+			return err
+		}
+	}
 	if err := expectedAfter.validatePositions(); err != nil {
 		return err
 	}
@@ -448,6 +455,12 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 		if err != nil {
 			return err
 		}
+	}
+	leaderOutputs, leaderPaidByValidator, err := deriveLPoDValidatorPayouts(
+		before, after, block.Header.Timestamp, settlement.Proposer, settlement.Leader,
+	)
+	if err != nil {
+		return err
 	}
 	for _, v := range derivedVaults {
 		sumAccrued, err = lpodAdd(sumAccrued, derefAccrual(v.ExactAccrual))
@@ -474,22 +487,58 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 		record.Vaults = append(record.Vaults, LPoDAuditVault{
 			ID: v.ID, ValidatorStake: stake.Amount, GuardianStake: v.GuardianStake,
 			TotalStake: totalStake, TierStake: v.TotalStake, APRPercent: tier.APRPercent, LeaderPercent: tier.LeaderPercent,
-			Accrued: derefAccrual(v.ExactAccrual), ActualLeaderPaid: pay.Leader,
+			Accrued: derefAccrual(v.ExactAccrual), ActualLeaderPaid: leaderPaidByValidator[v.ID],
 			GuardianPaid: pay.Angels, Unfunded: pay.Unfunded,
 		})
 	}
-	if after.State.AccruedLiability < before.State.AccruedLiability ||
-		after.State.AngelPaid < before.State.AngelPaid || after.State.LeaderPaid < before.State.LeaderPaid ||
-		sumAccrued != after.State.AccruedLiability-before.State.AccruedLiability ||
+	seenVaults := make(map[string]bool, len(record.Vaults))
+	for _, vault := range record.Vaults {
+		seenVaults[vault.ID] = true
+	}
+	var releasedValidators []string
+	for validator := range leaderPaidByValidator {
+		if !seenVaults[validator] {
+			releasedValidators = append(releasedValidators, validator)
+		}
+	}
+	sort.Strings(releasedValidators)
+	for _, validator := range releasedValidators {
+		record.Vaults = append(record.Vaults, LPoDAuditVault{
+			ID: validator, ActualLeaderPaid: leaderPaidByValidator[validator],
+		})
+	}
+	sort.Slice(record.Vaults, func(i, j int) bool { return record.Vaults[i].ID < record.Vaults[j].ID })
+	futureOnlyActivation := settlement.DailyValidatorPayout &&
+		before.ValidatorDailyPayoutVersion == 0
+	accrualBaseline := before.State.AccruedLiability
+	unfundedBaseline := before.State.UnfundedLiability
+	if futureOnlyActivation {
+		accrualBaseline = before.State.AngelPaid
+		unfundedBaseline = 0
+	}
+	expectedAccrued, err := lpodAdd(accrualBaseline, sumAccrued)
+	if err != nil {
+		return err
+	}
+	leaderBefore, err := lpodAdd(before.State.LeaderPaid, before.State.PendingLeader)
+	if err != nil {
+		return err
+	}
+	leaderAfter, err := lpodAdd(after.State.LeaderPaid, after.State.PendingLeader)
+	if err != nil {
+		return err
+	}
+	if after.State.AngelPaid < before.State.AngelPaid ||
+		after.State.AccruedLiability != expectedAccrued ||
 		sumGuardian != after.State.AngelPaid-before.State.AngelPaid ||
-		sumLeader != after.State.LeaderPaid-before.State.LeaderPaid {
+		leaderAfter < leaderBefore || sumLeader != leaderAfter-leaderBefore {
 		return fmt.Errorf("lpod audit: per-vault payments do not reconcile state deltas")
 	}
 	leftUnfunded, err := lpodAdd(after.State.UnfundedLiability, sumArrears)
 	if err != nil {
 		return err
 	}
-	rightUnfunded, err := lpodAdd(before.State.UnfundedLiability, sumUnfunded)
+	rightUnfunded, err := lpodAdd(unfundedBaseline, sumUnfunded)
 	if err != nil {
 		return err
 	}
@@ -539,6 +588,9 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 		carryBefore := uint64(0)
 		if priorOK {
 			dueBefore, carryBefore = prior.Due, prior.APRCarry
+		}
+		if futureOnlyActivation {
+			dueBefore, carryBefore = 0, 0
 		}
 		if pre.Due < dueBefore || post.Due > pre.Due || post.Withdrawn < func() uint64 {
 			if priorOK {
@@ -600,9 +652,11 @@ func (d *DB) PersistLPoDAuditAt(block *core.Block, settlement *LPoDSettlement, a
 			if payment.VaultID != settlement.Proposer {
 				return fmt.Errorf("lpod audit: non-proposer leader payment")
 			}
-			if err := addAmount(settlement.Leader, payment.Leader); err != nil {
-				return err
-			}
+		}
+	}
+	for address, amount := range leaderOutputs {
+		if err := addAmount(address, amount); err != nil {
+			return err
 		}
 	}
 

@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: Aperod Mainnet
+    orgId: 1
+    folder: Aperod Mainnet
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards/aperod-mainnet

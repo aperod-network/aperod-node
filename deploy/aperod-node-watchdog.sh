@@ -77,6 +77,48 @@ write_timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ' > "${file}" || true
 }
 
+# Keep only a bounded audit of Mainnet identity-refusal transitions. Entries
+# contain a Unix-ms timestamp and a fixed event token, never command output or
+# configuration. The atomic replacement prevents readers from seeing a partial
+# line; repeated checks in the same state do not add duplicate events.
+append_mainnet_identity_event() (
+  local event="$1"
+  local events_file="${STATE_DIR}/watchdog-mainnet-identity-events"
+  local latest_line="" latest_event="" tmp_file occurred_at_ms
+  case "${event}" in
+    refusal|recovery) ;;
+    *) return 1 ;;
+  esac
+
+  mkdir -p "${STATE_DIR}" 2>/dev/null || return 1
+  if [[ -f "${events_file}" ]]; then
+    latest_line=$(tail -n 1 "${events_file}") || true
+    if [[ "${latest_line}" =~ ^[0-9]{13}[[:space:]](refusal|recovery)$ ]]; then
+      latest_event="${BASH_REMATCH[1]}"
+      if [[ "${latest_event}" == "${event}" ]]; then
+        return 0
+      fi
+    fi
+  fi
+
+  umask 077
+  tmp_file=$(mktemp "${STATE_DIR}/.watchdog-mainnet-events.XXXXXX") || return 1
+  if [[ -f "${events_file}" ]] &&
+     ! tail -n 100 "${events_file}" |
+       awk 'NF == 2 && length($1) == 13 && $1 ~ /^[0-9]+$/ && ($2 == "refusal" || $2 == "recovery") { print $1, $2 }' |
+       tail -n 99 > "${tmp_file}"; then
+    rm -f "${tmp_file}" 2>/dev/null || true
+    return 1
+  fi
+  occurred_at_ms=$(( $(date +%s) * 1000 ))
+  if ! printf '%s %s\n' "${occurred_at_ms}" "${event}" >> "${tmp_file}" ||
+     ! chmod 0644 "${tmp_file}" ||
+     ! mv -f "${tmp_file}" "${events_file}"; then
+    rm -f "${tmp_file}" 2>/dev/null || true
+    return 1
+  fi
+)
+
 # Atomically increment the restart counter file
 increment_restart_count() {
   mkdir -p "${STATE_DIR}" 2>/dev/null || true
@@ -265,10 +307,62 @@ skip_for_api_startup_grace() {
   return 1
 }
 
+# A mainnet identity refusal exits with EX_CONFIG (78). systemd prevents its
+# restart, and this guard prevents the periodic watchdog from restarting it
+# again or generating repeated outage alerts until the operator changes the
+# configuration/release and starts the service deliberately.
+skip_for_mainnet_identity_refusal() {
+  local exit_status active_state marker="${STATE_DIR}/watchdog-mainnet-identity-refusal"
+  if ! exit_status=$(systemctl show aperod-node --property=ExecMainStatus --value 2>/dev/null); then
+    if [[ -e "${marker}" ]]; then
+      log "cannot verify the prior Mainnet identity refusal — keeping its marker and history"
+      exit 0
+    fi
+    return 1
+  fi
+  if [[ "${exit_status}" != "78" ]]; then
+    if [[ -e "${marker}" ]]; then
+      if ! append_mainnet_identity_event recovery; then
+        log "could not record Mainnet identity recovery — keeping refusal marker"
+        exit 0
+      fi
+      rm -f "${marker}" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  if ! active_state=$(systemctl show aperod-node --property=ActiveState --value 2>/dev/null); then
+    if [[ -e "${marker}" ]]; then
+      log "cannot verify the prior Mainnet identity refusal state — keeping its marker and history"
+      exit 0
+    fi
+    return 1
+  fi
+  if [[ "${active_state}" != "failed" && "${active_state}" != "inactive" ]]; then
+    if [[ -e "${marker}" ]]; then
+      if ! append_mainnet_identity_event recovery; then
+        log "could not record Mainnet identity recovery — keeping refusal marker"
+        exit 0
+      fi
+      rm -f "${marker}" 2>/dev/null || true
+    fi
+    return 1
+  fi
+
+  if ! append_mainnet_identity_event refusal; then
+    log "could not append Mainnet identity refusal event"
+  fi
+  if [[ ! -e "${marker}" ]]; then
+    log "mainnet identity/bootstrap is not verified (EX_CONFIG=78) — watchdog will not restart the unchanged service"
+    write_timestamp "${marker}"
+  fi
+  exit 0
+}
+
 # ---------------------------------------------------------------------------
 # Record this check run (always — so Admin Panel can detect liveness)
 # ---------------------------------------------------------------------------
 write_timestamp "${LAST_CHECK_FILE}"
+skip_for_mainnet_identity_refusal || true
 
 # ---------------------------------------------------------------------------
 # Health check (body captured for block-height parsing)

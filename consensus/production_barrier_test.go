@@ -38,6 +38,8 @@ func productionBarrierFixture(t *testing.T, stopAt uint64) (*Engine, *crypto.Loc
 			return nil
 		},
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	utxos := core.NewUTXOSet()
+	engine.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 	return engine, key
 }
 
@@ -63,6 +65,7 @@ func TestProductionBarrierStopsAtHeightAndSurvivesRestart(t *testing.T) {
 	}
 
 	restarted := NewEngine(engine.cfg, engine.chain, engine.pool, engine.log)
+	restarted.SetTxVerifier(core.NewTxVerifier(engine.utxos), engine.utxos)
 	if err := restarted.tick(); err != nil {
 		t.Fatal(err)
 	}

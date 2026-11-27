@@ -179,10 +179,223 @@ func lpodPositionVaultID(p LPoDPosition) string {
 	return hex.EncodeToString(v[:])
 }
 
+func addLPoDDeferredValidatorPayout(
+	payouts []LPoDDeferredValidatorPayout,
+	validator string,
+	address crypto.Address,
+	amount uint64,
+) ([]LPoDDeferredValidatorPayout, error) {
+	if amount == 0 {
+		return payouts, nil
+	}
+	rawValidator, err := hex.DecodeString(validator)
+	if err != nil || len(rawValidator) != 32 || hex.EncodeToString(rawValidator) != validator {
+		return nil, fmt.Errorf("lpod: invalid deferred validator identity")
+	}
+	if _, _, _, err := crypto.DecodeAddress(address); err != nil {
+		return nil, fmt.Errorf("lpod: invalid deferred validator reward address: %w", err)
+	}
+	index := sort.Search(len(payouts), func(i int) bool { return payouts[i].Validator >= validator })
+	if index < len(payouts) && payouts[index].Validator == validator {
+		payouts[index].AmountNAPRO, err = lpodAdd(payouts[index].AmountNAPRO, amount)
+		if err != nil {
+			return nil, err
+		}
+		// Keep the first address authorized in this daily window. This bounds
+		// consensus state to one entry per validator and prevents a later block
+		// from redirecting already accrued rewards.
+		return payouts, nil
+	}
+	if len(payouts) >= core.MaxValidators {
+		return nil, fmt.Errorf("lpod: deferred validator payout set exceeds active-validator limit")
+	}
+	payouts = append(payouts, LPoDDeferredValidatorPayout{})
+	copy(payouts[index+1:], payouts[index:])
+	payouts[index] = LPoDDeferredValidatorPayout{
+		Validator: validator, Address: address, AmountNAPRO: amount,
+	}
+	return payouts, nil
+}
+
+func collectLPoDDailyValidatorPayouts(
+	before *LPoDCheckpoint,
+	r *LPoDSettlement,
+	payments []lpod.Payment,
+) ([]LPoDDeferredValidatorPayout, bool, error) {
+	payouts := append([]LPoDDeferredValidatorPayout(nil), before.PendingValidatorPayouts...)
+	for _, payment := range payments {
+		if payment.Leader == 0 {
+			continue
+		}
+		if payment.VaultID != r.Proposer {
+			return nil, false, fmt.Errorf("lpod: non-proposer leader reward")
+		}
+		var err error
+		payouts, err = addLPoDDeferredValidatorPayout(
+			payouts, payment.VaultID, r.Leader, payment.Leader,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	due := before.ValidatorDailyPayoutVersion > 0 &&
+		before.NextValidatorPayoutNS > 0 &&
+		r.Timestamp >= before.NextValidatorPayoutNS
+	return payouts, due, nil
+}
+
+func deriveLPoDValidatorPayouts(
+	before, after *LPoDCheckpoint,
+	timestamp int64,
+	proposer string,
+	leader crypto.Address,
+) (map[crypto.Address]uint64, map[string]uint64, error) {
+	if after == nil {
+		return nil, nil, fmt.Errorf("lpod: missing validator payout checkpoint")
+	}
+	if before == nil {
+		before = &LPoDCheckpoint{}
+	}
+	if before.ValidatorDailyPayoutVersion > 0 && after.ValidatorDailyPayoutVersion == 0 {
+		return nil, nil, fmt.Errorf("lpod: validator daily payout activation was reverted")
+	}
+	if after.State.LeaderPaid < before.State.LeaderPaid {
+		return nil, nil, fmt.Errorf("lpod: validator paid total decreased")
+	}
+	beforeOutstanding, err := lpodAdd(before.State.LeaderPaid, before.State.PendingLeader)
+	if err != nil {
+		return nil, nil, err
+	}
+	afterOutstanding, err := lpodAdd(after.State.LeaderPaid, after.State.PendingLeader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if afterOutstanding < beforeOutstanding {
+		return nil, nil, fmt.Errorf("lpod: validator reward total decreased")
+	}
+	currentLeader := afterOutstanding - beforeOutstanding
+	paidDelta := after.State.LeaderPaid - before.State.LeaderPaid
+	addresses := make(map[crypto.Address]uint64)
+	validators := make(map[string]uint64)
+	if after.ValidatorDailyPayoutVersion == 0 {
+		if before.ValidatorDailyPayoutVersion != 0 ||
+			before.State.PendingLeader != 0 || after.State.PendingLeader != 0 ||
+			len(before.PendingValidatorPayouts) != 0 || len(after.PendingValidatorPayouts) != 0 ||
+			paidDelta != currentLeader {
+			return nil, nil, fmt.Errorf("lpod: invalid non-daily validator payout transition")
+		}
+		if currentLeader > 0 {
+			if proposer == "" {
+				return nil, nil, fmt.Errorf("lpod: missing validator identity for payout")
+			}
+			if _, _, _, err := crypto.DecodeAddress(leader); err != nil {
+				return nil, nil, fmt.Errorf("lpod: invalid validator reward address: %w", err)
+			}
+			addresses[leader] = currentLeader
+			validators[proposer] = currentLeader
+		}
+		return addresses, validators, nil
+	}
+	if after.NextValidatorPayoutNS <= timestamp {
+		return nil, nil, fmt.Errorf("lpod: next validator payout boundary is not in the future")
+	}
+	pending := append([]LPoDDeferredValidatorPayout(nil), before.PendingValidatorPayouts...)
+	if currentLeader > 0 {
+		if proposer == "" {
+			return nil, nil, fmt.Errorf("lpod: missing validator identity for deferred payout")
+		}
+		pending, err = addLPoDDeferredValidatorPayout(pending, proposer, leader, currentLeader)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	due := before.ValidatorDailyPayoutVersion > 0 &&
+		before.NextValidatorPayoutNS > 0 && timestamp >= before.NextValidatorPayoutNS
+	if !due {
+		pendingTotal, err := sumDeferredValidatorPayouts(pending)
+		if err != nil {
+			return nil, nil, err
+		}
+		if paidDelta != 0 || after.State.PendingLeader != pendingTotal ||
+			!reflect.DeepEqual(pending, after.PendingValidatorPayouts) {
+			return nil, nil, fmt.Errorf("lpod: validator reward was paid before its daily boundary")
+		}
+		return addresses, validators, nil
+	}
+	if after.State.PendingLeader != 0 || len(after.PendingValidatorPayouts) != 0 {
+		return nil, nil, fmt.Errorf("lpod: daily validator payout did not clear pending rewards")
+	}
+	var release uint64
+	for _, payout := range pending {
+		release, err = lpodAdd(release, payout.AmountNAPRO)
+		if err != nil {
+			return nil, nil, err
+		}
+		addresses[payout.Address], err = lpodAdd(addresses[payout.Address], payout.AmountNAPRO)
+		if err != nil {
+			return nil, nil, err
+		}
+		validators[payout.Validator], err = lpodAdd(validators[payout.Validator], payout.AmountNAPRO)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if release != paidDelta {
+		return nil, nil, fmt.Errorf("lpod: daily validator payout does not reconcile paid total")
+	}
+	return addresses, validators, nil
+}
+
+func sumDeferredValidatorPayouts(payouts []LPoDDeferredValidatorPayout) (uint64, error) {
+	var total uint64
+	for _, payout := range payouts {
+		var err error
+		total, err = lpodAdd(total, payout.AmountNAPRO)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
 func (c *LPoDCheckpoint) validatePositions() error {
 	var locked, due, pending uint64
-	if len(c.Positions) > LPoDMaxPositions || c.DailyPayoutVersion > 1 {
+	if len(c.Positions) > LPoDMaxPositions || c.DailyPayoutVersion > 1 ||
+		c.ValidatorDailyPayoutVersion > 1 {
 		return fmt.Errorf("lpod: position capacity exceeded")
+	}
+	if c.ValidatorDailyPayoutVersion == 0 {
+		if c.NextValidatorPayoutNS != 0 || len(c.PendingValidatorPayouts) != 0 ||
+			c.State.PendingLeader != 0 {
+			return fmt.Errorf("lpod: deferred validator payouts exist before activation")
+		}
+	} else if c.DailyPayoutVersion == 0 || c.NextValidatorPayoutNS <= 0 {
+		return fmt.Errorf("lpod: invalid validator daily payout checkpoint")
+	}
+	if len(c.PendingValidatorPayouts) > core.MaxValidators {
+		return fmt.Errorf("lpod: deferred validator payout set exceeds active-validator limit")
+	}
+	var pendingValidator uint64
+	previousValidator := ""
+	for _, payout := range c.PendingValidatorPayouts {
+		rawValidator, err := hex.DecodeString(payout.Validator)
+		if err != nil || len(rawValidator) != 32 ||
+			hex.EncodeToString(rawValidator) != payout.Validator ||
+			(previousValidator != "" && previousValidator >= payout.Validator) ||
+			payout.AmountNAPRO == 0 {
+			return fmt.Errorf("lpod: corrupt deferred validator payout")
+		}
+		if _, _, _, err := crypto.DecodeAddress(payout.Address); err != nil {
+			return fmt.Errorf("lpod: corrupt deferred validator address")
+		}
+		pendingValidator, err = lpodAdd(pendingValidator, payout.AmountNAPRO)
+		if err != nil {
+			return err
+		}
+		previousValidator = payout.Validator
+	}
+	if pendingValidator != c.State.PendingLeader {
+		return fmt.Errorf("lpod: deferred validator payout conservation failed")
 	}
 	for id, p := range c.Positions {
 		principal, err := LPoDPositionPrincipal(p)
@@ -248,6 +461,17 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 	if before.DailyPayoutVersion > 0 && !r.DailyPayout {
 		return nil, nil, nil, fmt.Errorf("lpod: daily payout protocol cannot be disabled after activation")
 	}
+	if before.ValidatorDailyPayoutVersion > 0 && !r.DailyValidatorPayout {
+		return nil, nil, nil, fmt.Errorf("lpod: validator daily payout protocol cannot be disabled after activation")
+	}
+	if r.DailyValidatorPayout && !r.DailyPayout {
+		return nil, nil, nil, fmt.Errorf("lpod: validator daily payouts require the daily position protocol")
+	}
+	if r.DailyValidatorPayout && before.ValidatorDailyPayoutVersion == 0 &&
+		(height != r.ValidatorDailyPayoutActivationHeight ||
+			r.ValidatorDailyPayoutActivationHeight == 0) {
+		return nil, nil, nil, fmt.Errorf("lpod: validator daily payout activation height was missed")
+	}
 	parent, err := d.readLPoDCanonicalBlock(height - 1)
 	if err != nil {
 		return nil, nil, nil, err
@@ -260,8 +484,27 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 		elapsed = LPoDMaxElapsedNS
 	}
 	next := *before
+	next.PendingValidatorPayouts = append(
+		[]LPoDDeferredValidatorPayout(nil), before.PendingValidatorPayouts...,
+	)
+	dailyValidatorActivation := r.DailyValidatorPayout &&
+		before.ValidatorDailyPayoutVersion == 0
 	if r.DailyPayout {
 		next.DailyPayoutVersion = 1
+	}
+	if r.DailyValidatorPayout {
+		next.ValidatorDailyPayoutVersion = 1
+		if dailyValidatorActivation {
+			next.NextValidatorPayoutNS, err = LPoDNextDailyBoundaryAfter24h(r.Timestamp)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else if r.Timestamp >= before.NextValidatorPayoutNS {
+			next.NextValidatorPayoutNS, err = lpodNextDailyBoundaryAfter(r.Timestamp)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
 	}
 	next.Positions = make(map[string]LPoDPosition, len(before.Positions))
 	vaultIDs := map[string]bool{r.Proposer: true}
@@ -271,6 +514,15 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 		principal, principalErr := LPoDPositionPrincipal(p)
 		if principalErr != nil {
 			return nil, nil, nil, principalErr
+		}
+		if dailyValidatorActivation {
+			// The new consensus rule pays only rewards earned from its activation
+			// onward. Retire prior unpaid/pending Guardian accruals and fractional
+			// carry instead of silently adding historical debt to a future payout.
+			p.Due = 0
+			p.PendingDue = 0
+			p.APRCarry = 0
+			p.NextPayoutNS = next.NextValidatorPayoutNS
 		}
 		// Fully closed positions no longer occupy capacity. Reopening their
 		// deposit still requires its already-spent, cryptographically linked KI.
@@ -303,7 +555,7 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 			stake = prior
 		}
 		var earned uint64
-		if p.UnlockHeight == 0 && stake.Active {
+		if !dailyValidatorActivation && p.UnlockHeight == 0 && stake.Active {
 			total, err := lpodAdd(stake.Amount, totals[v])
 			if err != nil {
 				return nil, nil, nil, err
@@ -628,16 +880,79 @@ func (d *DB) positionTransition(before *LPoDCheckpoint, height uint64, r *LPoDSe
 	return &next, vaults, entitlementVault, nil
 }
 
+func settleLPoDPositionAccounting(
+	before, next *LPoDCheckpoint,
+	height uint64,
+	r *LPoDSettlement,
+	vaults []lpod.Vault,
+) ([]lpod.Payment, error) {
+	accountingBefore := before.State
+	if r.DailyValidatorPayout && before.ValidatorDailyPayoutVersion == 0 {
+		// The coordinated upgrade begins a future-only reward period. Historical
+		// unpaid Guardian liabilities are not paid by the new daily protocol.
+		accountingBefore.UnfundedLiability = 0
+		accountingBefore.AccruedLiability = accountingBefore.AngelPaid
+	}
+	state, carries, payments, err := lpod.Settle(accountingBefore, before.Carries, height, vaults)
+	if err != nil {
+		return nil, err
+	}
+	next.State, next.Carries = state, carries
+	if r.DailyValidatorPayout {
+		pendingPayouts, due, err := collectLPoDDailyValidatorPayouts(before, r, payments)
+		if err != nil {
+			return nil, err
+		}
+		var currentLeader uint64
+		for _, payment := range payments {
+			currentLeader, err = lpodAdd(currentLeader, payment.Leader)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if currentLeader > next.State.LeaderPaid {
+			return nil, fmt.Errorf("lpod: leader payout exceeds recognized paid total")
+		}
+		next.State.LeaderPaid -= currentLeader
+		next.State.PendingLeader, err = lpodAdd(next.State.PendingLeader, currentLeader)
+		if err != nil {
+			return nil, err
+		}
+		next.PendingValidatorPayouts = pendingPayouts
+		if due {
+			var release uint64
+			for _, payout := range pendingPayouts {
+				release, err = lpodAdd(release, payout.AmountNAPRO)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if release != next.State.PendingLeader {
+				return nil, fmt.Errorf("lpod: deferred validator payout total differs from checkpoint")
+			}
+			next.State.PendingLeader = 0
+			next.State.LeaderPaid, err = lpodAdd(next.State.LeaderPaid, release)
+			if err != nil {
+				return nil, err
+			}
+			next.PendingValidatorPayouts = nil
+		}
+		if err := next.State.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return payments, nil
+}
+
 func (d *DB) previewPositions(before *LPoDCheckpoint, height uint64, r *LPoDSettlement) (*LPoDCheckpoint, []lpod.Payment, error) {
 	next, vaults, entitlementVault, err := d.positionTransition(before, height, r)
 	if err != nil {
 		return nil, nil, err
 	}
-	state, carries, payments, err := lpod.Settle(before.State, before.Carries, height, vaults)
+	payments, err := settleLPoDPositionAccounting(before, next, height, r, vaults)
 	if err != nil {
 		return nil, nil, err
 	}
-	next.State, next.Carries = state, carries
 	next.Allocation, err = lpodRewardDebit(before.Allocation, vaults)
 	if err != nil {
 		return nil, nil, err
@@ -722,13 +1037,32 @@ func (d *DB) PayoutLPoD(height uint64, r *LPoDSettlement, after *LPoDCheckpoint,
 		amounts[address], err = lpodAdd(amounts[address], n)
 		return err
 	}
-	for _, p := range payments {
-		if p.Leader > 0 {
-			if p.VaultID != r.Proposer {
-				return core.Transaction{}, fmt.Errorf("lpod: non-proposer leader reward")
+	if r.DailyValidatorPayout {
+		pendingPayouts, due, err := collectLPoDDailyValidatorPayouts(before, r, payments)
+		if err != nil {
+			return core.Transaction{}, err
+		}
+		expectedPending := pendingPayouts
+		if due {
+			expectedPending = nil
+			for _, payout := range pendingPayouts {
+				if err := add(payout.Address, payout.AmountNAPRO); err != nil {
+					return core.Transaction{}, err
+				}
 			}
-			if err := add(r.Leader, p.Leader); err != nil {
-				return core.Transaction{}, err
+		}
+		if !reflect.DeepEqual(expectedPending, after.PendingValidatorPayouts) {
+			return core.Transaction{}, fmt.Errorf("lpod: deferred validator payout checkpoint mismatch")
+		}
+	} else {
+		for _, p := range payments {
+			if p.Leader > 0 {
+				if p.VaultID != r.Proposer {
+					return core.Transaction{}, fmt.Errorf("lpod: non-proposer leader reward")
+				}
+				if err := add(r.Leader, p.Leader); err != nil {
+					return core.Transaction{}, err
+				}
 			}
 		}
 	}

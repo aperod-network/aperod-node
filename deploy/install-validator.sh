@@ -23,10 +23,10 @@ GO_VERSION="1.26.11"
 P2P_PORT=30303
 RPC_PORT=8545
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/node-source-release.sh"
 if [[ "${APEROD_NETWORK:-}" != "testnet" ]]; then
   die "Этот установщик поддерживает только testnet. Для mainnet нужны проверенные genesis и данные существующей цепи; пустой узел не запускается / This installer supports testnet only. Mainnet requires a verified genesis and existing chain state; a blank node will not be started"
 fi
+source "${SCRIPT_DIR}/node-source-release.sh"
 node_source_pin_guard || die "Нужен явно выбранный публичный коммит / An explicitly selected public commit is required"
 [[ ! -e /usr/local/bin/aperod-node && ! -e "${CONFIG_DIR}/node.yaml" ]] ||
   die "Узел уже установлен: используйте update-node.sh с проверенным baseline / Node already installed: use update-node.sh with an approved baseline"
@@ -360,6 +360,9 @@ LimitCORE=0
 ExecStart=/usr/local/bin/aperod-node --config ${CONFIG_DIR}/node.yaml
 Restart=always
 RestartSec=5
+# A missing authenticated mainnet identity is a permanent config refusal
+# (EX_CONFIG=78), not a transient crash. Keep this visible without retry loops.
+RestartPreventExitStatus=78
 StartLimitBurst=5
 StartLimitIntervalSec=60
 LimitNOFILE=65536
@@ -450,28 +453,15 @@ echo
 echo -e "  1) Проверьте ноду / Check the node:"
 echo -e "     ${CYAN}journalctl -u aperod-node -f${NC}"
 echo
-echo -e "  2) Зарегистрируйте ноду / Register the node (run this command):"
-echo
-APPLY_CMD="curl -s -X POST https://aperod.com/api/validators/apply \\
-  -H 'Content-Type: application/json' \\
-  -d '{
-    \"pubKey\":   \"${PUBKEY_HEX}\",
-    \"alias\":    \"my-validator\",
-    \"endpoint\": \"/ip4/${MY_IP}/tcp/${P2P_PORT}\",
-    \"address\":  \"${REWARD_ADDRESS}\"
-  }'"
-echo -e "  ${BOLD}${GREEN}${APPLY_CMD}${NC}"
-echo
-echo -e "  3) Переведите минимум / Transfer at least ${BOLD}100,000 APRO${NC} на адрес кошелька / to your wallet address:"
-echo -e "     ${BOLD}${REWARD_ADDRESS}${NC}"
-echo -e "     Валидатор активируется автоматически / The node joins the active validator set automatically."
-echo
-echo -e "  ${BOLD}Параметры сети / Network parameters:${NC}"
-echo -e "    Мин. стейк / Minimum stake        : 100,000 APRO"
-echo -e "    Макс. валидаторов / Max validators: 21"
-echo -e "    Эпоха / Epoch                     : 100 блоков / blocks (~1.7 мин / min)"
-echo -e "    Анбондинг / Unbonding              : 7,200 блоков / blocks (~2 часа / hours)"
-echo -e "    Штраф за двойную подпись / Double-sign penalty: 10% стейка / of stake"
+echo -e "  2) ${BOLD}Ограничение сети / Network limitation:${NC}"
+echo -e "     Этот установщик предназначен только для testnet / This installer is for testnet only."
+echo -e "     Он не подключает сервер к mainnet / It does not join a server to mainnet."
+echo -e "     API-заявка записывается вне блокчейна и не включает валидатор /"
+echo -e "     The API application is an off-chain record and does not activate a validator."
+echo -e "     Не отправляйте APRO на основании вывода этого установщика /"
+echo -e "     Do not send APRO based on this installer's output."
+echo -e "     Списание 10% стейка при двойной подписи не реализовано /"
+echo -e "     A durable 10% stake debit for double-signing is not implemented."
 echo
 echo -e "  Публичный ключ / Public key: ${BOLD}${PUBKEY_HEX}${NC}"
 echo -e "  P2P-адрес / P2P endpoint:   /ip4/${MY_IP}/tcp/${P2P_PORT}"

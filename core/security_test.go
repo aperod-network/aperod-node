@@ -75,6 +75,28 @@ func TestVerifyBlock_UnbalancedFeeCommitment_Rejected(t *testing.T) {
 	t.Logf("correctly rejected (%v)", err)
 }
 
+func TestMempoolRejectsExistingOutputKeyCollisionAfterHardening(t *testing.T) {
+	const activationHeight = uint64(10)
+	tx := makeValidTx(t)
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:     crypto.Hash32{1},
+		OneTimePub: tx.Outputs[0].OneTimePub,
+	})
+	verifier := core.NewTxVerifier(utxos)
+	verifier.SetSecurityHardeningActivationHeight(activationHeight)
+
+	cfg := core.DefaultMempoolConfig()
+	cfg.CurrentHeight = func() uint64 { return activationHeight - 1 }
+	cfg.RingCTV4ActivationHeight = ^uint64(0)
+	cfg.Verifier = verifier
+	pool := core.NewMempool(cfg)
+	if err := pool.Add(tx); err == nil ||
+		!strings.Contains(err.Error(), "one-time public key already exists") {
+		t.Fatalf("mempool Add error = %v, want existing-output-key rejection", err)
+	}
+}
+
 // TestVerifyBlock_TamperedInputCommitment_Rejected confirms that replacing an
 // input's AmountCommit with a random value causes the commitment-balance check
 // to fail (#411).

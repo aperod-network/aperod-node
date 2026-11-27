@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -69,6 +70,7 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 		return db.DeleteUTXO(txHash, outIdx)
 	}
 	mempoolCfg := core.DefaultMempoolConfig()
+mempoolCfg.Network = cfg.Network
 	mempoolCfg.CurrentHeight = chain.Height
 	mempool := core.NewMempool(mempoolCfg)
 
@@ -84,6 +86,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	}
 
 	if tipHash == (crypto.Hash32{}) {
+		if err := config.ValidateChainBootstrap(config.Network(cfg.Network), false); err != nil {
+			return nil, err
+		}
 		// First start: create and persist genesis block.
 		validatorPriv, _, err := crypto.GenerateValidatorKey()
 		if err != nil {

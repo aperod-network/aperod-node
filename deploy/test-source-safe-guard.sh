@@ -86,6 +86,19 @@ git -C "$TRACKED" sparse-checkout set --cone src
 assert_rejected "Git index still tracking excluded chain data blocks update" \
   source_checkout_guard "$TRACKED"
 
+section_guard "public static assets named data are not runtime node state"
+STATIC_ASSETS="$TMP/static-assets"
+make_repo "$STATIC_ASSETS"
+mkdir -p "$STATIC_ASSETS/data"
+printf 'static asset\n' > "$STATIC_ASSETS/data/favicon.png"
+git -C "$STATIC_ASSETS" add data/favicon.png
+git -C "$STATIC_ASSETS" commit -qm 'add public static asset'
+if source_checkout_guard "$STATIC_ASSETS"; then
+  pass "tracked data/favicon.png does not block a clean source checkout"
+else
+  fail "tracked data/favicon.png does not block a clean source checkout"
+fi
+
 section_guard "dirty source tree is rejected"
 DIRTY="$TMP/dirty"
 make_repo "$DIRTY"

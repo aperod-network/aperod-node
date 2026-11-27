@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/aperod/aperod/core"
@@ -26,6 +27,178 @@ func finalityTestChain(t *testing.T, marker string) (*core.Chain, *core.Block) {
 		t.Fatal(err)
 	}
 	return chain, block
+}
+
+func TestExplicitZeroFinalityScheduleKeepsV1AfterHardening(t *testing.T) {
+	e := &Engine{cfg: Config{
+		SecurityHardeningActivationHeight: 3_800_000,
+		ExplicitFinalityVoteSchedule:      true,
+	}}
+	if got := e.expectedFinalityVoteVersion(4_024_017); got != crypto.FinalityVoteVersionLegacy {
+		t.Fatalf("explicit zero expected v1, got v%d", got)
+	}
+	e.cfg.ExplicitFinalityVoteSchedule = false
+	if got := e.expectedFinalityVoteVersion(4_024_017); got != crypto.FinalityVoteVersionHeightBound {
+		t.Fatalf("legacy engine default expected v2, got v%d", got)
+	}
+}
+
+func TestFinalityActivationPreservesLegacyVotesAcrossDiskRestarts(t *testing.T) {
+	t.Run("same epoch", func(t *testing.T) { testFinalityTransitionRestarts(t, 2) })
+	t.Run("epoch boundary", func(t *testing.T) { testFinalityTransitionRestarts(t, core.EpochLength) })
+}
+
+func testFinalityTransitionRestarts(t *testing.T, activation uint64) {
+	t.Helper()
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, before := finalityTestChain(t, "vote-version-boundary")
+	for before.Header.Height+1 < activation {
+		b := &core.Block{Header: core.BlockHeader{
+			Height: before.Header.Height + 1, PrevHash: before.Hash(), Timestamp: before.Header.Timestamp + 1,
+		}}
+		if err := chain.AddBlock(b); err != nil {
+			t.Fatal(err)
+		}
+		before = b
+	}
+	at := &core.Block{Header: core.BlockHeader{
+		Height: activation, PrevHash: before.Hash(), Timestamp: before.Header.Timestamp + 1,
+	}}
+	dir := t.TempDir()
+	open := func() *store.DB {
+		t.Helper()
+		db, err := store.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	db := open()
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	})
+	reopen := func() {
+		t.Helper()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db = nil
+		db = open()
+	}
+	persist := func(b *core.Block) {
+		t.Helper()
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.PutRawBlock(b.Hash(), b.Header.Height, raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.PutTip(b.Hash(), b.Header.Height); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine := func() *Engine {
+		t.Helper()
+		e := NewEngine(Config{Validators: []crypto.ValidatorPubKey{pub}, Store: db,
+			BFTThreshold: 0.667, SecurityHardeningActivationHeight: 1,
+			FinalityVoteV2ActivationHeight: activation},
+			chain, core.NewMempool(core.DefaultMempoolConfig()),
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err := e.StartupError(); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	vote := func(b *core.Block, version uint8) FinalizeMsg {
+		t.Helper()
+		height, hash := b.Header.Height, b.Hash()
+		sig, err := priv.Sign(crypto.FinalityVoteMessage(version, height, hash))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return FinalizeMsg{Height: height, BlockHash: hash, ValidatorPub: pub, Version: version, Signature: sig}
+	}
+	saveVote := func(e *Engine, v FinalizeMsg) {
+		t.Helper()
+		if err := e.HandleVote(v); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.SaveLocalFinalityVote(store.LocalFinalityVote{
+			Version: 1, Height: v.Height, BlockHash: v.BlockHash, Validator: pub,
+			Signature: v.Signature, VoteVersion: v.Version,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	persist(before)
+	legacy := vote(before, crypto.FinalityVoteVersionLegacy)
+	saveVote(engine(), legacy)
+	reopen()
+	e := engine()
+	if !e.IsFinalizedHash(before.Header.Height, before.Hash()) {
+		t.Fatal("valid pre-activation legacy certificate did not survive disk restart")
+	}
+	if err := chain.AddBlock(at); err != nil {
+		t.Fatal(err)
+	}
+	persist(at)
+	// Crash after saving the activation block but before signing its first
+	// vote. The previous certificate and last local vote are still v1.
+	reopen()
+	e = engine()
+	if !e.IsFinalizedHash(before.Header.Height, before.Hash()) || e.IsFinalizedHash(at.Header.Height, at.Hash()) {
+		t.Fatal("restart at activation must restore only the historical finality")
+	}
+	local, err := db.LoadLocalFinalityVote()
+	if err != nil || local == nil || local.Height != before.Header.Height ||
+		local.VoteVersion != legacy.Version || !bytes.Equal(local.Signature, legacy.Signature) {
+		t.Fatalf("restart at activation did not preserve the last v1 local vote: %v", err)
+	}
+	if err := e.HandleVote(vote(at, crypto.FinalityVoteVersionLegacy)); err == nil {
+		t.Fatal("legacy vote accepted at activation")
+	}
+	heightBound := vote(at, crypto.FinalityVoteVersionHeightBound)
+	saveVote(e, heightBound)
+	reopen()
+	if !engine().IsFinalizedHash(activation, at.Hash()) {
+		t.Fatal("valid activation certificate did not survive disk restart")
+	}
+	historical, err := db.LoadFinalityCertificateAt(before.Header.Height)
+	if err != nil || historical == nil || len(historical.Votes) != 1 ||
+		!bytes.Equal(historical.Votes[0].Signature, legacy.Signature) {
+		t.Fatalf("historical v1 certificate changed or disappeared: %v", err)
+	}
+	for _, want := range []FinalizeMsg{legacy, heightBound} {
+		persisted, err := db.LoadFinalityVote(want.Height, pub)
+		if err != nil || persisted == nil || persisted.VoteVersion != want.Version ||
+			persisted.BlockHash != want.BlockHash || !bytes.Equal(persisted.Signature, want.Signature) {
+			t.Fatalf("journal lost or changed vote v%d after transition: %v", want.Version, err)
+		}
+	}
+}
+
+func TestRehearsalFinalityScheduleRefusesSigningKey(t *testing.T) {
+	priv, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer key.Destroy()
+	e := NewEngine(Config{MyKey: key, RehearsalFinalityV2Height: 2},
+		core.NewChain(), core.NewMempool(core.DefaultMempoolConfig()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if e.StartupError() == nil {
+		t.Fatal("a signer started with a rehearsal finality schedule")
+	}
 }
 
 func TestFinalityCertificateSurvivesRestartAndRejectsWrongFork(t *testing.T) {
@@ -68,6 +241,9 @@ func TestFinalityCertificateSurvivesRestartAndRejectsWrongFork(t *testing.T) {
 		t.Fatal("live quorum did not finalize block")
 	}
 	restarted := NewEngine(cfg, chain, core.NewMempool(core.DefaultMempoolConfig()), log)
+	if err := restarted.StartupError(); err != nil {
+		t.Fatalf("compatible legacy history failed startup: %v", err)
+	}
 	if !restarted.IsFinalizedHash(1, block.Hash()) || !restarted.IsFinalized(1) {
 		t.Fatal("authentic tip certificate was not restored")
 	}
@@ -80,6 +256,17 @@ func TestFinalityCertificateSurvivesRestartAndRejectsWrongFork(t *testing.T) {
 	if err := restarted.requireLPoDParentFinalized(2, block.Hash()); err == nil {
 		t.Fatal("finality was inferred from parent hash under a different height")
 	}
+
+	incompatible := cfg
+	incompatible.SecurityHardeningActivationHeight = 1
+	wrongVersion := NewEngine(incompatible, chain, core.NewMempool(core.DefaultMempoolConfig()), log)
+	if err := wrongVersion.StartupError(); err == nil || !strings.Contains(err.Error(), "certificate vote uses version 1 at height 1") {
+		t.Fatalf("expected startup to report the durable vote version mismatch, got %v", err)
+	}
+	if !wrongVersion.halted.Load() || wrongVersion.IsFinalizedHash(1, block.Hash()) {
+		t.Fatal("startup accepted a legacy certificate at the v2 activation height")
+	}
+	cfg.Registry.SetSecurityHardeningActivationHeight(cfg.SecurityHardeningActivationHeight)
 
 	otherChain, otherBlock := finalityTestChain(t, "other-fork")
 	wrongFork := NewEngine(cfg, otherChain, core.NewMempool(core.DefaultMempoolConfig()), log)
@@ -144,11 +331,12 @@ func TestFinalityCommitteeMigrationRestoresCertificateOnlyWithPinnedQuorum(t *te
 	}
 
 	chain, block := finalityTestChain(t, "migration-anchor")
-	db, err := store.Open(t.TempDir())
+	dir := t.TempDir()
+	db, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	rawBlock, err := json.Marshal(block)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +409,8 @@ func TestFinalityCommitteeMigrationRestoresCertificateOnlyWithPinnedQuorum(t *te
 		Registry:                          registry,
 		Store:                             db,
 		BFTThreshold:                      0.667,
+		SecurityHardeningActivationHeight: 1,
+		RehearsalFinalityV2Height:         2,
 		FinalityMigration:                 migration,
 		FinalityMigrationTrustAuthorities: authorities,
 	}
@@ -246,6 +436,78 @@ func TestFinalityCommitteeMigrationRestoresCertificateOnlyWithPinnedQuorum(t *te
 	tamperedCfg.FinalityMigration = &tampered
 	if !NewEngine(tamperedCfg, chain, core.NewMempool(core.DefaultMempoolConfig()), log).halted.Load() {
 		t.Fatal("tampered migration signature was accepted")
+	}
+
+	// Advance from the restored historical v1 certificate to v2. The two
+	// committees deliberately differ: the old approval cannot authorize
+	// either the new votes or a fallback to the live registry on restart.
+	next := &core.Block{Header: core.BlockHeader{
+		Height: 2, PrevHash: block.Hash(), Timestamp: 3,
+	}}
+	if err := chain.AddBlock(next); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutRawBlock(next.Hash(), next.Header.Height, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutTip(next.Hash(), next.Header.Height); err != nil {
+		t.Fatal(err)
+	}
+	makeVote := func(i int, version uint8) FinalizeMsg {
+		t.Helper()
+		sig, err := authorityPrivs[i].Sign(crypto.FinalityVoteMessage(version, next.Header.Height, next.Hash()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return FinalizeMsg{Height: next.Header.Height, BlockHash: next.Hash(),
+			ValidatorPub: authorities[i], Version: version, Signature: sig}
+	}
+	if err := engine.HandleVote(makeVote(0, crypto.FinalityVoteVersionLegacy)); err == nil {
+		t.Fatal("accepted a legacy vote at the rehearsal transition")
+	}
+	nextCert := store.FinalityCertificate{Version: 1, Height: next.Header.Height, BlockHash: next.Hash()}
+	for i := range authorities {
+		v := makeVote(i, crypto.FinalityVoteVersionHeightBound)
+		nextCert.Votes = append(nextCert.Votes, store.FinalityVote{
+			Validator: v.ValidatorPub, Signature: v.Signature, VoteVersion: v.Version,
+		})
+	}
+	if err := db.SaveFinalityCertificate(nextCert); err != nil {
+		t.Fatal(err)
+	}
+	start := func(c Config) *Engine {
+		return NewEngine(c, chain, core.NewMempool(core.DefaultMempoolConfig()), log)
+	}
+	if err := start(cfg).StartupError(); err == nil || !strings.Contains(err.Error(), "no persisted committee") {
+		t.Fatalf("valid successor signatures without a durable committee should fail: %v", err)
+	}
+	for i := range authorities {
+		if err := engine.HandleVote(makeVote(i, crypto.FinalityVoteVersionHeightBound)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !engine.IsFinalizedHash(next.Header.Height, next.Hash()) {
+		t.Fatal("v2 quorum did not finalize the transition block")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db = reopened
+	cfg.Store = db
+	if e := start(cfg); e.StartupError() != nil || !e.IsFinalizedHash(next.Header.Height, next.Hash()) {
+		t.Fatalf("successor certificate did not restore with the historical migration still configured: %v", e.StartupError())
+	}
+	tamperedCfg.Store = db
+	if err := start(tamperedCfg).StartupError(); err == nil || !strings.Contains(err.Error(), "untrusted approval") {
+		t.Fatalf("advancing the certificate must not bypass validation of the configured migration: %v", err)
 	}
 }
 

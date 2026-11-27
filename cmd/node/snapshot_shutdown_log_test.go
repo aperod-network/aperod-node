@@ -64,7 +64,7 @@ func TestLogSnapshotStartupReason_NoSnapshot(t *testing.T) {
 
 	logSnapshotStartupReason(os.ErrNotExist, 12345, log)
 
-	const wantMsg = "no snapshot found — full block scan required"
+const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&buf, wantMsg) {
 		t.Fatalf("expected log message %q not found in:\n%s", wantMsg, buf.String())
 	}
@@ -92,7 +92,7 @@ func TestLogSnapshotStartupReason_WrappedNotExist(t *testing.T) {
 	wrapped := fmt.Errorf("outer: %w", os.ErrNotExist)
 	logSnapshotStartupReason(wrapped, 0, log)
 
-	const wantMsg = "no snapshot found — full block scan required"
+const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&buf, wantMsg) {
 		t.Fatalf("expected log message %q for wrapped ErrNotExist, got:\n%s", wantMsg, buf.String())
 	}
@@ -373,7 +373,7 @@ func TestFallbackClassification_PrimaryAbsentNoPrevBackup(t *testing.T) {
 	var reasonBuf bytes.Buffer
 	logSnapshotStartupReason(err, height, newCaptureLogger(&reasonBuf))
 
-	reason, ok := logFieldValue(&reasonBuf, "no snapshot found — full block scan required", "startup_reason")
+reason, ok := logFieldValue(&reasonBuf, "no exact-tip snapshot found — checking older snapshots before replay", "startup_reason")
 	if !ok || reason != "no_snapshot" {
 		t.Errorf("startup_reason = %q (ok=%v), want no_snapshot; log:\n%s",
 			reason, ok, reasonBuf.String())
@@ -858,7 +858,7 @@ func TestRunWiring_NoSnapshot(t *testing.T) {
 	}
 
 	// ── Assertions. ──────────────────────────────────────────────────────────
-	const wantMsg = "no snapshot found — full block scan required"
+const wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	if !logContainsMsg(&logBuf, wantMsg) {
 		t.Fatalf("expected log %q not found;\nlog:\n%s", wantMsg, logBuf.String())
 	}
@@ -954,7 +954,7 @@ func assertStartupReasonInBuf(t *testing.T, buf *bytes.Buffer, want string) {
 	t.Helper()
 	wantMsg := "snapshot corrupt or unreadable — falling back to full block scan"
 	if want == "no_snapshot" {
-		wantMsg = "no snapshot found — full block scan required"
+wantMsg = "no exact-tip snapshot found — checking older snapshots before replay"
 	}
 	if !logContainsMsg(buf, wantMsg) {
 		t.Fatalf("expected log %q emitted by tryLoadStartupSnapshot, got:\n%s", wantMsg, buf.String())

@@ -58,6 +58,10 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
 TARGET_IP="192.0.2.1"   # TEST-NET-1 — never routes
 PRIMARY_IP="127.0.0.1"
+TEST_SOURCE_NODE_YAML="${TMPDIR_TEST}/source-node.yaml"
+cat >"${TEST_SOURCE_NODE_YAML}" <<'YAML'
+network: testnet
+YAML
 
 # ---------------------------------------------------------------------------
 # make_stub BIN_DIR CMD BODY
@@ -66,6 +70,18 @@ PRIMARY_IP="127.0.0.1"
 make_stub() {
   local dir="$1" cmd="$2" body="$3"
   mkdir -p "$dir"
+  # Each fixture PATH must resolve the store check to a test double rather
+  # than a possibly installed node binary on the host running the suite.
+  if [[ "$cmd" != "aperod-node" && ! -e "${dir}/aperod-node" ]]; then
+    cat >"${dir}/aperod-node" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *--check-store*) echo "fixture check-store: ok"; exit 0 ;;
+  *) echo "unexpected fixture aperod-node call: $*" >&2; exit 97 ;;
+esac
+STUB
+    chmod +x "${dir}/aperod-node"
+  fi
   printf '#!/usr/bin/env bash\n%s\n' "$body" >"${dir}/${cmd}"
   chmod +x "${dir}/${cmd}"
 }
@@ -92,6 +108,7 @@ run_join() {
     PATH="${bdir}:${PATH}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${ddir}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     GOMEMLIMIT_BYTES="5905580032" \
     bash "${JOIN_SH}" "${tip}" 2>&1 </dev/null
   ) || LAST_EXIT=$?
@@ -654,6 +671,7 @@ NI_OUTPUT=$(
   PATH="${NI_BIN}:${PATH}" \
   PRIMARY_IP="${PRIMARY_IP}" \
   PRIMARY_DATA_DIR="${NI_DATA}" \
+  PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
   SECONDARY_NODE_YAML="${NI_NODE_YAML}" \
   bash "${JOIN_SH}" "${TARGET_IP}" 2>&1
 ) || NI_EXIT=$?
@@ -2116,6 +2134,7 @@ MT_OUTPUT=$(
     PATH="${MT_BIN}:${MT_FARM}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${MT_DATA}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     bash "${JOIN_SH}" "${TARGET_IP}" 2>&1
 ) || MT_EXIT=$?
 

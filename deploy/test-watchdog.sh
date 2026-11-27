@@ -182,6 +182,11 @@ if [[ "$cmd" == "systemctl" && "\$1" == "show" && "\$2" == "aperod-node" ]]; the
       printf '%s\\n' "\${MOCK_SYSTEMCTL_ACTIVE_ENTER_TIMESTAMP_MONOTONIC-0}"
       exit 0
       ;;
+    --property=ExecMainStatus)
+      [[ "\${MOCK_SYSTEMCTL_EXEC_MAIN_STATUS_SHOW_FAIL:-0}" != "1" ]] || exit 1
+      printf '%s\\n' "\${MOCK_SYSTEMCTL_EXEC_MAIN_STATUS-0}"
+      exit 0
+      ;;
   esac
 fi
 echo "$cmd \$*" >> "$log_file"
@@ -1693,6 +1698,10 @@ if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
   echo 15min
   exit 0
 fi
+if [[ "\$*" == "show aperod-node --property=ExecMainStatus --value" ]]; then
+  echo 0
+  exit 0
+fi
 if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
   echo active
   exit 0
@@ -1750,6 +1759,10 @@ cat >"$T31_SC/systemctl" <<STUB
 #!/usr/bin/env bash
 if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
   echo "10min 5min"
+  exit 0
+fi
+if [[ "\$*" == "show aperod-node --property=ExecMainStatus --value" ]]; then
+  echo 0
   exit 0
 fi
 if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
@@ -1997,6 +2010,10 @@ if [[ "\$*" == "show aperod-node --property=TimeoutStopUSec --value" ]]; then
   echo 15min
   exit 0
 fi
+if [[ "\$*" == "show aperod-node --property=ExecMainStatus --value" ]]; then
+  echo 0
+  exit 0
+fi
 if [[ "\$*" == "show aperod-node --property=ActiveState --value" ]]; then
   echo active
   exit 0
@@ -2124,6 +2141,181 @@ else
 fi
 kill "$T38_NODE_PID" 2>/dev/null || true
 wait "$T38_NODE_PID" 2>/dev/null || true
+
+# =============================================================================
+# Test 39: mainnet identity refusal is recorded, then cleared after recovery
+# =============================================================================
+section "Test 39: EX_CONFIG refusal is recorded and cleared after successful recovery"
+
+T39_DIR=$(mktemp -d "$TMPDIR_TEST/t39-XXXXXXXX")
+T39_SC_LOG="$T39_DIR/systemctl.log"
+T39_CURL_LOG="$T39_DIR/curl.log"
+T39_OUTPUT="$T39_DIR/output.log"
+T39_FAKE_SC=$(make_fake_bin "systemctl" "$T39_SC_LOG")
+T39_CURL=$(make_fake_curl "$T39_CURL_LOG" "000")
+
+for T39_CHECK in 1 2; do
+  NODE_API_URL="http://127.0.0.1:19999" \
+    STATE_DIR="$T39_DIR/state" \
+    TIMEOUT_SECS="1" \
+    MOCK_SYSTEMCTL_ACTIVE_STATE="failed" \
+    MOCK_SYSTEMCTL_EXEC_MAIN_STATUS="78" \
+    SUPPORT_BOT_TOKEN="test-token" \
+    SUPPORT_ADMIN_CHAT_ID="123456" \
+    PATH="$T39_CURL:$T39_FAKE_SC:$PATH" \
+    bash "$WATCHDOG_SH" >>"$T39_OUTPUT" 2>&1
+  T39_EXIT=$?
+done
+
+if [[ $T39_EXIT -eq 0 ]] &&
+   ! grep -q "restart aperod-node" "$T39_SC_LOG" 2>/dev/null &&
+   ! grep -q "api.telegram.org" "$T39_CURL_LOG" 2>/dev/null &&
+   [[ $(grep -Fc "EX_CONFIG=78" "$T39_OUTPUT" 2>/dev/null || echo 0) -eq 1 ]]; then
+  pass "EX_CONFIG identity refusal caused no watchdog restart, API probe, or repeated alert"
+else
+  fail "identity refusal was retried or alerted (exit=$T39_EXIT, systemctl=$(cat "$T39_SC_LOG" 2>/dev/null || echo '<empty>'), curl=$(cat "$T39_CURL_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T39_OUTPUT" 2>/dev/null || echo '<empty>'))"
+fi
+
+T39_MARKER="$T39_DIR/state/watchdog-mainnet-identity-refusal"
+T39_EVENTS="$T39_DIR/state/watchdog-mainnet-identity-events"
+if [[ -s "$T39_MARKER" ]]; then
+  pass "EX_CONFIG refusal marker was written for the Admin API"
+else
+  fail "EX_CONFIG refusal marker was not written (state=$(ls -la "$T39_DIR/state" 2>/dev/null || echo '<missing>'))"
+fi
+if [[ $(wc -l < "$T39_EVENTS" 2>/dev/null || echo 0) -eq 1 ]] &&
+   grep -Eq '^[0-9]{13} refusal$' "$T39_EVENTS"; then
+  pass "repeated refusal checks produced one type-and-time event"
+else
+  fail "refusal history is missing, duplicated, or contains unexpected fields (history=$(cat "$T39_EVENTS" 2>/dev/null || echo '<missing>'))"
+fi
+
+T39_RECOVERY_PORT=$(find_free_port)
+T39_RECOVERY_PID=$(start_mock_server "$T39_RECOVERY_PORT" 200)
+if wait_for_server "$T39_RECOVERY_PORT" 5; then
+  pass "recovery HTTP server is ready"
+else
+  fail "recovery HTTP server did not start on port $T39_RECOVERY_PORT"
+fi
+
+T39_RECOVERY_SC_LOG="$T39_DIR/recovery-systemctl.log"
+T39_RECOVERY_FAKE_SC=$(make_fake_bin "systemctl" "$T39_RECOVERY_SC_LOG")
+NODE_API_URL="http://127.0.0.1:${T39_RECOVERY_PORT}" \
+  STATE_DIR="$T39_DIR/state" \
+  NODE_DATA_DIR="$T39_DIR/node-data" \
+  TIMEOUT_SECS="2" \
+  RAM_THRESHOLD_MB="0" \
+  DISK_WARN_PCT="0" \
+  DISK_CRIT_PCT="0" \
+  STALL_CHECKS_MAX="0" \
+  PEER_WAIT_MINS="0" \
+  MOCK_SYSTEMCTL_ACTIVE_STATE="active" \
+  MOCK_SYSTEMCTL_EXEC_MAIN_STATUS="0" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T39_RECOVERY_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T39_DIR/recovery-output.log" 2>&1
+T39_RECOVERY_EXIT=$?
+
+kill "$T39_RECOVERY_PID" 2>/dev/null || true
+wait "$T39_RECOVERY_PID" 2>/dev/null || true
+
+if [[ $T39_RECOVERY_EXIT -eq 0 ]] &&
+   [[ ! -e "$T39_MARKER" ]] &&
+   ! grep -q "restart aperod-node" "$T39_RECOVERY_SC_LOG" 2>/dev/null; then
+  pass "successful node recovery removed the refusal marker without restarting the healthy node"
+else
+  fail "recovery left stale refusal state or restarted the healthy node (exit=$T39_RECOVERY_EXIT, marker=$(cat "$T39_MARKER" 2>/dev/null || echo '<absent>'), systemctl=$(cat "$T39_RECOVERY_SC_LOG" 2>/dev/null || echo '<empty>'), output=$(cat "$T39_DIR/recovery-output.log" 2>/dev/null || echo '<empty>'))"
+fi
+if [[ $(wc -l < "$T39_EVENTS" 2>/dev/null || echo 0) -eq 2 ]] &&
+   grep -Eq '^[0-9]{13} refusal$' "$T39_EVENTS" &&
+   grep -Eq '^[0-9]{13} recovery$' "$T39_EVENTS" &&
+   [[ "$(tail -n 1 "$T39_EVENTS" 2>/dev/null | awk '{print $2}')" == "recovery" ]] &&
+   ! grep -Eq 'test-token|123456|secret|config' "$T39_EVENTS"; then
+  pass "history records recovery once and contains only timestamps and fixed event types"
+else
+  fail "recovery history is not a safe two-event sequence (history=$(cat "$T39_EVENTS" 2>/dev/null || echo '<missing>'))"
+fi
+
+# =============================================================================
+# Test 40: Mainnet identity history is bounded and remains readable by API user
+# =============================================================================
+section "Test 40: Mainnet identity event history is bounded and type-only"
+
+T40_DIR=$(mktemp -d "$TMPDIR_TEST/t40-XXXXXXXX")
+T40_STATE_DIR="$T40_DIR/state"
+T40_EVENTS="$T40_STATE_DIR/watchdog-mainnet-identity-events"
+mkdir -p "$T40_STATE_DIR"
+for T40_INDEX in {0..99}; do
+  printf '%s recovery\n' "$((1700000000000 + T40_INDEX))" >> "$T40_EVENTS"
+done
+printf '%s recovery injected=must-not-be-retained\n' "1700000000100" >> "$T40_EVENTS"
+T40_SC_LOG="$T40_DIR/systemctl.log"
+T40_FAKE_SC=$(make_fake_bin "systemctl" "$T40_SC_LOG")
+NODE_API_URL="http://127.0.0.1:19999" \
+  STATE_DIR="$T40_STATE_DIR" \
+  TIMEOUT_SECS="1" \
+  MOCK_SYSTEMCTL_ACTIVE_STATE="failed" \
+  MOCK_SYSTEMCTL_EXEC_MAIN_STATUS="78" \
+  SUPPORT_BOT_TOKEN="" \
+  SUPPORT_ADMIN_CHAT_ID="" \
+  PATH="$T40_FAKE_SC:$PATH" \
+  bash "$WATCHDOG_SH" >"$T40_DIR/output.log" 2>&1
+T40_EXIT=$?
+
+if [[ $T40_EXIT -eq 0 ]] &&
+   [[ $(wc -l < "$T40_EVENTS" 2>/dev/null || echo 0) -eq 100 ]] &&
+   [[ "$(stat -c '%a' "$T40_EVENTS" 2>/dev/null || true)" == "644" ]] &&
+   [[ "$(tail -n 1 "$T40_EVENTS" 2>/dev/null | awk '{print $2}')" == "refusal" ]] &&
+   ! grep -Ev '^[0-9]{13} (refusal|recovery)$' "$T40_EVENTS" >/dev/null; then
+  pass "event history keeps 100 entries, is API-readable, and contains only fixed fields"
+else
+  fail "event history exceeded its bound or contains unsafe fields (exit=$T40_EXIT, mode=$(stat -c '%a' "$T40_EVENTS" 2>/dev/null || echo '<unknown>'), entries=$(wc -l < "$T40_EVENTS" 2>/dev/null || echo 0), output=$(cat "$T40_DIR/output.log" 2>/dev/null || echo '<empty>'))"
+fi
+
+# =============================================================================
+# Test 41: an unconfirmed systemd read is not recorded as recovery
+# =============================================================================
+section "Test 41: unavailable systemd status preserves refusal history"
+
+T41_DIR=$(mktemp -d "$TMPDIR_TEST/t41-XXXXXXXX")
+T41_STATE_DIR="$T41_DIR/state"
+mkdir -p "$T41_STATE_DIR"
+printf '%s\n' "2026-01-01T00:00:00Z" > "$T41_STATE_DIR/watchdog-mainnet-identity-refusal"
+printf '%s refusal\n' "1767225600000" > "$T41_STATE_DIR/watchdog-mainnet-identity-events"
+T41_SC_LOG="$T41_DIR/systemctl.log"
+T41_CURL_LOG="$T41_DIR/curl.log"
+T41_FAKE_SC=$(make_fake_bin "systemctl" "$T41_SC_LOG")
+T41_CURL=$(make_fake_curl "$T41_CURL_LOG" "200")
+
+for T41_FAILURE_MODE in exec-status active-state; do
+  T41_FAILURE_ENV=()
+  if [[ "$T41_FAILURE_MODE" == "exec-status" ]]; then
+    T41_FAILURE_ENV+=(MOCK_SYSTEMCTL_EXEC_MAIN_STATUS_SHOW_FAIL=1)
+  else
+    T41_FAILURE_ENV+=(MOCK_SYSTEMCTL_EXEC_MAIN_STATUS=78 MOCK_SYSTEMCTL_ACTIVE_SHOW_FAIL=1)
+  fi
+  env "${T41_FAILURE_ENV[@]}" \
+    NODE_API_URL="http://127.0.0.1:19999" \
+    STATE_DIR="$T41_STATE_DIR" \
+    TIMEOUT_SECS="1" \
+    SUPPORT_BOT_TOKEN="" \
+    SUPPORT_ADMIN_CHAT_ID="" \
+    PATH="$T41_CURL:$T41_FAKE_SC:$PATH" \
+    bash "$WATCHDOG_SH" >>"$T41_DIR/output.log" 2>&1
+  T41_EXIT=$?
+done
+
+if [[ $T41_EXIT -eq 0 ]] &&
+   [[ -s "$T41_STATE_DIR/watchdog-mainnet-identity-refusal" ]] &&
+   [[ $(wc -l < "$T41_STATE_DIR/watchdog-mainnet-identity-events" 2>/dev/null || echo 0) -eq 1 ]] &&
+   [[ "$(awk 'END {print $2}' "$T41_STATE_DIR/watchdog-mainnet-identity-events")" == "refusal" ]] &&
+   [[ ! -s "$T41_CURL_LOG" ]] &&
+   ! grep -q "restart aperod-node" "$T41_SC_LOG" 2>/dev/null; then
+  pass "systemd read failures did not create a false recovery or lose the refusal state"
+else
+  fail "unconfirmed systemd status changed the refusal state (exit=$T41_EXIT, events=$(cat "$T41_STATE_DIR/watchdog-mainnet-identity-events"), curl=$(cat "$T41_CURL_LOG" 2>/dev/null || echo '<empty>'), systemctl=$(cat "$T41_SC_LOG" 2>/dev/null || echo '<empty>'))"
+fi
 
 # =============================================================================
 # Summary

@@ -38,7 +38,7 @@ type CheckpointEntry struct {
 
 // AVMCheckpoint is a complete state snapshot. V1 uses a single
 // operator-attested signature; v2 uses detached signatures from a configured
-// witness quorum. It is not a consensus rule or a substitute for block
+// witness policy. It is not a consensus rule or a substitute for block
 // validation: it only provides a trusted starting state for bounded replay.
 //
 //nolint:revive // The AVM prefix is retained because this serialized type is AVM-scoped.
@@ -202,11 +202,17 @@ func checkpointAuthorityAllowed(authorities []crypto.ValidatorPubKey, key crypto
 }
 
 func validateCheckpointAuthorities(authorities []crypto.ValidatorPubKey, threshold int) error {
-	if threshold < 2 {
-		return fmt.Errorf("avm checkpoint: quorum threshold must be at least 2")
+	if len(authorities) == 0 {
+		return fmt.Errorf("avm checkpoint: at least one trusted witness is required")
+	}
+	if threshold < 1 {
+		return fmt.Errorf("avm checkpoint: witness threshold must be positive")
+	}
+	if threshold == 1 && len(authorities) != 1 {
+		return fmt.Errorf("avm checkpoint: a 1-of-1 policy requires exactly one trusted authority")
 	}
 	if threshold > len(authorities) {
-		return fmt.Errorf("avm checkpoint: quorum threshold exceeds configured authority count")
+		return fmt.Errorf("avm checkpoint: witness threshold exceeds configured authority count")
 	}
 	seen := make(map[string]struct{}, len(authorities))
 	for i, authority := range authorities {

@@ -150,12 +150,13 @@ forecasts, return projections or guarantees.
 
 ### Quick-start (Linux / Ubuntu 22.04+)
 
-Use the pinned, reviewed installation procedure in
-[VALIDATORS.md — Setup Guide](VALIDATORS.md#setup-guide). Do not run an installer
-from the mutable `main` branch or pipe a downloaded script to `sudo bash`.
+There is no verified public Mainnet validator installation command yet. Read
+[VALIDATORS.md](VALIDATORS.md#setup-guide) for current readiness and requirements; do not run
+the legacy installer to join Mainnet or send stake based on an installation
+message.
 
-See [install-validator.sh](install-validator.sh) and
-[install-node.sh](install-node.sh) for full automation scripts.
+The repository's generic automation scripts are not a supported Mainnet
+onboarding procedure.
 
 ### System requirements
 

@@ -14,10 +14,11 @@ Select the exact reviewed public commit explicitly:
 export APEROD_NODE_SOURCE_COMMIT=<full-reviewed-public-commit>
 ```
 
-For a fresh installation, run `deploy/install-node.sh` or
-`deploy/install-validator.sh` from that package. Installers reject an existing
-binary, configuration, or nonempty state directory; an existing node is not a
-fresh install. Validator setup also needs the operator's reward address.
+There is currently no verified fresh-install procedure for joining Mainnet.
+The generic `install-node.sh` and `install-validator.sh` scripts do not provide
+the signed Mainnet state bootstrap and are not supported Mainnet onboarding
+commands. Do not use them to configure a Mainnet validator. See
+[`VALIDATORS.md`](VALIDATORS.md) for the current readiness and requirements.
 
 Updating an existing node additionally requires:
 

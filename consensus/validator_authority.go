@@ -42,16 +42,18 @@ func (e *Engine) validateAuthorityFork() error {
 	if err := e.cfg.Registry.ConfigureSignatureAuthority(f, e.chain.Height()+1); err != nil {
 		return err
 	}
-	if e.chain.Height() >= f.Height-1 {
-		parent, found, err := e.cfg.Store.GetCanonicalHash(f.Height - 1)
-		if err != nil || !found || parent != f.Parent {
-			return fmt.Errorf("authority fork pinned canonical parent unavailable")
+	for _, transition := range f.Transitions() {
+		if e.chain.Height() >= transition.Height-1 {
+			parent, found, err := e.cfg.Store.GetCanonicalHash(transition.Height - 1)
+			if err != nil || !found || parent != transition.Parent {
+				return fmt.Errorf("authority fork pinned canonical parent unavailable")
+			}
 		}
-	}
-	if e.chain.Height() == f.Height-1 {
-		raw, err := json.Marshal(e.cfg.Registry.TakeSnapshot())
-		if err != nil || crypto.Hash32(sha256.Sum256(raw)) != f.RegistrySHA256 {
-			return fmt.Errorf("authority fork parent registry fingerprint mismatch")
+		if e.chain.Height() == transition.Height-1 {
+			raw, err := json.Marshal(e.cfg.Registry.TakeSnapshot())
+			if err != nil || crypto.Hash32(sha256.Sum256(raw)) != transition.RegistrySHA256 {
+				return fmt.Errorf("authority fork parent registry fingerprint mismatch")
+			}
 		}
 	}
 	return nil
@@ -65,9 +67,10 @@ func (e *Engine) checkAuthorityParent(header core.BlockHeader) error {
 	if err := f.CheckParent(header); err != nil {
 		return err
 	}
-	if header.Height == f.Height {
+	transition := f.TransitionAt(header.Height)
+	if transition != nil {
 		raw, err := json.Marshal(e.cfg.Registry.TakeSnapshot())
-		if err != nil || crypto.Hash32(sha256.Sum256(raw)) != f.RegistrySHA256 {
+		if err != nil || crypto.Hash32(sha256.Sum256(raw)) != transition.RegistrySHA256 {
 			return fmt.Errorf("authority fork activation registry mismatch")
 		}
 	}

@@ -173,8 +173,10 @@ func (s *Server) restSaleReadiness(w http.ResponseWriter, r *http.Request) {
 		code = "SALE_NOT_ACTIVATED"
 	case s.blockStore == nil:
 		code = "NODE_UNAVAILABLE"
-	case s.myKey == nil || !s.myKey.Public().Equals(s.saleMigration.Checkpoint.SaleAuthority):
+	case s.myKey == nil:
 		code = "NO_READY_PRODUCER"
+	case !s.myKey.Public().Equals(s.saleMigration.Checkpoint.SaleAuthority):
+		code = "SALE_AUTHORITY_MISMATCH"
 	default:
 		if _, err := s.activeSale(false); err != nil {
 			code = "CHECKPOINT_LEDGER_MISMATCH"

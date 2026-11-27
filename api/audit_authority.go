@@ -41,10 +41,11 @@ func (s *Server) SetAuditValidatorAuthorityFork(f *core.ValidatorAuthorityFork) 
 // Resolve collateral identity separately from the loaded signing key. A retired
 // key must fail even when its public bytes still identify the local collateral.
 func (s *Server) localValidatorIdentity(next bool) (crypto.ValidatorPubKey, error) {
-	if s.myKey == nil {
+	key := s.validatorKeySnapshot()
+	if key == nil {
 		return nil, fmt.Errorf("local validator key unavailable")
 	}
-	signing := s.myKey.Public()
+	signing := key.Public()
 	if s.validatorAuthorityFork == nil {
 		return signing, nil
 	}

@@ -143,6 +143,7 @@ type Server struct {
 	lpodMigration          *store.LPoDMigration
 	genesisVestingHeight   uint64
 	validatorAuthorityFork *core.ValidatorAuthorityFork
+	mainnetIdentity        *mainnetGenesisIdentity
 	lpodFinalized          func(uint64, crypto.Hash32) bool
 	addr                   string
 	chain                  *core.Chain
@@ -151,6 +152,7 @@ type Server struct {
 	registry               *core.ValidatorRegistry    // live PoS validator registry (optional)
 	myKey                  *crypto.LockedValidatorKey // node's own validator key for admin stake ops (optional)
 	blockStore             *store.DB                  // optional: LevelDB store for pruned-block fallback
+	chainDBExportMu        sync.Mutex
 	log                    *slog.Logger
 	mux                    *http.ServeMux
 	hub                    *Hub
@@ -412,6 +414,7 @@ type Server struct {
 	stakedCollateralRingExclusionActivationHeight uint64
 	guardianFundActivationHeight                  uint64
 	guardianFundChainAnchor                       crypto.Hash32
+	consensusSchedule                             consensusScheduleSnapshot
 	broadcastTxMu                                 sync.RWMutex
 	broadcastTxFn                                 func(*core.Transaction)
 }
@@ -596,6 +599,12 @@ func (s *Server) SetValidatorKey(key *crypto.LockedValidatorKey) {
 	s.dailyJobs.mu.Lock()
 	defer s.dailyJobs.mu.Unlock()
 	s.myKey = key
+}
+
+func (s *Server) validatorKeySnapshot() *crypto.LockedValidatorKey {
+	s.dailyJobs.mu.Lock()
+	defer s.dailyJobs.mu.Unlock()
+	return s.myKey
 }
 
 // APIKeyConfig optionally sets the required API key for write operations.
@@ -1131,10 +1140,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // health for scraping. No external client library is used — the format is
 // simple enough to hand-write and keeps the Go module dependency-free.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	peers := 0
-	if s.peerCounter != nil {
-		peers = s.peerCounter()
-	}
+	state := s.localValidatorNetworkState()
 	activeValidators, totalValidators := 0, 0
 	if s.registry != nil {
 		activeValidators, totalValidators = s.registry.Count()
@@ -1164,7 +1170,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "# HELP aperod_peer_count Number of connected P2P peers.\n")
 	fmt.Fprintf(w, "# TYPE aperod_peer_count gauge\n")
-	fmt.Fprintf(w, "aperod_peer_count %d\n", peers)
+	fmt.Fprintf(w, "aperod_peer_count %d\n", state.PeerCount)
 
 	fmt.Fprintf(w, "# HELP aperod_validator_count_active Number of currently active PoA/PoS validators.\n")
 	fmt.Fprintf(w, "# TYPE aperod_validator_count_active gauge\n")
@@ -1174,9 +1180,103 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE aperod_validator_count_total gauge\n")
 	fmt.Fprintf(w, "aperod_validator_count_total %d\n", totalValidators)
 
+	fmt.Fprintf(w, "# HELP aperod_validator_local_key_loaded Whether this node has a validator signing key loaded.\n")
+	fmt.Fprintf(w, "# TYPE aperod_validator_local_key_loaded gauge\n")
+	fmt.Fprintf(w, "aperod_validator_local_key_loaded %d\n", boolMetric(state.KeyLoaded))
+
+	fmt.Fprintf(w, "# HELP aperod_validator_local_active Whether this node's loaded validator identity is active in the on-chain registry.\n")
+	fmt.Fprintf(w, "# TYPE aperod_validator_local_active gauge\n")
+	fmt.Fprintf(w, "aperod_validator_local_active %d\n", boolMetric(state.RegistryActive))
+
+	fmt.Fprintf(w, "# HELP aperod_validator_p2p_connected Whether this validator node has at least one established P2P peer.\n")
+	fmt.Fprintf(w, "# TYPE aperod_validator_p2p_connected gauge\n")
+	fmt.Fprintf(w, "aperod_validator_p2p_connected %d\n", boolMetric(state.P2PConnected))
+
+	fmt.Fprintf(w, "# HELP aperod_validator_online Whether the local validator key is active on-chain and this node has an established P2P peer.\n")
+	fmt.Fprintf(w, "# TYPE aperod_validator_online gauge\n")
+	fmt.Fprintf(w, "aperod_validator_online %d\n", boolMetric(state.Online))
+
+	fmt.Fprintf(w, "# HELP aperod_validator_sync_healthy Whether an online validator has a peer within 100 blocks of its local tip.\n")
+	fmt.Fprintf(w, "# TYPE aperod_validator_sync_healthy gauge\n")
+	fmt.Fprintf(w, "aperod_validator_sync_healthy %d\n", boolMetric(state.SyncHealthy))
+
+	fmt.Fprintf(w, "# HELP aperod_peer_sync_lag_blocks_max Maximum reported block-height lag among connected peers; zero when no peer is behind.\n")
+	fmt.Fprintf(w, "# TYPE aperod_peer_sync_lag_blocks_max gauge\n")
+	fmt.Fprintf(w, "aperod_peer_sync_lag_blocks_max %d\n", state.MaxPeerLagBlocks)
+
 	fmt.Fprintf(w, "# HELP aperod_up Whether the API server is reachable (always 1 when scraped successfully).\n")
 	fmt.Fprintf(w, "# TYPE aperod_up gauge\n")
 	fmt.Fprintf(w, "aperod_up 1\n")
+}
+
+const peerSyncHealthyMaxLagBlocks = uint64(100)
+
+type localValidatorNetworkStatus struct {
+	KeyLoaded        bool
+	RegistryActive   bool
+	P2PConnected     bool
+	Online           bool
+	SyncHealthy      bool
+	PeerCount        int
+	MaxPeerLagBlocks uint64
+}
+
+func (s *Server) localValidatorNetworkState() localValidatorNetworkStatus {
+	state := localValidatorNetworkStatus{
+		KeyLoaded: s.validatorKeySnapshot() != nil,
+	}
+	if s.peerCounter != nil {
+		state.PeerCount = s.peerCounter()
+	}
+	if state.PeerCount < 0 {
+		state.PeerCount = 0
+	}
+	if s.peerCounter == nil && s.peerListFn != nil {
+		state.PeerCount = len(s.peerListFn())
+	}
+	state.P2PConnected = state.PeerCount > 0
+
+	if state.KeyLoaded && s.registry != nil {
+		identity, err := s.localValidatorIdentity(false)
+		state.RegistryActive = err == nil && s.registry.IsActive(identity)
+	}
+	state.Online = state.KeyLoaded && state.RegistryActive && state.P2PConnected
+
+	if s.chain == nil || s.peerListFn == nil {
+		return state
+	}
+	tip := s.chain.Height()
+	hasSyncedPeer := false
+	for _, peer := range s.peerListFn() {
+		// Height zero means the peer has not replied to a keepalive yet, not
+		// that it is synchronized at genesis.
+		if peer.Height == 0 {
+			if tip > state.MaxPeerLagBlocks {
+				state.MaxPeerLagBlocks = tip
+			}
+			continue
+		}
+		if peer.Height >= tip {
+			hasSyncedPeer = true
+			continue
+		}
+		lag := tip - peer.Height
+		if lag > state.MaxPeerLagBlocks {
+			state.MaxPeerLagBlocks = lag
+		}
+		if lag <= peerSyncHealthyMaxLagBlocks {
+			hasSyncedPeer = true
+		}
+	}
+	state.SyncHealthy = state.Online && hasSyncedPeer
+	return state
+}
+
+func boolMetric(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
@@ -1510,11 +1610,17 @@ func (s *Server) aprGetBlockByHeight(params json.RawMessage) (interface{}, error
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	block := s.chain.GetByHeight(args.Height)
+	block, pruned, err := s.restBlockAtHeight(args.Height)
+	if err != nil {
+		return nil, err
+	}
+	if pruned != nil {
+		return nil, fmt.Errorf("block data pruned at height %d", pruned.Height)
+	}
 	if block == nil {
 		return nil, fmt.Errorf("block not found at height %d", args.Height)
 	}
-	return blockToResponse(block, s.avmGasBurnActivationHeight)
+	return s.restBlockToResponse(block)
 }
 
 func (s *Server) aprGetBlockByHash(params json.RawMessage) (interface{}, error) {
@@ -1530,11 +1636,21 @@ func (s *Server) aprGetBlockByHash(params json.RawMessage) (interface{}, error) 
 	}
 	var hash crypto.Hash32
 	copy(hash[:], b)
-	block := s.chain.GetByHash(hash)
+	block := s.lookupBlockMem(args.Hash)
+	if block == nil && s.blockStore != nil {
+		fullBlock, prunedBlock, err := s.lookupBlockFromDisk(args.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if prunedBlock != nil {
+			return nil, fmt.Errorf("block data pruned at height %d", prunedBlock.Height)
+		}
+		block = fullBlock
+	}
 	if block == nil {
 		return nil, fmt.Errorf("block not found: %s", args.Hash[:16])
 	}
-	return blockToResponse(block, s.avmGasBurnActivationHeight)
+	return s.restBlockToResponse(block)
 }
 
 func (s *Server) aprGetMempoolInfo() (interface{}, error) {

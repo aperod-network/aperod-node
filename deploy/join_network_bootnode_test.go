@@ -352,6 +352,7 @@ p2p:
   bootnodes: []
   max_peers: 50
 consensus:
+  non_validator: true
   validator_key: /etc/aperod/validator.key
   reward_address: aproecTest
 api:
@@ -367,6 +368,21 @@ genesis:
 
 	dataDir := t.TempDir()
 	dropinDir := t.TempDir()
+	preservedChain := filepath.Join(dataDir, "chain.db")
+	if err := os.MkdirAll(preservedChain, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(preservedChain, "CURRENT"), []byte("existing-chain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	preservedSnapshot := filepath.Join(dataDir, "snapshot-v2-7.json.gz")
+	if err := os.WriteFile(preservedSnapshot, []byte("existing-snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	preservedIdentity := filepath.Join(dataDir, "p2p_identity.key")
+	if err := os.WriteFile(preservedIdentity, []byte("existing-identity"), 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	// ── Build the command environment ────────────────────────────────────────
 	// Inherit the full process environment so Python site-packages (pyyaml),
@@ -410,6 +426,19 @@ genesis:
 			nonDefaultPort, runErr, out)
 	}
 	t.Logf("aperod-join.sh output:\n%s", out)
+	for path, want := range map[string]string{
+		filepath.Join(preservedChain, "CURRENT"): "existing-chain",
+		preservedSnapshot:                        "existing-snapshot",
+		preservedIdentity:                        "existing-identity",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("--no-chaindb removed existing node data %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Errorf("--no-chaindb changed %s: got %q, want %q", path, got, want)
+		}
+	}
 
 	// ── Load the written config and assert the bootnode port ─────────────────
 	cfg, err := config.Load(cfgPath)
@@ -420,6 +449,9 @@ genesis:
 	if len(cfg.P2P.Bootnodes) != 1 {
 		t.Fatalf("cfg.P2P.Bootnodes length = %d, want 1; got: %v",
 			len(cfg.P2P.Bootnodes), cfg.P2P.Bootnodes)
+	}
+	if !cfg.Consensus.NonValidator {
+		t.Fatal("join script removed the non_validator safe-mode guard before canonical identity verification")
 	}
 	got := cfg.P2P.Bootnodes[0]
 

@@ -865,7 +865,7 @@ func tryLoadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string,
 // without running the full node startup path.
 func logSnapshotStartupReason(serr error, tipHeight uint64, log *slog.Logger) {
 	if errors.Is(serr, os.ErrNotExist) {
-		log.Info("no snapshot found — full block scan required",
+log.Info("no exact-tip snapshot found — checking older snapshots before replay",
 			"tip_height", tipHeight,
 			"startup_reason", "no_snapshot",
 		)

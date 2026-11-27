@@ -282,16 +282,18 @@ func realIP(r *http.Request) string {
 	// Only honor X-Forwarded-For from a trusted local proxy.
 	if remoteIP == "127.0.0.1" || remoteIP == "::1" {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Take only the first (leftmost) address.
-			for idx := 0; idx < len(xff); idx++ {
+// Trust only the address appended by our immediate local proxy.
+// Earlier elements can be supplied by the remote client. Additional
+// proxy hops require explicit trust/real-IP configuration at that proxy.
+for idx := len(xff) - 1; idx >= 0; idx-- {
 				if xff[idx] == ',' {
-					xff = xff[:idx]
+xff = xff[idx+1:]
 					break
 				}
 			}
 			xff = trimSpace(xff)
-			if xff != "" {
-				return xff
+if ip := net.ParseIP(xff); ip != nil {
+return ip.String()
 			}
 		}
 	}

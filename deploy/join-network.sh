@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Aperod — Join Existing Network
+#  Aperod — legacy test-environment replica transfer (operator only).
+#  Do not use for Mainnet installation or validator admission.
+#  Для установки Mainnet см. deploy/MAINNET.md.
 #
 #  РЕЖИМ 1 (push): Запуск на ОСНОВНОМ узле (validator).
 #  Подключает новый сервер к работающей сети за один шаг.
 #
 #    sudo bash join-network.sh <IP_НОВОГО_СЕРВЕРА>
 #
-#    Пример: sudo bash join-network.sh 77.221.153.86
+#    Пример: sudo bash join-network.sh 192.0.2.10
 #
 #  РЕЖИМ 2 (bootstrap): Запуск на НОВОМ реле.
 #  Копирует chain.db и актуальный снимок с валидатора, чтобы
@@ -15,7 +17,7 @@
 #
 #    sudo bash join-network.sh --bootstrap-from=<IP_ВАЛИДАТОРА>
 #
-#    Пример: sudo bash join-network.sh --bootstrap-from=89.169.53.128
+#    Пример: sudo bash join-network.sh --bootstrap-from=192.0.2.20
 #
 #  Что делает скрипт (push-режим):
 #    1. Останавливает и отключает aperod-node на новом сервере
@@ -65,6 +67,7 @@ PRIMARY_P2P_PORT=30303
 # by install-validator.sh / install-node.sh.
 SECONDARY_NODE_YAML="${SECONDARY_NODE_YAML:-/etc/aperod/node.yaml}"
 SECONDARY_NODE_CONFIG_SH="${SECONDARY_NODE_CONFIG_SH:-/opt/aperod/blockchain/deploy/node-config.sh}"
+PRIMARY_NODE_YAML="${PRIMARY_NODE_YAML:-/etc/aperod/node.yaml}"
 
 # ── Аргументы ─────────────────────────────────────────────
 BOOTSTRAP_FROM=""
@@ -86,6 +89,43 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# ── Mainnet data-copy safety gate ──────────────────────────
+# Copying a LevelDB is an irreversible overwrite on the target. There is
+# currently no independently authenticated mainnet identity/bootstrap release
+# in this repository, so neither direction may stop a node, create a sentinel,
+# alter bootnodes, or copy data for a node configured as mainnet. Do not add an
+# environment-variable bypass: only a reviewed release with a pinned identity
+# may reopen this path.
+if [[ -n "${BOOTSTRAP_FROM}" ]]; then
+  _JOIN_LOCAL_CONFIG="${LOCAL_NODE_YAML:-${SECONDARY_NODE_YAML}}"
+else
+  _JOIN_LOCAL_CONFIG="${PRIMARY_NODE_YAML}"
+fi
+if [[ ! -f "${_JOIN_LOCAL_CONFIG}" ]]; then
+  die "Конфигурация локальной ноды не найдена: ${_JOIN_LOCAL_CONFIG}. Нельзя подтвердить сеть; перенос данных запрещён до любых изменений."
+fi
+_JOIN_NETWORK=$(python3 - "${_JOIN_LOCAL_CONFIG}" <<'PY'
+import sys
+try:
+    import yaml
+    with open(sys.argv[1], encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    network = config.get("network") if isinstance(config, dict) else None
+    if not isinstance(network, str) or not network.strip():
+        raise ValueError("missing network")
+    print(network.strip().lower())
+except Exception as exc:
+    print(f"cannot validate local node network: {exc}", file=sys.stderr)
+    sys.exit(2)
+PY
+) || die "Не удалось проверить сеть в ${_JOIN_LOCAL_CONFIG}; перенос данных запрещён до любых изменений."
+if [[ "${_JOIN_NETWORK}" == "mainnet" ]]; then
+  die "Mainnet-перенос заблокирован до любых изменений: в проекте нет независимо подтверждённого неизменяемого mainnet bootstrap/identity. Не останавливайте узлы и не копируйте данные; перенос будет разрешён только после проверки и закрепления network + genesis hash источника и цели."
+fi
+if [[ "${_JOIN_NETWORK}" != "testnet" && "${_JOIN_NETWORK}" != "devnet" ]]; then
+  die "Неизвестная сеть '${_JOIN_NETWORK}' в ${_JOIN_LOCAL_CONFIG}; перенос данных запрещён."
+fi
 
 # ══════════════════════════════════════════════════════════════
 #  BOOTSTRAP-РЕЖИМ: этот сервер (реле) тянет данные с валидатора

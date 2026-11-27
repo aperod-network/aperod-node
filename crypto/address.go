@@ -114,6 +114,23 @@ func Validate(addr Address) error {
 	return err
 }
 
+// DecodeWalletAddress additionally requires canonical, nonidentity prime-order
+// spend and view keys. DecodeAddress intentionally retains its historical
+// wire-decoding semantics; tightening it would change consensus replay.
+func DecodeWalletAddress(addr Address) (NetworkByte, Point32, Point32, error) {
+network, spend, view, err := DecodeAddress(addr)
+if err != nil {
+return 0, Point32{}, Point32{}, err
+}
+if _, err := checkedCLSAGPrimePoint(spend, "address spend key"); err != nil {
+return 0, Point32{}, Point32{}, err
+}
+if _, err := checkedCLSAGPrimePoint(view, "address view key"); err != nil {
+return 0, Point32{}, Point32{}, err
+}
+return network, spend, view, nil
+}
+
 // AddressFromKeys is a convenience wrapper for WalletKeyPair.
 func AddressFromKeys(net NetworkByte, kp *WalletKeyPair) Address {
 	return EncodeAddress(net, kp.Spend.Public, kp.View.Public)

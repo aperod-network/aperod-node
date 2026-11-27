@@ -299,9 +299,17 @@ exit 0
         wrong_network, network_refused = sandbox("mainnet-refused", network="mainnet")
         self.assertNotEqual(network_refused.returncode, 0)
         self.assertIn("testnet only", network_refused.stdout)
+        self.assertIn("поддерживает только testnet", network_refused.stdout)
         self.assertFalse((wrong_network / "commands").exists(), "mainnet refusal reached apt")
         self.assertFalse((wrong_network / "etc/aperod/validator.key").exists())
         self.assertFalse((wrong_network / "usr/local/bin/aperod-node").exists())
+        self.assertFalse((wrong_network / "etc/aperod/node.yaml").exists())
+        self.assertFalse((wrong_network / "etc/systemd/system/aperod-node.service").exists())
+        self.assertFalse((wrong_network / "systemctl.calls").exists())
+        self.assertFalse((wrong_network / "var/lib/aperod").exists(),
+                         "mainnet refusal created a data directory")
+        self.assertEqual(list((wrong_network / "opt/aperod").iterdir()),
+                         [], "mainnet refusal created an installation checkout")
         broken, failed = sandbox("fresh-missing-bootstrap", missing="ensure-dropin.sh")
         self.assertNotEqual(failed.returncode, 0)
         self.assertFalse((broken / "commands").exists(), "missing bootstrap reached apt")

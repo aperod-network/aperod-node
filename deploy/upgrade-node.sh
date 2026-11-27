@@ -91,6 +91,18 @@ if [[ ! -f "${BINARY_DST}" && ! -f "${SERVICE_FILE}" ]]; then
   For a first-time install run install-node.sh instead."
 fi
 
+# ── Step 0: Verify/update restart suppression before any upgrade changes ──
+#
+# Older units predate RestartPreventExitStatus=78. The updater can add a
+# dedicated, verified drop-in without stopping the running node. If the
+# effective policy cannot be confirmed, abort before ensure-dropin.sh writes
+# memory settings or update-node.sh prepares a build.
+section "Step 0/3 — Verifying permanent-startup-failure protection"
+info "Checking RestartPreventExitStatus=78 while the current node stays running..."
+if ! bash "${UPDATE_NODE_SH}" --check-restart-policy; then
+  die "Restart policy could not be safely verified. No node stop or binary update was attempted."
+fi
+
 # ── Banner ─────────────────────────────────────────────────
 echo -e "
 ${BOLD}╔════════════════════════════════════════════════════════════╗

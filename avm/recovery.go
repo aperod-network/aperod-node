@@ -54,7 +54,7 @@ func EnsureCanonicalStateWithSecurityHardening(
 	}
 	return ensureCanonicalState(
 		ctx, db, activationHeight, tipHeight, tipHash, nil,
-		securityHardeningActivationHeight,
+		securityHardeningActivationHeight, nil,
 	)
 }
 
@@ -117,7 +117,7 @@ func EnsureCanonicalStateWithCheckpointAndSecurityHardening(
 			signer:          signer,
 			maxReplayBlocks: maxReplayBlocks,
 		},
-		securityHardeningActivationHeight,
+		securityHardeningActivationHeight, nil,
 	)
 }
 
@@ -157,6 +157,19 @@ func EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
 	maxReplayBlocks uint64,
 	securityHardeningActivationHeight uint64,
 ) (bool, error) {
+	return EnsureCanonicalStateWithQuorumCheckpointAndAuthority(
+		ctx, db, activationHeight, tipHeight, tipHash, checkpointPath, authorities,
+		threshold, maxReplayBlocks, securityHardeningActivationHeight, nil,
+	)
+}
+
+// EnsureCanonicalStateWithQuorumCheckpointAndAuthority uses the same
+// height-scoped block signature authority as live consensus.
+func EnsureCanonicalStateWithQuorumCheckpointAndAuthority(
+	ctx context.Context, db *store.DB, activationHeight, tipHeight uint64, tipHash crypto.Hash32,
+	checkpointPath string, authorities []crypto.ValidatorPubKey, threshold int,
+	maxReplayBlocks, securityHardeningActivationHeight uint64, fork *core.ValidatorAuthorityFork,
+) (bool, error) {
 	if activationHeight == 0 || tipHeight < activationHeight {
 		return false, nil
 	}
@@ -177,7 +190,7 @@ func EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
 			witnessThreshold: threshold,
 			maxReplayBlocks:  maxReplayBlocks,
 		},
-		securityHardeningActivationHeight,
+		securityHardeningActivationHeight, fork,
 	)
 }
 
@@ -197,6 +210,7 @@ func ensureCanonicalState(
 	tipHash crypto.Hash32,
 	checkpoint *checkpointRecovery,
 	securityHardeningActivationHeight uint64,
+	fork *core.ValidatorAuthorityFork,
 ) (rebuilt bool, err error) {
 	if db == nil {
 		return false, fmt.Errorf("avm startup: nil database")
@@ -323,6 +337,9 @@ func ensureCanonicalState(
 	}
 
 	if !skipReplay && tipHeight >= startHeight {
+		if err := validateReplayAuthority(db, fork, tipHeight); err != nil {
+			return false, err
+		}
 		tipCommitment, err = replayCanonicalRange(
 			ctx,
 			db,
@@ -334,6 +351,7 @@ func ensureCanonicalState(
 			havePreviousHash,
 			strictHistory,
 			securityHardeningActivationHeight,
+			fork,
 		)
 		if err != nil {
 			return false, err
@@ -422,6 +440,27 @@ func ensureCanonicalState(
 	return rebuilt, nil
 }
 
+func validateReplayAuthority(db *store.DB, fork *core.ValidatorAuthorityFork, tip uint64) error {
+	if fork == nil {
+		return nil
+	}
+	if err := fork.Validate(); err != nil {
+		return fmt.Errorf("avm startup: invalid authority fork: %w", err)
+	}
+	if hash, found, err := db.GetCanonicalHash(0); err != nil || !found || hash != fork.Genesis {
+		return fmt.Errorf("avm startup: authority fork genesis does not match the canonical index")
+	}
+	for _, transition := range fork.Transitions() {
+		height := transition.Height - 1
+		if height <= tip {
+			if hash, found, err := db.GetCanonicalHash(height); err != nil || !found || hash != transition.Parent {
+				return fmt.Errorf("avm startup: authority fork parent does not match the canonical index at height %d", height)
+			}
+		}
+	}
+	return nil
+}
+
 func replayCanonicalRange(
 	ctx context.Context,
 	db *store.DB,
@@ -433,6 +472,7 @@ func replayCanonicalRange(
 	havePreviousHash bool,
 	verifySignatures bool,
 	securityHardeningActivationHeight uint64,
+	fork *core.ValidatorAuthorityFork,
 ) (crypto.Hash32, error) {
 	executor := NewBlockExecutorWithSecurityHardening(
 		replay, securityHardeningActivationHeight,
@@ -469,8 +509,13 @@ func replayCanonicalRange(
 		if havePreviousHash && block.Header.PrevHash != previousHash {
 			return crypto.Hash32{}, fmt.Errorf("avm startup: broken canonical linkage at height %d", height)
 		}
-		if verifySignatures && !block.Header.VerifySignature() {
-			return crypto.Hash32{}, fmt.Errorf("avm startup: invalid validator signature at height %d", height)
+		if verifySignatures {
+			if err := fork.CheckParent(block.Header); err != nil {
+				return crypto.Hash32{}, fmt.Errorf("avm startup: authority transition at height %d: %w", height, err)
+			}
+			if !block.Header.VerifySignature(fork.Authority(block.Header.ValidatorPub, height)) {
+				return crypto.Hash32{}, fmt.Errorf("avm startup: invalid validator signature at height %d", height)
+			}
 		}
 		if height == tipHeight && indexedHash != tipHash {
 			return crypto.Hash32{}, fmt.Errorf("avm startup: supplied tip does not match canonical block at height %d", height)
@@ -564,7 +609,7 @@ func BuildCheckpointDraftFromCanonicalWithSecurityHardening(
 	replay := NewMemoryStore()
 	writeSetCommitment, err := replayCanonicalRange(
 		ctx, db, replay, activationHeight, tipHeight, tipHash, parentHash, true, true,
-		securityHardeningActivationHeight,
+		securityHardeningActivationHeight, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("avm checkpoint: verify canonical history: %w", err)
@@ -641,7 +686,7 @@ func BuildVerifiedCheckpointFromCanonicalWithSecurityHardening(
 	replay := NewMemoryStore()
 	writeSetCommitment, err := replayCanonicalRange(
 		ctx, db, replay, activationHeight, tipHeight, tipHash, parentHash, true, true,
-		securityHardeningActivationHeight,
+		securityHardeningActivationHeight, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("avm checkpoint: verify canonical history: %w", err)

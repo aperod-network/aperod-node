@@ -7,11 +7,11 @@
 | Latest `main` | ✅ Active |
 | Older tags | ❌ No patches |
 
-No standalone signed installer archive is currently published. For an
-interactive install, use the pinned, GitHub-signature-verified source commit
-and clean-checkout procedure in [`README-public.md`](README-public.md).
-The installer independently checks the source commit and its ancestry. Never
-fetch a script from mutable `main` and pipe it to a root shell.
+A verified self-service mainnet bootstrap release is not yet published.
+Follow the release prerequisites in [`MAINNET.md`](MAINNET.md); a signed source
+commit alone does not prove compatibility with the live chain. Never fetch a
+script from mutable `main` and pipe it to a root shell, or bypass network and
+source-identity guards to turn a different network's installer into a mainnet one.
 
 ---
 

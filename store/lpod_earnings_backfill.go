@@ -292,13 +292,23 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 		return nil, fmt.Errorf("canonical payout counters decreased")
 	}
 	angelPaid := after.State.AngelPaid - priorAngel
-	leaderPaid := after.State.LeaderPaid - priorLeader
 	returned := after.PrincipalReturned - priorReturned
-	if leaderPaid > 0 {
-		rewards[auth.Leader] = leaderPaid
+	leaderPayouts, _, err := deriveLPoDValidatorPayouts(
+		before, after, block.Header.Timestamp, block.Header.ValidatorPub.Hex(), auth.Leader,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for address, amount := range leaderPayouts {
+		rewards[address], err = lpodAdd(rewards[address], amount)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var positionPaid, principalReturned uint64
+	futureOnlyActivation := after.ValidatorDailyPayoutVersion > 0 &&
+		(before == nil || before.ValidatorDailyPayoutVersion == 0)
 	if before != nil {
 		parentBlock, err := d.canonicalLPoDBlock(block.Header.Height - 1)
 		if err != nil || parentBlock.Hash() != block.Header.PrevHash ||
@@ -330,6 +340,9 @@ func (d *DB) classifyHistoricalLPoDBlock(block *core.Block, m *LPoDMigration, fu
 				return nil, err
 			}
 			accrued := old.Due
+			if futureOnlyActivation {
+				accrued = 0
+			}
 			if old.UnlockHeight == 0 {
 				q, err := inferHistoricalLPoDAccrual(old, next, elapsed)
 				if err != nil {

@@ -38,6 +38,23 @@ func (e *Engine) lpodDailyActive(height uint64) bool {
 	return e.cfg.LPoDDailyUpgradeHeight > 0 && height >= e.cfg.LPoDDailyUpgradeHeight
 }
 
+func (e *Engine) lpodValidatorDailyActive(height uint64) bool {
+	return e.cfg.LPoDValidatorDailyUpgradeHeight > 0 &&
+		height >= e.cfg.LPoDValidatorDailyUpgradeHeight
+}
+
+// ValidateLPoDRewardProfile checks the local parameters required by an LPoD
+// migration. Use the same check at preflight and at block validation.
+func (cfg Config) ValidateLPoDRewardProfile(migrationHeight uint64) error {
+	if cfg.GuardianFundActivationHeight != 0 || cfg.RewardAuthorizationActivationHeight == 0 ||
+		cfg.RewardAuthorizationActivationHeight > migrationHeight || cfg.StakingPoolNAPR != 2_000_000_000*lpod.Unit ||
+		(cfg.BlockRewardNAPR != 0 && cfg.BlockRewardNAPR != 3*lpod.Unit) ||
+		(cfg.TailRewardNAPR != 0 && cfg.TailRewardNAPR != lpod.Unit) {
+		return fmt.Errorf("lpod: incompatible legacy reward schedule or Guardian allocation (check staking_pool_napro, block_reward_napro, tail_reward_napro, reward_authorization_activation_height and guardian_fund_activation_height)")
+	}
+	return nil
+}
+
 func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.LPoDSettlement, *store.LPoDCheckpoint, []lpod.Payment, error) {
 	height := block.Header.Height
 	if !e.lpodActive(height) {
@@ -47,14 +64,15 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 	if e.cfg.LPoDDailyUpgradeHeight > 0 && e.cfg.LPoDDailyUpgradeHeight < m.Height {
 		return nil, nil, nil, fmt.Errorf("lpod: daily upgrade height precedes the position migration")
 	}
+	if e.cfg.LPoDValidatorDailyUpgradeHeight > 0 &&
+		e.cfg.LPoDValidatorDailyUpgradeHeight < m.Height {
+		return nil, nil, nil, fmt.Errorf("lpod: validator daily upgrade height precedes the position migration")
+	}
 	if e.cfg.Store == nil || e.cfg.OnCanonicalBlock == nil || e.cfg.Registry == nil {
 		return nil, nil, nil, fmt.Errorf("lpod: canonical store, atomic commit and validator registry required")
 	}
-	if e.cfg.GuardianFundActivationHeight != 0 || e.cfg.RewardAuthorizationActivationHeight == 0 ||
-		e.cfg.RewardAuthorizationActivationHeight > m.Height || e.cfg.StakingPoolNAPR != 2_000_000_000*lpod.Unit ||
-		(e.cfg.BlockRewardNAPR != 0 && e.cfg.BlockRewardNAPR != 3*lpod.Unit) ||
-		(e.cfg.TailRewardNAPR != 0 && e.cfg.TailRewardNAPR != lpod.Unit) {
-		return nil, nil, nil, fmt.Errorf("lpod: incompatible legacy reward schedule or Guardian allocation")
+	if err := e.cfg.ValidateLPoDRewardProfile(m.Height); err != nil {
+		return nil, nil, nil, err
 	}
 	g := e.chain.Genesis()
 	if g == nil || g.Hash() != m.Genesis {
@@ -77,10 +95,13 @@ func (e *Engine) prepareLPoD(block *core.Block, leader crypto.Address) (*store.L
 		}
 	}
 	r := &store.LPoDSettlement{Parent: block.Header.PrevHash, PositionProtocol: true,
-		DailyPayout: e.lpodDailyActive(height), Timestamp: block.Header.Timestamp,
-		GenesisVestingActivationHeight: e.cfg.GenesisVestingActivationHeight,
-		GenesisVestingFunding:          e.cfg.GenesisVestingFunding,
-		Proposer:                       block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
+		DailyPayout:                          e.lpodDailyActive(height) || e.lpodValidatorDailyActive(height),
+		DailyValidatorPayout:                 e.lpodValidatorDailyActive(height),
+		ValidatorDailyPayoutActivationHeight: e.cfg.LPoDValidatorDailyUpgradeHeight,
+		Timestamp:                            block.Header.Timestamp,
+		GenesisVestingActivationHeight:       e.cfg.GenesisVestingActivationHeight,
+		GenesisVestingFunding:                e.cfg.GenesisVestingFunding,
+		Proposer:                             block.Header.ValidatorPub.Hex(), Leader: leader, Stake: map[string]store.LPoDValidatorStake{},
 		PreviousStake:      map[string]store.LPoDValidatorStake{},
 		AuditPreviousStake: map[string]store.LPoDValidatorStake{},
 		AuditStake:         map[string]store.LPoDValidatorStake{}}

@@ -72,11 +72,17 @@ func isLPoDPureReward(reward, returnedPrincipal uint64) bool {
 
 func lpodWalletOwners(
 	leader crypto.Address,
+	before *LPoDCheckpoint,
 	after *LPoDCheckpoint,
 	height uint64,
 	parent, digest crypto.Hash32,
 ) (map[crypto.Point32]crypto.Address, error) {
 	candidates := map[crypto.Address]bool{leader: true}
+	if before != nil {
+		for _, payout := range before.PendingValidatorPayouts {
+			candidates[payout.Address] = true
+		}
+	}
 	if after.GenesisVesting != nil && after.GenesisVesting.paymentAt(height) > 0 {
 		candidates[after.GenesisVesting.Recipient] = true
 	}
@@ -112,7 +118,11 @@ func (d *DB) appendLPoDWalletIndex(batch *leveldb.Batch, b *core.Block, r *LPoDS
 	if after == nil || after.Allocation == nil {
 		return fmt.Errorf("lpod: funded checkpoint required for wallet discovery")
 	}
-	owners, err := lpodWalletOwners(r.Leader, after, b.Header.Height, r.Parent, after.Digest())
+	before, err := d.LoadLPoDCheckpoint()
+	if err != nil {
+		return err
+	}
+	owners, err := lpodWalletOwners(r.Leader, before, after, b.Header.Height, r.Parent, after.Digest())
 	if err != nil {
 		return err
 	}
@@ -243,16 +253,17 @@ func (d *DB) classifyLPoDEarnings(b *core.Block, r *LPoDSettlement, after *LPoDC
 		return nil, fmt.Errorf("lpod: canonical payout does not match v10 earnings reconstruction")
 	}
 
-	rewards := map[crypto.Address]uint64{}
+	rewards, _, err := deriveLPoDValidatorPayouts(
+		before, after, b.Header.Timestamp, r.Proposer, r.Leader,
+	)
+	if err != nil {
+		return nil, err
+	}
 	principal := map[crypto.Address]uint64{}
 	for _, p := range payments {
 		if p.Leader > 0 {
 			if p.VaultID != r.Proposer {
 				return nil, fmt.Errorf("lpod: non-proposer leader reward")
-			}
-			rewards[r.Leader], err = lpodAdd(rewards[r.Leader], p.Leader)
-			if err != nil {
-				return nil, err
 			}
 		}
 	}

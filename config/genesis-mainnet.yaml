@@ -1,0 +1,17 @@
+# Mainnet registry-seed profile. The timestamp and validator key match the
+# inspected genesis block; supply, block time, and ring size are protocol
+# configuration values and are not fields in the signed bootstrap statement.
+# This is not a standalone bootstrap: startup requires the separately verified
+# operator-signed chain snapshot and must never create a competing genesis from
+# an empty data directory.
+chain_id: "aperod-mainnet-1"
+timestamp: 1782932857
+initial_supply: 10000000000
+block_time_ms: 3000
+ring_size: 16
+min_validators: 1
+bft_threshold: 0.667
+checkpoint_every: 1000
+validators:
+  - "08fd38ba8857d32d2ac807f0246a0fd298c9edf336fbd0fea3bb7bd818c91137"
+allocations: []

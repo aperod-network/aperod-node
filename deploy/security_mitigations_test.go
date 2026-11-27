@@ -36,6 +36,39 @@ func TestJoinTunnelRequiresPinnedHostKey(t *testing.T) {
 	}
 }
 
+func TestJoinValidatesStagedChainBeforeChangingNodeData(t *testing.T) {
+	script, err := os.ReadFile("aperod-join.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"systemctl is-active --quiet aperod-node",
+		"отказывается заменять существующую цепь",
+		"unsupported archive member type",
+		"--check-store --data-dir=",
+		"--max-missing=0",
+		"--check-snapshot --data-dir=",
+		"--no-chaindb: существующие chain.db и snapshot не удаляются и не заменяются",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("join installer is missing staged-bootstrap safety check %q", required)
+		}
+	}
+	if strings.Contains(text, `rm -rf "${DATA_DIR}/chain.db"`) ||
+		strings.Contains(text, `rm -f "${DATA_DIR}"/snapshot-v2-*.json.gz`) ||
+		strings.Contains(text, "unset-field consensus.non_validator") {
+		t.Fatal("join installer still deletes existing chain/snapshot data or removes the safe-mode guard")
+	}
+	storeCheck := strings.Index(text, `"${NODE_BIN}" --check-store`)
+	snapshotCheck := strings.Index(text, `"${NODE_BIN}" --check-snapshot`)
+	publishDB := strings.Index(text, `mv -nT "${JOIN_STAGE}/chain.db" "${DATA_DIR}/chain.db"`)
+	if storeCheck < 0 || snapshotCheck < 0 || publishDB < 0 ||
+		storeCheck > publishDB || snapshotCheck > publishDB {
+		t.Fatal("join installer promotes staged data before validating both the chain and matching snapshot")
+	}
+}
+
 func TestInstallerWalletSetupNeverPersistsRawPrivateKey(t *testing.T) {
 	script, err := os.ReadFile("install-node.sh")
 	if err != nil {
@@ -87,32 +120,41 @@ func TestGoToolchainInstallersVerifyOfficialChecksumsBeforeExtraction(t *testing
 	}
 }
 
-func TestMonitoringExporterArchivesArePinnedBeforeExtraction(t *testing.T) {
+func TestMonitoringEntrypointUsesExistingVerifiedBinaries(t *testing.T) {
 	script, err := os.ReadFile("install-monitoring.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(script)
+if !strings.Contains(text, `exec bash "$SCRIPT_DIR/setup-monitoring-ovh.sh" "$@"`) {
+t.Fatal("compatibility entrypoint must delegate only to the adjacent checked-out script")
+}
+setup, err := os.ReadFile("setup-monitoring-ovh.sh")
+if err != nil {
+t.Fatal(err)
+}
+text += "\n" + string(setup)
 	for _, required := range []string{
-		"6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66",
-		"627382b9723c642411c33f48861134ebe893e70a63bcc8b3fc0619cd0bfac4be",
-		"4e27d332281e6bda7514f51f5a6e7c62f8bfb7667d459095a4c73d437b2d27ad",
-		"c78cd780d8f3f659cb3c8655f9491dc5ffe90a9bf60a91fc9829cc5afde318fd",
-		`verify_release_archive "$NODE_ARCHIVE" "$NODE_EXPORTER_SHA256"`,
-		`verify_release_archive "$NGINX_ARCHIVE" "$NGINX_EXPORTER_SHA256"`,
+"/usr/local/bin/prometheus --version",
+"/usr/local/bin/prometheus-alertmanager --version",
+"/usr/local/bin/prometheus-node-exporter --version",
+"The verified monitoring binary is missing",
+"Expected Prometheus 3.16.0",
+"Expected Alertmanager 0.35.1",
+"Expected node_exporter 1.13.1",
 	} {
 		if !strings.Contains(text, required) {
-			t.Errorf("monitoring installer is missing pinned archive verification %q", required)
+t.Errorf("monitoring setup is missing an existing-binary verification guard %q", required)
 		}
 	}
-	for _, pair := range [][2]string{
-		{`verify_release_archive "$NODE_ARCHIVE"`, `tar -xzf "$NODE_ARCHIVE"`},
-		{`verify_release_archive "$NGINX_ARCHIVE"`, `tar -xzf "$NGINX_ARCHIVE"`},
+// Archives are no longer downloaded by this entrypoint. Keep the absence of
+// extraction and mutable release URLs covered, not obsolete checksum strings.
+for _, forbidden := range []string{
+"tar -", "wget ", "/releases/download/", "/releases/latest/",
+"curl |", "| bash", "| sudo bash",
 	} {
-		verifyAt := strings.Index(text, pair[0])
-		extractAt := strings.Index(text, pair[1])
-		if verifyAt < 0 || extractAt < 0 || verifyAt > extractAt {
-			t.Errorf("monitoring installer extracts an archive before verifying it: %q", pair[0])
+if strings.Contains(text, forbidden) {
+t.Errorf("monitoring setup reintroduced an unchecked archive or remote script: %q", forbidden)
 		}
 	}
 	if strings.Contains(text, `-O /tmp/node_exporter.tar.gz`) ||
@@ -121,9 +163,28 @@ func TestMonitoringExporterArchivesArePinnedBeforeExtraction(t *testing.T) {
 	}
 }
 
-func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
+func TestPublicValidatorGuidesRequireVerifiedMainnetReadiness(t *testing.T) {
 	validators, err := os.ReadFile("VALIDATORS.md")
 	if err != nil {
+		t.Fatal(err)
+	}
+	mainnet, err := os.ReadFile("MAINNET.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicReadme, err := os.ReadFile("README-public.md")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	// The published tree may retain an older deploy/README-public.md while the
+	// current public-facing copy is at the repository root. Prefer that root
+	// copy when it contains the current mainnet safety notice.
+	publicRootReadme, rootErr := os.ReadFile("../README.md")
+	if rootErr == nil && strings.Contains(string(publicRootReadme), "current `install-validator.sh` is not a verified mainnet installer") {
+		publicReadme = publicRootReadme
+	} else if err != nil {
 		t.Fatal(err)
 	}
 	investors, err := os.ReadFile("INVESTORS.md")
@@ -158,22 +219,51 @@ func TestPublicValidatorGuidesRequirePinnedInstallerSource(t *testing.T) {
 			}
 		}
 	}
+	validatorText := strings.Join(strings.Fields(string(validators)), " ")
 	for _, required := range []string{
-		"APEROD_NODE_SOURCE_COMMIT",
-		`[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]`,
-		"git checkout --detach",
-		`git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"`,
-		"test \"$(git rev-parse HEAD)\" = \"$APEROD_NODE_SOURCE_COMMIT\"",
-		"sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT=",
-		"APEROD_NETWORK=testnet",
-		"supports testnet only",
+		"[mainnet onboarding](MAINNET.md)",
+		"A verified self-service mainnet bootstrap release is not yet published.",
+		"must not be used as a mainnet installer",
 	} {
-		if !strings.Contains(string(validators), required) {
-			t.Errorf("pinned installation procedure is missing %q", required)
+		if !strings.Contains(validatorText, required) {
+			t.Errorf("validator guide is missing the mainnet readiness boundary %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"APEROD_NETWORK=testnet",
+		"sudo env APEROD_NETWORK=",
+	} {
+		if strings.Contains(validatorText, forbidden) {
+			t.Errorf("validator guide still advertises a non-mainnet install command: %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"existing Aperod mainnet",
+		"verified, self-service",
+		"canonical genesis",
+		"consistent, hash-verified bootstrap snapshot",
+		"on-chain stake",
+		"active set",
+		"source-pinning shell block is not a mainnet installer",
+		"Preserve that directory and its contents",
+		"child shell (`(...)`)",
+	} {
+		if !strings.Contains(string(mainnet), required) {
+			t.Errorf("mainnet onboarding guide is missing required release or activation guidance %q", required)
+		}
+	}
+	for _, required := range []string{
+		"current `install-validator.sh` is not a verified mainnet installer",
+		"does not make it one",
+		"preserve it rather than deleting it",
+		"child shell (`(...)`)",
+	} {
+		if !strings.Contains(string(publicReadme), required) {
+			t.Errorf("public node guide is missing installation safety guidance %q", required)
 		}
 	}
 	if !strings.Contains(string(investors), "VALIDATORS.md#setup-guide") {
-		t.Fatal("investor quick-start does not link to the pinned validator setup")
+		t.Fatal("investor quick-start does not link to the validator setup")
 	}
 	if !strings.Contains(string(morningReport), "install -o root -g root -m 0755 deploy/aperod-morning-report.sh") {
 		t.Fatal("morning-report installation does not use the checked-out source")

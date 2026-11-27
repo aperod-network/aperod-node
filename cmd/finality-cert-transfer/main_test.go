@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -22,10 +23,17 @@ type transferFixture struct {
 }
 
 func makeTransferFixture(t *testing.T) transferFixture {
+	return makeTransferFixtureWithCommitteeSize(t, 1)
+}
+
+func makeTransferFixtureWithCommitteeSize(t *testing.T, committeeSize int) transferFixture {
 	t.Helper()
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if committeeSize < 1 || committeeSize > 2 {
+		t.Fatalf("unsupported test committee size %d", committeeSize)
 	}
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "chain.db")
@@ -59,6 +67,25 @@ func makeTransferFixture(t *testing.T) transferFixture {
 	}
 	if err := db.SaveFinalityCertificate(cert); err != nil {
 		t.Fatal(err)
+	}
+	committee := []crypto.ValidatorPubKey{pub}
+	if committeeSize == 2 {
+		_, second, err := crypto.GenerateValidatorKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		committee = append(committee, second)
+		if bytes.Compare(committee[0], committee[1]) > 0 {
+			committee[0], committee[1] = committee[1], committee[0]
+		}
+	}
+	if err := db.SaveFinalityCommitteeSnapshot(store.FinalityCommitteeSnapshot{
+		Version:         1,
+		Epoch:           cert.Height / core.EpochLength,
+		Validators:      committee,
+		BFTThresholdPPM: 667_000,
+	}); err != nil {
+		t.Fatalf("save finality committee snapshot: %v", err)
 	}
 	registry := anchoredRegistry{
 		Height: 0, Hash: genesis.Hash(),
@@ -114,6 +141,7 @@ func TestValidCertificateTransfer(t *testing.T) {
 	}
 	relayPath := filepath.Join(t.TempDir(), "relay.db")
 	copyCanonicalChain(t, fixture.dbPath, relayPath, 1)
+	copyFinalityCommitteeSnapshot(t, fixture.dbPath, relayPath, fixture.cert.Height/core.EpochLength)
 	fixture.certPath = exportPath
 	if err := importCertificate(relayPath, fixture.certPath, fixture.registryPath, fixture.expected, fixture.genesis, true); err != nil {
 		t.Fatalf("import: %v", err)
@@ -170,6 +198,43 @@ func copyCanonicalChain(t *testing.T, sourcePath, targetPath string, tipHeight u
 	}
 	if err := target.PutTip(tipHash, tipHeight); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func copyFinalityCommitteeSnapshot(t *testing.T, sourcePath, targetPath string, epoch uint64) {
+	t.Helper()
+	source, err := store.OpenReadOnly(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := source.LoadFinalityCommitteeSnapshot(epoch)
+	if err != nil || snapshot == nil {
+		_ = source.Close()
+		t.Fatalf("source committee snapshot: snapshot=%#v error=%v", snapshot, err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.Open(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.SaveFinalityCommitteeSnapshot(*snapshot); err != nil {
+		t.Fatalf("copy committee snapshot: %v", err)
+	}
+}
+
+func TestExportRejectsCertificateFromMultiValidatorCommittee(t *testing.T) {
+	fixture := makeTransferFixtureWithCommitteeSize(t, 2)
+	err := exportCertificate(
+		fixture.dbPath,
+		filepath.Join(t.TempDir(), "export.json"),
+		fixture.expected,
+		fixture.genesis,
+	)
+	if err == nil || !strings.Contains(err.Error(), "single-operator 1-of-1 committee") {
+		t.Fatalf("export error = %v, want single-operator committee rejection", err)
 	}
 }
 

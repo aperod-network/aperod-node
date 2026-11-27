@@ -121,7 +121,7 @@ func newOracleEngine(
 ) *consensus.Engine {
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
-	return consensus.NewEngine(consensus.Config{
+	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock: noopCanonicalPersistence,
 		BlockTime:        15 * time.Millisecond,
 		BFTThreshold:     0.667,
@@ -129,6 +129,9 @@ func newOracleEngine(
 		MyKey:            myKey,
 		OracleURL:        oracleURL,
 	}, chain, mp, log)
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+	return eng
 }
 
 // drainBlocks reads from ch until it has seen n blocks or deadline expires.
@@ -355,6 +358,8 @@ func TestOraclePrice_NoURLSkipsEmbedding(t *testing.T) {
 		MyKey:            lk,
 		OracleURL:        "", // intentionally empty
 	}, chain, mp, newNopLogger())
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
 	stop := make(chan struct{})
 	go eng.Run(stop)
@@ -456,6 +461,8 @@ func TestOracleSlowFetch_DoesNotDelayBlockProduction(t *testing.T) {
 		MyKey:            lk,
 		OracleURL:        slowSrv.URL, // slow — responds after 2 s
 	}, chain, mp, newNopLogger())
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 
 	stop := make(chan struct{})
 	go eng.Run(stop)

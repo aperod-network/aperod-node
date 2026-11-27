@@ -21,32 +21,46 @@ import (
 // carry, rather than an independently persisted mutable "remaining" counter.
 // Initial funding requires a fully reconciled, quorum-attested allocation debit.
 type LPoDCheckpoint struct {
-	GenesisVesting     *GenesisVestingState    `json:"genesis_vesting,omitempty"`
-	State              lpod.State              `json:"state"`
-	Carries            map[string]lpod.Carry   `json:"carries"`
-	Allocation         *LPoDAllocation         `json:"allocation,omitempty"`
-	Positions          map[string]LPoDPosition `json:"positions,omitempty"`
-	DailyPayoutVersion uint8                   `json:"daily_payout_version,omitempty"`
-	PendingLiability   uint64                  `json:"pending_liability_napro,string,omitempty"`
-	PrincipalDeposited uint64                  `json:"principal_deposited_napro,string"`
-	PrincipalLocked    uint64                  `json:"principal_locked_napro,string"`
-	PrincipalReturned  uint64                  `json:"principal_returned_napro,string"`
+	GenesisVesting              *GenesisVestingState          `json:"genesis_vesting,omitempty"`
+	State                       lpod.State                    `json:"state"`
+	Carries                     map[string]lpod.Carry         `json:"carries"`
+	Allocation                  *LPoDAllocation               `json:"allocation,omitempty"`
+	Positions                   map[string]LPoDPosition       `json:"positions,omitempty"`
+	DailyPayoutVersion          uint8                         `json:"daily_payout_version,omitempty"`
+	PendingLiability            uint64                        `json:"pending_liability_napro,string,omitempty"`
+	ValidatorDailyPayoutVersion uint8                         `json:"validator_daily_payout_version,omitempty"`
+	NextValidatorPayoutNS       int64                         `json:"next_validator_payout_ns,omitempty"`
+	PendingValidatorPayouts     []LPoDDeferredValidatorPayout `json:"pending_validator_payouts,omitempty"`
+	PrincipalDeposited          uint64                        `json:"principal_deposited_napro,string"`
+	PrincipalLocked             uint64                        `json:"principal_locked_napro,string"`
+	PrincipalReturned           uint64                        `json:"principal_returned_napro,string"`
+}
+
+// LPoDDeferredValidatorPayout pins one validator's first authorized reward
+// address during the current daily window, keeping pending consensus state
+// bounded by the active validator set.
+type LPoDDeferredValidatorPayout struct {
+	Validator   string         `json:"validator"`
+	Address     crypto.Address `json:"address"`
+	AmountNAPRO uint64         `json:"amount_napro,string"`
 }
 
 // LPoDSettlement is prepared from canonical registry/position state by consensus.
 // Store commits verify its clock, operations, checkpoint and actual payout plan.
 type LPoDSettlement struct {
-	GenesisVestingActivationHeight uint64
-	GenesisVestingFunding          *GenesisVestingFunding
-	Parent                         crypto.Hash32
-	Vaults                         []lpod.Vault
-	Migration                      *LPoDMigration
-	PositionProtocol               bool
-	DailyPayout                    bool
-	Timestamp                      int64
-	Proposer                       string
-	Leader                         crypto.Address
-	Stake                          map[string]LPoDValidatorStake
+	GenesisVestingActivationHeight       uint64
+	GenesisVestingFunding                *GenesisVestingFunding
+	Parent                               crypto.Hash32
+	Vaults                               []lpod.Vault
+	Migration                            *LPoDMigration
+	PositionProtocol                     bool
+	DailyPayout                          bool
+	DailyValidatorPayout                 bool
+	ValidatorDailyPayoutActivationHeight uint64
+	Timestamp                            int64
+	Proposer                             string
+	Leader                               crypto.Address
+	Stake                                map[string]LPoDValidatorStake
 	// PreviousStake is the established non-seeded routing projection before
 	// stake operations. It is used only to rank destinations, never as a source
 	// of funds.

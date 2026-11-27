@@ -197,6 +197,14 @@ func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 }
 
 func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source crypto.Scalar32) (*Transaction, error) {
+// New deposits/top-ups must be wallet-scannable. Keep historical withdrawal
+// construction available for recovery; this is local construction policy,
+// not a retrospective change to LPoDPositionAction's consensus parser.
+if a.Action != LPoDWithdraw {
+if err := validateLPoDBeneficiaryAdmission(a, ""); err != nil {
+return nil, err
+}
+}
 	body, err := json.Marshal(a)
 	if err != nil {
 		return nil, err
@@ -226,6 +234,38 @@ func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source cry
 		return nil, err
 	}
 	return tx, nil
+}
+
+// validateLPoDBeneficiaryAdmission is stricter local mempool/construction policy.
+// Consensus parsing stays unchanged until a separately coordinated fork.
+func validateLPoDBeneficiaryAdmission(a LPoDPositionAction, network string) error {
+if a.Action == LPoDWithdraw {
+return nil // Do not prevent recovery of already-canonical legacy positions.
+}
+net, spend, _, err := crypto.DecodeWalletAddress(a.Beneficiary)
+if err != nil {
+return fmt.Errorf("lpod: invalid beneficiary wallet keys: %w", err)
+}
+if spend != a.Owner {
+return fmt.Errorf("lpod: beneficiary does not belong to signing owner")
+}
+var expected crypto.NetworkByte
+switch network {
+case "":
+return nil // Standalone builders do not know the chain's configured network.
+case "mainnet":
+expected = crypto.MainnetByte
+case "testnet":
+expected = crypto.TestnetByte
+case "devnet":
+expected = crypto.DevnetByte
+default:
+return fmt.Errorf("lpod: unknown admission network")
+}
+if net != expected {
+return fmt.Errorf("lpod: beneficiary network differs from node network")
+}
+return nil
 }
 
 type LPoDPayoutAuthorization struct {

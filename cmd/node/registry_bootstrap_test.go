@@ -320,6 +320,31 @@ func TestBootstrapRealArchiveReadOnly(t *testing.T) {
 	t.Logf("tip active-count metadata: present=%t count=%d error=%v", present, cached, err)
 	registry := core.NewValidatorRegistry()
 	registry.RestoreFromSnapshot(snap.Registry)
+	fork, err := loadValidatorAuthorityFork(config.ConsensusConfig{
+		ValidatorAuthorityForkFile:   os.Getenv("LPOD_REAL_AUTHORITY_FORK"),
+		ValidatorAuthorityForkSHA256: os.Getenv("LPOD_REAL_AUTHORITY_FORK_SHA256"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fork != nil {
+		genesis, found, err := db.GetCanonicalHash(0)
+		if err != nil || !found || genesis != fork.Genesis {
+			t.Fatal("authority fork does not bind the copied genesis")
+		}
+		for _, transition := range fork.Transitions() {
+			if transition.Height > tip {
+				continue
+			}
+			parent, found, err := db.GetCanonicalHash(transition.Height - 1)
+			if err != nil || !found || parent != transition.Parent {
+				t.Fatalf("authority fork does not bind canonical parent at height %d", transition.Height-1)
+			}
+		}
+		if err := registry.ConfigureSignatureAuthority(fork, tip+1); err != nil {
+			t.Fatal(err)
+		}
+	}
 	utxos := core.NewUTXOSetWithDB(db)
 	utxos.RestoreFromSnapshot(snap.UTXOs)
 	registry.SetUTXOSet(utxos)

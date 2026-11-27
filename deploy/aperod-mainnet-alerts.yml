@@ -1,0 +1,162 @@
+groups:
+  - name: aperod-mainnet
+    rules:
+      - alert: AperodNodeUnavailable
+        expr: up{job="aperod-node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-node
+        annotations:
+          summary: "Нода Mainnet недоступна"
+          description: "Prometheus не может получить метрики ноды более минуты."
+
+      - alert: AperodBlockProductionStalled
+        expr: up{job="aperod-node"} == 1 and changes(aperod_chain_height{job="aperod-node"}[1m]) == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: aperod-node
+        annotations:
+          summary: "Новые блоки Mainnet не наблюдаются"
+          description: "Высота этой ноды Mainnet не менялась более 90 секунд. Проверьте P2P и наличие активного производителя; при режиме sync-only это ожидаемая пауза, а не падение процесса."
+
+      - alert: AperodNodeHasNoPeers
+        expr: aperod_peer_count{job="aperod-node"} < 1
+        for: 2m
+        labels:
+          severity: warning
+          service: aperod-node
+        annotations:
+          summary: "У ноды Mainnet нет P2P-соседей"
+          description: "Нода не видит ни одного P2P-соседа более двух минут."
+
+      - alert: AperodValidatorHealthExporterUnavailable
+        expr: up{job="aperod-validator-health"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-validator-health
+        annotations:
+          summary: "Мониторинг локального валидатора недоступен"
+          description: "Prometheus не может получить локальный статус валидатора более минуты."
+
+      - alert: AperodLocalValidatorOffline
+        expr: aperod_validator_monitor_status_available{job="aperod-validator-health"} == 1 and on(job,instance) aperod_validator_monitor_validator_mode_enabled{job="aperod-validator-health"} == 1 and on(job,instance) aperod_validator_monitor_online{job="aperod-validator-health"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-validator-health
+        annotations:
+          summary: "Локальный валидатор не в сети"
+          description: "Режим валидатора включён, но локальный ключ неактивен в реестре Mainnet или нода не имеет P2P-соседей."
+
+      - alert: AperodValidatorStatusUnavailable
+        expr: aperod_validator_monitor_status_available{job="aperod-validator-health"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-validator-health
+        annotations:
+          summary: "Не удалось определить состояние валидатора"
+          description: "Локальный экспортёр не смог одновременно проверить ключ, реестр, высоту и P2P-пиры."
+
+      - alert: AperodValidatorSyncUnhealthy
+        expr: aperod_validator_monitor_status_available{job="aperod-validator-health"} == 1 and on(job,instance) aperod_validator_monitor_online{job="aperod-validator-health"} == 1 and on(job,instance) aperod_validator_monitor_sync_healthy{job="aperod-validator-health"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: aperod-validator-health
+        annotations:
+          summary: "Локальный валидатор отстаёт от Mainnet"
+          description: "Нода онлайн, но ни один P2P-пир не находится в пределах 100 блоков от её вершины."
+
+      - alert: AperodApiUnavailable
+        expr: up{job="aperod-api-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-api
+        annotations:
+          summary: "API Aperod недоступен"
+          description: "Prometheus не может получить метрики API более минуты."
+
+      - alert: AperodApiReportsNodeDown
+        expr: aperod_api_up{job="aperod-api-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: aperod-api
+        annotations:
+          summary: "API не видит блокчейн-ноду"
+          description: "Проверка связи API с локальной нодой не проходит более минуты."
+
+      - alert: AperodApiServerErrors
+        expr: sum(rate(aperod_api_http_requests_total{job="aperod-api-server",status=~"5.."}[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          service: aperod-api
+        annotations:
+          summary: "В API Aperod выросло число ошибок 5xx"
+          description: "Ошибки 5xx превышают 0.2 запроса в секунду пять минут."
+
+      - alert: AperodAlertmanagerUnavailable
+        expr: up{job="alertmanager"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: alertmanager
+        annotations:
+          summary: "Служба Alertmanager недоступна"
+          description: "Prometheus не может передать оповещения в Alertmanager."
+
+      - alert: AperodHostExporterUnavailable
+        expr: up{job="node-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: node-exporter
+        annotations:
+          summary: "Сбор метрик сервера OVH недоступен"
+          description: "Prometheus не может получить системные метрики сервера более минуты."
+
+      - alert: AperodRequiredServiceDown
+        expr: node_systemd_unit_state{name=~"aperod-node.service|aperod-api.service|aperod-explorer-indexer.service|aperod-validator-health-exporter.service|nginx.service|prometheus.service|prometheus-alertmanager.service|prometheus-node-exporter.service|grafana-server.service",state="active"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: systemd
+        annotations:
+          summary: "Остановлена обязательная служба Aperod"
+          description: "Одна из обязательных служб ноды, API, индексатора, мониторинга или nginx неактивна."
+
+      - alert: AperodRootDiskLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"}) < 0.15
+        for: 5m
+        labels:
+          severity: warning
+          service: host
+        annotations:
+          summary: "Заканчивается место на диске OVH"
+          description: "Свободно менее 15% на корневом разделе; проверьте рост единственного дерева Mainnet."
+
+      - alert: AperodRootDiskCritical
+        expr: (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"}) < 0.08
+        for: 2m
+        labels:
+          severity: critical
+          service: host
+        annotations:
+          summary: "Критически мало места на диске OVH"
+          description: "Свободно менее 8% на корневом разделе."
+
+      - alert: AperodMemoryPressure
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+        for: 5m
+        labels:
+          severity: critical
+          service: host
+        annotations:
+          summary: "Критически мало доступной памяти OVH"
+          description: "Доступно менее 10% памяти более пяти минут."

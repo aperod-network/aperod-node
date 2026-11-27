@@ -14,6 +14,7 @@ package api
 //   POST /api/v1/admin/stake-deposit                   — admin-only: v2 UTXO-backed stake deposit
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -42,6 +43,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
 	s.mux.HandleFunc("/api/v1/scan/outputs", s.restScanOutputs)
 	s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
+	s.mux.HandleFunc("/api/v1/chain/identity-evidence", s.restChainIdentityEvidence)
 	s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
 	s.mux.HandleFunc("/api/v1/mempool", s.restMempoolTransactions)
 	s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
@@ -55,6 +57,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/invoice", s.localOnly(s.requireAPIKey(s.restSaleInvoice)))
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/receipt", s.localOnly(s.requireAPIKey(s.restSaleReceipt)))
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/recover", s.localOnly(s.requireAPIKey(s.restSaleRecover)))
+	s.mux.HandleFunc("/api/v1/admin/consensus-schedule", s.localOnly(s.requireAPIKey(s.restConsensusSchedule)))
 	s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.requireAPIKey(s.restAdminPartialUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.requireAPIKey(s.restAdminFullUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.requireAPIKey(s.restAdminStakeDeposit)))
@@ -265,16 +268,22 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blocks := make([]BlockResponse, 0, limit)
+	blocks := make([]interface{}, 0, limit)
 	for h := startHeight; len(blocks) < limit; {
-		b := s.chain.GetByHeight(h)
+		b, pruned, lookupErr := s.restBlockAtHeight(h)
+		if lookupErr != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, lookupErr.Error())
+			return
+		}
 		if b != nil {
-			response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+			response, err := s.restBlockToResponse(b)
 			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			blocks = append(blocks, response)
+		} else if pruned != nil {
+			blocks = append(blocks, prunedBlockDetailResponse(pruned))
 		}
 		if h == 0 {
 			break
@@ -287,6 +296,52 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 		"limit":  limit,
 		"offset": offset,
 	})
+}
+
+func (s *Server) restBlockAtHeight(height uint64) (*core.Block, *store.StoredBlock, error) {
+	block := s.chain.GetByHeight(height)
+	if s.blockStore == nil {
+		return block, nil, nil
+	}
+	if block != nil {
+		if _, _, err := s.canonicalBlockID(block); err == nil {
+			return block, nil, nil
+		}
+	}
+
+	fullBlock, prunedBlock, err := s.lookupBlockFromDisk(strconv.FormatUint(height, 10))
+	if err != nil {
+		return nil, nil, err
+	}
+	if fullBlock != nil {
+		if _, _, err := s.canonicalBlockID(fullBlock); err != nil {
+			return nil, nil, err
+		}
+		return fullBlock, nil, nil
+	}
+	if prunedBlock != nil {
+		if _, err := s.canonicalPrunedBlockID(prunedBlock); err != nil {
+			return nil, nil, err
+		}
+		return nil, prunedBlock, nil
+	}
+	if block != nil {
+		return nil, nil, fmt.Errorf("in-memory block at height %d differs from the canonical index and no canonical body is available", height)
+	}
+	return nil, nil, nil
+}
+
+func (s *Server) restBlockToResponse(block *core.Block) (BlockResponse, error) {
+	response, err := blockToResponse(block, s.avmGasBurnActivationHeight)
+	if err != nil {
+		return BlockResponse{}, err
+	}
+	canonicalHash, _, err := s.canonicalBlockID(block)
+	if err != nil {
+		return BlockResponse{}, err
+	}
+	response.Hash = fmt.Sprintf("%x", canonicalHash[:])
+	return response, nil
 }
 
 // ─── GET /api/v1/blocks/{id} and /api/v1/blocks/{id}/transactions ────────────
@@ -324,7 +379,11 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.blockStore != nil {
-			fullBlock, _, _ := s.lookupBlockFromDisk(id)
+			fullBlock, _, err := s.lookupBlockFromDisk(id)
+			if err != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			if fullBlock != nil {
 				s.writeBlockOutputs(w, fullBlock)
 				return
@@ -350,7 +409,11 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Fall back to the on-disk store for old or pruned blocks.
 		if s.blockStore != nil {
-			fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(id)
+			fullBlock, prunedBlock, err := s.lookupBlockFromDisk(id)
+			if err != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			if fullBlock != nil {
 				s.writeBlockTransactions(w, fullBlock)
 				return
@@ -366,9 +429,9 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 
 	// Block detail endpoint
 	if b := s.lookupBlockMem(tail); b != nil {
-		response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+		response, err := s.restBlockToResponse(b)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
@@ -381,11 +444,15 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 	}
 	// Fall back to disk for old / pruned blocks.
 	if s.blockStore != nil {
-		fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(tail)
+		fullBlock, prunedBlock, err := s.lookupBlockFromDisk(tail)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		if fullBlock != nil {
-			response, err := blockToResponse(fullBlock, s.avmGasBurnActivationHeight)
+			response, err := s.restBlockToResponse(fullBlock)
 			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, response)
@@ -412,7 +479,13 @@ func isValidBlockID(id string) bool {
 // lookupBlockMem returns the block from the in-memory sliding window, or nil.
 func (s *Server) lookupBlockMem(id string) *core.Block {
 	if height, err := strconv.ParseUint(id, 10, 64); err == nil {
-		return s.chain.GetByHeight(height)
+		block := s.chain.GetByHeight(height)
+		if block != nil && s.blockStore != nil {
+			if _, _, err := s.canonicalBlockID(block); err != nil {
+				return nil
+			}
+		}
+		return block
 	}
 	raw, err := hex.DecodeString(id)
 	if err != nil || len(raw) != 32 {
@@ -420,7 +493,14 @@ func (s *Server) lookupBlockMem(id string) *core.Block {
 	}
 	var hash crypto.Hash32
 	copy(hash[:], raw)
-	return s.chain.GetByHash(hash)
+	block := s.chain.GetByHash(hash)
+	if block != nil && s.blockStore != nil {
+		canonicalHash, _, err := s.canonicalBlockID(block)
+		if err != nil || canonicalHash != hash {
+			return nil
+		}
+	}
+	return block
 }
 
 // lookupBlockFromDisk reads a block from LevelDB by height or hash string.
@@ -471,6 +551,19 @@ func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock
 		if err := json.Unmarshal(rawBytes, &b); err != nil {
 			return nil, nil, nil
 		}
+		canonicalHash, found, err := s.canonicalBlockID(&b)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			return nil, nil, nil
+		}
+		if _, heightErr := strconv.ParseUint(id, 10, 64); heightErr != nil {
+			rawID, decodeErr := hex.DecodeString(id)
+			if decodeErr != nil || len(rawID) != len(canonicalHash) || !bytes.Equal(rawID, canonicalHash[:]) {
+				return nil, nil, nil
+			}
+		}
 		return &b, nil, nil
 	}
 
@@ -479,6 +572,16 @@ func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock
 		var sb store.StoredBlock
 		if err := json.Unmarshal(rawBytes, &sb); err != nil {
 			return nil, nil, nil
+		}
+		canonicalHash, err := s.canonicalPrunedBlockID(&sb)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, heightErr := strconv.ParseUint(id, 10, 64); heightErr != nil {
+			rawID, decodeErr := hex.DecodeString(id)
+			if decodeErr != nil || len(rawID) != len(canonicalHash) || !bytes.Equal(rawID, canonicalHash[:]) {
+				return nil, nil, nil
+			}
 		}
 		return nil, &sb, nil
 	}
@@ -557,6 +660,11 @@ type BlockTxItem struct {
 
 // writeBlockTransactions writes the transactions of a block as JSON.
 func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
+	blockHash, _, err := s.canonicalBlockID(b)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	txs := make([]BlockTxItem, 0, len(b.Txs))
 	for i, tx := range b.Txs {
 		h := tx.Hash()
@@ -574,7 +682,7 @@ func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"block_hash":   fmt.Sprintf("%x", func() [32]byte { h := b.Hash(); return h }()),
+		"block_hash":   fmt.Sprintf("%x", blockHash[:]),
 		"block_height": b.Header.Height,
 		"tx_count":     len(txs),
 		"transactions": txs,
@@ -598,7 +706,11 @@ type BlockOutputItem struct {
 // Each output is identified by its one_time_pub_hex.  Pruned blocks (nil Txs) return
 // an empty list with pruned:true so the indexer can skip them gracefully.
 func (s *Server) writeBlockOutputs(w http.ResponseWriter, b *core.Block) {
-	bHash := b.Hash()
+	bHash, _, err := s.canonicalBlockID(b)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	items := make([]BlockOutputItem, 0)
 	for i, tx := range b.Txs {
 		txH := tx.Hash()
@@ -641,7 +753,11 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
 
 	tx, loc, ok := s.chain.GetTransaction(hash)
 	if ok {
-		bHash := loc.Block.Hash()
+		bHash, _, err := s.canonicalBlockID(loc.Block)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, TxResponse{
 			Hash:        hashStr,
 			BlockHash:   fmt.Sprintf("%x", bHash[:]),
@@ -690,7 +806,11 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		bHash := diskLoc.Block.Hash()
+		bHash, _, err := s.canonicalBlockID(diskLoc.Block)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, TxResponse{
 			Hash:        hashStr,
 			BlockHash:   fmt.Sprintf("%x", bHash[:]),
@@ -2106,8 +2226,17 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	if s.myKey == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"pub_key": nil})
+	state := s.localValidatorNetworkState()
+	if !state.KeyLoaded {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"pub_key":             nil,
+			"registered_active":   false,
+			"p2p_connected":       state.P2PConnected,
+			"online":              false,
+			"sync_healthy":        false,
+			"peer_count":          state.PeerCount,
+			"max_peer_lag_blocks": state.MaxPeerLagBlocks,
+		})
 		return
 	}
 	pub, identityErr := s.localValidatorIdentity(false)
@@ -2116,7 +2245,13 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pub_key": pub.Hex(),
+		"pub_key":             pub.Hex(),
+		"registered_active":   state.RegistryActive,
+		"p2p_connected":       state.P2PConnected,
+		"online":              state.Online,
+		"sync_healthy":        state.SyncHealthy,
+		"peer_count":          state.PeerCount,
+		"max_peer_lag_blocks": state.MaxPeerLagBlocks,
 	})
 }
 
@@ -3154,6 +3289,7 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(extraBytes) != core.StakePayloadSizeV2 &&
+		len(extraBytes) != core.StakePayloadSizeV4 &&
 		len(extraBytes) != core.StakeWithdrawalPayloadSizeV2 {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported stake payload length %d", len(extraBytes)))
 		return
@@ -3191,7 +3327,10 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		Version: core.TxVersionStake,
 		Extra:   extraBytes,
 	}
-	if len(extraBytes) == core.StakeWithdrawalPayloadSizeV2 {
+	var broadcast func(*core.Transaction)
+	// V4 deposits require canonical ownership/spentness and activation checks.
+	// Keep this fail-closed even on servers without a mempool admission callback.
+	if len(extraBytes) == core.StakePayloadSizeV4 || len(extraBytes) == core.StakeWithdrawalPayloadSizeV2 {
 		if s.registry == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "validator registry unavailable")
 			return
@@ -3205,12 +3344,25 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if len(extraBytes) == core.StakePayloadSizeV4 {
+		s.broadcastTxMu.RLock()
+		broadcast = s.broadcastTxFn
+		s.broadcastTxMu.RUnlock()
+		if broadcast == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P transaction broadcaster is not ready")
+			return
+		}
+	}
 	if err := s.mempool.Add(tx); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "mempool: "+err.Error())
 		return
 	}
 
 	txHash := tx.Hash()
+	if broadcast != nil {
+		s.hub.BroadcastTx(&tx)
+		broadcast(&tx)
+	}
 	txHashHex := fmt.Sprintf("%x", txHash[:])
 	s.log.Info("signed stake transaction broadcast", "tx_hash", txHashHex)
 
@@ -3256,6 +3408,10 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
 		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
 		"burn_address":              crypto.MainnetBurnAddress().String(),
+	}
+	// This is the local consensus schedule, not a claim about other peers.
+	if s.registry != nil {
+		resp["stake_key_image_v4_activation_height"] = s.registry.StakeKeyImageV4Activation()
 	}
 	if nextRestartAt := s.nextNightlyRestartAt(time.Now()); nextRestartAt != nil {
 		resp["next_restart_at"] = nextRestartAt.UTC().Format(time.RFC3339)

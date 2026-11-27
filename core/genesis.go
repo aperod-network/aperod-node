@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -140,6 +141,44 @@ func (g *GenesisConfig) Validate() error {
 		seenPub[spendPub] = i
 	}
 	return nil
+}
+
+// TestnetChainID is the chain identifier used by the bundled development
+// genesis. It is never an acceptable identity for a node configured as mainnet.
+const TestnetChainID = "aperod-testnet-1"
+
+// MainnetChainID is the canonical post-attestation network identifier. The
+// signed bootstrap manifest binds this label to the preserved genesis hashes.
+const MainnetChainID = "aperod-mainnet-1"
+
+// ValidateNetworkGenesis checks that a genesis file is compatible with the
+// selected network. Mainnet authenticity is checked separately by the
+// configuration package's pinned operator-signed bootstrap manifest.
+func ValidateNetworkGenesis(network string, g *GenesisConfig) error {
+	if g == nil {
+		return fmt.Errorf("genesis config is required")
+	}
+	if err := g.Validate(); err != nil {
+		return fmt.Errorf("invalid genesis: %w", err)
+	}
+
+	if network != strings.ToLower(strings.TrimSpace(network)) {
+		return fmt.Errorf("unsupported network %q", network)
+	}
+	switch network {
+	case "mainnet":
+		if strings.EqualFold(strings.TrimSpace(g.ChainID), TestnetChainID) {
+			return fmt.Errorf("testnet genesis chain_id %q cannot be used as mainnet", g.ChainID)
+		}
+		if strings.TrimSpace(g.ChainID) != MainnetChainID {
+			return fmt.Errorf("mainnet genesis chain_id must be %q", MainnetChainID)
+		}
+		return nil
+	case "testnet", "devnet":
+		return nil
+	default:
+		return fmt.Errorf("unsupported network %q", network)
+	}
 }
 
 // CreateGenesisBlock builds the deterministic genesis block from configuration.

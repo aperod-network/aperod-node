@@ -245,10 +245,46 @@ func (d *DB) GetBlock(hash crypto.Hash32) (*StoredBlock, error) {
 	if err != nil || data == nil {
 		return nil, err
 	}
+	return decodeStoredBlock(data, hash)
+}
+
+// decodeStoredBlock accepts both the legacy flattened database representation
+// and the canonical core.Block representation used by newer Mainnet nodes.
+// The expected key hash is checked in either format so a mismatched body cannot
+// be silently returned as a valid block.
+func decodeStoredBlock(data []byte, expectedHash crypto.Hash32) (*StoredBlock, error) {
 	var sb StoredBlock
 	if err := json.Unmarshal(data, &sb); err != nil {
 		return nil, fmt.Errorf("unmarshal block: %w", err)
 	}
+	if sb.Hash != (crypto.Hash32{}) {
+		if sb.Hash != expectedHash {
+			return nil, fmt.Errorf("stored block hash does not match its database key")
+		}
+		return &sb, nil
+	}
+
+	var canonical struct {
+		Header *core.BlockHeader `json:"Header"`
+		Txs    []json.RawMessage `json:"Txs"`
+	}
+	if err := json.Unmarshal(data, &canonical); err != nil {
+		return nil, fmt.Errorf("unmarshal canonical block: %w", err)
+	}
+	if canonical.Header == nil {
+		return nil, fmt.Errorf("stored block has neither a flattened hash nor a canonical header")
+	}
+	canonicalHash := canonical.Header.Hash()
+	if canonicalHash != expectedHash {
+		return nil, fmt.Errorf("canonical block header hash does not match its database key")
+	}
+	sb.Height = canonical.Header.Height
+	sb.PrevHash = canonical.Header.PrevHash
+	sb.Hash = canonicalHash
+	sb.Timestamp = canonical.Header.Timestamp
+	sb.Round = canonical.Header.Round
+	sb.TxCount = len(canonical.Txs)
+	sb.TxData = canonical.Txs
 	return &sb, nil
 }
 
@@ -261,7 +297,14 @@ func (d *DB) GetBlockByHeight(height uint64) (*StoredBlock, error) {
 	}
 	var hash crypto.Hash32
 	copy(hash[:], hashBytes)
-	return d.GetBlock(hash)
+	block, err := d.GetBlock(hash)
+	if err != nil || block == nil {
+		return block, err
+	}
+	if block.Height != height {
+		return nil, fmt.Errorf("block at height index %d declares height %d", height, block.Height)
+	}
+	return block, nil
 }
 
 // ─── UTXO storage ─────────────────────────────────────────────────────────────
@@ -292,10 +335,9 @@ func (d *DB) PutUTXO(txHash crypto.Hash32, outIdx uint32, u *StoredUTXO) error {
 	}
 	batch := new(leveldb.Batch)
 	batch.Put(utxoKey(txHash, outIdx), data)
-	if err := d.stageRingSamplingChange(batch, u.OneTimePub, !u.ProtocolLocked); err != nil {
+	if err := d.newRingBatch(batch).putMember(u, data); err != nil {
 		return err
 	}
-	batch.Put(ringMemberKey(u.OneTimePub), data)
 	return d.db.Write(batch, nil)
 }
 
@@ -325,10 +367,9 @@ func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
 	batch.Delete(utxoKey(txHash, outIdx))
 	batch.Delete(spentUTXOKey(txHash, outIdx))
 	if u != nil {
-		if err := d.stageRingSamplingChange(batch, u.OneTimePub, false); err != nil {
+		if err := d.newRingBatch(batch).deleteMember(u.OneTimePub); err != nil {
 			return err
 		}
-		batch.Delete(ringMemberKey(u.OneTimePub))
 	}
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
@@ -806,18 +847,21 @@ func (d *DB) LoadTxTotal() (int64, error) {
 func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	var hb [8]byte
 	binary.LittleEndian.PutUint64(hb[:], height)
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
-	if err := d.restoreSale(batch, hash, height); err != nil {
+	ring := d.newRingBatch(batch)
+	if err := d.restoreSale(batch, ring, hash, height); err != nil {
 		return err
 	}
 	if err := d.restoreLPoDPool(batch, hash, height); err != nil {
 		return err
 	}
-	if err := d.rollbackLPoDIndices(batch, hash, height); err != nil {
+	if err := d.rollbackLPoDIndices(batch, ring, hash, height); err != nil {
 		return err
 	}
 	batch.Put(hashKey, hash[:])
@@ -905,6 +949,8 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 	writeSetCommitment crypto.Hash32, saleSettlement *SaleSettlement, lpodSettlement []*LPoDSettlement) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil {
 		return err
 	}
@@ -918,7 +964,8 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 	if err != nil {
 		return err
 	}
-	if err := d.appendSaleSettlement(batch, data, hash, height, saleSettlement); err != nil {
+	ring := d.newRingBatch(batch)
+	if err := d.appendSaleSettlement(batch, ring, data, hash, height, saleSettlement); err != nil {
 		return err
 	}
 	// Reserve and carries share the same fsynced batch as the canonical tip.
@@ -931,7 +978,7 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 		if err := json.Unmarshal(data, &block); err != nil {
 			return err
 		}
-		if err := appendLPoDIndices(batch, &block, false); err != nil {
+		if err := appendLPoDIndices(batch, ring, &block, false); err != nil {
 			return err
 		}
 		if err := d.appendLPoDWalletIndex(batch, &block, lpodSettlement[0]); err != nil {

@@ -57,6 +57,7 @@ type State struct {
 	Balance           uint64 `json:"balance_napro,string"`
 	RewardInflow      uint64 `json:"reward_inflow_napro,string"`
 	LeaderPaid        uint64 `json:"leader_paid_napro,string"`
+	PendingLeader     uint64 `json:"pending_leader_napro,string,omitempty"`
 	AngelPaid         uint64 `json:"angel_paid_napro,string"`
 	SurplusInflow     uint64 `json:"surplus_inflow_napro,string"`
 	DeficitOutflow    uint64 `json:"deficit_outflow_napro,string"`
@@ -124,6 +125,10 @@ func (s State) Validate() error {
 		return err
 	}
 	right, err = add(right, s.AngelPaid)
+	if err != nil {
+		return err
+	}
+	right, err = add(right, s.PendingLeader)
 	if err != nil {
 		return err
 	}

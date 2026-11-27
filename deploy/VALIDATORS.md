@@ -1,453 +1,220 @@
-# Aperod Validator Rules
+# Mainnet validator onboarding
 
-> **Network:** Aperod Mainnet &nbsp;·&nbsp; **Consensus:** BFT Proof of Stake (stake-weighted, permissionless)
+## Current status
 
-This document is the authoritative specification for validator participation in the Aperod network. All rules are enforced at the protocol level in `consensus/poa.go`.
+The live OVH check is recorded below. The following genesis inspection and
+sync-only rehearsal are historical observations from 2026-11-23, not the
+current validator role.
 
----
+The existing Mainnet genesis and a checkpoint at height `4,076,315` have been
+inspected on a closed copy on the new OVH server. Their bootstrap and AVM
+signatures verify under the selected single-operator trust policy. That policy
+is not a validator quorum, and a valid checkpoint signature is not proof that a
+new node has joined the network.
 
-## Table of Contents
+On 2026-11-23, an isolated non-validator on the new OVH server connected to the
+Mainnet relay and applied live blocks through height `4,083,185`. A graceful
+shutdown saved a snapshot at `4,083,026`; after restart, the node reloaded that
+snapshot, reconnected, and continued accepting blocks. At the recorded ready
+check, the local API reported `syncing=false`, `utxo_rebuilding=false`, zero
+phantom key images, and zero missing UTXO/store rows. The local API also matched
+the signed genesis, height-1 index, and checkpoint anchors; the stale genesis
+hash was rejected.
 
-- [Overview](#overview)
-- [Eligibility](#eligibility)
-- [Active Validator Set](#active-validator-set)
-- [Epoch & Rotation](#epoch--rotation)
-- [Rewards](#rewards)
-- [Liveness Requirements](#liveness-requirements)
-- [Slashing](#slashing)
-- [Unbonding & Withdrawal](#unbonding--withdrawal)
-- [Setup Guide](#setup-guide)
-
----
-
-## Overview
-
-Aperod uses **permissionless, stake-weighted BFT Proof of Stake**:
-
-- Validators are selected by stake size — no operator approval or whitelist.
-- The **top 21 nodes** by staked APRO form the active set at any given epoch.
-- Block proposers rotate in round-robin order among active validators.
-- A block is finalised when **≥ 2/3 of active validators** sign it (BFT threshold).
-
----
-
-## Eligibility
-
-Any node may become a validator by meeting **all** of the following conditions:
-
-| Condition | Requirement |
-|-----------|-------------|
-| Stake | ≥ **100,000 APRO** locked on-chain |
-| Node software | Latest `aperod-node` binary, fully synced |
-| Consensus key | Valid Ed25519 key registered on-chain |
-| Reward address | Valid APRO wallet address configured |
-| Connectivity | Port **30303/tcp+udp** reachable from the internet |
-| Ranking | Top 21 by total stake at epoch boundary |
-
-There is no application, KYC, or governance vote required.
-
----
-
-## Active Validator Set
-
-| Parameter | Value |
-|-----------|-------|
-| Active validators | **21** (maximum) |
-| Selection criterion | Top 21 by total staked APRO |
-| Set refresh | Every epoch boundary (every 100 blocks) |
-| Churn limit | **3** new validators per epoch (prevents instability) |
-
-If fewer than 21 nodes meet the minimum stake, the active set is smaller.  
-A node ranked 22nd or below is **standby** — it does not produce blocks or earn rewards, but retains its stake.
-
----
-
-## Epoch & Rotation
-
-| Parameter | Value |
-|-----------|-------|
-| Epoch length | **100 blocks** (~300 seconds at 3 s/block) |
-| Block time target | **3 seconds** |
-| Proposer selection | Round-robin within the active set |
-| Finality | BFT — block is final once 2/3 validators have signed |
-
-At each epoch boundary the consensus engine:
-1. Reads the current stake rankings from the UTXO set.
-2. Computes the new active set (top 21, churn ≤ 3).
-3. Rotates out validators that fell below rank 21.
-4. Activates standby validators that entered the top 21.
-
----
-
-## Rewards
-
-| Item | Detail |
-|------|--------|
-| Pool-phase reward | **3 APRO** per block produced |
-| Reward pool | **2,000,000,000 APRO**, pre-allocated at genesis |
-| Tail emission | **1 APRO** per block after pool exhaustion (~63 years) |
-| Reward destination | Validator's configured `reward_address` (Telegram wallet) |
-| Notification | Telegram push notification on every reward payment |
-| Fee share | 100% of the base fee is burned; explicit priority tips go to the proposer |
-| Halving | **None** |
-
-During the pool phase each produced block transfers
-**300,000,000 nAPRO (3 APRO)** from the pre-allocated validator pool. This
-redistributes existing genesis supply and does not mint new APRO. After the pool
-is exhausted, the protocol mints a constant **100,000,000 nAPRO (1 APRO)** tail
-reward per block. The configured `reward_address` must be a valid APRO address.
-
----
-
-## Liveness Requirements
-
-Validators are expected to be online and signing continuously.
-
-| Metric | Threshold |
-|--------|-----------|
-| Minimum blocks signed per epoch | **≥ 2/3 of epoch blocks** (≥ 67 of 100) |
-| Maximum consecutive missed blocks | 50 before downtime flag is raised |
-| Uptime target | ≥ 99 % |
-
-Falling below the liveness threshold in an epoch triggers a **downtime penalty** (see Slashing).
-
----
-
-## Slashing
-
-Slashing is automatic, on-chain, and non-reversible.
-
-### Double-Sign (Critical)
-
-Signing two conflicting blocks at the same height.
-
-| Consequence | Detail |
-|-------------|--------|
-| Stake penalty | **10 % of total stake** burned immediately |
-| Set removal | Permanent ban — node cannot re-enter the validator set |
-| Evidence window | Any time after the double-sign is detected |
-
-Double-sign protection is enforced in the node software. Running duplicate processes on the same key is dangerous.
-
-### Extended Downtime
-
-Failing to sign ≥ 2/3 of blocks in an epoch (liveness violation).
-
-| Consequence | Detail |
-|-------------|--------|
-| Stake penalty | **5 % of total stake** deducted |
-| Set removal | Removed from active set at epoch boundary |
-| Re-entry | Allowed after restaking to ≥ 100,000 APRO |
-
-### Stake Falls Below Minimum
-
-If a validator's stake drops below 100,000 APRO (due to slashing or partial withdrawal):
-
-- Removed from active set at next epoch boundary.
-- Must top up stake to re-enter.
-
----
-
-## Unbonding & Withdrawal
-
-Staked APRO is locked while the validator is active. To withdraw:
-
-| Step | Detail |
-|------|--------|
-| 1. Initiate unbonding | Send unbonding request via [@sup_apro_bot](https://t.me/sup_apro_bot) |
-| 2. Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
-| 3. Funds released | APRO returned to wallet after unbonding period |
-
-Partial unbonding is supported. If remaining stake drops below 100,000 APRO, the node exits the validator set.
-
-Withdrawals cannot be cancelled once initiated.
-
----
-
-## Setup Guide
-
-Complete installation instructions are in the main [README](README.md).
-
-Use the reviewed, signed source commit below. Do not run an installer fetched
-from the mutable `main` branch, and never pipe a downloaded script directly to
-`sudo bash`. This is a pinned source checkout, not a standalone installer
+This proves snapshot recovery and outbound P2P sync for a manually staged
+non-validator. It is **not** a clean install from the public installer, nor proof
+of active-set admission or validator activation. The 2026-11-24 restart measured
+the height-index sweep at about 2 minutes 22 seconds, but it still skipped
+`798,755` heights with no retained block bodies and did not create a verified
+index sentinel. The node completed its registry replay and returned to API-ready
+status after about 6 minutes 21 seconds. This is not a complete historical
 archive.
 
-The public validator installer supports testnet only. Do not use it to join
-mainnet; mainnet requires a verified canonical genesis and existing chain state.
-
-```bash
-# Reviewed source commit; GitHub reports its commit signature as valid.
-APEROD_NODE_SOURCE_COMMIT="de38c4b084c4377b5925d501d853cfe3da555a92"
-[[ ! "$APEROD_NODE_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] && { echo "Invalid source commit / Неверный коммит исходного кода" >&2; exit 1; }
-curl -fsSL "https://api.github.com/repos/aperod-network/aperod-node/commits/$APEROD_NODE_SOURCE_COMMIT" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["commit"]["verification"]["verified"] is True else 1)'
-
-INSTALLER_DIR="$HOME/aperod-node-$APEROD_NODE_SOURCE_COMMIT"
-test ! -e "$INSTALLER_DIR" || { echo "Directory exists; inspect it and choose another path." >&2; exit 1; }
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git python3
-git clone --no-checkout https://github.com/aperod-network/aperod-node.git "$INSTALLER_DIR"
-cd "$INSTALLER_DIR"
-git fetch --depth=1 origin "$APEROD_NODE_SOURCE_COMMIT"
-git cat-file -e "${APEROD_NODE_SOURCE_COMMIT}^{commit}"
-git checkout --detach "$APEROD_NODE_SOURCE_COMMIT"
-test "$(git rev-parse HEAD)" = "$APEROD_NODE_SOURCE_COMMIT"
-test -z "$(git status --porcelain)"
-
-# The script requires root and runs from this pinned local checkout.
-sudo env APEROD_NETWORK=testnet APEROD_NODE_SOURCE_COMMIT="$APEROD_NODE_SOURCE_COMMIT" bash deploy/install-validator.sh
-
-# Review the checked-out uninstaller before this destructive operation.
-sudo bash deploy/uninstall-validator.sh
-```
-
-The source commit above was signature-verified and its publication checks
-passed. If GitHub reports an invalid/missing signature, the checkout differs,
-or the installer refuses the pin, stop and do not bypass the checks.
-
-**Key file locations after install:**
-
-| File | Path |
-|------|------|
-| Node config | `/etc/aperod/node.yaml` |
-| Consensus key | `/etc/aperod/validator.key` |
-| Blockchain data | `/var/lib/aperod/` |
-| Service logs | `journalctl -u aperod-node -f` |
-
----
-
-## One-time Fix: validator.key File Permissions (existing validators)
-
-If your validator node was installed before **July 2026**, the key file may have
-wrong ownership or permissions, causing the node to fail with
-`permission denied` or `unsafe permissions` on the next binary update.
-
-Run this one-time fix **on the validator server**:
-
-```bash
-sudo chown aperod:aperod /etc/aperod/validator.key
-sudo chmod 600 /etc/aperod/validator.key
-```
-
-Verify:
-```bash
-sudo ls -la /etc/aperod/validator.key
-# expected: -rw------- aperod aperod ...
-```
-
-Newly installed validators (using the current `install-validator.sh`) have the
-correct ownership set automatically.
-
----
-
-## Managing Bootnodes Safely
-
-**Never edit `node.yaml` bootnodes with `sed` or by hand** — a missed newline
-silently merges entries into invalid YAML, which crash-loops the node.
-
-Use `node-config.sh` instead:
-
-```bash
-# List current bootnodes
-sudo bash /opt/aperod/blockchain/deploy/node-config.sh list-bootnodes
-
-# Add a bootnode (Python rewrites the YAML; validates before writing)
-sudo bash /opt/aperod/blockchain/deploy/node-config.sh add-bootnode /ip4/1.2.3.4/tcp/30303
-
-# Remove a bootnode by exact address
-sudo bash /opt/aperod/blockchain/deploy/node-config.sh remove-bootnode /ip4/1.2.3.4/tcp/30303
-```
-
-The script:
-1. Parses the existing YAML with Python (not sed), so list structure is preserved.
-2. Checks for duplicates before adding.
-3. Shows a diff of exactly what changed before writing.
-4. Validates the result with `aperod-node --validate-config` (falls back to
-   `python3 yaml.safe_load` if the binary is not on PATH).
-5. Only writes the file after validation passes — the original is never
-   truncated on failure.
-
-After any change, restart the node:
-
-```bash
-sudo systemctl restart aperod-node
-```
-
-Override the config path with `APEROD_CONFIG=/path/to/node.yaml` if your file
-is not at the default `/etc/aperod/node.yaml`.
-
----
-
-## Validating node.yaml Without Starting the Node
-
-```bash
-aperod-node --config /etc/aperod/node.yaml --validate-config
-# config OK: /etc/aperod/node.yaml (network=mainnet)
-```
-
-Exits 0 on success, non-zero with an error message on any parse or semantic
-validation failure.  Safe to run while the node is running — it does not
-open any ports or touch the database.
-
----
-
-## Keeping Validator Binaries in Sync with the Main Node
-
-> **Critical:** The main node and every validator must run the **same binary
-> version** at all times.  When the main node gains a new feature (e.g. TLS
-> P2P encryption), validators running an older binary fail the handshake
-> silently — `peer_count` stays 0 for hours with no obvious error in the logs.
-
-### Standard update procedure
-
-Every time you update the main node, push the new binary to all validators
-immediately afterwards:
-
-```bash
-# Step 1 — Update the main node (builds binary, runs health + peer checks).
-sudo bash /opt/aperod/blockchain/deploy/update-node.sh
-
-# Step 2 — Push the same binary to every validator in validators.conf.
-sudo bash /opt/aperod/blockchain/deploy/update-validator.sh
-```
-
-That's it.  The two scripts must always be run as a pair.
-
-### Validator inventory: validators.conf
-
-The list of validator SSH targets lives in `deploy/validators.conf` (one
-`user@host` per line, `#` = comment).  Edit this file to add or remove
-validators:
-
-```
-# deploy/validators.conf
-aperod@203.0.113.10
-aperod@203.0.113.20
-```
-
-> **Security note:** If this repository is public, keep real production IPs in
-> a local file and point the script at it with the `VALIDATORS_CONF` env var:
-> ```bash
-> VALIDATORS_CONF=/etc/aperod/validators.conf \
->   sudo bash /opt/aperod/blockchain/deploy/update-validator.sh
-> ```
-
-### Updating a single validator
-
-Pass the SSH target as a command-line argument to skip the conf file:
-
-```bash
-sudo bash /opt/aperod/blockchain/deploy/update-validator.sh aperod@203.0.113.10
-```
-
-### What update-validator.sh does
-
-For each validator listed in `validators.conf` (or passed as arguments):
-
-1. **SCP** the binary from `/usr/local/bin/aperod-node` on the main server to
-   a temporary path on the validator.
-2. **Stop** the `aperod-node` service (`systemctl stop`).
-3. **Install** the binary to `/usr/local/bin/aperod-node`.
-4. **Start** the service.
-5. **Health check** — polls `http://127.0.0.1:8545/api/v1/status` until the
-   node responds; fires a Telegram alert on failure.
-
-On failure the script reports which validators failed and exits non-zero.
-
-### Requirements
-
-- SSH key-based access to every validator (no password prompts).  
-  Default key: `~/.ssh/id_ed25519` — override with `SSH_KEY=<path>`.
-- The `aperod` user on each validator has `sudo` rights for `systemctl`.
-- Port 22 reachable from the main server to every validator.
-- Every validator's SSH host key must be pre-recorded in the known-hosts
-  file **before** the first run (see below).
-
-### First-time host-key verification (run once per new validator)
-
-The script uses `StrictHostKeyChecking=yes` — it will **refuse** to connect
-to any host whose key is not already recorded.  This prevents MITM attacks
-where an attacker intercepts the binary push.
-
-Add a validator's key once, **after verifying the fingerprint out-of-band**
-(e.g. via your cloud provider's console or an independent channel):
-
-```bash
-# 1. Fetch and display the fingerprint — verify it matches your provider:
-ssh-keyscan -H <validator-ip> 2>/dev/null | ssh-keygen -lf - -E sha256
-
-# 2. Once verified, append the key to the deploy known-hosts file:
-sudo mkdir -p /etc/aperod
-ssh-keyscan -H <validator-ip> | sudo tee -a /etc/aperod/validator_known_hosts
-sudo chmod 600 /etc/aperod/validator_known_hosts
-```
-
-If a validator's host key changes (e.g. server was reprovisioned), the script
-aborts with a clear error.  Remove the stale entry and add the new key after
-re-verifying the fingerprint:
-
-```bash
-ssh-keygen -R <validator-ip> -f /etc/aperod/validator_known_hosts
-ssh-keyscan -H <validator-ip> | sudo tee -a /etc/aperod/validator_known_hosts
-```
-
-### Optional env vars
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `VALIDATORS_CONF` | `deploy/validators.conf` | Path to the inventory file |
-| `SSH_KEY` | `~/.ssh/id_ed25519` | SSH private key |
-| `KNOWN_HOSTS_FILE` | `/etc/aperod/validator_known_hosts` | Pre-verified host keys |
-| `BINARY_SRC` | `/usr/local/bin/aperod-node` | Binary to push |
-| `SKIP_HEALTH_CHECK` | `0` | Set to `1` to bypass health polling |
-| `HEALTH_MAX_ATTEMPTS` | `15` | Poll attempts before declaring failure |
-| `HEALTH_WAIT_SECS` | `2` | Seconds between health polls |
-| `SUPPORT_BOT_TOKEN` | — | Telegram bot token for failure alerts |
-| `SUPPORT_ADMIN_CHAT_ID` | — | Telegram chat ID for failure alerts |
-
----
-
-## Updating the Main Node Binary
-
-**Always use `update-node.sh` — never build and copy manually.**
-
-Two silent failure modes occur with a manual update:
-
-| Mistake | Symptom |
-|---------|---------|
-| Building to the wrong path (e.g. `/opt/aperod/data/aperod-node`) | Binary never picked up — service runs old code silently |
-| Copying over a running binary | `Text file busy` (ETXTBSY) — copy fails, old binary still running |
-
-The update script handles both correctly — it stops the service first, then installs to `/usr/local/bin/aperod-node` (the path the `aperod-node.service` unit executes), then starts the service and waits for the API to respond.
-
-```bash
-sudo bash /opt/aperod/blockchain/deploy/update-node.sh
-```
-
-The script performs these steps in order:
-
-1. `git pull` latest source
-2. `make build` — if this fails, the service is **not stopped** (old binary keeps running)
-3. `systemctl stop aperod-node`
-4. `cp build/aperod-node /usr/local/bin/aperod-node`
-5. `systemctl start aperod-node`
-6. Polls `http://localhost:8545/api/v1/status` until the node responds (sends a Telegram alert on failure)
-7. Polls `http://localhost:8545/api/v1/network/stats` for up to 30 s — warns if `peer_count` is still 0 (non-fatal)
-
-**After running update-node.sh, always run update-validator.sh (see above).**
-
-**Optional env vars:**
-
-```bash
-SUPPORT_BOT_TOKEN=<token> \
-SUPPORT_ADMIN_CHAT_ID=<chat_id> \
-  sudo bash /opt/aperod/blockchain/deploy/update-node.sh
-```
-
-Set `SKIP_HEALTH_CHECK=1` if the RPC port is not exposed on this machine.
-
----
-
-*Rules enforced by protocol — `consensus/poa.go`, `core/chain.go`.*  
-*Last updated: July 2026 — [aperod-network](https://github.com/aperod-network)*
+## Setup guide
+
+A verified self-service mainnet bootstrap release is not yet published.
+The legacy `install-validator.sh` must not be used as a mainnet installer;
+do not bypass its safety checks or run it with a different network flag.
+
+See [mainnet onboarding](MAINNET.md) for the chain anchors, the stale
+public Explorer/API records, the operator-attestation boundary, and the OVH
+sync/restart evidence. A read-only logical snapshot confirmed that the pinned
+historical replacement signer `eb9650…` verifies all `17,563` retained blocks
+from checkpoint height `4,076,315` through snapshot tip `4,093,877`, while the
+headers retain collateral identity `08fd…`. Keep that public key in historical
+verification; do not use its private key for future signing. The new key
+`056a…` is not yet bound by an approved authority transition.
+
+At the 2026-11-25 06:04 UTC live check, `/api/v1/chain/identity-evidence`
+returned HTTP 200 under `operator_1_of_1`. The serving node reported the
+canonical-index genesis signature and checkpoint signature at height
+`4,105,317` as valid; it explicitly reported finality quorum as unverified.
+The genesis header hash differs from the canonical index hash, and the signed
+statement names the canonical index hash as its signature target. The statement
+signer begins `b4c0…`, distinct from the active validator key `08fd…`; do not
+describe the evidence as a validator quorum or silently treat those keys as the
+same authority.
+
+At the 2026-11-25 06:07 UTC status check, the local API reported height
+`4,120,290`,
+`syncing=false`, `utxo_rebuilding=false`, and zero missing store/UTXO rows. It
+reported `non_validator=false`; the sole validator registry entry `08fd…` was
+active with 1,000,000 APRO stake. After restart, the node finalized block
+`4,120,146` and continued producing blocks. One outbound peer reported height
+`4,108,808`; the local tip was `4,120,290` (11,482 blocks ahead). The relay and
+OVH shared the same block hash at height `4,108,808`, but the next OVH block
+(`4,108,809`) has `oracle_price=0` and the relay rejected it with
+`oracle price is missing after hardening activation`. This explains the stalled
+peer: later blocks cannot extend the relay's tip. The active binaries match and
+both config files specify security hardening at height `3,800,000`. The likely
+producer-side cause is an asymmetric check in the source: incoming blocks call
+the oracle validator, while the self-produced path did not.
+Current nonzero prices on later blocks do not repair that ancestor. The OVH
+validator was gracefully stopped and restarted for an authorized snapshot
+rehearsal; it resumed from height `4,120,145`, became API-ready, and finalized
+block `4,120,146`. The relay was not changed, and no consensus settings or
+production source were deployed. Peer convergence and independent acceptance
+are not established. The public API and Explorer still
+expose the stale genesis records described in `MAINNET.md`; this is not a clean
+public validator installation.
+
+The OVH journal records an oracle JSON decode failure at `20:19:39 UTC`, then
+finalizes block `4,108,809` three seconds later. Source review found
+`checkOraclePriceDeviation` only on the peer-received path; self-produced
+validation checks transactions and key images without invoking it. The running
+binary's source revision could not be independently matched to this checkout,
+so this is a likely source-level diagnosis, not a verified release mapping. A
+source patch now runs the existing oracle check for self-produced blocks before
+state mutation, with a regression test. Targeted tests passed on Go 1.26.11 in
+a temporary workspace on the new OVH; the source, toolchain, module cache, and
+test files were removed afterward. The patch is not deployed. A consistent
+18,847,403,159-byte copy of the live tree passed `--check-snapshot` at tip
+`4,120,145` and the snapshot SHA-256 matched. The live node resumed from that
+tip, passed startup integrity and snapshot UTXO-count checks, and produced new
+blocks; the temporary copy was removed after verification. This validates
+snapshot recovery only, not rollback of the rejected ancestor or relay
+convergence.
+
+The OVH sync binary was built from a modified working tree
+(`buildvcs.modified=true`), so it is test evidence, not a release binary. If an
+older install attempt reports `[source-safety] REFUSED` for the checkout's
+top-level `data/` directory, do not bypass the guard. If it reports
+`Directory exists`, inspect the existing checkout and preserve it; see the
+diagnosis in [MAINNET.md](MAINNET.md).
+
+An earlier read-only comparison on 2026-11-24 found the primary at height
+`4,095,578` and OVH at `4,095,577`; both returned the same canonical hash
+`3e6579833d018e732a38bfe87f53fd80ff6a360dcc5f4540187b785a4fe23756` at the
+common height, with `syncing=false`. This confirms the OVH sync process follows
+the same current chain; it does not prove validator admission.
+
+The public Explorer/API is still not safe to use as a Mainnet source of truth:
+on 2026-11-24 both public hosts returned stale genesis and height-1 records.
+Cloudflare marked the responses `DYNAMIC` and `no-store`, and the active API
+bundle on the primary lacks the canonical early-block guard. The current source
+has regression coverage for stale hash lookups and canonical height lookups;
+31 targeted route tests, typecheck, and build passed on OVH. A live isolated
+router check against the copied OVH database and local node also passed 3/3
+checks, including canonical heights 0/1 and 404 for stale hashes. The copied DB
+tip was 43 blocks behind the node at a later read-only check, with a matching
+hash at that tip. Since then, the persistent indexer was configured on OVH to
+use `aperod_mainnet_api_20261124` and the local Mainnet node. It now catches up
+continuously. Historical burn totals remain unverified because pruned bodies
+blocked the scan. The live API service has not been installed there or cut over.
+
+At the 11:14 UTC check on 2026-11-24, both the OVH node API and its PostgreSQL
+index reached height `4,099,675` with the same block hash. Both node and indexer
+services were active and enabled for boot, with exactly one node process; the
+indexer unit depends on PostgreSQL only and cannot start a second node. This
+proves local catch-up, not that the public API/Explorer has been corrected or
+switched over.
+
+The signed snapshot was copied to OVH and matched its source and signed
+manifest exactly: 14,064 files, 16,401,821,101 bytes, tree SHA-256
+`18a50686c11d5772606057ab89c08698d71ae698496e4e9bfceb1dceea29d795`. The
+closed staging duplicate was then removed from the primary; its active Mainnet
+database was left untouched.
+
+At the 2026-11-25 05:28 UTC check, the single OVH tree was still
+`/var/lib/aperod/mainnet`, but its live role had changed: `non_validator=false`,
+and `/api/v1/my-validator` matched the sole local registry entry `08fd…`
+(`active`, 1,000,000 APRO stake). All 25 most recent block records named that
+key as producer. The local status endpoint reported height `4,119,630`,
+`syncing=false`, and zero missing store/UTXO rows.
+
+The node had one outbound P2P peer with a height-bearing keepalive, but the
+peer reported height `4,108,808`, 10,822 blocks behind the local tip. This proves
+a live peer connection, not peer convergence. `/api/v1/chain/identity-evidence`
+returned HTTP 200 with `operator_1_of_1`; the canonical-index genesis signature
+and checkpoint signature at height `4,105,317` verified, while finality quorum
+did not. The signed bootstrap statement names `canonical_index_hash` as the
+genesis signature target and is signed by a key beginning `b4c0…`, distinct
+from the active validator key `08fd…`. The evidence is served by this node and
+is not independent quorum verification.
+
+These checks do not establish an independently confirmed canonical tip,
+validator-quorum finality, or a clean public validator installation. The
+historical body gap and index-completeness limits recorded above remain.
+
+The restart verified the signed genesis/checkpoint and completed the startup
+height-index sweep in about 2 minutes 26 seconds. The sweep skipped `798,755`
+heights in the known historical body gap `924,790–1,723,544`, so it did not
+write the verified-index sentinel. Current sync and local indexing work, but
+historical height-index completeness is not established. No old-primary
+cutover or public API/Explorer change has occurred.
+
+## Protocol values in source
+
+These values are implemented in the current source; they are not, by
+themselves, proof of the live network's activation schedule or an invitation to
+send funds.
+
+| Parameter | Source value |
+|---|---:|
+| Active validators | **21** (maximum) |
+| Stake | ≥ **100,000 APRO** locked on-chain |
+| Epoch length | **100 blocks** (~300 seconds at 3 seconds per block) |
+| Churn limit | **3** new validators per epoch |
+| Unbonding period | **144,000 blocks** (~5 days) — node leaves active set |
+| Pool-phase block reward | **300,000,000 nAPRO (3 APRO)** |
+| Tail emission | **1 APRO** (100,000,000 nAPRO) per block |
+
+## Double-sign penalty
+
+The source specifies a penalty of **10 % of total stake** burned immediately.
+This is a source-level value, not proof that the rule is active at the current
+Mainnet height.
+
+Validator capacity is unrelated to the 10-billion APRO nominal supply.
+Consensus activation heights must come from one reviewed Mainnet release and
+must not be selected independently on a new node.
+
+## Requirements for a usable public release
+
+The same reviewed release must include and verify:
+
+1. The canonical genesis profile, operator-signed bootstrap statement, AVM
+   checkpoint, migration witnesses, and consistent chain snapshot.
+2. The exact compatible source revision, executable, service config, and
+   checksums.
+3. A verified Mainnet peer identity and an authorized admission procedure.
+4. A clean-server install from the published package, sync to the canonical tip,
+   and restart check on the new OVH host.
+5. An owner-authorized on-chain stake deposit, active-set inclusion, and a
+   vote or block accepted by the existing network.
+
+A signed snapshot does not validate a binary or installer. A synchronized
+non-validator does not prove stake eligibility. An application record or wallet
+balance is not locked stake. Local tests do not prove that Mainnet accepted a
+vote.
+
+## Operator safety
+
+- Never share or reuse another validator's consensus private key.
+- Do not create a new genesis when a node is missing its verified chain state.
+- Do not change consensus activation heights on one node.
+- Do not delete an existing chain or wallet directory to retry installation.
+- Do not treat an application, balance, or advertised minimum stake as proof
+  of active-set membership.
+- Test and deploy rehearsals belong on the new OVH server; preserve the primary
+  node and remove only temporary rehearsal files after verification.

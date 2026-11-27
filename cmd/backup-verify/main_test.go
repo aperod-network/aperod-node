@@ -95,11 +95,80 @@ func TestWriteChainProofVerifiesCanonicalGenesisAndAnchors(t *testing.T) {
 	if err := jsonFile(proofPath, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Schema != 1 || got.GenesisHash != fmt.Sprintf("%x", genesisHash[:]) ||
+	if got.Schema != 2 || got.GenesisHash != fmt.Sprintf("%x", genesisHash[:]) ||
+		got.GenesisIndexHash != fmt.Sprintf("%x", genesisHash[:]) ||
 		got.TipHash != fmt.Sprintf("%x", tipHash[:]) || got.TipHeight != 2 ||
 		len(got.Anchors) != 2 || got.Anchors[0].ID != "checkpoint-a" ||
 		got.Anchors[1].ID != "checkpoint-b" {
 		t.Fatalf("unexpected proof: %+v", got)
+	}
+}
+
+func TestWriteChainProofVerifiesLegacyIndexedGenesis(t *testing.T) {
+	stage := t.TempDir()
+	dbPath := filepath.Join(stage, "chain.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: 1_000_000_000, MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub,
+	}}
+	genesisIndexHash := legacyGenesisID(&genesis.Header)
+	genesis.Header.Signature, err = priv.Sign(genesisIndexHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesisRaw, err := json.Marshal(genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutRawBlock(genesisIndexHash, 0, genesisRaw); err != nil {
+		t.Fatal(err)
+	}
+	tip := &core.Block{Header: core.BlockHeader{
+		Height: 1, PrevHash: genesisIndexHash, Timestamp: 2_000_000_000,
+		MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub, BaseFee: 1,
+	}}
+	tipRaw, err := json.Marshal(tip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutRawBlock(tip.Hash(), 1, tipRaw); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutTip(tip.Hash(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	genesisHeaderHash := genesis.Hash()
+	tipHash := tip.Hash()
+	anchorsPath := filepath.Join(stage, "anchors.json")
+	anchors := fmt.Sprintf(
+		`{"schema":2,"genesis_hash":"%x","genesis_index_hash":"%x","anchors":[{"id":"genesis-index","height":0,"hash":"%x"},{"id":"tip","height":1,"hash":"%x"}]}`,
+		genesisHeaderHash[:], genesisIndexHash[:], genesisIndexHash[:], tipHash[:],
+	)
+	if err := os.WriteFile(anchorsPath, []byte(anchors), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(stage, "proof.json")
+	if err := writeChainProof(dbPath, anchorsPath, outputPath, fmt.Sprintf("%x", tipHash[:]), 1); err != nil {
+		t.Fatalf("writeChainProof rejected valid legacy-indexed genesis: %v", err)
+	}
+	var got proof
+	if err := jsonFile(outputPath, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Schema != 2 || got.GenesisHash != fmt.Sprintf("%x", genesisHeaderHash[:]) ||
+		got.GenesisIndexHash != fmt.Sprintf("%x", genesisIndexHash[:]) || got.TipHeight != 1 {
+		t.Fatalf("unexpected legacy genesis proof: %+v", got)
 	}
 }
 
@@ -137,7 +206,16 @@ func TestWriteChainProofRejectsWrongGenesisAndNoncanonicalAnchors(t *testing.T) 
 
 func TestWriteChainProofRejectsDisconnectedIndividuallyValidCanonicalEntries(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "chain.db")
-	genesis := &core.Block{Header: core.BlockHeader{Height: 0, Timestamp: 1, BaseFee: 1}}
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: 1, BaseFee: 1, MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub,
+	}}
+	if err := genesis.Header.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
 	middle := &core.Block{Header: core.BlockHeader{
 		Height: 1, PrevHash: genesis.Hash(), Timestamp: 2, BaseFee: 1,
 	}}
@@ -150,7 +228,7 @@ func TestWriteChainProofRejectsDisconnectedIndividuallyValidCanonicalEntries(t *
 	anchorsPath := writeAnchorFixture(t, genesis.Hash(), []anchor{{
 		ID: "cleanup", Height: 1, Hash: fmt.Sprintf("%x", middleHash[:]),
 	}})
-	err := writeChainProof(dbPath, anchorsPath, filepath.Join(t.TempDir(), "proof.json"),
+	err = writeChainProof(dbPath, anchorsPath, filepath.Join(t.TempDir(), "proof.json"),
 		fmt.Sprintf("%x", tipHash[:]), 2)
 	if err == nil || !strings.Contains(err.Error(), "disconnected") {
 		t.Fatalf("writeChainProof error = %v, want disconnected canonical ancestry", err)
@@ -159,7 +237,16 @@ func TestWriteChainProofRejectsDisconnectedIndividuallyValidCanonicalEntries(t *
 
 func TestWriteChainProofRejectsBrokenPrevHashWithinRequiredRange(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "chain.db")
-	genesis := &core.Block{Header: core.BlockHeader{Height: 0, Timestamp: 1, BaseFee: 1}}
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: 1, BaseFee: 1, MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub,
+	}}
+	if err := genesis.Header.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
 	wrongParent := crypto.Hash32{78}
 	middle := &core.Block{Header: core.BlockHeader{
 		Height: 1, PrevHash: wrongParent, Timestamp: 2, BaseFee: 1,
@@ -172,7 +259,7 @@ func TestWriteChainProofRejectsBrokenPrevHashWithinRequiredRange(t *testing.T) {
 	anchorsPath := writeAnchorFixture(t, genesisHash, []anchor{{
 		ID: "genesis-anchor", Height: 0, Hash: fmt.Sprintf("%x", genesisHash[:]),
 	}})
-	err := writeChainProof(dbPath, anchorsPath, filepath.Join(t.TempDir(), "proof.json"),
+	err = writeChainProof(dbPath, anchorsPath, filepath.Join(t.TempDir(), "proof.json"),
 		fmt.Sprintf("%x", tipHash[:]), 2)
 	if err == nil || !strings.Contains(err.Error(), "disconnected") {
 		t.Fatalf("writeChainProof error = %v, want broken PrevHash rejection", err)
@@ -350,7 +437,16 @@ func writeSmallStore(t *testing.T, path string, hash crypto.Hash32, height uint6
 
 func writeProofStore(t *testing.T, path string) (crypto.Hash32, crypto.Hash32, crypto.Hash32, uint64) {
 	t.Helper()
-	genesis := &core.Block{Header: core.BlockHeader{Height: 0, Timestamp: 1, BaseFee: 1}}
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: 1, BaseFee: 1, MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub,
+	}}
+	if err := genesis.Header.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
 	middle := &core.Block{Header: core.BlockHeader{
 		Height: 1, PrevHash: genesis.Hash(), Timestamp: 2, BaseFee: 1,
 	}}
@@ -394,7 +490,16 @@ func writeGappedProofStore(t *testing.T, path string) (crypto.Hash32, crypto.Has
 	if err != nil {
 		t.Fatalf("create gapped proof chain.db: %v", err)
 	}
-	genesis := &core.Block{Header: core.BlockHeader{Height: 0, Timestamp: 1, BaseFee: 1}}
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis := &core.Block{Header: core.BlockHeader{
+		Height: 0, Timestamp: 1, BaseFee: 1, MerkleRoot: core.MerkleRoot(nil), ValidatorPub: pub,
+	}}
+	if err := genesis.Header.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
 	block1 := &core.Block{Header: core.BlockHeader{
 		Height: 1, PrevHash: genesis.Hash(), Timestamp: 2, BaseFee: 1,
 	}}

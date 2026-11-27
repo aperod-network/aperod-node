@@ -86,6 +86,8 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 			return avm.CommitCanonicalBlock(db, b, raw, p)
 		},
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	utxos := core.NewUTXOSet()
+	e.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 	return e, db, parent, priv
 }
 

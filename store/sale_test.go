@@ -106,11 +106,21 @@ func TestSaleDurableBatchRestartRollbackAndIndependentStores(t *testing.T) {
 	paths := []string{t.TempDir() + "/node-a", t.TempDir() + "/node-b"}
 	a := seedSaleParent(t, paths[0], records)
 	defer closeStoreTestResource(t, a)
+	if err := a.EnsureRingMemberIndex(); err != nil {
+		t.Fatal(err)
+	}
+	beforeRing, err := a.VerifyRingSamplingIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
 	b := seedSaleParent(t, paths[1], records)
 	defer closeStoreTestResource(t, b)
 	block, r := saleTestBlock(t, a, m, key, address, m.Checkpoint.Height, g.Hash(), "first")
 	commitSaleFixture(t, a, block, m, r)
 	commitSaleFixture(t, b, block, m, r)
+	if inv, err := a.VerifyRingSamplingIndex(); err != nil || inv.Eligible <= beforeRing.Eligible {
+		t.Fatalf("sale commit did not index its output: %+v, %v", inv, err)
+	}
 	// Simulate a database activated before the retention index existed, then
 	// exercise the startup backfill from its canonical delivery fence.
 	if err := a.db.Delete(saleRetainedBlockKey(block.Header.Height), nil); err != nil {
@@ -162,6 +172,9 @@ func TestSaleDurableBatchRestartRollbackAndIndependentStores(t *testing.T) {
 	}
 	if err = a.PutTip(g.Hash(), g.Header.Height); err != nil {
 		t.Fatal(err)
+	}
+	if inv, err := a.VerifyRingSamplingIndex(); err != nil || inv != beforeRing {
+		t.Fatalf("sale rollback left a stale ring member: %+v, %v", inv, err)
 	}
 	if marker, err := a.get(saleRetainedBlockKey(block.Header.Height)); err != nil || marker != nil {
 		t.Fatal("rollback retained an orphan sale-body marker", err)

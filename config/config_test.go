@@ -10,6 +10,51 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+func TestMainnetFinalityVoteBoundaryIsNotAnOperatorOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.yaml")
+	if err := os.WriteFile(path, []byte("network: mainnet\nconsensus:\n  security_hardening_activation_height: 3800000\n  finality_vote_v2_activation_height: 99000000\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MainnetFinalityVoteV2ActivationHeight
+	if cfg.FinalityVoteV2ActivationHeight() != want ||
+		cfg.Consensus.SecurityHardeningActivationHeight != MainnetSecurityHardeningActivationHeight {
+		t.Fatal("local finality setting changed the vote or hardening boundary")
+	}
+}
+
+func TestValidateChainBootstrap(t *testing.T) {
+	t.Run("refuses empty mainnet", func(t *testing.T) {
+		err := ValidateChainBootstrap(Mainnet, false)
+		if err == nil || !strings.Contains(err.Error(), "verified canonical chain bootstrap") {
+			t.Fatalf("expected explicit mainnet bootstrap refusal, got %v", err)
+		}
+	})
+
+	t.Run("allows existing mainnet chain", func(t *testing.T) {
+		if err := ValidateChainBootstrap(Mainnet, true); err != nil {
+			t.Fatalf("existing mainnet chain rejected: %v", err)
+		}
+	})
+
+	t.Run("allows empty development chains", func(t *testing.T) {
+		for _, network := range []Network{Testnet, Devnet} {
+			if err := ValidateChainBootstrap(network, false); err != nil {
+				t.Fatalf("empty %s chain rejected: %v", network, err)
+			}
+		}
+	})
+
+	t.Run("normalizes mainnet spelling", func(t *testing.T) {
+		if err := ValidateChainBootstrap(Network(" Mainnet "), false); err == nil {
+			t.Fatal("mixed-case mainnet with whitespace was accepted")
+		}
+	})
+}
+
 func TestValidate_RewardAuthorizationActivation(t *testing.T) {
 	validRewardAddress := func(t *testing.T, network crypto.NetworkByte) string {
 		t.Helper()
@@ -82,6 +127,27 @@ func TestValidate_RewardAuthorizationActivation(t *testing.T) {
 	})
 }
 
+func TestLPoDValidatorDailyUpgradeRequiresCanonicalMigrationAndValidOrder(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Consensus.LPoDValidatorDailyUpgradeHeight = 100
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "requires a canonical LPoD migration") {
+		t.Fatalf("validator daily payout without migration error = %v", err)
+	}
+
+	cfg.Consensus.LPoDMigrationFile = "fixture-migration.json"
+	cfg.Consensus.LPoDDailyUpgradeHeight = 101
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "must not precede lpod_daily_upgrade_height") {
+		t.Fatalf("validator daily activation before Guardian daily error = %v", err)
+	}
+
+	cfg.Consensus.LPoDDailyUpgradeHeight = 100
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("matching future daily activation heights rejected: %v", err)
+	}
+}
+
 func TestStopProducingAtHeightValidationAndPersistence(t *testing.T) {
 	t.Run("zero disables barrier", func(t *testing.T) {
 		cfg := DefaultConfig()
@@ -125,6 +191,7 @@ func TestStopProducingAtHeightValidationAndPersistence(t *testing.T) {
 func TestMainnetSecurityHardeningHeightRequiresCoordinationForValidators(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Network = Mainnet
+	cfg.Consensus.ValidatorKey = "validator.key"
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "security_hardening_activation_height must be explicitly configured") {
 		t.Fatalf("mainnet config without a hardening height error = %v", err)
@@ -142,9 +209,94 @@ func TestMainnetSecurityHardeningHeightRequiresCoordinationForValidators(t *test
 	// fail closed on other required mainnet settings.
 	cfg.Consensus.OracleMaxDeviation = 0.05
 	cfg.Consensus.NonValidator = true
+	cfg.Consensus.ValidatorKey = ""
 	err = cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "staked_collateral_ring_exclusion_activation_height") {
 		t.Fatalf("mainnet config with an explicit height should proceed to other required checks, got %v", err)
+	}
+}
+
+func TestMainnetValidatorRequiresExplicitSigningKey(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Network = Mainnet
+	cfg.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "requires an explicit consensus.validator_key") {
+		t.Fatalf("mainnet validator without an explicit key was accepted: %v", err)
+	}
+
+	cfg.Consensus.NonValidator = true
+	if err := cfg.Validate(); err == nil ||
+		strings.Contains(err.Error(), "requires an explicit consensus.validator_key") {
+		t.Fatalf("sync-only Mainnet node should not require a signing key: %v", err)
+	}
+}
+
+func TestValidate_MainnetFailsClosedWithoutVerifiedBootstrap(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Network = Mainnet
+	cfg.Consensus.NonValidator = true
+	cfg.DataDir = filepath.Join(t.TempDir(), "must-not-be-created")
+	cfg.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight
+	cfg.Consensus.OracleMaxDeviation = 0.05
+	cfg.Consensus.OracleURL = "https://oracle.example.invalid"
+	cfg.Consensus.RingCTV4ActivationHeight = 100
+	cfg.Consensus.RingCTCLSAGActivationHeight = 101
+	cfg.Consensus.StakedCollateralRingExclusionActivationHeight = 102
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Consensus.RewardAddress = string(crypto.AddressFromKeys(crypto.MainnetByte, keys))
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "no valid signed operator_1_of_1 Mainnet bootstrap manifest") {
+		t.Fatalf("mainnet config without a verified bootstrap error = %v", err)
+	}
+	if _, statErr := os.Stat(cfg.DataDir); !os.IsNotExist(statErr) {
+		t.Fatalf("config validation created mainnet data directory: stat error = %v", statErr)
+	}
+}
+
+func TestRehearsalFinalityV2HeightIsNonSigningOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Network = Mainnet
+	cfg.Consensus.SecurityHardeningActivationHeight = MainnetSecurityHardeningActivationHeight
+	cfg.Consensus.RehearsalFinalityV2Height = MainnetSecurityHardeningActivationHeight + 1
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "only valid for non-signing Mainnet rehearsals") {
+		t.Fatalf("signing configuration was not rejected: %v", err)
+	}
+	cfg.Consensus.NonValidator = true
+	cfg.Consensus.OracleMaxDeviation = 0.05
+	cfg.Consensus.RehearsalFinalityV2Height = MainnetSecurityHardeningActivationHeight - 1
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must be supported and not precede") {
+		t.Fatalf("earlier finality boundary was not rejected: %v", err)
+	}
+	cfg.Consensus.RehearsalFinalityV2Height = MainnetSecurityHardeningActivationHeight + 1
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "staked_collateral_ring_exclusion_activation_height") {
+		t.Fatalf("isolated configuration did not proceed to ordinary checks: %v", err)
+	}
+}
+
+func TestValidate_RejectsNonCanonicalAndUnknownNetworks(t *testing.T) {
+	for _, network := range []Network{" MAINNET ", "production", "test-net"} {
+		t.Run(string(network), func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Network = network
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("unsupported/noncanonical network %q was accepted", network)
+			}
+		})
+	}
+}
+
+func TestValidate_TestnetStillWorks(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default testnet config rejected: %v", err)
 	}
 }
 
@@ -195,10 +347,12 @@ func TestValidate_AVMCheckpointTrustAuthorities(t *testing.T) {
 		wantError   bool
 	}{
 		{name: "valid 2 of 3 quorum", activation: 3, authorities: validKeys, threshold: 2},
+		{name: "valid explicit 1 of 1 policy", activation: 3, authorities: validKeys[:1], threshold: 1},
 		{name: "checkpoint file requires trust root", activation: 3, file: "avm-checkpoint.json", wantError: true},
 		{name: "trust root requires AVM activation", authorities: validKeys, threshold: 2, wantError: true},
 		{name: "rejects thresholdless v1 trust", activation: 3, authorities: validKeys, wantError: true},
-		{name: "rejects one signer", activation: 3, authorities: validKeys[:1], threshold: 1, wantError: true},
+		{name: "rejects 1 of many", activation: 3, authorities: validKeys, threshold: 1, wantError: true},
+		{name: "rejects zero threshold", activation: 3, authorities: validKeys[:1], threshold: 0, wantError: true},
 		{name: "rejects threshold above authority count", activation: 3, authorities: validKeys, threshold: 4, wantError: true},
 		{name: "threshold requires authority keys", activation: 3, threshold: 2, wantError: true},
 		{name: "rejects malformed key", activation: 3, authorities: []string{"abcd"}, threshold: 2, wantError: true},

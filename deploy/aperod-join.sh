@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Aperod — One-Command Node Join
-#  Запустите НА НОВОМ СЕРВЕРЕ (не на основном).
+#  Aperod — managed replica recovery (operator only).
+#  Не используйте для подключения нового валидатора к mainnet:
+#  / Do not use for public mainnet onboarding: see deploy/MAINNET.md.
+#  Run on the recovery destination, not on the source server.
 #
 #  Использование:
-#    sudo bash aperod-join.sh <PRIMARY_IP>:<API_PORT> [OPTIONS]
+#    sudo bash aperod-join.sh <SOURCE_HOST>:<API_PORT> [OPTIONS]
 #
 #  Примеры:
 #    # Remote sync requires an SSH tunnel with a pinned host key:
-#    sudo bash aperod-join.sh 89.169.53.128:8545 --tunnel operator@89.169.53.128
+#    sudo bash aperod-join.sh source.example:8545 --tunnel operator@source.example
 #
 #    # Нестандартная директория данных:
-#    sudo bash aperod-join.sh 89.169.53.128:8545 --data-dir /opt/aperod/data/testnet
+#    sudo bash aperod-join.sh source.example:8545 \
+#      --tunnel operator@source.example --data-dir /srv/aperod-replica
 #
 #  Опции:
 #    --api-key    <key>      X-API-Key (предпочтительно задать через APEROD_API_KEY)
@@ -28,15 +31,14 @@
 #    allowed for local test fixtures only. Never accept a first-use host key.
 #
 #  Что делает скрипт:
-#    1. Останавливает aperod-node на ТЕКУЩЕМ сервере
-#    2. При --tunnel: поднимает SSH-туннель к основному узлу
-#    3. Скачивает chain.db через HTTP с основного узла
-#    4. Скачивает snapshot (UTXO-состояние) через HTTP с основного узла
-#    5. Распаковывает файлы в data_dir с проверкой имён файлов
-#    6. Удаляет p2p_identity.key (нода генерирует новый при старте)
-#    7. Прописывает PRIMARY_IP как bootnode в /etc/aperod/node.yaml
-#    8. Применяет drop-in конфиги systemd (timeout, GOMEMLIMIT)
-#    9. Запускает aperod-node и ждёт готовности API
+#    1. Проверяет, что локальная нода остановлена и chain.db ещё не существует
+#    2. При --tunnel: поднимает SSH-туннель с заранее закреплённым host key
+#    3. Загружает chain.db и snapshot только во временную staging-директорию
+#    4. Проверяет tar-пути, полную высоту chain.db и точное совпадение snapshot
+#       с tip chain.db; до этого этапа существующие данные не изменяются
+#    5. Переносит проверенную пару в data_dir и создаёт новый P2P identity
+#    6. Прописывает PRIMARY_IP как bootnode в /etc/aperod/node.yaml
+#    7. Применяет drop-in конфиги systemd и при необходимости запускает ноду
 # ============================================================
 set -euo pipefail
 
@@ -60,6 +62,7 @@ TUNNEL_LOCAL_PORT=19545          # ephemeral local port for SSH tunnel
 HEALTH_MAX_ATTEMPTS=60           # 5 мин при 5-секундном интервале
 HEALTH_WAIT_SECS=5
 TUNNEL_PID=""
+JOIN_STAGE=""
 # NODE_YAML / NODE_CONFIG_SH: overridable via env vars so that tests can
 # redirect paths to temp files without root access or a real install.
 NODE_YAML="${APEROD_NODE_YAML:-/etc/aperod/node.yaml}"
@@ -103,16 +106,10 @@ fi
 # Fail before stopping a service or replacing any existing chain data.
 [[ -f "${NODE_YAML}" ]] || die "${NODE_YAML} не найден. Сначала установите ноду через install-node.sh; без node.yaml нельзя настроить peer_whitelist."
 
-# ── Ранняя проверка: --no-chaindb несовместим с safe-mode guard ───────────────
-# install-node.sh sets consensus.non_validator: true when no --primary-ip is
-# given to prevent the node from mining an incompatible genesis block.
-# cmd/node/main.go aborts startup immediately with
-#   "non_validator mode requires an existing chain"
-# when there is no chain.db — peer-sync cannot help: the node never reaches P2P
-# code.  If we continued with --no-chaindb we would stop the service, DELETE the
-# existing chain.db, configure the bootnode, and then leave the operator with a
-# node that cannot start (guard still set) or one that creates its own
-# incompatible genesis (guard removed).  Fail before touching anything.
+# ── Ранняя проверка: --no-chaindb требует существующую цепь ────────────────────
+# install-node.sh keeps consensus.non_validator: true until canonical mainnet
+# identity and validator activation are independently verified. Never remove
+# that guard here: a matching local snapshot proves consistency, not mainnet.
 if [[ "${NO_CHAINDB}" == "true" && -f "${NODE_YAML}" ]]; then
   NV_FLAG=$(python3 - "${NODE_YAML}" <<'PY' 2>/dev/null || echo "false"
 import sys, yaml
@@ -121,22 +118,24 @@ with open(sys.argv[1]) as f:
 print(str((cfg.get('consensus') or {}).get('non_validator', False)).lower())
 PY
 )
-  if [[ "${NV_FLAG}" == "true" ]]; then
+  if [[ "${NV_FLAG}" == "true" && ! -d "${DATA_DIR}/chain.db" ]]; then
     echo
     echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗"
-    echo -e "║  ✗  --no-chaindb несовместим с ограничением non_validator         ║"
+    echo -e "║  ✗  --no-chaindb требует существующую chain.db                   ║"
+    echo -e "║     --no-chaindb requires an existing chain.db                    ║"
     echo -e "╠══════════════════════════════════════════════════════════════════╣"
-    echo -e "║  Этот сервер установлен без --primary-ip и имеет                 ║"
+    echo -e "║  Новый узел установлен в безопасном режиме и имеет               ║"
+    echo -e "║  The new node is in safe mode with                                ║"
     echo -e "║  consensus.non_validator: true в node.yaml.                      ║"
-    echo -e "║  Нода не запустится без корректного chain.db:                    ║"
-    echo -e "║    «non_validator mode requires an existing chain»               ║"
+    echo -e "║  consensus.non_validator: true in node.yaml.                     ║"
+    echo -e "║  Без существующей цепи нельзя создавать собственный genesis.     ║"
+    echo -e "║  Without an existing chain, do not create a separate genesis.    ║"
     echo -e "║                                                                  ║"
-    echo -e "║  Решение: запустите без --no-chaindb, чтобы скачать chain.db:   ║"
-    echo -e "║                                                                  ║"
-    echo -e "║    sudo bash aperod-join.sh ${PRIMARY}$(printf '%*s' $((42 - ${#PRIMARY})) '')║"
+    echo -e "║  Дождитесь проверенного bootstrap mainnet-релиза.                ║"
+    echo -e "║  Wait for a verified mainnet bootstrap release.                  ║"
     echo -e "╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo
-    die "--no-chaindb нельзя использовать пока consensus.non_validator: true. Загрузите chain.db (запустите без --no-chaindb)."
+    die "--no-chaindb требует существующую chain.db; этот скрипт не выбирает mainnet genesis."
   fi
 fi
 
@@ -178,6 +177,10 @@ cleanup() {
   if [[ -n "${TUNNEL_PID}" ]]; then
     kill "${TUNNEL_PID}" 2>/dev/null || true
     info "SSH-туннель закрыт (PID ${TUNNEL_PID})"
+  fi
+  if [[ -n "${JOIN_STAGE}" && -d "${JOIN_STAGE}" ]]; then
+    rm -rf -- "${JOIN_STAGE}"
+    info "Временная staging-директория удалена"
   fi
 }
 trap cleanup EXIT
@@ -223,42 +226,83 @@ fi
 ok "Основной узел доступен"
 echo
 
-# ── Шаг 2: Останавливаем ноду на ТЕКУЩЕМ сервере ─────────
-info "Шаг 2/7: Останавливаем aperod-node на текущем сервере…"
+# ── Шаг 2: Не трогаем запущенную ноду и существующую цепь ─
+info "Шаг 2/7: Проверяем, что локальная нода и её данные не будут перезаписаны…"
 if systemctl is-active --quiet aperod-node 2>/dev/null; then
-  systemctl disable --now aperod-node
-  ok "aperod-node остановлен и отключён"
+  die "aperod-node сейчас запущен. Присоединение остановлено без изменения службы или данных; сначала проверьте этот сервер."
 else
-  warn "aperod-node не запущен — продолжаем"
+  ok "aperod-node не запущен"
+fi
+
+if [[ "${NO_CHAINDB}" == "false" ]]; then
+  [[ ! -e "${DATA_DIR}/chain.db" ]] || die \
+    "В ${DATA_DIR} уже есть chain.db. Скрипт отказывается заменять существующую цепь."
+  if compgen -G "${DATA_DIR}/snapshot-v2-*.json.gz" >/dev/null; then
+    die "В ${DATA_DIR} уже есть startup snapshot. Скрипт отказывается менять существующие данные."
+  fi
 fi
 echo
 
 # ── Шаг 3: Подготовка директории данных ──────────────────
 info "Шаг 3/7: Подготавливаем директорию данных…"
-if [[ -d "${DATA_DIR}" ]]; then
-  warn "Очищаем старые данные: chain.db и snapshot файлы…"
-  rm -rf "${DATA_DIR}/chain.db" "${DATA_DIR}"/snapshot-v2-*.json.gz
-fi
 mkdir -p "${DATA_DIR}"
 ok "Директория данных готова: ${DATA_DIR}"
+if [[ "${NO_CHAINDB}" == "false" ]]; then
+  JOIN_STAGE=$(mktemp -d "${DATA_DIR}/.join-staging.XXXXXX")
+  chmod 0700 "${JOIN_STAGE}"
+  ok "Создана закрытая staging-директория"
+else
+  warn "--no-chaindb: существующие chain.db и snapshot не удаляются и не заменяются"
+fi
 echo
 
 # ── Шаг 4: Скачиваем chain.db ─────────────────────────────
 if [[ "${NO_CHAINDB}" == "false" ]]; then
   info "Шаг 4/7: Скачиваем chain.db (~1-2 ГБ, может занять несколько минут)…"
-  CHAINDB_TMP="${DATA_DIR}/.chaindb-download.tar.gz.tmp"
-  rm -f "${CHAINDB_TMP}"
+  CHAINDB_TMP="${JOIN_STAGE}/chaindb.tar.gz"
 
   if api_curl "${BASE_URL}/api/v1/chaindb/export" \
       --progress-bar \
       --max-time 1800 \
       -o "${CHAINDB_TMP}"; then
-    info "  Распаковываем chain.db…"
-    # --no-same-permissions / --no-same-owner: don't trust archive metadata for permissions.
-    # This prevents a tampered archive from installing suid files or changing ownership.
-    tar --no-same-permissions --no-same-owner -xzf "${CHAINDB_TMP}" -C "${DATA_DIR}"
+    gzip -t "${CHAINDB_TMP}" || die "Архив chain.db повреждён (gzip integrity check failed)."
+    CHAINDB_UNPACKED_BYTES=$(python3 - "${CHAINDB_TMP}" <<'PY'
+import sys, tarfile
+from pathlib import PurePosixPath
+
+total = 0
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    members = archive.getmembers()
+    if not members:
+        raise SystemExit("empty chain.db archive")
+    for member in members:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "chain.db":
+            raise SystemExit("unsafe archive path: " + member.name)
+        if not (member.isdir() or member.isfile()):
+            raise SystemExit("unsupported archive member type: " + member.name)
+        total += member.size
+        if total > (1 << 63) - 1:
+            raise SystemExit("archive size overflows local disk accounting")
+print(total)
+PY
+    ) || die "Архив chain.db содержит недопустимые пути или типы файлов."
+    FREE_BYTES=$(df -PB1 "${DATA_DIR}" | awk 'NR == 2 {print $4}')
+    [[ "${FREE_BYTES}" =~ ^[0-9]+$ ]] || die "Не удалось проверить свободное место для распаковки."
+    REQUIRED_BYTES=$((CHAINDB_UNPACKED_BYTES + 5368709120))
+    (( FREE_BYTES > REQUIRED_BYTES )) || die \
+      "Недостаточно места для chain.db и резерва 5 ГиБ: свободно ${FREE_BYTES}, требуется больше ${REQUIRED_BYTES} байт."
+
+    info "  Распаковываем проверенный архив в staging…"
+    tar --no-same-permissions --no-same-owner -xzf "${CHAINDB_TMP}" -C "${JOIN_STAGE}"
+    [[ -d "${JOIN_STAGE}/chain.db" ]] || die "В архиве нет каталога chain.db."
     rm -f "${CHAINDB_TMP}"
-    ok "chain.db загружен и распакован"
+
+    NODE_BIN="${APEROD_NODE_BIN:-/usr/local/bin/aperod-node}"
+    [[ -x "${NODE_BIN}" ]] || die "Проверяющий бинарный файл не найден: ${NODE_BIN}"
+    info "  Проверяем непрерывность всех сохранённых высот…"
+    "${NODE_BIN}" --check-store --data-dir="${JOIN_STAGE}" --max-missing=0
+    ok "chain.db прошёл проверку высот и tip"
   else
     rm -f "${CHAINDB_TMP}"
     die "Не удалось скачать chain.db с основного узла.
@@ -269,57 +313,72 @@ if [[ "${NO_CHAINDB}" == "false" ]]; then
   fi
 else
   warn "Шаг 4/7: Загрузка chain.db пропущена (--no-chaindb)"
-  warn "  Нода синхронизируется от peers — это займёт несколько часов"
+  warn "  Текущие chain.db и snapshot остаются без изменений"
 fi
 echo
 
 # ── Шаг 5: Скачиваем snapshot ─────────────────────────────
-info "Шаг 5/7: Скачиваем UTXO-snapshot с основного узла…"
-SNAP_HEADER_FILE="${DATA_DIR}/.snap-headers.tmp"
-SNAP_TMP="${DATA_DIR}/.snapshot-download.tmp"
-rm -f "${SNAP_HEADER_FILE}" "${SNAP_TMP}"
+if [[ "${NO_CHAINDB}" == "false" ]]; then
+  info "Шаг 5/7: Скачиваем snapshot и проверяем точное совпадение с chain.db…"
+  SNAP_HEADER_FILE="${JOIN_STAGE}/.snap-headers.tmp"
+  SNAP_TMP="${JOIN_STAGE}/.snapshot-download.tmp"
 
-if api_curl "${BASE_URL}/api/v1/snapshot/export" \
-    --progress-bar \
-    --max-time 300 \
-    -D "${SNAP_HEADER_FILE}" \
-    -o "${SNAP_TMP}"; then
+  if api_curl "${BASE_URL}/api/v1/snapshot/export" \
+      --progress-bar \
+      --max-time 300 \
+      --max-filesize 1073741824 \
+      -D "${SNAP_HEADER_FILE}" \
+      -o "${SNAP_TMP}"; then
+    RAW_FILENAME=$(grep -i "X-Snapshot-Filename:" "${SNAP_HEADER_FILE}" 2>/dev/null \
+      | tr -d '\r' | awk '{print $2}' | tr -d ' ')
+    if [[ "${RAW_FILENAME}" =~ ^snapshot-v2-[0-9]+\.json\.gz$ ]]; then
+      SNAP_FILENAME="${RAW_FILENAME}"
+    else
+      die "Основной узел вернул некорректное имя snapshot; данные не установлены."
+    fi
+    gzip -t "${SNAP_TMP}" || die "Startup snapshot повреждён."
+    mv "${SNAP_TMP}" "${JOIN_STAGE}/${SNAP_FILENAME}"
+    rm -f "${SNAP_HEADER_FILE}"
 
-  # Read server-supplied filename from response headers.
-  RAW_FILENAME=$(grep -i "X-Snapshot-Filename:" "${SNAP_HEADER_FILE}" 2>/dev/null \
-    | tr -d '\r' | awk '{print $2}' | tr -d ' ')
-  rm -f "${SNAP_HEADER_FILE}"
-
-  # ── Path traversal guard ─────────────────────────────────────
-  # Accept only filenames that match the exact canonical pattern.
-  # Any other value (including paths with / or ..) is rejected.
-  if [[ "${RAW_FILENAME}" =~ ^snapshot-v2-[0-9]+\.json\.gz$ ]]; then
-    SNAP_FILENAME="${RAW_FILENAME}"
+    NODE_BIN="${APEROD_NODE_BIN:-/usr/local/bin/aperod-node}"
+    info "  Проверяем checksum, содержимое и точное совпадение snapshot с tip…"
+    "${NODE_BIN}" --check-snapshot --data-dir="${JOIN_STAGE}"
+    SNAP_HEIGHT=$(echo "${SNAP_FILENAME}" | grep -oP '(?<=snapshot-v2-)\d+')
+    ok "Snapshot совпадает с chain.db: height=${SNAP_HEIGHT}"
   else
-    warn "Unexpected X-Snapshot-Filename: '${RAW_FILENAME}' — using safe default"
-    SNAP_FILENAME="snapshot-v2-import.json.gz"
+    rm -f "${SNAP_TMP}" "${SNAP_HEADER_FILE}"
+    die "Не удалось загрузить обязательный snapshot. Staging удалится; существующие данные не затронуты."
   fi
-
-  mv "${SNAP_TMP}" "${DATA_DIR}/${SNAP_FILENAME}"
-  SNAP_HEIGHT=$(echo "${SNAP_FILENAME}" | grep -oP '(?<=snapshot-v2-)\d+' || echo "unknown")
-  ok "Snapshot загружен: ${SNAP_FILENAME} (height=${SNAP_HEIGHT})"
 else
-  rm -f "${SNAP_TMP}" "${SNAP_HEADER_FILE}"
-  warn "Snapshot недоступен — нода запустится без fast-path (чуть медленнее)"
-  warn "Это нормально если snapshot ещё не создан на основном узле"
+  warn "Шаг 5/7: Snapshot не скачивается без chain.db, чтобы не смешать разные состояния"
 fi
 echo
 
-# ── Шаг 6: Права и p2p identity ──────────────────────────
-info "Шаг 6/8: Устанавливаем права и очищаем p2p identity…"
+# ── Шаг 6: Публикуем только предварительно проверенную пару ─
+if [[ "${NO_CHAINDB}" == "false" ]]; then
+  info "Шаг 6/7: Устанавливаем проверенную пару chain.db + snapshot…"
+  SNAP_FILENAME=$(find "${JOIN_STAGE}" -maxdepth 1 -type f -name 'snapshot-v2-*.json.gz' -printf '%f\n' -quit)
+  [[ -n "${SNAP_FILENAME}" ]] || die "Проверенный snapshot исчез из staging."
+  mv -nT "${JOIN_STAGE}/${SNAP_FILENAME}" "${DATA_DIR}/${SNAP_FILENAME}"
+  [[ ! -e "${JOIN_STAGE}/${SNAP_FILENAME}" ]] || die \
+    "Snapshot не установлен: целевой файл уже существует. Существующие данные сохранены."
+  mv -nT "${JOIN_STAGE}/chain.db" "${DATA_DIR}/chain.db"
+  if [[ -e "${JOIN_STAGE}/chain.db" ]]; then
+    rm -f "${DATA_DIR}/${SNAP_FILENAME}"
+    die "Не удалось установить chain.db; snapshot откатан, staging будет удалён."
+  fi
 
-# Удаляем p2p_identity.key — нода сгенерирует новый уникальный ключ при старте.
-# Если скопировать ключ с основного узла, оба сервера видят друг друга как
-# self-connection и peer_count остаётся 0 навсегда.
-rm -f "${DATA_DIR}/p2p_identity.key"
+  # The joining node must create its own P2P identity, never copy the source's.
+  rm -f "${DATA_DIR}/p2p_identity.key"
+  ok "Проверенная пара установлена; исходные данные не перезаписывались"
+else
+  info "Шаг 6/7: Существующие chain.db, snapshot и P2P identity сохранены"
+fi
 
 if id "${DATA_USER}" &>/dev/null; then
-  chown -R "${DATA_USER}:${DATA_USER}" "${DATA_DIR}"
+  if [[ "${NO_CHAINDB}" == "false" ]]; then
+    chown -R "${DATA_USER}:${DATA_USER}" "${DATA_DIR}/chain.db" "${DATA_DIR}/${SNAP_FILENAME}"
+  fi
   ok "Права установлены: ${DATA_USER}:${DATA_USER}"
 else
   warn "Пользователь '${DATA_USER}' не существует — права не изменены"
@@ -437,42 +496,10 @@ else:
 PY
   ok "IP основного узла ${PRIMARY_HOST} добавлен в peer_whitelist"
 
-  # ── Remove non_validator safe-mode guard set by install-node.sh ─────────────
-  # install-node.sh writes consensus.non_validator: true when no --primary-ip is
-  # given so the node cannot produce blocks (and cannot mine an incompatible
-  # genesis) if the operator ignores the bootnode warning and manually starts the
-  # service.  Now that we have the correct chain.db and a bootnode configured,
-  # the operator's consensus settings should take effect — remove the override.
-  #
-  # The --no-chaindb + consensus.non_validator: true combination is rejected
-  # above (early argument check before any destructive step) because the node
-  # aborts on startup without chain.db when non_validator is true.  At this
-  # point we are guaranteed to have either a downloaded chain.db or no guard to
-  # remove.
-  info "Снимаем ограничение consensus.non_validator (chain.db на месте, режим реле больше не нужен)…"
-  if [[ -x "${NODE_CONFIG_SH}" ]]; then
-    APEROD_CONFIG="${NODE_YAML}" bash "${NODE_CONFIG_SH}" unset-field consensus.non_validator \
-      || warn "Не удалось снять consensus.non_validator — проверьте ${NODE_YAML} вручную"
-  else
-    # Fallback: inline Python — mirrors node-config.sh unset-field with dotted path.
-    # Only removes consensus.non_validator; leaves the rest of the consensus block intact.
-    python3 - "${NODE_YAML}" <<'PY'
-import sys, yaml, os
-cfg_path = sys.argv[1]
-with open(cfg_path) as f:
-    cfg = yaml.safe_load(f) or {}
-consensus = cfg.get('consensus')
-if isinstance(consensus, dict) and 'non_validator' in consensus:
-    del consensus['non_validator']
-    tmp = cfg_path + '.tmp'
-    with open(tmp, 'w') as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-    os.replace(tmp, cfg_path)
-    print('[OK]   consensus.non_validator removed from', cfg_path)
-else:
-    print('[OK]   consensus.non_validator was not set — nothing to do')
-PY
-  fi
+  # A verified archive and matching local snapshot establish consistency, not
+  # canonical chain identity or validator eligibility. Keep the safe-mode guard.
+  info "consensus.non_validator оставлен без изменений до подтверждения genesis и допуска валидатора"
+  info "consensus.non_validator stays enabled until genesis and validator eligibility are verified"
 fi
 echo
 
@@ -576,10 +603,13 @@ fi
 # ── Итог ──────────────────────────────────────────────────
 echo
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════╗"
-echo -e "  ✓  Нода успешно подключена к сети Aperod"
+echo -e "  ✓  Локальная проверка и настройка подключения завершены"
+echo -e "     Local checks and connection configuration are complete"
 if [[ "${SKIP_START}" == "false" ]]; then
   echo -e "     Height: ${HEIGHT}  |  Peers: ${PEERS}"
 fi
+echo -e "     Genesis mainnet и регистрация валидатора этим скриптом не подтверждаются."
+echo -e "     This script does not verify the mainnet genesis or validator registration."
 echo -e "╚══════════════════════════════════════════════════════════════════╝${NC}"
 echo
 

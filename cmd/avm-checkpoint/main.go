@@ -1,5 +1,5 @@
-// Command avm-checkpoint builds, independently signs, or assembles a v2 AVM
-// quorum checkpoint using canonical database copies and witness keys.
+// Command avm-checkpoint builds, signs, or assembles a v2 AVM checkpoint using
+// canonical database copies and explicitly selected witness policies.
 package main
 
 import (
@@ -35,14 +35,14 @@ func (s *stringListFlag) Set(value string) error {
 }
 
 func main() {
-	mode := flag.String("mode", "build", "build, sign, or assemble")
+	mode := flag.String("mode", "build", "build, build-state, sign, sign-state, or assemble")
 	dbPath := flag.String("db", "", "path to a canonical chain.db copy")
 	activationHeight := flag.Uint64("activation-height", 0, "configured AVM activation height")
 	securityHardeningHeight := flag.Uint64("security-hardening-height", 0, "configured consensus security-hardening activation height (required for build/sign; use 0 before activation)")
 	candidatePath := flag.String("candidate", "", "unsigned v2 checkpoint draft")
 	keyPath := flag.String("key", "", "0600 witness private-key file (sign mode only)")
 	outputPath := flag.String("out", "", "output draft, partial signature, or final checkpoint")
-	threshold := flag.Int("threshold", 0, "required m-of-n witness signature count (assemble mode)")
+	threshold := flag.Int("threshold", 0, "required witness signatures (assemble mode; 1 only with one authority)")
 	var authorityKeys stringListFlag
 	var signatureFiles stringListFlag
 	flag.Var(&authorityKeys, "authority", "trusted witness public key in hex (repeat for each key)")
@@ -63,6 +63,12 @@ func main() {
 			os.Exit(2)
 		}
 		err = runBuild(*dbPath, *activationHeight, *securityHardeningHeight, *outputPath)
+	case "build-state":
+		if *dbPath == "" || *activationHeight == 0 || *outputPath == "" {
+			flag.Usage()
+			os.Exit(2)
+		}
+		err = runBuildState(*dbPath, *activationHeight, *outputPath)
 	case "sign":
 		if *dbPath == "" || *activationHeight == 0 || *candidatePath == "" ||
 			*keyPath == "" || *outputPath == "" || !securityHardeningHeightProvided {
@@ -73,8 +79,19 @@ func main() {
 			*dbPath, *activationHeight, *securityHardeningHeight,
 			*candidatePath, *keyPath, *outputPath,
 		)
+	case "sign-state":
+		if *dbPath == "" || *activationHeight == 0 || *candidatePath == "" ||
+			*keyPath == "" || *outputPath == "" || len(authorityKeys) != 1 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		err = runSignState(
+			*dbPath, *activationHeight, *candidatePath, *keyPath,
+			authorityKeys, *outputPath,
+		)
 	case "assemble":
-		if *candidatePath == "" || *outputPath == "" || *threshold < 2 ||
+		if *candidatePath == "" || *outputPath == "" || *threshold < 1 ||
+			(*threshold == 1 && len(authorityKeys) != 1) ||
 			len(authorityKeys) < *threshold || len(signatureFiles) < *threshold {
 			flag.Usage()
 			os.Exit(2)
@@ -88,6 +105,43 @@ func main() {
 		fmt.Fprintln(os.Stderr, "avm-checkpoint:", err)
 		os.Exit(1)
 	}
+}
+
+// runBuildState makes an unsigned draft from the current persisted AVM state.
+// It binds the state to the current canonical tip and its AVM write marker; it
+// does not replay block history. Use only for the explicitly trusted
+// single-operator attestation path after the operator has accepted the source
+// database state.
+func runBuildState(dbPath string, activationHeight uint64, outputPath string) (retErr error) {
+	db, err := store.OpenReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("open chain database read-only: %w", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close checkpoint source database: %w", err))
+		}
+	}()
+	tipHash, tipHeight, err := db.GetTip()
+	if err != nil {
+		return fmt.Errorf("read canonical tip: %w", err)
+	}
+	draft, err := avm.CreateQuorumCheckpointDraftFromCanonicalState(
+		db, activationHeight, tipHeight, tipHash,
+	)
+	if err != nil {
+		return err
+	}
+	if err := avm.WriteCheckpointFile(outputPath, draft); err != nil {
+		return fmt.Errorf("write unsigned state checkpoint draft: %w", err)
+	}
+	fmt.Printf(
+		"unsigned 1-of-1 AVM state draft written: height=%d block_hash=%x state_commitment=%x\n",
+		draft.Height,
+		draft.BlockHash,
+		draft.StateCommitment,
+	)
+	return nil
 }
 
 func runBuild(dbPath string, activationHeight, securityHardeningHeight uint64, outputPath string) (retErr error) {
@@ -173,6 +227,76 @@ func runSign(dbPath string, activationHeight, securityHardeningHeight uint64, ca
 	}
 	fmt.Printf(
 		"independent witness signature written: height=%d witness_public_key=%s\n",
+		draft.Height,
+		signature.WitnessPublicKey.Hex(),
+	)
+	return nil
+}
+
+// runSignState signs a state-only draft only when the key is the sole pinned
+// authority and its own read-only database copy contains the identical AVM
+// state at the exact canonical tip. This is an operator attestation, not a
+// replay or independent-history proof.
+func runSignState(
+	dbPath string,
+	activationHeight uint64,
+	candidatePath string,
+	keyPath string,
+	authorityHex []string,
+	outputPath string,
+) (retErr error) {
+	authorities, err := avm.ParseCheckpointAuthorities(authorityHex)
+	if err != nil {
+		return err
+	}
+	if len(authorities) != 1 {
+		return fmt.Errorf("state signing requires exactly one pinned operator authority")
+	}
+	draft, found, err := avm.ReadCheckpointFile(candidatePath)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("checkpoint draft does not exist")
+	}
+	if err := avm.ValidateQuorumCheckpointDraft(draft, activationHeight); err != nil {
+		return err
+	}
+	db, err := store.OpenReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("open operator database copy read-only: %w", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close operator database copy: %w", err))
+		}
+	}()
+	localDraft, err := avm.CreateQuorumCheckpointDraftFromCanonicalState(
+		db, activationHeight, draft.Height, draft.BlockHash,
+	)
+	if err != nil {
+		return fmt.Errorf("verify current canonical AVM state: %w", err)
+	}
+	if !avm.CheckpointPayloadEqual(draft, localDraft) {
+		return fmt.Errorf("candidate differs from this operator's canonical AVM state")
+	}
+	privateKey, err := readWitnessKey(keyPath)
+	if err != nil {
+		return err
+	}
+	defer crypto.ZeroBytes(privateKey.Bytes())
+	if !privateKey.Public().Equals(authorities[0]) {
+		return fmt.Errorf("operator key does not match the sole pinned authority")
+	}
+	signature, err := avm.SignCheckpointDraft(draft, activationHeight, privateKey)
+	if err != nil {
+		return err
+	}
+	if err := writeWitnessSignature(outputPath, signature); err != nil {
+		return fmt.Errorf("write operator signature: %w", err)
+	}
+	fmt.Printf(
+		"single-operator AVM state attestation written: height=%d operator_public_key=%s\n",
 		draft.Height,
 		signature.WitnessPublicKey.Hex(),
 	)

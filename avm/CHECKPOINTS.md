@@ -13,9 +13,15 @@ configured number of distinct, valid signatures from explicitly pinned
 authorities. Every supplied signature is checked; an invalid extra signature
 also rejects the checkpoint. The node does not need witness private keys.
 
+An explicit single-operator policy is supported only as exactly 1-of-1:
+configure one pinned authority and threshold `1`. This lets that one authority
+attest the AVM state without independent corroboration. Threshold `1` with
+multiple configured authorities is rejected; multi-authority configurations
+must require at least two signatures.
+
 Legacy v1 checkpoints have a single operator-attested signature. They are not
-quorum certificates and are rejected when the node is configured for quorum
-mode. Do not describe v1 as independent consensus evidence.
+v2 checkpoint certificates and are rejected when the node is configured for
+the v2 witness policy. Do not describe v1 as independent consensus evidence.
 
 Startup binds the signatures to activation height, genesis, canonical block
 hash, state commitment, and AVM write-set commitment. It then checks the
@@ -41,7 +47,8 @@ cd blockchain
 go run ./cmd/avm-checkpoint \
   -mode build \
   -db /path/to/stopped-copy/chain.db \
-  -activation-height 123456 \
+  -activation-height "$AVM_ACTIVATION_HEIGHT" \
+  -security-hardening-height "$SECURITY_HARDENING_ACTIVATION_HEIGHT" \
   -out /shared/avm-checkpoint-draft.json
 ```
 
@@ -52,7 +59,8 @@ Each witness independently verifies and signs it. Use a key file with mode
 go run ./cmd/avm-checkpoint \
   -mode sign \
   -db /path/to/this-witness/chain.db \
-  -activation-height 123456 \
+  -activation-height "$AVM_ACTIVATION_HEIGHT" \
+  -security-hardening-height "$SECURITY_HARDENING_ACTIVATION_HEIGHT" \
   -candidate /shared/avm-checkpoint-draft.json \
   -key /path/to/this-witness/witness.key \
   -out /shared/witness-1-signature.json
@@ -75,6 +83,41 @@ go run ./cmd/avm-checkpoint \
   -out /path/to/avm-state.checkpoint.json
 ```
 
+For the explicit 1-of-1 operator policy, a draft can instead be built from the
+already-persisted AVM state in a stopped, canonical database copy. This does not
+replay block history; the operator is attesting to that state and must verify
+the source database and exact tip before signing:
+
+```sh
+go run ./cmd/avm-checkpoint \
+  -mode build-state \
+  -db /path/to/stopped-copy/chain.db \
+  -activation-height "$AVM_ACTIVATION_HEIGHT" \
+  -out /shared/avm-checkpoint-draft.json
+
+go run ./cmd/avm-checkpoint \
+  -mode sign-state \
+  -db /path/to/operator/canonical-copy/chain.db \
+  -activation-height "$AVM_ACTIVATION_HEIGHT" \
+  -candidate /shared/avm-checkpoint-draft.json \
+  -key /path/to/operator/witness.key \
+  -authority "$OPERATOR_PUBLIC_KEY_HEX" \
+  -out /shared/operator-signature.json
+
+go run ./cmd/avm-checkpoint \
+  -mode assemble \
+  -candidate /shared/avm-checkpoint-draft.json \
+  -signature /shared/operator-signature.json \
+  -authority "$OPERATOR_PUBLIC_KEY_HEX" \
+  -threshold 1 \
+  -out /path/to/avm-state.checkpoint.json
+```
+
+The signing key must match the sole pinned public key. The signer compares the
+draft with its read-only database copy at the exact canonical tip; it does not
+prove the earlier chain history independently. Never copy a private key to the
+new validator or a shared assembly host.
+
 Configure the same authority list and threshold on the node:
 
 ```yaml
@@ -85,6 +128,17 @@ consensus:
     - "<witness-2-public-key-hex>"
     - "<witness-3-public-key-hex>"
   avm_checkpoint_witness_threshold: 2
+```
+
+For a deliberately selected single-operator trust model, assemble one signature
+against one pinned key and use:
+
+```yaml
+consensus:
+  avm_checkpoint_file: avm-state.checkpoint.json
+  avm_checkpoint_trust_authorities:
+    - "<operator-public-key-hex>"
+  avm_checkpoint_witness_threshold: 1
 ```
 
 Relative checkpoint paths resolve under `data_dir`. Key rotation must use an

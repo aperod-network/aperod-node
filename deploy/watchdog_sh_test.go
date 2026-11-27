@@ -49,6 +49,18 @@ func TestWatchdogScenarioStateIsolation(t *testing.T) {
 	}
 }
 
+func TestInstallersPreventRestartForPermanentMainnetRefusal(t *testing.T) {
+	for _, path := range []string{"install-validator.sh", "install-node.sh"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(raw), "RestartPreventExitStatus=78") {
+			t.Errorf("%s does not prevent systemd restarts on EX_CONFIG=78", path)
+		}
+	}
+}
+
 // TestWatchdogSh runs test-watchdog.sh as a subprocess and fails if the
 // script exits with a non-zero status.
 //

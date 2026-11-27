@@ -285,6 +285,123 @@ func TestREST_StakeBroadcast_ValidPayload(t *testing.T) {
 	}
 }
 
+func TestREST_StatusReportsLocalStakeV4Schedule(t *testing.T) {
+	fixture := buildStakeServerFull(t)
+	registry := core.NewValidatorRegistry()
+	fixture.srv.SetRegistry(registry)
+	check := func(want uint64) {
+		t.Helper()
+		resp := httptest.NewRecorder()
+		fixture.srv.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+		var status struct {
+			Activation *uint64 `json:"stake_key_image_v4_activation_height"`
+		}
+		if err := json.Unmarshal(resp.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Code != http.StatusOK || status.Activation == nil || *status.Activation != want {
+			t.Fatalf("local schedule: status %d, response %s, want activation %d", resp.Code, resp.Body.String(), want)
+		}
+	}
+	check(0)
+	if err := registry.ConfigureStakeKeyImageV4(42); err != nil {
+		t.Fatal(err)
+	}
+	check(42)
+}
+
+func TestREST_StakeBroadcast_V4WalletCollateral(t *testing.T) {
+	owner, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := crypto.CreateStealthOutput(owner.Spend.Public, owner.View.Public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset, err := crypto.ScanForOutput(owner.View.Private, owner.Spend.Public, output.TxPubKey, output.OneTimePub)
+	if err != nil || offset == nil {
+		t.Fatalf("wallet did not recognize its output: %v", err)
+	}
+	secret, err := crypto.AddScalars(owner.Spend.Private, *offset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount := uint64(core.MinStakeNAPR)
+	blind := crypto.BlindFactor(crypto.ScalarFromUint64(17))
+	commit, err := crypto.Commit(amount, blind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := crypto.Hash32{0x41}
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{TxHash: ref, OneTimePub: output.OneTimePub, TxPubKey: output.TxPubKey, AmountCommit: commit})
+	pool := core.NewMempool(core.DefaultMempoolConfig())
+	registry := core.NewValidatorRegistry()
+	registry.SetUTXOSet(utxos)
+	srv := api.NewServer(":0", core.NewChain(), pool, utxos, testLogger())
+	srv.SetAPIKey(testStakeAPIKey)
+
+	action := core.StakeDeposit
+	msg := core.StakeSignMsgV2(action, pub, amount, ref, 0)
+	sig, err := validator.Sign(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := core.StakeKeyImageProofContext(action, pub, amount, ref, 0, blind)
+	image, proof, err := crypto.ProveKeyImage(secret, output.OneTimePub, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, err := core.EncodeStakeExtraV4(action, pub, amount, sig, ref, 0, blind, image, proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := core.Transaction{Version: core.TxVersionStake, Extra: extra}
+	body := fmt.Sprintf(`{"tx_extra_hex":%q}`, hex.EncodeToString(extra))
+	check := func(want int) {
+		t.Helper()
+		if got, response := restPost(t, srv, "/api/v1/stake", body); got != want {
+			t.Fatalf("HTTP %d, want %d: %v", got, want, response)
+		}
+	}
+	check(http.StatusServiceUnavailable)
+	srv.SetRegistry(registry)
+	check(http.StatusUnprocessableEntity)
+	if _, ok := pool.Get(tx.Hash()); ok {
+		t.Fatal("deposit entered the mempool before V4 activation")
+	}
+	if err := registry.ConfigureStakeKeyImageV4(1); err != nil {
+		t.Fatal(err)
+	}
+	check(http.StatusServiceUnavailable)
+	var relayed crypto.Hash32
+	srv.SetTransactionBroadcaster(func(tx *core.Transaction) { relayed = tx.Hash() })
+	check(http.StatusCreated)
+	if relayed != tx.Hash() {
+		t.Fatal("verified deposit was not handed off to P2P")
+	}
+	queued, ok := pool.Get(tx.Hash())
+	if !ok {
+		t.Fatal("verified deposit was not queued")
+	}
+	if _, err := registry.ApplyBlockStakeTxs([]core.Transaction{queued}, 1); err != nil {
+		t.Fatalf("apply deposit: %v", err)
+	}
+	entry, ok := registry.GetEntry(pub)
+	if !ok || entry.StakeNAPR != amount || registry.IsActive(pub) {
+		t.Fatalf("expected locked stake pending activation; got %+v", entry)
+	}
+	registry.UpdateEpoch(uint64(core.EpochLength))
+	if !registry.IsActive(pub) {
+		t.Fatal("eligible validator did not enter the next epoch's active set")
+	}
+}
+
 func TestREST_StakeBroadcast_RequiresAPIKey(t *testing.T) {
 	f := buildStakeServerFull(t)
 	extra := makeV2StakeExtraFor(t, f)

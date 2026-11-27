@@ -215,6 +215,70 @@ cleaned()
 assert Path("/etc/aperod/node.yaml").is_file()
 assert Path("/etc/systemd/system/aperod-node.service.d/timeout.conf").is_file()
 assert Path("/etc/systemd/system/aperod-node.service.d/gomemlimit.conf").is_file()
+node_unit = Path("/etc/systemd/system/aperod-node.service").read_text()
+assert "Restart=always" in node_unit
+assert "RestartPreventExitStatus=78" in node_unit, \
+    "installed node unit must stop retrying permanent EX_CONFIG identity refusals"
+
+# Exercise the actual systemd restart policy in this disposable guest. A
+# permanent configuration refusal must execute once and stay failed, while a
+# transient non-78 failure must still restart and become healthy.
+policy_unit = Path("/etc/systemd/system/aperod-restart-policy-fixture.service")
+fixture = Path("/usr/local/bin/aperod-restart-policy-fixture")
+permanent_count = ROOT / "identity-refusal-starts"
+transient_count = ROOT / "transient-recovery-starts"
+
+def run_policy_fixture(exit_code, counter, restart_prevent=False):
+    fixture.write_text(
+        "#!/bin/bash\n"
+        f"count=0; [[ ! -f {counter} ]] || count=$(cat {counter}); "
+        f"count=$((count+1)); echo $count > {counter}\n"
+        f"if [[ {exit_code} == 1 && $count == 1 ]]; then exit 1; fi\n"
+        + ("echo 'mainnet identity not authenticated' >&2; exit 78\n"
+           if restart_prevent else "exec /bin/sleep 30\n")
+    )
+    fixture.chmod(0o755)
+    prevent = "RestartPreventExitStatus=78\n" if restart_prevent else ""
+    policy_unit.write_text(
+        "[Unit]\nDescription=Disposable Aperod restart policy test\n"
+        "StartLimitIntervalSec=10\nStartLimitBurst=4\n"
+        "[Service]\nType=simple\n"
+        f"ExecStart={fixture}\nRestart=always\nRestartSec=1\n"
+        f"{prevent}"
+    )
+    run("systemctl", "daemon-reload")
+    run("systemctl", "start", "aperod-restart-policy-fixture.service", ok=False)
+
+try:
+    run_policy_fixture(1, transient_count)
+    for _ in range(30):
+        if transient_count.exists() and int(transient_count.read_text().strip()) >= 2:
+            break
+        time.sleep(0.2)
+    assert transient_count.exists() and int(transient_count.read_text().strip()) >= 2, \
+        "systemd did not retry a transient failure"
+    assert run("systemctl", "is-active", "aperod-restart-policy-fixture.service").stdout.strip() == "active"
+    proof("systemd retries a transient failure and the fixture recovers")
+    run("systemctl", "stop", "aperod-restart-policy-fixture.service")
+    run("systemctl", "reset-failed", "aperod-restart-policy-fixture.service")
+
+    run_policy_fixture(78, permanent_count, restart_prevent=True)
+    time.sleep(2.5)
+    assert permanent_count.read_text().strip() == "1", \
+        "systemd restarted the permanent EX_CONFIG refusal"
+    assert run("systemctl", "show", "aperod-restart-policy-fixture.service",
+               "-p", "NRestarts", "--value").stdout.strip() == "0"
+    assert run("systemctl", "show", "aperod-restart-policy-fixture.service",
+               "-p", "ExecMainStatus", "--value").stdout.strip() == "78"
+    assert run("systemctl", "show", "aperod-restart-policy-fixture.service",
+               "-p", "ActiveState", "--value").stdout.strip() == "failed"
+    proof("systemd keeps permanent EX_CONFIG visible without retrying")
+finally:
+    run("systemctl", "stop", "aperod-restart-policy-fixture.service", ok=False)
+    run("systemctl", "reset-failed", "aperod-restart-policy-fixture.service", ok=False)
+    policy_unit.unlink(missing_ok=True)
+    fixture.unlink(missing_ok=True)
+    run("systemctl", "daemon-reload")
 backup = Path("/usr/local/bin/aperod_backup.sh")
 if MODE != "validator":
     assert backup.is_file() and (backup.stat().st_mode & 0o777) == 0o700

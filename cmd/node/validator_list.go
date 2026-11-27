@@ -11,13 +11,14 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/crypto"
 )
 
 // buildValidatorList constructs the validators slice that seeds the registry
 // and the consensus engine's static fallback list.
 //
-// Non-validator mode (nonValidator=true):
+// Mainnet in either mode, or any non-validator:
 //
 //	Decodes and returns the public keys from genesisValidators (hex strings as
 //	they appear in genesis.yaml).  This ensures handleIncomingBlock's
@@ -25,16 +26,17 @@ import (
 //	validators so the node can sync without producing blocks.
 //	The node's own myKey must NOT appear in the returned list.
 //
-// Validator mode (nonValidator=false):
+// Non-Mainnet validator mode (nonValidator=false):
 //
 //	Returns a single-element slice containing myKey.Public().  This is the
 //	single-validator / testnet design where this node IS the proposer.
 func buildValidatorList(
+	network config.Network,
 	nonValidator bool,
 	genesisValidators []string,
 	myKey *crypto.LockedValidatorKey,
 ) ([]crypto.ValidatorPubKey, error) {
-	if nonValidator {
+	if network == config.Mainnet || nonValidator {
 		validators := make([]crypto.ValidatorPubKey, 0, len(genesisValidators))
 		for _, hexPub := range genesisValidators {
 			pubBytes, err := hex.DecodeString(hexPub)

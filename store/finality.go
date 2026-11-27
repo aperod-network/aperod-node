@@ -17,6 +17,9 @@ var finalityVotePrefix = []byte("consensus/finality_vote/v1/")
 var voteEquivocationPrefix = []byte("consensus/vote_equivocation/v1/")
 var finalityCommitteePrefix = []byte("consensus/finality_committee/v1/")
 
+// FinalityVoteJournalDepth is the retention and startup replay window.
+const FinalityVoteJournalDepth uint64 = 256
+
 type FinalityVote struct {
 	Validator   crypto.ValidatorPubKey `json:"validator"`
 	Signature   []byte                 `json:"signature"`

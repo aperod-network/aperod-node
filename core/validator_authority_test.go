@@ -61,6 +61,132 @@ func TestAuthorityForkEraAndIdentityBoundaries(t *testing.T) {
 	}
 }
 
+func TestAuthorityForkRotationPreservesHistoricalSignerRanges(t *testing.T) {
+	first, identity, firstReplacement := authorityFixture(t)
+	secondReplacement, secondPublic, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := &ValidatorAuthorityFork{
+		Version:             2,
+		Genesis:             first.Genesis,
+		Height:              8,
+		Parent:              crypto.HashBytes([]byte("rotation parent")),
+		Identity:            append(crypto.ValidatorPubKey(nil), first.Identity...),
+		Replacement:         secondPublic,
+		RegistrySHA256:      crypto.HashBytes([]byte("rotation registry")),
+		LegacyWitnessSHA256: first.LegacyWitnessSHA256,
+		Previous:            first.Clone(),
+	}
+	rotated.Possession = authoritySign(t, secondReplacement, rotated.Message())
+	if err := rotated.Validate(); err != nil {
+		t.Fatalf("valid sequential rotation rejected: %v", err)
+	}
+
+	checks := []struct {
+		height uint64
+		signer crypto.ValidatorPubKey
+	}{
+		{height: 4, signer: identity.Public()},
+		{height: 5, signer: firstReplacement.Public()},
+		{height: 7, signer: firstReplacement.Public()},
+		{height: 8, signer: secondPublic},
+		{height: 100, signer: secondPublic},
+	}
+	for _, check := range checks {
+		if got := rotated.Authority(identity.Public(), check.height); !got.Equals(check.signer) {
+			t.Fatalf("height %d resolved signer %s, want %s", check.height, got.Hex(), check.signer.Hex())
+		}
+	}
+	if got := rotated.LocalIdentity(firstReplacement.Public(), 7); !got.Equals(identity.Public()) {
+		t.Fatal("first replacement lost its pre-rotation identity")
+	}
+	if got := rotated.LocalIdentity(firstReplacement.Public(), 8); got.Equals(identity.Public()) {
+		t.Fatal("retired replacement retained authority after second rotation")
+	}
+	if got := rotated.LocalIdentity(secondPublic, 8); !got.Equals(identity.Public()) {
+		t.Fatal("second replacement did not retain the collateral identity")
+	}
+	thirdReplacement, thirdPublic, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := &ValidatorAuthorityFork{
+		Version:             2,
+		Genesis:             rotated.Genesis,
+		Height:              12,
+		Parent:              crypto.HashBytes([]byte("third rotation parent")),
+		Identity:            append(crypto.ValidatorPubKey(nil), rotated.Identity...),
+		Replacement:         thirdPublic,
+		RegistrySHA256:      crypto.HashBytes([]byte("third rotation registry")),
+		LegacyWitnessSHA256: rotated.LegacyWitnessSHA256,
+		Previous:            rotated.Clone(),
+	}
+	third.Possession = authoritySign(t, thirdReplacement, third.Message())
+	if err := third.Validate(); err != nil {
+		t.Fatalf("valid third transition rejected: %v", err)
+	}
+	if !third.Authority(identity.Public(), 11).Equals(secondPublic) ||
+		!third.Authority(identity.Public(), 12).Equals(thirdPublic) {
+		t.Fatal("third transition did not preserve the preceding signer interval")
+	}
+
+	if err := rotated.CheckParent(BlockHeader{Height: 5, PrevHash: first.Parent}); err != nil {
+		t.Fatalf("first activation parent rejected: %v", err)
+	}
+	if err := rotated.CheckParent(BlockHeader{Height: 8, PrevHash: rotated.Parent}); err != nil {
+		t.Fatalf("second activation parent rejected: %v", err)
+	}
+	if err := rotated.CheckParent(BlockHeader{Height: 8, PrevHash: first.Parent}); err == nil {
+		t.Fatal("wrong second activation parent accepted")
+	}
+
+	tampered := third.Clone()
+	tampered.Previous.Replacement[0] ^= 1
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("tampered historical transition accepted")
+	}
+}
+
+func TestAuthorityForkRejectsInvalidRotationSequence(t *testing.T) {
+	first, _, _ := authorityFixture(t)
+	next, nextPublic, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, unrelatedIdentity, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeRotation := func(height uint64, identity crypto.ValidatorPubKey, genesis crypto.Hash32) *ValidatorAuthorityFork {
+		f := &ValidatorAuthorityFork{
+			Version:             2,
+			Genesis:             genesis,
+			Height:              height,
+			Parent:              crypto.HashBytes([]byte("next parent")),
+			Identity:            identity,
+			Replacement:         nextPublic,
+			RegistrySHA256:      crypto.HashBytes([]byte("next registry")),
+			LegacyWitnessSHA256: first.LegacyWitnessSHA256,
+			Previous:            first.Clone(),
+		}
+		f.Possession = authoritySign(t, next, f.Message())
+		return f
+	}
+	if makeRotation(first.Height, first.Identity, first.Genesis).Validate() == nil {
+		t.Fatal("duplicate activation height accepted")
+	}
+	if makeRotation(first.Height+1, unrelatedIdentity, first.Genesis).Validate() == nil {
+		t.Fatal("changed collateral identity accepted")
+	}
+	if makeRotation(first.Height+1, first.Identity, crypto.HashBytes([]byte("other genesis"))).Validate() == nil {
+		t.Fatal("changed genesis accepted")
+	}
+	if makeRotation(first.Height+1, first.Identity, first.Genesis).Validate() != nil {
+		t.Fatal("valid forward rotation rejected")
+	}
+}
+
 func TestAuthorityForkPossessionBindsAllRuleFields(t *testing.T) {
 	f, _, _ := authorityFixture(t)
 	mutations := []func(*ValidatorAuthorityFork){
