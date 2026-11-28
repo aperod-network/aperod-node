@@ -62,9 +62,122 @@ BINARY_SRC="${BLOCKCHAIN_DIR}/build/aperod-node"
 HEALTH_URL="http://localhost:8545/api/v1/status"
 STATS_URL="http://localhost:8545/api/v1/network/stats"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+DROPIN_DIR="${DROPIN_DIR:-/etc/systemd/system/${SERVICE_NAME}.service.d}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+
+# BEGIN restart-policy preflight
+restart_policy_has_exit_78() {
+  local token
+  local normalized="${1//,/ }"
+  for token in ${normalized}; do
+    token="${token%%/*}"
+    [[ "${token}" == "78" || "${token^^}" == "EX_CONFIG" ]] && return 0
+  done
+  return 1
+}
+
+ensure_restart_policy() {
+  local restart_mode prevent_status policy_file temp_file restart_after prevent_after
+  policy_file="${DROPIN_DIR}/restart-policy.conf"
+
+  if ! restart_mode=$("${SYSTEMCTL}" show "${SERVICE_NAME}" -p Restart --value 2>&1) ||
+     [[ -z "${restart_mode}" ]]; then
+    echo "✗ Cannot read the loaded restart policy for ${SERVICE_NAME}: ${restart_mode:-no Restart value}." >&2
+    echo "  The node was NOT stopped; its process and data are untouched." >&2
+    echo "  Check the unit with: systemctl show ${SERVICE_NAME} -p Restart -p RestartPreventExitStatus" >&2
+    return 1
+  fi
+  if ! prevent_status=$("${SYSTEMCTL}" show "${SERVICE_NAME}" -p RestartPreventExitStatus --value 2>&1); then
+    echo "✗ Cannot read RestartPreventExitStatus for ${SERVICE_NAME}: ${prevent_status}" >&2
+    echo "  The node was NOT stopped; its process and data are untouched." >&2
+    return 1
+  fi
+  if restart_policy_has_exit_78 "${prevent_status}"; then
+    echo "  [ok] ${SERVICE_NAME}: Restart=${restart_mode}; exit 78 is excluded from automatic restarts."
+    return 0
+  fi
+
+  if [[ -e "${policy_file}" ]]; then
+    echo "✗ ${policy_file} already exists but the loaded unit does not exclude exit 78." >&2
+    echo "  It was not overwritten. Inspect that file and preserve its settings while adding" >&2
+    echo "  RestartPreventExitStatus=78 under [Service], then run systemctl daemon-reload." >&2
+    echo "  Verify with: systemctl show ${SERVICE_NAME} -p Restart -p RestartPreventExitStatus" >&2
+    echo "  The node was NOT stopped; its process and data are untouched." >&2
+    return 1
+  fi
+
+  if ! mkdir -p "${DROPIN_DIR}"; then
+    echo "✗ Cannot create systemd drop-in directory ${DROPIN_DIR}; update aborted before stopping the node." >&2
+    return 1
+  fi
+  if ! temp_file=$(mktemp "${DROPIN_DIR}/.restart-policy.XXXXXX"); then
+    echo "✗ Cannot prepare restart-policy drop-in; update aborted before stopping the node." >&2
+    return 1
+  fi
+  if ! printf '[Service]\nRestartPreventExitStatus=78\n' > "${temp_file}" ||
+     ! chmod 0644 "${temp_file}"; then
+    rm -f "${temp_file}"
+    echo "✗ Cannot write the restart-policy drop-in; update aborted before stopping the node." >&2
+    return 1
+  fi
+  if ! ln "${temp_file}" "${policy_file}"; then
+    rm -f "${temp_file}"
+    echo "✗ Could not safely create ${policy_file}; no existing file was replaced." >&2
+    echo "  The node was NOT stopped; inspect the unit and retry." >&2
+    return 1
+  fi
+  rm -f "${temp_file}"
+
+  if ! "${SYSTEMCTL}" daemon-reload; then
+    rm -f "${policy_file}"
+    "${SYSTEMCTL}" daemon-reload >/dev/null 2>&1 || true
+    echo "✗ systemd could not reload the restart-policy drop-in; it was removed." >&2
+    echo "  The node was NOT stopped; its process and data are untouched." >&2
+    return 1
+  fi
+  if ! restart_after=$("${SYSTEMCTL}" show "${SERVICE_NAME}" -p Restart --value 2>&1) ||
+     ! prevent_after=$("${SYSTEMCTL}" show "${SERVICE_NAME}" -p RestartPreventExitStatus --value 2>&1) ||
+     [[ "${restart_after}" != "${restart_mode}" ]] ||
+     ! restart_policy_has_exit_78 "${prevent_after}"; then
+    rm -f "${policy_file}"
+    if ! "${SYSTEMCTL}" daemon-reload >/dev/null 2>&1; then
+      echo "✗ Verification failed and systemd could not reload after removing the new drop-in." >&2
+      echo "  The node was NOT stopped. Inspect ${policy_file} and the systemd journal before retrying." >&2
+      return 1
+    fi
+    echo "✗ systemd did not confirm the required restart policy; the new drop-in was removed." >&2
+    echo "  The node was NOT stopped; its process and data are untouched." >&2
+    echo "  If the unit uses custom restart settings, add and verify RestartPreventExitStatus=78 manually." >&2
+    return 1
+  fi
+
+  echo "  [ok] Installed and verified ${policy_file} (Restart=${restart_after}; exit 78 will not restart the service)."
+}
+# END restart-policy preflight
+
+# upgrade-node.sh uses this read/configure-only entry before changing any
+# drop-ins. It never stops, starts, or signals the running process.
+if [[ "${1:-}" == "--check-restart-policy" ]]; then
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "✗ Run as root: sudo bash ${BASH_SOURCE[0]} --check-restart-policy" >&2
+    exit 1
+  fi
+  ensure_restart_policy
+  exit $?
+fi
+if [[ "$#" -gt 0 ]]; then
+  echo "Usage: sudo bash ${BASH_SOURCE[0]} [--check-restart-policy]" >&2
+  exit 2
+fi
+
+source "${DEPLOY_DIR}/mainnet-payout-release-gate.sh"
+mainnet_payout_release_gate "${APEROD_CONFIG_FILE:-/etc/aperod/node.yaml}" || exit 1
+
 source "${DEPLOY_DIR}/node-source-release.sh"
 node_source_baseline_guard "$BINARY_DST" ||
   { echo "✗ Public source/baseline approval refused; no deploy changes were made." >&2; exit 1; }
+ensure_restart_policy || exit 1
 node_source_prepare || exit 1
 chown -R aperod:aperod "$NODE_SOURCE_JOB"
 LIVE_BLOCKCHAIN_DIR="$BLOCKCHAIN_DIR"
@@ -114,8 +227,6 @@ send_telegram_alert() {
 # which is always present.  This guarantees a valid insertion point regardless
 # of what other directives the file has.
 # ---------------------------------------------------------------------------
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
 # Helper: ensure a Key=Value directive exists in the service file with exactly
 # the required value.  If the key is absent it is appended after the anchor
 # line; if it is present with the wrong value it is replaced in-place.
@@ -233,7 +344,6 @@ fi
 # ---------------------------------------------------------------------------
 # Honour an externally-supplied DROPIN_DIR (test seam); fall back to the
 # live systemd drop-in directory only when the caller has not set it.
-DROPIN_DIR="${DROPIN_DIR:-/etc/systemd/system/${SERVICE_NAME}.service.d}"
 TIMEOUT_CONF="${DROPIN_DIR}/timeout.conf"
 mkdir -p "${DROPIN_DIR}"
 
@@ -345,8 +455,6 @@ fi
 # externally supplied value) and SYSTEMCTL defaults to `systemctl`.
 # ---------------------------------------------------------------------------
 GOMEMLIMIT_CONF="${DROPIN_DIR}/gomemlimit.conf"
-SYSTEMCTL="${SYSTEMCTL:-systemctl}"
-
 echo "==> [0d] Ensuring gomemlimit.conf drop-in (OOM protection)..."
 
 if ! source "${DEPLOY_DIR}/gomemlimit-policy.sh" || ! gomemlimit_resolve; then

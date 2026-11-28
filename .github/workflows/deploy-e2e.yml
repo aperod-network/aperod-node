@@ -5,10 +5,16 @@ on:
   push:
     paths:
       - 'deploy/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/deploy-e2e.yml'
     branches: [main, master, develop]
   pull_request:
     paths:
       - 'deploy/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/deploy-e2e.yml'
 
 permissions:
   contents: read
@@ -17,42 +23,20 @@ jobs:
   install-node-e2e:
     name: install-node.sh e2e smoke test
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
         mode: [install, validator, update, upgrade]
     timeout-minutes: 30
-
-    defaults:
-      run:
-        # The public Go module is rooted at the repository root.
-        working-directory: .
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
-
-      - name: Verify Docker is available
-        run: |
-          # Use the host Docker daemon when available (ubuntu-latest).
-          # On self-hosted container runners where the host daemon is absent,
-          # fall back to the DinD service and persist DOCKER_HOST so subsequent
-          # steps can reach it.
-          if docker info >/dev/null 2>&1; then
-            echo "Using host Docker daemon"
-          else
-            echo "Host daemon not reachable — switching to DinD service"
-            echo "DOCKER_HOST=tcp://localhost:2375" >> "$GITHUB_ENV"
-            timeout 30 bash -c 'until docker -H tcp://localhost:2375 info >/dev/null 2>&1; do sleep 1; done'
-            echo "DinD ready"
-          fi
-
+      - name: Verify isolated test runtime
+        run: docker info
       - name: Real systemd lifecycle in isolated guest
         env:
           APEROD_RUN_DOCKER_E2E: "1"

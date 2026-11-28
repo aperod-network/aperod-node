@@ -17,6 +17,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -75,6 +76,7 @@ func (h *Hub) BroadcastBlock(b *core.Block) error {
 	return nil
 }
 
+// SetAVMGasBurnActivationHeight configures the rule used to render block events.
 func (h *Hub) SetAVMGasBurnActivationHeight(height uint64) {
 	h.mu.Lock()
 	h.avmGasBurnActivationHeight = height
@@ -178,13 +180,13 @@ func (h *Hub) Handler() http.Handler {
 		// Enforce global max concurrent WS clients (2.2.5).
 		if !h.CanAcceptClient() {
 			h.log.Warn("ws client rejected: global max reached", "max", MaxWSClients)
-			conn.Close()
+			h.closeConnection(conn)
 			return
 		}
 		// Enforce per-IP cap (security: F-006 — prevents a single host
 		// from monopolising the hub even when the global cap has room).
 		if !h.CanAcceptFromIP(clientIP) {
-			conn.Close()
+			h.closeConnection(conn)
 			return
 		}
 		c := &wsClient{
@@ -195,7 +197,7 @@ func (h *Hub) Handler() http.Handler {
 		}
 		if !h.register(c) {
 			h.log.Warn("ws client rejected: connection cap reached")
-			conn.Close()
+			h.closeConnection(conn)
 			return
 		}
 		defer h.unregister(c)
@@ -206,9 +208,13 @@ func (h *Hub) Handler() http.Handler {
 		go func() {
 			enc := json.NewEncoder(conn)
 			for evt := range c.send {
-				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					h.log.Debug("set WebSocket write deadline failed", "err", err)
+					h.closeConnection(conn)
+					return
+				}
 				if err := enc.Encode(evt); err != nil {
-					conn.Close()
+					h.closeConnection(conn)
 					return
 				}
 			}
@@ -217,10 +223,20 @@ func (h *Hub) Handler() http.Handler {
 		// Read loop (drain & discard — subscribe-only model)
 		buf := make([]byte, 512)
 		for {
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if err := conn.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+				h.log.Debug("set WebSocket read deadline failed", "err", err)
+				h.closeConnection(conn)
+				return
+			}
 			if _, err := conn.Read(buf); err != nil {
 				return // client disconnected
 			}
 		}
 	})
+}
+
+func (h *Hub) closeConnection(conn io.Closer) {
+	if err := conn.Close(); err != nil {
+		h.log.Debug("close WebSocket connection failed", "err", err)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -17,6 +18,7 @@ var (
 	receiptPrefix = []byte{0xff, 'a', 'v', 'm', '/', 'r', '/'}
 )
 
+// Receipt records the execution effects of one AVM transaction.
 type Receipt struct {
 	TxHash      crypto.Hash32
 	ContractID  crypto.Hash32
@@ -38,11 +40,13 @@ type PreparedBlock struct {
 	WriteSetCommitment crypto.Hash32
 }
 
+// BlockExecutor derives a block's AVM effects over a backing store.
 type BlockExecutor struct {
 	store                             Store
 	securityHardeningActivationHeight uint64
 }
 
+// NewBlockExecutor creates a block executor with the historical nesting policy.
 func NewBlockExecutor(store Store) *BlockExecutor {
 	return &BlockExecutor{store: store}
 }
@@ -57,13 +61,14 @@ func NewBlockExecutorWithSecurityHardening(store Store, activationHeight uint64)
 	}
 }
 
+// PrepareBlock derives pending effects without committing the backing store.
 func (e *BlockExecutor) PrepareBlock(ctx context.Context, block *core.Block) (*PreparedBlock, error) {
 	if block == nil {
 		return nil, fmt.Errorf("avm: nil block")
 	}
 	overlay := NewOverlayStore(e.store)
 	engine := NewEngine(overlay)
-	defer engine.Close(ctx)
+	defer closeRuntimeResource(ctx, engine, "block engine", slog.Default())
 	prepared := &PreparedBlock{
 		Height:    block.Header.Height,
 		BlockHash: block.Hash(),
@@ -225,7 +230,7 @@ func ValidateMempoolAdmission(store Store, payload *core.AVMPayload) error {
 		accessList[i] = Access{Key: bytes.Clone(access.Key), Write: access.Write}
 	}
 	engine := NewEngine(NewOverlayStore(store))
-	defer engine.Close(context.Background())
+	defer closeRuntimeResource(context.Background(), engine, "replay engine", slog.Default())
 	if _, err := engine.Execute(context.Background(), ExecutionRequest{
 		ContractID: [32]byte(payload.ContractID),
 		Code:       code,
@@ -252,9 +257,11 @@ func encodeReceipt(receipt Receipt) []byte {
 	var number [8]byte
 	binary.LittleEndian.PutUint64(number[:], receipt.GasUsed)
 	out.Write(number[:])
+	// #nosec G115 -- Engine-produced receipt counts come from the nonnegative write-set length; not a user-supplied signed counter.
 	binary.LittleEndian.PutUint64(number[:], uint64(receipt.StateWrites))
 	out.Write(number[:])
 	var length [4]byte
+	// #nosec G115 -- The AVM output host function enforces MaxStateValue (64 KiB) before producing receipt return bytes.
 	binary.LittleEndian.PutUint32(length[:], uint32(len(receipt.ReturnData)))
 	out.Write(length[:])
 	out.Write(receipt.ReturnData)
@@ -266,8 +273,10 @@ func hashWrites(writes []Write) crypto.Hash32 {
 	parts = append(parts, []byte("APRO/AVM/STATE-COMMITMENT/V1"))
 	for _, write := range writes {
 		var length [4]byte
+		// #nosec G115 -- Accepted engine state keys are bounded by MaxStateKeySize (64 bytes).
 		binary.LittleEndian.PutUint32(length[:], uint32(len(write.Key)))
 		parts = append(parts, bytes.Clone(length[:]), bytes.Clone(write.Key))
+		// #nosec G115 -- Accepted engine state values are bounded by MaxStateValue (64 KiB).
 		binary.LittleEndian.PutUint32(length[:], uint32(len(write.Value)))
 		parts = append(parts, bytes.Clone(length[:]), bytes.Clone(write.Value))
 	}

@@ -155,10 +155,65 @@ func (d *DB) InvalidateRingSamplingIndex() error {
 	return d.db.Delete(ringSamplingCountKey, &opt.WriteOptions{Sync: true})
 }
 
-// stageRingSamplingChange runs under ringMu and stages every derived change
-// into the SAME LevelDB batch as u/ and rm/. No memory population cache exists.
-func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, eligible bool) error {
-	count, ready, err := ringSamplingCount(d.db)
+// ringBatch overlays only touched ring keys so every mutation sees earlier
+// changes in the same transaction, including tail swaps during a rewind.
+// The caller holds ringMu through the LevelDB write or discards the batch.
+type ringBatch struct {
+	db      *DB
+	batch   *leveldb.Batch
+	pending map[string][]byte
+}
+
+func (d *DB) newRingBatch(batch *leveldb.Batch) *ringBatch {
+	return &ringBatch{db: d, batch: batch, pending: make(map[string][]byte)}
+}
+
+func (r *ringBatch) Get(key []byte, opts *opt.ReadOptions) ([]byte, error) {
+	if raw, ok := r.pending[string(key)]; ok {
+		if raw == nil {
+			return nil, leveldb.ErrNotFound
+		}
+		return raw, nil
+	}
+	return r.db.db.Get(key, opts)
+}
+
+func (r *ringBatch) get(key []byte) ([]byte, error) {
+	raw, err := r.Get(key, nil)
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil, nil
+	}
+	return raw, err
+}
+
+func (r *ringBatch) put(key, raw []byte) {
+	r.pending[string(key)] = bytes.Clone(raw)
+	r.batch.Put(key, raw)
+}
+
+func (r *ringBatch) delete(key []byte) {
+	r.pending[string(key)] = nil
+	r.batch.Delete(key)
+}
+
+func (r *ringBatch) putMember(u *StoredUTXO, raw []byte) error {
+	if err := r.stage(u.OneTimePub, !u.ProtocolLocked); err != nil {
+		return err
+	}
+	r.put(ringMemberKey(u.OneTimePub), raw)
+	return nil
+}
+
+func (r *ringBatch) deleteMember(pub crypto.Point32) error {
+	if err := r.stage(pub, false); err != nil {
+		return err
+	}
+	r.delete(ringMemberKey(pub))
+	return nil
+}
+
+func (r *ringBatch) stage(pub crypto.Point32, eligible bool) error {
+	count, ready, err := ringSamplingCount(r)
 	if err != nil {
 		return err
 	}
@@ -166,7 +221,7 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 		// A brand-new rm/ store starts at ordinal zero. Existing legacy rm/
 		// stores keep accepting canonical writes but remain unavailable for
 		// sampling until the explicit streaming preparation finishes.
-		iter := d.db.NewIterator(util.BytesPrefix(prefixRingMember), nil)
+		iter := r.db.db.NewIterator(util.BytesPrefix(prefixRingMember), nil)
 		nonempty := iter.First()
 		err := iter.Error()
 		iter.Release()
@@ -177,7 +232,7 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 			return nil
 		}
 	}
-	oldData, err := d.get(ringMemberKey(pub))
+	oldData, err := r.get(ringMemberKey(pub))
 	if err != nil {
 		return err
 	}
@@ -189,7 +244,7 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 		}
 		oldEligible = !old.ProtocolLocked
 	}
-	reverse, err := d.get(ringSamplingReverseKey(pub))
+	reverse, err := r.get(ringSamplingReverseKey(pub))
 	if err != nil {
 		return err
 	}
@@ -202,7 +257,7 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 			return fmt.Errorf("ring sampling: malformed reverse index")
 		}
 		index = binary.BigEndian.Uint64(reverse)
-		slot, err := d.get(ringSamplingSlotKey(index))
+		slot, err := r.get(ringSamplingSlotKey(index))
 		if err != nil {
 			return err
 		}
@@ -214,7 +269,7 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 	case oldEligible && !eligible:
 		last := count - 1
 		if index != last {
-			lastPub, err := d.get(ringSamplingSlotKey(last))
+			lastPub, err := r.get(ringSamplingSlotKey(last))
 			if err != nil {
 				return err
 			}
@@ -226,14 +281,14 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 			if moved == pub {
 				return fmt.Errorf("ring sampling: duplicate tail member")
 			}
-			if _, err := readRingSamplingMember(d.db, last); err != nil {
+			if _, err := readRingSamplingMember(r, last); err != nil {
 				return err
 			}
-			batch.Put(ringSamplingSlotKey(index), lastPub)
-			batch.Put(ringSamplingReverseKey(moved), ringSamplingUint(index))
+			r.put(ringSamplingSlotKey(index), lastPub)
+			r.put(ringSamplingReverseKey(moved), ringSamplingUint(index))
 		}
-		batch.Delete(ringSamplingSlotKey(last))
-		batch.Delete(ringSamplingReverseKey(pub))
+		r.delete(ringSamplingSlotKey(last))
+		r.delete(ringSamplingReverseKey(pub))
 		count--
 	case !oldEligible && eligible:
 		if count == math.MaxUint64 {
@@ -241,18 +296,18 @@ func (d *DB) stageRingSamplingChange(batch *leveldb.Batch, pub crypto.Point32, e
 		}
 		// An unexpected existing tail is corruption, not permission to
 		// overwrite it or return a biased partial sample.
-		tail, err := d.get(ringSamplingSlotKey(count))
+		tail, err := r.get(ringSamplingSlotKey(count))
 		if err != nil {
 			return err
 		}
 		if tail != nil {
 			return fmt.Errorf("ring sampling: occupied append slot")
 		}
-		batch.Put(ringSamplingSlotKey(count), pub[:])
-		batch.Put(ringSamplingReverseKey(pub), ringSamplingUint(count))
+		r.put(ringSamplingSlotKey(count), pub[:])
+		r.put(ringSamplingReverseKey(pub), ringSamplingUint(count))
 		count++
 	}
-	batch.Put(ringSamplingCountKey, ringSamplingUint(count))
+	r.put(ringSamplingCountKey, ringSamplingUint(count))
 	return nil
 }
 

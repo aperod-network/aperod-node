@@ -33,6 +33,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -164,7 +165,7 @@ func TestRelaxedHash_UTXOCountDivergenceAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	// Seed the DB with a count that diverges by 100 % from the snapshot's 0.
 	const dbStoredCount = 200

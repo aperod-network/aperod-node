@@ -20,6 +20,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -352,7 +353,7 @@ func syntheticLPoDV3FundingAt(t *testing.T, path string, withLiquidity ...bool) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	validator, validatorPub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)

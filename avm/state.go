@@ -36,10 +36,12 @@ type OverlayStore struct {
 	writes map[string][]byte
 }
 
+// NewOverlayStore creates a write buffer over base.
 func NewOverlayStore(base Store) *OverlayStore {
 	return &OverlayStore{base: base, writes: make(map[string][]byte)}
 }
 
+// Get returns a copy of a staged value, or reads the unchanged base store.
 func (s *OverlayStore) Get(key []byte) ([]byte, bool, error) {
 	s.mu.RLock()
 	value, staged := s.writes[string(key)]
@@ -53,6 +55,7 @@ func (s *OverlayStore) Get(key []byte) ([]byte, bool, error) {
 	return s.base.Get(key)
 }
 
+// Apply buffers a validated write batch without changing the base store.
 func (s *OverlayStore) Apply(writes []Write) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,6 +70,7 @@ func (s *OverlayStore) Apply(writes []Write) error {
 	return nil
 }
 
+// Writes returns a key-sorted copy of the staged changes.
 func (s *OverlayStore) Writes() []Write {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -82,10 +86,12 @@ func (s *OverlayStore) Writes() []Write {
 	return writes
 }
 
+// NewMemoryStore creates an empty in-memory AVM store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{data: make(map[string][]byte)}
 }
 
+// Get returns a copy of the value associated with key.
 func (s *MemoryStore) Get(key []byte) ([]byte, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -96,6 +102,7 @@ func (s *MemoryStore) Get(key []byte) ([]byte, bool, error) {
 	return bytes.Clone(value), true, nil
 }
 
+// Apply updates the in-memory store after validating every key in the batch.
 func (s *MemoryStore) Apply(writes []Write) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

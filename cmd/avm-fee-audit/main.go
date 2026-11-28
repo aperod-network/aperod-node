@@ -16,6 +16,7 @@ import (
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -113,7 +114,7 @@ func main() {
 	}
 }
 
-func run(args []string, output io.Writer) error {
+func run(args []string, output io.Writer) (readCloseErr error) {
 	flags := flag.NewFlagSet("avm-fee-audit", flag.ContinueOnError)
 	flags.SetOutput(output)
 	dbPath := flags.String("db", "", "copied LevelDB directory under /tmp (required)")
@@ -128,21 +129,23 @@ func run(args []string, output io.Writer) error {
 	rewardCutover := flags.Uint64("reward-cutover-height", 0, "observed historical reward base cutover height (required with --audit-reward-eras)")
 	preCutoverBase := flags.Uint64("pre-cutover-base-napro", 0, "expected authorized reward base before cutover, in nAPRO (required with --audit-reward-eras)")
 	postCutoverBase := flags.Uint64("post-cutover-base-napro", 0, "expected authorized reward base from cutover, in nAPRO (required with --audit-reward-eras)")
+	var usageErr error
 	flags.Usage = func() {
-		fmt.Fprintln(output, "Usage: avm-fee-audit --db /tmp/copied/chain.db --expected-tip-height HEIGHT --expected-tip-hash HASH --avm-activation-height HEIGHT --reward-activation-height HEIGHT [--start HEIGHT] [--end HEIGHT] [--inspect-rewards | --audit-reward-eras --reward-cutover-height HEIGHT --pre-cutover-base-napro AMOUNT --post-cutover-base-napro AMOUNT]")
-		fmt.Fprintln(output, "Supply tip values independently observed from the live API and activation heights from the effective node config.")
-		fmt.Fprintln(output, "--inspect-rewards requires explicit --start and --end spanning at most 16 heights inclusive.")
-		fmt.Fprintln(output, "--audit-reward-eras defaults to the reward authorization activation height through tip; explicit ranges are also accepted.")
-		fmt.Fprintln(output, "AVM wire examples identify payload fields only; they do not establish AVM execution or user activity.")
-		fmt.Fprintln(output, "This audit does not prove API source trust, block-header signatures, state transitions, or AVM execution/state.")
+		_, writeErr := fmt.Fprintln(output, `Usage: avm-fee-audit --db /tmp/copied/chain.db --expected-tip-height HEIGHT --expected-tip-hash HASH --avm-activation-height HEIGHT --reward-activation-height HEIGHT [--start HEIGHT] [--end HEIGHT] [--inspect-rewards | --audit-reward-eras --reward-cutover-height HEIGHT --pre-cutover-base-napro AMOUNT --post-cutover-base-napro AMOUNT]
+Supply tip values independently observed from the live API and activation heights from the effective node config.
+--inspect-rewards requires explicit --start and --end spanning at most 16 heights inclusive.
+--audit-reward-eras defaults to the reward authorization activation height through tip; explicit ranges are also accepted.
+AVM wire examples identify payload fields only; they do not establish AVM execution or user activity.
+This audit does not prove API source trust, block-header signatures, state transitions, or AVM execution/state.`)
+		usageErr = errors.Join(usageErr, writeErr)
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			flags.Usage()
-			return nil
+			return usageErr
 		}
-		return fmt.Errorf("parse arguments: %w", err)
+		return fmt.Errorf("parse arguments: %w", errors.Join(err, usageErr))
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
@@ -207,7 +210,7 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("open copied LevelDB read-only: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	var report any
 	if *auditRewardEras {
@@ -767,7 +770,11 @@ func rewardEraMinimumFee(tx *core.Transaction, baseFee uint64) (uint64, error) {
 	if rate == 0 {
 		rate = core.InitialBaseFeePerByte
 	}
-	size := uint64(tx.Size())
+	signedSize := tx.Size()
+	if signedSize < 0 {
+		return 0, fmt.Errorf("invalid transaction fee size")
+	}
+	size := uint64(signedSize)
 	if size != 0 && rate > ^uint64(0)/size {
 		return 0, fmt.Errorf("fee floor overflows uint64")
 	}

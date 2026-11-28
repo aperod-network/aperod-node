@@ -51,7 +51,7 @@ func makeChainWithGenesis(t *testing.T, priv crypto.ValidatorPrivKey, pub crypto
 func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.LockedValidatorKey, chain *core.Chain) *consensus.Engine {
 	t.Helper()
 	mp := core.NewMempool(core.DefaultMempoolConfig())
-	return consensus.NewEngine(consensus.Config{
+	eng := consensus.NewEngine(consensus.Config{
 		OnCanonicalBlock:         noopCanonicalPersistence,
 		BlockTime:                20 * time.Millisecond,
 		BFTThreshold:             0.667,
@@ -59,6 +59,9 @@ func newEngine(t *testing.T, validators []crypto.ValidatorPubKey, myKey *crypto.
 		MyKey:                    myKey,
 		RingCTV4ActivationHeight: ^uint64(0),
 	}, chain, mp, newNopLogger())
+	utxos := core.NewUTXOSet()
+	eng.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+	return eng
 }
 
 // ─── ProposerAt ───────────────────────────────────────────────────────────────
@@ -381,8 +384,12 @@ func TestEngine_RejectsBlock_NoVerifier(t *testing.T) {
 	chain := makeChainWithGenesis(t, priv, pub)
 
 	// Engine with no TxVerifier wired (simulates pre-SetTxVerifier startup window).
-	eng := newEngine(t, []crypto.ValidatorPubKey{pub}, nil, chain)
-	// Deliberately do NOT call eng.SetTxVerifier.
+	eng := consensus.NewEngine(consensus.Config{
+		OnCanonicalBlock: noopCanonicalPersistence,
+		BlockTime:        20 * time.Millisecond,
+		BFTThreshold:     0.667,
+		Validators:       []crypto.ValidatorPubKey{pub},
+	}, chain, core.NewMempool(core.DefaultMempoolConfig()), newNopLogger())
 
 	stop := make(chan struct{})
 	go eng.Run(stop)

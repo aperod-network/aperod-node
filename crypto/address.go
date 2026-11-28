@@ -11,6 +11,7 @@ import (
 // NetworkByte prefixes an address to identify which chain it belongs to.
 type NetworkByte byte
 
+// Address network bytes distinguish the supported chain environments.
 const (
 	MainnetByte NetworkByte = 0x41 // mainnet
 	TestnetByte NetworkByte = 0x54 // testnet
@@ -112,6 +113,23 @@ func DecodeAddress(addr Address) (net NetworkByte, spend, view Point32, err erro
 func Validate(addr Address) error {
 	_, _, _, err := DecodeAddress(addr)
 	return err
+}
+
+// DecodeWalletAddress additionally requires canonical, nonidentity prime-order
+// spend and view keys. DecodeAddress intentionally retains its historical
+// wire-decoding semantics; tightening it would change consensus replay.
+func DecodeWalletAddress(addr Address) (NetworkByte, Point32, Point32, error) {
+	network, spend, view, err := DecodeAddress(addr)
+	if err != nil {
+		return 0, Point32{}, Point32{}, err
+	}
+	if _, err := checkedCLSAGPrimePoint(spend, "address spend key"); err != nil {
+		return 0, Point32{}, Point32{}, err
+	}
+	if _, err := checkedCLSAGPrimePoint(view, "address view key"); err != nil {
+		return 0, Point32{}, Point32{}, err
+	}
+	return network, spend, view, nil
 }
 
 // AddressFromKeys is a convenience wrapper for WalletKeyPair.

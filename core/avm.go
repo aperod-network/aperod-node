@@ -10,6 +10,7 @@ import (
 	aprocrypto "github.com/aperod/aperod/crypto"
 )
 
+// AVM payload limits bound code, input, state access and gas reservations.
 const (
 	AVMMaxCodeSize       = 1 << 20
 	AVMMaxCalldataSize   = 64 << 10
@@ -26,8 +27,10 @@ const (
 	AVMGasPriceNAPR uint64 = 10
 )
 
+// AVMAction selects contract deployment or execution.
 type AVMAction uint8
 
+// AVM action identifiers are part of the transaction wire format.
 const (
 	AVMDeployContract  AVMAction = 1
 	AVMExecuteContract AVMAction = 2
@@ -56,6 +59,7 @@ type AVMPayload struct {
 	AccessList []AVMAccess       `json:"access_list,omitempty"`
 }
 
+// Validate checks the AVM wire payload.
 func (p *AVMPayload) Validate() error {
 	if p == nil {
 		return fmt.Errorf("avm payload is required")
@@ -111,6 +115,7 @@ func (p *AVMPayload) Validate() error {
 	return nil
 }
 
+// SigningHash hashes the canonical payload without its signature.
 func (p *AVMPayload) SigningHash() aprocrypto.Hash32 {
 	if p == nil {
 		return aprocrypto.Hash32{}
@@ -135,6 +140,7 @@ func (p *AVMPayload) canonicalBytes(includeSignature bool) []byte {
 	out.Write(number[:])
 	out.Write(p.Signer[:])
 	var count [2]byte
+	// #nosec G115 -- Valid payloads have at most AVMMaxAccessListKeys (64); canonical encoding is not an admission substitute.
 	binary.LittleEndian.PutUint16(count[:], uint16(len(p.AccessList)))
 	out.Write(count[:])
 	for _, access := range p.AccessList {
@@ -153,11 +159,13 @@ func (p *AVMPayload) canonicalBytes(includeSignature bool) []byte {
 
 func writeAVMBytes(out *bytes.Buffer, value []byte) {
 	var length [4]byte
+	// #nosec G115 -- Canonical AVM fields are bounded by payload/code/transaction admission limits far below uint32; preserve the existing wire bytes.
 	binary.LittleEndian.PutUint32(length[:], uint32(len(value)))
 	out.Write(length[:])
 	out.Write(value)
 }
 
+// DeriveAVMContractID binds a contract identifier to signer, nonce and code.
 func DeriveAVMContractID(signer [32]byte, nonce uint64, code []byte) aprocrypto.Hash32 {
 	var nonceBytes [8]byte
 	binary.LittleEndian.PutUint64(nonceBytes[:], nonce)
@@ -170,6 +178,7 @@ func DeriveAVMContractID(signer [32]byte, nonce uint64, code []byte) aprocrypto.
 	)
 }
 
+// AVMGasFee converts gas to nAPRO with overflow checking.
 func AVMGasFee(gasLimit uint64) (uint64, error) {
 	if gasLimit > ^uint64(0)/AVMGasPriceNAPR {
 		return 0, fmt.Errorf("avm gas fee overflows uint64")

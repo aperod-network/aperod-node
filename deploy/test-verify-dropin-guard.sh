@@ -46,6 +46,10 @@ trap 'rm -rf "$WORK"' EXIT
 # ── Mock bin directory ─────────────────────────────────────────────────────────
 MOCK_BIN="${WORK}/bin"
 mkdir -p "${MOCK_BIN}"
+PYTHON3_PATH="$(command -v python3 || true)"
+if [[ -n "${PYTHON3_PATH}" ]]; then
+  ln -s "${PYTHON3_PATH}" "${MOCK_BIN}/python3"
+fi
 
 # mock: rsync — succeeds silently
 cat > "${MOCK_BIN}/rsync" <<'SH'
@@ -111,6 +115,7 @@ mkdir -p "${PRIMARY_DIR}/chain.db" "${SECONDARY_DIR}"
 # Minimal node.yaml so the bootnode-config step has a file to edit
 NODE_YAML="${WORK}/node.yaml"
 cat > "${NODE_YAML}" <<'YAML'
+network: testnet
 p2p:
   bootnodes: []
 YAML
@@ -173,6 +178,7 @@ COMMON_ENV=(
   PATH="${MOCK_BIN}:/usr/bin:/bin"
   PRIMARY_IP="192.0.2.1"
   PRIMARY_DATA_DIR="${PRIMARY_DIR}"
+  PRIMARY_NODE_YAML="${NODE_YAML}"
   SECONDARY_DATA_DIR="${SECONDARY_DIR}"
   SECONDARY_NODE_YAML="${NODE_YAML}"
   SECONDARY_NODE_CONFIG_SH="/nonexistent/node-config.sh"

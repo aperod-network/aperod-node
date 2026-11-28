@@ -11,6 +11,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
@@ -44,6 +45,133 @@ func TestLPoDDailyBoundaryWaitsForFullDayAndUsesMoscowTime(t *testing.T) {
 	}
 	if _, err := LPoDNextDailyBoundaryAfter24h(int64(^uint64(0) >> 1)); err == nil {
 		t.Fatal("accepted an overflowing payout anchor")
+	}
+}
+
+func TestLPoDDailyValidatorPayoutPinsAddressAndBoundsCheckpointEntries(t *testing.T) {
+	firstWallet, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondWallet, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAddress := crypto.AddressFromKeys(crypto.MainnetByte, firstWallet)
+	secondAddress := crypto.AddressFromKeys(crypto.MainnetByte, secondWallet)
+	payouts := make([]LPoDDeferredValidatorPayout, 0, core.MaxValidators)
+	var firstValidator string
+	for i := 0; i < core.MaxValidators; i++ {
+		_, pub, err := crypto.GenerateValidatorKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstValidator = pub.Hex()
+			payouts, err = addLPoDDeferredValidatorPayout(payouts, firstValidator, firstAddress, 5)
+			if err == nil {
+				payouts, err = addLPoDDeferredValidatorPayout(payouts, firstValidator, secondAddress, 7)
+			}
+		} else {
+			payouts, err = addLPoDDeferredValidatorPayout(payouts, pub.Hex(), secondAddress, 1)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinned := false
+	for _, payout := range payouts {
+		if payout.Validator == firstValidator {
+			pinned = payout.Address == firstAddress && payout.AmountNAPRO == 12
+			break
+		}
+	}
+	if len(payouts) != core.MaxValidators || !pinned {
+		t.Fatalf("daily payout set did not pin first address or aggregate exactly: %+v", payouts)
+	}
+	_, extraValidator, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := addLPoDDeferredValidatorPayout(payouts, extraValidator.Hex(), secondAddress, 1); err == nil {
+		t.Fatal("daily payout checkpoint exceeded the active-validator bound")
+	}
+}
+
+func TestDeriveLPoDDailyValidatorPayoutsDefersAndReleasesToPinnedAddress(t *testing.T) {
+	_, validatorPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstWallet, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondWallet, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAddress := crypto.AddressFromKeys(crypto.MainnetByte, firstWallet)
+	secondAddress := crypto.AddressFromKeys(crypto.MainnetByte, secondWallet)
+	validator := validatorPub.Hex()
+	const nextBoundary = int64(1_000_000_000_000)
+
+	activation := &LPoDCheckpoint{
+		ValidatorDailyPayoutVersion: 1,
+		NextValidatorPayoutNS:       nextBoundary,
+		State: lpod.State{
+			PendingLeader: 10,
+		},
+		PendingValidatorPayouts: []LPoDDeferredValidatorPayout{{
+			Validator: validator, Address: firstAddress, AmountNAPRO: 10,
+		}},
+	}
+	outputs, byValidator, err := deriveLPoDValidatorPayouts(
+		&LPoDCheckpoint{}, activation, nextBoundary-10, validator, firstAddress,
+	)
+	if err != nil || len(outputs) != 0 || len(byValidator) != 0 {
+		t.Fatalf("activation paid before the first daily boundary: outputs=%v validators=%v err=%v",
+			outputs, byValidator, err)
+	}
+
+	beforeBoundary := *activation
+	beforeBoundary.PendingValidatorPayouts = append(
+		[]LPoDDeferredValidatorPayout(nil), activation.PendingValidatorPayouts...,
+	)
+	next := *activation
+	next.State.PendingLeader = 17
+	next.PendingValidatorPayouts = []LPoDDeferredValidatorPayout{{
+		Validator: validator, Address: firstAddress, AmountNAPRO: 17,
+	}}
+	outputs, _, err = deriveLPoDValidatorPayouts(
+		&beforeBoundary, &next, nextBoundary-1, validator, secondAddress,
+	)
+	if err != nil || len(outputs) != 0 {
+		t.Fatalf("daily reward was released early or redirected: outputs=%v err=%v", outputs, err)
+	}
+
+	paid := *activation
+	paid.State.LeaderPaid = 20
+	paid.State.PendingLeader = 0
+	paid.NextValidatorPayoutNS = nextBoundary + 24*60*60*1_000_000_000
+	paid.PendingValidatorPayouts = nil
+	outputs, byValidator, err = deriveLPoDValidatorPayouts(
+		&next, &paid, nextBoundary, validator, secondAddress,
+	)
+	if err != nil || outputs[firstAddress] != 20 || len(outputs) != 1 ||
+		byValidator[validator] != 20 || len(byValidator) != 1 {
+		t.Fatalf("daily boundary did not release to the pinned owner: outputs=%v validators=%v err=%v",
+			outputs, byValidator, err)
+	}
+
+	legacyBefore := &LPoDCheckpoint{}
+	legacyAfter := &LPoDCheckpoint{State: lpod.State{LeaderPaid: 5}}
+	outputs, byValidator, err = deriveLPoDValidatorPayouts(
+		legacyBefore, legacyAfter, nextBoundary, validator, secondAddress,
+	)
+	if err != nil || outputs[secondAddress] != 5 || byValidator[validator] != 5 {
+		t.Fatalf("legacy per-block validator payout changed: outputs=%v validators=%v err=%v",
+			outputs, byValidator, err)
 	}
 }
 
@@ -143,6 +271,28 @@ func TestLPoDDailyAccrualWaitsForBoundaryAndTopUpResetsOnlyPendingAmount(t *test
 		Timestamp: boundary.Add(-time.Second).UnixNano(), Proposer: pub.Hex(),
 		Leader: crypto.AddressFromKeys(crypto.MainnetByte, leader),
 		Stake:  map[string]LPoDValidatorStake{pub.Hex(): {Amount: 100_000 * lpod.Unit, Active: true}},
+	}
+	activationRequest := *request
+	activationRequest.Timestamp = parent.Header.Timestamp + 1
+	activationRequest.DailyValidatorPayout = true
+	activationRequest.ValidatorDailyPayoutActivationHeight = 3
+	activation, _, err := db.PreviewLPoD(3, &activationRequest)
+	if err != nil {
+		t.Fatalf("preview future-only daily payout activation: %v", err)
+	}
+	activatedPosition := activation.Positions[id]
+	if activatedPosition.Due != 0 || activatedPosition.PendingDue != 0 ||
+		activation.PendingLiability != 0 || activation.State.UnfundedLiability != 0 ||
+		activation.State.AccruedLiability != activation.State.AngelPaid ||
+		activation.State.PendingLeader == 0 ||
+		activation.ValidatorDailyPayoutVersion != 1 {
+		t.Fatalf("activation did not exclude historical unpaid Guardian debt or defer new validator reward: position=%+v checkpoint=%+v",
+			activatedPosition, activation)
+	}
+	missedActivation := activationRequest
+	missedActivation.ValidatorDailyPayoutActivationHeight = 2
+	if _, _, err := db.PreviewLPoD(3, &missedActivation); err == nil {
+		t.Fatal("a node that missed the configured daily activation height silently activated late")
 	}
 	beforeBoundary, _, err := db.PreviewLPoD(3, request)
 	if err != nil {
@@ -302,7 +452,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +490,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	parent := &core.Block{Header: core.BlockHeader{Height: deadline - 1, Timestamp: 1, ValidatorPub: pub},
 		Txs: []core.Transaction{{Version: core.TxVersionLPoDPayout}, core.LPoDCheckpointTx(checkpoint.Digest())}}
 	parent.Header.MerkleRoot = core.MerkleRoot(parent.Txs)
-	parent.Header.Sign(priv)
+	testutil.NoError(t, parent.Header.Sign(priv))
 	raw, _ := json.Marshal(parent)
 	if err := db.PutRawBlock(parent.Hash(), parent.Header.Height, raw); err != nil {
 		t.Fatal(err)
@@ -389,7 +539,7 @@ func TestLPoDImmediatePrincipalReturnRetainsAndRepaysArrears(t *testing.T) {
 	block := &core.Block{Header: core.BlockHeader{Height: deadline, PrevHash: parent.Hash(), Timestamp: request.Timestamp, ValidatorPub: pub},
 		Txs: []core.Transaction{payout, core.LPoDCheckpointTx(c.Digest()), *withdraw}}
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
-	block.Header.Sign(priv)
+	testutil.NoError(t, block.Header.Sign(priv))
 	raw, _ = json.Marshal(block)
 	if err := db.CommitRawBlockWithAVM(block.Hash(), deadline, raw, nil, crypto.Hash32{}, request); err != nil {
 		t.Fatal(err)

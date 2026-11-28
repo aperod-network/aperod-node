@@ -19,6 +19,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -89,14 +90,14 @@ func TestTxIndex_PutLoad(t *testing.T) {
 			}
 		}
 	}
-	db1.Close()
+	testutil.Close(t, db1)
 
 	// ── Second session: reload and verify ───────────────────────────────────
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("Open (second session): %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	idx, err := db2.LoadTxIndex(0)
 	if err != nil {
@@ -150,7 +151,7 @@ func TestTxIndex_LoadMinHeight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	for _, blk := range []*core.Block{genesis, blk1, blk2} {
 		for i, tx := range blk.Txs {
@@ -186,7 +187,7 @@ func TestTxIndex_LoadEmptyReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	idx, err := db.LoadTxIndex(0)
 	if err != nil {
@@ -374,14 +375,14 @@ func TestTxIndex_EndToEnd(t *testing.T) {
 	persistBlock(genesis)
 	persistBlock(blk1)
 	persistBlock(blk2)
-	db1.Close()
+	testutil.Close(t, db1)
 
 	// ── Second session: simulate node restart with fast path ─────────────────
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("Open (second session): %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	_, tipHeight, err := db2.GetTip()
 	if err != nil {

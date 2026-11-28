@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -57,7 +58,7 @@ func TestPongCooldown_SuppressesRedundantRequestHeaders(t *testing.T) {
 	if err := tcpLn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatalf("set listener deadline: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	serverDone := make(chan struct{})
 	go func() {
@@ -66,7 +67,7 @@ func TestPongCooldown_SuppressesRedundantRequestHeaders(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 		conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 
 		// Inbound handshake: wait for MsgPing, reply MsgPong(0).
@@ -202,7 +203,7 @@ func TestPongCooldown_SelfHealFallback(t *testing.T) {
 	if err := tcpLn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatalf("set listener deadline: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// pongCh carries (height, timestamp) pairs for the write goroutine to send
 	// as MsgPong messages.  The server goroutine feeds heights via this channel.
@@ -216,7 +217,7 @@ func TestPongCooldown_SelfHealFallback(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 		conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 
 		// Inbound handshake.

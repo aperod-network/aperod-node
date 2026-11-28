@@ -1,0 +1,28 @@
+{
+  "statement": {
+    "schema_version": "aperod-mainnet-bootstrap-v2",
+    "network": "mainnet",
+    "chain_id": "aperod-mainnet-1",
+    "trust_model": "operator_1_of_1",
+    "bootstrap_signer_public_key": "8bf6b47c87e075007527993d3ea1c8f45424c1f382cb43eab8ab7f5c19cb650f",
+    "genesis_header_hash": "c8fde86c1764a5603eabd6d9c56c9e47b4cf06d88d299a55665694473e2c512f",
+    "genesis_index_hash": "da452e4c9d3bd8a21d73289c88a3583960eb774d0fa312206b72020b5dc54de1",
+    "genesis_signature_hash_kind": "canonical_index_hash",
+    "genesis_signer_public_key": "08fd38ba8857d32d2ac807f0246a0fd298c9edf336fbd0fea3bb7bd818c91137",
+    "checkpoint_height": 4076315,
+    "checkpoint_header_hash": "48f2668a598b9fe9111bed594ce7fcf646bdb15385eac91542188dd5a82aea70",
+    "checkpoint_index_hash": "48f2668a598b9fe9111bed594ce7fcf646bdb15385eac91542188dd5a82aea70",
+    "checkpoint_validator_public_key": "08fd38ba8857d32d2ac807f0246a0fd298c9edf336fbd0fea3bb7bd818c91137",
+    "checkpoint_signature_length": 64,
+    "checkpoint_signature_hash_kind": "header_hash",
+    "checkpoint_oracle_price": 70188000,
+    "checkpoint_base_fee": 50,
+    "validator_authority_fork_sha256": "56ddcf10e5e83efc79d81eee0cf2bc065ea052142b5f6f85ec2085eb327cd196",
+    "protocol_sale_migration_sha256": "f3344da9cfb502a68b9c38d5c02c6feb17cd9169f2759e1e2a17b34615c98384",
+    "lpod_migration_witness_sha256": "b25f546a2bd00a40afc3ed8f0a17ff5b73fd7a8ef1765e8fabe9436ab8519dc0",
+    "snapshot_tree_sha256": "18a50686c11d5772606057ab89c08698d71ae698496e4e9bfceb1dceea29d795",
+    "registry_sha256": "7f20fab06735fbddc014316f37c8da667e99ce122a6e28bd4db28a6722506254"
+  },
+  "signer_public_key": "8bf6b47c87e075007527993d3ea1c8f45424c1f382cb43eab8ab7f5c19cb650f",
+  "signature": "c8c0eca61438548b0c04e6880b51769cfb7efa925157824f68586dc59db120e149b52d201ec0b3a125b5b7923bbe06110ba73d561343029bb1b0c864a40fe504"
+}

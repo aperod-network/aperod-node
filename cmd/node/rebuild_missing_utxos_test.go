@@ -13,6 +13,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -32,7 +33,7 @@ func buildMintBlock(t *testing.T, dir string) (*store.DB, *core.Block, crypto.Ha
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	putBlk := func(b *core.Block) {
 		raw, merr := json.Marshal(b)

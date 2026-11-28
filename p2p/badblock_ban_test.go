@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -46,7 +48,7 @@ func connectPeer(t *testing.T, hostAddr string) (conn net.Conn, peerIP string) {
 	}
 	peerIP = host
 
-	c.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, c.SetDeadline(time.Now().Add(2*time.Second)))
 	// Dialer sends Ping first (asymmetric handshake).
 	if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
 		NodeID:    "rogue-peer",
@@ -54,16 +56,16 @@ func connectPeer(t *testing.T, hostAddr string) (conn net.Conn, peerIP string) {
 		UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); err != nil {
-		c.Close()
+		testutil.Close(t, c)
 		t.Fatalf("write ping: %v", err)
 	}
 	// Host replies with Pong.
 	msgType, _, err := p2p.ReadMsg(c)
 	if err != nil || msgType != p2p.MsgPong {
-		c.Close()
+		testutil.Close(t, c)
 		t.Fatalf("expected MsgPong, got %v err=%v", msgType, err)
 	}
-	c.SetDeadline(time.Time{}) // clear deadline
+	testutil.NoError(t, c.SetDeadline(time.Time{})) // clear deadline
 	return c, peerIP
 }
 
@@ -73,11 +75,11 @@ func sendBlockAtHeight(t *testing.T, conn net.Conn, height uint64) {
 	sb := p2p.SerializedBlock{
 		Header: p2p.SerializedHeader{Height: height},
 	}
-	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	testutil.NoError(t, conn.SetWriteDeadline(time.Now().Add(time.Second)))
 	if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
 		t.Fatalf("WriteMsg block h=%d: %v", height, err)
 	}
-	conn.SetWriteDeadline(time.Time{})
+	testutil.NoError(t, conn.SetWriteDeadline(time.Time{}))
 }
 
 // waitFor polls cond up to maxWait and returns whether it became true.
@@ -108,7 +110,7 @@ func TestBadBlockBan_9BlocksNotBanned(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, _ := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	// Wait for peer to register.
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
@@ -148,7 +150,7 @@ func TestBadBlockBan_10thBlockBansPeer(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -201,7 +203,7 @@ func TestBadBlockBan_ReconnectRejected(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -222,11 +224,11 @@ func TestBadBlockBan_ReconnectRejected(t *testing.T) {
 		// Connection refused at TCP level means the host itself is down — that's wrong.
 		t.Fatalf("host unreachable on reconnect: %v", err)
 	}
-	defer conn2.Close()
+	defer testutil.CleanupClose(t, conn2)
 
 	// Attempt the handshake; the host should close the connection immediately
 	// because the bare IP is banned.
-	conn2.SetDeadline(time.Now().Add(time.Second))
+	testutil.NoError(t, conn2.SetDeadline(time.Now().Add(time.Second)))
 	_ = p2p.WriteMsg(conn2, p2p.MsgPing, p2p.PingMsg{
 		NodeID:    "rogue-peer-reconnect",
 		Height:    0,
@@ -270,11 +272,11 @@ func TestBadBlockBan_AllConnectionsEvicted(t *testing.T) {
 
 	// First connection — will be used to send bad blocks.
 	conn1, _ := connectPeer(t, hostAddr)
-	defer conn1.Close()
+	defer testutil.CleanupClose(t, conn1)
 
 	// Second connection from the same IP (127.0.0.1), different source port.
 	conn2, _ := connectPeer(t, hostAddr)
-	defer conn2.Close()
+	defer testutil.CleanupClose(t, conn2)
 
 	// Wait for both peers to register.
 	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 2 }) {
@@ -297,7 +299,7 @@ func TestBadBlockBan_AllConnectionsEvicted(t *testing.T) {
 	// fix), so buffered bytes may still be readable — drain them until the
 	// read errors, then distinguish close (EOF/reset) from a still-open
 	// connection (timeout).
-	conn2.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	testutil.NoError(t, conn2.SetDeadline(time.Now().Add(300*time.Millisecond)))
 	buf := make([]byte, 256)
 	var readErr error
 	for readErr == nil {
@@ -370,7 +372,7 @@ func TestBadBlockBan_ValidBlockResetsCounter(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, _ := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -428,7 +430,7 @@ func TestBadBlockBan_CustomThreshold(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -480,7 +482,7 @@ func TestBadBlockBan_CustomHeightLead(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -535,7 +537,7 @@ func TestBadBlockBan_CustomBanDuration(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -589,7 +591,7 @@ func TestBadBlockBan_WhitelistedPeerNotBanned(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -665,7 +667,7 @@ func TestBadBlockBan_NonWhitelistedStillBanned(t *testing.T) {
 
 	hostAddr2 := h2.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr2)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h2.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -737,7 +739,7 @@ func TestBadBlockBan_WhitelistPersistsAcrossRestart(t *testing.T) {
 	}
 
 	conn1, peerIP := connectPeer(t, h1.ListenAddr())
-	defer conn1.Close()
+	defer testutil.CleanupClose(t, conn1)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h1.PeerCount() == 1 }) {
 		t.Fatal("h1: peer did not register after handshake")
@@ -761,7 +763,7 @@ func TestBadBlockBan_WhitelistPersistsAcrossRestart(t *testing.T) {
 	t.Logf("h1: peer %s correctly not banned (whitelisted); sidecar written to %s", peerIP, wlFile)
 
 	h1.Stop()
-	conn1.Close()
+	testutil.Close(t, conn1)
 
 	// ── Phase 2: simulated restart — sidecar is the sole source of truth ─────
 
@@ -799,7 +801,7 @@ func TestBadBlockBan_WhitelistPersistsAcrossRestart(t *testing.T) {
 	t.Logf("h2: whitelist loaded from sidecar: %v", loaded)
 
 	conn2, peerIP2 := connectPeer(t, h2.ListenAddr())
-	defer conn2.Close()
+	defer testutil.CleanupClose(t, conn2)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h2.PeerCount() == 1 }) {
 		t.Fatal("h2: peer did not register after handshake (post-restart)")
@@ -895,7 +897,7 @@ func TestWhitelistSidecar_UnreadableAbortsStart(t *testing.T) {
 	if err := os.Chmod(wlFile, 0o000); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
-	t.Cleanup(func() { os.Chmod(wlFile, 0o644) }) // restore so TempDir cleanup succeeds
+	t.Cleanup(func() { testutil.NoError(t, os.Chmod(wlFile, 0o644)) }) // restore so TempDir cleanup succeeds
 
 	h := p2p.NewHost(p2p.Config{
 		ListenAddr:    "127.0.0.1:0",
@@ -1018,7 +1020,7 @@ func TestWhitelistInboundGate_AllowsAfterRestart(t *testing.T) {
 	// If the acceptLoop gate drops the connection before the handshake, the
 	// MsgPong read will fail and the test will report the regression.
 	conn, peerIP := connectPeer(t, h2.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	// PeerCount must reach 1: the whitelisted peer passed the inbound-IP gate
 	// and completed the handshake.
@@ -1067,7 +1069,7 @@ func TestRoguePeerBan_FullPipeline_AsymmetricHandshake(t *testing.T) {
 	// ── Step 1: complete the asymmetric Ping/Pong handshake ──────────────────
 	// connectPeer: dialer sends Ping → host replies Pong.
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after asymmetric handshake")
@@ -1122,11 +1124,11 @@ func TestRoguePeerBan_FullPipeline_AsymmetricHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 4 failed: host unreachable on reconnect: %v", err)
 	}
-	defer conn2.Close()
+	defer testutil.CleanupClose(t, conn2)
 
 	// Attempt the asymmetric handshake from the banned IP.
 	// The host must close the connection immediately on the ban check.
-	conn2.SetDeadline(time.Now().Add(time.Second))
+	testutil.NoError(t, conn2.SetDeadline(time.Now().Add(time.Second)))
 	_ = p2p.WriteMsg(conn2, p2p.MsgPing, p2p.PingMsg{
 		NodeID:    "rogue-reconnect",
 		Height:    0,
@@ -1222,9 +1224,9 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 	// Dialer sends Ping first (asymmetric handshake); host replies with Pong.
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID:    "validator-peer",
@@ -1238,7 +1240,7 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 	if err != nil || msgType != p2p.MsgPong {
 		t.Fatalf("expected MsgPong, got type=%v err=%v", msgType, err)
 	}
-	conn.SetDeadline(time.Time{})
+	testutil.NoError(t, conn.SetDeadline(time.Time{}))
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -1258,11 +1260,11 @@ func TestBadBlockBan_RelaySyncNoBan(t *testing.T) {
 			Header: p2p.SerializedHeader{Height: header.Height, ValidatorPub: header.ValidatorPub[:],
 				Timestamp: header.Timestamp, MerkleRoot: header.MerkleRoot, Signature: header.Signature},
 		}
-		conn.SetWriteDeadline(time.Now().Add(time.Second))
+		testutil.NoError(t, conn.SetWriteDeadline(time.Now().Add(time.Second)))
 		if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
 			t.Fatalf("WriteMsg block %d: %v", i, err)
 		}
-		conn.SetWriteDeadline(time.Time{})
+		testutil.NoError(t, conn.SetWriteDeadline(time.Time{}))
 	}
 
 	// Give the host time to process all 20 messages.
@@ -1320,9 +1322,9 @@ func TestBadBlockBan_RoguePeerStillBanned(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 		if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 			NodeID:    "rogue-peer",
 			Height:    peerHeight,
@@ -1335,7 +1337,7 @@ func TestBadBlockBan_RoguePeerStillBanned(t *testing.T) {
 		if err != nil || msgType != p2p.MsgPong {
 			t.Fatalf("expected MsgPong, got type=%v err=%v", msgType, err)
 		}
-		conn.SetDeadline(time.Time{})
+		testutil.NoError(t, conn.SetDeadline(time.Time{}))
 
 		if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 			t.Fatal("peer did not register after handshake")
@@ -1345,12 +1347,12 @@ func TestBadBlockBan_RoguePeerStillBanned(t *testing.T) {
 			sb := p2p.SerializedBlock{
 				Header: p2p.SerializedHeader{Height: rogueBlockHeight},
 			}
-			conn.SetWriteDeadline(time.Now().Add(time.Second))
+			testutil.NoError(t, conn.SetWriteDeadline(time.Now().Add(time.Second)))
 			if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
 				// Connection may have been closed by the ban — stop sending.
 				break
 			}
-			conn.SetWriteDeadline(time.Time{})
+			testutil.NoError(t, conn.SetWriteDeadline(time.Time{}))
 		}
 
 		if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 0 }) {
@@ -1552,7 +1554,7 @@ func TestBanFile_UnreadableAbortsStart(t *testing.T) {
 	if err := os.Chmod(banFile, 0o000); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
-	t.Cleanup(func() { os.Chmod(banFile, 0o644) }) // restore so TempDir cleanup succeeds
+	t.Cleanup(func() { testutil.NoError(t, os.Chmod(banFile, 0o644)) }) // restore so TempDir cleanup succeeds
 
 	h := p2p.NewHost(p2p.Config{
 		ListenAddr: "127.0.0.1:0",
@@ -1794,7 +1796,7 @@ func TestWhitelist_EmptySidecarRetainsNodeYamlEntries(t *testing.T) {
 	// Because the whitelist is non-empty and 127.0.0.1 is in it, the acceptLoop
 	// must allow the connection rather than dropping it immediately.
 	conn, _ := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Errorf("peer from 127.0.0.1 was NOT accepted through the inbound-IP gate "+
@@ -1864,7 +1866,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer tlsConn.Close()
+	defer testutil.CleanupClose(t, tlsConn)
 
 	// Extract the bare IP as seen by the host (local side of our connection).
 	localAddr := tlsConn.LocalAddr().String()
@@ -1887,7 +1889,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 	if err != nil || msgType != p2p.MsgPong {
 		t.Fatalf("expected MsgPong over TLS, got %v err=%v", msgType, err)
 	}
-	tlsConn.SetDeadline(time.Time{}) // clear deadline
+	testutil.NoError(t, tlsConn.SetDeadline(time.Time{})) // clear deadline
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("TLS peer did not register after Ping/Pong handshake")
@@ -1971,7 +1973,7 @@ func TestBadBlockBan_TLSAuthenticatedPeer(t *testing.T) {
 		}
 		return
 	}
-	defer tlsConn2.Close()
+	defer testutil.CleanupClose(t, tlsConn2)
 
 	// TLS handshake completed — regression scenario: the ban check did not fire
 	// before the TLS handshake.  The host must still close the connection at the
@@ -2073,12 +2075,12 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 			UserAgent: "test",
 			Timestamp: time.Now().Unix(),
 		}); err != nil {
-			c.Close()
+			testutil.Close(t, c)
 			t.Fatalf("write ping (%s): %v", nodeID, err)
 		}
 		msgType, _, err := p2p.ReadMsg(c)
 		if err != nil || msgType != p2p.MsgPong {
-			c.Close()
+			testutil.Close(t, c)
 			t.Fatalf("expected MsgPong (%s), got %v err=%v", nodeID, msgType, err)
 		}
 		c.SetDeadline(time.Time{}) //nolint:errcheck
@@ -2087,10 +2089,10 @@ func TestBadBlockBan_TLSAllConnectionsEvicted(t *testing.T) {
 
 	// Open two TLS connections from the same 127.0.0.1 address.
 	tlsConn1 := dialTLS("tls-rogue-1")
-	defer tlsConn1.Close()
+	defer testutil.CleanupClose(t, tlsConn1)
 
 	tlsConn2 := dialTLS("tls-rogue-2")
-	defer tlsConn2.Close()
+	defer testutil.CleanupClose(t, tlsConn2)
 
 	// Wait for both peers to register.
 	if !waitFor(600*time.Millisecond, func() bool { return h.PeerCount() == 2 }) {
@@ -2151,12 +2153,12 @@ func TestTimestampBan_TLSAllConnectionsEvicted(t *testing.T) {
 	// Pin the host identity rather than bypassing certificate verification.
 	cfgPeer = pinTLSConfig(t, cfgPeer, fpHost)
 	h := p2p.NewHost(p2p.Config{
-		ListenAddr:           "127.0.0.1:0",
-		MaxPeers:             10,
-		NodeID:               "test-timestamp-tls-evict",
-		UserAgent:            "aperod/test",
-		TLSConfig:            cfgHost,
-		AllowedPeers:         []string{fpPeer},
+		ListenAddr:            "127.0.0.1:0",
+		MaxPeers:              10,
+		NodeID:                "test-timestamp-tls-evict",
+		UserAgent:             "aperod/test",
+		TLSConfig:             cfgHost,
+		AllowedPeers:          []string{fpPeer},
 		TimestampBanThreshold: threshold,
 		TimestampBanDuration:  time.Hour,
 	}, &stubHandler{}, newTestLogger())
@@ -2314,7 +2316,7 @@ func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer tlsConn.Close()
+	defer testutil.CleanupClose(t, tlsConn)
 
 	// Extract the bare IP as seen by the host (local side of our connection).
 	localAddr := tlsConn.LocalAddr().String()
@@ -2337,7 +2339,7 @@ func TestBadBlockBan_TLSWhitelistedPeerNotBanned(t *testing.T) {
 	if err != nil || msgType != p2p.MsgPong {
 		t.Fatalf("expected MsgPong over TLS, got %v err=%v", msgType, err)
 	}
-	tlsConn.SetDeadline(time.Time{}) // clear deadline
+	testutil.NoError(t, tlsConn.SetDeadline(time.Time{})) // clear deadline
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("TLS peer did not register after Ping/Pong handshake")
@@ -2497,7 +2499,7 @@ func TestSlowHandshakeFlood(t *testing.T) {
 		} else {
 			t.Logf("step 2 ✓ excess conn %d closed by host: %v", i, readErr)
 		}
-		c.Close()
+		testutil.Close(t, c)
 	}
 
 	// The counter must not have exceeded the cap at any point we can observe.
@@ -2510,7 +2512,7 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	// EOF error; handleConn then calls releaseHS() via defer, decrementing the
 	// counter.
 	for _, c := range floodConns {
-		c.Close()
+		testutil.Close(t, c)
 	}
 	if !waitFor(time.Second, func() bool {
 		return h.PendingHandshakes() == 0
@@ -2534,7 +2536,7 @@ func TestSlowHandshakeFlood(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 4 failed: legitimate TLS peer could not connect after flood: %v", err)
 	}
-	defer tlsConn.Close()
+	defer testutil.CleanupClose(t, tlsConn)
 
 	localAddr := tlsConn.LocalAddr().String()
 	legitIP, _, splitErr := net.SplitHostPort(localAddr)
@@ -2728,7 +2730,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 			t.Logf("phase 2 ✓ excess conn %d immediately closed by host: %v", i, readErr)
 			closedCount++
 		}
-		c.Close()
+		testutil.Close(t, c)
 	}
 	t.Logf("phase 2 summary: %d/%d excess connections immediately closed by host",
 		closedCount, extraFlood)
@@ -2743,7 +2745,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 	// permanently — the guard becomes a ratchet that can only tighten.
 	for _, c := range floodConns {
 		if c != nil {
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}
 	if !waitFor(2*time.Second, func() bool {
@@ -2765,7 +2767,7 @@ func TestConcurrentHandshakeFlood(t *testing.T) {
 	if err != nil {
 		t.Fatalf("phase 4: legitimate TLS peer could not connect after concurrent flood: %v", err)
 	}
-	defer tlsConn.Close()
+	defer testutil.CleanupClose(t, tlsConn)
 
 	tlsConn.SetDeadline(time.Now().Add(3 * time.Second)) //nolint:errcheck
 	if err := p2p.WriteMsg(tlsConn, p2p.MsgPing, p2p.PingMsg{
@@ -2828,7 +2830,7 @@ func TestBadBlockBan_BanEventRecorded(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -2916,7 +2918,7 @@ func TestBadBlockStrike_TTLResetsCounter(t *testing.T) {
 	defer h.Stop()
 
 	conn, peerIP := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -3003,7 +3005,7 @@ func TestBadBlockStrike_AccumulatesWithinTTL(t *testing.T) {
 	defer h.Stop()
 
 	conn, peerIP := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("peer did not register after handshake")
@@ -3191,7 +3193,7 @@ func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
 			// Tight polling: no sleep, to maximize the chance of catching a
 			// partial write between the truncate and re-write steps that a
 			// non-atomic implementation would expose.
-			runtime_gosched()
+			runtime.Gosched()
 		}
 	}()
 
@@ -3238,21 +3240,6 @@ func TestBanSidecar_ConcurrentWritesNeverPartiallyVisible(t *testing.T) {
 	t.Logf("final sidecar: %d entries", len(entries))
 }
 
-// runtime_gosched is a thin wrapper around runtime.Gosched so the reader
-// goroutine yields to other goroutines rather than spinning the CPU to 100%.
-// Defined as a function (not a direct call) to keep the import confined to the
-// helper and avoid adding "runtime" to the top-level import block unnecessarily.
-func runtime_gosched() {
-	// Intentional tight loop without sleep: we want to maximize read frequency
-	// to stress the atomicity of the sidecar write.  A brief yield prevents
-	// the goroutine from starving the writers on single-CPU builds.
-	//
-	// We use a micro-sleep instead of runtime.Gosched() to avoid importing the
-	// runtime package just for this — time.Sleep(0) is equivalent on all
-	// platforms supported by the Go scheduler.
-	time.Sleep(0)
-}
-
 // ─── Test: null-JSON whitelist sidecar blocks startup ────────────────────────
 
 // TestWhitelistSidecar_EmptySidecarAndNoCfgIsOpenNetwork confirms that an
@@ -3291,7 +3278,7 @@ func TestWhitelistSidecar_EmptySidecarAndNoCfgIsOpenNetwork(t *testing.T) {
 
 	// A peer from 127.0.0.1 must be accepted — no IP restriction should apply.
 	conn, _ := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Errorf("PeerCount = %d after handshake, want 1 (open network must accept the peer)", h.PeerCount())
@@ -3368,7 +3355,7 @@ func TestBadBlockBan_RoguePeerBanEventAndDialBlocked(t *testing.T) {
 	defer h.Stop()
 
 	conn, peerIP := connectPeer(t, h.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("rogue peer did not register after handshake")

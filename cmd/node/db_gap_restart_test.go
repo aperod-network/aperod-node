@@ -38,6 +38,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -72,7 +73,7 @@ func buildChainWithGap(t *testing.T, dir string, nBlocks int, gapHeight uint64) 
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	blocks := make([]*core.Block, nBlocks+1)
 	genesis := makeBlock(0, crypto.Hash32{})
@@ -216,20 +217,6 @@ func (f *filteredGetter) GetRawBlockByHeight(h uint64) ([]byte, error) {
 		return nil, nil
 	}
 	return f.inner.GetRawBlockByHeight(h)
-}
-
-// stubGetter is a minimal blockByHeightGetter backed by an in-memory map.
-// Used by anchor-guard unit tests that don't need a full LevelDB store.
-type stubGetter struct {
-	blocks map[uint64][]byte
-}
-
-func (s *stubGetter) GetRawBlockByHeight(h uint64) ([]byte, error) {
-	b, ok := s.blocks[h]
-	if !ok {
-		return nil, nil
-	}
-	return b, nil
 }
 
 // TestTipAnchorGuardNoopWhenTipIsCorrect verifies that anchorTipIfNeeded is a
@@ -570,7 +557,7 @@ func buildEntireWindowGapChain(t *testing.T, dir string, nBlocks int) (*store.DB
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	storeBlk := func(b *core.Block) {
 		raw, merr := json.Marshal(b)

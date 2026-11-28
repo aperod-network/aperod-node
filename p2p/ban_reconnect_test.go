@@ -39,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -47,7 +48,7 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// Track how many connections the listener received and whether each
 	// was immediately closed by the other side (no data, immediate EOF).
@@ -119,7 +120,7 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 			t.Fatalf("listener accept: %v", res.err)
 		}
 		listenerConn = res.conn
-		defer listenerConn.Close()
+		defer testutil.CleanupClose(t, listenerConn)
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("listener did not receive connection within 500 ms")
 	}
@@ -139,7 +140,7 @@ func TestBanDial_PostConnect_BanDropsConnection(t *testing.T) {
 	}
 
 	// The listener side of the connection must be closed (no data, EOF).
-	listenerConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	testutil.NoError(t, listenerConn.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
 	buf := make([]byte, 1)
 	_, readErr := listenerConn.Read(buf)
 	if readErr == nil {
@@ -185,7 +186,7 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	var dialCount atomic.Int32
 	go func() {
@@ -195,7 +196,7 @@ func TestBanDial_ConcurrentBan_KnownPeer(t *testing.T) {
 				return
 			}
 			dialCount.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 
@@ -270,7 +271,7 @@ func TestBanDial_ConcurrentBan_Bootnode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	var dialCount atomic.Int32
 	go func() {
@@ -280,7 +281,7 @@ func TestBanDial_ConcurrentBan_Bootnode(t *testing.T) {
 				return
 			}
 			dialCount.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 
@@ -359,7 +360,7 @@ func TestBanReconnect_MaintainLoopSkipsBannedPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	var dialCount atomic.Int32
 	go func() {
@@ -369,7 +370,7 @@ func TestBanReconnect_MaintainLoopSkipsBannedPeer(t *testing.T) {
 				return // listener closed; goroutine exits cleanly
 			}
 			dialCount.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 
@@ -437,7 +438,7 @@ func TestBanReconnect_BootnodePathSkipsBannedAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	var dialCount atomic.Int32
 	go func() {
@@ -447,7 +448,7 @@ func TestBanReconnect_BootnodePathSkipsBannedAddr(t *testing.T) {
 				return
 			}
 			dialCount.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 
@@ -514,13 +515,13 @@ func TestBanReconnect_BareIPBanBlocksListenPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen ephemeral: %v", err)
 	}
-	defer lnEphemeral.Close()
+	defer testutil.CleanupClose(t, lnEphemeral)
 
 	lnListen, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen listen: %v", err)
 	}
-	defer lnListen.Close()
+	defer testutil.CleanupClose(t, lnListen)
 
 	var dialCount atomic.Int32
 	go func() {
@@ -530,7 +531,7 @@ func TestBanReconnect_BareIPBanBlocksListenPort(t *testing.T) {
 				return
 			}
 			dialCount.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 

@@ -1034,13 +1034,9 @@ func sameDailyStakeMap(a, b map[string]store.LPoDValidatorStake) bool {
 	return true
 }
 
-func (s *Server) verifyDailyLPoDAudit(block *core.Block, r *store.LPoDBlockAudit) error {
-	return s.verifyDailyLPoDAuditWithCache(block, r, nil, nil, nil)
-}
-
 // verifyDailyLPoDAuditWithCache reuses immutable adjacent checkpoints and the
 // already-authenticated contiguous predecessor supplied by the daily scan.
-// Standalone callers use verifyDailyLPoDAudit, which performs all reads itself.
+// Nil caches cause the verifier to perform the corresponding reads itself.
 func (s *Server) verifyDailyLPoDAuditWithCache(
 	block *core.Block,
 	r *store.LPoDBlockAudit,
@@ -1294,6 +1290,7 @@ func (s *Server) verifyDailyPositionRowsWithParent(
 		block.Header.Timestamp <= parent.Header.Timestamp {
 		return fail(fmt.Errorf("position accrual parent body or timestamp unavailable"))
 	}
+	// #nosec G115 -- Strict monotonicity above makes the mathematical delta unsigned; this preserves its full 64-bit value even across signed subtraction wrap. Capped below.
 	elapsed := uint64(block.Header.Timestamp - parent.Header.Timestamp)
 	const maxElapsedNS = uint64(15_000_000_000)
 	if elapsed > maxElapsedNS {

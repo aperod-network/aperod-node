@@ -27,13 +27,18 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
       - name: Scan reachable Go vulnerabilities
         run: govulncheck ./...
+      - name: Full-module Go lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.3
+          args: --timeout=5m
       - name: Test application packages
         shell: bash
         run: |
           set -euo pipefail
           mapfile -t packages < <(go list ./... | grep -v '^github.com/aperod/aperod/deploy$')
           test "${#packages[@]}" -gt 0
-          go test -timeout 600s "${packages[@]}"
+          go test -p 2 -timeout 600s "${packages[@]}"
       - name: Test privileged deployment fixtures
         # The backup socket requires root. Tests use temporary fixtures and
         # mocked services; do not relax that requirement in production code.

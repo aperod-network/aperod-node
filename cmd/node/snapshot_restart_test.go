@@ -31,6 +31,7 @@ import (
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -86,7 +87,7 @@ func buildChainInStore(t *testing.T, dir string, nExtra int) (*store.DB, []*core
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var blocks []*core.Block
 	genesis := makeBlock(0, crypto.Hash32{})
@@ -1553,7 +1554,7 @@ func TestSaveSnapshotAbortOnCopyFailLeavesOldPrimaryIntact(t *testing.T) {
 	if err := os.MkdirAll(blockPath, 0755); err != nil {
 		t.Fatalf("MkdirAll blocker %s: %v", blockPath, err)
 	}
-	t.Cleanup(func() { os.RemoveAll(blockPath) })
+	t.Cleanup(func() { testutil.NoError(t, os.RemoveAll(blockPath)) })
 
 	// ── Step 3: attempt a second save at the same height.
 	// saveStartupSnapshot must fail because copyFile cannot create its temp file.
@@ -1667,7 +1668,7 @@ func TestSaveSnapshotRenameFailureLeavesOldPrimaryIntact(t *testing.T) {
 	if err := os.MkdirAll(newPrimaryPath, 0755); err != nil {
 		t.Fatalf("MkdirAll rename-blocker %s: %v", newPrimaryPath, err)
 	}
-	t.Cleanup(func() { os.RemoveAll(newPrimaryPath) })
+	t.Cleanup(func() { testutil.NoError(t, os.RemoveAll(newPrimaryPath)) })
 
 	// ── Step 3: attempt the save at height 5 — must fail on rename.
 	const newTxTotal int64 = 99
@@ -2017,7 +2018,7 @@ func TestShutdownSnapshotMatchesFinalDBTip(t *testing.T) {
 	//   3. db.GetTip()   → reads the final tip = 6
 	//   4. saveSnapshot  → snapshot written at height 6
 	var shutLog bytes.Buffer
-	performShutdown(stop, engineDone, db, utxos, registry, dir, newCaptureLogger(&shutLog), nil)
+	performShutdown(stop, engineDone, db, utxos, registry, dir, newCaptureLogger(&shutLog))
 
 	// ── Assert: snapshot height == final DB tip (6, not 5) ──────────────────
 	dbTipHash, dbTipHeight, dbErr := db.GetTip()

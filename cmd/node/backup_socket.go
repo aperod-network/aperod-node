@@ -78,6 +78,8 @@ func startBackupSocket(dataDir string, exporter logicalBackupExporter) (*backupS
 		return nil, fmt.Errorf("backup socket: set socket permissions: %w", err)
 	}
 
+	// #nosec G118 -- Ownership transfers to backupSocket.Close, which cancels
+	// outstanding checkpoint work before the listener and socket are retired.
 	socketCtx, cancel := context.WithCancel(context.Background())
 	s := &backupSocket{
 		listener: listener,
@@ -91,7 +93,7 @@ func startBackupSocket(dataDir string, exporter logicalBackupExporter) (*backupS
 	s.cond = sync.NewCond(&s.mu)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/checkpoint", s.handleCheckpoint)
-	s.server = &http.Server{Handler: mux}
+	s.server = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		_ = s.server.Serve(listener)
 	}()
@@ -102,11 +104,16 @@ func startBackupSocket(dataDir string, exporter logicalBackupExporter) (*backupS
 // connection-refused/timeout result. The inode check prevents replacing a
 // different path if another process changes it while liveness is checked.
 func removeStaleBackupSocket(path string, info os.FileInfo) error {
+	effectiveUID := os.Geteuid()
+	if effectiveUID < 0 || uint64(effectiveUID) > uint64(^uint32(0)) {
+		return fmt.Errorf("backup socket: effective uid is outside the native uid range")
+	}
+	expectedUID := uint32(effectiveUID)
 	if info.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("backup socket: refusing to replace non-socket path %s", path)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uint32(os.Geteuid()) {
+	if !ok || stat.Uid != expectedUID {
 		return fmt.Errorf("backup socket: refusing to replace socket not owned by this user: %s", path)
 	}
 	conn, err := net.DialTimeout("unix", path, 250*time.Millisecond)
@@ -127,7 +134,7 @@ func removeStaleBackupSocket(path string, info os.FileInfo) error {
 	}
 	currentStat, ok := current.Sys().(*syscall.Stat_t)
 	if current.Mode()&os.ModeSocket == 0 || !ok ||
-		currentStat.Uid != uint32(os.Geteuid()) ||
+		currentStat.Uid != expectedUID ||
 		!os.SameFile(info, current) {
 		return fmt.Errorf("backup socket: existing path changed during stale check: %s", path)
 	}
@@ -190,6 +197,7 @@ func (s *backupSocket) handleCheckpoint(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "could not prepare backup staging directory", http.StatusInternalServerError)
 		return
 	}
+	// #nosec G302 -- stagingDir is a directory; owner execute is required for traversal, and group/other have no access.
 	if err := os.Chmod(stagingDir, 0700); err != nil {
 		http.Error(w, "could not secure backup staging directory", http.StatusInternalServerError)
 		return
@@ -221,6 +229,7 @@ func (s *backupSocket) handleCheckpoint(w http.ResponseWriter, r *http.Request) 
 	hashHex := fmt.Sprintf("%x", tipHash[:])
 
 	manifestPath := filepath.Join(stage, "manifest.json")
+	// #nosec G304 -- Fixed manifest basename in this backup's exclusively created private staging directory.
 	manifest, err := os.OpenFile(manifestPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		http.Error(w, "could not write backup manifest", http.StatusInternalServerError)

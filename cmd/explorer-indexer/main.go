@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/explorer"
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 func main() {
@@ -107,7 +108,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
-	defer idx.Close()
+	defer checkedio.LogClose(log, idx, "explorer index database")
 	log.Info("connected to PostgreSQL")
 
 	client := &nodeClient{

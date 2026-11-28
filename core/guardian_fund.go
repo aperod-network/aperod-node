@@ -12,6 +12,7 @@ import (
 // the existing 10B nominal cap, not an emission or a normal wallet transfer.
 const GuardianFundNAPR uint64 = 1_000_000_000 * 100_000_000
 
+// GuardianFundVersion identifies the guardian allocation transaction encoding.
 const (
 	GuardianFundVersion   uint8 = 1
 	guardianFundExtraSize       = len("APRO-GUARDIAN-FUND") + 1 + 32 + 8

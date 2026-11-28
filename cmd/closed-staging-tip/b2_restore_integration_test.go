@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 const (
@@ -275,7 +278,7 @@ func authorizeB2TestBucket(accessKey, secretKey, bucketID, bucketName string) (*
 	if err != nil {
 		return nil, fmt.Errorf("B2 authorization request failed: %w", err)
 	}
-	defer response.Body.Close()
+	defer checkedio.LogClose(slog.Default(), response.Body, "B2 test authorization response")
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("B2 authorization returned HTTP %d", response.StatusCode)
 	}
@@ -430,7 +433,7 @@ func (b2 *b2TestClient) request(method, rawURL string, body io.Reader, headers h
 		return nil, fmt.Errorf("B2 request failed: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		response.Body.Close()
+		checkedio.LogClose(slog.Default(), response.Body, "B2 test rejected response")
 		return nil, fmt.Errorf("B2 request returned HTTP %d", response.StatusCode)
 	}
 	return response, nil
@@ -449,7 +452,7 @@ func (b2 *b2TestClient) call(method string, payload any, output any) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer checkedio.LogClose(slog.Default(), response.Body, "B2 test API response")
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output); err != nil {
 		return fmt.Errorf("decode B2 %s response: %w", method, err)
 	}
@@ -564,7 +567,7 @@ func (b2 *b2TestClient) uploadFile(objectName string, data []byte) (b2TestFileVe
 	if err != nil {
 		return b2TestFileVersion{}, err
 	}
-	defer response.Body.Close()
+	defer checkedio.LogClose(slog.Default(), response.Body, "B2 test upload response")
 	var uploaded b2TestFileVersion
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&uploaded); err != nil {
 		return b2TestFileVersion{}, fmt.Errorf("decode B2 upload receipt: %w", err)
@@ -581,7 +584,7 @@ func (b2 *b2TestClient) downloadFileByID(fileID string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer checkedio.LogClose(slog.Default(), response.Body, "B2 test download response")
 	data, err := io.ReadAll(io.LimitReader(response.Body, 64<<20+1))
 	if err != nil {
 		return nil, fmt.Errorf("read downloaded B2 ciphertext: %w", err)

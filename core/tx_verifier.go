@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -159,6 +160,12 @@ func (v *TxVerifier) VerifyTxAtHeight(tx *Transaction, height uint64) error {
 	if tx != nil && tx.Version == TxVersionLPoDTopUp &&
 		(v.lpodDailyUpgradeHeight == 0 || height < v.lpodDailyUpgradeHeight) {
 		return fmt.Errorf("lpod: top-ups are not active at candidate height %d", height)
+	}
+	if tx != nil && v.securityHardeningActivationHeight > 0 &&
+		height >= v.securityHardeningActivationHeight {
+		if err := v.verifyOutputKeyUniqueness([]Transaction{*tx}, height); err != nil {
+			return err
+		}
 	}
 	return v.verifyTx(tx, nil, height)
 }
@@ -579,20 +586,29 @@ func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
 			block.Header.Height, size, MaxBlockBytes)
 	}
 
+	return v.verifyOutputKeyUniqueness(block.Txs, block.Header.Height)
+}
+
+// verifyOutputKeyUniqueness rejects output keys that are invalid, repeated
+// within the candidate transaction set, or already present in canonical UTXO
+// or retained spent-output history. It is shared by block verification and
+// height-aware transaction admission so a bad output cannot sit in a mempool
+// and repeatedly stall local block production.
+func (v *TxVerifier) verifyOutputKeyUniqueness(txs []Transaction, height uint64) error {
 	seen := make(map[crypto.Point32]struct{})
-	for txIndex, tx := range block.Txs {
+	for txIndex, tx := range txs {
 		for outputIndex, output := range tx.Outputs {
 			pub := output.OneTimePub
 			if err := crypto.ValidateOutputPoints(output.OneTimePub, output.TxPubKey); err != nil {
 				return fmt.Errorf(
 					"block %d tx %d output %d: invalid output point: %w",
-					block.Header.Height, txIndex, outputIndex, err,
+					height, txIndex, outputIndex, err,
 				)
 			}
 			if _, exists := seen[pub]; exists {
 				return fmt.Errorf(
 					"block %d tx %d output %d: duplicate one-time public key in block",
-					block.Header.Height, txIndex, outputIndex,
+					height, txIndex, outputIndex,
 				)
 			}
 			seen[pub] = struct{}{}
@@ -601,13 +617,13 @@ func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
 				if err != nil {
 					return fmt.Errorf(
 						"block %d tx %d output %d: could not check one-time public key uniqueness: %w",
-						block.Header.Height, txIndex, outputIndex, err,
+						height, txIndex, outputIndex, err,
 					)
 				}
 				if existing != nil {
 					return fmt.Errorf(
 						"block %d tx %d output %d: one-time public key already exists",
-						block.Header.Height, txIndex, outputIndex,
+						height, txIndex, outputIndex,
 					)
 				}
 			}
@@ -619,8 +635,9 @@ func (v *TxVerifier) verifySecurityHardeningRules(block *Block) error {
 // ringSignMessage computes the message hash for an MLSAG ring signature.
 // msg = SHA-256(txHash || inputIndex) — binds the signature to a specific input.
 func ringSignMessage(txHash crypto.Hash32, inputIdx uint32) crypto.Hash32 {
-	idx := []byte{byte(inputIdx >> 24), byte(inputIdx >> 16), byte(inputIdx >> 8), byte(inputIdx)}
-	return crypto.HashBytes([]byte("aperod/ring-sign/v1"), txHash[:], idx)
+	var idx [4]byte
+	binary.BigEndian.PutUint32(idx[:], inputIdx)
+	return crypto.HashBytes([]byte("aperod/ring-sign/v1"), txHash[:], idx[:])
 }
 
 // RingSignMessage is exported for use in tx building.

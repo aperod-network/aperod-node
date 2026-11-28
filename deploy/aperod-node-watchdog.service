@@ -55,8 +55,9 @@ Environment=WATCHDOG_INTERVAL_SECS=45
 
 ExecStart=/usr/local/bin/aperod-node-watchdog.sh
 
-# Give the script enough time: curl timeout (5 s) + systemctl restart margin
-TimeoutStartSec=30
+# Snapshot saves can outlast the API probe; production observed a 61 s save.
+# Allow this one-shot to finish its synchronous restart with reasonable margin.
+TimeoutStartSec=180
 
 StandardOutput=journal
 StandardError=journal

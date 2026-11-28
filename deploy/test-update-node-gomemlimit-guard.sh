@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# test-update-node-gomemlimit-guard.sh — fail-closed tests for Step 0d.
+# test-update-node-gomemlimit-guard.sh — fail-closed update preflight tests.
 #
 # Extract and execute the real Step 0d block rather than duplicating it.  The
-# shared policy is deliberately exercised with hostile/missing meminfo, a
-# low-memory relay, and an explicit operator override.  A policy failure must
-# occur before a drop-in write or systemctl invocation (and therefore before
-# update-node.sh can later stop the service).
+# shared GOMEMLIMIT policy is exercised with hostile/missing meminfo, a
+# low-memory relay, and an explicit operator override. The restart-policy
+# preflight is also executed verbatim against a systemctl stub to prove that
+# refusal leaves a simulated running process and its data untouched.
 # =============================================================================
 set -uo pipefail
 
@@ -210,6 +210,225 @@ if [[ -n "${FAKE_STEP0D_LINE}" && -n "${FAKE_STOP_LINE}" && "${FAKE_STEP0D_LINE}
   pass "T8: stop-before-policy regression is detected"
 else
   fail "T8: stop-before-policy regression was not detected"
+fi
+
+echo ""
+echo "─────────────────────────────────────────────"
+TOTAL=$((PASS + FAIL))
+if [[ "${FAIL}" -eq 0 ]]; then
+  pass "legacy and current GOMEMLIMIT policy scenarios remain green"
+else
+  echo -e "${RED}${FAIL} of ${TOTAL} tests FAILED.${NC}"
+  exit 1
+fi
+
+# =============================================================================
+# T9-T13: exercise the real restart-policy helper with a harmless systemctl
+# implementation. No host service, unit file, or production data is touched.
+# =============================================================================
+section "T9-T13: restart-policy protection for legacy units"
+RESTART_POLICY_BLOCK=$(awk '
+  /^# BEGIN restart-policy preflight$/ { found=1; next }
+  /^# END restart-policy preflight$/ { exit }
+  found { print }
+' "${UPDATE_SH}")
+if [[ -z "${RESTART_POLICY_BLOCK}" ]]; then
+  fail "T9: restart-policy helper block is missing"
+else
+  pass "T9: restart-policy helper is present"
+fi
+
+make_restart_policy_systemctl() {
+  local fake_dir="$1"
+  cat > "${fake_dir}/systemctl" <<'STUB'
+#!/usr/bin/env bash
+set -u
+echo "systemctl $*" >> "${FAKE_SYSTEMCTL_LOG}"
+case "$1" in
+  daemon-reload)
+    [[ "${FAKE_RELOAD_FAIL:-0}" != "1" ]]
+    exit $?
+    ;;
+  show)
+    [[ "${FAKE_SHOW_FAIL:-0}" != "1" ]] || exit 1
+    case " $* " in
+      *" -p RestartPreventExitStatus "*)
+        if [[ "${FAKE_INITIAL_PREVENT:-}" == "78" ]] ||
+           { [[ "${FAKE_IGNORE_DROPIN:-0}" != "1" ]] &&
+             [[ -f "${DROPIN_DIR}/restart-policy.conf" ]] &&
+             grep -q '^RestartPreventExitStatus=78$' "${DROPIN_DIR}/restart-policy.conf"; }; then
+          echo 78
+        else
+          echo
+        fi
+        ;;
+      *" -p Restart "*)
+        echo "${FAKE_RESTART_MODE:-always}"
+        ;;
+      *)
+        echo "unexpected systemctl show arguments: $*" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB
+  chmod +x "${fake_dir}/systemctl"
+}
+
+run_restart_policy_helper() {
+  local dropin="$1" fake_bin="$2" log="$3"
+  local initial_prevent="${4:-}" show_fail="${5:-0}" ignore_dropin="${6:-0}"
+  DROPIN_DIR="${dropin}" \
+  SERVICE_NAME="aperod-node" \
+  SYSTEMCTL="${fake_bin}/systemctl" \
+  FAKE_SYSTEMCTL_LOG="${log}" \
+  FAKE_INITIAL_PREVENT="${initial_prevent}" \
+  FAKE_SHOW_FAIL="${show_fail}" \
+  FAKE_IGNORE_DROPIN="${ignore_dropin}" \
+  bash -s <<RUNNER
+set -uo pipefail
+${RESTART_POLICY_BLOCK}
+ensure_restart_policy
+RUNNER
+}
+
+# T9: an old unit with an ordinary Restart policy gains an isolated, verified
+# drop-in before any service stop. This is a simulated future update, not a
+# change to the current production unit.
+T9_DROPIN="${TMPDIR_TEST}/t9-dropin"; mkdir -p "${T9_DROPIN}"
+T9_BIN="${TMPDIR_TEST}/t9-bin"; mkdir -p "${T9_BIN}"
+T9_LOG="${TMPDIR_TEST}/t9-systemctl.log"; : > "${T9_LOG}"
+make_restart_policy_systemctl "${T9_BIN}"
+if run_restart_policy_helper "${T9_DROPIN}" "${T9_BIN}" "${T9_LOG}" \
+  >"${TMPDIR_TEST}/t9.out" 2>"${TMPDIR_TEST}/t9.err"; then
+  if [[ "$(cat "${T9_DROPIN}/restart-policy.conf" 2>/dev/null)" == $'[Service]\nRestartPreventExitStatus=78' ]]; then
+    pass "T9: legacy unit receives the exact EX_CONFIG drop-in"
+  else
+    fail "T9: generated restart-policy drop-in is incorrect"
+  fi
+  if grep -q 'Installed and verified' "${TMPDIR_TEST}/t9.out" &&
+     grep -q '^systemctl daemon-reload$' "${T9_LOG}"; then
+    pass "T9: daemon-reload and effective policy verification succeeded"
+  else
+    fail "T9: policy was not reported and reloaded as verified"
+  fi
+  if ! grep -q 'systemctl stop' "${T9_LOG}"; then
+    pass "T9: preflight did not stop or signal the service"
+  else
+    fail "T9: preflight unexpectedly stopped the service"
+  fi
+else
+  fail "T9: a normal legacy unit could not be upgraded safely"
+fi
+
+# T10: an unreadable effective policy refuses preflight while preserving a
+# live stand-in process and its data; no drop-in or service operation occurs.
+section "T10: unreadable policy refusal preserves process and data"
+T10_DROPIN="${TMPDIR_TEST}/t10-dropin"; mkdir -p "${T10_DROPIN}"
+T10_BIN="${TMPDIR_TEST}/t10-bin"; mkdir -p "${T10_BIN}"
+T10_LOG="${TMPDIR_TEST}/t10-systemctl.log"; : > "${T10_LOG}"
+T10_DATA="${TMPDIR_TEST}/t10-chain-data"; printf 'canonical-chain-fixture\n' > "${T10_DATA}"
+T10_HASH=$(sha256sum "${T10_DATA}" | cut -d' ' -f1)
+make_restart_policy_systemctl "${T10_BIN}"
+sleep 30 & T10_PID=$!
+T10_RC=0
+run_restart_policy_helper "${T10_DROPIN}" "${T10_BIN}" "${T10_LOG}" "" 1 \
+  >"${TMPDIR_TEST}/t10.out" 2>"${TMPDIR_TEST}/t10.err" || T10_RC=$?
+if [[ "${T10_RC}" -ne 0 ]] && kill -0 "${T10_PID}" 2>/dev/null; then
+  pass "T10: policy-read failure aborts and the process stays alive"
+else
+  fail "T10: refusal did not preserve the simulated running process"
+fi
+if [[ "$(sha256sum "${T10_DATA}" | cut -d' ' -f1)" == "${T10_HASH}" &&
+      ! -e "${T10_DROPIN}/restart-policy.conf" ]]; then
+  pass "T10: chain-data fixture and unit files remain unchanged"
+else
+  fail "T10: refusal changed the data fixture or created a drop-in"
+fi
+if ! grep -q 'systemctl stop' "${T10_LOG}" &&
+   grep -q 'NOT stopped' "${TMPDIR_TEST}/t10.err"; then
+  pass "T10: refusal is explicit and no stop command was issued"
+else
+  fail "T10: refusal lacks a no-stop guarantee"
+fi
+kill "${T10_PID}" 2>/dev/null || true
+wait "${T10_PID}" 2>/dev/null || true
+
+# T11: a pre-existing operator-owned file is never overwritten when its
+# effective policy is incomplete.
+section "T11: conflicting operator drop-in is preserved"
+T11_DROPIN="${TMPDIR_TEST}/t11-dropin"; mkdir -p "${T11_DROPIN}"
+T11_BIN="${TMPDIR_TEST}/t11-bin"; mkdir -p "${T11_BIN}"
+T11_LOG="${TMPDIR_TEST}/t11-systemctl.log"; : > "${T11_LOG}"
+printf '[Service]\nRestart=on-failure\n# operator-owned\n' > "${T11_DROPIN}/restart-policy.conf"
+cp "${T11_DROPIN}/restart-policy.conf" "${TMPDIR_TEST}/t11-original.conf"
+make_restart_policy_systemctl "${T11_BIN}"
+T11_RC=0
+run_restart_policy_helper "${T11_DROPIN}" "${T11_BIN}" "${T11_LOG}" \
+  >"${TMPDIR_TEST}/t11.out" 2>"${TMPDIR_TEST}/t11.err" || T11_RC=$?
+if [[ "${T11_RC}" -ne 0 ]] && cmp -s "${T11_DROPIN}/restart-policy.conf" "${TMPDIR_TEST}/t11-original.conf"; then
+  pass "T11: incomplete operator drop-in causes a safe refusal without overwrite"
+else
+  fail "T11: existing operator drop-in was not preserved on refusal"
+fi
+
+# T12: a systemd reload that fails to expose the requested effective value
+# rolls back only the newly created file, leaving the node running.
+section "T12: failed effective verification cleans up its own change"
+T12_DROPIN="${TMPDIR_TEST}/t12-dropin"; mkdir -p "${T12_DROPIN}"
+T12_BIN="${TMPDIR_TEST}/t12-bin"; mkdir -p "${T12_BIN}"
+T12_LOG="${TMPDIR_TEST}/t12-systemctl.log"; : > "${T12_LOG}"
+make_restart_policy_systemctl "${T12_BIN}"
+T12_RC=0
+run_restart_policy_helper "${T12_DROPIN}" "${T12_BIN}" "${T12_LOG}" "" 0 1 \
+  >"${TMPDIR_TEST}/t12.out" 2>"${TMPDIR_TEST}/t12.err" || T12_RC=$?
+if [[ "${T12_RC}" -ne 0 && ! -e "${T12_DROPIN}/restart-policy.conf" ]] &&
+   [[ "$(grep -c '^systemctl daemon-reload$' "${T12_LOG}")" -eq 2 ]]; then
+  pass "T12: failed verification removes its file and reloads the original policy"
+else
+  fail "T12: failed policy verification did not safely roll back"
+fi
+
+# T13: already-safe units remain unchanged and do not reload systemd.
+section "T13: an already-protected unit is idempotent"
+T13_DROPIN="${TMPDIR_TEST}/t13-dropin"; mkdir -p "${T13_DROPIN}"
+T13_BIN="${TMPDIR_TEST}/t13-bin"; mkdir -p "${T13_BIN}"
+T13_LOG="${TMPDIR_TEST}/t13-systemctl.log"; : > "${T13_LOG}"
+make_restart_policy_systemctl "${T13_BIN}"
+if run_restart_policy_helper "${T13_DROPIN}" "${T13_BIN}" "${T13_LOG}" 78 \
+  >"${TMPDIR_TEST}/t13.out" 2>"${TMPDIR_TEST}/t13.err" &&
+   ! grep -q '^systemctl daemon-reload$' "${T13_LOG}" &&
+   ! grep -q 'systemctl stop' "${T13_LOG}" &&
+   [[ ! -e "${T13_DROPIN}/restart-policy.conf" ]]; then
+  pass "T13: existing exit-78 protection is verified without rewriting"
+else
+  fail "T13: already-protected unit was changed or failed verification"
+fi
+
+# T14: both entry points perform the policy check before any disruptive or
+# unrelated upgrade step.
+section "T14: update and upgrade entry points preflight first"
+UPDATE_POLICY_CALL=$(grep -n '^ensure_restart_policy || exit 1$' "${UPDATE_SH}" | head -1 | cut -d: -f1)
+SOURCE_PREPARE_LINE=$(grep -n '^node_source_prepare || exit 1$' "${UPDATE_SH}" | head -1 | cut -d: -f1)
+UPDATE_STOP_LINE=$(grep -n '^[^#]*systemctl stop' "${UPDATE_SH}" | head -1 | cut -d: -f1)
+UPGRADE_POLICY_CALL=$(grep -n -- '--check-restart-policy' "${SCRIPT_DIR}/upgrade-node.sh" | tail -1 | cut -d: -f1)
+ENSURE_DROPIN_CALL=$(grep -n 'bash "${ENSURE_DROPIN_SH}"' "${SCRIPT_DIR}/upgrade-node.sh" | head -1 | cut -d: -f1)
+if [[ -n "${UPDATE_POLICY_CALL}" && -n "${SOURCE_PREPARE_LINE}" &&
+      "${UPDATE_POLICY_CALL}" -lt "${SOURCE_PREPARE_LINE}" &&
+      "${UPDATE_POLICY_CALL}" -lt "${UPDATE_STOP_LINE}" ]]; then
+  pass "T14: update-node verifies the restart policy before source preparation and stop"
+else
+  fail "T14: update-node restart-policy preflight is missing or too late"
+fi
+if [[ -n "${UPGRADE_POLICY_CALL}" && -n "${ENSURE_DROPIN_CALL}" &&
+      "${UPGRADE_POLICY_CALL}" -lt "${ENSURE_DROPIN_CALL}" ]]; then
+  pass "T14: upgrade-node preflights before memory-drop-in changes"
+else
+  fail "T14: upgrade-node restart-policy preflight is missing or too late"
 fi
 
 echo ""

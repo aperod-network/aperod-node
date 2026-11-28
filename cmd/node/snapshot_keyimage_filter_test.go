@@ -8,6 +8,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -16,7 +17,7 @@ func TestFilterSnapshotKeyImagesLeavesEmptyIndexUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	var ki crypto.KeyImage
 	ki[0] = 1
@@ -32,7 +33,7 @@ func TestFilterSnapshotKeyImagesUsesPointLookupsAndPurgesUnconfirmed(t *testing.
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	var confirmed, unconfirmed crypto.KeyImage
 	confirmed[0] = 0xC1

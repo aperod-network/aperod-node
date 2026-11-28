@@ -17,6 +17,7 @@ import (
 // MessageType identifies the purpose of a network message.
 type MessageType uint8
 
+// Message type identifiers are encoded in the P2P frame's type byte.
 const (
 	MsgPing       MessageType = 0x01
 	MsgPong       MessageType = 0x02
@@ -163,34 +164,37 @@ func writeMsg(conn net.Conn, msgType MessageType, payload interface{}) error {
 // The 4-byte length prefix and the body are written with a single
 // conn.Write call so a successful write is always a complete frame.
 func writeMsgN(conn net.Conn, msgType MessageType, payload interface{}) (int, error) {
-	conn.SetWriteDeadline(time.Now().Add(WriteTimeout)) //nolint:errcheck
+	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return 0, fmt.Errorf("set write deadline: %w", err)
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("marshal: %w", err)
 	}
-	if uint32(len(data)) > maxMessagePayloadBytes(msgType) {
+	// Bound the native-int arithmetic directly, before adding the type byte
+	// and length prefix. The wire cap fits even a 32-bit int.
+	if len(data) > MaxMessageSize-1 || uint64(len(data)) > uint64(maxMessagePayloadBytes(msgType)) {
 		return 0, fmt.Errorf("message payload too large for type 0x%02x: %d bytes",
 			msgType, len(data))
 	}
 
-	// [1 byte type][payload]
-	body := append([]byte{byte(msgType)}, data...)
-
-	if len(body) > MaxMessageSize {
-		return 0, fmt.Errorf("message too large: %d bytes", len(body))
-	}
-
-	// [4-byte length prefix][body] in one buffer → one Write call.
-	frame := make([]byte, 4+len(body))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
-	copy(frame[4:], body)
+	// [4-byte length prefix][1-byte type][payload], in one bounded buffer
+	// and one Write call. Avoid a second allocation/copy for the body.
+	bodySize := len(data) + 1
+	frame := make([]byte, 4+bodySize)
+	// #nosec G115 -- the direct payload guard bounds bodySize to [1, 10 MiB], well within uint32.
+	binary.BigEndian.PutUint32(frame[:4], uint32(bodySize))
+	frame[4] = byte(msgType)
+	copy(frame[5:], data)
 
 	return conn.Write(frame)
 }
 
 // readMsg reads the next message from conn.
 func readMsg(conn net.Conn) (MessageType, []byte, error) {
-	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		return 0, nil, fmt.Errorf("set read deadline: %w", err)
+	}
 
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {

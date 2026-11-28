@@ -76,6 +76,8 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
 TARGET_IP="192.0.2.55"   # TEST-NET-1 — never routes
 PRIMARY_IP="10.0.0.1"
+TEST_SOURCE_NODE_YAML="${TMPDIR_TEST}/source-node.yaml"
+printf 'network: testnet\n' >"${TEST_SOURCE_NODE_YAML}"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -231,6 +233,7 @@ run_join() {
     PATH="${bdir}:${PATH}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${src}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     SECONDARY_DATA_DIR="${tgt}" \
     SECONDARY_NODE_YAML="${node_yaml}" \
     SECONDARY_NODE_CONFIG_SH="/nonexistent/node-config.sh" \

@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -91,6 +92,7 @@ func setYAMLKeepalive(root *yaml.Node, value string) error {
 // the same directory, RE-PARSED via config.Load to prove the result is a
 // loadable config, and only then renamed over the original.
 func persistKeepaliveInterval(cfgPath string, d time.Duration) error {
+	// #nosec G304 G703 -- The running node's startup-config path is fixed by its operator; the admin request supplies only an interval.
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", cfgPath, err)
@@ -116,6 +118,7 @@ func persistKeepaliveInterval(cfgPath string, d time.Duration) error {
 
 	// Preserve the original file mode when possible.
 	mode := os.FileMode(0644)
+	// #nosec G703 -- Same operator-fixed startup config; no request-controlled filename is accepted.
 	if info, statErr := os.Stat(cfgPath); statErr == nil {
 		mode = info.Mode().Perm()
 	}
@@ -126,43 +129,40 @@ func persistKeepaliveInterval(cfgPath string, d time.Duration) error {
 		return fmt.Errorf("create tmp in %s: %w", dir, err)
 	}
 	tmpPath := tmp.Name()
-	cleanup := func() { os.Remove(tmpPath) }
+	cleanup := func() error {
+		// #nosec G703 -- Exact name returned by os.CreateTemp in the config directory, not an input path.
+		return os.Remove(tmpPath)
+	}
 	if _, err := tmp.Write(buf.Bytes()); err != nil {
-		tmp.Close()
-		cleanup()
-		return fmt.Errorf("write tmp: %w", err)
+		return fmt.Errorf("write tmp: %w", errors.Join(err, tmp.Close(), cleanup()))
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		cleanup()
-		return fmt.Errorf("fsync tmp: %w", err)
+		return fmt.Errorf("fsync tmp: %w", errors.Join(err, tmp.Close(), cleanup()))
 	}
 	if err := tmp.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("close tmp: %w", err)
+		return fmt.Errorf("close tmp: %w", errors.Join(err, cleanup()))
 	}
+	// #nosec G703 -- Exact os.CreateTemp staging path; preserves the operator's existing config mode.
 	if err := os.Chmod(tmpPath, mode); err != nil {
-		cleanup()
-		return fmt.Errorf("chmod tmp: %w", err)
+		return fmt.Errorf("chmod tmp: %w", errors.Join(err, cleanup()))
 	}
 
 	// Final safety gate: the rewritten file must be loadable as a config and
 	// must round-trip the new interval BEFORE it replaces the original.
 	newCfg, err := config.Load(tmpPath)
 	if err != nil {
-		cleanup()
-		return fmt.Errorf("rewritten config failed to load — original left untouched: %w", err)
+		return fmt.Errorf("rewritten config failed to load — original left untouched: %w", errors.Join(err, cleanup()))
 	}
 	if newCfg.P2P.KeepaliveInterval != d {
-		cleanup()
-		return fmt.Errorf(
+		mismatch := fmt.Errorf(
 			"rewritten config round-trip mismatch (got %v, want %v) — original left untouched",
 			newCfg.P2P.KeepaliveInterval, d)
+		return errors.Join(mismatch, cleanup())
 	}
 
+	// #nosec G703 -- Publishes the verified staging file only to the operator-fixed startup config path.
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		cleanup()
-		return fmt.Errorf("rename tmp over %s: %w", cfgPath, err)
+		return fmt.Errorf("rename tmp over %s: %w", cfgPath, errors.Join(err, cleanup()))
 	}
 	return nil
 }

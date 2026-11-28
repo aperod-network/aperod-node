@@ -19,15 +19,13 @@ Description=Aperod node API watchdog timer (every 60 s by default)
 After=aperod-node.service
 
 [Timer]
-# First run after the timer unit activates (gives the node time to start).
+# First run after this timer unit activates (gives the node time to start).
 # Overridden by the drop-in written by aperod-watchdog-set-interval.
-OnBootSec=60
-# Repeat every 60 s thereafter.
-OnUnitActiveSec=60
+OnActiveSec=60
+# Repeat 60 s after the one-shot watchdog service exits.
+OnUnitInactiveSec=60
 # If a run is missed (e.g. system was suspended) catch up immediately.
 AccuracySec=5
-# Persist the last-fire timestamp across reboots.
-Persistent=true
 
 [Install]
 WantedBy=timers.target

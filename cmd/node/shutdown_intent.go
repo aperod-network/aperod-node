@@ -1,12 +1,16 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 const shutdownIntentMarkerName = "shutdown-intent"
@@ -30,18 +34,17 @@ func writeShutdownIntentMarker(dataDir string) error {
 		return fmt.Errorf("create shutdown intent marker: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer checkedio.LogRemoveStaging(slog.Default(), tmpName)
 	if _, err := tmp.WriteString(body); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write shutdown intent marker: %w", err)
+		return fmt.Errorf("write shutdown intent marker: %w", errors.Join(err, tmp.Close()))
 	}
 	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync shutdown intent marker: %w", err)
+		return fmt.Errorf("sync shutdown intent marker: %w", errors.Join(err, tmp.Close()))
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close shutdown intent marker: %w", err)
 	}
+	// #nosec G703 -- Fixed marker basename inside the operator's data directory, with an os.CreateTemp source.
 	if err := os.Rename(tmpName, shutdownIntentMarkerPath(dataDir)); err != nil {
 		return fmt.Errorf("publish shutdown intent marker: %w", err)
 	}

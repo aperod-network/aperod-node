@@ -1,13 +1,13 @@
 # Aperod Node Maintenance Guide
 
-Operational playbook for keeping all **21 validators** and relay nodes healthy —
-disk space, log rotation, chain resync, automatic recovery.
+Mainnet operations guide for existing validator and relay nodes. For
+bootstrap and chain identity requirements, see [Mainnet](MAINNET.md).
 
 ---
 
 ## Table of Contents
 
-- [Automated safeguards (always-on)](#automated-safeguards-always-on)
+- [Automated safeguards](#automated-safeguards)
 - [Disk space management](#disk-space-management)
 - [Log rotation setup (one-time per server)](#log-rotation-setup-one-time-per-server)
 - [Pruning old blocks (relay nodes)](#pruning-old-blocks-relay-nodes)
@@ -17,15 +17,14 @@ disk space, log rotation, chain resync, automatic recovery.
 
 ---
 
-## Automated safeguards (always-on)
+## Automated safeguards
 
-The following services run automatically on every validator after installation
-via `install-validator.sh` or `install-node.sh`:
+Check which services your deployment actually installed before relying on
+automated recovery or backups:
 
 | Service | What it does | Fires every |
 |---------|-------------|-------------|
 | `aperod-node-watchdog.timer` | Restarts node if API fails, RAM > threshold, blocks stall, or disk < threshold | 60 s |
-| `aperod-node-sched-restart.timer` | Nightly proactive restart to prevent RAM growth | 04:00 UTC |
 | `aperod-backup.timer` | Snapshot backup to backup directory | configurable |
 
 The watchdog now also monitors **disk space** and sends a Telegram alert when
@@ -48,8 +47,10 @@ systemctl status aperod-node-watchdog.timer
 ```bash
 df -h /
 du -sh /var/log/syslog /var/log/daemon.log 2>/dev/null
-du -sh /var/lib/aperod/chain.db 2>/dev/null || \
-  du -sh /opt/aperod/data/testnet/chain.db 2>/dev/null
+# Read the effective data-directory setting of the running service first.
+sudo systemctl cat aperod-node
+# Set MAINNET_DATA_DIR to the path confirmed in that service's configuration.
+du -sh -- "${MAINNET_DATA_DIR:?Set the verified Mainnet data directory}/chain.db"
 journalctl --disk-usage
 ```
 
@@ -137,53 +138,18 @@ journalctl -u aperod-node -n 20 --no-pager | grep -i prun
 
 ## Chain resync — relay node fell far behind
 
-When a relay node's chain tip is more than ~50 000 blocks behind the validator
-(e.g. after a disk-full crash), P2P sync cannot bridge the gap reliably. The
-fastest recovery is to rsync the chain data directly from the validator.
+First compare the relay's last known canonical block hash with the
+trusted Mainnet source, then check peer admission and the source's block
+coverage. Distance from the tip alone does not establish a fork or show
+that P2P recovery is impossible.
 
-### Automated resync script
-
-Run **on the SOURCE validator** (the one with the authoritative chain data):
-
-```bash
-sudo bash /opt/aperod/blockchain/deploy/node-resync.sh \
-    --source /opt/aperod/data/testnet \
-    --target root@<relay-ip>:/var/lib/aperod
-```
-
-What happens:
-1. Stops `aperod-node` on the validator (~3–5 min downtime for block production)
-2. rsyncs `chain.db` + `snapshot-v2-*.json.gz` to the relay
-3. Removes stale `p2p_whitelist.json` / `p2p_bans.json` on the relay
-4. Restarts both nodes
-5. Sends a Telegram success/failure alert
-
-Estimated downtime: **3–5 minutes** (depends on chain.db size and network speed).
-
-### Manual step-by-step (if the script is unavailable)
-
-```bash
-# ── On the VALIDATOR (source) ─────────────────────────────────────────
-systemctl stop aperod-node
-
-rsync -az --progress \
-  /opt/aperod/data/testnet/chain.db \
-  /opt/aperod/data/testnet/snapshot-v2-*.json.gz \
-  root@<relay-ip>:/var/lib/aperod/
-
-systemctl start aperod-node
-
-# ── On the RELAY (target) ─────────────────────────────────────────────
-rm -f /var/lib/aperod/p2p_whitelist.json \
-      /var/lib/aperod/p2p_bans.json
-systemctl restart aperod-node
-
-# Verify sync started:
-journalctl -u aperod-node -n 20 --no-pager | grep -i "tip\|sync\|peer"
-```
-
-> **Important**: always stop the source before rsync.
-> Copying a live LevelDB produces a corrupt database.
+If the needed history is unavailable from peers, use a verified, closed
+Mainnet checkpoint following [Mainnet](MAINNET.md). Import it into a
+separate staged directory and verify the signed genesis and checkpoint
+hashes before starting the relay. Keep its previous data until the new
+copy advances with matching canonical hashes and passes a database
+reopen check. Do not copy a live LevelDB, stop the only producer merely
+to resync a relay, or delete peer allowlists as part of a data restore.
 
 ---
 
@@ -219,20 +185,20 @@ sudo cp /opt/aperod/blockchain/deploy/aperod-syslog.logrotate \
 
 ## Validator checklist after reinstall
 
-After provisioning a new server or recovering from a major failure, verify:
+These checks are for an already authorized validator, not a registration
+procedure. Use the configured paths and API port from that node's service.
 
 ```bash
 # 1. Node data directory has correct permissions
-ls -la /var/lib/aperod/ || ls -la /opt/aperod/data/testnet/
+stat -c '%A %U %n' -- "${MAINNET_DATA_DIR:?Set the verified Mainnet data directory}"
 
 # 2. Validator key is present and has correct permissions
-ls -la /opt/aperod/blockchain/data/testnet/validator.key
-# → Must be: -rw------- (chmod 600)
-# Fix with: chmod 600 /opt/aperod/blockchain/data/testnet/validator.key
+stat -c '%a %U %n' -- "${VALIDATOR_KEY_PATH:?Set the configured validator key path}"
+# Expect mode 600 and ownership by the node service account.
 
-# 3. Node is running and producing blocks
-curl -s http://localhost:8545/api/v1/status | python3 -m json.tool | \
-  grep -E "height|syncing|ok"
+# 3. Node is responding; also verify its canonical hash and active set.
+curl -fsS "${NODE_API_URL:?Set the configured loopback API URL}/api/v1/status" | \
+  python3 -m json.tool
 
 # 4. Watchdog is active
 systemctl status aperod-node-watchdog.timer --no-pager | grep Active

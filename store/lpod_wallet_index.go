@@ -24,6 +24,9 @@ func lpodWalletPrefix(address crypto.Address) []byte {
 	h := crypto.HashBytes([]byte(address))
 	return append([]byte("lpod/wallet/v1/"), h[:]...)
 }
+
+// IsUTXOSpentChecked reads an explicit durable spent-output marker.
+// Marker absence is not a general proof that a hidden-member CLSAG output is unspent.
 func (d *DB) IsUTXOSpentChecked(hash crypto.Hash32, index uint32) (bool, error) {
 	raw, err := d.get(spentUTXOKey(hash, index))
 	return raw != nil, err
@@ -36,6 +39,7 @@ var lpodWalletReadyKey = []byte("lpod/wallet-ready/v1")
 var lpodEarningsReadyKey = []byte("lpod/earnings-ready/v2")
 var lpodEarningsProgressKey = []byte("lpod/earnings-progress/v2")
 
+// LPoDWalletIndexReady checks both wallet index markers against the funding hash.
 func (d *DB) LPoDWalletIndexReady(funding crypto.Hash32) (bool, error) {
 	raw, err := d.get(lpodWalletReadyKey)
 	if err != nil {
@@ -45,6 +49,7 @@ func (d *DB) LPoDWalletIndexReady(funding crypto.Hash32) (bool, error) {
 	return bytes.Equal(raw, funding[:]) && bytes.Equal(backfilled, funding[:]), err
 }
 
+// LPoDEarningsIndexReady checks the earnings marker for this funding and canonical tip.
 func (d *DB) LPoDEarningsIndexReady(funding, tip crypto.Hash32, height uint64) (bool, error) {
 	raw, err := d.get(lpodEarningsReadyKey)
 	expected := earningsReadyValue(funding, tip, height)
@@ -72,11 +77,17 @@ func isLPoDPureReward(reward, returnedPrincipal uint64) bool {
 
 func lpodWalletOwners(
 	leader crypto.Address,
+	before *LPoDCheckpoint,
 	after *LPoDCheckpoint,
 	height uint64,
 	parent, digest crypto.Hash32,
 ) (map[crypto.Point32]crypto.Address, error) {
 	candidates := map[crypto.Address]bool{leader: true}
+	if before != nil {
+		for _, payout := range before.PendingValidatorPayouts {
+			candidates[payout.Address] = true
+		}
+	}
 	if after.GenesisVesting != nil && after.GenesisVesting.paymentAt(height) > 0 {
 		candidates[after.GenesisVesting.Recipient] = true
 	}
@@ -112,7 +123,11 @@ func (d *DB) appendLPoDWalletIndex(batch *leveldb.Batch, b *core.Block, r *LPoDS
 	if after == nil || after.Allocation == nil {
 		return fmt.Errorf("lpod: funded checkpoint required for wallet discovery")
 	}
-	owners, err := lpodWalletOwners(r.Leader, after, b.Header.Height, r.Parent, after.Digest())
+	before, err := d.LoadLPoDCheckpoint()
+	if err != nil {
+		return err
+	}
+	owners, err := lpodWalletOwners(r.Leader, before, after, b.Header.Height, r.Parent, after.Digest())
 	if err != nil {
 		return err
 	}
@@ -243,16 +258,17 @@ func (d *DB) classifyLPoDEarnings(b *core.Block, r *LPoDSettlement, after *LPoDC
 		return nil, fmt.Errorf("lpod: canonical payout does not match v10 earnings reconstruction")
 	}
 
-	rewards := map[crypto.Address]uint64{}
+	rewards, _, err := deriveLPoDValidatorPayouts(
+		before, after, b.Header.Timestamp, r.Proposer, r.Leader,
+	)
+	if err != nil {
+		return nil, err
+	}
 	principal := map[crypto.Address]uint64{}
 	for _, p := range payments {
 		if p.Leader > 0 {
 			if p.VaultID != r.Proposer {
 				return nil, fmt.Errorf("lpod: non-proposer leader reward")
-			}
-			rewards[r.Leader], err = lpodAdd(rewards[r.Leader], p.Leader)
-			if err != nil {
-				return nil, err
 			}
 		}
 	}
@@ -353,7 +369,8 @@ func (d *DB) rollbackLPoDWalletIndex(batch *leveldb.Batch, hash crypto.Hash32) e
 	return nil
 }
 
-// Bounded address-prefix lookup; no block-history scan. Cursor is tied to this
+// LPoDWalletOutputs performs a bounded address-prefix lookup without a history scan.
+// Its cursor is tied to this
 // address prefix; callers additionally bind all pages to one finalized tip.
 func (d *DB) LPoDWalletOutputs(address crypto.Address, cursor string, limit int) ([]StoredUTXO, string, error) {
 	if limit < 1 || limit > 128 {
@@ -398,6 +415,7 @@ func (d *DB) LPoDWalletOutputs(address crypto.Address, cursor string, limit int)
 	return rows, next, iter.Error()
 }
 
+// LPoDEarningsOutputs returns indexed earnings outputs for the requested address.
 func (d *DB) LPoDEarningsOutputs(address crypto.Address, cursor string, limit int) ([]StoredUTXO, string, error) {
 	if limit < 1 || limit > 128 {
 		return nil, "", fmt.Errorf("invalid page limit")

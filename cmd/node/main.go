@@ -14,7 +14,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
-	_ "net/http/pprof" // registers /debug/pprof/* handlers on http.DefaultServeMux
+	_ "net/http/pprof" // #nosec G108 -- Config.Validate requires a literal loopback bind; diagnostics use a separate optional server, never the API mux.
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,6 +34,8 @@ import (
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
+	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/p2p"
 	"github.com/aperod/aperod/store"
 )
@@ -41,8 +43,17 @@ import (
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "aperod-node: %v\n", err)
-		os.Exit(1)
+		os.Exit(startupExitCode(err))
 	}
+}
+
+const exitCodeConfigurationError = 78 // sysexits.h EX_CONFIG
+
+func startupExitCode(err error) int {
+	if errors.Is(err, config.ErrMainnetBootstrapUnavailable) {
+		return exitCodeConfigurationError
+	}
+	return 1
 }
 
 const guardianEconomicReconciliationNotApproved = "guardian fund activation refused: economic reconciliation not approved; nominal allocations already total 10B APRO and no allocation debit has been approved"
@@ -257,26 +268,33 @@ func runCompactDB() error {
 	// Measure disk use before compaction.
 	sizeBefore := dirSize(dbPath)
 
-	fmt.Fprintf(os.Stdout, "compact-db: opening %s (size before: %s)\n",
-		dbPath, formatBytes(sizeBefore))
+	if _, err := fmt.Fprintf(os.Stdout, "compact-db: opening %s (size before: %s)\n",
+		dbPath, formatBytes(sizeBefore)); err != nil {
+		return fmt.Errorf("compact-db: write preflight output: %w", err)
+	}
 
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("compact-db: open %s: %w", dbPath, err)
 	}
 
-	fmt.Fprintf(os.Stdout, "compact-db: running full compaction (this may take several minutes)...\n")
-	if err := db.Compact(); err != nil {
-		db.Close()
-		return fmt.Errorf("compact-db: compaction failed: %w", err)
+	if _, err := fmt.Fprintf(os.Stdout, "compact-db: running full compaction (this may take several minutes)...\n"); err != nil {
+		return errors.Join(fmt.Errorf("compact-db: write preflight output: %w", err), db.Close())
 	}
-	db.Close()
+	if err := db.Compact(); err != nil {
+		return fmt.Errorf("compact-db: compaction failed: %w", errors.Join(err, db.Close()))
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("compact-db: compaction completed but database close failed: %w", err)
+	}
 
 	sizeAfter := dirSize(dbPath)
 	saved := sizeBefore - sizeAfter
-	fmt.Fprintf(os.Stdout,
+	if _, err := fmt.Fprintf(os.Stdout,
 		"compact-db: done — size after: %s, saved: %s\n",
-		formatBytes(sizeAfter), formatBytes(saved))
+		formatBytes(sizeAfter), formatBytes(saved)); err != nil {
+		slog.Warn("compaction completed but terminal output failed", "err", err)
+	}
 	return nil
 }
 
@@ -361,14 +379,16 @@ func maintenancePreflight(out io.Writer, cfgPath, dataDir string, tipHeight uint
 
 func maintenancePreflightResolved(out io.Writer, resolvedConfig, absDataDir string, tipHeight uint64) error {
 	snapshotHeight := latestSnapshotHeight(absDataDir)
-	fmt.Fprintf(out,
+	if _, err := fmt.Fprintf(out,
 		"\n================ MAINTENANCE PREFLIGHT ================\n"+
 			"resolved_config: %s\n"+
 			"absolute_data_dir: %s\n"+
 			"tip_height: %d\n"+
 			"latest_snapshot_height: %d\n"+
 			"=======================================================\n",
-		resolvedConfig, absDataDir, tipHeight, snapshotHeight)
+		resolvedConfig, absDataDir, tipHeight, snapshotHeight); err != nil {
+		return fmt.Errorf("write maintenance preflight: %w", err)
+	}
 
 	if snapshotHeight <= tipHeight {
 		return nil
@@ -399,7 +419,7 @@ func maintenancePreflightResolved(out io.Writer, resolvedConfig, absDataDir stri
 //
 // This is intentionally config-free: operators call it right after an rsync
 // when no full node.yaml may yet be present on the relay.
-func runCheckStore() error {
+func runCheckStore() (readCloseErr error) {
 	dataDir := ""
 	maxMissing := uint64(5000) // mirrors the scan.go hardcoded default
 
@@ -422,19 +442,19 @@ func runCheckStore() error {
 	}
 
 	dbPath := filepath.Join(dataDir, "chain.db")
-	db, err := store.Open(dbPath)
+	db, err := store.OpenReadOnly(dbPath)
 	if err != nil {
 		return fmt.Errorf("check-store: open %s: %w", dbPath, err)
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	_, tipHeight, err := db.GetTip()
 	if err != nil {
 		return fmt.Errorf("check-store: read tip: %w", err)
 	}
 	if tipHeight == 0 {
-		fmt.Fprintf(os.Stdout, "check-store OK: empty store (tip_height=0)\n")
-		return nil
+		_, err := fmt.Fprintf(os.Stdout, "check-store OK: empty store (tip_height=0)\n")
+		return err
 	}
 
 	missing, firstMissing, err := db.CountMissingHeights(tipHeight)
@@ -452,10 +472,10 @@ func runCheckStore() error {
 		)
 	}
 
-	fmt.Fprintf(os.Stdout,
+	_, err = fmt.Fprintf(os.Stdout,
 		"check-store OK: tip_height=%d missing=%d (threshold=%d)\n",
 		tipHeight, missing, maxMissing)
-	return nil
+	return err
 }
 
 // runCheckSnapshot implements the --check-snapshot subcommand.
@@ -504,8 +524,8 @@ func runCheckSnapshot() error {
 		)
 	}
 
-	fmt.Fprintf(os.Stdout, "check-snapshot OK: tip_height=%d\n", tipHeight)
-	return nil
+	_, err = fmt.Fprintf(os.Stdout, "check-snapshot OK: tip_height=%d\n", tipHeight)
+	return err
 }
 
 // ─── Rsync-in-progress sentinel ──────────────────────────────────────────────
@@ -571,7 +591,7 @@ func loadHeightIndexSentinel(dataDir string) bool {
 // storeHeightIndexSentinel creates (or overwrites) the sentinel marker file.
 // Non-fatal on error: the sentinel is absent and the next restart retries.
 func storeHeightIndexSentinel(dataDir string) error {
-	return os.WriteFile(heightIndexSentinelPath(dataDir), []byte("1\n"), 0644)
+	return os.WriteFile(heightIndexSentinelPath(dataDir), []byte("1\n"), 0600)
 }
 
 // runRepairHeightIndex implements the --repair-height-index subcommand.
@@ -614,20 +634,22 @@ func runRepairHeightIndex() error {
 	if err != nil {
 		return fmt.Errorf("repair-height-index: open %s: %w", dbPath, err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "height-index repair database")
 
 	_, tipHeight, err := db.GetTip()
 	if err != nil {
 		return fmt.Errorf("repair-height-index: read tip: %w", err)
 	}
 	if tipHeight == 0 {
-		fmt.Fprintf(os.Stdout, "repair-height-index: empty store (tip_height=0) — nothing to repair\n")
-		return nil
+		_, err := fmt.Fprintf(os.Stdout, "repair-height-index: empty store (tip_height=0) — nothing to repair\n")
+		return err
 	}
 
-	fmt.Fprintf(os.Stdout,
+	if _, err := fmt.Fprintf(os.Stdout,
 		"repair-height-index: scanning %d stored blocks (tip_height=%d)...\n",
-		tipHeight+1, tipHeight)
+		tipHeight+1, tipHeight); err != nil {
+		return fmt.Errorf("write repair preflight output; sweep not started: %w", err)
+	}
 
 	lastPct := uint64(101) // sentinel so first progress call always prints
 	progress := func(scanned, total uint64) {
@@ -636,7 +658,7 @@ func runRepairHeightIndex() error {
 		}
 		pct := scanned * 100 / total
 		if pct != lastPct {
-			fmt.Fprintf(os.Stdout,
+			writeMaintenanceReport(os.Stdout,
 				"repair-height-index: %d / %d (%d%%)\r",
 				scanned, total, pct)
 			lastPct = pct
@@ -644,7 +666,7 @@ func runRepairHeightIndex() error {
 	}
 
 	repaired, skipped, repErr := db.RepairAllHeightIndex(tipHeight, progress)
-	fmt.Fprintf(os.Stdout, "\n") // newline after \r progress line
+	writeMaintenanceReport(os.Stdout, "\n") // newline after \r progress line
 
 	// Only write the sentinel when the sweep completed without I/O errors
 	// AND without any unrepairable heights (missing block body AND missing
@@ -654,34 +676,34 @@ func runRepairHeightIndex() error {
 	sweepOK := repErr == nil && skipped == 0
 	if sweepOK {
 		if sentErr := storeHeightIndexSentinel(dataDir); sentErr != nil {
-			fmt.Fprintf(os.Stderr,
+			writeMaintenanceReport(os.Stderr,
 				"repair-height-index: warning: failed to write sentinel file: %v\n", sentErr)
 		}
 	}
 
 	if skipped > 0 {
-		fmt.Fprintf(os.Stderr,
+		writeMaintenanceReport(os.Stderr,
 			"repair-height-index: %d height(s) could not be repaired "+
 				"(block body missing from b/ namespace) — sentinel NOT written; "+
 				"restore from a clean snapshot for those heights\n",
 			skipped)
 	}
 	if repaired > 0 {
-		fmt.Fprintf(os.Stdout,
+		writeMaintenanceReport(os.Stdout,
 			"repair-height-index: repaired %d height-index entries "+
 				"(tip_height=%d, skipped=%d)\n",
 			repaired, tipHeight, skipped)
 	} else {
-		fmt.Fprintf(os.Stdout,
+		writeMaintenanceReport(os.Stdout,
 			"repair-height-index: height index consistent "+
 				"(tip_height=%d, 0 entries repaired, skipped=%d)\n",
 			tipHeight, skipped)
 	}
 	if !sweepOK {
-		fmt.Fprintf(os.Stdout,
+		writeMaintenanceReport(os.Stdout,
 			"repair-height-index: sweep incomplete — start normally only after resolving the gaps above\n")
 	} else {
-		fmt.Fprintf(os.Stdout,
+		writeMaintenanceReport(os.Stdout,
 			"repair-height-index: sweep complete — start normally\n")
 	}
 	if repErr != nil {
@@ -800,6 +822,12 @@ func checkStartupIntegrity(
 }
 
 func run() error {
+	for _, arg := range os.Args[1:] {
+		if arg == "--help" || arg == "-h" {
+			_, err := fmt.Fprintln(os.Stdout, "Usage: aperod-node --config <verified Mainnet node.yaml> [options]\nConfig-free node startup is disabled.")
+			return err
+		}
+	}
 	// Preflight must never dispatch a config-free mutating maintenance mode.
 	preflightRequested := false
 	preflightCapability := false
@@ -823,8 +851,8 @@ func run() error {
 	if preflightCapability {
 		// --validate-config accompanies this probe so an older binary which ignores
 		// unknown flags can only validate configuration, never start a live node.
-		fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
-		return nil
+		_, err := fmt.Fprintln(os.Stdout, `{"schema":1,"command":"sale-upgrade-preflight"}`)
+		return err
 	}
 	// ── 0. config-free maintenance subcommands ────────────────────────────────
 	// Processed before config loading so operators can verify a chain.db that
@@ -843,7 +871,9 @@ func run() error {
 	}
 
 	// ── 1. Load configuration ─────────────────────────────────────────────────
-	cfgPath := "config/testnet.yaml"
+	// Never start an unconfigured node from the legacy testnet template. A
+	// validator must name its verified network configuration explicitly.
+	cfgPath := ""
 	configFlagExplicit := false
 	resetP2PIdentity := false
 	validateOnly := false
@@ -906,26 +936,21 @@ func run() error {
 	// ── repair-db / reset-tip safety guard ───────────────────────────────────
 	// When a maintenance flag (--repair-db, --reset-tip, --rebuild-key-images,
 	// --rebuild-spent-index) is active and the operator did NOT supply an
-	// explicit --config flag, the default config path (config/testnet.yaml)
-	// points to a stale local copy with a ~105 K-block data directory — NOT the
-	// 1 M+ block production chain in /etc/aperod/node.yaml.  Silently scanning
-	// the wrong copy has caused multi-hour repair attempts with no effect on the
-	// live node.
+	// explicit --config flag, prefer the installed system config. Never fall
+	// back to a development/testnet config for maintenance or node startup.
 	//
-	// Fix: if the system config exists at the canonical production path and no
-	// --config was given, print a clear warning, switch to the system config,
-	// and continue. If the system config does NOT exist, require an explicit
-	// --config instead of allowing maintenance against the development default.
+	// If the system config exists at the canonical production path and no
+	// --config was given, print a clear warning and use it. Otherwise require an
+	// explicit path instead of scanning an ambiguous data directory.
 	const systemConfigPath = "/etc/aperod/node.yaml"
 	maintenanceMode := repairDB || resetTip || rebuildKeyImages || rebuildSpentIndex
 	if maintenanceMode && !configFlagExplicit {
 		if _, statErr := os.Stat(systemConfigPath); statErr == nil {
 			fmt.Fprintf(os.Stderr,
-				"WARNING: --config was not supplied; defaulting to %s\n"+
-					"  The local default (%s) points to a stale development data directory\n"+
-					"  and is NOT the production chain.  Switching to system config automatically.\n"+
+				"WARNING: --config was not supplied; using %s\n"+
+					"  Switching to the installed system config automatically.\n"+
 					"  To silence this warning, pass --config %s explicitly.\n",
-				systemConfigPath, cfgPath, systemConfigPath)
+				systemConfigPath, systemConfigPath)
 			cfgPath = systemConfigPath
 			configFlagExplicit = true
 		} else {
@@ -934,6 +959,9 @@ func run() error {
 					"pass --config <path> explicitly so a repair cannot run against the default data directory",
 				systemConfigPath)
 		}
+	}
+	if !configFlagExplicit && !maintenanceMode {
+		return fmt.Errorf("STARTUP REFUSED: pass --config <verified Mainnet node.yaml>; config-free startup is disabled")
 	}
 
 	cfg, err := config.Load(cfgPath)
@@ -959,6 +987,11 @@ func run() error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
+	if !maintenanceMode {
+		if err := p2p.ValidateAllowedPeerFingerprints(cfg.P2P.AllowedPeers); err != nil {
+			return fmt.Errorf("invalid config: p2p.allowed_peers: %w", err)
+		}
+	}
 	if maintenanceMode {
 		absConfig, absDataDir, pathErr := maintenancePaths(cfgPath, cfg.DataDir)
 		if pathErr != nil {
@@ -977,21 +1010,16 @@ func run() error {
 	// the node.  Prints the config path and network name so the caller can
 	// confirm which file was checked.
 	if validateOnly {
-		// Enforce the same fatal validator-key permission check the node
-		// applies at startup (mode & 0o077 must be 0).  Running it as part of
-		// this dry-run — BEFORE any live service is stopped — lets deploy
-		// tooling detect an unsafe-permission key and fix it without ever
-		// taking the node offline.  Otherwise the old binary keeps running
-		// while the freshly deployed one would refuse to boot.
-		keyPath := cfg.Consensus.ValidatorKey
-		if keyPath == "" {
-			keyPath = filepath.Join(cfg.DataDir, "validator.key")
+		if err := validateLPoDPreflight(cfg.Consensus); err != nil {
+			return fmt.Errorf("invalid config: %w", err)
 		}
-		if err := checkKeyFilePermissions(keyPath); err != nil {
-			return err
+		if cfg.Consensus.RehearsalFinalityV2Height == 0 {
+			if err := validateStartupKeyPath(cfg.Consensus.ValidatorKey, cfg.DataDir); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintf(os.Stdout, "config OK: %s (network=%s)\n", cfgPath, cfg.Network)
-		return nil
+		_, err := fmt.Fprintf(os.Stdout, "config OK: %s (network=%s)\n", cfgPath, cfg.Network)
+		return err
 	}
 
 	// ── 2. Setup logger ───────────────────────────────────────────────────────
@@ -1116,7 +1144,7 @@ func run() error {
 			return err
 		}
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 	// A shutdown-intent marker only suppresses watchdog action for the process
@@ -1169,7 +1197,21 @@ func run() error {
 			return fmt.Errorf("open store: %w", err)
 		}
 	}
-	defer db.Close()
+	defer checkedio.LogClose(log, db, "node database")
+
+	var signedMainnet mainnetbootstrap.SignedStatement
+	if cfg.Network == config.Mainnet {
+		signedMainnet, err = verifyStartupMainnetAnchors(db, cfg.MainnetBootstrapFile)
+		if err != nil {
+			return fmt.Errorf("%w: local chain: %v", config.ErrMainnetBootstrapUnavailable, err)
+		}
+		if err := validateRegistryBootstrapKeyImageBinding(
+			db, signedMainnet.Statement, cfg.Consensus.RegistryBootstrap,
+		); err != nil {
+			return fmt.Errorf("%w: registry bootstrap key-image anchor: %v", config.ErrMainnetBootstrapUnavailable, err)
+		}
+		log.Info("startup: signed Mainnet genesis and checkpoint match the local height index")
+	}
 
 	// Bind the private checkpoint trigger beside the exact chain.db opened
 	// above. It is a Unix socket only and never shares the public TCP API.
@@ -1177,13 +1219,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("start backup socket: %w", err)
 	}
-	defer backupSrv.Close()
+	defer checkedio.LogClose(log, backupSrv, "private backup socket")
 	log.Info("private backup socket started", "path", backupSrv.path)
 
-	// ── 4. Load or generate a persistent validator key ────────────────────────
+	// ── 4. Load node identity (rehearsals get an in-memory identity only) ──────
 	myKey, err := loadOrGenerateValidatorKey(cfg, log)
 	if err != nil {
 		return fmt.Errorf("validator key: %w", err)
+	}
+	if cfg.Consensus.RehearsalFinalityV2Height != 0 {
+		defer myKey.Destroy()
 	}
 	var (
 		avmCheckpointPath        string
@@ -1197,13 +1242,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		avmCheckpointPath = cfg.Consensus.AVMCheckpointFile
-		if avmCheckpointPath == "" {
-			avmCheckpointPath = "avm-state.checkpoint.json"
-		}
-		if !filepath.IsAbs(avmCheckpointPath) {
-			avmCheckpointPath = filepath.Join(cfg.DataDir, avmCheckpointPath)
-		}
+		avmCheckpointPath = cfg.AVMCheckpointPath()
 		avmCheckpointThreshold = cfg.Consensus.AVMCheckpointWitnessThreshold
 	}
 
@@ -1211,6 +1250,9 @@ func run() error {
 	genesisConfig, err := core.LoadGenesis(cfg.Genesis.File)
 	if err != nil {
 		return fmt.Errorf("load genesis: %w", err)
+	}
+	if err := core.ValidateNetworkGenesis(string(cfg.Network), genesisConfig); err != nil {
+		return fmt.Errorf("validate network genesis: %w", err)
 	}
 
 	// Build the initial validator set used to seed the registry and the
@@ -1223,9 +1265,9 @@ func run() error {
 	// treated as a genesis validator with stake, which could cause it to win
 	// a proposer slot even though MyKey is nil in the engine.
 	//
-	// Validator mode: override with our own key (single-validator / testnet
-	// design where this node IS the only proposer).
-	validators, err := buildValidatorList(cfg.Consensus.NonValidator, genesisConfig.Validators, myKey)
+	// Mainnet uses the same initial registry in both modes. A joining
+	// validator's local key must never earn synthetic genesis stake.
+	validators, err := buildValidatorList(cfg.Network, cfg.Consensus.NonValidator, genesisConfig.Validators, myKey)
 	if err != nil {
 		return fmt.Errorf("build validator list: %w", err)
 	}
@@ -1243,6 +1285,7 @@ func run() error {
 	}
 	chain := core.NewChain(chainMaxBlocks)
 	mempoolCfg := core.DefaultMempoolConfig()
+	mempoolCfg.Network = string(cfg.Network)
 	mempoolCfg.RingCTV4ActivationHeight = cfg.Consensus.RingCTV4ActivationHeight
 	mempoolCfg.RingCTCLSAGActivationHeight = cfg.Consensus.RingCTCLSAGActivationHeight
 	mempoolCfg.RingCTAmountBindingActivationHeight = cfg.Consensus.RingCTAmountBindingActivationHeight
@@ -1436,11 +1479,22 @@ func run() error {
 		)
 		apiSrv.SetAllowedOrigins(cfg.API.CORS)
 		apiSrv.SetStore(db)
+		if cfg.Network == config.Mainnet {
+			if err := apiSrv.SetMainnetBootstrapIdentity(signedMainnet); err != nil {
+				return fmt.Errorf("pin API to signed Mainnet identity: %w", err)
+			}
+		}
 		var apiGuardianAnchor crypto.Hash32
 		if raw, err := hex.DecodeString(cfg.Consensus.GuardianFundChainAnchor); err == nil && len(raw) == 32 {
 			copy(apiGuardianAnchor[:], raw)
 		}
 		apiSrv.SetGuardianFundConfig(cfg.Consensus.GuardianFundActivationHeight, apiGuardianAnchor)
+		apiSrv.SetConsensusActivationSchedule(
+			cfg.Consensus.GuardianFundActivationHeight,
+			cfg.Consensus.LPoDDailyUpgradeHeight,
+			cfg.Consensus.LPoDValidatorDailyUpgradeHeight,
+			cfg.Consensus.LPoDMigrationFile,
+		)
 		apiSrv.SetAVMStore(
 			cfg.Consensus.AVMActivationHeight,
 			avm.LevelStore{DB: db},
@@ -1527,6 +1581,9 @@ func run() error {
 				cfg.Genesis.File,
 			)
 		}
+		if err := config.ValidateChainBootstrap(cfg.Network, false); err != nil {
+			return err
+		}
 		if apiSrv != nil {
 			apiSrv.SetStartupSnapshotOutcome(api.StartupNoSnapshot, 0, nil)
 		}
@@ -1587,7 +1644,7 @@ func run() error {
 		var avmRebuilt bool
 		var avmErr error
 		if len(avmCheckpointAuthorities) > 0 {
-			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithQuorumCheckpointAndSecurityHardening(
+			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithQuorumCheckpointAndAuthority(
 				context.Background(),
 				db,
 				cfg.Consensus.AVMActivationHeight,
@@ -1598,6 +1655,7 @@ func run() error {
 				avmCheckpointThreshold,
 				avm.MaxAVMCheckpointReplay,
 				cfg.Consensus.SecurityHardeningActivationHeight,
+				authorityFork,
 			)
 		} else {
 			avmRebuilt, avmErr = avm.EnsureCanonicalStateWithSecurityHardening(
@@ -1816,9 +1874,9 @@ func run() error {
 				}
 			}
 			if apiSrv != nil {
-				apiSrv.SetStoreMissingBlocks(int64(missingCount))
-				apiSrv.SetStoreMissingFirstBlock(int64(firstMissing))
-				apiSrv.SetStoreMissingLastBlock(int64(lastMissing))
+				apiSrv.SetStoreMissingBlocks(missingCount)
+				apiSrv.SetStoreMissingFirstBlock(firstMissing)
+				apiSrv.SetStoreMissingLastBlock(lastMissing)
 			}
 		}
 
@@ -1916,7 +1974,21 @@ func run() error {
 		// Otherwise a restart could not validate chain-bound v2 withdrawal
 		// nonces, and legacy withdrawals after activation would be replayed under
 		// obsolete rules.
-		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, validators,
+		// The signed checkpoint can supply LPoD's early authority list, but not
+		// seed the live registry or bypass the independent UTXO restoration.
+		verifySignedRegistry := signedMainnet.Statement.RegistrySHA256 != "" &&
+			signedMainnet.Statement.CheckpointHeight == tipHeight
+		lpodValidators := validators
+		if verifySignedRegistry {
+			snapshot, err := mainnetbootstrap.VerifyCheckpointRegistry(db, signedMainnet)
+			if err != nil {
+				return fmt.Errorf("authenticate Mainnet checkpoint registry: %w", err)
+			}
+			expected := core.NewValidatorRegistry()
+			expected.RestoreFromSnapshot(snapshot)
+			lpodValidators = expected.GetActiveValidators()
+		}
+		lpodMigration, err = loadLPoDMigration(cfg.Consensus.LPoDMigrationFile, db, chain, lpodValidators,
 			genesisConfig.Validators, cfg.Consensus.LPoDV2TrustAuthorities, cfg.Consensus.LPoDV3TrustAuthorities)
 		if err != nil {
 			return err
@@ -2555,6 +2627,14 @@ func run() error {
 			_ = kiCount // already logged above; kept for the key-image index path
 		} // end !snapLoaded
 
+		if verifySignedRegistry {
+			if err := mainnetbootstrap.VerifyRegistrySnapshot(signedMainnet.Statement, tipHash, registry.TakeSnapshot()); err != nil {
+				return fmt.Errorf("authenticate restored Mainnet checkpoint registry: %w", err)
+			}
+			validators = registry.GetActiveValidators()
+			log.Info("startup: restored registry matches the signed Mainnet checkpoint", "height", tipHeight)
+		}
+
 		// ── Background tx-hash index backfill (snapshot fast path) ────────────
 		// When the snapshot fast path skips the full startup block scan, blocks
 		// outside the in-memory chain window may lack t/ entries if they were
@@ -2765,6 +2845,7 @@ func run() error {
 		FinalityMigrationTrustAuthorities:   finalityMigrationTrustAuthorities,
 		LPoDMigration:                       lpodMigration,
 		LPoDDailyUpgradeHeight:              cfg.Consensus.LPoDDailyUpgradeHeight,
+		LPoDValidatorDailyUpgradeHeight:     cfg.Consensus.LPoDValidatorDailyUpgradeHeight,
 		SaleMigration:                       saleMigration,
 		GenesisVestingActivationHeight:      cfg.Consensus.GenesisVestingActivationHeight,
 		GenesisVestingFunding:               genesisVestingFunding,
@@ -2792,6 +2873,9 @@ func run() error {
 		),
 		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
 		SecurityHardeningActivationHeight:   cfg.Consensus.SecurityHardeningActivationHeight,
+		FinalityVoteV2ActivationHeight:      cfg.FinalityVoteV2ActivationHeight(),
+		ExplicitFinalityVoteSchedule:        true,
+		RehearsalFinalityV2Height:           cfg.Consensus.RehearsalFinalityV2Height,
 		GuardianFundActivationHeight:        cfg.Consensus.GuardianFundActivationHeight,
 		GuardianFundChainAnchor:             guardianAnchor,
 		OnCanonicalBlock: func(block *core.Block, prepared *avm.PreparedBlock) error {
@@ -2923,9 +3007,9 @@ func run() error {
 							"rss_before_mb", rssBefore>>20,
 							"rss_after_mb", rssAfter>>20,
 							"rss_freed_mb", (rssBefore-rssAfter)>>20,
-							"heap_alloc_mb", int64(ms.HeapAlloc)>>20,
-							"heap_sys_mb", int64(ms.HeapSys)>>20,
-							"heap_idle_mb", int64(ms.HeapIdle)>>20,
+							"heap_alloc_mb", int64(ms.HeapAlloc>>20),
+							"heap_sys_mb", int64(ms.HeapSys>>20),
+							"heap_idle_mb", int64(ms.HeapIdle>>20),
 							"num_gc", ms.NumGC,
 						)
 					}(h)
@@ -3027,6 +3111,9 @@ func run() error {
 			}(periodicSnap, h, periodicActive)
 		},
 	}, chain, mempool, log)
+	if err := engine.StartupError(); err != nil {
+		return fmt.Errorf("consensus startup failed before readiness: %w", err)
+	}
 	if failed, err := engine.ReconcileRewardAddressAdminMintIntents(); err != nil {
 		return fmt.Errorf("admin mint startup reconciliation: %w", err)
 	} else if failed > 0 {
@@ -3043,7 +3130,10 @@ func run() error {
 		} else {
 			log.Info("v3 LPoD earnings index backfill complete")
 		}
-		if err := db.BackfillLPoDWalletIndex(lpodMigration); err != nil {
+		if err := db.BackfillLPoDWalletIndexWithProgress(lpodMigration, func(through, target uint64) {
+			log.Info("v3 LPoD wallet-output index backfill progress",
+				"indexed_through_height", through, "target_height", target)
+		}); err != nil {
 			log.Warn("v3 LPoD wallet-output index backfill incomplete; wallet balance API remains fail-closed", "err", err)
 		} else {
 			log.Info("v3 LPoD wallet-output index backfill complete")
@@ -3059,7 +3149,13 @@ func run() error {
 	txVerifier.SetStakedCollateralRingExclusionActivationHeight(
 		cfg.Consensus.StakedCollateralRingExclusionActivationHeight,
 	)
-	txVerifier.SetLPoDDailyUpgradeHeight(cfg.Consensus.LPoDDailyUpgradeHeight)
+	lpodDailyPositionHeight := cfg.Consensus.LPoDDailyUpgradeHeight
+	if lpodDailyPositionHeight == 0 ||
+		(cfg.Consensus.LPoDValidatorDailyUpgradeHeight > 0 &&
+			cfg.Consensus.LPoDValidatorDailyUpgradeHeight < lpodDailyPositionHeight) {
+		lpodDailyPositionHeight = cfg.Consensus.LPoDValidatorDailyUpgradeHeight
+	}
+	txVerifier.SetLPoDDailyUpgradeHeight(lpodDailyPositionHeight)
 	// Wire vesting enforcement so the verifier rejects spending of still-locked
 	// genesis allocations at the protocol level (not just display-only).
 	// Use the actual persisted genesis block timestamp (nanoseconds ÷ 1e9) rather
@@ -3222,7 +3318,9 @@ func run() error {
 	if apiSrv != nil {
 		// Wire engine-dependent options now that the consensus engine exists.
 		apiSrv.SetRegistry(engine.Registry())
-		apiSrv.SetValidatorKey(myKey)
+		if cfg.Consensus.RehearsalFinalityV2Height == 0 {
+			apiSrv.SetValidatorKey(myKey)
+		}
 		if err := apiSrv.SetAuditValidatorAuthorityFork(authorityFork); err != nil {
 			log.Error("daily audit authority binding failed", "err", err)
 			os.Exit(1)
@@ -3602,8 +3700,9 @@ func run() error {
 			// handlers on http.DefaultServeMux as a side effect; we serve
 			// that mux here on its own dedicated port.
 			pprofSrv := &http.Server{
-				Addr:    pprofAddr,
-				Handler: http.DefaultServeMux,
+				Addr:              pprofAddr,
+				Handler:           http.DefaultServeMux,
+				ReadHeaderTimeout: 5 * time.Second,
 			}
 			log.Info("pprof endpoint started", "addr", pprofAddr,
 				"hint", "go tool pprof http://"+pprofAddr+"/debug/pprof/profile?seconds=30")
@@ -3728,9 +3827,8 @@ func performShutdown(
 	registry *core.ValidatorRegistry,
 	dataDir string,
 	log *slog.Logger,
-	apiSrv *api.Server,
 ) {
-	performShutdownWithGate(stop, engineDone, db, utxos, registry, dataDir, log, apiSrv, nil)
+	performShutdownWithGate(stop, engineDone, db, utxos, registry, dataDir, log, nil, nil)
 }
 
 func performShutdownWithGate(
@@ -4027,25 +4125,68 @@ func saveShutdownSnapshotWithPaths(
 // world-readable/writable/executable bits set (mode & 0o077 != 0).
 // A compromised key file is a critical security risk — the node refuses to boot.
 func checkKeyFilePermissions(path string) error {
+	// #nosec G703 -- Node startup's operator-configured validator-key path; permission validation is performed below.
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil // not found — handled by caller
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	return checkValidatorKeyMode(path, info.Mode())
+}
+
+// validateStartupKeyPath does not create or read a key. An explicit key path
+// opts out of startup's key generation and therefore must be usable now.
+func validateStartupKeyPath(configuredPath, dataDir string) error {
+	if configuredPath == "" {
+		return checkKeyFilePermissions(filepath.Join(dataDir, "validator.key"))
+	}
+	info, err := os.Stat(configuredPath)
+	if err != nil {
+		return fmt.Errorf("inspect configured validator key: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("configured validator key %q is not a regular file", configuredPath)
+	}
+	if err := checkValidatorKeyMode(configuredPath, info.Mode()); err != nil {
+		return err
+	}
+	// #nosec G304 -- Operator-selected local startup identity, never supplied by a peer or HTTP request.
+	key, err := os.Open(configuredPath)
+	if err != nil {
+		return fmt.Errorf("open configured validator key: %w", err)
+	}
+	return key.Close()
+}
+
+func checkValidatorKeyMode(path string, mode os.FileMode) error {
+	if mode.Perm()&0o077 != 0 {
 		return fmt.Errorf(
 			"validator key file %q has unsafe permissions %s — "+
 				"other users may read it; fix with: chmod 600 %q",
-			path, info.Mode().Perm(), path)
+			path, mode.Perm(), path)
 	}
 	return nil
 }
 
 // loadOrGenerateValidatorKey returns the node's validator private key.
 func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.LockedValidatorKey, error) {
+	if cfg.Consensus.RehearsalFinalityV2Height != 0 {
+		if !cfg.Consensus.NonValidator || cfg.Consensus.ValidatorKey != "" {
+			return nil, errors.New("finality rehearsal requires a non-signing node without a configured validator key")
+		}
+		priv, _, err := crypto.GenerateValidatorKey()
+		if err != nil {
+			return nil, fmt.Errorf("generate ephemeral rehearsal identity: %w", err)
+		}
+		defer crypto.ZeroBytes(priv.Bytes())
+		return crypto.NewLockedValidatorKey(priv.Bytes(), func(mlockErr error) {
+			log.Warn("mlock ephemeral rehearsal identity failed (non-fatal)", "err", mlockErr)
+		})
+	}
 	if cfg.Consensus.ValidatorKey != "" {
 		if err := checkKeyFilePermissions(cfg.Consensus.ValidatorKey); err != nil {
 			return nil, err
 		}
+		// #nosec G703 -- Validator signing key path from validated operator startup configuration.
 		privBytes, err := os.ReadFile(cfg.Consensus.ValidatorKey)
 		if err != nil {
 			return nil, fmt.Errorf("read validator key file: %w", err)
@@ -4065,6 +4206,7 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
 	if err := checkKeyFilePermissions(keyPath); err != nil {
 		return nil, err
 	}
+	// #nosec G304 G703 -- Startup-owned P2P identity file in the operator-configured data directory.
 	if data, err := os.ReadFile(keyPath); err == nil {
 		if err := crypto.MlockBytes(data); err != nil {
 			log.Warn("mlock validator key bytes failed (non-fatal)", "err", err)
@@ -4084,6 +4226,7 @@ func loadOrGenerateValidatorKey(cfg *config.Config, log *slog.Logger) (*crypto.L
 	if err != nil {
 		return nil, fmt.Errorf("generate validator key: %w", err)
 	}
+	// #nosec G703 -- Persists the generated local P2P identity to its operator-configured startup path with private mode.
 	if err := os.WriteFile(keyPath, priv.Bytes(), 0600); err != nil {
 		return nil, fmt.Errorf("save validator key: %w", err)
 	}
@@ -4375,11 +4518,12 @@ func readEffectiveTimeoutStopSec(dropinDir, servicePath string) (float64, bool) 
 	// the same file.  Whitespace around "=" is trimmed to match systemd's
 	// lenient unit-file parser.
 	scanFile := func(path string) (float64, bool) {
+		// #nosec G304 -- Fixed local systemd service/drop-in paths used only for advisory shutdown-timeout discovery.
 		f, err := os.Open(path)
 		if err != nil {
 			return 0, false
 		}
-		defer f.Close()
+		defer checkedio.LogClose(slog.Default(), f, "advisory systemd timeout file")
 		var last float64
 		found := false
 		sc := bufio.NewScanner(f)
@@ -5654,6 +5798,7 @@ func auditUTXOStore(
 // when mismatches>0.  apiSrv must be non-nil.
 func startUTXOAuditLoop(blockStore *store.DB, apiSrv *api.Server, log *slog.Logger) {
 	go func() {
+		// #nosec G115 -- Jitter-only PCG seed preserves all timestamp bits; Getpid is a nonnegative OS pid. Neither seed is a credential.
 		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(os.Getpid())))
 		time.Sleep(utxoAuditInitialDelay)
 		for {

@@ -2,10 +2,20 @@ package crypto
 
 import "encoding/binary"
 
+// Finality vote versions distinguish historical and height-bound signing formats.
 const (
 	FinalityVoteVersionLegacy      uint8 = 1
 	FinalityVoteVersionHeightBound uint8 = 2
 )
+
+// FinalityVoteVersionAt selects the signature format, not a block validation
+// rule. An unset activation leaves the legacy format in place.
+func FinalityVoteVersionAt(height, activation uint64) uint8 {
+	if activation != 0 && height >= activation {
+		return FinalityVoteVersionHeightBound
+	}
+	return FinalityVoteVersionLegacy
+}
 
 // FinalityVoteMessage returns the signed digest for a finality vote.
 // Version 1 is retained for historical certificates. Version 2 binds the

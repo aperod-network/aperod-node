@@ -393,7 +393,7 @@ func stateWriteModule() []byte {
 		ImportSection:   []*wasm.Import{{Type: wasm.ExternTypeFunc, Module: "apro", Name: "state_write", DescFunc: 0}},
 		FunctionSection: []wasm.Index{1}, MemorySection: &wasm.Memory{Min: 1, Max: avm.MaxMemoryPages, IsMaxEncoded: true},
 		ExportSection: []*wasm.Export{{Type: wasm.ExternTypeFunc, Name: "run", Index: 1}, {Type: wasm.ExternTypeMemory, Name: "memory", Index: 0}},
-		CodeSection:   []*wasm.Code{{Body: []byte{byte(wasm.OpcodeI32Const), 0, byte(wasm.OpcodeI32Const), 3, byte(wasm.OpcodeI32Const), 3, byte(wasm.OpcodeI32Const), 5, byte(wasm.OpcodeCall), 0, byte(wasm.OpcodeDrop), byte(wasm.OpcodeEnd)}}},
+		CodeSection:   []*wasm.Code{{Body: []byte{wasm.OpcodeI32Const, 0, wasm.OpcodeI32Const, 3, wasm.OpcodeI32Const, 3, wasm.OpcodeI32Const, 5, wasm.OpcodeCall, 0, wasm.OpcodeDrop, wasm.OpcodeEnd}}},
 		DataSection:   []*wasm.DataSegment{{OffsetExpression: &wasm.ConstantExpression{Opcode: wasm.OpcodeI32Const, Data: []byte{0}}, Init: []byte("keyvalue")}},
 	}
 	return binary.EncodeModule(module)
@@ -485,7 +485,7 @@ func (n *avmEngineNode) addStakeUTXO(t *testing.T, priv crypto.ValidatorPrivKey,
 	const amount = uint64(10_000_000_000_000)
 	var one crypto.Point32
 	copy(one[:], []byte(pub))
-	blind, err := crypto.DeterministicMintBlind(one, amount)
+	blind, err := crypto.LegacyMintBlind(one, amount)
 	if err != nil {
 		t.Fatal(err)
 	}

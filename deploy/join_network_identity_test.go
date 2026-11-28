@@ -86,3 +86,29 @@ func TestJoinNetworkIdentity(t *testing.T) {
 			err)
 	}
 }
+
+// TestJoinNetworkMainnetIdentityGuard ensures both copy directions refuse a
+// mainnet node before any SSH, service, sentinel, or rsync operation when the
+// independently authenticated identity release is absent.
+func TestJoinNetworkMainnetIdentityGuard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mainnet identity guard test requires bash")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not found in PATH")
+	}
+	scriptDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("cannot determine script directory: %v", err)
+	}
+	scriptPath := filepath.Join(scriptDir, "test-join-network-mainnet-identity-guard.sh")
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		t.Fatalf("mainnet identity guard script not found at %s", scriptPath)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("mainnet identity guard failed: %v", err)
+	}
+}

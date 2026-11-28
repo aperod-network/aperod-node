@@ -20,6 +20,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,6 +32,8 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // copyChainDB copies all files and subdirectories from src to dst recursively.
@@ -56,17 +59,17 @@ func copyChainDB(t *testing.T, src, dst string) {
 	}
 }
 
-func copyOneFile(src, dst string) error {
+func copyOneFile(src, dst string) (copyErr error) {
 	r, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() { copyErr = errors.Join(copyErr, r.Close()) }()
 	w, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+	defer func() { copyErr = errors.Join(copyErr, w.Close()) }()
 	_, err = io.Copy(w, r)
 	return err
 }
@@ -115,10 +118,10 @@ func deleteRawBlockBody(t *testing.T, dbDir string, db *store.DB, hash crypto.Ha
 	copy(bKey, []byte("b/"))
 	copy(bKey[2:], hash[:])
 	if err := raw.Delete(bKey, &opt.WriteOptions{Sync: true}); err != nil {
-		raw.Close()
+		testutil.Close(t, raw)
 		t.Fatalf("delete block body: %v", err)
 	}
-	raw.Close()
+	testutil.Close(t, raw)
 	db2, err := store.Open(dbDir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -144,7 +147,7 @@ func TestHeightIndexSentinel_RsyncLifecycle(t *testing.T) {
 		t.Fatalf("open source: %v", err)
 	}
 	hashes := buildMinimalChain(t, srcDB, 3) // heights 0, 1, 2
-	srcDB.Close()
+	testutil.Close(t, srcDB)
 
 	// Write sentinel to source dataDir (outside chain.db/).
 	if err := storeHeightIndexSentinel(srcDataDir); err != nil {
@@ -179,7 +182,7 @@ func TestHeightIndexSentinel_RsyncLifecycle(t *testing.T) {
 
 	// ── Run repair sweep (would be triggered by sentinel-absent startup) ───
 	repaired, skipped, sweepErr := destDB.RepairAllHeightIndex(tipHeight, nil)
-	destDB.Close()
+	testutil.Close(t, destDB)
 
 	if sweepErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", sweepErr)
@@ -213,7 +216,7 @@ func TestHeightIndexSentinel_CleanRsyncWritesSentinel(t *testing.T) {
 		t.Fatalf("open source: %v", err)
 	}
 	buildMinimalChain(t, srcDB, 3)
-	srcDB.Close()
+	testutil.Close(t, srcDB)
 
 	// Rsync chain.db/ to dest (no sentinel file copied).
 	destDataDir := t.TempDir()
@@ -234,7 +237,7 @@ func TestHeightIndexSentinel_CleanRsyncWritesSentinel(t *testing.T) {
 	}
 
 	repaired, skipped, sweepErr := destDB.RepairAllHeightIndex(tipHeight, nil)
-	destDB.Close()
+	testutil.Close(t, destDB)
 
 	if sweepErr != nil {
 		t.Fatalf("RepairAllHeightIndex: %v", sweepErr)

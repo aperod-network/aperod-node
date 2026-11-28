@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -74,7 +75,7 @@ func TestKeyImageFastPath_LoadsFromDBIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	utxos := core.NewUTXOSet()
 	kiCount := 0
@@ -108,7 +109,7 @@ func TestKeyImageFastPath_EmptyIndexNotTrusted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	kiCount := 0
 	iterErr := db.IterKeyImages(func(crypto.KeyImage) error {

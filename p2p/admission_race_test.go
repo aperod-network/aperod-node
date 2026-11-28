@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -105,7 +106,7 @@ func TestHost_InboundAdmissionRecheckAfterHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial honest peer: %v", err)
 	}
-	defer honest.Close()
+	defer testutil.CleanupClose(t, honest)
 	_ = honest.SetDeadline(time.Now().Add(2 * time.Second))
 	if err := p2p.WriteMsg(honest, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "honest-peer", UserAgent: "aperod/test", Timestamp: time.Now().UnixNano(),

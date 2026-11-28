@@ -78,12 +78,12 @@ func TestEngineRejectsUndeclaredStateWrite(t *testing.T) {
 }
 
 func TestValidateModuleRejectsFloatWASIAndLoops(t *testing.T) {
-	floatModule := minimalModule([]wasm.ValueType{wasm.ValueTypeF32}, nil, []byte{byte(wasm.OpcodeEnd)}, nil)
+	floatModule := minimalModule([]wasm.ValueType{wasm.ValueTypeF32}, nil, []byte{wasm.OpcodeEnd}, nil)
 	if _, err := ValidateModule(floatModule); err == nil {
 		t.Fatal("floating-point module accepted")
 	}
 
-	wasiModule := minimalModule(nil, nil, []byte{byte(wasm.OpcodeEnd)}, []*wasm.Import{{
+	wasiModule := minimalModule(nil, nil, []byte{wasm.OpcodeEnd}, []*wasm.Import{{
 		Type: wasm.ExternTypeFunc, Module: "wasi_snapshot_preview1", Name: "fd_write", DescFunc: 0,
 	}})
 	if _, err := ValidateModule(wasiModule); err == nil {
@@ -91,7 +91,7 @@ func TestValidateModuleRejectsFloatWASIAndLoops(t *testing.T) {
 	}
 
 	loopModule := minimalModule(nil, nil, []byte{
-		byte(wasm.OpcodeLoop), 0x40, byte(wasm.OpcodeEnd), byte(wasm.OpcodeEnd),
+		wasm.OpcodeLoop, 0x40, wasm.OpcodeEnd, wasm.OpcodeEnd,
 	}, nil)
 	if _, err := ValidateModule(loopModule); err == nil {
 		t.Fatal("loop module accepted")
@@ -102,7 +102,7 @@ func TestValidateModuleDoesNotTreatIntegerImmediateAsFloatOpcode(t *testing.T) {
 	// i32.const 67 encodes immediate byte 0x43, which is also f32.const when
 	// interpreted as an opcode. Instruction-aware parsing must accept it.
 	code := minimalModule(nil, nil, []byte{
-		byte(wasm.OpcodeI32Const), 0x43, byte(wasm.OpcodeDrop), byte(wasm.OpcodeEnd),
+		wasm.OpcodeI32Const, 0x43, wasm.OpcodeDrop, wasm.OpcodeEnd,
 	}, nil)
 	if _, err := ValidateModule(code); err != nil {
 		t.Fatalf("integer immediate rejected as float opcode: %v", err)
@@ -122,24 +122,24 @@ func stateWriteModule(outOfGas bool) []byte {
 		{Type: wasm.ExternTypeFunc, Module: "apro", Name: "output_write", DescFunc: 2},
 	}
 	body := []byte{
-		byte(wasm.OpcodeI32Const), 0x00,
-		byte(wasm.OpcodeI32Const), 0x03,
-		byte(wasm.OpcodeI32Const), 0x03,
-		byte(wasm.OpcodeI32Const), 0x05,
-		byte(wasm.OpcodeCall), 0x00,
-		byte(wasm.OpcodeDrop),
+		wasm.OpcodeI32Const, 0x00,
+		wasm.OpcodeI32Const, 0x03,
+		wasm.OpcodeI32Const, 0x03,
+		wasm.OpcodeI32Const, 0x05,
+		wasm.OpcodeCall, 0x00,
+		wasm.OpcodeDrop,
 	}
 	if outOfGas {
-		body = append(body, byte(wasm.OpcodeI64Const), 0x90, 0x4e, byte(wasm.OpcodeCall), 0x01)
+		body = append(body, wasm.OpcodeI64Const, 0x90, 0x4e, wasm.OpcodeCall, 0x01)
 	} else {
 		body = append(body,
-			byte(wasm.OpcodeI32Const), 0x03,
-			byte(wasm.OpcodeI32Const), 0x05,
-			byte(wasm.OpcodeCall), 0x02,
-			byte(wasm.OpcodeDrop),
+			wasm.OpcodeI32Const, 0x03,
+			wasm.OpcodeI32Const, 0x05,
+			wasm.OpcodeCall, 0x02,
+			wasm.OpcodeDrop,
 		)
 	}
-	body = append(body, byte(wasm.OpcodeEnd))
+	body = append(body, wasm.OpcodeEnd)
 	module := &wasm.Module{
 		TypeSection:     types,
 		ImportSection:   imports,

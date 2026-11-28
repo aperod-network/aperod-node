@@ -19,6 +19,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -249,7 +250,7 @@ func TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	serverDone := make(chan struct{})
 	go func() {
@@ -258,7 +259,7 @@ func TestHost_SetKeepaliveInterval_DecreaseKeepsPeerAlive(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Asymmetric handshake: outbound host sends MsgPing first.
 		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
@@ -359,7 +360,7 @@ func TestHost_KeepalivePongDeadline_EvictsDeadPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	serverDone := make(chan struct{})
 	go func() {
@@ -368,7 +369,7 @@ func TestHost_KeepalivePongDeadline_EvictsDeadPeer(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Asymmetric handshake: outbound host sends MsgPing first.
 		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
@@ -471,7 +472,7 @@ func TestHost_KeepaliveTickRate_MatchesConfiguredInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// pingCount counts keepalive MsgPing frames received AFTER the
 	// handshake ping; windowStart is closed once the handshake completes
@@ -486,7 +487,7 @@ func TestHost_KeepaliveTickRate_MatchesConfiguredInterval(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Asymmetric handshake: outbound host sends MsgPing first.
 		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
@@ -632,9 +633,9 @@ func dialAndHandshake(t *testing.T, addr string, extraMsg func(conn net.Conn)) {
 		t.Logf("dialAndHandshake: dial failed: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 
 	// Send ping to host (dialer goes first under the asymmetric protocol)
 	ping := p2p.PingMsg{NodeID: "fake-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix()}
@@ -709,15 +710,23 @@ func TestHost_Handshake_InboundWithMessages(t *testing.T) {
 	go func() {
 		defer close(done)
 		dialAndHandshake(t, addr, func(conn net.Conn) {
-			conn.SetDeadline(time.Now().Add(2 * time.Second))
+			testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 			// Send GetPeers
-			p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{})
+			testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetPeers, struct{}{}))
 			// Read peers response
-			p2p.ReadMsg(conn)
+			msgType, _, err := readMsgSkipGetHeaders(conn)
+			testutil.NoError(t, err)
+			if msgType != p2p.MsgPeers {
+				t.Errorf("GetPeers response=%v, want MsgPeers", msgType)
+			}
 			// Send GetHeaders
-			p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10})
+			testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10}))
 			// Read headers response
-			p2p.ReadMsg(conn)
+			msgType, _, err = readMsgSkipGetHeaders(conn)
+			testutil.NoError(t, err)
+			if msgType != p2p.MsgHeaders {
+				t.Errorf("GetHeaders response=%v, want MsgHeaders", msgType)
+			}
 		})
 	}()
 	<-done
@@ -857,9 +866,9 @@ func TestHost_MaliciousPacket_NodeSurvives(t *testing.T) {
 	for i := range garbage {
 		garbage[i] = byte(i & 0xFF)
 	}
-	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	testutil.NoError(t, conn.SetWriteDeadline(time.Now().Add(time.Second)))
 	conn.Write(garbage) //nolint:errcheck
-	conn.Close()
+	testutil.Close(t, conn)
 
 	// Allow the node goroutine to process the packet and recover.
 	time.Sleep(200 * time.Millisecond)
@@ -870,7 +879,7 @@ func TestHost_MaliciousPacket_NodeSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("node unreachable after malicious packet (panic may have escaped recover): %v", err)
 	}
-	conn2.Close()
+	testutil.Close(t, conn2)
 }
 
 // TestHost_MaxPeersPerIP_Enforced verifies that a single IP cannot consume more
@@ -910,7 +919,7 @@ func TestHost_MaxPeersPerIP_Enforced(t *testing.T) {
 	// The (limit+1)-th connection should be closed by the host already.
 	// Try to write to it — it should fail or read EOF.
 	extra := conns[limit]
-	extra.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	testutil.NoError(t, extra.SetDeadline(time.Now().Add(300*time.Millisecond)))
 	buf := make([]byte, 1)
 	n, err := extra.Read(buf)
 	if n > 0 || err == nil {
@@ -918,7 +927,7 @@ func TestHost_MaxPeersPerIP_Enforced(t *testing.T) {
 	}
 
 	for _, c := range conns {
-		c.Close()
+		testutil.Close(t, c)
 	}
 }
 
@@ -967,11 +976,11 @@ func TestHost_MinOutbound_BlocksInboundFlood(t *testing.T) {
 	if err != nil {
 		t.Fatalf("node unreachable after inbound flood — MinOutbound may have broken acceptLoop: %v", err)
 	}
-	probe.Close()
+	testutil.Close(t, probe)
 
 	for _, c := range conns {
 		if c != nil {
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}
 }
@@ -1007,7 +1016,7 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 	if err != nil {
 		t.Fatalf("trusted peer listen: %v", err)
 	}
-	defer trustedLn.Close()
+	defer testutil.CleanupClose(t, trustedLn)
 
 	// Background goroutine: accept connections and complete the handshake.
 	go func() {
@@ -1017,8 +1026,8 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 				return // listener closed
 			}
 			go func(c net.Conn) {
-				defer c.Close()
-				c.SetDeadline(time.Now().Add(2 * time.Second))
+				defer testutil.CleanupClose(t, c)
+				testutil.NoError(t, c.SetDeadline(time.Now().Add(2*time.Second)))
 				// Read ping from hA
 				msgType, _, rdErr := p2p.ReadMsg(c)
 				if rdErr != nil || msgType != p2p.MsgPing {
@@ -1029,7 +1038,7 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 					NodeID: "trusted-peer", Height: 0, UserAgent: "test",
 					Timestamp: time.Now().Unix(),
 				})
-				c.SetDeadline(time.Time{})
+				testutil.NoError(t, c.SetDeadline(time.Time{}))
 				// Hold the connection open so hA keeps the peer registered.
 				time.Sleep(2 * time.Second)
 			}(conn)
@@ -1047,7 +1056,7 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 		if err != nil {
 			t.Fatalf("flooder dial %d: %v", i, err)
 		}
-		c.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, c.SetDeadline(time.Now().Add(2*time.Second)))
 
 		// Asymmetric handshake: dialer sends Ping first, host replies with Pong.
 		if err := p2p.WriteMsg(c, p2p.MsgPing, p2p.PingMsg{
@@ -1056,20 +1065,20 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 			UserAgent: "flood",
 			Timestamp: time.Now().Unix(),
 		}); err != nil {
-			c.Close()
+			testutil.Close(t, c)
 			t.Fatalf("flooder %d: write ping: %v", i, err)
 		}
 		msgType, _, err := p2p.ReadMsg(c)
 		if err != nil || msgType != p2p.MsgPong {
-			c.Close()
+			testutil.Close(t, c)
 			t.Fatalf("flooder %d: expected MsgPong, got %v err=%v", i, msgType, err)
 		}
-		c.SetDeadline(time.Time{}) // clear deadline — keep connection open
+		testutil.NoError(t, c.SetDeadline(time.Time{})) // clear deadline — keep connection open
 		inConns = append(inConns, c)
 	}
 	defer func() {
 		for _, c := range inConns {
-			c.Close()
+			testutil.CleanupClose(t, c)
 		}
 	}()
 
@@ -1085,7 +1094,7 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 	// Verify that one more inbound connection is rejected (inbound cap enforced).
 	extra, err := net.DialTimeout("tcp", addrA, time.Second)
 	if err == nil {
-		extra.SetDeadline(time.Now().Add(300 * time.Millisecond))
+		testutil.NoError(t, extra.SetDeadline(time.Now().Add(300*time.Millisecond)))
 		// Asymmetric handshake: send Ping, try to read Pong (host may reject before replying).
 		if writeErr := p2p.WriteMsg(extra, p2p.MsgPing, p2p.PingMsg{
 			NodeID: "extra", UserAgent: "test", Timestamp: time.Now().Unix(),
@@ -1093,7 +1102,7 @@ func TestMinOutbound_OutboundDialSucceedsAfterInboundFlood(t *testing.T) {
 			_, _, _ = p2p.ReadMsg(extra) // host may close early if cap exceeded
 			time.Sleep(80 * time.Millisecond)
 		}
-		extra.Close()
+		testutil.Close(t, extra)
 	}
 	time.Sleep(50 * time.Millisecond)
 
@@ -1276,24 +1285,24 @@ func TestHost_PeerWhitelist_AllowsWhitelistedIP(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 
 	// Asymmetric handshake: dialer (us) sends Ping first, host replies Pong.
 	if wErr := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "wl-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); wErr != nil {
-		conn.Close()
+		testutil.Close(t, conn)
 		t.Fatalf("write Ping: %v", wErr)
 	}
 	msgType, _, rErr := p2p.ReadMsg(conn)
 	if rErr != nil || msgType != p2p.MsgPong {
-		conn.Close()
+		testutil.Close(t, conn)
 		t.Fatalf("expected MsgPong from whitelisted host, got type=%v err=%v", msgType, rErr)
 	}
 
 	// Clear the deadline so the host keeps the peer registered while we poll.
-	conn.SetDeadline(time.Time{})
+	testutil.NoError(t, conn.SetDeadline(time.Time{}))
 
 	// Poll until the host registers the peer (handshake completes async).
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -1306,7 +1315,7 @@ func TestHost_PeerWhitelist_AllowsWhitelistedIP(t *testing.T) {
 
 	// Assert PeerCount while the connection is still open.
 	count := h.PeerCount()
-	conn.Close() // now safe to close
+	testutil.Close(t, conn) // now safe to close
 
 	if count < 1 {
 		t.Errorf("PeerCount = %d after whitelisted connection; want ≥ 1 — whitelist may be incorrectly blocking loopback", count)
@@ -1342,7 +1351,7 @@ func TestHost_PeerWhitelist_BlocksNonWhitelistedIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	// Send a Ping so the host receives at least one byte and still must close,
 	// ruling out the case where the host simply ignores silent connections.
@@ -1357,7 +1366,7 @@ func TestHost_PeerWhitelist_BlocksNonWhitelistedIP(t *testing.T) {
 	// read must return a definitive close error (EOF or connection reset) within
 	// the deadline — NOT a timeout.  A timeout would mean the host left the
 	// connection open, which is the exact regression we are guarding against.
-	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(500*time.Millisecond)))
 	buf := make([]byte, 1)
 	n, readErr := conn.Read(buf)
 	if n > 0 {
@@ -1413,7 +1422,7 @@ func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer listener: %v", err)
 	}
-	defer peerLn.Close()
+	defer testutil.CleanupClose(t, peerLn)
 
 	peerConnected := make(chan struct{})
 	go func() {
@@ -1421,9 +1430,9 @@ func TestHost_PeerWhitelist_OutboundDialUnaffected(t *testing.T) {
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 		close(peerConnected) // signal: TCP connection received
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 		// Read Ping from the host (outbound dialer goes first).
 		msgType, _, rdErr := p2p.ReadMsg(conn)
 		if rdErr != nil || msgType != p2p.MsgPing {
@@ -1517,20 +1526,20 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 	if wErr := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "wl-peer", Height: 0, UserAgent: "test",
 		Timestamp: time.Now().Unix(),
 	}); wErr != nil {
-		conn.Close()
+		testutil.Close(t, conn)
 		t.Fatalf("write Ping: %v", wErr)
 	}
 	msgType, _, rErr := p2p.ReadMsg(conn)
 	if rErr != nil || msgType != p2p.MsgPong {
-		conn.Close()
+		testutil.Close(t, conn)
 		t.Fatalf("expected MsgPong from host, got type=%v err=%v — valid IP entry may have been discarded alongside the invalid one", msgType, rErr)
 	}
-	conn.SetDeadline(time.Time{}) // clear deadline — hold connection open for assertion
+	testutil.NoError(t, conn.SetDeadline(time.Time{})) // clear deadline — hold connection open for assertion
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -1540,7 +1549,7 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	count := h.PeerCount()
-	conn.Close()
+	testutil.Close(t, conn)
 	if count < 1 {
 		t.Errorf("PeerCount = %d; want ≥ 1 — valid IP entry may have been discarded alongside the invalid one", count)
 	} else {
@@ -1578,7 +1587,7 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial h2: %v", err)
 	}
-	defer conn2.Close()
+	defer testutil.CleanupClose(t, conn2)
 
 	// Send a Ping so the host receives data and must actively reject, ruling
 	// out the case where silent connections are just ignored.
@@ -1587,7 +1596,7 @@ func TestHost_PeerWhitelist_InvalidEntrySkipped(t *testing.T) {
 		Timestamp: time.Now().Unix(),
 	})
 
-	conn2.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	testutil.NoError(t, conn2.SetDeadline(time.Now().Add(500*time.Millisecond)))
 	buf := make([]byte, 1)
 	n, readErr := conn2.Read(buf)
 	if n > 0 {
@@ -1626,7 +1635,7 @@ func TestBootnode_SkipsBackoffWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootnode listen: %v", err)
 	}
-	defer bootLn.Close()
+	defer testutil.CleanupClose(t, bootLn)
 	go func() {
 		for {
 			c, acceptErr := bootLn.Accept()
@@ -1634,7 +1643,7 @@ func TestBootnode_SkipsBackoffWindow(t *testing.T) {
 				return
 			}
 			bootnodeDials.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 	bootnodeAddr := bootLn.Addr().String()
@@ -1645,7 +1654,7 @@ func TestBootnode_SkipsBackoffWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("regular listen: %v", err)
 	}
-	defer regLn.Close()
+	defer testutil.CleanupClose(t, regLn)
 	go func() {
 		for {
 			c, acceptErr := regLn.Accept()
@@ -1653,7 +1662,7 @@ func TestBootnode_SkipsBackoffWindow(t *testing.T) {
 				return
 			}
 			regularDials.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 	regularAddr := regLn.Addr().String()
@@ -1727,7 +1736,7 @@ func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("old listen: %v", err)
 	}
-	defer oldLn.Close()
+	defer testutil.CleanupClose(t, oldLn)
 	go func() {
 		for {
 			c, e := oldLn.Accept()
@@ -1735,7 +1744,7 @@ func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
 				return
 			}
 			oldDials.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 	addrOld := oldLn.Addr().String()
@@ -1744,7 +1753,7 @@ func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new listen: %v", err)
 	}
-	defer newLn.Close()
+	defer testutil.CleanupClose(t, newLn)
 	go func() {
 		for {
 			c, e := newLn.Accept()
@@ -1752,7 +1761,7 @@ func TestBootnode_DNSRefresh_RemovesRetiredAddr(t *testing.T) {
 				return
 			}
 			newDials.Add(1)
-			c.Close()
+			testutil.Close(t, c)
 		}
 	}()
 	addrNew := newLn.Addr().String()
@@ -2064,7 +2073,7 @@ func TestHost_WhitelistSidecar_UnreadablePermissions(t *testing.T) {
 	if err := os.Chmod(sidecar, 0o000); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	t.Cleanup(func() { os.Chmod(sidecar, 0o644) }) // restore so TempDir cleanup works
+	t.Cleanup(func() { testutil.NoError(t, os.Chmod(sidecar, 0o644)) }) // restore so TempDir cleanup works
 
 	h := p2p.NewHost(p2p.Config{
 		ListenAddr:    "127.0.0.1:0",
@@ -2128,7 +2137,7 @@ func TestHost_AddToWhitelist_UnwritableDir_RollsBack(t *testing.T) {
 		t.Fatalf("chmod dir: %v", err)
 	}
 	// Always restore so t.TempDir cleanup can remove it.
-	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	t.Cleanup(func() { testutil.NoError(t, os.Chmod(dir, 0o755)) })
 
 	// (a) AddToWhitelist must return a non-nil error.
 	addErr := h.AddToWhitelist("5.6.7.8")
@@ -2256,7 +2265,7 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lnA listen: %v", err)
 	}
-	defer lnA.Close()
+	defer testutil.CleanupClose(t, lnA)
 	addrA := lnA.Addr().String() // plain "127.0.0.1:PORT" — passed as-is to Bootnodes
 
 	// ── Bootnode B: prefer IPv6 multiaddr; fall back to IPv4 multiaddr ────────
@@ -2281,7 +2290,7 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 		addrBMultiaddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%s", pB)
 		t.Logf("bootnode B: IPv4 multiaddr fallback %s", addrBMultiaddr)
 	}
-	defer lnB.Close()
+	defer testutil.CleanupClose(t, lnB)
 
 	var dialCountA, dialCountB atomic.Int32
 
@@ -2306,8 +2315,8 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 				serverConns = append(serverConns, c)
 				connMu.Unlock()
 				go func(c net.Conn) {
-					defer c.Close()
-					c.SetDeadline(time.Now().Add(2 * time.Second))
+					defer testutil.CleanupClose(t, c)
+					testutil.NoError(t, c.SetDeadline(time.Now().Add(2*time.Second)))
 					// Outbound dialer sends Ping first under the asymmetric handshake.
 					msgType, _, rdErr := p2p.ReadMsg(c)
 					if rdErr != nil || msgType != p2p.MsgPing {
@@ -2318,7 +2327,7 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 					}); wrErr != nil {
 						return
 					}
-					c.SetDeadline(time.Time{}) // clear deadline — hold open
+					testutil.NoError(t, c.SetDeadline(time.Time{})) // clear deadline — hold open
 					// io.Copy blocks until the connection is closed (hiccup sim or
 					// test teardown) and returns cleanly on EOF / net.Error.
 					io.Copy(io.Discard, c) //nolint:errcheck
@@ -2363,7 +2372,7 @@ func TestMaintainLoop_ReconnectsBothBootnodesAfterHiccup(t *testing.T) {
 	// ── Phase 2: simulate network hiccup — close all server-side connections ──
 	connMu.Lock()
 	for _, c := range serverConns {
-		c.Close()
+		testutil.Close(t, c)
 	}
 	serverConns = serverConns[:0]
 	connMu.Unlock()
@@ -2420,7 +2429,7 @@ func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	go func() {
 		for {
@@ -2428,7 +2437,7 @@ func TestHost_DialPeer_BackoffAfterHandshakeDrop(t *testing.T) {
 			if err != nil {
 				return
 			}
-			c.Close() // drop before any P2P handshake bytes
+			testutil.Close(t, c) // drop before any P2P handshake bytes
 		}
 	}()
 
@@ -2587,14 +2596,14 @@ func TestSync_RelayNode_Catches2000BlockGap(t *testing.T) {
 	if listenErr != nil {
 		t.Fatalf("validator listen: %v", listenErr)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	go func() {
 		conn, acceptErr := ln.Accept()
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// writeCh decouples reading from writing so the server never deadlocks:
 		// when both the relay and the server want to write at the same time,
@@ -2895,14 +2904,14 @@ func TestSync_RelayNode_CatchesUpDuringLiveProduction(t *testing.T) {
 	if listenErr != nil {
 		t.Fatalf("validator listen: %v", listenErr)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	go func() {
 		conn, acceptErr := ln.Accept()
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// done is closed when this goroutine exits, signaling the write goroutine
 		// and the gossip forwarder to stop.  Using a done channel (rather than
@@ -3221,7 +3230,7 @@ func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// timestamps[n] records when the (n+1)-th MsgGetHeaders was received.
 	var tsMu sync.Mutex
@@ -3232,11 +3241,11 @@ func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// ── Asymmetric handshake: inbound side waits for Ping, replies Pong ──
 		// The relay host dials us as outbound, so it sends Ping first.
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
 		msgType, _, rdErr := p2p.ReadMsg(conn)
 		if rdErr != nil || msgType != p2p.MsgPing {
 			t.Logf("peer server: expected MsgPing, got %v err=%v", msgType, rdErr)
@@ -3254,7 +3263,7 @@ func TestSync_RelayStall_ReissuesGetHeaders(t *testing.T) {
 
 		// ── Message loop: serve GetHeaders, silently drop GetBlock ───────────
 		for {
-			conn.SetDeadline(time.Now().Add(10 * time.Second))
+			testutil.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
 			mt, _, rdErr2 := p2p.ReadMsg(conn)
 			if rdErr2 != nil {
 				return
@@ -3415,7 +3424,7 @@ func TestSync_RelayStall_Recovers(t *testing.T) {
 	if listenErr != nil {
 		t.Fatalf("listen: %v", listenErr)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// getHeadersCount counts how many MsgGetHeaders the peer has received.
 	// Once it reaches 2 (meaning the stall ticker fired and re-issued), the
@@ -3427,7 +3436,7 @@ func TestSync_RelayStall_Recovers(t *testing.T) {
 		if acceptErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Dedicated write goroutine to avoid read/write deadlocks on loopback.
 		type writeReq struct {
@@ -3605,7 +3614,7 @@ func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
 
 	hostAddr := h.ListenAddr()
 	conn, peerIP := connectPeer(t, hostAddr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 
 	if !waitFor(500*time.Millisecond, func() bool { return h.PeerCount() == 1 }) {
 		t.Fatal("rogue peer did not register after handshake")
@@ -3629,13 +3638,13 @@ func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
 	// write error on the 6th block is acceptable attacker-side behavior.
 	for i := 0; i < 2; i++ {
 		sb := p2p.SerializedBlock{Header: p2p.SerializedHeader{Height: 500_000}}
-		conn.SetWriteDeadline(time.Now().Add(time.Second))
+		testutil.NoError(t, conn.SetWriteDeadline(time.Now().Add(time.Second)))
 		if err := p2p.WriteMsg(conn, p2p.MsgBlock, sb); err != nil {
 			t.Logf("write bad block #%d failed (peer already evicted): %v", prodThreshold+i, err)
 			break
 		}
 	}
-	conn.SetWriteDeadline(time.Time{})
+	testutil.NoError(t, conn.SetWriteDeadline(time.Time{}))
 
 	// 3) Peer must be disconnected.
 	if !waitFor(time.Second, func() bool { return h.PeerCount() == 0 }) {
@@ -3665,8 +3674,8 @@ func TestHost_RoguePeer_BannedAtProductionThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("host unreachable on reconnect attempt: %v", err)
 	}
-	defer c2.Close()
-	c2.SetDeadline(time.Now().Add(2 * time.Second))
+	defer testutil.CleanupClose(t, c2)
+	testutil.NoError(t, c2.SetDeadline(time.Now().Add(2*time.Second)))
 	_ = p2p.WriteMsg(c2, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "rogue-peer-back", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
 	})
@@ -3727,7 +3736,7 @@ func TestHost_RelayNode_SelfHeals_AfterMissedSyncWindow(t *testing.T) {
 	if lnErr != nil {
 		t.Fatalf("listen: %v", lnErr)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	serverDone := make(chan struct{})
 	go func() {
@@ -3736,7 +3745,7 @@ func TestHost_RelayNode_SelfHeals_AfterMissedSyncWindow(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
 
@@ -3890,7 +3899,7 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 	if err != nil {
 		t.Fatalf("valid bootnode listen: %v", err)
 	}
-	defer validLn.Close()
+	defer testutil.CleanupClose(t, validLn)
 	validAddr := validLn.Addr().String()
 
 	go func() {
@@ -3900,8 +3909,8 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 				return // listener closed — test teardown
 			}
 			go func(c net.Conn) {
-				defer c.Close()
-				c.SetDeadline(time.Now().Add(5 * time.Second))
+				defer testutil.CleanupClose(t, c)
+				testutil.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
 				// Outbound host sends MsgPing first (asymmetric handshake).
 				mt, _, rdErr := p2p.ReadMsg(c)
 				if rdErr != nil || mt != p2p.MsgPing {
@@ -3912,11 +3921,11 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 				}); wrErr != nil {
 					return
 				}
-				c.SetDeadline(time.Time{}) // clear — hold open until test ends
+				testutil.NoError(t, c.SetDeadline(time.Time{})) // clear — hold open until test ends
 				// Drain keepalive pings so the host doesn't evict the peer.
 				buf := make([]byte, 256)
 				for {
-					c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+					testutil.NoError(t, c.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
 					if _, rerr := c.Read(buf); rerr != nil {
 						return
 					}
@@ -3932,7 +3941,7 @@ func TestBootnode_RefusedConnection_RetriedWithoutBlockingValidPeer(t *testing.T
 		t.Fatalf("rogue bootnode listen: %v", err)
 	}
 	rogueAddr := rogueLn.Addr().String()
-	rogueLn.Close() // from this point on: connection refused
+	testutil.Close(t, rogueLn) // from this point on: connection refused
 
 	// ── Host under test ───────────────────────────────────────────────────────
 	// MaxDialBackoff is set to 100 ms so the per-bootnode back-off window
@@ -4083,7 +4092,7 @@ func TestHost_SetKeepaliveInterval_MidConnection_AdoptsNewRate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer testutil.CleanupClose(t, ln)
 
 	// pingTimes records the arrival time of every keepalive MsgPing received
 	// after the handshake ping.  Guarded by pingMu.
@@ -4099,7 +4108,7 @@ func TestHost_SetKeepaliveInterval_MidConnection_AdoptsNewRate(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
 		// Asymmetric handshake: outbound host sends MsgPing first.
 		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck

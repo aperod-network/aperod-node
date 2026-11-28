@@ -13,6 +13,7 @@ import (
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -71,7 +72,7 @@ func TestLocalVoteBroadcastCallbackAndDurableRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	locked, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -299,7 +300,7 @@ func TestLatestLocalVoteWaitsForCanonicalPersistenceAndFailsClosed(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	locked, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
 	if err != nil {
 		t.Fatal(err)

@@ -340,7 +340,11 @@ func (s *Server) executeAVMReadOnly(w http.ResponseWriter, r *http.Request, simu
 		executionStore = avm.NewOverlayStore(store)
 	}
 	engine := avm.NewEngine(executionStore)
-	defer engine.Close(context.Background())
+	defer func() {
+		if err := engine.Close(context.Background()); err != nil {
+			s.log.Debug("close AVM preview engine failed", "err", err)
+		}
+	}()
 	result, executeErr := engine.ExecuteBounded(r.Context(), avm.ExecutionRequest{
 		ContractID: [32]byte(id), Code: code, Entry: req.Entry, Input: input,
 		GasLimit: req.GasLimit, ReadOnly: !simulation, AccessList: access,

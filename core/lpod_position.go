@@ -15,7 +15,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-// LPOD payouts use standard wallet-scannable stealth outputs, with public,
+// BuildLPoDPayoutOutput creates standard wallet-scannable stealth outputs, with public,
 // deterministic ephemeral scalars bound to the unpredictable canonical parent.
 // This avoids pre-creating a future height-only mint key to poison its key image.
 // Amounts and recipients remain public protocol information, not private sends.
@@ -60,19 +60,27 @@ func BuildLPoDPayoutOutput(address crypto.Address, amount, height uint64, parent
 		EncAmount: EncryptAmount(amount, &stealth.HsScalar)}, nil
 }
 
+// TxVersionLPoDPosition identifies deposit and withdrawal transactions.
 const TxVersionLPoDPosition TxVersion = 9
+
+// TxVersionLPoDPayout identifies a protocol payout transaction.
 const TxVersionLPoDPayout TxVersion = 10
 
 // TxVersionLPoDTopUp is an independently signed source-output addition to an
 // existing position. Version 9 deposit and withdrawal bytes remain unchanged.
 const TxVersionLPoDTopUp TxVersion = 12
+
+// LPoDDeposit selects a new position deposit.
 const LPoDDeposit uint8 = 1
+
+// LPoDWithdraw selects a position withdrawal.
 const LPoDWithdraw uint8 = 2
 
 // LPoDTopUp is the action code for adding an independently signed output to an existing position.
 const LPoDTopUp uint8 = 3
 
-// Position ownership is independent of validator keys. OwnerProof proves knowledge
+// LPoDPositionAction keeps position ownership independent of validator keys.
+// OwnerProof proves knowledge
 // of the beneficiary's wallet spend scalar; DepositProof proves knowledge of the
 // source one-time scalar, amount opening AND its correctly linked key image.
 type LPoDPositionAction struct {
@@ -93,6 +101,7 @@ type LPoDPositionAction struct {
 	WithdrawAmount uint64 `json:"withdraw_amount_napro,string,omitempty"`
 }
 
+// Message hashes the action with its protocol-specific signing domain.
 func (a LPoDPositionAction) Message() crypto.Hash32 {
 	b, _ := json.Marshal(a)
 	if a.Action == LPoDTopUp {
@@ -101,6 +110,7 @@ func (a LPoDPositionAction) Message() crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/lpod/position/v1"), b)
 }
 
+// LPoDPositionID binds a position identifier to genesis and its source output.
 func LPoDPositionID(genesis, source crypto.Hash32, index uint32) crypto.Hash32 {
 	b, _ := json.Marshal(struct {
 		Genesis, Source crypto.Hash32
@@ -109,6 +119,7 @@ func LPoDPositionID(genesis, source crypto.Hash32, index uint32) crypto.Hash32 {
 	return crypto.HashBytes([]byte("aperod/lpod/position-id/v1"), b)
 }
 
+// LPoDOwnershipRing constructs the deterministic ring for a direct ownership proof.
 func LPoDOwnershipRing(pub crypto.Point32) []crypto.RingMember {
 	r := make([]crypto.RingMember, crypto.RingSize)
 	r[0] = pub
@@ -128,6 +139,7 @@ func (tx *Transaction) IsLPoDPosition() bool {
 // IsLPoDPayout reports whether tx is an LPoD payout transaction.
 func (tx *Transaction) IsLPoDPayout() bool { return tx != nil && tx.Version == TxVersionLPoDPayout }
 
+// LPoDPositionAction decodes and verifies the action and its ownership proofs.
 func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 	if !tx.IsLPoDPosition() || len(tx.Extra) > 4096 || len(tx.Extra) == 0 {
 		return nil, fmt.Errorf("lpod: invalid position payload")
@@ -196,7 +208,17 @@ func (tx *Transaction) LPoDPositionAction() (*LPoDPositionAction, error) {
 	return &a, nil
 }
 
+// BuildLPoDPositionTx constructs a signed action with owner and source proofs.
+// Local beneficiary admission policy is not retrospective consensus validation.
 func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source crypto.Scalar32) (*Transaction, error) {
+	// New deposits/top-ups must be wallet-scannable. Keep historical withdrawal
+	// construction available for recovery; this is local construction policy,
+	// not a retrospective change to LPoDPositionAction's consensus parser.
+	if a.Action != LPoDWithdraw {
+		if err := validateLPoDBeneficiaryAdmission(a, ""); err != nil {
+			return nil, err
+		}
+	}
 	body, err := json.Marshal(a)
 	if err != nil {
 		return nil, err
@@ -228,11 +250,45 @@ func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source cry
 	return tx, nil
 }
 
+// validateLPoDBeneficiaryAdmission is stricter local mempool/construction policy.
+// Consensus parsing stays unchanged until a separately coordinated fork.
+func validateLPoDBeneficiaryAdmission(a LPoDPositionAction, network string) error {
+	if a.Action == LPoDWithdraw {
+		return nil // Do not prevent recovery of already-canonical legacy positions.
+	}
+	net, spend, _, err := crypto.DecodeWalletAddress(a.Beneficiary)
+	if err != nil {
+		return fmt.Errorf("lpod: invalid beneficiary wallet keys: %w", err)
+	}
+	if spend != a.Owner {
+		return fmt.Errorf("lpod: beneficiary does not belong to signing owner")
+	}
+	var expected crypto.NetworkByte
+	switch network {
+	case "":
+		return nil // Standalone builders do not know the chain's configured network.
+	case "mainnet":
+		expected = crypto.MainnetByte
+	case "testnet":
+		expected = crypto.TestnetByte
+	case "devnet":
+		expected = crypto.DevnetByte
+	default:
+		return fmt.Errorf("lpod: unknown admission network")
+	}
+	if net != expected {
+		return fmt.Errorf("lpod: beneficiary network differs from node network")
+	}
+	return nil
+}
+
+// LPoDPayoutAuthorization identifies the leader and checkpoint for a payout.
 type LPoDPayoutAuthorization struct {
 	Leader crypto.Address `json:"leader"`
 	Digest crypto.Hash32  `json:"digest"`
 }
 
+// LPoDPayoutAuthorization validates the payout encoding and extracts its authorization.
 func (tx *Transaction) LPoDPayoutAuthorization() (*LPoDPayoutAuthorization, error) {
 	if !tx.IsLPoDPayout() || len(tx.Inputs) != 0 || len(tx.Outputs) > 4097 || tx.Fee != 0 ||
 		tx.FeeCommit != (crypto.Commitment{}) || len(tx.Signatures) != 0 || len(tx.CLSAGSignatures) != 0 ||

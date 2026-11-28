@@ -9,6 +9,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 // LPoDBodyCoverageReport describes a read-only scan of canonical historical
@@ -32,7 +33,7 @@ const lpodAuditNotice = "This scan establishes only structural presence and link
 // through throughHeight, inclusive. The database must be an explicitly
 // supplied copy; this function opens it with LevelDB ReadOnly and never repairs
 // or mutates data.
-func AuditLPoDBodyCoverageReadOnly(path string, throughHeight uint64) (*LPoDBodyCoverageReport, error) {
+func AuditLPoDBodyCoverageReadOnly(path string, throughHeight uint64) (_ *LPoDBodyCoverageReport, readCloseErr error) {
 	report := &LPoDBodyCoverageReport{
 		ThroughHeight: throughHeight,
 		Notice:        lpodAuditNotice,
@@ -41,7 +42,7 @@ func AuditLPoDBodyCoverageReadOnly(path string, throughHeight uint64) (*LPoDBody
 	if err != nil {
 		return report, err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	tipHashBytes, err := db.GetMeta("tip/hash")
 	if err != nil {
@@ -199,7 +200,7 @@ func decodeLPoDAuditBlock(raw []byte) (*core.Block, error) {
 				return nil, err
 			}
 			if len(bytes.TrimSpace(header)) == 0 || bytes.TrimSpace(header)[0] != '{' {
-				return nil, fmt.Errorf("Header field must be an object")
+				return nil, fmt.Errorf("header field must be an object")
 			}
 			if err := json.Unmarshal(header, &block.Header); err != nil {
 				return nil, err

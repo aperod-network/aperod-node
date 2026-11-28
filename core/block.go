@@ -145,7 +145,7 @@ func encodeUint64(v uint64) []byte {
 }
 
 func encodeInt64(v int64) []byte {
-	return encodeUint64(uint64(v))
+	return encodeUint64(uint64(v)) // #nosec G115 -- Signed values use their canonical two's-complement wire bits, including historical negative timestamps.
 }
 
 func encodeUint32(v uint32) []byte {

@@ -41,6 +41,9 @@ type MempoolConfig struct {
 	RingCTAmountBindingActivationHeight uint64
 	AVMActivationHeight                 uint64
 	CurrentHeight                       func() uint64
+	// Network pins new LPoD deposit/top-up recipients to this node's address
+	// network. Empty is for isolated callers without a configured network.
+	Network string
 	// Verifier performs full RingCT/ring-sig/range-proof verification in Add().
 	// When nil the mempool only runs structural Validate() (dev/test mode).
 	// Production nodes MUST set this to prevent C-0/C-1 inflation attacks.
@@ -234,6 +237,9 @@ func (m *Mempool) Add(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
+	if err := m.validateLPoDBeneficiary(&tx); err != nil {
+		return err
+	}
 	// Full RingCT cryptographic verification (ring sigs, range proofs, Pedersen balance).
 	// C-0/C-1: prevents supply inflation via forged AmountCommit or unbound stake amount.
 	// Stake txs are included — they carry ring inputs whose proofs must be valid.
@@ -244,6 +250,9 @@ func (m *Mempool) Add(tx Transaction) error {
 	}
 
 	size := tx.Size()
+	if size <= 0 {
+		return fmt.Errorf("mempool: invalid transaction size %d", size)
+	}
 	if size > m.cfg.MaxTxSize {
 		return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
 	}
@@ -491,13 +500,14 @@ func (m *Mempool) removeAVMSignerLocked(entry *mempoolEntry) {
 // stakeExtraPubKey extracts the validator public key from a stake Extra payload.
 // Handles v1 (105-byte withdraw/partial-withdraw), v2 (173-byte deposit), and
 // v3 (237-byte deposit with one-time-key ownership proof — F-049 fix) layouts.
-// In all three cases the 32-byte pubkey occupies bytes [1:33].
+// In all supported formats the 32-byte pubkey occupies bytes [1:33].
 func stakeExtraPubKey(extra []byte) (crypto.ValidatorPubKey, error) {
-	if len(extra) != StakePayloadSize && len(extra) != StakeWithdrawalPayloadSizeV2 && len(extra) != StakePayloadSizeV2 && len(extra) != StakePayloadSizeV3 {
-		return nil, fmt.Errorf("stake extra: expected %d or %d bytes, got %d",
-			StakePayloadSize, StakePayloadSizeV2, len(extra))
+	switch len(extra) {
+	case StakePayloadSize, StakeWithdrawalPayloadSizeV2, StakePayloadSizeV2, StakePayloadSizeV3, StakePayloadSizeV4:
+		return crypto.ValidatorPubKey(extra[1:33]), nil
+	default:
+		return nil, fmt.Errorf("stake extra: unsupported length %d", len(extra))
 	}
-	return crypto.ValidatorPubKey(extra[1:33]), nil
 }
 
 // RemoveBlock removes all transactions included in the given block.
@@ -531,6 +541,9 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 	if err := tx.Validate(); err != nil {
 		return fmt.Errorf("mempool: invalid tx: %w", err)
 	}
+	if err := m.validateLPoDBeneficiary(&tx); err != nil {
+		return err
+	}
 	if err := m.validateAVMNonce(&tx); err != nil {
 		return err
 	}
@@ -546,6 +559,9 @@ func (m *Mempool) AddPrivileged(tx Transaction) error {
 		}
 	}
 	size := tx.Size()
+	if size <= 0 {
+		return fmt.Errorf("mempool: invalid transaction size %d", size)
+	}
 	if size > m.cfg.MaxTxSize {
 		return fmt.Errorf("mempool: tx too large: %d bytes (max %d)", size, m.cfg.MaxTxSize)
 	}
@@ -637,7 +653,6 @@ func (m *Mempool) SelectTxs(n int) []Transaction {
 	return txs
 }
 
-// Count returns the number of pending transactions.
 // MempoolConfig returns a snapshot of the config the pool was created with.
 // Useful for exposing limits in metrics endpoints.
 func (m *Mempool) MempoolConfig() MempoolConfig {
@@ -646,6 +661,7 @@ func (m *Mempool) MempoolConfig() MempoolConfig {
 	return m.cfg
 }
 
+// Count returns the number of pending transactions.
 func (m *Mempool) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -711,6 +727,22 @@ func (m *Mempool) SetVerifier(v *TxVerifier) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cfg.Verifier = v
+}
+
+// Called after Validate has authenticated/canonicalized the action. Privileged
+// admission and persisted-pool reload must not bypass recipient policy.
+func (m *Mempool) validateLPoDBeneficiary(tx *Transaction) error {
+	if !tx.IsLPoDPosition() {
+		return nil
+	}
+	var action LPoDPositionAction
+	if err := json.Unmarshal(tx.Extra, &action); err != nil {
+		return fmt.Errorf("mempool: invalid lpod action: %w", err)
+	}
+	if err := validateLPoDBeneficiaryAdmission(action, m.cfg.Network); err != nil {
+		return fmt.Errorf("mempool: beneficiary admission: %w", err)
+	}
+	return nil
 }
 
 // Hashes returns all transaction hashes currently in the pool.
@@ -885,6 +917,7 @@ func (m *Mempool) Load(dataDir string, log *slog.Logger) int {
 		log = slog.Default()
 	}
 	path := mempoolPath(dataDir)
+	// #nosec G304 -- Mempool persistence path is supplied by node startup, not transaction contents or network peers.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -973,9 +1006,9 @@ func (m *Mempool) evictLowestFeeRate() bool {
 		if e.Tx.IsCoinbase() || e.Tx.IsStake() || e.Tx.IsLPoDPosition() {
 			continue
 		}
-		sz := uint64(e.Size)
-		if sz == 0 {
-			sz = 1
+		sz := uint64(1)
+		if e.Size > 0 {
+			sz = uint64(e.Size)
 		}
 		rate := e.Tx.Fee / sz
 		if cheapest == nil || rate < cheapestRate {

@@ -38,6 +38,8 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // ─── Raw-key helpers (mirror unexported store internals) ──────────────────────
@@ -75,7 +77,7 @@ func deleteRawKeys(t *testing.T, dir string, db *store.DB, keys ...[]byte) *stor
 	}
 	for _, k := range keys {
 		if err := raw.Delete(k, &opt.WriteOptions{Sync: true}); err != nil {
-			raw.Close()
+			testutil.Close(t, raw)
 			t.Fatalf("raw delete %x: %v", k, err)
 		}
 	}
@@ -97,7 +99,7 @@ func assertHeightPointer(t *testing.T, dir string, height uint64, want crypto.Ha
 	if err != nil {
 		t.Fatalf("open raw leveldb for pointer check: %v", err)
 	}
-	defer raw.Close()
+	defer testutil.CleanupClose(t, raw)
 	val, err := raw.Get(heightKeyRaw(height), nil)
 	if err != nil {
 		t.Fatalf("raw get h/%d: %v", height, err)
@@ -282,11 +284,11 @@ func TestRepairHeightIndex_MissingBlockBody(t *testing.T) {
 
 	rawHash, err := db.GetRawBlockByHeight(tipHeight)
 	if err != nil {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("GetRawBlockByHeight after reopen: %v", err)
 	}
 	if rawHash != nil {
-		db.Close()
+		testutil.Close(t, db)
 		t.Fatalf("GetRawBlockByHeight after reopen = %d bytes, want nil (block body never restored)", len(rawHash))
 	}
 
@@ -357,7 +359,7 @@ func TestRepairHeightIndex_MissingEntry(t *testing.T) {
 		t.Errorf("repaired height-index hash = %x, want %x", gotAfterRepair.Hash[:8], tipHash[:8])
 	}
 
-	db1.Close()
+	testutil.Close(t, db1)
 
 	// ── Second open: verify the repair persisted across close / reopen ────────
 
@@ -365,7 +367,7 @@ func TestRepairHeightIndex_MissingEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	// GetTip must still return the same hash+height.
 	storedHash, storedHeight, err := db2.GetTip()
@@ -454,14 +456,14 @@ func TestRepairHeightIndex_HashMismatch(t *testing.T) {
 		t.Errorf("expected INFO log to contain %q; got: %s", "hash mismatch", logBuf)
 	}
 
-	db1.Close()
+	testutil.Close(t, db1)
 
 	// After reopen, height index must point at hashA (the tip pointer).
 	db2, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer testutil.CleanupClose(t, db2)
 
 	gotPersisted, err := db2.GetBlockByHeight(tipHeight)
 	if err != nil {
@@ -491,7 +493,7 @@ func TestRepairHeightIndex_AlreadyConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	const tipHeight = uint64(1)
 	tipHash := putTestBlock(t, db, tipHeight)

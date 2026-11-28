@@ -22,6 +22,7 @@ import (
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -33,6 +34,7 @@ type AdminMintRecordStore interface {
 	LoadAdminMintRecord(idempotencyKey string) (record store.AdminMintRecord, found bool, err error)
 }
 
+// AdminMintRecordLister exposes persisted administrative mint records.
 type AdminMintRecordLister interface {
 	ListAdminMintRecords() ([]store.AdminMintRecordEntry, error)
 }
@@ -52,7 +54,10 @@ type Config struct {
 	// LPoDDailyUpgradeHeight is a coordinated fork gate for top-ups and daily
 	// Guardian-position settlement. Zero keeps the feature disabled.
 	LPoDDailyUpgradeHeight uint64
-	SaleMigration          *store.SaleMigration
+	// LPoDValidatorDailyUpgradeHeight activates the coordinated daily
+	// validator-reward settlement. Zero preserves historical per-block payouts.
+	LPoDValidatorDailyUpgradeHeight uint64
+	SaleMigration                   *store.SaleMigration
 	// Approved durable purchase intents are built at the real slot and parent.
 	// Nil never enables the legacy admin-mint path.
 	SaleTransactions func(height uint64, parent crypto.Hash32) ([]core.Transaction, error)
@@ -166,6 +171,15 @@ type Config struct {
 	// validator tie-breaking, output-key uniqueness, block limits, and oracle
 	// checks that depend only on the canonical parent block.
 	SecurityHardeningActivationHeight uint64
+	// FinalityVoteV2ActivationHeight is supplied by the network profile,
+	// never by an operator override. An explicit zero leaves v2 disabled.
+	FinalityVoteV2ActivationHeight uint64
+	// ExplicitFinalityVoteSchedule distinguishes an explicit zero from
+	// an unset schedule in legacy engine callers.
+	ExplicitFinalityVoteSchedule bool
+	// RehearsalFinalityV2Height changes only the vote-version boundary, and
+	// must never be used with a local signing key.
+	RehearsalFinalityV2Height uint64
 	// GuardianFundActivationHeight and GuardianFundChainAnchor gate the
 	// consensus-synthesized, protocol-locked 1B APRO allocation. ChainAnchor
 	// is always the canonical genesis block hash, never the activation parent.
@@ -197,10 +211,14 @@ type finalityCommittee struct {
 }
 
 func (e *Engine) expectedFinalityVoteVersion(height uint64) uint8 {
-	if activation := e.cfg.SecurityHardeningActivationHeight; activation > 0 && height >= activation {
-		return crypto.FinalityVoteVersionHeightBound
+	activation := e.cfg.FinalityVoteV2ActivationHeight
+	if activation == 0 && !e.cfg.ExplicitFinalityVoteSchedule {
+		activation = e.cfg.SecurityHardeningActivationHeight
 	}
-	return crypto.FinalityVoteVersionLegacy
+	if e.cfg.RehearsalFinalityV2Height != 0 {
+		activation = e.cfg.RehearsalFinalityV2Height
+	}
+	return crypto.FinalityVoteVersionAt(height, activation)
 }
 
 // finalityCommitteeLocked returns the immutable committee snapshot for the
@@ -262,7 +280,13 @@ func finalityCommitteeContains(committee finalityCommittee, validator crypto.Val
 }
 
 func finalityQuorumSize(committee finalityCommittee) int {
-	return int(uint64(len(committee.validators))*uint64(committee.thresholdPPM)/1_000_000) + 1
+	required, err := core.RequiredFinalityVotes(len(committee.validators), committee.thresholdPPM)
+	if err != nil {
+		// An invalid persisted/internal committee must never become a
+		// nonpositive quorum through integer wrapping.
+		panic(fmt.Errorf("consensus finality committee: %w", err))
+	}
+	return required
 }
 
 const candidateVoteLimit = 4096
@@ -284,6 +308,7 @@ type incomingBlockSubmission struct {
 	result chan error
 }
 
+// Engine coordinates block production, verification and finality.
 type Engine struct {
 	lpodFinalizedHashes map[uint64]crypto.Hash32
 	cfg                 Config
@@ -312,10 +337,12 @@ type Engine struct {
 	// baseFee is the current EIP-1559 base fee per byte (nAPRO/byte).
 	// Updated after every accepted block; embedded in every produced block header.
 	baseFee uint64
-	// halted is set when a transactional rollback cannot be persisted.  The
+	// halted is set when startup verification or a consensus transition
+	// cannot complete safely. At runtime the
 	// process stays available for diagnostics but refuses all further consensus
 	// transitions until an operator restarts it after repairing storage.
-	halted atomic.Bool
+	halted     atomic.Bool
+	startupErr error // set during construction, before the engine is shared
 	// txVerifier performs full cryptographic verification of incoming block txs.
 	// If nil, cryptographic verification is skipped (dev/test only — never in production).
 	txVerifier *core.TxVerifier
@@ -453,8 +480,14 @@ const defaultTailRewardNAPR uint64 = 100_000_000
 // 3 APRO per block, drawn from the pre-allocated 2B APRO staking pool.
 const DefaultPoolBlockRewardNAPR uint64 = 300_000_000
 
+// StartupError reports a failed authority or durable finality check. A node
+// must not publish readiness or start networking when this check fails.
+func (e *Engine) StartupError() error { return e.startupErr }
+
 // NewEngine creates a new PoA consensus engine.
 func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logger) *Engine {
+	// Validate before registering hooks or loading a persistent monetary pool.
+	initialPoolBalance := checkedPoolBalance(cfg.StakingPoolNAPR)
 	cfg.ValidatorAuthorityFork = cfg.ValidatorAuthorityFork.Clone()
 	if cfg.Registry != nil {
 		cfg.Registry.SetSecurityHardeningActivationHeight(cfg.SecurityHardeningActivationHeight)
@@ -512,8 +545,14 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		store:                  cfg.Store,
 		adminMintStore:         adminMintStore,
 	}
+	if cfg.RehearsalFinalityV2Height != 0 && cfg.MyKey != nil {
+		e.halted.Store(true)
+		e.startupErr = errors.New("rehearsal finality vote schedule cannot be used by a signer")
+		return e
+	}
 	if err := e.validateAuthorityFork(); err != nil {
 		e.halted.Store(true)
+		e.startupErr = fmt.Errorf("validator authority fork: %w", err)
 		e.log.Error("validator authority fork invalid; consensus halted", "err", err)
 		return e
 	}
@@ -528,14 +567,17 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 	}
 	if err := e.restoreFinalityCertificate(); err != nil {
 		e.halted.Store(true)
+		e.startupErr = errors.Join(e.startupErr, fmt.Errorf("restore finality certificate: %w", err))
 		log.Warn("finality certificate not restored; finality remains fail-closed", "err", err)
 	}
 	if err := e.restoreFinalityVotes(); err != nil {
 		e.halted.Store(true)
+		e.startupErr = errors.Join(e.startupErr, fmt.Errorf("restore finality vote journal: %w", err))
 		log.Warn("persisted finality votes could not be restored; consensus halted", "err", err)
 	}
 	if err := e.restoreLocalFinalityVote(); err != nil {
 		e.halted.Store(true)
+		e.startupErr = errors.Join(e.startupErr, fmt.Errorf("restore local finality vote: %w", err))
 		log.Warn("local finality vote lacks canonical durable ancestry; consensus halted",
 			"err", err)
 	}
@@ -550,25 +592,26 @@ func NewEngine(cfg Config, chain *core.Chain, pool *core.Mempool, log *slog.Logg
 		// do not re-initialize to the full 2 B.
 		if cfg.Store != nil {
 			if rem, found, err := cfg.Store.LoadStakingPoolRemaining(); err != nil {
-				log.Warn("staking pool: failed to load from store; using config value", "err", err)
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+				panic(fmt.Errorf("staking pool: cannot safely restore persisted balance: %w", err))
 			} else if found {
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(rem))
+				atomic.StoreInt64(&e.stakingPoolRemaining, checkedPoolBalance(rem))
 				log.Info("staking pool: restored from store",
 					"remaining_napro", rem,
 					"remaining_apro", float64(rem)/1e8,
 				)
 			} else {
 				// First boot with pool enabled — persist initial balance.
-				atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
-				_ = cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR)
+				if err := cfg.Store.StoreStakingPoolRemaining(cfg.StakingPoolNAPR); err != nil {
+					panic(fmt.Errorf("staking pool: cannot persist initial balance: %w", err))
+				}
+				atomic.StoreInt64(&e.stakingPoolRemaining, initialPoolBalance)
 				log.Info("staking pool: initialized",
 					"total_napro", cfg.StakingPoolNAPR,
 					"total_apro", float64(cfg.StakingPoolNAPR)/1e8,
 				)
 			}
 		} else {
-			atomic.StoreInt64(&e.stakingPoolRemaining, int64(cfg.StakingPoolNAPR))
+			atomic.StoreInt64(&e.stakingPoolRemaining, initialPoolBalance)
 		}
 	} else {
 		// Pool disabled — -1 signals legacy mint behavior.
@@ -676,7 +719,7 @@ func (e *Engine) DecrementPool(height uint64) {
 		// The validator debit and LPoD credit already committed in the same
 		// block batch. Refresh RAM only; never deduct the reward a second time.
 		if c, err := e.store.LoadLPoDCheckpoint(); err == nil && c != nil && c.Allocation != nil {
-			atomic.StoreInt64(&e.stakingPoolRemaining, int64(c.Allocation.ValidatorRemaining))
+			atomic.StoreInt64(&e.stakingPoolRemaining, checkedPoolBalance(c.Allocation.ValidatorRemaining))
 		}
 		return
 	}
@@ -703,10 +746,11 @@ func (e *Engine) DecrementPool(height uint64) {
 		if uint64(cur) < deduct {
 			deduct = uint64(cur) // clamp to remaining
 		}
-		next := int64(uint64(cur) - deduct)
+		remaining := uint64(cur) - deduct
+		next := checkedPoolBalance(remaining)
 		if atomic.CompareAndSwapInt64(&e.stakingPoolRemaining, cur, next) {
 			if e.store != nil {
-				if err := e.store.StoreStakingPoolRemaining(uint64(next)); err != nil {
+				if err := e.store.StoreStakingPoolRemaining(remaining); err != nil {
 					e.log.Warn("staking pool: failed to persist remaining", "height", height, "err", err)
 				}
 			}
@@ -738,7 +782,13 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	if v != nil {
 		v.SetSecurityHardeningActivationHeight(e.cfg.SecurityHardeningActivationHeight)
 		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
-		v.SetLPoDDailyUpgradeHeight(e.cfg.LPoDDailyUpgradeHeight)
+		dailyPositionHeight := e.cfg.LPoDDailyUpgradeHeight
+		if dailyPositionHeight == 0 ||
+			(e.cfg.LPoDValidatorDailyUpgradeHeight > 0 &&
+				e.cfg.LPoDValidatorDailyUpgradeHeight < dailyPositionHeight) {
+			dailyPositionHeight = e.cfg.LPoDValidatorDailyUpgradeHeight
+		}
+		v.SetLPoDDailyUpgradeHeight(dailyPositionHeight)
 	}
 }
 
@@ -939,6 +989,15 @@ func (e *Engine) tick() error {
 		}
 	}
 
+	// Peer-received blocks pass these same block-wide checks before any UTXO,
+	// stake, or chain state is mutated. Self-produced blocks must not bypass
+	// them: per-transaction screening cannot detect collisions between outputs
+	// in different transactions or keys already present in retained history.
+	if err := e.validateSelfProducedBlock(block); err != nil {
+		return fmt.Errorf("self-produced block %d failed block verification: %w",
+			block.Header.Height, err)
+	}
+
 	preparedAVM, err := e.prepareAVMBlock(block)
 	if err != nil {
 		for _, tx := range block.Txs {
@@ -1054,7 +1113,7 @@ func (e *Engine) tick() error {
 	e.mu.Unlock()
 	e.pool.SetBaseFee(newFee)
 
-	// Stake txs already applied above — no processStakeTxs call needed.
+	// Stake changes were already applied above.
 	if e.cfg.Registry != nil {
 		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
 	}
@@ -1282,6 +1341,13 @@ func (e *Engine) authorizedRewardAmount(height uint64, txs []core.Transaction) (
 // OraclePrice = price_usd × oraclePriceScale  (i.e. 9 decimal places).
 const oraclePriceScale float64 = 1_000_000_000
 
+type producerOraclePriceSelection struct {
+	price     uint64
+	quote     uint64
+	reference uint64
+	adjusted  bool
+}
+
 // oracleErrorThreshold is the number of consecutive oracle fetch failures after
 // which fetchOraclePrice escalates its log message from Warn to Error.  An Error
 // is visible in structured-log pipelines that feed the Telegram admin channel,
@@ -1317,7 +1383,7 @@ func (e *Engine) fetchOraclePrice() uint64 {
 		}
 		return 0
 	}
-	defer resp.Body.Close()
+	defer checkedio.LogClose(e.log, resp.Body, "oracle response body")
 	var p oraclePriceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
 		fails := atomic.AddInt64(&e.oracleConsecFails, 1)
@@ -1337,6 +1403,51 @@ func (e *Engine) fetchOraclePrice() uint64 {
 	return uint64(math.Round(p.PriceUSD * oraclePriceScale))
 }
 
+// selectProducerOraclePrice keeps locally produced blocks inside the same
+// deterministic parent-price window that incoming blocks enforce. A missing
+// quote falls back to the committed reference price; an out-of-window quote is
+// bounded to the exact 5% limit. Before hardening activation, preserve the
+// historical raw-feed behavior.
+func (e *Engine) selectProducerOraclePrice(height uint64, parent *core.Block) (producerOraclePriceSelection, error) {
+	quote := atomic.LoadUint64(&e.cachedOraclePrice)
+	selection := producerOraclePriceSelection{price: quote, quote: quote}
+	if e.cfg.SecurityHardeningActivationHeight == 0 ||
+		height < e.cfg.SecurityHardeningActivationHeight {
+		return selection, nil
+	}
+
+	parentIsPinnedGap := e.isPinnedMainnetOraclePriceGap(parent)
+	var previous *core.Block
+	if parentIsPinnedGap && parent != nil {
+		previous = e.chain.GetByHash(parent.Header.PrevHash)
+	}
+	reference, err := hardenedOracleReferencePrice(parent, previous, parentIsPinnedGap)
+	if err != nil {
+		return producerOraclePriceSelection{}, err
+	}
+	selection.reference = reference
+
+	// Once hardening is active, never emit a zero price when the parent chain
+	// provides a valid deterministic reference.
+	if quote == 0 {
+		selection.price = reference
+		selection.adjusted = true
+		return selection, nil
+	}
+
+	maxDeviation := reference / 20
+	if quote > reference && quote-reference > maxDeviation {
+		// This addition cannot overflow: quote > reference+maxDeviation and
+		// quote is itself a uint64.
+		selection.price = reference + maxDeviation
+		selection.adjusted = true
+	} else if quote < reference && reference-quote > maxDeviation {
+		selection.price = reference - maxDeviation
+		selection.adjusted = true
+	}
+	return selection, nil
+}
+
 // checkOraclePriceDeviation applies the legacy local-feed check before the
 // hardening fork. After activation, the parent block's committed price is the
 // reference so validators cannot disagree based on HTTP reachability or timing.
@@ -1349,15 +1460,23 @@ func (e *Engine) checkOraclePriceDeviation(block *core.Block) error {
 		block.Header.Height >= e.cfg.SecurityHardeningActivationHeight
 	if hardeningActive {
 		if blockPrice == 0 {
+			if e.isPinnedMainnetOraclePriceGap(block) {
+				return nil
+			}
 			return fmt.Errorf("oracle price is missing after hardening activation")
 		}
 		parent := e.chain.GetByHash(block.Header.PrevHash)
 		if parent == nil {
 			return fmt.Errorf("parent block unavailable for deterministic oracle price check")
 		}
-		referencePrice := parent.Header.OraclePrice
-		if referencePrice == 0 {
-			return fmt.Errorf("parent oracle price is missing at hardening activation")
+		parentIsPinnedGap := e.isPinnedMainnetOraclePriceGap(parent)
+		var previous *core.Block
+		if parentIsPinnedGap {
+			previous = e.chain.GetByHash(parent.Header.PrevHash)
+		}
+		referencePrice, err := hardenedOracleReferencePrice(parent, previous, parentIsPinnedGap)
+		if err != nil {
+			return err
 		}
 		difference := blockPrice - referencePrice
 		if blockPrice < referencePrice {
@@ -1390,6 +1509,65 @@ func (e *Engine) checkOraclePriceDeviation(block *core.Block) error {
 		)
 	}
 	return nil
+}
+
+// This one already-canonical Mainnet block has no embedded oracle price even
+// though it is above the hardening activation height. Pin the exception to the
+// exact genesis, block and parent; never treat a network-wide height exception
+// as permission to accept arbitrary zero-price blocks.
+const (
+	canonicalMainnetGenesisHeaderHashHex = "c8fde86c1764a5603eabd6d9c56c9e47b4cf06d88d299a55665694473e2c512f"
+	mainnetOraclePriceGapHeight          = uint64(4100597)
+	mainnetOraclePriceGapBlockHashHex    = "46cc6fc699b53fefb9785df38114dd44b80294df83ecf9cf21dfc62372efd82c"
+	mainnetOraclePriceGapParentHashHex   = "0c97d3d494e2451e5787e4cac20366054aa0e463906feccfd59df045586c5e78"
+)
+
+func (e *Engine) isPinnedMainnetOraclePriceGap(block *core.Block) bool {
+	if e == nil || e.chain == nil || block == nil {
+		return false
+	}
+	genesis := e.chain.GetByHeight(0)
+	if genesis == nil {
+		return false
+	}
+	return isPinnedMainnetOraclePriceGap(
+		fmt.Sprintf("%x", genesis.Hash()),
+		block.Header.Height,
+		fmt.Sprintf("%x", block.Hash()),
+		fmt.Sprintf("%x", block.Header.PrevHash),
+		block.Header.OraclePrice,
+	)
+}
+
+func isPinnedMainnetOraclePriceGap(
+	genesisHash string,
+	height uint64,
+	blockHash string,
+	parentHash string,
+	oraclePrice uint64,
+) bool {
+	return genesisHash == canonicalMainnetGenesisHeaderHashHex &&
+		height == mainnetOraclePriceGapHeight &&
+		blockHash == mainnetOraclePriceGapBlockHashHex &&
+		parentHash == mainnetOraclePriceGapParentHashHex &&
+		oraclePrice == 0
+}
+
+func hardenedOracleReferencePrice(parent, previous *core.Block, parentIsPinnedGap bool) (uint64, error) {
+	if parent == nil {
+		return 0, fmt.Errorf("parent block unavailable for deterministic oracle price check")
+	}
+	if parent.Header.OraclePrice != 0 {
+		return parent.Header.OraclePrice, nil
+	}
+	if !parentIsPinnedGap || previous == nil ||
+		previous.Header.Height+1 != parent.Header.Height ||
+		previous.Header.OraclePrice == 0 {
+		return 0, fmt.Errorf("parent oracle price is missing at hardening activation")
+	}
+	// The exact approved gap block is skipped; its immediate child compares
+	// against the last committed nonzero price, preserving the 5% rule.
+	return previous.Header.OraclePrice, nil
 }
 
 // maxCoinbasesPerBlock is the hard limit on zero-input (coinbase) transactions
@@ -1635,6 +1813,8 @@ func legacyAdminMintAuthorizationAvailable() bool {
 	return false
 }
 
+// ScheduleAdminMint rejects new legacy mints without consensus-authenticated
+// authorization. Local credentials or configuration cannot enable that path.
 func (e *Engine) ScheduleAdminMint(idempotencyKey, addr string, amountNAPR uint64, timeout time.Duration) (crypto.Hash32, uint64, error) {
 	// Legacy admin mints have no consensus-authenticated envelope.  In
 	// particular, the idempotency key authenticates nothing: the resulting
@@ -1878,6 +2058,9 @@ func (e *Engine) resolveAdminMintsPersistenceFailed(err error) {
 	e.mintMu.Unlock()
 }
 func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.Block, error) {
+	if round > math.MaxUint32 {
+		return nil, fmt.Errorf("block round exceeds uint32 wire range")
+	}
 	if e.cfg.MyKey == nil || !e.authority(e.localIdentity(height), height).Equals(e.cfg.MyKey.Public()) {
 		return nil, fmt.Errorf("configured key is not the signing authority at height %d", height)
 	}
@@ -2155,9 +2338,23 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		txs[index] = guardian
 	}
 
-	// Read the last price fetched by the background oracle goroutine.
-	// This is an atomic load — never blocks on network I/O.
-	oraclePrice := atomic.LoadUint64(&e.cachedOraclePrice)
+	// Select a price that every peer will accept under the activated
+	// parent-bound hardening rule. An external quote can jump beyond the
+	// consensus window, or be temporarily unavailable; embedding it raw would
+	// make our own block invalid to peers and strand the network at this tip.
+	oracleSelection, err := e.selectProducerOraclePrice(height, parent)
+	if err != nil {
+		return nil, fmt.Errorf("select consensus-valid oracle price: %w", err)
+	}
+	oraclePrice := oracleSelection.price
+	if oracleSelection.adjusted {
+		e.log.Warn("producer oracle quote adjusted to consensus hardening range",
+			"height", height,
+			"oracle_price_quote", oracleSelection.quote,
+			"parent_reference_price", oracleSelection.reference,
+			"oracle_price_used", oracleSelection.price,
+		)
+	}
 
 	header := core.BlockHeader{
 		Height:       height,
@@ -2193,6 +2390,26 @@ func (e *Engine) produceBlock(height, round uint64, parent *core.Block) (*core.B
 		)
 	}
 	return &core.Block{Header: header, Txs: txs}, nil
+}
+
+// validateSelfProducedBlock applies the same deterministic block-header,
+// key-image, and transaction verification gates used for incoming blocks. It
+// must run before prepareAVMBlock, UTXO application, stake application, or
+// chain insertion.
+func (e *Engine) validateSelfProducedBlock(block *core.Block) error {
+	if err := e.checkOraclePriceDeviation(block); err != nil {
+		return fmt.Errorf("oracle price check failed: %w", err)
+	}
+	if e.txVerifier == nil {
+		return fmt.Errorf("transaction verifier is not configured; refusing to commit a self-produced block")
+	}
+	if err := blockKeyImageCheck(block); err != nil {
+		return fmt.Errorf("block key-image check failed: %w", err)
+	}
+	if err := e.verifyBlockWithSales(block); err != nil {
+		return fmt.Errorf("block transaction verification failed: %w", err)
+	}
+	return nil
 }
 
 // handleIncomingBlock processes a block received from P2P.
@@ -2430,7 +2647,7 @@ func (e *Engine) handleIncomingBlock(block *core.Block) error {
 		e.halted.Store(true)
 		return fmt.Errorf("fatal slashing detector conflict after canonical persistence: %s", ev.String())
 	}
-	// Stake txs already applied above — no processStakeTxs call needed.
+	// Stake changes were already applied above.
 	if e.cfg.Registry != nil {
 		e.cfg.Registry.SetSignatureAdmissionHeight(block.Header.Height + 1)
 	}
@@ -2839,7 +3056,7 @@ func (e *Engine) handleVote(vote FinalizeMsg) error {
 	// current tip to prevent unbounded growth when blocks never reach quorum
 	// (e.g. due to network partitions or validator churn).
 	// Keep the most recent 256 heights of pending votes and finalized entries.
-	const votePruneDepth uint64 = 256
+	const votePruneDepth = store.FinalityVoteJournalDepth
 	if vote.Height > votePruneDepth {
 		pruneBelow := vote.Height - votePruneDepth
 		for bh, ht := range e.pendingVoteHeight {
@@ -3085,14 +3302,35 @@ func (e *Engine) restoreFinalityCertificate() error {
 		}
 	}
 	var committeeSnapshot finalityCommittee
-	if e.cfg.FinalityMigration != nil {
-		migrationCommittee, err := e.verifyFinalityCommitteeMigration(certificate)
+	if migration := e.cfg.FinalityMigration; migration != nil {
+		if certificate.Height < migration.CertificateHeight ||
+			(certificate.Height == migration.CertificateHeight && certificate.BlockHash != migration.CertificateBlockHash) {
+			return fmt.Errorf("finality migration: certificate binding mismatch")
+		}
+		migrationCommittee, err := e.verifyFinalityCommitteeMigration()
 		if err != nil {
 			return err
 		}
-		committeeSnapshot = finalityCommittee{
-			validators:   migrationCommittee,
-			thresholdPPM: uint32(math.Round(e.cfg.BFTThreshold * 1_000_000)),
+		if certificate.Height == migration.CertificateHeight {
+			committeeSnapshot = finalityCommittee{
+				validators:   migrationCommittee,
+				thresholdPPM: uint32(math.Round(e.cfg.BFTThreshold * 1_000_000)),
+			}
+		} else {
+			// The signed migration authorizes only the historical block. After
+			// the latest certificate advances, require the newer epoch's
+			// persisted committee rather than the migration or live registry.
+			epoch := certificate.Height / core.EpochLength
+			persisted, err := e.cfg.Store.LoadFinalityCommitteeSnapshot(epoch)
+			if err != nil {
+				return fmt.Errorf("finality: load successor committee for epoch %d: %w", epoch, err)
+			}
+			if persisted == nil {
+				return fmt.Errorf("finality: successor certificate has no persisted committee for epoch %d", epoch)
+			}
+			committeeSnapshot = finalityCommittee{
+				validators: persisted.Validators, thresholdPPM: persisted.BFTThresholdPPM,
+			}
 		}
 	} else if len(e.cfg.FinalityMigrationTrustAuthorities) != 0 {
 		return fmt.Errorf("finality: migration authorities configured without a migration file")
@@ -3149,7 +3387,7 @@ func (e *Engine) restoreFinalityVotes() error {
 		return fmt.Errorf("finality: cannot restore votes without a canonical tip")
 	}
 	currentEpoch := tip.Header.Height / core.EpochLength
-	const votePruneDepth uint64 = 256
+	const votePruneDepth = store.FinalityVoteJournalDepth
 	minHeight := uint64(0)
 	if tip.Header.Height >= votePruneDepth {
 		minHeight = tip.Header.Height - votePruneDepth + 1
@@ -3470,25 +3708,6 @@ func (e *Engine) ProposerAt(round uint32) crypto.ValidatorPubKey {
 
 // Registry returns the validator registry (may be nil for legacy static config).
 func (e *Engine) Registry() *core.ValidatorRegistry { return e.cfg.Registry }
-
-// processStakeTxs scans a block for stake transactions and applies them to the registry.
-func (e *Engine) processStakeTxs(block *core.Block) {
-	if e.cfg.Registry == nil {
-		return
-	}
-	for _, tx := range block.Txs {
-		if !tx.IsStake() {
-			continue
-		}
-		if err := e.cfg.Registry.ProcessStakeTx(tx, block.Header.Height); err != nil {
-			e.log.Warn("stake tx rejected",
-				"height", block.Header.Height,
-				"tx", tx.Hash(),
-				"err", err,
-			)
-		}
-	}
-}
 
 // HandleVote processes a finalization vote (exported for testing and P2P).
 func (e *Engine) HandleVote(vote FinalizeMsg) error {

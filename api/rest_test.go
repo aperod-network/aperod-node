@@ -18,6 +18,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -673,11 +674,12 @@ func TestHub_ClientCount_Initial(t *testing.T) {
 
 func TestHub_BroadcastBlock_NoPeers(t *testing.T) {
 	srv, _ := newTestServer(t)
-	priv, pub, _ := crypto.GenerateValidatorKey()
+	priv, pub, err := crypto.GenerateValidatorKey()
+	testutil.NoError(t, err)
 	hdr := core.BlockHeader{Height: 0, ValidatorPub: pub, Timestamp: time.Now().UnixNano()}
-	_ = hdr.Sign(priv)
+	testutil.NoError(t, hdr.Sign(priv))
 	b := &core.Block{Header: hdr}
-	srv.Hub().BroadcastBlock(b) // must not panic
+	testutil.NoError(t, srv.Hub().BroadcastBlock(b))
 }
 
 func TestHub_BroadcastTx_NoPeers(t *testing.T) {
@@ -782,7 +784,7 @@ func TestREST_AdminMint_ReturnsV2BlindForScheduledHeight(t *testing.T) {
 	if gotHex != wantHex {
 		t.Fatalf("blind_hex mismatch: got %s want V2 %s", gotHex, wantHex)
 	}
-	v1, _ := crypto.DeterministicMintBlind(wk.Spend.Public, amountNAPR)
+	v1, _ := crypto.LegacyMintBlind(wk.Spend.Public, amountNAPR)
 	if gotHex == fmt.Sprintf("%x", v1[:]) {
 		t.Fatal("blind_hex equals legacy V1 blind — commitment mismatch for scheduled mints")
 	}
@@ -1402,8 +1404,8 @@ func TestREST_AddressScan_PostViewKey(t *testing.T) {
 		BlockHeight: 1,
 	})
 
-	import_ := `{"view_key_hex":"` + hex.EncodeToString(wk.View.Private[:]) + `"}`
-	code, resp := restPostJSON(t, srv, "/api/v1/address/"+string(addr)+"/scan", []byte(import_))
+	importBody := `{"view_key_hex":"` + hex.EncodeToString(wk.View.Private[:]) + `"}`
+	code, resp := restPostJSON(t, srv, "/api/v1/address/"+string(addr)+"/scan", []byte(importBody))
 	if code != http.StatusOK {
 		t.Fatalf("POST /scan status = %d, want 200: %v", code, resp)
 	}
@@ -1449,7 +1451,7 @@ func TestWS_Endpoint_Registered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /ws: %v", err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 	if resp.StatusCode == http.StatusNotFound {
 		t.Error("/ws route not registered (got 404)")
 	}
@@ -1494,7 +1496,7 @@ func TestREST_UTXO_InMemorySpentCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	srv.SetStore(db)
 
 	// Register a UTXO in the in-memory set.

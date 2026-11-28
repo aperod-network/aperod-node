@@ -147,6 +147,66 @@ func TestRunSignRequiresMatchingIndependentCanonicalReplay(t *testing.T) {
 	}
 }
 
+func TestRunStateAttestationSupportsOnlyOneOfOne(t *testing.T) {
+	dbPath, err := makeCheckpointTestDB(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	candidatePath := filepath.Join(dir, "state-draft.json")
+	if err := runBuildState(dbPath, 1, candidatePath); err != nil {
+		t.Fatalf("build state draft: %v", err)
+	}
+	draft, found, err := avm.ReadCheckpointFile(candidatePath)
+	if err != nil || !found {
+		t.Fatalf("read state draft found=%v err=%v", found, err)
+	}
+	if draft.Height != 1 || draft.ActivationHeight != 1 {
+		t.Fatalf("state draft has unexpected height: activation=%d checkpoint=%d", draft.ActivationHeight, draft.Height)
+	}
+
+	operatorKey, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "operator.key")
+	if err := os.WriteFile(keyPath, operatorKey.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signaturePath := filepath.Join(dir, "operator-signature.json")
+	authorityHex := []string{operatorKey.Public().Hex()}
+	if err := runSignState(dbPath, 1, candidatePath, keyPath, authorityHex, signaturePath); err != nil {
+		t.Fatalf("sign matching 1-of-1 state draft: %v", err)
+	}
+	signature, err := readWitnessSignature(signaturePath)
+	if err != nil || !signature.WitnessPublicKey.Equals(operatorKey.Public()) {
+		t.Fatalf("read operator signature=%+v err=%v", signature, err)
+	}
+	checkpointPath := filepath.Join(dir, "one-of-one-checkpoint.json")
+	if err := runAssemble(candidatePath, []string{signaturePath}, authorityHex, 1, checkpointPath); err != nil {
+		t.Fatalf("assemble 1-of-1 checkpoint: %v", err)
+	}
+	checkpoint, found, err := avm.ReadCheckpointFile(checkpointPath)
+	if err != nil || !found {
+		t.Fatalf("read assembled checkpoint found=%v err=%v", found, err)
+	}
+	if err := avm.VerifyCheckpointQuorum(checkpoint, 1, []crypto.ValidatorPubKey{operatorKey.Public()}, 1); err != nil {
+		t.Fatalf("verify assembled 1-of-1 checkpoint: %v", err)
+	}
+
+	secondKey, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runAssemble(
+		candidatePath, []string{signaturePath},
+		[]string{operatorKey.Public().Hex(), secondKey.Public().Hex()}, 1,
+		filepath.Join(dir, "one-of-many-checkpoint.json"),
+	); err == nil || !strings.Contains(err.Error(), "1-of-1 policy requires exactly one trusted authority") {
+		t.Fatalf("1-of-many attestation was accepted: %v", err)
+	}
+}
+
 func copyDatabaseForWitness(t *testing.T, source string) string {
 	t.Helper()
 	destination := t.TempDir()

@@ -36,6 +36,8 @@ func authorityEngineFixture(t *testing.T) (*Engine, crypto.ValidatorPrivKey, cry
 	cfg := e.cfg
 	cfg.MyKey, cfg.ValidatorAuthorityFork = key, f
 	e = NewEngine(cfg, e.chain, e.pool, e.log)
+	utxos := core.NewUTXOSet()
+	e.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 	if e.halted.Load() {
 		t.Fatal("fixture authority fork rejected")
 	}
@@ -79,6 +81,76 @@ func TestAuthorityForkLPoDBlockFinalityAndRestart(t *testing.T) {
 	entry, ok := rebuilt.cfg.Registry.GetEntry(old.Public())
 	if !ok || entry.StakeNAPR != 1_000_000*core.BaseUnitsPerAPR {
 		t.Fatal("stake not preserved on restart")
+	}
+}
+
+func TestAuthorityForkSecondRotationKeepsOldBlocksValid(t *testing.T) {
+	e, old, firstReplacement := authorityEngineFixture(t)
+	if err := e.tick(); err != nil {
+		t.Fatalf("produce first replacement block: %v", err)
+	}
+	historical := e.chain.Tip()
+	if historical.Header.Height != 2 ||
+		!historical.Header.VerifySignature(firstReplacement.Public()) {
+		t.Fatal("first replacement block was not produced as expected")
+	}
+
+	secondReplacement, secondPublic, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := crypto.NewLockedValidatorKey(secondReplacement.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(locked.Destroy)
+	registrySnapshot, err := json.Marshal(e.cfg.Registry.TakeSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &core.ValidatorAuthorityFork{
+		Version:             2,
+		Genesis:             e.cfg.ValidatorAuthorityFork.Genesis,
+		Height:              3,
+		Parent:              historical.Hash(),
+		Identity:            append(crypto.ValidatorPubKey(nil), old.Public()...),
+		Replacement:         secondPublic,
+		RegistrySHA256:      crypto.Hash32(sha256.Sum256(registrySnapshot)),
+		LegacyWitnessSHA256: e.cfg.ValidatorAuthorityFork.LegacyWitnessSHA256,
+		Previous:            e.cfg.ValidatorAuthorityFork.Clone(),
+	}
+	second.Possession, err = secondReplacement.Sign(second.Message())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := e.cfg
+	cfg.MyKey = locked
+	cfg.ValidatorAuthorityFork = second
+	registry := core.NewValidatorRegistry()
+	registry.RestoreFromSnapshot(e.cfg.Registry.TakeSnapshot())
+	utxos := core.NewUTXOSet()
+	registry.SetUTXOSet(utxos)
+	cfg.Registry = registry
+	rotated := NewEngine(cfg, e.chain, e.pool, e.log)
+	rotated.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
+	if rotated.halted.Load() {
+		t.Fatal("valid second rotation halted engine")
+	}
+	if err := rotated.tick(); err != nil {
+		t.Fatalf("produce second replacement block: %v", err)
+	}
+	current := rotated.chain.Tip()
+	if current.Header.Height != 3 ||
+		!current.Header.ValidatorPub.Equals(old.Public()) ||
+		!current.Header.VerifySignature(secondPublic) {
+		t.Fatal("second replacement did not sign under the existing collateral identity")
+	}
+	if !historical.Header.VerifySignature(rotated.authority(old.Public(), historical.Header.Height)) {
+		t.Fatal("second rotation invalidated a historical block")
+	}
+	restarted := NewEngine(rotated.cfg, rotated.chain, rotated.pool, rotated.log)
+	if restarted.halted.Load() {
+		t.Fatal("restart rejected the historical and current authority schedule")
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -179,7 +180,7 @@ func rawConnect(t *testing.T, addr string) net.Conn {
 // Uses the asymmetric protocol: dialer sends Ping first, host replies with Pong.
 func rawHandshake(t *testing.T, conn net.Conn) bool {
 	t.Helper()
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 	// Dialer goes first: send Ping to host.
 	if err := p2p.WriteMsg(conn, p2p.MsgPing, p2p.PingMsg{
 		NodeID: "raw-peer", Height: 0, UserAgent: "test", Timestamp: time.Now().Unix(),
@@ -200,7 +201,8 @@ func rawHandshake(t *testing.T, conn net.Conn) bool {
 // tryReadMsg attempts to read one message from conn.
 // It closes conn after deadline to unblock ReadMsg (which sets its own 30s deadline).
 // Returns (msgType, true) if a message arrived before deadline, or (0, false) on timeout.
-func tryReadMsg(conn net.Conn, deadline time.Duration) (p2p.MessageType, bool) {
+func tryReadMsg(t *testing.T, conn net.Conn, deadline time.Duration) (p2p.MessageType, bool) {
+	t.Helper()
 	type result struct {
 		mt p2p.MessageType
 		ok bool
@@ -222,7 +224,18 @@ func tryReadMsg(conn net.Conn, deadline time.Duration) (p2p.MessageType, bool) {
 			return
 		}
 	}()
-	time.AfterFunc(deadline, func() { conn.Close() })
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(deadline, func() {
+		defer close(timerDone)
+		testutil.CleanupClose(t, conn)
+	})
+	defer func() {
+		// A callback already running must finish before it can report against
+		// a completed test. Otherwise cancel the unused deadline entirely.
+		if !timer.Stop() {
+			<-timerDone
+		}
+	}()
 	r := <-ch
 	return r.mt, r.ok
 }
@@ -246,7 +259,7 @@ func TestHost_GossipRelay_TwoPeers_BlockRelayed(t *testing.T) {
 
 	// Peer A — will send the block
 	connA := rawConnect(t, addr)
-	defer connA.Close()
+	defer testutil.CleanupClose(t, connA)
 	if !rawHandshake(t, connA) {
 		t.Skip("handshake A failed")
 	}
@@ -254,7 +267,7 @@ func TestHost_GossipRelay_TwoPeers_BlockRelayed(t *testing.T) {
 	// Peer B — should receive the relay
 	connB := rawConnect(t, addr)
 	if !rawHandshake(t, connB) {
-		connB.Close()
+		testutil.Close(t, connB)
 		t.Skip("handshake B failed")
 	}
 
@@ -267,13 +280,13 @@ func TestHost_GossipRelay_TwoPeers_BlockRelayed(t *testing.T) {
 	block := &core.Block{Header: hdr}
 	sb := p2p.BlockToMsg(block)
 
-	connA.SetDeadline(time.Now().Add(2 * time.Second))
+	testutil.NoError(t, connA.SetDeadline(time.Now().Add(2*time.Second)))
 	if err := p2p.WriteMsg(connA, p2p.MsgBlock, sb); err != nil {
 		t.Fatalf("send block from A: %v", err)
 	}
 
 	// Peer B should receive relay (tryReadMsg closes connB after deadline)
-	mt, ok := tryReadMsg(connB, 500*time.Millisecond)
+	mt, ok := tryReadMsg(t, connB, 500*time.Millisecond)
 	if !ok {
 		t.Log("peer B relay read timed out — timing sensitive, skipping assertion")
 		return
@@ -305,7 +318,7 @@ func TestHost_GossipRelay_NotEchoedToSender(t *testing.T) {
 
 	connA := rawConnect(t, addr)
 	if !rawHandshake(t, connA) {
-		connA.Close()
+		testutil.Close(t, connA)
 		t.Skip("handshake failed")
 	}
 	time.Sleep(30 * time.Millisecond)
@@ -316,11 +329,11 @@ func TestHost_GossipRelay_NotEchoedToSender(t *testing.T) {
 	block := &core.Block{Header: hdr}
 	sb := p2p.BlockToMsg(block)
 
-	connA.SetDeadline(time.Now().Add(2 * time.Second))
-	p2p.WriteMsg(connA, p2p.MsgBlock, sb)
+	testutil.NoError(t, connA.SetDeadline(time.Now().Add(2*time.Second)))
+	testutil.NoError(t, p2p.WriteMsg(connA, p2p.MsgBlock, sb))
 
 	// tryReadMsg will close connA after 200ms if nothing arrives
-	mt, ok := tryReadMsg(connA, 200*time.Millisecond)
+	mt, ok := tryReadMsg(t, connA, 200*time.Millisecond)
 	if ok && mt == p2p.MsgBlock {
 		t.Error("block must NOT be echoed back to sender")
 	}
@@ -346,7 +359,7 @@ func TestHost_GossipRelay_DuplicateBlock_NotRelayedTwice(t *testing.T) {
 	}
 
 	connA := rawConnect(t, addr)
-	defer connA.Close()
+	defer testutil.CleanupClose(t, connA)
 	if !rawHandshake(t, connA) {
 		t.Skip("handshake failed")
 	}
@@ -358,10 +371,10 @@ func TestHost_GossipRelay_DuplicateBlock_NotRelayedTwice(t *testing.T) {
 	block := &core.Block{Header: hdr}
 	sb := p2p.BlockToMsg(block)
 
-	connA.SetDeadline(time.Now().Add(2 * time.Second))
-	p2p.WriteMsg(connA, p2p.MsgBlock, sb)
+	testutil.NoError(t, connA.SetDeadline(time.Now().Add(2*time.Second)))
+	testutil.NoError(t, p2p.WriteMsg(connA, p2p.MsgBlock, sb))
 	time.Sleep(30 * time.Millisecond)
-	p2p.WriteMsg(connA, p2p.MsgBlock, sb) // duplicate
+	testutil.NoError(t, p2p.WriteMsg(connA, p2p.MsgBlock, sb)) // duplicate
 	time.Sleep(80 * time.Millisecond)
 
 	// Handler called at least once, no panic
@@ -393,7 +406,7 @@ func TestHost_BanPeer_ClosesConnection(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -443,8 +456,8 @@ func TestHost_SetHeaderProvider_ServesHeaders(t *testing.T) {
 	}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10}))
 		msgType, data, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg GetHeaders: %v", err)
@@ -483,8 +496,8 @@ func TestHost_NoHeaderProvider_ServesEmpty(t *testing.T) {
 	}
 
 	connectAndHandshake(t, addr, func(conn net.Conn) {
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
-		p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10})
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+		testutil.NoError(t, p2p.WriteMsg(conn, p2p.MsgGetHeaders, p2p.GetHeadersMsg{Limit: 10}))
 		msgType, data, err := readMsgSkipGetHeaders(conn)
 		if err != nil {
 			t.Logf("ReadMsg: %v", err)
@@ -525,7 +538,7 @@ func TestHost_BroadcastBlock_TransientFailure_RetriesOnce(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -556,7 +569,7 @@ func TestHost_BroadcastBlock_TransientFailure_RetriesOnce(t *testing.T) {
 	host.BroadcastBlock(block)
 
 	// The peer must still receive the block quickly via the single retry.
-	mt, ok := tryReadMsg(conn, 2*time.Second)
+	mt, ok := tryReadMsg(t, conn, 2*time.Second)
 	if !ok {
 		t.Fatal("peer never received the block despite retry")
 	}
@@ -581,7 +594,7 @@ func TestHost_BroadcastVote_DeliversToConnectedPeer(t *testing.T) {
 	}
 	defer host.Stop()
 	conn := rawConnect(t, host.ListenAddr())
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -596,7 +609,7 @@ func TestHost_BroadcastVote_DeliversToConnectedPeer(t *testing.T) {
 		ValidatorPub: append([]byte(nil), pub[:]...), Signature: []byte("signed-vote"),
 	}
 	host.BroadcastVote(vote)
-	msgType, ok := tryReadMsg(conn, 2*time.Second)
+	msgType, ok := tryReadMsg(t, conn, 2*time.Second)
 	if !ok {
 		t.Fatal("connected peer did not receive finality vote")
 	}
@@ -624,7 +637,7 @@ func TestHost_BroadcastBlock_PeerEvicted_NoRetry(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -702,7 +715,7 @@ func TestHost_BroadcastBlock_PermanentFailure_NoRetry(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -761,7 +774,7 @@ func TestHost_BroadcastBlock_ConcurrentEviction_NoSendAfterDrop(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -828,8 +841,8 @@ func TestWriteMsgN_PartialWrite_ReportsBytesWritten(t *testing.T) {
 	// Transport-level check: writeMsgN must report exactly how many bytes
 	// reached the wire so callers can detect a poisoned stream.
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer testutil.CleanupClose(t, server)
+	defer testutil.CleanupClose(t, client)
 
 	// Drain the reader side so Pipe writes don't block.
 	go func() {
@@ -872,7 +885,7 @@ func TestHost_BroadcastBlock_PartialWrite_ClosesConn_NoRetry(t *testing.T) {
 	}
 
 	conn := rawConnect(t, addr)
-	defer conn.Close()
+	defer testutil.CleanupClose(t, conn)
 	if !rawHandshake(t, conn) {
 		t.Skip("handshake failed")
 	}
@@ -924,8 +937,8 @@ func TestPeer_SendN_PartialWrite_PoisonsAtomically_ConcurrentSendRejected(t *tes
 	// blocked on that lock can never append a new frame to the broken
 	// stream.  We verify by counting underlying Write calls: exactly one.
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer testutil.CleanupClose(t, server)
+	defer testutil.CleanupClose(t, client)
 
 	go func() { // drain reader so Pipe writes don't block
 		buf := make([]byte, 4096)

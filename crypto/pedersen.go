@@ -94,11 +94,21 @@ func CommitSum(inputs []Commitment, outputs []Commitment, feeCommit Commitment) 
 // This lets the wallet spend a mint UTXO without storing the blind externally —
 // it can always be recomputed from the recipient's spend public key and amount.
 //
-// Deprecated: new block-reward mints (height > 0) must use DeterministicMintBlindV2,
-// which includes the block height so each reward's blind is unique.
-// DeterministicMintBlind is preserved only for height=0 admin mints and
-// backward-compatible recovery of UTXOs created before the V2 migration.
+// Deprecated: use DeterministicMintBlindV2 for new block rewards (height > 0).
+// Only height-zero admin outputs and pre-V2 recovery may use LegacyMintBlind.
 func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error) {
+	return LegacyMintBlind(spendPub, amount)
+}
+
+// LegacyMintBlind reproduces the V1 mint blind for height-zero administrative
+// outputs and recovery of historical outputs created before the V2 migration.
+// It must never replace DeterministicMintBlindV2 for new block rewards.
+//
+// The historical preimage is
+// SHA-512("aperod-mint-blind-v1" || spendPub || amount_LE), reduced as a scalar.
+// Keep these bytes unchanged: existing commitments and spendability depend on
+// this algorithm. Recovery callers must verify the on-chain commitment.
+func LegacyMintBlind(spendPub Point32, amount uint64) (BlindFactor, error) {
 	h := sha512.New()
 	h.Write([]byte("aperod-mint-blind-v1"))
 	h.Write(spendPub[:])
@@ -117,7 +127,7 @@ func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error
 }
 
 // DeterministicMintBlindV2 derives a stable blinding factor for transparent
-// block-reward mint outputs.  It extends DeterministicMintBlind by including
+// block-reward mint outputs.  It extends LegacyMintBlind by including
 // the block height in the SHA-512 pre-image:
 //
 //	SHA-512("aperod-mint-blind-v2" || spendPub || amount_LE || height_LE) → SetUniformBytes
@@ -125,7 +135,7 @@ func DeterministicMintBlind(spendPub Point32, amount uint64) (BlindFactor, error
 // Including height ensures each per-block reward has a unique blind even when
 // (address, amount) repeat across blocks.  This is required for all new mints
 // produced by BuildMintTx with height > 0; height=0 admin mints continue to
-// use DeterministicMintBlind for backward compatibility.
+// use LegacyMintBlind for backward compatibility.
 //
 // Security note: height is on-chain public data, so the blind alone is still
 // derivable given the full UTXO descriptor.  The complete protection against

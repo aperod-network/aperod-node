@@ -84,6 +84,10 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT
 TARGET_IP="192.0.2.55"   # TEST-NET-1 — never routes
 PRIMARY_IP="10.0.0.1"
 BOOTNODE="/ip4/${PRIMARY_IP}/tcp/30303"
+TEST_SOURCE_NODE_YAML="${TMPDIR_TEST}/source-node.yaml"
+cat >"${TEST_SOURCE_NODE_YAML}" <<'YAML'
+network: testnet
+YAML
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -231,6 +235,7 @@ run_join() {
     PATH="${bdir}:${PATH}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${ddir}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     SECONDARY_NODE_YAML="${node_yaml}" \
     SECONDARY_NODE_CONFIG_SH="${node_config_sh}" \
     GOMEMLIMIT_BYTES="5905580032" \
@@ -459,6 +464,7 @@ else
     PATH="${M2_BIN}:${PATH}" \
     PRIMARY_IP="${PRIMARY_IP}" \
     PRIMARY_DATA_DIR="${M2_DATA}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     SECONDARY_NODE_YAML="${M2_YAML}" \
     SECONDARY_NODE_CONFIG_SH="${NODE_CONFIG_SH}" \
     GOMEMLIMIT_BYTES="5905580032" \
@@ -706,6 +712,7 @@ make_stub "${M7_BIN}" "hostname" 'echo "10.1.0.1 10.2.0.1"'
 make_stub "${M7_BIN}" "ip" '[[ "$*" == "-4 route get 192.0.2.55" ]] || exit 1
 echo "192.0.2.55 via 10.1.0.254 dev eth1 src 10.1.0.1 uid 0"'
 if OUTPUT=$(env -u PRIMARY_IP PATH="${M7_BIN}:${PATH}" PRIMARY_DATA_DIR="${M7_DATA}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     SECONDARY_NODE_YAML="${M7_YAML}" SECONDARY_DATA_DIR="${M7_REMOTE}" SECONDARY_NODE_CONFIG_SH=/nonexistent \
     GOMEMLIMIT_BYTES=5905580032 bash "${JOIN_SH}" "${TARGET_IP}" 2>&1); then
   if python3 - "${M7_YAML}" <<'PY'
@@ -728,6 +735,7 @@ make_stub "${M7_BIN}" "ssh" 'exit 1'
 make_stub "${M7_BIN}" "systemctl" "touch '${TMPDIR_TEST}/m8-service-touched'; exit 1"
 BEFORE=$(cat "${M7_YAML}")
 if OUTPUT=$(env -u PRIMARY_IP PATH="${M7_BIN}:${PATH}" PRIMARY_DATA_DIR="${M7_DATA}" \
+    PRIMARY_NODE_YAML="${TEST_SOURCE_NODE_YAML}" \
     SECONDARY_NODE_YAML="${M7_YAML}" GOMEMLIMIT_BYTES=5905580032 \
     bash "${JOIN_SH}" "${TARGET_IP}" 2>&1); then
   fail "M8: Failed observation was accepted"

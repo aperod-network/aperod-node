@@ -2,10 +2,16 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -172,8 +178,32 @@ func TestLPoDV2WitnessRejectsDifferentPeerTrustAnchor(t *testing.T) {
 	if err := m.VerifyAuthorization(); err != nil {
 		t.Fatalf("matching explicit authority rejected: %v", err)
 	}
+	path := filepath.Join(t.TempDir(), "witness.json")
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	profile := config.ConsensusConfig{
+		LPoDMigrationFile: path, LPoDV2TrustAuthorities: []string{hex.EncodeToString(pub)},
+		StakingPoolNAPR: 2_000_000_000 * lpod.Unit, RewardAuthorizationActivationHeight: 1,
+	}
+	if err := validateLPoDPreflight(profile); err != nil {
+		t.Fatalf("config preflight rejected the signed witness: %v", err)
+	}
+	missingPool := profile
+	missingPool.StakingPoolNAPR = 0
+	if err := validateLPoDPreflight(missingPool); err == nil || !strings.Contains(err.Error(), "staking_pool_napro") {
+		t.Fatalf("expected missing staking pool to fail configuration preflight, got %v", err)
+	}
 
 	peerAuthority := newLPoDAuthority(t)
+	profile.LPoDV2TrustAuthorities = []string{hex.EncodeToString(peerAuthority)}
+	if err := validateLPoDPreflight(profile); err == nil {
+		t.Fatal("config preflight accepted a witness signed by an unpinned key")
+	}
 	peerConfig, err := parseLPoDV2TrustAuthorities([]string{hex.EncodeToString(peerAuthority)})
 	if err != nil {
 		t.Fatal(err)
@@ -181,6 +211,16 @@ func TestLPoDV2WitnessRejectsDifferentPeerTrustAnchor(t *testing.T) {
 	m.TrustedValidators = peerConfig
 	if err := m.VerifyAuthorization(); err == nil {
 		t.Fatal("peer with a different configured trust anchor accepted witness")
+	}
+}
+
+func TestLPoDV3ConfigPreflightRequiresExplicitPin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "witness.json")
+	if err := os.WriteFile(path, []byte(`{"version":3}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLPoDPreflight(config.ConsensusConfig{LPoDMigrationFile: path}); err == nil || !strings.Contains(err.Error(), "explicit version 3 trust authority set is required") {
+		t.Fatalf("expected missing pin error, got %v", err)
 	}
 }
 
@@ -202,7 +242,7 @@ func TestLPoDV2TrustOptInRequiresWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	_, authority, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +259,7 @@ func TestLPoDV3TrustOptInRequiresWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	_, authority, err := crypto.GenerateValidatorKey()
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +279,7 @@ func TestLPoDPastUnfundedWitnessFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	m := &store.LPoDMigration{Version: 2, Height: 20}
 	for _, tip := range []uint64{20, 21} {
 		hash := crypto.HashBytes([]byte{byte(tip)})

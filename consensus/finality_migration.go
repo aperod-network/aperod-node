@@ -5,22 +5,19 @@ import (
 	"math"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/mainnetbootstrap"
 	"github.com/aperod/aperod/store"
 )
 
-func (e *Engine) verifyFinalityCommitteeMigration(certificate *store.FinalityCertificate) ([]crypto.ValidatorPubKey, error) {
+func (e *Engine) verifyFinalityCommitteeMigration() ([]crypto.ValidatorPubKey, error) {
 	migration := e.cfg.FinalityMigration
-	if migration == nil || certificate == nil || e.cfg.Store == nil {
-		return nil, fmt.Errorf("finality migration: missing migration, certificate, or store")
+	if migration == nil || e.cfg.Store == nil {
+		return nil, fmt.Errorf("finality migration: missing migration or store")
 	}
 	genesis := e.chain.Genesis()
 	tip := e.chain.Tip()
 	if genesis == nil || tip == nil || migration.Genesis != genesis.Hash() {
 		return nil, fmt.Errorf("finality migration: network genesis mismatch")
-	}
-	if migration.CertificateHeight != certificate.Height ||
-		migration.CertificateBlockHash != certificate.BlockHash {
-		return nil, fmt.Errorf("finality migration: certificate binding mismatch")
 	}
 	if migration.ApprovalHeight > tip.Header.Height {
 		return nil, fmt.Errorf("finality migration: approval anchor is above the canonical tip")
@@ -28,6 +25,10 @@ func (e *Engine) verifyFinalityCommitteeMigration(certificate *store.FinalityCer
 	storedTipHash, storedTipHeight, err := e.cfg.Store.GetTip()
 	if err != nil || storedTipHeight != tip.Header.Height || storedTipHash != tip.Hash() {
 		return nil, fmt.Errorf("finality migration: durable tip does not match the canonical chain")
+	}
+	certifiedHash, found, err := e.cfg.Store.GetCanonicalHash(migration.CertificateHeight)
+	if err != nil || !found || certifiedHash != migration.CertificateBlockHash {
+		return nil, fmt.Errorf("finality migration: certified block is not canonical")
 	}
 	anchorHash, found, err := e.cfg.Store.GetCanonicalHash(migration.ApprovalHeight)
 	if err != nil || !found || anchorHash != migration.ApprovalBlockHash {
@@ -41,6 +42,12 @@ func (e *Engine) verifyFinalityCommitteeMigration(certificate *store.FinalityCer
 	}
 
 	authorities := e.cfg.FinalityMigrationTrustAuthorities
+	if migration.Version == store.FinalityCommitteeOperatorVersion {
+		if err := mainnetbootstrap.VerifyHistoricalCommitteeOperator(*migration, authorities); err != nil {
+			return nil, err
+		}
+		return append([]crypto.ValidatorPubKey(nil), migration.HistoricalCommittee...), nil
+	}
 	if len(authorities) == 0 || len(authorities) > 256 {
 		return nil, fmt.Errorf("finality migration: explicit trust authorities are required")
 	}

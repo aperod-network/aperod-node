@@ -221,7 +221,11 @@ func TestChecksum_UnreadableSidecarIsCorrupt(t *testing.T) {
 	if err := os.Chmod(chk, 0o000); err != nil {
 		t.Fatalf("chmod sidecar: %v", err)
 	}
-	defer os.Chmod(chk, 0o644) // let TempDir cleanup succeed
+	defer func(path string) {
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Errorf("restore checksum fixture permissions: %v", err)
+		}
+	}(chk) // let TempDir cleanup succeed
 
 	_, _, err := loadStartupSnapshotWithFallback(dir, 460, snap.TipHashHex, discardLogger())
 	if err == nil {
@@ -339,7 +343,11 @@ func TestChecksum_PromotionUnreadableSourceSidecarAbortsSave(t *testing.T) {
 	if err := os.Chmod(chk, 0o000); err != nil {
 		t.Fatalf("chmod sidecar: %v", err)
 	}
-	defer os.Chmod(chk, 0o644)
+	defer func(path string) {
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Errorf("restore checksum fixture permissions: %v", err)
+		}
+	}(chk)
 
 	updated := makeSnap(650)
 	updated.TxTotal = 222

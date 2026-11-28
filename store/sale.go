@@ -150,7 +150,7 @@ func (d *DB) PrepareSaleBlock(b *core.Block, m *SaleMigration) (*SaleSettlement,
 	return &SaleSettlement{Migration: m, Before: before, After: after}, nil
 }
 
-func (d *DB) appendSaleSettlement(batch *leveldb.Batch, data []byte, hash crypto.Hash32, height uint64, p *SaleSettlement) error {
+func (d *DB) appendSaleSettlement(batch *leveldb.Batch, ring *ringBatch, data []byte, hash crypto.Hash32, height uint64, p *SaleSettlement) error {
 	var b core.Block
 	if json.Unmarshal(data, &b) != nil {
 		s, err := d.LoadSaleState()
@@ -229,7 +229,9 @@ func (d *DB) appendSaleSettlement(batch *leveldb.Batch, data []byte, hash crypto
 				return err
 			}
 			batch.Put(utxoKey(th, uint32(i)), raw)
-			batch.Put(ringMemberKey(out.OneTimePub), raw)
+			if err := ring.putMember(&u, raw); err != nil {
+				return err
+			}
 		}
 	}
 	retentionKind := byte(0)
@@ -263,7 +265,7 @@ func (d *DB) appendSaleSettlement(batch *leveldb.Batch, data []byte, hash crypto
 	return nil
 }
 
-func (d *DB) restoreSale(batch *leveldb.Batch, target crypto.Hash32, height uint64) error {
+func (d *DB) restoreSale(batch *leveldb.Batch, ring *ringBatch, target crypto.Hash32, height uint64) error {
 	s, err := d.LoadSaleState()
 	if err != nil || s == nil {
 		return err
@@ -318,7 +320,9 @@ func (d *DB) restoreSale(batch *leveldb.Batch, target crypto.Hash32, height uint
 			batch.Delete(append(append([]byte{}, prefixTxIdx...), th[:]...))
 			for i, out := range tx.Outputs {
 				batch.Delete(utxoKey(th, uint32(i)))
-				batch.Delete(ringMemberKey(out.OneTimePub))
+				if err := ring.deleteMember(out.OneTimePub); err != nil {
+					return err
+				}
 				batch.Delete(spentUTXOKey(th, uint32(i)))
 			}
 		}

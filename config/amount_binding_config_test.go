@@ -36,13 +36,13 @@ func TestRingCTAmountBindingActivationValidationAndLoad(t *testing.T) {
 	}
 }
 
-func TestOfflineRehearsalSchedulesStagingAmountBindingOnly(t *testing.T) {
+func TestOfflineRehearsalMainnetConfigRequiresVerifiedBootstrap(t *testing.T) {
 	cfg, err := Load("rehearsal-offline.yaml")
 	if err != nil {
 		t.Fatalf("load offline rehearsal config: %v", err)
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validate offline rehearsal config: %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "no valid signed operator_1_of_1 Mainnet bootstrap manifest") {
+		t.Fatalf("offline mainnet rehearsal must remain blocked without a verified bootstrap, got %v", err)
 	}
 	if !cfg.Consensus.NonValidator {
 		t.Fatal("offline amount-binding rehearsal must remain non-validator")

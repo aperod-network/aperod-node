@@ -36,7 +36,7 @@ func buildMintUTXOFixture(t *testing.T) (
 
 	const amount uint64 = core.MinStakeNAPR
 
-	burnBlind, err = crypto.DeterministicMintBlind(spendPub, amount)
+	burnBlind, err = crypto.LegacyMintBlind(spendPub, amount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestF049_DeterministicMintBlindV2_DiffersFromV1(t *testing.T) {
 	const amount uint64 = 1_000_000_000
 	const height uint64 = 42
 
-	v1, err := crypto.DeterministicMintBlind(spendPub, amount)
+	v1, err := crypto.LegacyMintBlind(spendPub, amount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}

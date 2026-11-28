@@ -83,6 +83,20 @@ func TestSecurityHardeningRejectsExistingOutputKeyCollision(t *testing.T) {
 	}
 }
 
+func TestVerifyTxAtHeightRejectsExistingOutputKeyCollision(t *testing.T) {
+	pub := securityHardeningTestPoint(t)
+	utxos := NewUTXOSet()
+	utxos.Add(&UTXO{TxHash: crypto.Hash32{1}, OneTimePub: pub})
+
+	tx := Transaction{Outputs: []Output{{OneTimePub: pub}}}
+	verifier := NewTxVerifier(utxos)
+	verifier.SetSecurityHardeningActivationHeight(testSecurityHardeningHeight)
+	err := verifier.VerifyTxAtHeight(&tx, testSecurityHardeningHeight)
+	if err == nil || !strings.Contains(err.Error(), "one-time public key already exists") {
+		t.Fatalf("VerifyTxAtHeight error = %v, want existing-key collision rejection", err)
+	}
+}
+
 func TestSecurityHardeningFailsClosedWhenRingIndexCannotBeRead(t *testing.T) {
 	utxos := NewUTXOSet()
 	utxos.ringMembers = hardeningFailingRingMemberStore{}
@@ -130,9 +144,7 @@ func TestUpdateEpochBreaksStakeTiesDeterministicallyAtActivation(t *testing.T) {
 	}
 
 	var want []crypto.ValidatorPubKey
-	for _, pub := range pubs {
-		want = append(want, pub)
-	}
+	want = append(want, pubs...)
 	sortValidatorKeys(want)
 	want = want[:MaxValidators]
 

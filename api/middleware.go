@@ -58,6 +58,7 @@ type RateLimiter struct {
 	overflow *tokenBucket
 }
 
+// NewRateLimiter creates a bounded per-address limiter and starts bucket pruning.
 func NewRateLimiter() *RateLimiter {
 	rl := &RateLimiter{
 		buckets:    make(map[string]*tokenBucket),
@@ -245,6 +246,7 @@ var rateLimitExempt = map[string]bool{
 	"/health": true,
 }
 
+// Middleware applies the configured request buckets before invoking next.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !rateLimitExempt[r.URL.Path] {
@@ -282,16 +284,18 @@ func realIP(r *http.Request) string {
 	// Only honor X-Forwarded-For from a trusted local proxy.
 	if remoteIP == "127.0.0.1" || remoteIP == "::1" {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Take only the first (leftmost) address.
-			for idx := 0; idx < len(xff); idx++ {
+			// Trust only the address appended by our immediate local proxy.
+			// Earlier elements can be supplied by the remote client. Additional
+			// proxy hops require explicit trust/real-IP configuration at that proxy.
+			for idx := len(xff) - 1; idx >= 0; idx-- {
 				if xff[idx] == ',' {
-					xff = xff[:idx]
+					xff = xff[idx+1:]
 					break
 				}
 			}
 			xff = trimSpace(xff)
-			if xff != "" {
-				return xff
+			if ip := net.ParseIP(xff); ip != nil {
+				return ip.String()
 			}
 		}
 	}
@@ -313,6 +317,8 @@ func trimSpace(s string) string {
 
 // APIKeyMiddleware requires X-API-Key to match key for the wrapped handler.
 // Used for write-operation endpoints (sendRawTransaction).
+//
+//nolint:revive // Retain the historical exported name for downstream API compatibility.
 func APIKeyMiddleware(key string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		candidate := r.Header.Get("X-API-Key")

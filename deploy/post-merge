@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# post-merge — git hook: alert when /usr/local/bin/aperod_backup.sh drifts
+# from the repo copy after a `git pull` / `git merge`.
+#
+# Source file tracked in the repo at:  blockchain/deploy/post-merge
+# Installed to the live repo by:        update-node.sh (step 1c)
+#                                        install-node.sh (step 12b, if git-based)
+#
+# Security model
+# ---------------
+# /usr/local/bin/aperod_backup.sh is root-owned (mode 700, owner root) and
+# executed by aperod-backup.service running as root.  The git repository is
+# owned by the aperod user.  To preserve the privilege boundary between the
+# unprivileged pull user and the root backup service, this hook performs NO
+# writes to /usr/local/bin/ or any other root-owned path.
+#
+# What this hook does
+# --------------------
+# 1. Detects a content mismatch between the repo copy and the installed copy.
+# 2. Prints a clear warning to stderr so the operator sees it immediately
+#    after `git pull` and knows to run sudo update-node.sh.
+# 3. Optionally sends a Telegram alert when credentials are available.
+# 4. Always exits 0 to ensure a completed pull is never blocked.
+#
+# What it does NOT do
+# --------------------
+# • Never writes to root-owned paths.
+# • Never calls sudo or any privileged mechanism.
+# The actual privileged sync is performed by update-node.sh (step 1b) which
+# runs as root and uses the atomic stage-then-rename pattern in
+# sync-backup-script.sh.
+
+set -euo pipefail
+
+# Locate the repository root via git.  If git is unavailable or we are not
+# inside a git repo, skip silently — never block the merge.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# Resolve the repo copy path for both known repo layouts:
+#   Private/production repo:  blockchain/deploy/aperod_backup.sh
+#   Public repo (no subdir):  deploy/aperod_backup.sh
+if [[ -f "${REPO_ROOT}/blockchain/deploy/aperod_backup.sh" ]]; then
+  REPO_COPY="${REPO_ROOT}/blockchain/deploy/aperod_backup.sh"
+elif [[ -f "${REPO_ROOT}/deploy/aperod_backup.sh" ]]; then
+  REPO_COPY="${REPO_ROOT}/deploy/aperod_backup.sh"
+else
+  # This repo layout has no backup script — skip silently.
+  exit 0
+fi
+
+INSTALLED="/usr/local/bin/aperod_backup.sh"
+
+# ── Early exit: backup not configured on this server ─────────────────────────
+# If /usr/local/bin/aperod_backup.sh is absent, setup-backup.sh has not been
+# run yet.  No mismatch can occur; skip silently.
+[[ -f "${INSTALLED}" ]] || exit 0
+
+# ── Compare repo copy vs installed copy ──────────────────────────────────────
+if cmp -s "${REPO_COPY}" "${INSTALLED}" 2>/dev/null; then
+  echo "  [post-merge] aperod_backup.sh: installed copy is up to date."
+  exit 0
+fi
+
+# ── Mismatch detected ─────────────────────────────────────────────────────────
+echo "" >&2
+echo "╔══════════════════════════════════════════════════════════╗" >&2
+echo "║  ⚠  aperod_backup.sh: INSTALLED COPY IS STALE           ║" >&2
+echo "╚══════════════════════════════════════════════════════════╝" >&2
+echo "" >&2
+echo "  The repository copy differs from the installed backup script." >&2
+echo "  The backup service will use the OLD version until the" >&2
+echo "  installed copy is updated." >&2
+echo "" >&2
+echo "  Installed : ${INSTALLED}" >&2
+echo "  Repo copy : ${REPO_COPY}" >&2
+echo "" >&2
+echo "  ── Fix: run the privileged update script ────────────────" >&2
+echo "  sudo bash blockchain/deploy/update-node.sh" >&2
+echo "  (or)  sudo bash blockchain/deploy/update-api.sh" >&2
+echo "  ─────────────────────────────────────────────────────────" >&2
+echo "" >&2
+
+# ── Optional Telegram alert ───────────────────────────────────────────────────
+# Try to read Telegram credentials from the environment or from the aperod
+# config files (readable by the aperod user without root).
+_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+_TG_CHAT="${ADMIN_TELEGRAM_CHAT_ID:-}"
+
+# Read from /etc/aperod/api.env if not in environment (best-effort).
+if [[ -z "${_TG_TOKEN}" && -r "/etc/aperod/api.env" ]]; then
+  _TG_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=)\S+' /etc/aperod/api.env 2>/dev/null | head -1 || true)
+fi
+if [[ -z "${_TG_CHAT}" && -r "/etc/aperod/api.env" ]]; then
+  _TG_CHAT=$(grep -oP '(?<=^ADMIN_TELEGRAM_CHAT_ID=)\S+' /etc/aperod/api.env 2>/dev/null | head -1 || true)
+fi
+
+if [[ -n "${_TG_TOKEN}" && -n "${_TG_CHAT}" ]]; then
+  _ts_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
+  _tg_msg="⚠️ <b>Aperod: aperod_backup.sh is STALE after git pull</b>
+
+The installed backup script differs from the repository copy.
+The backup service will use the OLD version until synced.
+
+<b>Server:</b> $(hostname 2>/dev/null || echo unknown)
+<b>Time:</b> ${_ts_iso}
+
+<b>Fix:</b>
+<code>sudo bash blockchain/deploy/update-node.sh</code>"
+
+  curl -s --max-time 10 -X POST \
+    "https://api.telegram.org/bot${_TG_TOKEN}/sendMessage" \
+    -d "chat_id=${_TG_CHAT}" \
+    -d "text=${_tg_msg}" \
+    -d "parse_mode=HTML" \
+    >/dev/null 2>&1 || true   # never let a failed alert block the merge
+fi
+
+# Always exit 0 — hook must never block a completed merge.
+exit 0

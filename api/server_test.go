@@ -6,10 +6,12 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,7 +198,7 @@ func TestRPC_GetBlockByHash_Genesis(t *testing.T) {
 	srv, chain := newTestServer(t)
 	genesis := chain.GetByHeight(0)
 	hash := genesis.Hash()
-	hashHex := string(make([]byte, 64))
+	var hashHex string
 	{
 		b := make([]byte, 64)
 		for i, v := range hash {
@@ -337,5 +339,27 @@ func TestRPC_GetBalance_InvalidAddress(t *testing.T) {
 	})
 	if resp["error"] == nil {
 		t.Error("expected error for invalid address in apr_getBalance")
+	}
+}
+
+func TestRPC_GetBalance_UnsupportedViewScanDoesNotReportZero(t *testing.T) {
+	srv, _ := newTestServer(t)
+	keys, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := crypto.AddressFromKeys(crypto.MainnetByte, keys)
+	// A syntactically valid scalar, deliberately fixed and not a real secret.
+	viewKey := strings.Repeat("01", 32)
+	resp := rpcCall(t, srv, "apr_getBalance", map[string]interface{}{
+		"address":  addr.String(),
+		"view_key": viewKey,
+	})
+	failure, ok := resp["error"].(map[string]interface{})
+	if !ok || !strings.Contains(fmt.Sprint(failure["message"]), "not supported") {
+		t.Fatalf("unsupported scan was not rejected explicitly: %v", resp)
+	}
+	if resp["result"] != nil || strings.Contains(fmt.Sprint(resp), viewKey) {
+		t.Fatalf("unsupported scan returned a balance or echoed the view key: %v", resp)
 	}
 }

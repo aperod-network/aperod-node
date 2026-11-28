@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,38 @@ func TestConservationSurplusDeficitExhaustion(t *testing.T) {
 	}
 	if s != fundedFixture() {
 		t.Fatal("input mutated")
+	}
+}
+
+func TestPendingLeaderRewardsRemainInConservationWithoutBeingMarkedPaid(t *testing.T) {
+	state, _, payments, err := Settle(fundedFixture(), nil, 1, []Vault{{
+		ID: "validator", TotalStake: 100_000 * Unit, ActualIncome: 3 * Unit,
+	}})
+	if err != nil || len(payments) != 1 || payments[0].Leader == 0 {
+		t.Fatalf("create leader reward fixture: payments=%+v err=%v", payments, err)
+	}
+	state.LeaderPaid -= payments[0].Leader
+	state.PendingLeader = payments[0].Leader
+	if err := state.Validate(); err != nil {
+		t.Fatalf("valid deferred leader reward rejected: %v", err)
+	}
+	unfunded := state
+	unfunded.PendingLeader--
+	if err := unfunded.Validate(); err == nil {
+		t.Fatal("deferred leader reward was omitted from conservation")
+	}
+	released := state
+	released.PendingLeader = 0
+	released.LeaderPaid = payments[0].Leader
+	if err := released.Validate(); err != nil {
+		t.Fatalf("released leader reward did not conserve: %v", err)
+	}
+	legacyJSON, err := json.Marshal(fundedFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacyJSON), "pending_leader_napro") {
+		t.Fatalf("zero new field changed historical state encoding: %s", legacyJSON)
 	}
 }
 

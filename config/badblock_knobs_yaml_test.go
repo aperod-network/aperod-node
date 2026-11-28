@@ -5,12 +5,14 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestBadBlockKnobsParseFromYAML(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "node.yaml")
-	os.WriteFile(p, []byte("p2p:\n  bad_block_height_lead: 500\n  bad_block_ban_threshold: 7\n  bad_block_ban_duration: 12h\n"), 0644)
+	testutil.NoError(t, os.WriteFile(p, []byte("p2p:\n  bad_block_height_lead: 500\n  bad_block_ban_threshold: 7\n  bad_block_ban_duration: 12h\n"), 0644))
 	c, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load: %v", err)

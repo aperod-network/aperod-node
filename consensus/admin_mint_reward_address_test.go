@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -14,7 +15,7 @@ func TestReconcileRewardAddressAdminMintIntents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	const rewardAddress = "aproRewardAddressForStartupReconciliation"
 	records := map[string]store.AdminMintRecord{

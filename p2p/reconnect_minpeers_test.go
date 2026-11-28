@@ -66,7 +66,6 @@ func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
 	if err := behindChain.SetGenesis(genesis); err != nil {
 		t.Fatalf("behind SetGenesis: %v", err)
 	}
-	prev = genesis
 	for height := uint64(1); height <= 3; height++ {
 		block := aheadChain.GetByHeight(height)
 		if block == nil {
@@ -75,7 +74,6 @@ func TestSync_AheadNodeDoesNotRequestStaleBlocksFromBehindPeer(t *testing.T) {
 		if err := behindChain.AddBlock(block); err != nil {
 			t.Fatalf("behind AddBlock %d: %v", height, err)
 		}
-		prev = block
 	}
 
 	behindHandler := &minimalChainHandler{chain: behindChain}

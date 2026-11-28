@@ -876,11 +876,8 @@ print(str((cfg.get('consensus') or {}).get('non_validator', False)).lower())
 PY
 }
 
-# ── Test 16: --no-chaindb + guard → exits nonzero BEFORE deleting chain.db ────
-# The early argument check must fire before any destructive operation so that an
-# existing valid chain.db is not lost when the operator accidentally passes
-# --no-chaindb on a guarded (non_validator: true) install.
-section "Test 16: --no-chaindb + consensus.non_validator: true exits nonzero and preserves chain.db"
+# ── Test 16: --no-chaindb refuses empty safe-mode node ────────────────────────
+section "Test 16: --no-chaindb refuses an empty safe-mode node"
 if [[ ! -f "${APEROD_JOIN_SH}" ]]; then
   skip "Test 16: aperod-join.sh safe-mode guard (${APEROD_JOIN_SH} not found)"
 else
@@ -894,15 +891,14 @@ for arg; do [[ "$arg" == "-u" ]] && echo 0 && exit 0; done
 exit 1
 STUB
 
-  # systemctl stub: not needed before the early check fires, but present for safety.
+  # systemctl stub: the test runs with --skip-start, but the join script probes it.
   cat > "${STUB16}/systemctl" << 'STUB'
 #!/usr/bin/env bash
 [[ "${1:-}" == "is-active" ]] && exit 1
 exit 0
 STUB
 
-  # curl stub: primary accessible (needed for step 1 after root check, but the
-  # early check fires before step 1 so this is a safety stub only).
+  # curl stub: primary status is accessible; chain and snapshot exports are skipped.
   cat > "${STUB16}/curl" << 'STUB'
 #!/usr/bin/env bash
 for arg; do
@@ -917,96 +913,65 @@ STUB
   DATA16="${TMPDIR_TEST}/data-t16"
   DROPIN16="${TMPDIR_TEST}/dropin-t16"
   make_guarded_config "${CFG16}"
-  mkdir -p "${DATA16}/chain.db" "${DROPIN16}"
-  # Create a sentinel file inside chain.db to verify it is not deleted.
-  echo "sentinel" > "${DATA16}/chain.db/CURRENT"
+  mkdir -p "${DROPIN16}"
 
-  PATH="${STUB16}:${PATH}" \
+  JOIN16_OUTPUT=$(PATH="${STUB16}:${PATH}" \
     APEROD_NODE_YAML="${CFG16}" \
     APEROD_NODE_CONFIG_SH="${NODE_CONFIG_SH}" \
     APEROD_DROPIN_DIR="${DROPIN16}" \
     bash "${APEROD_JOIN_SH}" \
-      "${PRIMARY_IP}:8545" \
+      "127.0.0.1:8545" \
       --data-dir "${DATA16}" \
       --user nonexistentuser_test16 \
       --skip-start \
       --no-chaindb \
-    >/dev/null 2>&1
+    2>&1)
   EXIT16=$?
+  if [[ ${EXIT16} -ne 0 ]]; then
+    printf '%s\n' "${JOIN16_OUTPUT}"
+  fi
 
   if [[ ${EXIT16} -ne 0 ]]; then
-    pass "--no-chaindb + non_validator: true exits nonzero (${EXIT16})"
+    pass "--no-chaindb without an existing chain was rejected (${EXIT16})"
   else
-    fail "--no-chaindb + non_validator: true should exit nonzero but exited 0"
+    fail "--no-chaindb without an existing chain should have been rejected"
   fi
 
-  # chain.db must be intact — the early check fires before step 3 (data cleanup).
-  if [[ -f "${DATA16}/chain.db/CURRENT" ]]; then
-    pass "chain.db preserved — early check fired before data cleanup"
+  if [[ ! -e "${DATA16}/chain.db" ]]; then
+    pass "empty safe-mode node did not create or replace a chain"
   else
-    fail "chain.db deleted — early check did not fire before step 3 (data destructive step)"
+    fail "empty safe-mode node unexpectedly created chain.db"
   fi
 
-  # node.yaml must be untouched — guard still set.
+  # node.yaml must retain the guard after rejection.
   NV16=$(get_non_validator "${CFG16}")
   if [[ "${NV16}" == "true" ]]; then
-    pass "consensus.non_validator: true still set in node.yaml after rejected --no-chaindb"
+    pass "consensus.non_validator remains true after rejection"
   else
-    fail "consensus.non_validator was removed despite --no-chaindb rejection — node.yaml was mutated"
+    fail "consensus.non_validator was removed without identity verification"
   fi
 fi
 
-# ── Test 17: guard is removed from node.yaml after install-node.sh path ────────
-# Verifies that the inline Python fallback in aperod-join.sh correctly removes
-# consensus.non_validator while preserving all other consensus fields.
-section "Test 17: consensus.non_validator removed after successful join (inline Python fallback)"
+# ── Test 17: guard cannot be removed by the join script ───────────────────────
+section "Test 17: consensus.non_validator stays until verified validator activation"
 CFG17="${TMPDIR_TEST}/node-t17.yaml"
 make_guarded_config "${CFG17}"
-
-# Simulate the inline Python fallback from aperod-join.sh step 7.
-python3 - "${CFG17}" <<'PY'
-import sys, yaml, os
-cfg_path = sys.argv[1]
-with open(cfg_path) as f:
-    cfg = yaml.safe_load(f) or {}
-consensus = cfg.get('consensus')
-if isinstance(consensus, dict) and 'non_validator' in consensus:
-    del consensus['non_validator']
-    tmp = cfg_path + '.tmp'
-    with open(tmp, 'w') as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-    os.replace(tmp, cfg_path)
-PY
-
 if is_valid_yaml "${CFG17}"; then
-  pass "node.yaml is valid YAML after guard removal"
+  pass "guarded node.yaml remains valid"
 else
-  fail "node.yaml invalid YAML after guard removal"
+  fail "guarded node.yaml is invalid"
 fi
 
 NV17=$(get_non_validator "${CFG17}")
-if [[ "${NV17}" == "false" ]]; then
-  pass "consensus.non_validator removed from node.yaml after successful join"
+if [[ "${NV17}" == "true" ]]; then
+  pass "consensus.non_validator is true before verified activation"
 else
-  fail "consensus.non_validator still present after guard removal (got: ${NV17})"
+  fail "consensus.non_validator should remain true, got ${NV17}"
 fi
-
-# The consensus section itself must still exist (guard removal must not wipe the
-# entire consensus block — other consensus settings must survive).
-python3 - "${CFG17}" <<'PY'
-import sys, yaml
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-if 'consensus' not in cfg:
-    print("MISSING: consensus block was removed entirely", file=sys.stderr)
-    sys.exit(1)
-sys.exit(0)
-PY
-KEYS17=$?
-if [[ ${KEYS17} -eq 0 ]]; then
-  pass "consensus block preserved after guard removal (only non_validator key removed)"
+if grep -Fq 'unset-field consensus.non_validator' "${APEROD_JOIN_SH}"; then
+  fail "join script still removes the safe-mode guard"
 else
-  fail "consensus block was removed entirely — other consensus settings lost"
+  pass "join script does not remove the safe-mode guard"
 fi
 
 # ── Test 18: node-config.sh set-field / unset-field for nested key ────────────

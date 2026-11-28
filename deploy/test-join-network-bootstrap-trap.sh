@@ -66,6 +66,18 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT
 make_stub() {
   local dir="$1" cmd="$2" body="$3"
   mkdir -p "$dir"
+  # Never fall through to an installed host binary when a fixture reaches the
+  # post-rsync store check. Each scenario has its own PATH directory.
+  if [[ "$cmd" != "aperod-node" && ! -e "${dir}/aperod-node" ]]; then
+    cat >"${dir}/aperod-node" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *--check-store*) echo "fixture check-store: ok"; exit 0 ;;
+  *) echo "unexpected fixture aperod-node call: $*" >&2; exit 97 ;;
+esac
+STUB
+    chmod +x "${dir}/aperod-node"
+  fi
   printf '#!/usr/bin/env bash\n%s\n' "$body" >"${dir}/${cmd}"
   chmod +x "${dir}/${cmd}"
 }

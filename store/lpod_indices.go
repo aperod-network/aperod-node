@@ -13,7 +13,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
-func appendLPoDIndices(batch *leveldb.Batch, b *core.Block, rollback bool) error {
+func appendLPoDIndices(batch *leveldb.Batch, ring *ringBatch, b *core.Block, rollback bool) error {
 	for _, tx := range b.Txs {
 		hash := tx.Hash()
 		for _, in := range tx.Inputs {
@@ -46,17 +46,21 @@ func appendLPoDIndices(batch *leveldb.Batch, b *core.Block, rollback bool) error
 			index := uint32(i)
 			if rollback {
 				batch.Delete(utxoKey(hash, index))
-				batch.Delete(ringMemberKey(out.OneTimePub))
+				if err := ring.deleteMember(out.OneTimePub); err != nil {
+					return err
+				}
 				batch.Delete(spentUTXOKey(hash, index))
 			} else {
 				u := StoredUTXO{TxHash: hash, OutputIndex: index, OneTimePub: out.OneTimePub, TxPubKey: out.TxPubKey,
-					AmountCommit: out.AmountCommit, EncAmount: out.EncAmount, BlockHeight: b.Header.Height}
+					AmountCommit: out.AmountCommit, EncAmount: out.EncAmount, BlockHeight: b.Header.Height, ProtocolLocked: tx.IsGuardianFund()}
 				raw, err := json.Marshal(u)
 				if err != nil {
 					return err
 				}
 				batch.Put(utxoKey(hash, index), raw)
-				batch.Put(ringMemberKey(out.OneTimePub), raw)
+				if err := ring.putMember(&u, raw); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -66,7 +70,7 @@ func appendLPoDIndices(batch *leveldb.Batch, b *core.Block, rollback bool) error
 // Ancestor selection restores the native position indices in the same batch as
 // reserve/position selection. Alternate branches must first rewind to the common
 // parent and then use ordinary validated canonical commits, never jump a tip.
-func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, target crypto.Hash32, height uint64) error {
+func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, ring *ringBatch, target crypto.Hash32, height uint64) error {
 	bound := false
 	for _, key := range [][]byte{
 		[]byte("lpod/activation/v1"),
@@ -102,7 +106,7 @@ func (d *DB) rollbackLPoDIndices(batch *leveldb.Batch, target crypto.Hash32, hei
 		if json.Unmarshal(raw, &block) != nil || block.Hash() != cursor || block.Header.Height != current {
 			return fmt.Errorf("lpod: full canonical body required to rewind principal indices")
 		}
-		if err := appendLPoDIndices(batch, &block, true); err != nil {
+		if err := appendLPoDIndices(batch, ring, &block, true); err != nil {
 			return err
 		}
 		if err := d.rollbackLPoDWalletIndex(batch, block.Hash()); err != nil {

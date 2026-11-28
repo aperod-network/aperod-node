@@ -28,6 +28,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -88,7 +89,7 @@ func BenchmarkLPoDAuditDailySynthetic(b *testing.B) {
 			RawBlockBytes int64
 		}
 		if err != nil || json.Unmarshal(raw, &saved) != nil || fmt.Sprint(saved.Configuration) != fmt.Sprint(configuration) {
-			db.Close()
+			testutil.Close(b, db)
 			b.Fatal("fixture configuration missing or different")
 		}
 		rawBlockBytes = saved.RawBlockBytes
@@ -110,7 +111,7 @@ func BenchmarkLPoDAuditDailySynthetic(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(b, db)
 	diskBytes, err := directoryBytes(path)
 	if err != nil {
 		b.Fatal(err)
@@ -157,7 +158,7 @@ func BenchmarkLPoDAuditDailySynthetic(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		defer db.Close()
+		defer testutil.CleanupClose(b, db)
 		server.SetStore(db)
 	}
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &beforeUsage); err != nil {
@@ -269,7 +270,7 @@ func startDailyAuditProfile(b *testing.B) func() {
 			b.Fatalf("create allocation profile: %v", err)
 		}
 		if err := pprof.Lookup("allocs").WriteTo(file, 0); err != nil {
-			file.Close()
+			testutil.Close(b, file)
 			b.Fatalf("write allocation profile: %v", err)
 		}
 		if err := file.Close(); err != nil {
@@ -282,7 +283,7 @@ func startDailyAuditProfile(b *testing.B) func() {
 		b.Fatalf("create CPU profile: %v", err)
 	}
 	if err := pprof.StartCPUProfile(cpuFile); err != nil {
-		cpuFile.Close()
+		testutil.Close(b, cpuFile)
 		b.Fatalf("start CPU profile: %v", err)
 	}
 	b.Logf("profiling the real ServeHTTP request; profiles are in %s", dir)
@@ -311,7 +312,7 @@ func TestDailyAuditBoundarySearchDoesNotReadPrunedPreIntervalBody(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := rawDB.Put(append([]byte("b/"), prunedHash[:]...), []byte(`{"pruned":true}`), nil); err != nil {
-		rawDB.Close()
+		testutil.Close(t, rawDB)
 		t.Fatal(err)
 	}
 	if err := rawDB.Close(); err != nil {
@@ -321,7 +322,7 @@ func TestDailyAuditBoundarySearchDoesNotReadPrunedPreIntervalBody(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	server.SetStore(db)
 
 	recorder := httptest.NewRecorder()
@@ -344,7 +345,7 @@ func TestDailyAuditBoundarySearchDoesNotReadPrunedPreIntervalBody(t *testing.T) 
 
 func TestDailyAuditTimestampMisorderInCertifiedRangeFailsClosed(t *testing.T) {
 	db, server, _, _ := makeDailyAuditBenchmarkFixture(t, 2, 0, 0, 1, 8, 0, true)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	recorder := httptest.NewRecorder()
 	server.restLPoDAuditDaily(recorder, authenticatedDailyAuditRequest())
 	var response struct {
@@ -440,7 +441,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 	}
 	walletKeys, err := crypto.GenerateWalletKeys()
 	if err != nil {
-		rawDB.Close()
+		testutil.Close(b, rawDB)
 		b.Fatal(err)
 	}
 	leader := crypto.AddressFromKeys(crypto.MainnetByte, walletKeys)
@@ -478,7 +479,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 	if vaultCount > 0 {
 		tier, err := lpod.TierFor(totalStake)
 		if err != nil {
-			rawDB.Close()
+			testutil.Close(b, rawDB)
 			b.Fatalf("benchmark vault stake is not a valid LPoD tier: %v", err)
 		}
 		for i := 0; i < vaultCount; i++ {
@@ -486,7 +487,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			if i > 0 {
 				_, validatorPub, err = crypto.GenerateValidatorKey()
 				if err != nil {
-					rawDB.Close()
+					testutil.Close(b, rawDB)
 					b.Fatalf("generate benchmark vault validator: %v", err)
 				}
 			}
@@ -508,7 +509,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 		}
 	}
 	if positionCount > 0 && vaultCount == 0 {
-		rawDB.Close()
+		testutil.Close(b, rawDB)
 		b.Fatal("benchmark positions require at least one operator-attested vault")
 	}
 	zero := uint64(0)
@@ -530,7 +531,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			return
 		}
 		if err := rawDB.Write(batch, nil); err != nil {
-			rawDB.Close()
+			testutil.Close(b, rawDB)
 			b.Fatal(err)
 		}
 		batch.Reset()
@@ -549,7 +550,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 	closingHeight := firstIncludedHeight + uint64(includedBlocks)
 	lastHeight := closingHeight + uint64(tailBlocks)
 	for height := uint64(0); height <= lastHeight; height++ {
-		timestamp := start.Add(-time.Second)
+		var timestamp time.Time
 		if height <= uint64(preludeBlocks) {
 			timestamp = start.Add(time.Duration(int64(height)-int64(preludeBlocks)-1) * 3 * time.Second)
 		} else {
@@ -582,12 +583,12 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			for n := 0; n < positionCount; n++ {
 				sourceKeys, keyErr := crypto.GenerateWalletKeys()
 				if keyErr != nil {
-					rawDB.Close()
+					testutil.Close(b, rawDB)
 					b.Fatalf("generate benchmark position source keys: %v", keyErr)
 				}
 				blind, blindErr := crypto.NewBlindFactor()
 				if blindErr != nil {
-					rawDB.Close()
+					testutil.Close(b, rawDB)
 					b.Fatalf("generate benchmark position commitment blind: %v", blindErr)
 				}
 				sourceTx := crypto.HashBytes([]byte(fmt.Sprintf("synthetic-position-source-%04d", n)))
@@ -600,7 +601,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 				}
 				tx, txErr := core.BuildLPoDPositionTx(action, walletKeys.Spend.Private, sourceKeys.Spend.Private)
 				if txErr != nil {
-					rawDB.Close()
+					testutil.Close(b, rawDB)
 					b.Fatalf("build benchmark position deposit %d: %v", n, txErr)
 				}
 				positionID := fmt.Sprintf("%x", action.PositionID[:])
@@ -608,7 +609,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 				positionVaultIDs[positionID] = hex.EncodeToString(action.Vault[:])
 				positionTxs = append(positionTxs, *tx)
 				if ^uint64(0)-positionPrincipal < action.Amount {
-					rawDB.Close()
+					testutil.Close(b, rawDB)
 					b.Fatal("benchmark position principal overflow")
 				}
 				positionPrincipal += action.Amount
@@ -677,7 +678,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			// An empty-output payout remains a valid zero-settlement commitment.
 			auth, marshalErr := json.Marshal(core.LPoDPayoutAuthorization{Leader: leader, Digest: checkpointDigest})
 			if marshalErr != nil {
-				rawDB.Close()
+				testutil.Close(b, rawDB)
 				b.Fatal(marshalErr)
 			}
 			txs = append(txs,
@@ -710,7 +711,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			signer = successor
 		}
 		if err := block.Header.Sign(signer); err != nil {
-			rawDB.Close()
+			testutil.Close(b, rawDB)
 			b.Fatal(err)
 		}
 		hash := block.Hash()
@@ -723,7 +724,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 		}
 		raw, err := json.Marshal(block)
 		if err != nil {
-			rawDB.Close()
+			testutil.Close(b, rawDB)
 			b.Fatal(err)
 		}
 		blockBodyBytes += int64(len(raw))
@@ -735,7 +736,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 
 		checkpointRaw, err := json.Marshal(checkpoint)
 		if err != nil {
-			rawDB.Close()
+			testutil.Close(b, rawDB)
 			b.Fatal(err)
 		}
 		batch.Put(append([]byte("lpod/checkpoint/v1/"), hash[:]...), checkpointRaw)
@@ -809,7 +810,7 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 			}
 			recordRaw, err := json.Marshal(record)
 			if err != nil {
-				rawDB.Close()
+				testutil.Close(b, rawDB)
 				b.Fatal(err)
 			}
 			batch.Put(append([]byte("lpod/block-audit/v3/"), hash[:]...), recordRaw)
@@ -862,14 +863,14 @@ func makeDailyAuditBenchmarkFixtureWithOptions(
 	}
 	closingHash, found, err := db.GetCanonicalHash(closingHeight)
 	if err != nil || !found {
-		db.Close()
+		testutil.Close(b, db)
 		b.Fatalf("fixture closing hash unavailable: %v", err)
 	}
 	if err := db.SaveFinalityCertificate(store.FinalityCertificate{
 		Version: 1, Height: closingHeight, BlockHash: closingHash,
 		Votes: []store.FinalityVote{{Signature: []byte{1}}},
 	}); err != nil {
-		db.Close()
+		testutil.Close(b, db)
 		b.Fatal(err)
 	}
 	server := NewServer(":0", nil, nil, nil, slog.Default())

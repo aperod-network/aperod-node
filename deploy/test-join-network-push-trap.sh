@@ -91,11 +91,15 @@ LAST_EXIT=0
 run_push() {
   local bdir="$1" pdata="$2"
   shift 2
+  # Exercise trap/ordering logic on an explicit isolated testnet fixture.
+  # Never depend on, or bypass the absence of, the operator's node.yaml.
+  printf 'network: testnet\n' > "${pdata}/test-node.yaml"
   LAST_EXIT=0
   LAST_OUTPUT=$(
     env \
       PATH="${bdir}:${PATH}" \
       PRIMARY_DATA_DIR="${pdata}" \
+      PRIMARY_NODE_YAML="${pdata}/test-node.yaml" \
       PRIMARY_IP="${PRIMARY_IP}" \
       SECONDARY_DATA_DIR="/var/lib/aperod-test" \
       SECONDARY_NODE_YAML="/etc/aperod-test/node.yaml" \

@@ -34,6 +34,7 @@ func parseIntentionalBurnExtra(extra []byte) (uint64, bool, error) {
 	return amount, true, nil
 }
 
+// BurnAmount extracts a well-formed burn marker, without verifying the transaction.
 func BurnAmount(tx *Transaction) (uint64, bool) {
 	if tx == nil {
 		return 0, false
@@ -42,17 +43,22 @@ func BurnAmount(tx *Transaction) (uint64, bool) {
 	return amount, marked && err == nil
 }
 
+// IsBurnTx reports whether the transaction contains a well-formed burn marker.
 func IsBurnTx(tx *Transaction) bool {
 	_, ok := BurnAmount(tx)
 	return ok
 }
 
+// BurnAmount extracts a well-formed burn marker, without verifying the transaction.
 func (tx *Transaction) BurnAmount() (uint64, bool) { return BurnAmount(tx) }
-func (tx *Transaction) IsBurnTx() bool             { return IsBurnTx(tx) }
+
+// IsBurnTx reports whether the transaction contains a well-formed burn marker.
+func (tx *Transaction) IsBurnTx() bool { return IsBurnTx(tx) }
 
 // TxVersion identifies the transaction format version.
 type TxVersion uint8
 
+// Transaction version identifiers select protocol wire formats.
 const (
 	TxVersionBase      TxVersion = 1 // Standard RingCT transaction
 	TxVersionGameAsset TxVersion = 2 // Transaction with game asset data in Extra
@@ -203,10 +209,12 @@ func (tx *Transaction) IsStake() bool {
 	return tx.Version == TxVersionStake
 }
 
+// IsAVM reports whether the selected wire version carries an AVM payload.
 func (tx *Transaction) IsAVM() bool {
 	return tx != nil && (tx.Version == TxVersionAVM || tx.Version == TxVersionAVMAmountBinding)
 }
 
+// UsesAmountBinding reports whether the selected wire version binds encrypted amounts.
 func (tx *Transaction) UsesAmountBinding() bool {
 	return tx != nil && (tx.Version == TxVersionAmountBinding || tx.Version == TxVersionAVMAmountBinding)
 }
@@ -215,6 +223,7 @@ func (tx *Transaction) UsesAmountBinding() bool {
 // materialization. Its full identity is checked by GuardianFundTxAt.
 func (tx *Transaction) IsGuardianFund() bool { return tx != nil && tx.Version == TxVersionGuardianFund }
 
+// UsesCLSAG reports whether the selected wire version uses CLSAG spend proofs.
 func (tx *Transaction) UsesCLSAG() bool {
 	return tx != nil && (tx.Version == TxVersionCLSAG || tx.Version == TxVersionAVM ||
 		tx.Version == TxVersionAmountBinding || tx.Version == TxVersionAVMAmountBinding)
@@ -577,7 +586,11 @@ func (tx *Transaction) MinFeeAt(baseFeePerByte uint64) uint64 {
 	if baseFeePerByte == 0 {
 		baseFeePerByte = InitialBaseFeePerByte
 	}
-	size := uint64(tx.Size())
+	signedSize := tx.Size()
+	if signedSize < 0 {
+		return ^uint64(0)
+	}
+	size := uint64(signedSize)
 	if size != 0 && baseFeePerByte > ^uint64(0)/size {
 		// Saturate rather than wrap.  Callers compare Fee against this
 		// value, so overflow becomes fail-closed.

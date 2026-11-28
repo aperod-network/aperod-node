@@ -11,7 +11,12 @@ import (
 // FinalityCommitteeMigrationVersion is the canonical encoding version for committee migrations.
 const FinalityCommitteeMigrationVersion uint8 = 1
 
+// FinalityCommitteeOperatorVersion uses a distinct domain for a separately
+// pinned, off-chain operator. Consensus never resolves it as a validator key.
+const FinalityCommitteeOperatorVersion uint8 = 2
+
 const finalityCommitteeMigrationDomain = "aperod/finality-committee-migration/v1\x00"
+const finalityCommitteeOperatorDomain = "aperod/finality-committee-operator/v2\x00"
 
 // FinalityMigrationApproval records one validator's signature for a migration.
 type FinalityMigrationApproval struct {
@@ -38,7 +43,7 @@ type FinalityCommitteeMigration struct {
 // authorities. Committee and approval order must be canonical to avoid
 // multiple encodings of the same migration.
 func (m FinalityCommitteeMigration) SigningMessage() (crypto.Hash32, error) {
-	if m.Version != FinalityCommitteeMigrationVersion ||
+	if (m.Version != FinalityCommitteeMigrationVersion && m.Version != FinalityCommitteeOperatorVersion) ||
 		m.Genesis == (crypto.Hash32{}) ||
 		m.CertificateHeight == 0 ||
 		m.CertificateBlockHash == (crypto.Hash32{}) ||
@@ -52,7 +57,11 @@ func (m FinalityCommitteeMigration) SigningMessage() (crypto.Hash32, error) {
 	}
 
 	var payload bytes.Buffer
-	payload.WriteString(finalityCommitteeMigrationDomain)
+	if m.Version == FinalityCommitteeOperatorVersion {
+		payload.WriteString(finalityCommitteeOperatorDomain)
+	} else {
+		payload.WriteString(finalityCommitteeMigrationDomain)
+	}
 	payload.WriteByte(m.Version)
 	payload.Write(m.Genesis[:])
 	if err := binary.Write(&payload, binary.BigEndian, m.CertificateHeight); err != nil {

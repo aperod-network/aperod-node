@@ -13,11 +13,26 @@ package main
 // (same package) to assert on the emitted record's level.
 
 import (
+	"bytes"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
 const gomemlimitDropinPath = "/etc/systemd/system/aperod-node.service.d/gomemlimit.conf"
+
+func TestCheckGOMEMLIMIT_CustomDiagnosticPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom-unit-memory.conf")
+	var output bytes.Buffer
+	err := checkGOMLEMLIMIT("", false, true, false, path, newCaptureLogger(&output))
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(output.String(), path) {
+		t.Fatalf("custom diagnostic path was lost: err=%v log=%s", err, output.String())
+	}
+	if strings.Contains(err.Error(), gomemlimitDropinPath) {
+		t.Fatal("the diagnostic silently substituted the default unit path")
+	}
+}
 
 // TestCheckGOMEMLIMIT_UnsetNotDisabled_LogsWARN asserts that when the limit is
 // unset and memory_limit_disabled is false, the guard emits the warning at WARN.

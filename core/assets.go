@@ -29,6 +29,7 @@ var AssetTag = [4]byte{'A', 'P', 'R', 'A'}
 // AssetAction identifies the operation encoded in the Extra payload.
 type AssetAction uint8
 
+// Asset action identifiers distinguish mint, transfer and burn operations.
 const (
 	ActionMint     AssetAction = 1 // Create a new asset
 	ActionTransfer AssetAction = 2 // Transfer ownership
@@ -131,6 +132,7 @@ func EncodeAssetPayload(p AssetPayload) ([]byte, error) {
 }
 
 func appendLenPrefixed(buf, data []byte) []byte {
+	// #nosec G115 -- Only EncodeAssetPayload calls this helper, after bounding the entire encoded payload (including all these fields) to 255 bytes.
 	buf = append(buf, byte(len(data)))
 	buf = append(buf, data...)
 	return buf

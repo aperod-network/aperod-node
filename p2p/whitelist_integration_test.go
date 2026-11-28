@@ -18,6 +18,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // ─── minimal handler stub ─────────────────────────────────────────────────────
@@ -106,9 +107,9 @@ func TestHost_CIDRWhitelist_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
-		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
 
 		// Asymmetric handshake: dialer sends Ping first, host replies with Pong.
 		ping := PingMsg{
@@ -182,9 +183,9 @@ func TestHost_CIDRWhitelist_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer testutil.CleanupClose(t, conn)
 
-		conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		testutil.NoError(t, conn.SetDeadline(time.Now().Add(500*time.Millisecond)))
 
 		// Send a Ping so the host has something to respond to if the whitelist
 		// were broken (it must NOT respond with Pong for an outside IP).
@@ -216,7 +217,7 @@ func TestHost_CIDRWhitelist_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("host unreachable after whitelist rejection: %v", err)
 		}
-		probe.Close()
+		testutil.Close(t, probe)
 		t.Log("host remains alive after rejecting outside-IP connection ✓")
 	})
 }

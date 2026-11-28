@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -36,16 +37,16 @@ func backoffDuration(failures int) time.Duration {
 		return 0
 	}
 	const base = 5 * time.Second
-	const cap_ = 5 * time.Minute
+	const maximumDelay = 5 * time.Minute
 	d := base
 	for i := 1; i < failures; i++ {
 		d *= 2
-		if d > cap_ {
-			return cap_
+		if d > maximumDelay {
+			return maximumDelay
 		}
 	}
-	if d > cap_ {
-		return cap_
+	if d > maximumDelay {
+		return maximumDelay
 	}
 	return d
 }
@@ -141,20 +142,18 @@ func (pm *PeerMgr) persistBans() {
 	tmpName := tmp.Name()
 
 	if _, err := tmp.Write(encoded); err != nil {
-		slog.Default().Warn("p2p: ban persistence: write failed", "file", tmpName, "err", err)
-		tmp.Close()
-		os.Remove(tmpName)
+		slog.Default().Warn("p2p: ban persistence: write failed",
+			"file", tmpName, "err", errors.Join(err, tmp.Close(), os.Remove(tmpName)))
 		return
 	}
 	if err := tmp.Close(); err != nil {
-		slog.Default().Warn("p2p: ban persistence: close failed", "file", tmpName, "err", err)
-		os.Remove(tmpName)
+		slog.Default().Warn("p2p: ban persistence: close failed",
+			"file", tmpName, "err", errors.Join(err, os.Remove(tmpName)))
 		return
 	}
 	if err := os.Rename(tmpName, pm.banFile); err != nil {
 		slog.Default().Warn("p2p: ban persistence: rename failed",
-			"tmp", tmpName, "dst", pm.banFile, "err", err)
-		os.Remove(tmpName)
+			"tmp", tmpName, "dst", pm.banFile, "err", errors.Join(err, os.Remove(tmpName)))
 	}
 }
 

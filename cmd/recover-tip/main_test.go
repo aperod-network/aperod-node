@@ -2,48 +2,16 @@ package main
 
 import (
 	"compress/gzip"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/storage"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // ---- helpers ----------------------------------------------------------------
-
-// makeMemDB creates an in-memory LevelDB populated with a fake block at the
-// given height/hash and sets m/tip/hash and m/tip/height accordingly.
-func makeMemDB(t *testing.T, height uint64, hashBytes []byte) *leveldb.DB {
-	t.Helper()
-	db, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		t.Fatalf("open mem DB: %v", err)
-	}
-
-	// height index
-	if err := db.Put(heightKey(height), hashBytes, nil); err != nil {
-		t.Fatalf("put height key: %v", err)
-	}
-	// block data (minimal non-empty value)
-	blkKey := append([]byte("b/"), hashBytes...)
-	if err := db.Put(blkKey, []byte{0x01}, nil); err != nil {
-		t.Fatalf("put block data: %v", err)
-	}
-	// tip pointers
-	var hb [8]byte
-	binary.LittleEndian.PutUint64(hb[:], height)
-	if err := db.Put(metaKey("tip/height"), hb[:], nil); err != nil {
-		t.Fatalf("put tip/height: %v", err)
-	}
-	if err := db.Put(metaKey("tip/hash"), hashBytes, nil); err != nil {
-		t.Fatalf("put tip/hash: %v", err)
-	}
-	return db
-}
 
 // writeGzipSnapshot writes a startupSnapshot as gzip JSON to path.
 func writeGzipSnapshot(t *testing.T, path string, snap startupSnapshot) {
@@ -54,12 +22,12 @@ func writeGzipSnapshot(t *testing.T, path string, snap startupSnapshot) {
 	}
 	gz := gzip.NewWriter(f)
 	if err := json.NewEncoder(gz).Encode(snap); err != nil {
-		gz.Close()
-		f.Close()
+		testutil.Close(t, gz)
+		testutil.Close(t, f)
 		t.Fatalf("encode snapshot: %v", err)
 	}
 	if err := gz.Close(); err != nil {
-		f.Close()
+		testutil.Close(t, f)
 		t.Fatalf("close gzip: %v", err)
 	}
 	if err := f.Close(); err != nil {
@@ -362,8 +330,11 @@ func TestDryRunLeavesBytesIdentical(t *testing.T) {
 	beforeP := fileBytes(t, primaryPath)
 	beforeV := fileBytes(t, prevPath)
 
-	patchSnapshot(primaryPath, "primary", newHash, true)
-	patchSnapshot(prevPath, "prev-backup", newHash, true)
+	foundPrimary, primaryErr := patchSnapshot(primaryPath, "primary", newHash, true)
+	foundPrev, prevErr := patchSnapshot(prevPath, "prev-backup", newHash, true)
+	if !foundPrimary || !foundPrev || primaryErr != nil || prevErr != nil {
+		t.Fatalf("dry-run fixture failed: primary=%v/%v prev=%v/%v", foundPrimary, primaryErr, foundPrev, prevErr)
+	}
 
 	afterP := fileBytes(t, primaryPath)
 	afterV := fileBytes(t, prevPath)

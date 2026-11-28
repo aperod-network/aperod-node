@@ -16,6 +16,7 @@ import (
 )
 
 const lpodWalletBackfillBatchHeights = 64
+const lpodWalletBackfillReportInterval = 16384
 
 var lpodWalletBackfillReadyKey = []byte("lpod/wallet-ready/v2")
 var lpodWalletBackfillProgressKey = []byte("lpod/wallet-progress/v2")
@@ -31,6 +32,14 @@ type lpodWalletBackfillProgress struct {
 // canonical v3 payout blocks. The readiness marker is only written after the
 // complete funding-to-tip range has been replayed and rechecked.
 func (d *DB) BackfillLPoDWalletIndex(m *LPoDMigration) error {
+	return d.BackfillLPoDWalletIndexWithProgress(m, nil)
+}
+
+// BackfillLPoDWalletIndexWithProgress reports the persisted resume position and
+// subsequent committed batches at bounded intervals. Reaching the target in a
+// progress report does not imply readiness: the final tip check and ready write
+// still have to succeed.
+func (d *DB) BackfillLPoDWalletIndexWithProgress(m *LPoDMigration, report func(throughHeight, targetHeight uint64)) error {
 	if m == nil || m.Version != 3 {
 		return fmt.Errorf("lpod: v3 migration required for wallet index backfill")
 	}
@@ -94,6 +103,10 @@ func (d *DB) BackfillLPoDWalletIndex(m *LPoDMigration) error {
 	if err := d.db.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
 		return err
 	}
+	lastReport := progress.NextHeight - 1
+	if report != nil {
+		report(lastReport, targetHeight)
+	}
 
 	for progress.NextHeight <= targetHeight {
 		end := progress.NextHeight + lpodWalletBackfillBatchHeights - 1
@@ -128,6 +141,10 @@ func (d *DB) BackfillLPoDWalletIndex(m *LPoDMigration) error {
 		batch.Put(lpodWalletBackfillProgressKey, progressRaw)
 		if err := d.db.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
 			return err
+		}
+		if report != nil && (end == targetHeight || end-lastReport >= lpodWalletBackfillReportInterval) {
+			report(end, targetHeight)
+			lastReport = end
 		}
 	}
 
@@ -184,8 +201,12 @@ func (d *DB) indexHistoricalLPoDWalletPayout(
 	if err != nil || auth.Digest != after.Digest() {
 		return fmt.Errorf("invalid payout authorization")
 	}
+	before, err := d.LoadLPoDCheckpointAt(block.Header.PrevHash)
+	if err != nil {
+		return err
+	}
 	owners, err := lpodWalletOwners(
-		auth.Leader, after, block.Header.Height, block.Header.PrevHash, after.Digest(),
+		auth.Leader, before, after, block.Header.Height, block.Header.PrevHash, after.Digest(),
 	)
 	if err != nil {
 		return err

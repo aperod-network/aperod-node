@@ -8,6 +8,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -100,7 +101,7 @@ func TestEnsureCanonicalStateRebuildsInterruptedCommitAndSurvivesRestart(t *test
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	rebuilt, err = EnsureCanonicalState(context.Background(), db, 1, 1, block.Hash())
 	if err != nil || rebuilt {
 		t.Fatalf("restart verification rebuilt=%v err=%v", rebuilt, err)
@@ -112,7 +113,7 @@ func TestEnsureCanonicalStateRebuildsMissingStateWithValidMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	tx := signedAVMTransaction(t, core.AVMDeployContract, [32]byte{}, 0, stateWriteModule(false))
 	block := &core.Block{Header: core.BlockHeader{Height: 3}, Txs: []core.Transaction{tx}}
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
@@ -142,7 +143,7 @@ func TestEnsureCanonicalStateFailsClosedOnMarkerMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	block := &core.Block{Header: core.BlockHeader{Height: 2}}
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
 	raw, _ := json.Marshal(block)
@@ -161,7 +162,7 @@ func TestEnsureCanonicalStateFailsClosedOnStateCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	tx := signedAVMTransaction(t, core.AVMDeployContract, [32]byte{}, 0, stateWriteModule(false))
 	block := &core.Block{Header: core.BlockHeader{Height: 4}, Txs: []core.Transaction{tx}}
 	block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
@@ -189,7 +190,7 @@ func TestEnsureCanonicalStateActivationZeroIsDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	rebuilt, err := EnsureCanonicalState(context.Background(), db, 0, 99, crypto.Hash32{})
 	if err != nil || rebuilt {
 		t.Fatalf("activation zero rebuilt=%v err=%v", rebuilt, err)

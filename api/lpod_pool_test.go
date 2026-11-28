@@ -14,6 +14,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -62,7 +63,7 @@ func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {
 	b := &core.Block{Header: core.BlockHeader{Height: 2, ValidatorPub: pub},
 		Txs: []core.Transaction{{Version: core.TxVersionLPoDPayout}, core.LPoDCheckpointTx(c.Digest())}}
 	b.Header.MerkleRoot = core.MerkleRoot(b.Txs)
-	b.Header.Sign(priv)
+	testutil.NoError(t, b.Header.Sign(priv))
 	path := t.TempDir()
 	db, err := store.Open(path)
 	if err != nil {
@@ -101,7 +102,7 @@ func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	srv.SetStore(db)
 	finalized := false
 	srv.SetLPoDConfig(&store.LPoDMigration{Height: 2, Genesis: genesis, ReconciliationRoot: root},
@@ -151,7 +152,7 @@ func TestLPoDPoolFinalizedFullExitExcludesRetainedPositions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer badDB.Close()
+	defer testutil.CleanupClose(t, badDB)
 	srv.SetStore(badDB)
 	_, invalidBody := restGet(t, srv, "/api/v1/lpod-pool")
 	if invalidBody["state"] != "unavailable" || invalidBody["accrued_liability_napro"] != nil ||

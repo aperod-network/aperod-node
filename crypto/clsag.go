@@ -258,6 +258,7 @@ func clsagHash(domain string, message Hash32, keys []Point32, commitments []Comm
 	h.Write(d[:])
 	if index >= 0 {
 		var b [4]byte
+		// #nosec G115 -- Challenge indices come only from the validated fixed RingSize loop; -1 is handled by the outer guard.
 		binary.LittleEndian.PutUint32(b[:], uint32(index))
 		h.Write(b[:])
 		h.Write(l.Bytes())

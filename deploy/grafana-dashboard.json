@@ -10,10 +10,11 @@
     }
   ],
   "title": "Aperod (APRO) — Обзор ноды",
+  "description": "Доступность процесса/API, синхронизация, mempool и подключение валидатора показаны отдельно. API «работает» не означает, что валидатор производит блоки.",
   "uid": "aperod-node-overview",
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 4,
+  "version": 6,
   "refresh": "15s",
   "time": {
     "from": "now-6h",
@@ -76,7 +77,8 @@
     },
     {
       "id": 2,
-      "title": "Размер мемпула",
+      "title": "Очередь транзакций мемпула",
+      "description": "0 означает, что сейчас нет ожидающих транзакций; это не признак недоступности ноды. Без производителя транзакции не получат подтверждение.",
       "type": "stat",
       "gridPos": {
         "h": 6,
@@ -135,7 +137,7 @@
     },
     {
       "id": 3,
-      "title": "Подключённые ноды",
+      "title": "Подключённые P2P-пиры",
       "type": "stat",
       "gridPos": {
         "h": 6,
@@ -188,13 +190,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "expr": "aperod_peer_count",
-          "legendFormat": "ноды"
+          "legendFormat": "пиры"
         }
       ]
     },
     {
       "id": 4,
-      "title": "Статус ноды",
+      "title": "Валидаторное подключение",
+      "description": "В СЕТИ означает, что режим валидатора включён, локальный ключ активен в реестре и есть P2P-пир. Процесс/API могут работать при статусе НЕ В СЕТИ.",
       "type": "stat",
       "gridPos": {
         "h": 6,
@@ -222,12 +225,12 @@
               "type": "value",
               "options": {
                 "0": {
-                  "text": "ВЫКЛ",
+                  "text": "НЕ В СЕТИ",
                   "color": "red",
                   "index": 0
                 },
                 "1": {
-                  "text": "ВКЛ",
+                  "text": "В СЕТИ",
                   "color": "green",
                   "index": 1
                 }
@@ -259,8 +262,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "aperod_up",
-          "legendFormat": "нода"
+          "expr": "aperod_validator_monitor_online{job=\"aperod-validator-health\"}",
+          "legendFormat": "валидатор"
         }
       ]
     },
@@ -305,7 +308,8 @@
     },
     {
       "id": 6,
-      "title": "Валидаторы: активные / всего",
+      "title": "В реестре: активные / всего",
+      "description": "Это состояние записей валидаторов в блокчейн-реестре, а не подтверждение, что их процессы сейчас онлайн. Текущее подключение показано отдельно выше.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -1499,7 +1503,8 @@
     },
     {
       "id": 70,
-      "title": "API-сервер статус",
+      "title": "Доступность API",
+      "description": "Показывает только ответ API-сервера. Это не статус валидатора и не подтверждение производства блоков.",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -1527,12 +1532,12 @@
               "type": "value",
               "options": {
                 "0": {
-                  "text": "ВЫКЛ",
+                  "text": "API НЕ РАБОТАЕТ",
                   "color": "red",
                   "index": 0
                 },
                 "1": {
-                  "text": "ВКЛ",
+                  "text": "API РАБОТАЕТ",
                   "color": "green",
                   "index": 1
                 }
@@ -1610,6 +1615,209 @@
           },
           "expr": "aperod_api_uptime_seconds",
           "legendFormat": "аптайм"
+        }
+      ]
+    },
+    {
+      "id": 72,
+      "title": "Синхронизация P2P",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 84
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ОТСТАЁТ / НЕТ ПИРОВ",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "СИНХРОНИЗИРОВАН",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_validator_monitor_sync_healthy{job=\"aperod-validator-health\"}",
+          "legendFormat": "синхронизация"
+        }
+      ]
+    },
+    {
+      "id": 73,
+      "title": "Максимальное отставание P2P, блоки",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 84
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_validator_monitor_peer_sync_lag_blocks_max{job=\"aperod-validator-health\"}",
+          "legendFormat": "блоков"
+        }
+      ]
+    },
+    {
+      "id": 74,
+      "title": "Режим валидатора",
+      "description": "SYNC-ONLY сохраняет синхронизацию и доступность read-only API, но не выпускает блоки.",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "SYNC-ONLY",
+                  "color": "yellow",
+                  "index": 0
+                },
+                "1": {
+                  "text": "ВАЛИДАТОР",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "noValue": "НЕТ ДАННЫХ",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "aperod_validator_monitor_validator_mode_enabled{job=\"aperod-validator-health\"}",
+          "legendFormat": "режим"
         }
       ]
     }

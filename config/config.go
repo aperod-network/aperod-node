@@ -2,9 +2,12 @@ package config
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,21 +15,129 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/mainnetbootstrap"
 )
 
 // Network identifies which chain this node is on.
 type Network string
 
+// Network names identify the configured chain environment.
 const (
 	Mainnet Network = "mainnet"
 	Testnet Network = "testnet"
 	Devnet  Network = "devnet"
 )
 
-// MainnetSecurityHardeningActivationHeight is the currently coordinated height
-// for mainnet validator configurations. Change it only after a full staging
-// replay and an explicitly coordinated consensus release.
+// ErrMainnetBootstrapUnavailable marks a permanent startup refusal: this
+// binary has no valid Mainnet bootstrap signed by its pinned operator key.
+// The node process maps it to EX_CONFIG so systemd and the watchdog can avoid
+// retrying an unchanged configuration while preserving ordinary crash recovery.
+var ErrMainnetBootstrapUnavailable = errors.New(
+	"mainnet startup refused: no valid signed operator_1_of_1 Mainnet bootstrap manifest is configured",
+)
+
+// ValidateChainBootstrap prevents a node from inventing a local genesis for
+// mainnet. Genesis creation signs the block with a local validator key and can
+// silently split a clean installation onto a different chain. Mainnet nodes
+// must first receive an existing, independently verified chain bootstrap.
+func ValidateChainBootstrap(network Network, hasExistingChain bool) error {
+	if strings.EqualFold(strings.TrimSpace(string(network)), string(Mainnet)) && !hasExistingChain {
+		return fmt.Errorf(
+			"%w: refusing to create a local mainnet genesis; install a verified canonical chain bootstrap first",
+			ErrMainnetBootstrapUnavailable,
+		)
+	}
+	return nil
+}
+
+// validateMainnetBootstrapRelease binds the operator-signed chain statement to
+// the exact authority, sale, and LPoD migration artifacts installed for this node.
+func validateMainnetBootstrapRelease(
+	network Network,
+	manifestPath, authorityForkPath, authorityForkSHA256 string,
+	saleMigrationPath, lpodWitnessPath string,
+) error {
+	if network != Mainnet {
+		return nil
+	}
+	if manifestPath == "" || authorityForkPath == "" || authorityForkSHA256 == "" ||
+		saleMigrationPath == "" || lpodWitnessPath == "" {
+		return ErrMainnetBootstrapUnavailable
+	}
+	info, err := os.Lstat(manifestPath)
+	if err != nil {
+		return fmt.Errorf("%w: inspect manifest: %v", ErrMainnetBootstrapUnavailable, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: manifest must be a regular, non-symlink file", ErrMainnetBootstrapUnavailable)
+	}
+	// #nosec G304 -- Operator-configured startup manifest; no remote filename input reaches config validation.
+	file, err := os.Open(manifestPath)
+	if err != nil {
+		return fmt.Errorf("%w: open manifest: %v", ErrMainnetBootstrapUnavailable, err)
+	}
+	signed, decodeErr := mainnetbootstrap.ReadStrict(file)
+	closeErr := file.Close()
+	if decodeErr != nil {
+		return fmt.Errorf("%w: decode manifest: %v", ErrMainnetBootstrapUnavailable, decodeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("%w: close manifest: %v", ErrMainnetBootstrapUnavailable, closeErr)
+	}
+	if err := signed.Verify(); err != nil {
+		return fmt.Errorf("%w: %v", ErrMainnetBootstrapUnavailable, err)
+	}
+	if signed.Statement.ValidatorAuthorityForkSHA256 != authorityForkSHA256 {
+		return fmt.Errorf("%w: authority fork pin differs from the signed manifest", ErrMainnetBootstrapUnavailable)
+	}
+	if _, err := mainnetbootstrap.LoadPinnedAuthorityFork(authorityForkPath, authorityForkSHA256); err != nil {
+		return fmt.Errorf("%w: authority fork: %v", ErrMainnetBootstrapUnavailable, err)
+	}
+	saleMigrationSHA256, err := mainnetbootstrap.FileSHA256(saleMigrationPath)
+	if err != nil || saleMigrationSHA256 != signed.Statement.ProtocolSaleMigrationSHA256 {
+		return fmt.Errorf("%w: protocol sale migration file is missing or differs from the signed manifest", ErrMainnetBootstrapUnavailable)
+	}
+	lpodWitnessSHA256, err := mainnetbootstrap.FileSHA256(lpodWitnessPath)
+	if err != nil || lpodWitnessSHA256 != signed.Statement.LPoDMigrationWitnessSHA256 {
+		return fmt.Errorf("%w: LPoD migration witness is missing or differs from the signed manifest", ErrMainnetBootstrapUnavailable)
+	}
+	return nil
+}
+
+// MainnetSecurityHardeningActivationHeight is the height required by this
+// release candidate's validator configuration, not proof of the effective
+// activation height of a deployed Mainnet binary. Change it only after a
+// full staging replay and an explicitly coordinated consensus release.
 const MainnetSecurityHardeningActivationHeight uint64 = 3_800_000
+
+// MainnetFinalityVoteV2ActivationHeight is intentionally unset until a
+// coordinated release establishes the observed history and future boundary.
+// Zero keeps Mainnet on v1, independently of general block hardening.
+// This is not a local configuration switch: all Mainnet nodes must use
+// the same boundary.
+const MainnetFinalityVoteV2ActivationHeight uint64 = 0
+
+// FinalityVoteV2ActivationHeight is the production vote-format boundary,
+// excluding the explicit non-signing rehearsal override.
+func (c *Config) FinalityVoteV2ActivationHeight() uint64 {
+	if c.Network == Mainnet {
+		return MainnetFinalityVoteV2ActivationHeight
+	}
+	return c.Consensus.SecurityHardeningActivationHeight
+}
+
+// AVMCheckpointPath resolves the checkpoint relative to the node's data
+// directory. Both startup and release preflight must use this rule.
+func (c *Config) AVMCheckpointPath() string {
+	path := c.Consensus.AVMCheckpointFile
+	if path == "" {
+		path = "avm-state.checkpoint.json"
+	}
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(c.DataDir, path)
+}
 
 // SnapshotConfig controls snapshot integrity-check behavior.
 type SnapshotConfig struct {
@@ -140,17 +251,18 @@ type PprofConfig struct {
 
 // Config is the top-level node configuration.
 type Config struct {
-	Network     Network           `yaml:"network"`
-	DataDir     string            `yaml:"data_dir"`
-	LogLevel    string            `yaml:"log_level"`
-	P2P         P2PConfig         `yaml:"p2p"`
-	Consensus   ConsensusConfig   `yaml:"consensus"`
-	API         APIConfig         `yaml:"api"`
-	Genesis     GenesisRef        `yaml:"genesis"`
-	Pruning     PruningConfig     `yaml:"pruning"`
-	Snapshot    SnapshotConfig    `yaml:"snapshot"`
-	Pprof       PprofConfig       `yaml:"pprof"`
-	Maintenance MaintenanceConfig `yaml:"maintenance"`
+	Network              Network           `yaml:"network"`
+	MainnetBootstrapFile string            `yaml:"mainnet_bootstrap_file"`
+	DataDir              string            `yaml:"data_dir"`
+	LogLevel             string            `yaml:"log_level"`
+	P2P                  P2PConfig         `yaml:"p2p"`
+	Consensus            ConsensusConfig   `yaml:"consensus"`
+	API                  APIConfig         `yaml:"api"`
+	Genesis              GenesisRef        `yaml:"genesis"`
+	Pruning              PruningConfig     `yaml:"pruning"`
+	Snapshot             SnapshotConfig    `yaml:"snapshot"`
+	Pprof                PprofConfig       `yaml:"pprof"`
+	Maintenance          MaintenanceConfig `yaml:"maintenance"`
 	// MemoryLimitBytes, when positive, is passed to runtime/debug.SetMemoryLimit
 	// at startup if the GOMEMLIMIT environment variable is not already set.
 	// This lets operators running outside of systemd (Docker, bare shell, CI)
@@ -398,6 +510,9 @@ type ConsensusConfig struct {
 	// non-validator staging node may test a candidate height before that value is
 	// coordinated for validators.
 	SecurityHardeningActivationHeight uint64 `yaml:"security_hardening_activation_height"`
+	// RehearsalFinalityV2Height overrides only finality vote encoding for an
+	// isolated, non-signing rehearsal. Zero preserves the existing schedule.
+	RehearsalFinalityV2Height uint64 `yaml:"rehearsal_finality_v2_height"`
 	// AVMActivationHeight is the first block allowed to execute native Wasm
 	// contracts. Zero disables AVM consensus to prevent an uncoordinated fork.
 	AVMActivationHeight uint64 `yaml:"avm_activation_height"`
@@ -408,7 +523,9 @@ type ConsensusConfig struct {
 	// AVM state witnesses. Private keys must not be stored in node.yaml.
 	AVMCheckpointTrustAuthorities []string `yaml:"avm_checkpoint_trust_authorities"`
 	// AVMCheckpointWitnessThreshold is the required number of distinct
-	// signatures on a v2 checkpoint. Quorum checkpoints require at least 2.
+	// signatures on a v2 checkpoint. A threshold of 1 is allowed only when
+	// exactly one trusted authority is configured; larger authority sets
+	// require at least 2 signatures.
 	AVMCheckpointWitnessThreshold int `yaml:"avm_checkpoint_witness_threshold"`
 	// AVMGasBurnActivationHeight is the first block that burns the mandatory
 	// AVM gas fee instead of paying it as a validator tip. Zero disables the
@@ -428,6 +545,10 @@ type ConsensusConfig struct {
 	// LPoDDailyUpgradeHeight activates signed position top-ups and daily 20:00
 	// Moscow payout processing. Zero leaves the historical per-block rules intact.
 	LPoDDailyUpgradeHeight uint64 `yaml:"lpod_daily_upgrade_height"`
+	// LPoDValidatorDailyUpgradeHeight activates deferred validator rewards at
+	// the 20:00 Moscow settlement boundary. It is consensus-critical and must
+	// be coordinated at one future height across all validators; zero disables it.
+	LPoDValidatorDailyUpgradeHeight uint64 `yaml:"lpod_validator_daily_upgrade_height"`
 	// FinalityMigrationFile is a signed, versioned attestation for one exact
 	// historical finality certificate. Empty leaves ordinary quorum checks intact.
 	FinalityMigrationFile string `yaml:"finality_migration_file"`
@@ -458,6 +579,8 @@ type ConsensusConfig struct {
 	RegistryBootstrap *RegistryBootstrapConfig `yaml:"registry_bootstrap"`
 }
 
+// RegistryBootstrapConfig describes operator-attested offline recovery inputs.
+// It is not independent authentication of the historical committee.
 type RegistryBootstrapConfig struct {
 	Trust        string `yaml:"trust"`
 	SnapshotFile string `yaml:"snapshot_file"`
@@ -558,6 +681,7 @@ func DefaultConfig() *Config {
 func Load(path string) (*Config, error) {
 	cfg := DefaultConfig()
 
+	// #nosec G304 -- Explicit local startup configuration path selected by the node operator.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
@@ -690,6 +814,19 @@ func (c *Config) Warnings() []string {
 
 // Validate checks that required fields are present and valid.
 func (c *Config) Validate() error {
+	if c.MempoolEvictIntervalSec > maxMempoolEvictIntervalSec {
+		return fmt.Errorf("mempool_evict_interval_sec exceeds time.Duration range (maximum %d)", maxMempoolEvictIntervalSec)
+	}
+	switch c.Network {
+	case Mainnet, Testnet, Devnet:
+		// Only the exact canonical spellings are supported. In particular,
+		// aliases such as " MAINNET " must not bypass network-specific guards.
+	default:
+		if c.Network == "" {
+			return fmt.Errorf("network must be set")
+		}
+		return fmt.Errorf("unsupported network %q; use mainnet, testnet, or devnet", c.Network)
+	}
 	if anchor := c.Consensus.RegistryBootstrap; anchor != nil {
 		if anchor.KeyImageFile != "" || anchor.KeyImageSHA256 != "" {
 			digest, err := hex.DecodeString(anchor.KeyImageSHA256)
@@ -702,9 +839,6 @@ func (c *Config) Validate() error {
 			anchor.Height == 0 || anchor.SnapshotFile == "" || err != nil || len(digest) != 32 {
 			return fmt.Errorf("registry_bootstrap requires non_validator, trust: operator_attested, snapshot_file, height > 0 and a SHA-256 digest")
 		}
-	}
-	if c.Network == "" {
-		return fmt.Errorf("network must be set")
 	}
 	if c.DataDir == "" {
 		return fmt.Errorf("data_dir must be set")
@@ -722,15 +856,34 @@ func (c *Config) Validate() error {
 	if c.Consensus.LPoDDailyUpgradeHeight > uint64(1<<63-1) {
 		return fmt.Errorf("lpod_daily_upgrade_height exceeds the supported maximum")
 	}
+	if c.Consensus.LPoDValidatorDailyUpgradeHeight > uint64(1<<63-1) {
+		return fmt.Errorf("lpod_validator_daily_upgrade_height exceeds the supported maximum")
+	}
 	if c.Consensus.StopProducingAtHeight > 0 && c.Consensus.NonValidator {
 		return fmt.Errorf("stop_producing_at_height is only valid for validator nodes")
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	securityHardeningActivation := c.Consensus.SecurityHardeningActivationHeight
+	if h := c.Consensus.RehearsalFinalityV2Height; h != 0 {
+		if c.Network != Mainnet || !c.Consensus.NonValidator {
+			return fmt.Errorf("rehearsal_finality_v2_height is only valid for non-signing Mainnet rehearsals")
+		}
+		if c.Consensus.ValidatorKey != "" {
+			return fmt.Errorf("rehearsal_finality_v2_height does not accept a validator_key")
+		}
+		if h > uint64(1<<63-1) || h < securityHardeningActivation {
+			return fmt.Errorf("rehearsal_finality_v2_height must be supported and not precede security_hardening_activation_height")
+		}
+	}
 	ringCTActivation := c.Consensus.RingCTV4ActivationHeight
 	clsagActivation := c.Consensus.RingCTCLSAGActivationHeight
 	amountBindingActivation := c.Consensus.RingCTAmountBindingActivationHeight
 	if c.Network == Mainnet {
+		if !c.Consensus.NonValidator && strings.TrimSpace(c.Consensus.ValidatorKey) == "" {
+			return fmt.Errorf(
+				"mainnet validator requires an explicit consensus.validator_key; refusing to generate a new unregistered key",
+			)
+		}
 		if securityHardeningActivation == 0 {
 			return fmt.Errorf("mainnet security_hardening_activation_height must be explicitly configured")
 		}
@@ -820,6 +973,13 @@ func (c *Config) Validate() error {
 	if c.Consensus.LPoDDailyUpgradeHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
 		return fmt.Errorf("lpod_daily_upgrade_height requires a canonical LPoD migration")
 	}
+	if c.Consensus.LPoDValidatorDailyUpgradeHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
+		return fmt.Errorf("lpod_validator_daily_upgrade_height requires a canonical LPoD migration")
+	}
+	if c.Consensus.LPoDValidatorDailyUpgradeHeight > 0 &&
+		c.Consensus.LPoDDailyUpgradeHeight > c.Consensus.LPoDValidatorDailyUpgradeHeight {
+		return fmt.Errorf("lpod_validator_daily_upgrade_height must not precede lpod_daily_upgrade_height")
+	}
 	if c.Consensus.GenesisVestingActivationHeight > 0 && c.Consensus.LPoDMigrationFile == "" {
 		return fmt.Errorf("genesis_vesting_activation_height requires a canonical LPoD migration")
 	}
@@ -869,11 +1029,14 @@ func (c *Config) Validate() error {
 		if avmActivation == 0 {
 			return fmt.Errorf("avm_checkpoint_trust_authorities requires avm_activation_height")
 		}
-		if c.Consensus.AVMCheckpointWitnessThreshold < 2 ||
-			c.Consensus.AVMCheckpointWitnessThreshold > len(c.Consensus.AVMCheckpointTrustAuthorities) {
+		threshold := c.Consensus.AVMCheckpointWitnessThreshold
+		authorityCount := len(c.Consensus.AVMCheckpointTrustAuthorities)
+		if threshold < 1 ||
+			(threshold == 1 && authorityCount != 1) ||
+			(threshold > 1 && threshold > authorityCount) {
 			return fmt.Errorf(
-				"avm_checkpoint_witness_threshold must be between 2 and the authority count (%d)",
-				len(c.Consensus.AVMCheckpointTrustAuthorities),
+				"avm_checkpoint_witness_threshold must be 1 for one authority or between 2 and the authority count (%d)",
+				authorityCount,
 			)
 		}
 		seen := make(map[string]struct{}, len(c.Consensus.AVMCheckpointTrustAuthorities))
@@ -1103,8 +1266,20 @@ func (c *Config) Validate() error {
 			)
 		}
 	}
+	if err := validateMainnetBootstrapRelease(
+		c.Network,
+		c.MainnetBootstrapFile,
+		c.Consensus.ValidatorAuthorityForkFile,
+		c.Consensus.ValidatorAuthorityForkSHA256,
+		c.Consensus.SaleMigrationFile,
+		c.Consensus.LPoDMigrationFile,
+	); err != nil {
+		return err
+	}
 	return nil
 }
+
+const maxMempoolEvictIntervalSec = uint64(math.MaxInt64) / uint64(time.Second)
 
 // ResolveMempoolEvictInterval converts MempoolEvictIntervalSec into a
 // time.Duration, applying the 5-minute default when the value is zero.
@@ -1112,9 +1287,14 @@ func (c *Config) Validate() error {
 // (YAML leaves the field at its zero value, overriding the DefaultConfig
 // value of 300) or because the operator explicitly wrote
 // mempool_evict_interval_sec: 0 to request the default behavior.
+// It panics on an out-of-range direct argument; Config.Validate rejects such
+// operator configuration before node startup, without reaching this resolver.
 func ResolveMempoolEvictInterval(sec uint64) time.Duration {
 	if sec == 0 {
 		return 5 * time.Minute
+	}
+	if sec > maxMempoolEvictIntervalSec {
+		panic("mempool eviction interval exceeds time.Duration range")
 	}
 	return time.Duration(sec) * time.Second
 }

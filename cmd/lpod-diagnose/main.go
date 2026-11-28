@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -38,8 +39,9 @@ func main() {
 	copiedDB := flag.String("copied-db", "", "path to a separate copied LevelDB database (required)")
 	heightText := flag.String("height", "", "canonical block height to diagnose (required)")
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "lpod-diagnose compares historical block-header hash candidates from an offline database copy.")
-		fmt.Fprintln(flag.CommandLine.Output(), "The supplied database must be a separate cold copy, never the live node database.")
+		if _, err := fmt.Fprintln(flag.CommandLine.Output(), "lpod-diagnose compares historical block-header hash candidates from an offline database copy.\nThe supplied database must be a separate cold copy, never the live node database."); err != nil {
+			slog.Error("write diagnostic usage failed", "err", err)
+		}
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -62,14 +64,22 @@ func main() {
 	}
 }
 
-func diagnose(path string, height uint64) diagnosis {
-	result := diagnosis{Height: height}
+func diagnose(path string, height uint64) (result diagnosis) {
+	result = diagnosis{Height: height}
 	db, err := store.OpenLPoDAuditReadOnly(path)
 	if err != nil {
 		result.Status, result.Error = "error", err.Error()
 		return result
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			result.Status = "error"
+			if result.Error != "" {
+				result.Error += "; "
+			}
+			result.Error += fmt.Sprintf("close offline diagnostic database: %v", err)
+		}
+	}()
 
 	indexHash, found, err := db.GetCanonicalHash(height)
 	if err != nil {
@@ -149,7 +159,7 @@ func historicalHeaderHash(header core.BlockHeader, includeOraclePrice, includeBa
 	encoded.Write(u64[:])
 	encoded.Write(header.PrevHash[:])
 	encoded.Write(header.MerkleRoot[:])
-	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(u64[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	encoded.Write(u64[:])
 	var u32 [4]byte
 	binary.LittleEndian.PutUint32(u32[:], header.Round)

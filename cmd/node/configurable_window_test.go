@@ -15,6 +15,7 @@ import (
 
 	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // ── Chain sliding-window tests ────────────────────────────────────────────────
@@ -46,7 +47,7 @@ func TestChainConfigurableWindowSmall(t *testing.T) {
 	if tip == nil {
 		t.Fatal("chain has no tip")
 	}
-	wantTip := uint64(window + 5)
+	wantTip := window + 5
 	if tip.Header.Height != wantTip {
 		t.Errorf("tip.Height = %d, want %d", tip.Header.Height, wantTip)
 	}
@@ -266,6 +267,6 @@ func buildTestBlocks(t *testing.T, nExtra int) []*core.Block {
 	t.Helper()
 	dir := t.TempDir()
 	db, blocks := buildChainWithGap(t, dir, nExtra, 99999 /* no gap */)
-	db.Close()
+	testutil.Close(t, db)
 	return blocks
 }

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
@@ -54,7 +55,7 @@ type Config struct {
 // New creates a fully initialized (but not yet started) node.
 func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	// ── Storage ───────────────────────────────────────────────────────────────
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	db, err := store.Open(cfg.DataDir + "/chain.db")
@@ -69,6 +70,7 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 		return db.DeleteUTXO(txHash, outIdx)
 	}
 	mempoolCfg := core.DefaultMempoolConfig()
+	mempoolCfg.Network = cfg.Network
 	mempoolCfg.CurrentHeight = chain.Height
 	mempool := core.NewMempool(mempoolCfg)
 
@@ -84,6 +86,9 @@ func New(cfg *Config, log *slog.Logger) (*Node, error) {
 	}
 
 	if tipHash == (crypto.Hash32{}) {
+		if err := config.ValidateChainBootstrap(config.Network(cfg.Network), false); err != nil {
+			return nil, err
+		}
 		// First start: create and persist genesis block.
 		validatorPriv, _, err := crypto.GenerateValidatorKey()
 		if err != nil {
@@ -289,7 +294,9 @@ func (n *Node) Stop() error {
 	n.log.Info("shutting down node...")
 	close(n.stop)
 	n.host.Stop()
-	n.db.Close()
+	if err := n.db.Close(); err != nil {
+		return fmt.Errorf("close node database: %w", err)
+	}
 	n.log.Info("node stopped")
 	return nil
 }
@@ -320,15 +327,6 @@ func (n *Node) broadcastLoop() {
 				broadcastVote(vote)
 			}
 		}
-	}
-}
-
-// persistBlock saves a block to LevelDB (DB-only; UTXO state already updated by engine).
-func (n *Node) persistBlock(block *Block) {
-	if err := persistBlockToDB(n.db, block); err != nil {
-		n.log.Error("persist block failed", "height", block.Header.Height, "err", err)
-	} else {
-		n.log.Debug("block persisted", "height", block.Header.Height, "txs", len(block.Txs))
 	}
 }
 
@@ -598,9 +596,16 @@ func (a *p2pAdapter) GetBlock(hash crypto.Hash32) *core.Block {
 
 // ─── Type aliases for node package ───────────────────────────────────────────
 
+// Block aliases the core block type for node-package users.
 type Block = core.Block
+
+// Transaction aliases the core transaction type for node-package users.
 type Transaction = core.Transaction
+
+// Mempool aliases the core mempool type for node-package users.
 type Mempool = core.Mempool
+
+// Chain aliases the core chain type for node-package users.
 type Chain = core.Chain
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

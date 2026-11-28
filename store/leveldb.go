@@ -5,6 +5,7 @@ package store
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -64,6 +65,23 @@ func OpenReadOnly(path string) (*DB, error) {
 	if err := CheckRingMaintenanceFence(path); err != nil {
 		return nil, err
 	}
+	// LevelDB's storage opener can create a directory or LOCK even when its
+	// database options say read-only. Reject missing/uninitialised targets
+	// before handing the path to it; verification must not create its evidence.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("open leveldb read-only %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("open leveldb read-only %s: database path is not a directory", path)
+	}
+	current, err := os.Stat(filepath.Join(path, "CURRENT"))
+	if err != nil {
+		return nil, fmt.Errorf("open leveldb read-only %s: %w", path, err)
+	}
+	if !current.Mode().IsRegular() {
+		return nil, fmt.Errorf("open leveldb read-only %s: CURRENT is not a regular file", path)
+	}
 	opts := &opt.Options{ReadOnly: true, ErrorIfMissing: true}
 	db, err := leveldb.OpenFile(path, opts)
 	if err != nil {
@@ -75,12 +93,17 @@ func OpenReadOnly(path string) (*DB, error) {
 // ReadTipOnly opens an existing LevelDB in read-only mode and returns its
 // canonical tip without running recovery, compaction, or creating files.
 // Maintenance commands use this to validate their target before any mutation.
-func ReadTipOnly(path string) (crypto.Hash32, uint64, error) {
+func ReadTipOnly(path string) (tipHash crypto.Hash32, tipHeight uint64, retErr error) {
 	wrapped, err := OpenReadOnly(path)
 	if err != nil {
 		return crypto.Hash32{}, 0, err
 	}
-	defer wrapped.Close()
+	defer func() {
+		if err := wrapped.Close(); err != nil {
+			tipHash, tipHeight = crypto.Hash32{}, 0
+			retErr = errors.Join(retErr, fmt.Errorf("close canonical tip database: %w", err))
+		}
+	}()
 
 	hashBytes, err := wrapped.GetMeta("tip/hash")
 	if err != nil {
@@ -245,10 +268,46 @@ func (d *DB) GetBlock(hash crypto.Hash32) (*StoredBlock, error) {
 	if err != nil || data == nil {
 		return nil, err
 	}
+	return decodeStoredBlock(data, hash)
+}
+
+// decodeStoredBlock accepts both the legacy flattened database representation
+// and the canonical core.Block representation used by newer Mainnet nodes.
+// The expected key hash is checked in either format so a mismatched body cannot
+// be silently returned as a valid block.
+func decodeStoredBlock(data []byte, expectedHash crypto.Hash32) (*StoredBlock, error) {
 	var sb StoredBlock
 	if err := json.Unmarshal(data, &sb); err != nil {
 		return nil, fmt.Errorf("unmarshal block: %w", err)
 	}
+	if sb.Hash != (crypto.Hash32{}) {
+		if sb.Hash != expectedHash {
+			return nil, fmt.Errorf("stored block hash does not match its database key")
+		}
+		return &sb, nil
+	}
+
+	var canonical struct {
+		Header *core.BlockHeader `json:"Header"`
+		Txs    []json.RawMessage `json:"Txs"`
+	}
+	if err := json.Unmarshal(data, &canonical); err != nil {
+		return nil, fmt.Errorf("unmarshal canonical block: %w", err)
+	}
+	if canonical.Header == nil {
+		return nil, fmt.Errorf("stored block has neither a flattened hash nor a canonical header")
+	}
+	canonicalHash := canonical.Header.Hash()
+	if canonicalHash != expectedHash {
+		return nil, fmt.Errorf("canonical block header hash does not match its database key")
+	}
+	sb.Height = canonical.Header.Height
+	sb.PrevHash = canonical.Header.PrevHash
+	sb.Hash = canonicalHash
+	sb.Timestamp = canonical.Header.Timestamp
+	sb.Round = canonical.Header.Round
+	sb.TxCount = len(canonical.Txs)
+	sb.TxData = canonical.Txs
 	return &sb, nil
 }
 
@@ -261,7 +320,14 @@ func (d *DB) GetBlockByHeight(height uint64) (*StoredBlock, error) {
 	}
 	var hash crypto.Hash32
 	copy(hash[:], hashBytes)
-	return d.GetBlock(hash)
+	block, err := d.GetBlock(hash)
+	if err != nil || block == nil {
+		return block, err
+	}
+	if block.Height != height {
+		return nil, fmt.Errorf("block at height index %d declares height %d", height, block.Height)
+	}
+	return block, nil
 }
 
 // ─── UTXO storage ─────────────────────────────────────────────────────────────
@@ -292,10 +358,9 @@ func (d *DB) PutUTXO(txHash crypto.Hash32, outIdx uint32, u *StoredUTXO) error {
 	}
 	batch := new(leveldb.Batch)
 	batch.Put(utxoKey(txHash, outIdx), data)
-	if err := d.stageRingSamplingChange(batch, u.OneTimePub, !u.ProtocolLocked); err != nil {
+	if err := d.newRingBatch(batch).putMember(u, data); err != nil {
 		return err
 	}
-	batch.Put(ringMemberKey(u.OneTimePub), data)
 	return d.db.Write(batch, nil)
 }
 
@@ -325,10 +390,9 @@ func (d *DB) DeleteUTXO(txHash crypto.Hash32, outIdx uint32) error {
 	batch.Delete(utxoKey(txHash, outIdx))
 	batch.Delete(spentUTXOKey(txHash, outIdx))
 	if u != nil {
-		if err := d.stageRingSamplingChange(batch, u.OneTimePub, false); err != nil {
+		if err := d.newRingBatch(batch).deleteMember(u.OneTimePub); err != nil {
 			return err
 		}
-		batch.Delete(ringMemberKey(u.OneTimePub))
 	}
 	return d.db.Write(batch, &opt.WriteOptions{Sync: true})
 }
@@ -674,6 +738,8 @@ func (d *DB) BindGuardianFundConfig(height uint64, genesis crypto.Hash32) error 
 	return nil
 }
 
+// AdminMintRecord stores an administrative mint's durable idempotency state.
+// The record alone does not establish canonical transaction inclusion.
 type AdminMintRecord struct {
 	// State is intent, prepared, completed, or failed. Empty is accepted as
 	// completed for records written by versions predating this state
@@ -708,6 +774,7 @@ func (d *DB) StoreAdminMintRecord(idempotencyKey string, record AdminMintRecord)
 	return nil
 }
 
+// LoadAdminMintRecord reads the stored record for an idempotency key.
 func (d *DB) LoadAdminMintRecord(idempotencyKey string) (record AdminMintRecord, found bool, err error) {
 	value, err := d.GetMeta("admin_mint/" + idempotencyKey)
 	if err != nil {
@@ -778,6 +845,9 @@ func (d *DB) LoadStakingPoolRemaining() (napro uint64, found bool, err error) {
 // metadata value so the API server can restore the counter after a restart
 // without scanning all blocks.
 func (d *DB) StoreTxTotal(n int64) error {
+	if n < 0 {
+		return fmt.Errorf("store: tx_total cannot be negative")
+	}
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, uint64(n))
 	return d.PutMeta("tx_total", buf)
@@ -796,7 +866,11 @@ func (d *DB) LoadTxTotal() (int64, error) {
 	if len(v) != 8 {
 		return 0, fmt.Errorf("store: tx_total metadata corrupted (got %d bytes, want 8)", len(v))
 	}
-	return int64(binary.LittleEndian.Uint64(v)), nil
+	value := binary.LittleEndian.Uint64(v)
+	if value > math.MaxInt64 {
+		return 0, fmt.Errorf("store: tx_total metadata exceeds int64")
+	}
+	return int64(value), nil
 }
 
 // PutTip records the current canonical chain tip hash and height.
@@ -806,18 +880,21 @@ func (d *DB) LoadTxTotal() (int64, error) {
 func (d *DB) PutTip(hash crypto.Hash32, height uint64) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	var hb [8]byte
 	binary.LittleEndian.PutUint64(hb[:], height)
 	hashKey := append(append([]byte{}, prefixMeta...), []byte("tip/hash")...)
 	heightKey2 := append(append([]byte{}, prefixMeta...), []byte("tip/height")...)
 	batch := new(leveldb.Batch)
-	if err := d.restoreSale(batch, hash, height); err != nil {
+	ring := d.newRingBatch(batch)
+	if err := d.restoreSale(batch, ring, hash, height); err != nil {
 		return err
 	}
 	if err := d.restoreLPoDPool(batch, hash, height); err != nil {
 		return err
 	}
-	if err := d.rollbackLPoDIndices(batch, hash, height); err != nil {
+	if err := d.rollbackLPoDIndices(batch, ring, hash, height); err != nil {
 		return err
 	}
 	batch.Put(hashKey, hash[:])
@@ -905,6 +982,8 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 	writeSetCommitment crypto.Hash32, saleSettlement *SaleSettlement, lpodSettlement []*LPoDSettlement) error {
 	d.canonicalMu.Lock()
 	defer d.canonicalMu.Unlock()
+	d.ringMu.Lock()
+	defer d.ringMu.Unlock()
 	if err := d.validateLPoDBlock(data, hash, height, lpodSettlement); err != nil {
 		return err
 	}
@@ -918,7 +997,8 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 	if err != nil {
 		return err
 	}
-	if err := d.appendSaleSettlement(batch, data, hash, height, saleSettlement); err != nil {
+	ring := d.newRingBatch(batch)
+	if err := d.appendSaleSettlement(batch, ring, data, hash, height, saleSettlement); err != nil {
 		return err
 	}
 	// Reserve and carries share the same fsynced batch as the canonical tip.
@@ -931,7 +1011,7 @@ func (d *DB) commitRawBlock(hash crypto.Hash32, height uint64, data []byte, writ
 		if err := json.Unmarshal(data, &block); err != nil {
 			return err
 		}
-		if err := appendLPoDIndices(batch, &block, false); err != nil {
+		if err := appendLPoDIndices(batch, ring, &block, false); err != nil {
 			return err
 		}
 		if err := d.appendLPoDWalletIndex(batch, &block, lpodSettlement[0]); err != nil {
@@ -1141,6 +1221,9 @@ func (d *DB) LoadTxIdxCompleteHeight() (h uint64, found bool, err error) {
 // the observed save time already approaches the configured TimeoutStopSec —
 // before waiting for the next shutdown to discover the problem.
 func (d *DB) StoreSnapshotSaveDuration(ms int64) error {
+	if ms < 0 {
+		return fmt.Errorf("store: snapshot save duration cannot be negative")
+	}
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, uint64(ms))
 	return d.PutMeta("last_snap_save_ms", buf)
@@ -1160,7 +1243,11 @@ func (d *DB) LoadSnapshotSaveDuration() (ms int64, found bool, err error) {
 	if len(v) != 8 {
 		return 0, false, fmt.Errorf("store: last_snap_save_ms metadata corrupted (%d bytes, want 8)", len(v))
 	}
-	return int64(binary.LittleEndian.Uint64(v)), true, nil
+	value := binary.LittleEndian.Uint64(v)
+	if value > math.MaxInt64 {
+		return 0, false, fmt.Errorf("store: snapshot save duration metadata exceeds int64")
+	}
+	return int64(value), true, nil
 }
 
 // StoreSnapshotTimeoutSec persists the effective systemd TimeoutStopSec (in
@@ -1203,6 +1290,9 @@ func (d *DB) LoadSnapshotTimeoutSec() (sec float64, found bool, err error) {
 // active UTXO count against an authoritative count recorded at save time.
 func (d *DB) StoreActiveUTXOCount(tipHashHex string, n int) error {
 	buf := make([]byte, 8)
+	if n < 0 {
+		return fmt.Errorf("store: active UTXO count cannot be negative")
+	}
 	binary.LittleEndian.PutUint64(buf, uint64(n))
 	return d.PutMeta("active_utxo_count/"+tipHashHex, buf)
 }
@@ -1223,7 +1313,11 @@ func (d *DB) LoadActiveUTXOCount(tipHashHex string) (n int, ok bool, err error) 
 	if len(v) != 8 {
 		return 0, false, fmt.Errorf("store: active_utxo_count metadata corrupted (got %d bytes, want 8)", len(v))
 	}
-	return int(binary.LittleEndian.Uint64(v)), true, nil
+	value := binary.LittleEndian.Uint64(v)
+	if value > math.MaxInt {
+		return 0, false, fmt.Errorf("store: active UTXO count metadata exceeds int")
+	}
+	return int(value), true, nil
 }
 
 // IterUTXOs calls fn for every UTXO in the database (for scanning).
@@ -1273,6 +1367,9 @@ type TxIdxEntry struct {
 // transaction hash.  Called by storeBlock so that FastForwardWithIndex can
 // restore the in-memory tx index at startup without recomputing tx.Hash().
 func (d *DB) PutTxIdx(txHash crypto.Hash32, height uint64, txIdx int) error {
+	if txIdx < 0 || uint64(txIdx) > math.MaxUint32 {
+		return fmt.Errorf("store: transaction index exceeds uint32")
+	}
 	val := make([]byte, 12)
 	binary.BigEndian.PutUint64(val[:8], height)
 	binary.BigEndian.PutUint32(val[8:], uint32(txIdx))
@@ -1393,7 +1490,8 @@ func (d *DB) RepairAllHeightIndex(tipHeight uint64, progress func(scanned, total
 		hash      crypto.Hash32
 		ambiguous bool
 	}
-	byHeight := make(map[uint64]bEntry, int(tipHeight)+1)
+	// Allocate from retained entries, not a possibly sparse or corrupt tip height.
+	byHeight := make(map[uint64]bEntry)
 	iter := d.db.NewIterator(util.BytesPrefix(prefixBlock), nil)
 	for iter.Next() {
 		key := iter.Key()
@@ -1519,7 +1617,7 @@ func (d *DB) CheckAllHeightIndex(tipHeight, fromHeight uint64) (broken uint64, f
 		hash  crypto.Hash32
 		found bool // false = absent / zeroed
 	}
-	entries := make(map[uint64]heightEntry, int(tipHeight-fromHeight)+1)
+	entries := make(map[uint64]heightEntry)
 	startKey := heightKey(fromHeight)
 	endKey := heightKey(tipHeight + 1) // exclusive upper bound
 	iter := d.db.NewIterator(&util.Range{Start: startKey, Limit: endKey}, nil)

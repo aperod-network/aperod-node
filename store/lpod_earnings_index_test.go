@@ -15,12 +15,13 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 )
 
 func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 	db, path, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	parent, _, err := db.GetTip()
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen already-funded v3 database: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	if err := db.BackfillLPoDEarningsIndex(migration); err != nil {
 		t.Fatalf("backfill an already-funded v3 database: %v", err)
 	}
@@ -177,6 +178,184 @@ func TestLPoDEarningsIndexFundingRollbackReplayAndPagination(t *testing.T) {
 	}
 }
 
+func TestLPoDDailyValidatorPayoutBackfillIndexesOnlyCanonicalBoundaryOutput(t *testing.T) {
+	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
+	defer testutil.CleanupClose(t, db)
+	secondPriv, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdPriv, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	walletB, err := crypto.GenerateWalletKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addressB := crypto.AddressFromKeys(crypto.MainnetByte, walletB)
+	stake := map[string]LPoDValidatorStake{
+		priv.Public().Hex():       {Amount: 100_000 * lpod.Unit, Active: true},
+		secondPriv.Public().Hex(): {Amount: 100_000 * lpod.Unit, Active: true},
+		thirdPriv.Public().Hex():  {Amount: 100_000 * lpod.Unit, Active: true},
+	}
+
+	appendBlock := func(timestamp int64, dailyActivationHeight uint64, signer crypto.ValidatorPrivKey, leader crypto.Address) *core.Block {
+		t.Helper()
+		parentHash, parentHeight, err := db.GetTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent, err := db.readLPoDCanonicalBlock(parentHeight)
+		if err != nil {
+			t.Fatal(err)
+		}
+		validator := signer.Public().Hex()
+		r := &LPoDSettlement{
+			Parent: parentHash, PositionProtocol: true,
+			DailyPayout: true, DailyValidatorPayout: true,
+			ValidatorDailyPayoutActivationHeight: dailyActivationHeight,
+			Timestamp:                            timestamp, Proposer: validator, Leader: leader,
+			PreviousStake: stake, Stake: stake,
+			AuditPreviousStake: stake, AuditStake: stake,
+		}
+		if parentHeight+1 == migration.Height {
+			r.Migration = migration
+		}
+		registryBefore := testLPoDRegistrySnapshot(t, stake)
+		registryAfter := testLPoDRegistrySnapshot(t, stake)
+		r.RegistryBefore, r.RegistryAfter = &registryBefore, &registryAfter
+		checkpoint, payments, err := db.PreviewLPoD(parentHeight+1, r)
+		if err != nil {
+			t.Fatalf("preview daily block at height %d: %v", parentHeight+1, err)
+		}
+		payout, err := db.PayoutLPoD(parentHeight+1, r, checkpoint, payments)
+		if err != nil {
+			t.Fatalf("build daily payout at height %d: %v", parentHeight+1, err)
+		}
+		block := &core.Block{
+			Header: core.BlockHeader{
+				Height: parentHeight + 1, Round: parent.Header.Round + 1,
+				PrevHash: parentHash, Timestamp: timestamp, ValidatorPub: signer.Public(),
+			},
+			Txs: []core.Transaction{payout, core.LPoDCheckpointTx(checkpoint.Digest())},
+		}
+		block.Header.MerkleRoot = core.MerkleRoot(block.Txs)
+		if err := block.Header.Sign(signer); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.CommitRawBlockWithAVM(
+			block.Hash(), block.Header.Height, raw, nil, crypto.Hash32{}, r,
+		); err != nil {
+			t.Fatalf("commit daily block %d: %v", block.Header.Height, err)
+		}
+		return block
+	}
+
+	_, parentHeight, err := db.GetTip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := db.readLPoDCanonicalBlock(parentHeight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationTimestamp := parent.Header.Timestamp + 3_000_000_000
+	activationHeight := parentHeight + 1
+	appendBlock(activationTimestamp, activationHeight, priv, address)
+	activated, err := db.LoadLPoDCheckpoint()
+	if err != nil || activated == nil || activated.State.PendingLeader == 0 {
+		t.Fatalf("daily activation did not defer leader reward: checkpoint=%+v err=%v", activated, err)
+	}
+	boundary, err := LPoDNextDailyBoundaryAfter24h(activationTimestamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendBlock(boundary-2_000_000_000, 0, secondPriv, addressB)
+	appendBlock(boundary-1_000_000_000, 0, thirdPriv, address)
+	beforeBoundary, err := db.LoadLPoDCheckpoint()
+	if err != nil || beforeBoundary == nil || len(beforeBoundary.PendingValidatorPayouts) != 3 {
+		t.Fatalf("multiple validators did not accrue before the boundary: checkpoint=%+v err=%v", beforeBoundary, err)
+	}
+	if rows, _, err := db.LPoDEarningsOutputs(address, "", 128); err != nil || len(rows) != 0 {
+		t.Fatalf("deferred shared-owner reward appeared before payout boundary: rows=%d err=%v", len(rows), err)
+	}
+	boundaryBlock := appendBlock(boundary, 0, priv, address)
+	paid, err := db.LoadLPoDCheckpoint()
+	if err != nil || paid == nil || paid.State.PendingLeader != 0 {
+		t.Fatalf("daily boundary did not release validator reward: checkpoint=%+v err=%v", paid, err)
+	}
+	currentReward := paid.State.LeaderPaid - beforeBoundary.State.LeaderPaid - beforeBoundary.State.PendingLeader
+	wantByAddress := map[crypto.Address]uint64{}
+	for _, payout := range beforeBoundary.PendingValidatorPayouts {
+		wantByAddress[payout.Address] += payout.AmountNAPRO
+	}
+	wantByAddress[address] += currentReward
+	boundaryTxHash := boundaryBlock.Txs[0].Hash()
+	outputsA, _, err := db.LPoDEarningsOutputs(address, "", 128)
+	outputsB, _, errB := db.LPoDEarningsOutputs(addressB, "", 128)
+	if err != nil || errB != nil || len(outputsA) != 1 || len(outputsB) != 1 ||
+		outputsA[0].TxHash != boundaryTxHash || outputsB[0].TxHash != boundaryTxHash ||
+		outputsA[0].AmountNAPRO != wantByAddress[address] ||
+		outputsB[0].AmountNAPRO != wantByAddress[addressB] {
+		t.Fatalf("canonical multi-validator earnings index mismatch: A=%+v B=%+v want=%v err=%v/%v",
+			outputsA, outputsB, wantByAddress, err, errB)
+	}
+
+	if err := db.db.Delete(lpodEarningsReadyKey, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.clearLPoDEarningsRows(); err != nil {
+		t.Fatal(err)
+	}
+	for _, recipient := range []crypto.Address{address, addressB} {
+		rows, _, err := db.LPoDWalletOutputs(recipient, "", 128)
+		if err != nil || len(rows) != 1 || rows[0].TxHash != boundaryTxHash {
+			t.Fatalf("incremental wallet index mismatch for %s: rows=%+v err=%v", recipient, rows, err)
+		}
+		row := rows[0]
+		key := lpodWalletPrefix(recipient)
+		var suffix [12]byte
+		binary.BigEndian.PutUint64(suffix[:8], row.BlockHeight)
+		binary.BigEndian.PutUint32(suffix[8:], row.OutputIndex)
+		key = append(key, suffix[:]...)
+		blockHash := boundaryBlock.Hash()
+		key = append(key, blockHash[:]...)
+		key = append(key, row.TxHash[:]...)
+		if err := db.db.Delete(key, nil); err != nil {
+			t.Fatalf("remove wallet index fixture for %s: %v", recipient, err)
+		}
+	}
+	if err := db.db.Delete(lpodWalletBackfillReadyKey, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.BackfillLPoDWalletIndex(migration); err != nil {
+		t.Fatalf("backfill multi-validator wallet outputs: %v", err)
+	}
+	for _, recipient := range []crypto.Address{address, addressB} {
+		rows, _, err := db.LPoDWalletOutputs(recipient, "", 128)
+		if err != nil || len(rows) != 1 || rows[0].TxHash != boundaryTxHash {
+			t.Fatalf("rebuilt multi-validator wallet index mismatch for %s: rows=%+v err=%v", recipient, rows, err)
+		}
+	}
+	if err := db.BackfillLPoDEarningsIndex(migration); err != nil {
+		t.Fatalf("backfill daily validator payout history: %v", err)
+	}
+	rebuiltA, _, err := db.LPoDEarningsOutputs(address, "", 128)
+	rebuiltB, _, errB := db.LPoDEarningsOutputs(addressB, "", 128)
+	if err != nil || errB != nil || len(rebuiltA) != 1 || len(rebuiltB) != 1 ||
+		rebuiltA[0].TxHash != boundaryTxHash || rebuiltB[0].TxHash != boundaryTxHash ||
+		rebuiltA[0].AmountNAPRO != wantByAddress[address] ||
+		rebuiltB[0].AmountNAPRO != wantByAddress[addressB] {
+		t.Fatalf("rebuilt multi-validator earnings index mismatch: A=%+v B=%+v want=%v err=%v/%v",
+			rebuiltA, rebuiltB, wantByAddress, err, errB)
+	}
+}
+
 func TestLPoDPureRewardClassificationFailsClosedForMixedOutputs(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -238,7 +417,7 @@ func TestLPoDRegistryEvidenceReplaysWithdrawalButNotDepositTopUp(t *testing.T) {
 
 func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	db, path, migration, priv, _ := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	addressKeys, err := crypto.GenerateWalletKeys()
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +554,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after audit persistence: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	restartedAudit, err := db.LoadLPoDAuditAt(mixedBlock.Hash())
 	if err != nil || restartedAudit == nil || !reflect.DeepEqual(restartedAudit, mixedAudit) {
 		t.Fatalf("audit did not survive restart: audit=%+v err=%v", restartedAudit, err)
@@ -401,7 +580,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after orphan rollback: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	rolledStart, found, err = db.LoadLPoDAuditStart()
 	if err != nil || !found || !reflect.DeepEqual(rolledStart, start) {
 		t.Fatalf("orphan rollback baseline did not survive restart: start=%+v found=%t err=%v", rolledStart, found, err)
@@ -439,7 +618,7 @@ func TestLPoDEarningsMixedPayoutBackfillRollbackAndReplay(t *testing.T) {
 
 func TestLPoDAuditMissingRegistrySnapshotsIsUnavailable(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	block, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(block.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -463,7 +642,7 @@ func TestLPoDAuditMissingRegistrySnapshotsIsUnavailable(t *testing.T) {
 
 func TestLPoDAuditStartOrphanRecoveryRestartsAtCurrentRecord(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -518,7 +697,7 @@ func TestLPoDAuditStartOrphanRecoveryRestartsAtCurrentRecord(t *testing.T) {
 
 func TestLPoDAuditStartRecoveryDoesNotScanFundingGap(t *testing.T) {
 	db, _, _, _, _ := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	const highBlockHeight = uint64(1) << 60
 	orphan := LPoDAuditStart{
 		Height: highBlockHeight, Hash: crypto.HashBytes([]byte("stale marker")),
@@ -552,7 +731,7 @@ func TestLPoDAuditStartRecoveryDoesNotScanFundingGap(t *testing.T) {
 
 func TestLPoDAuditPersistenceFailureLeavesCoverageIncomplete(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -588,7 +767,7 @@ func TestLPoDAuditPersistenceFailureLeavesCoverageIncomplete(t *testing.T) {
 
 func TestLPoDEarningsBackfillRejectsStaleTipHeightIndex(t *testing.T) {
 	db, _, migration, priv, address := trustedLPoDV3FundingFixture(t)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	funding, settlement, raw := lpodActivationBlock(t, db, migration, priv, address)
 	if err := db.CommitRawBlockWithAVM(funding.Hash(), migration.Height, raw, nil, crypto.Hash32{}, settlement); err != nil {
 		t.Fatalf("commit funding block: %v", err)
@@ -699,8 +878,24 @@ func TestLPoDWalletIndexBackfillsMissingNativeOutputs(t *testing.T) {
 		t.Fatalf("wallet index remained ready after its backfill marker was removed: ready=%t err=%v", ready, err)
 	}
 
-	if err := db.BackfillLPoDWalletIndex(migration); err != nil {
+	var reported []uint64
+	if err := db.BackfillLPoDWalletIndexWithProgress(migration, func(through, targetHeight uint64) {
+		reported = append(reported, through)
+		raw, readErr := db.get(lpodWalletBackfillProgressKey)
+		var progress lpodWalletBackfillProgress
+		if readErr != nil || json.Unmarshal(raw, &progress) != nil ||
+			progress.NextHeight != through+1 || progress.TargetHeight != targetHeight ||
+			targetHeight != LPoDV2ActivationHeight {
+			t.Fatalf("reported a height that was not persisted: through=%d target=%d progress=%+v err=%v", through, targetHeight, progress, readErr)
+		}
+		if ready, err := db.LPoDWalletIndexReady(funding); err != nil || ready {
+			t.Fatalf("progress announced readiness before the final commit: ready=%t err=%v", ready, err)
+		}
+	}); err != nil {
 		t.Fatalf("backfill native payout outputs from canonical blocks: %v", err)
+	}
+	if len(reported) != 2 || reported[0] != LPoDV2ActivationHeight-1 || reported[1] != LPoDV2ActivationHeight {
+		t.Fatalf("expected starting position and last committed height, got %v", reported)
 	}
 	if ready, err := db.LPoDWalletIndexReady(funding); err != nil || !ready {
 		t.Fatalf("wallet index not ready after replay: ready=%t err=%v", ready, err)

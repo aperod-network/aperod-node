@@ -6,7 +6,7 @@ import "sort"
 //
 // Source: https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt
 // SHA-256 (UTF-8 source file, including its trailing newline):
-// 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda
+// 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda.
 var bip39WordList = canonicalBIP39EnglishWordList()
 
 // bip39WordListBase is completed below with words omitted by the vulnerable,

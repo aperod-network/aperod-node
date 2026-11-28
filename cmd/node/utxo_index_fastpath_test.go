@@ -24,6 +24,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -53,7 +54,7 @@ func buildChainFP(t *testing.T, dir string, nBlocks int) (*store.DB, []*core.Blo
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	putBlk := func(b *core.Block) {
 		raw, err := json.Marshal(b)
@@ -200,7 +201,7 @@ func TestUTXOFromIndex_ActiveCountFromIterator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	// Write 5 UTXOs; mark 2 spent; expect 3 active.
 	hashes := make([]crypto.Hash32, 5)

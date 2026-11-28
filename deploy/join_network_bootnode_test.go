@@ -19,6 +19,7 @@
 package deploy_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/config"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // TestJoinNetworkBootnode shells out to test-join-network-bootnode.sh and
@@ -186,13 +188,18 @@ genesis:
 				t.Fatalf("create temp file: %v", err)
 			}
 			cfgPath := f.Name()
-			defer os.Remove(cfgPath)
-			defer os.Remove(cfgPath + ".tmp")
+			defer func(paths ...string) {
+				for _, path := range paths {
+					if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("remove temporary bootnode fixture: %v", err)
+					}
+				}
+			}(cfgPath+".tmp", cfgPath)
 
 			if _, err := f.WriteString(strings.TrimSpace(tc.yaml) + "\n"); err != nil {
 				t.Fatalf("write yaml: %v", err)
 			}
-			f.Close()
+			testutil.Close(t, f)
 
 			// Run the Python injection (mirrors join-network.sh step 5/7).
 			runPythonInject(t, cfgPath, bootnode)
@@ -340,7 +347,7 @@ python3 -m pip "$@"`,
 		t.Fatalf("create temp config: %v", err)
 	}
 	cfgPath := cfgFile.Name()
-	t.Cleanup(func() { os.Remove(cfgPath) })
+	t.Cleanup(func() { testutil.NoError(t, os.Remove(cfgPath)) })
 
 	// nestedYAML matches the config produced by install-validator.sh.
 	nestedYAML := strings.TrimSpace(`
@@ -352,6 +359,7 @@ p2p:
   bootnodes: []
   max_peers: 50
 consensus:
+  non_validator: true
   validator_key: /etc/aperod/validator.key
   reward_address: aproecTest
 api:
@@ -363,10 +371,25 @@ genesis:
 	if _, err := cfgFile.WriteString(nestedYAML); err != nil {
 		t.Fatalf("write config yaml: %v", err)
 	}
-	cfgFile.Close()
+	testutil.Close(t, cfgFile)
 
 	dataDir := t.TempDir()
 	dropinDir := t.TempDir()
+	preservedChain := filepath.Join(dataDir, "chain.db")
+	if err := os.MkdirAll(preservedChain, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(preservedChain, "CURRENT"), []byte("existing-chain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	preservedSnapshot := filepath.Join(dataDir, "snapshot-v2-7.json.gz")
+	if err := os.WriteFile(preservedSnapshot, []byte("existing-snapshot"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	preservedIdentity := filepath.Join(dataDir, "p2p_identity.key")
+	if err := os.WriteFile(preservedIdentity, []byte("existing-identity"), 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	// ── Build the command environment ────────────────────────────────────────
 	// Inherit the full process environment so Python site-packages (pyyaml),
@@ -410,6 +433,19 @@ genesis:
 			nonDefaultPort, runErr, out)
 	}
 	t.Logf("aperod-join.sh output:\n%s", out)
+	for path, want := range map[string]string{
+		filepath.Join(preservedChain, "CURRENT"): "existing-chain",
+		preservedSnapshot:                        "existing-snapshot",
+		preservedIdentity:                        "existing-identity",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("--no-chaindb removed existing node data %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Errorf("--no-chaindb changed %s: got %q, want %q", path, got, want)
+		}
+	}
 
 	// ── Load the written config and assert the bootnode port ─────────────────
 	cfg, err := config.Load(cfgPath)
@@ -420,6 +456,9 @@ genesis:
 	if len(cfg.P2P.Bootnodes) != 1 {
 		t.Fatalf("cfg.P2P.Bootnodes length = %d, want 1; got: %v",
 			len(cfg.P2P.Bootnodes), cfg.P2P.Bootnodes)
+	}
+	if !cfg.Consensus.NonValidator {
+		t.Fatal("join script removed the non_validator safe-mode guard before canonical identity verification")
 	}
 	got := cfg.P2P.Bootnodes[0]
 

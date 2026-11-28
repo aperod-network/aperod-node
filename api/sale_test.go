@@ -6,6 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/sale"
+	"github.com/aperod/aperod/store"
 )
 
 func TestSaleReadinessIsPrivateAndClosed(t *testing.T) {
@@ -61,6 +65,53 @@ func TestSaleEndpointsFailClosedBeforeConfiguration(t *testing.T) {
 		if !strings.Contains(w.Body.String(), "AUTHORIZED_APRO_SETTLEMENT_UNAVAILABLE") {
 			t.Fatal("silent fallback")
 		}
+	}
+}
+
+func TestSaleReadinessDistinguishesCheckpointAuthorityMismatch(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close sale readiness test database: %v", err)
+		}
+	})
+	localKey, _, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, checkpointPub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := crypto.NewLockedValidatorKey(localKey.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(locked.Destroy)
+
+	s := &Server{blockStore: db}
+	s.SetValidatorKey(locked)
+	s.SetSaleConfig(&store.SaleMigration{
+		Checkpoint: sale.Checkpoint{SaleAuthority: checkpointPub},
+	}, func() bool { return false }, func(uint64, crypto.Hash32) bool { return true })
+
+	w := httptest.NewRecorder()
+	s.restSaleReadiness(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/protocol-sales/readiness", nil))
+	var result map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || result["code"] != "SALE_AUTHORITY_MISMATCH" || result["ready"] != false {
+		t.Fatalf("unexpected readiness response: status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	reserve := httptest.NewRecorder()
+	s.restSaleReserve(reserve, httptest.NewRequest(http.MethodPost, "/api/v1/admin/protocol-sales/reserve", strings.NewReader("{}")))
+	if reserve.Code != http.StatusServiceUnavailable || !strings.Contains(reserve.Body.String(), "AUTHORIZED_APRO_SETTLEMENT_UNAVAILABLE") {
+		t.Fatalf("authority mismatch must keep reservation closed: status=%d body=%s", reserve.Code, reserve.Body.String())
 	}
 }
 

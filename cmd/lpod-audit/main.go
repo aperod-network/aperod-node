@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -16,9 +17,9 @@ func main() {
 	copiedDB := flag.String("copied-db", "", "path to a separate copied LevelDB database (required)")
 	through := flag.String("through-height", "", "inclusive height to scan from genesis (required)")
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "lpod-audit performs offline read-only structural body coverage checks.")
-		fmt.Fprintln(flag.CommandLine.Output(), "It does not authenticate signatures, proofs, or full-body integrity.")
-		fmt.Fprintln(flag.CommandLine.Output(), "Those require an independently attested LPoDBodyRootStep plus exact issuance openings.")
+		if _, err := fmt.Fprintln(flag.CommandLine.Output(), "lpod-audit performs offline read-only structural body coverage checks.\nIt does not authenticate signatures, proofs, or full-body integrity.\nThose require an independently attested LPoDBodyRootStep plus exact issuance openings."); err != nil {
+			slog.Error("write audit usage failed", "err", err)
+		}
 		flag.PrintDefaults()
 	}
 	flag.Parse()

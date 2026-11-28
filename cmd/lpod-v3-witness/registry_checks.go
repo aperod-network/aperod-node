@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -21,12 +22,13 @@ type anchoredRegistry struct {
 	Registry core.RegistrySnapshot `json:"registry"`
 }
 
-func readAnchoredRegistry(path string) (*anchoredRegistry, error) {
+func readAnchoredRegistry(path string) (_ *anchoredRegistry, readCloseErr error) {
+	// #nosec G304 -- Operator-selected offline registry evidence, authenticated by separate anchor checks.
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open validator-set snapshot: %w", err)
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	info, err := file.Stat()
 	if err != nil || info.Size() < 0 || info.Size() > 4<<20 {
 		return nil, fmt.Errorf("validator-set snapshot must be at most 4 MiB")
@@ -179,7 +181,7 @@ func legacyGenesisID(header *core.BlockHeader) crypto.Hash32 {
 	var height, timestamp [8]byte
 	var round [4]byte
 	binary.LittleEndian.PutUint64(height[:], header.Height)
-	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp))
+	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
 	binary.LittleEndian.PutUint32(round[:], header.Round)
 	return crypto.HashBytes(height[:], header.PrevHash[:], header.MerkleRoot[:],
 		timestamp[:], round[:], header.ValidatorPub)

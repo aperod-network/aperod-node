@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestDailyJobTamperingRejectedAcrossRestart(t *testing.T) {
 	db, original, _, _ := makeDailyAuditBenchmarkFixture(t, 70, 1, 128, 4, 0, 8)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	enqueueDailyTest(t, original)
 	original.runDailyJobBatch(context.Background())
 	trusted, err := db.GetMeta(dailyJobKey)
@@ -61,7 +63,7 @@ func TestDailyJobTamperingRejectedAcrossRestart(t *testing.T) {
 				j.Progress.HaveDigest = false
 			case "result":
 				var result map[string]interface{}
-				json.Unmarshal(j.Result, &result)
+				testutil.NoError(t, json.Unmarshal(j.Result, &result))
 				result["status"] = "complete"
 				j.Result, _ = json.Marshal(result)
 			case "date":
@@ -120,7 +122,7 @@ func TestDailyJobTamperingRejectedAcrossRestart(t *testing.T) {
 // such states before signing.
 func TestDailyJobAuthenticatedStateConsistency(t *testing.T) {
 	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, 70, 0, 0, 1, 0, 2)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	enqueueDailyTest(t, s)
 	s.runDailyJobBatch(context.Background())
 	partial, err := s.loadDailyJob()
@@ -150,7 +152,7 @@ func TestDailyJobAuthenticatedStateConsistency(t *testing.T) {
 			if mutation == "missing registry" || mutation == "missing digest flag" || mutation == "impossible cursor" {
 				source = partialBytes
 			}
-			json.Unmarshal(source, &j)
+			testutil.NoError(t, json.Unmarshal(source, &j))
 			switch mutation {
 			case "queued complete result":
 				j.State = "queued"
@@ -166,7 +168,7 @@ func TestDailyJobAuthenticatedStateConsistency(t *testing.T) {
 				j.Progress.Next = j.Progress.AnchorHeight
 			default:
 				var result map[string]interface{}
-				json.Unmarshal(j.Result, &result)
+				testutil.NoError(t, json.Unmarshal(j.Result, &result))
 				switch mutation {
 				case "complete incomplete result":
 					result["status"] = "incomplete"
@@ -198,7 +200,7 @@ func TestDailyJobAuthenticatedStateConsistency(t *testing.T) {
 
 func TestDailyJobResetUnreadableAndWrongKeyState(t *testing.T) {
 	db, s, _, _ := makeDailyAuditBenchmarkFixture(t, 2, 0, 0, 1, 0, 0)
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	enqueueDailyTest(t, s)
 	trusted, _ := db.GetMeta(dailyJobKey)
 	for _, test := range []struct {

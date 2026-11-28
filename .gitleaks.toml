@@ -1,0 +1,28 @@
+title = 'Aperod signed Mainnet checkpoint scan'
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = 'generic-api-key'
+
+[[rules.allowlists]]
+description = 'Exact public AVM state-key false positives in the signed checkpoint; unrelated findings remain blocked'
+condition = 'AND'
+paths = ['''(^|/)deploy/mainnet-avm-checkpoint-(4076315|4105317)[.]json$''']
+regexTarget = 'secret'
+regexes = [
+  '''^[Z][K][s][E][Z][o][y][t][s][H][o][f][P][4][i][j][6][w][C][m][B][e][Z][G][r][n][/][c][P][N][+][3][b][d][1][D][I][8][r][T][s][F][k][v][a][2][V][5]$''',
+  '''^[d][1][e][Z][/][k][b][8][d][e][b][k][v][J][c][Q][N][j][y][2][Y][J][g][F][5][G][G][t][3][M][F][X][8][q][z][P][O][c][/][p][m][0][Y][v][a][2][V][5]$''',
+  '''^[t][i][i][h][R][0][U][F][y][c][V][5][/][0][1][i][y][T][f][G][Y][S][O][o][O][0][M][U][l][s][o][z][S][G][9][Q][5][G][M][L][M][v][U][v][a][2][V][5]$''',
+  '''^[1][I][N][U][E][3][W][N][b][R][s][J][Q][2][3][P][k][w][C][M][2][4][O][O][p][R][f][+][O][D][z][J][H][S][9][4][m][a][h][v][5][n][E][v][a][2][V][5]$''',
+]
+
+[[rules.allowlists]]
+description = 'Exact public key-image archive SHA-256 in the signed bootstrap statement'
+condition = 'AND'
+paths = ['''(^|/)deploy/mainnet-bootstrap-4105317[.]json$''']
+regexTarget = 'secret'
+regexes = [
+  '''^[9][4][6][f][9][a][d][d][b][d][a][2][6][4][4][a][3][e][e][2][0][0][b][9][a][9][f][3][4][3][b][e][a][9][0][8][1][2][6][8][4][d][d][1][5][0][1][7][8][2][d][f][5][3][e][9][9][5][f][2][9][8][2][9]$''',
+]

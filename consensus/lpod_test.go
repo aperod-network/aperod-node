@@ -12,6 +12,7 @@ import (
 	"github.com/aperod/aperod/avm"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/lpod"
 	"github.com/aperod/aperod/store"
 )
@@ -35,7 +36,7 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	g := &core.Block{Header: core.BlockHeader{Height: 0, ValidatorPub: pub, Timestamp: 1, MerkleRoot: core.MerkleRoot(nil)}}
 	if err := g.Header.Sign(priv); err != nil {
 		t.Fatal(err)
@@ -49,7 +50,7 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 		t.Fatal(err)
 	}
 	parent := &core.Block{Header: core.BlockHeader{Height: 1, Round: 1, PrevHash: g.Hash(), ValidatorPub: pub, Timestamp: 2, MerkleRoot: core.MerkleRoot(nil)}}
-	parent.Header.Sign(priv)
+	testutil.NoError(t, parent.Header.Sign(priv))
 	if err := chain.AddBlock(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +87,8 @@ func lpodConsensusFixture(t *testing.T) (*Engine, *store.DB, *core.Block, crypto
 			return avm.CommitCanonicalBlock(db, b, raw, p)
 		},
 	}, chain, core.NewMempool(core.DefaultMempoolConfig()), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	utxos := core.NewUTXOSet()
+	e.SetTxVerifier(core.NewTxVerifier(utxos), utxos)
 	return e, db, parent, priv
 }
 
@@ -168,7 +171,7 @@ func TestLPoDConsensusRejectsMutatedTransitions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			raw, _ := json.Marshal(valid)
 			var b core.Block
-			json.Unmarshal(raw, &b)
+			testutil.NoError(t, json.Unmarshal(raw, &b))
 			switch name {
 			case "early":
 				b.Header.Height = 1
@@ -194,7 +197,7 @@ func TestLPoDConsensusRejectsMutatedTransitions(t *testing.T) {
 				defer func() { e.cfg.LPoDMigration.Genesis = old }()
 			}
 			b.Header.MerkleRoot = core.MerkleRoot(b.Txs)
-			b.Header.Sign(priv)
+			testutil.NoError(t, b.Header.Sign(priv))
 			err := e.validateCoinbasePolicy(&b)
 			if err == nil {
 				err = e.validateRingCTV4Activation(&b)

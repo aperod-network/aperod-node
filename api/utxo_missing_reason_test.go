@@ -26,6 +26,7 @@ import (
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -36,12 +37,12 @@ func openTestStore(t *testing.T) *store.DB {
 	if err != nil {
 		t.Fatalf("TempDir: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { testutil.NoError(t, os.RemoveAll(dir)) })
 	db, err := store.Open(dir)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 	return db
 }
 
@@ -106,7 +107,7 @@ func postStakePayload(t *testing.T, srv *api.Server, txHash crypto.Hash32, outId
 	}
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
-	blind, err := crypto.DeterministicMintBlind(spendPub, amount)
+	blind, err := crypto.LegacyMintBlind(spendPub, amount)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}

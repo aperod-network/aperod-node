@@ -432,8 +432,8 @@ run_update_timeout_block() {
   local block
   block=$(awk '
     /# Step 0c: Ensure timeout\.conf drop-in exists/{f=1}
+    f && /^# Step 0d:/{exit}
     f{print}
-    f && /^fi$/{f=0}
   ' "$UPDATE_SH")
 
   if [[ -z "$block" ]]; then
@@ -441,13 +441,12 @@ run_update_timeout_block() {
     return 1
   fi
 
-  # The block reassigns DROPIN_DIR and TIMEOUT_CONF from SERVICE_NAME.
-  # Replace those two assignments with our temp-dir paths so the block
-  # writes to a location we can inspect without root.
+  # Inject the temporary drop-in path so the extracted block can run without
+  # touching the host's real systemd directory.
   block=$(echo "$block" | \
-    sed "s|DROPIN_DIR=.*|DROPIN_DIR=\"${dropin_dir}\"|" | \
     sed "s|TIMEOUT_CONF=.*|TIMEOUT_CONF=\"${timeout_conf_path}\"|")
 
+  DROPIN_DIR="$dropin_dir" \
   PATH="$fake_sc_dir:$PATH" \
   bash -s <<RUNNER
 set -euo pipefail

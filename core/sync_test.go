@@ -9,6 +9,7 @@ package core_test
 // Verification: all three chains end at the same height and tip hash.
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -1019,7 +1021,7 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("phase 3: proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, proxyLn) })
 	proxyAddr := proxyLn.Addr().String()
 
 	relayHandler := &chainHandler{chain: relayChain}
@@ -1070,10 +1072,10 @@ func TestSync_RelayNode_BlockMinedDuringReconnectHandshake(t *testing.T) {
 		}
 		server, err := net.Dial("tcp", validatorAddr)
 		if err != nil {
-			client.Close()
+			testutil.Close(t, client)
 			return
 		}
-		t.Cleanup(func() { client.Close(); server.Close() })
+		t.Cleanup(func() { testutil.CleanupClose(t, client); testutil.CleanupClose(t, server) })
 		go io.Copy(client, server) //nolint:errcheck // validator→relay flows freely
 		go func() {
 			<-gate                  // hold relay→validator until the block below is mined
@@ -1225,7 +1227,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 		hostValidator.Stop()
 		t.Fatalf("phase 2: proxy listen: %v", err)
 	}
-	t.Cleanup(func() { proxyLn.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, proxyLn) })
 	proxyAddr := proxyLn.Addr().String()
 
 	relayHandler := &chainHandler{chain: relayChain}
@@ -1290,7 +1292,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 
 		server, err := net.Dial("tcp", validatorAddr)
 		if err != nil {
-			client.Close()
+			testutil.Close(t, client)
 			return
 		}
 
@@ -1299,8 +1301,8 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 
 		// validator→relay: forward or intercept.
 		go func() {
-			defer client.Close()
-			defer server.Close()
+			defer testutil.CleanupClose(t, client)
+			defer testutil.CleanupClose(t, server)
 			buf := make([]byte, 4096)
 			stalledOnce := sync.Once{}
 			interceptedOnce := sync.Once{}
@@ -1309,7 +1311,14 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 				case <-gate:
 					// ── Intercept mode ───────────────────────────────────────
 					stalledOnce.Do(func() { close(stalled) })
-					server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+					if err := server.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+						// Stop owns this same pipe; its typed closure errors
+						// end the proxy, rather than invalidating the fixture.
+						if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+							t.Errorf("set intercepted proxy deadline: %v", err)
+						}
+						return
+					}
 					n, err := server.Read(buf)
 					if n > 0 {
 						// Signal first observed block-send bytes.
@@ -1327,7 +1336,12 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 				}
 
 				// ── Forward mode ─────────────────────────────────────────────
-				server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+				if err := server.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+					if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+						t.Errorf("set forwarding proxy deadline: %v", err)
+					}
+					return
+				}
 				n, err := server.Read(buf)
 				if n > 0 {
 					client.Write(buf[:n]) //nolint:errcheck
@@ -1474,7 +1488,7 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 		close(proceedCh)
 		hostValidator.Stop()
 		<-broadcastDone
-		proxyClient.Close()
+		testutil.CleanupClose(t, proxyClient)
 		t.Fatalf("phase 6: proxy did not observe liveRest[0] within 3 s — " +
 			"block bytes did not reach the proxy server socket")
 	}
@@ -1498,7 +1512,8 @@ func TestSync_RelayNode_MidStreamValidatorRestart(t *testing.T) {
 	// Close the proxy's relay-side connection: relay sees EOF.
 	// The proxy goroutine also defers client.Close() when it reads server EOF,
 	// but being explicit here avoids a race with the PeerHeight poll below.
-	proxyClient.Close()
+	// An already-closed socket is the intended outcome of either cleanup owner.
+	testutil.CleanupClose(t, proxyClient)
 
 	// Proxy was in intercept mode for all of liveRest: zero bytes reached relay.
 	if relayChain.Height() >= wantFinalHeight {

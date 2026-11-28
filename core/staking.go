@@ -68,6 +68,7 @@ const (
 // StakeAction is the type of stake operation encoded in a StakeTx.
 type StakeAction uint8
 
+// Stake action identifiers select the validator registry operation.
 const (
 	StakeDeposit         StakeAction = 1 // Lock APRO to enter validator queue
 	StakeWithdraw        StakeAction = 2 // Initiate full unbonding period
@@ -125,6 +126,7 @@ const StakePayloadSizeV4 = 301
 // generation(8) + expiry_height(8) + stake_ref(32) + ed25519_sig(64).
 const StakeWithdrawalPayloadSizeV2 = 193
 
+// StakeWithdrawalAuthorizationV2 binds a withdrawal to chain, stake and nonce.
 type StakeWithdrawalAuthorizationV2 struct {
 	Action       StakeAction
 	PubKey       crypto.ValidatorPubKey
@@ -137,6 +139,7 @@ type StakeWithdrawalAuthorizationV2 struct {
 	Signature    []byte
 }
 
+// StakeReferenceV2 commits to the chain, validator, generation and stake amount.
 func StakeReferenceV2(genesis crypto.Hash32, pub crypto.ValidatorPubKey, generation, stake uint64) crypto.Hash32 {
 	var g, s [8]byte
 	binary.BigEndian.PutUint64(g[:], generation)
@@ -144,6 +147,7 @@ func StakeReferenceV2(genesis crypto.Hash32, pub crypto.ValidatorPubKey, generat
 	return crypto.HashBytes([]byte("aperod/stake-withdrawal/reference/v2"), genesis[:], pub, g[:], s[:])
 }
 
+// StakeWithdrawalSignMsgV2 hashes the canonical withdrawal authorization fields.
 func StakeWithdrawalSignMsgV2(a StakeWithdrawalAuthorizationV2) crypto.Hash32 {
 	var amount, nonce, generation, expiry [8]byte
 	binary.BigEndian.PutUint64(amount[:], a.Amount)
@@ -155,6 +159,7 @@ func StakeWithdrawalSignMsgV2(a StakeWithdrawalAuthorizationV2) crypto.Hash32 {
 		generation[:], expiry[:], a.StakeRef[:])
 }
 
+// EncodeStakeWithdrawalExtraV2 encodes a withdrawal after checking action and lengths.
 func EncodeStakeWithdrawalExtraV2(a StakeWithdrawalAuthorizationV2) ([]byte, error) {
 	if len(a.PubKey) != 32 || len(a.Signature) != 64 {
 		return nil, fmt.Errorf("stake withdrawal v2: invalid public key or signature length")
@@ -175,6 +180,8 @@ func EncodeStakeWithdrawalExtraV2(a StakeWithdrawalAuthorizationV2) ([]byte, err
 	return b, nil
 }
 
+// DecodeStakeWithdrawalExtraV2 parses the fixed-size withdrawal authorization.
+// Cryptographic authorization is checked by the registry transition.
 func DecodeStakeWithdrawalExtraV2(extra []byte) (StakeWithdrawalAuthorizationV2, error) {
 	var a StakeWithdrawalAuthorizationV2
 	if len(extra) != StakeWithdrawalPayloadSizeV2 {
@@ -533,6 +540,7 @@ func StakeSignMsgV2(action StakeAction, pub crypto.ValidatorPubKey, amount uint6
 // ValidatorStatus is the lifecycle state of a registered validator.
 type ValidatorStatus uint8
 
+// Validator registry states do not independently establish network liveness.
 const (
 	ValidatorPending   ValidatorStatus = iota + 1 // staked, waiting for activation
 	ValidatorActive                               // producing / voting in consensus
@@ -641,6 +649,7 @@ func (r *ValidatorRegistry) ConfigureStakeWithdrawalV2(genesis crypto.Hash32, ac
 	return nil
 }
 
+// StakeWithdrawalV2Config returns the configured chain, activation height and enabled flag.
 func (r *ValidatorRegistry) StakeWithdrawalV2Config() (crypto.Hash32, uint64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

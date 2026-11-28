@@ -46,6 +46,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // elfMagic is the four-byte signature that every ELF binary starts with.
@@ -197,7 +199,7 @@ func assertELF(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("cannot open binary %s after build: %v", path, err)
 	}
-	defer f.Close()
+	defer testutil.CleanupClose(t, f)
 
 	// Read e_ident (16 bytes) + e_type (2 bytes) = 18 bytes total.
 	header := make([]byte, 18)

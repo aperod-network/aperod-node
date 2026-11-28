@@ -3,17 +3,33 @@ package api_test
 import (
 	"archive/tar"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aperod/aperod/api"
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
+	"github.com/aperod/aperod/store"
 )
+
+type exportDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	writeDeadline time.Time
+}
+
+func (w *exportDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.writeDeadline = deadline
+	return nil
+}
 
 // buildExportServer returns a server wired with a data dir and an optional API key.
 func buildExportServer(t *testing.T, dataDir string, apiKey string) *api.Server {
@@ -163,14 +179,14 @@ func TestChainDBExport_MethodNotAllowed(t *testing.T) {
 	}
 }
 
-func TestChainDBExport_NoChainDB(t *testing.T) {
+func TestChainDBExport_RequiresConfiguredStore(t *testing.T) {
 	dir := t.TempDir()
 	srv := buildExportServer(t, dir, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rr.Code)
 	}
 }
 
@@ -190,38 +206,32 @@ func TestChainDBExport_RequiresAPIKey(t *testing.T) {
 	}
 }
 
-// writeFakeChainDB creates a fake chain.db directory with immutable SST files
-// and a WAL file (*.log) for testing.  Returns the list of SST filenames.
-func writeFakeChainDB(t *testing.T, dataDir string) []string {
+func writeExportFixture(t *testing.T, dataDir string) (*store.DB, crypto.Hash32) {
 	t.Helper()
-	dbDir := filepath.Join(dataDir, "chain.db")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	db, err := store.Open(filepath.Join(dataDir, "chain.db"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	sstFiles := []string{"000001.ldb", "000002.ldb", "MANIFEST-000003", "CURRENT"}
-	for _, name := range sstFiles {
-		if err := os.WriteFile(filepath.Join(dbDir, name), []byte("data:"+name), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// WAL file — must be excluded from the archive.
-	if err := os.WriteFile(filepath.Join(dbDir, "000004.log"), []byte("wal-data"), 0644); err != nil {
+	tipHash := crypto.HashBytes([]byte("api logical export test genesis"))
+	if err := db.PutRawBlock(tipHash, 0, []byte("synthetic genesis body")); err != nil {
+		_ = db.Close()
 		t.Fatal(err)
 	}
-	return sstFiles
+	if err := db.PutTip(tipHash, 0); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	return db, tipHash
 }
 
-// readTarEntries reads a gzip+tar archive from r and returns the map of
-// entry name → content.
-func readTarEntries(t *testing.T, r io.Reader) map[string]string {
+func extractCheckpointArchive(t *testing.T, r io.Reader, destination string) {
 	t.Helper()
 	gzr, err := gzip.NewReader(r)
 	if err != nil {
 		t.Fatalf("gzip.NewReader: %v", err)
 	}
-	defer gzr.Close()
+	defer testutil.CleanupClose(t, gzr)
 	tr := tar.NewReader(gzr)
-	entries := make(map[string]string)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -230,128 +240,86 @@ func readTarEntries(t *testing.T, r io.Reader) map[string]string {
 		if err != nil {
 			t.Fatalf("tar.Next: %v", err)
 		}
+		if filepath.IsAbs(hdr.Name) || strings.Contains(hdr.Name, "..") {
+			t.Fatalf("archive contains unsafe path %q", hdr.Name)
+		}
+		target := filepath.Join(destination, filepath.FromSlash(hdr.Name))
 		if hdr.Typeflag == tar.TypeDir {
+			if err := os.MkdirAll(target, 0700); err != nil {
+				t.Fatal(err)
+			}
 			continue
 		}
-		data, _ := io.ReadAll(tr)
-		entries[hdr.Name] = string(data)
+		// Keep accepting the historical NUL regular-file flag.
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != 0 {
+			t.Fatalf("unsupported checkpoint archive member type %d at %q", hdr.Typeflag, hdr.Name)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, copyErr := io.CopyN(file, tr, hdr.Size)
+		closeErr := file.Close()
+		if copyErr != nil {
+			t.Fatal(copyErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
 	}
-	return entries
 }
 
-func TestChainDBExport_ProducesValidTar(t *testing.T) {
+func TestChainDBExport_ProducesPointInTimeLogicalCheckpoint(t *testing.T) {
 	dir := t.TempDir()
-	sstFiles := writeFakeChainDB(t, dir)
+	var disk syscall.Statfs_t
+	if err := syscall.Statfs(dir, &disk); err != nil {
+		t.Fatal(err)
+	}
+	freeBytes := disk.Bavail * uint64(disk.Bsize)
+	if freeBytes <= 5*1024*1024*1024+64*1024*1024 {
+		t.Skipf("logical checkpoint needs more than 5 GiB plus working headroom; currently %d bytes free", freeBytes)
+	}
+	db, tipHash := writeExportFixture(t, dir)
+	defer testutil.CleanupClose(t, db)
 
 	srv := buildExportServer(t, dir, "")
+	srv.SetStore(db)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
-	rr := httptest.NewRecorder()
+	rr := &exportDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 	srv.ServeHTTP(rr, req)
 
+	if time.Until(rr.writeDeadline) < 90*time.Minute {
+		t.Fatalf("export write deadline was not extended sufficiently: %v", rr.writeDeadline)
+	}
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
-	if ct := rr.Header().Get("Content-Type"); ct != "application/x-tar" {
-		t.Errorf("Content-Type = %q, want application/x-tar", ct)
+	if ct := rr.Header().Get("Content-Type"); ct != "application/gzip" {
+		t.Errorf("Content-Type = %q, want application/gzip", ct)
 	}
-
-	entries := readTarEntries(t, rr.Body)
-
-	// All SST files must be present.
-	for _, name := range sstFiles {
-		key := "chain.db/" + name
-		if _, ok := entries[key]; !ok {
-			t.Errorf("missing entry %q in archive", key)
-		}
+	if rr.Header().Get("X-ChainDB-Tip-Height") != "0" {
+		t.Fatalf("tip height header = %q, want 0", rr.Header().Get("X-ChainDB-Tip-Height"))
 	}
-}
-
-func TestChainDBExport_ExcludesWALFiles(t *testing.T) {
-	dir := t.TempDir()
-	writeFakeChainDB(t, dir)
-
-	srv := buildExportServer(t, dir, "")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+	if rr.Header().Get("X-ChainDB-Tip-Hash") != fmt.Sprintf("%x", tipHash[:]) {
+		t.Fatalf("tip hash header = %q, want %x", rr.Header().Get("X-ChainDB-Tip-Hash"), tipHash)
 	}
-
-	entries := readTarEntries(t, rr.Body)
-	for name := range entries {
-		if strings.HasSuffix(name, ".log") {
-			t.Errorf("WAL file %q must not appear in the archive", name)
-		}
+	extracted := t.TempDir()
+	extractCheckpointArchive(t, rr.Body, extracted)
+	gotHash, gotHeight, err := store.ReadTipOnly(filepath.Join(extracted, "chain.db"))
+	if err != nil {
+		t.Fatalf("read exported logical checkpoint: %v", err)
 	}
-}
-
-func TestChainDBExport_FileContentIsCorrect(t *testing.T) {
-	dir := t.TempDir()
-	dbDir := filepath.Join(dir, "chain.db")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if gotHash != tipHash || gotHeight != 0 {
+		t.Fatalf("reopened exported tip = %x/%d, want %x/0", gotHash, gotHeight, tipHash)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".backup-staging"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	content := []byte("leveldb-sst-content")
-	if err := os.WriteFile(filepath.Join(dbDir, "000001.ldb"), content, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	srv := buildExportServer(t, dir, "")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
-	}
-
-	entries := readTarEntries(t, rr.Body)
-	got, ok := entries["chain.db/000001.ldb"]
-	if !ok {
-		t.Fatal("chain.db/000001.ldb not found in archive")
-	}
-	if got != string(content) {
-		t.Errorf("content = %q, want %q", got, content)
-	}
-}
-
-func TestChainDBExport_ValidKeyAccepted(t *testing.T) {
-	dir := t.TempDir()
-	writeFakeChainDB(t, dir)
-	srv := buildExportServer(t, dir, "thekey")
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
-	req.Header.Set("X-API-Key", "thekey")
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Errorf("valid key: status = %d, want 200", rr.Code)
-	}
-}
-
-// TestChainDBExport_PathSanitisation verifies that symlinks or paths containing
-// ".." do not appear in the archive.  We can't easily create an escaping entry
-// via the Walk (the sanitisation happens inside the Walk), but we can verify
-// that no entry in a real export starts with "..".
-func TestChainDBExport_PathSanitisation(t *testing.T) {
-	dir := t.TempDir()
-	writeFakeChainDB(t, dir)
-
-	srv := buildExportServer(t, dir, "")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/chaindb/export", nil)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
-	}
-
-	entries := readTarEntries(t, rr.Body)
-	for name := range entries {
-		if strings.HasPrefix(name, "..") || strings.Contains(name, "/../") {
-			t.Errorf("archive contains escaping path: %q", name)
-		}
+	if len(entries) != 0 {
+		t.Fatalf("temporary checkpoint stage was not cleaned: %v", entries)
 	}
 }

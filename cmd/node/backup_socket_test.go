@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 type backupExporterFunc func(context.Context, string) (crypto.Hash32, uint64, error)
@@ -101,7 +102,7 @@ func TestBackupSocketRecoversSameUserStaleSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start with stale socket: %v", err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 	if srv.path != socketPath {
 		t.Fatalf("socket path = %q, want %q", srv.path, socketPath)
 	}
@@ -116,7 +117,7 @@ func TestBackupSocketRefusesLiveSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 	if _, err := startBackupSocket(dataDir, exporter); err == nil {
 		t.Fatal("starting a second server replaced a live socket")
 	}
@@ -148,13 +149,13 @@ func TestBackupSocketCheckpointSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 
 	resp, err := backupHTTPClient(srv.path).Post("http://unix/checkpoint", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer testutil.CleanupClose(t, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("checkpoint status = %d: %s", resp.StatusCode, body)
@@ -209,7 +210,7 @@ func TestBackupSocketFailureCleansStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 
 	resp, err := backupHTTPClient(srv.path).Post("http://unix/checkpoint", "", nil)
 	if err != nil {
@@ -243,7 +244,7 @@ func TestBackupSocketCancellationCleansStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/checkpoint", nil)
@@ -301,7 +302,7 @@ func TestBackupSocketExcludesConcurrentCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer testutil.CleanupClose(t, srv)
 
 	client := backupHTTPClient(srv.path)
 	firstDone := make(chan error, 1)

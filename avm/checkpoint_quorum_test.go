@@ -2,10 +2,12 @@ package avm
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
 )
@@ -83,6 +85,46 @@ func TestQuorumCheckpointRequiresThresholdAndVerifiesEverySignature(t *testing.T
 	if _, err := AttachCheckpointSignatures(draft, threeSignatures, chain.activation, authorities, 2); err == nil ||
 		!strings.Contains(err.Error(), "invalid witness signature") {
 		t.Fatalf("invalid extra signature was ignored: %v", err)
+	}
+}
+
+func TestQuorumCheckpointAllowsOnlyExplicitOneOfOne(t *testing.T) {
+	chain := newCheckpointTestChain(t)
+	chain.appendDeployAndEmptyBlocks(t, 1, 0, "")
+	tipHash := mustCanonicalHash(t, chain.db, 1)
+	draft, err := BuildCheckpointDraftFromCanonical(
+		context.Background(), chain.db, chain.activation, 1, tipHash,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signers, authorities := checkpointWitnessSet(t, 1)
+	signatures := collectCheckpointSignatures(t, draft, chain.activation, signers[0])
+	checkpoint, err := AttachCheckpointSignatures(draft, signatures, chain.activation, authorities, 1)
+	if err != nil {
+		t.Fatalf("attach explicit 1-of-1 signature: %v", err)
+	}
+	if err := VerifyCheckpointQuorum(checkpoint, chain.activation, authorities, 1); err != nil {
+		t.Fatalf("verify explicit 1-of-1 checkpoint: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "one-of-one-checkpoint.json")
+	if err := WriteCheckpointFile(path, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCanonicalStateWithQuorumCheckpoint(
+		context.Background(), chain.db, chain.activation, 1, tipHash,
+		path, authorities, 1, 10,
+	); err != nil {
+		t.Fatalf("start from explicit 1-of-1 checkpoint: %v", err)
+	}
+
+	manySigners, manyAuthorities := checkpointWitnessSet(t, 2)
+	oneSignature := collectCheckpointSignatures(t, draft, chain.activation, manySigners[0])
+	if _, err := AttachCheckpointSignatures(draft, oneSignature, chain.activation, manyAuthorities, 1); err == nil ||
+		!strings.Contains(err.Error(), "1-of-1 policy requires exactly one trusted authority") {
+		t.Fatalf("1-of-many policy was accepted: %v", err)
 	}
 }
 
@@ -287,6 +329,87 @@ func TestQuorumCheckpointRecoveryAndRestart(t *testing.T) {
 	)
 	if err != nil || rebuilt {
 		t.Fatalf("restart with quorum checkpoint rebuilt=%v err=%v", rebuilt, err)
+	}
+}
+
+func TestQuorumCheckpointRestartVerifiesRotatedBlockAuthority(t *testing.T) {
+	chain := newCheckpointTestChain(t)
+	genesis := mustCanonicalHash(t, chain.db, 0)
+	parent := chain.appendBlock(t, 1, genesis, nil)
+	draft, err := CreateQuorumCheckpointDraftFromCanonicalState(chain.db, chain.activation, 1, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signers, authorities := checkpointWitnessSet(t, 1)
+	checkpoint, err := AttachCheckpointSignatures(draft, collectCheckpointSignatures(t, draft, chain.activation, signers[0]), chain.activation, authorities, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "avm.json")
+	if err := WriteCheckpointFile(path, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	replacement, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork := &core.ValidatorAuthorityFork{
+		Version: 1, Height: 2, Genesis: genesis, Parent: parent,
+		Identity: chain.privateKey.Public(), Replacement: pub, RegistrySHA256: crypto.HashStr("registry"),
+	}
+	fork.Possession, err = replacement.Sign(fork.Message())
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := &core.Block{Header: core.BlockHeader{
+		Height: 2, PrevHash: parent, Timestamp: 3, ValidatorPub: fork.Identity, MerkleRoot: core.MerkleRoot(nil),
+	}}
+	if err := block.Header.Sign(replacement); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := NewBlockExecutor(LevelStore{DB: chain.db}).PrepareBlock(context.Background(), block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip := block.Hash()
+	if err := CommitCanonicalBlock(chain.db, block, raw, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := chain.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	chain.db, err = store.Open(chain.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := func(f *core.ValidatorAuthorityFork) error {
+		_, err := EnsureCanonicalStateWithQuorumCheckpointAndAuthority(
+			context.Background(), chain.db, chain.activation, 2, tip, path, authorities, 1, 2, 0, f,
+		)
+		return err
+	}
+	if err := replay(nil); err == nil || !strings.Contains(err.Error(), "invalid validator signature") {
+		t.Fatalf("replay without the pinned fork should reject the rotated signature: %v", err)
+	}
+	if err := replay(fork); err != nil {
+		t.Fatalf("restart rejected the authorized rotated signature: %v", err)
+	}
+	if err := block.Header.Sign(chain.privateKey); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chain.db.PutRawBlock(tip, 2, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := replay(fork); err == nil || !strings.Contains(err.Error(), "invalid validator signature") {
+		t.Fatalf("replay accepted the retired key after activation: %v", err)
 	}
 }
 

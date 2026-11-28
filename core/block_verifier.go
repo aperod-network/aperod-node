@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// Block limits bound transaction count and encoded block size.
 const (
 	MaxTransactionsPerBlock = 2_000
 	MaxBlockBytes           = 4 * 1024 * 1024

@@ -252,80 +252,80 @@ func (m *walletSnapshotManager) capture(ctx context.Context, s *Server, address 
 	if read == nil {
 		return nil, errors.New("capture wallet snapshot returned nil")
 	}
-	fail := func(err error) (*walletSnapshotLease, error) {
+	fail := func(err error) error {
 		read.Release()
-		return nil, err
+		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
 	}
 
 	hash, height, err := read.GetTip()
 	if err != nil {
-		return fail(fmt.Errorf("read pinned canonical tip: %w", err))
+		return nil, fail(fmt.Errorf("read pinned canonical tip: %w", err))
 	}
 	if err := ctx.Err(); err != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
 	}
 	indexed, found, err := read.GetCanonicalHash(height)
 	if err != nil || !found || indexed != hash {
-		return fail(errors.New("pinned canonical height index does not match tip"))
+		return nil, fail(errors.New("pinned canonical height index does not match tip"))
 	}
 	if err := ctx.Err(); err != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
 	}
 	if s.lpodMigration == nil || s.lpodFinalized == nil || !s.lpodFinalized(height, hash) {
-		return fail(errors.New("hash-specific finalized checkpoint required"))
+		return nil, fail(errors.New("hash-specific finalized checkpoint required"))
 	}
 	if err := ctx.Err(); err != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
 	}
 	checkpoint, err := read.LoadLPoDCheckpointAtBounded(hash, availableBytes)
 	if ctx.Err() != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", ctx.Err()))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", ctx.Err()))
 	}
 	if err != nil || checkpoint == nil || checkpoint.Allocation == nil {
 		if err == nil {
 			err = errors.New("pinned LPoD checkpoint is missing")
 		}
-		return fail(fmt.Errorf("load bounded LPoD checkpoint: %w", err))
+		return nil, fail(fmt.Errorf("load bounded LPoD checkpoint: %w", err))
 	}
 	allocation := checkpoint.Allocation
 	if allocation.Genesis != s.lpodMigration.Genesis ||
 		allocation.ReconciliationRoot != s.lpodMigration.ReconciliationRoot ||
 		allocation.FundingHeight != s.lpodMigration.Height ||
 		checkpoint.State.LastHeight != height {
-		return fail(errors.New("pinned LPoD checkpoint does not match configured migration and height"))
+		return nil, fail(errors.New("pinned LPoD checkpoint does not match configured migration and height"))
 	}
 	if err := checkpoint.State.Validate(); err != nil {
-		return fail(fmt.Errorf("invalid pinned LPoD checkpoint state: %w", err))
+		return nil, fail(fmt.Errorf("invalid pinned LPoD checkpoint state: %w", err))
 	}
 	ready, err := read.LPoDWalletIndexReady(allocation.FundingBlock)
 	if err != nil || !ready {
 		if err == nil {
 			err = errors.New("native wallet index is not ready at pinned snapshot")
 		}
-		return fail(err)
+		return nil, fail(err)
 	}
 	encoded, err := json.Marshal(checkpoint)
 	if err != nil {
-		return fail(fmt.Errorf("measure pinned checkpoint: %w", err))
+		return nil, fail(fmt.Errorf("measure pinned checkpoint: %w", err))
 	}
 	checkpointSize := len(encoded)
 	if checkpointSize > availableBytes || checkpointSize > walletSnapshotCheckpointLimit {
-		return fail(errors.New("wallet snapshot checkpoint memory limit reached"))
+		return nil, fail(errors.New("wallet snapshot checkpoint memory limit reached"))
 	}
 	if err := ctx.Err(); err != nil {
-		return fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
+		return nil, fail(fmt.Errorf("wallet snapshot capture canceled: %w", err))
 	}
 
 	var randomID [32]byte
 	if _, err := rand.Read(randomID[:]); err != nil {
-		return fail(fmt.Errorf("generate wallet snapshot id: %w", err))
+		return nil, fail(fmt.Errorf("generate wallet snapshot id: %w", err))
 	}
 	var cursorKey [32]byte
 	if _, err := rand.Read(cursorKey[:]); err != nil {
-		return fail(fmt.Errorf("generate wallet snapshot cursor key: %w", err))
+		return nil, fail(fmt.Errorf("generate wallet snapshot cursor key: %w", err))
 	}
 	id := hex.EncodeToString(randomID[:])
 	entry := &walletSnapshotEntry{
@@ -338,7 +338,7 @@ func (m *walletSnapshotManager) capture(ctx context.Context, s *Server, address 
 	m.expireLocked(time.Now())
 	if _, exists := m.entries[id]; exists {
 		m.mu.Unlock()
-		return fail(errors.New("wallet snapshot id collision"))
+		return nil, fail(errors.New("wallet snapshot id collision"))
 	}
 	m.entries[id] = entry
 	m.active++

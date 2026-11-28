@@ -10,6 +10,7 @@ import (
 	"github.com/aperod/aperod/crypto"
 )
 
+// TxVersionLPoD identifies a ledger checkpoint transaction without coin outputs.
 const TxVersionLPoD TxVersion = 8
 
 var lpodPrefix = []byte("APRO-LPOD-CHECKPOINT\x01")
@@ -20,6 +21,7 @@ func LPoDCheckpointTx(digest crypto.Hash32) Transaction {
 	return Transaction{Version: TxVersionLPoD, Extra: append(append([]byte{}, lpodPrefix...), digest[:]...)}
 }
 
+// IsLPoD reports whether tx is an LPoD checkpoint transaction.
 func (tx *Transaction) IsLPoD() bool { return tx != nil && tx.Version == TxVersionLPoD }
 
 func (tx *Transaction) validateLPoD() error {
@@ -32,6 +34,7 @@ func (tx *Transaction) validateLPoD() error {
 	return nil
 }
 
+// LPoDCheckpointDigest validates and extracts the checkpoint commitment.
 func (tx *Transaction) LPoDCheckpointDigest() (crypto.Hash32, error) {
 	var digest crypto.Hash32
 	if !tx.IsLPoD() {

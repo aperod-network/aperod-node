@@ -10,6 +10,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // makeTestBlock wraps a list of transactions into a signed block at height h.
@@ -73,6 +74,28 @@ func TestVerifyBlock_UnbalancedFeeCommitment_Rejected(t *testing.T) {
 		t.Fatal("VerifyBlock must reject a block with an unbalanced fee commitment")
 	}
 	t.Logf("correctly rejected (%v)", err)
+}
+
+func TestMempoolRejectsExistingOutputKeyCollisionAfterHardening(t *testing.T) {
+	const activationHeight = uint64(10)
+	tx := makeValidTx(t)
+	utxos := core.NewUTXOSet()
+	utxos.Add(&core.UTXO{
+		TxHash:     crypto.Hash32{1},
+		OneTimePub: tx.Outputs[0].OneTimePub,
+	})
+	verifier := core.NewTxVerifier(utxos)
+	verifier.SetSecurityHardeningActivationHeight(activationHeight)
+
+	cfg := core.DefaultMempoolConfig()
+	cfg.CurrentHeight = func() uint64 { return activationHeight - 1 }
+	cfg.RingCTV4ActivationHeight = ^uint64(0)
+	cfg.Verifier = verifier
+	pool := core.NewMempool(cfg)
+	if err := pool.Add(tx); err == nil ||
+		!strings.Contains(err.Error(), "one-time public key already exists") {
+		t.Fatalf("mempool Add error = %v, want existing-output-key rejection", err)
+	}
 }
 
 // TestVerifyBlock_TamperedInputCommitment_Rejected confirms that replacing an
@@ -177,7 +200,7 @@ func TestVerifyBlock_Timejacking_Rejected(t *testing.T) {
 		t.Fatalf("Sign genesis: %v", err)
 	}
 	genesis := &core.Block{Header: genesisHdr}
-	chain.SetGenesis(genesis)
+	testutil.NoError(t, chain.SetGenesis(genesis))
 
 	cfg := core.DefaultBlockVerifierConfig()
 	cfg.MaxPastDrift = 30 * time.Second

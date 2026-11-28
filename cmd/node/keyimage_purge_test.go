@@ -22,6 +22,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -31,7 +32,7 @@ func TestRebuildKeyImagesPurgesPhantomIndexEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var confirmedKI, missingKI, phantomKI crypto.KeyImage
 	confirmedKI[0] = 0xC1
@@ -105,7 +106,7 @@ func TestRebuildKeyImagesFailClosedOnIncompleteScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var confirmedKI, unknownKI crypto.KeyImage
 	confirmedKI[0] = 0xC1
@@ -164,7 +165,7 @@ func TestRebuildKeyImagesForcePurgeOnIncompleteScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	var confirmedKI, phantomKI crypto.KeyImage
 	confirmedKI[0] = 0xC1

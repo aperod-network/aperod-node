@@ -17,12 +17,6 @@ import (
 
 // ─── nop logger ──────────────────────────────────────────────────────────────
 
-type nopHandler struct{}
-
-func (nopHandler) Enabled(_ interface{ Deadline() (interface{}, bool) }, _ slog.Level) bool {
-	return false
-}
-
 func newNopLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }

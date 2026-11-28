@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 
+	"github.com/aperod/aperod/config"
+	"github.com/aperod/aperod/consensus"
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
 	"github.com/aperod/aperod/store"
@@ -168,57 +170,83 @@ func decodeLPoDMigrationWitness(raw []byte) (*store.LPoDMigration, error) {
 	return m, nil
 }
 
+func readLPoDMigrationWitness(path string, v2TrustAuthorities, v3TrustAuthorities []string) (*store.LPoDMigration, error) {
+	if path == "" {
+		if len(v2TrustAuthorities) != 0 || len(v3TrustAuthorities) != 0 {
+			return nil, fmt.Errorf("lpod: trusted checkpoint authorities are configured but the migration witness is missing")
+		}
+		return nil, nil
+	}
+	// #nosec G304 -- Operator-configured local consensus witness; authenticated contents are validated separately, not a request-selected file.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("lpod reconciliation witness: %w", err)
+	}
+	m, err := decodeLPoDMigrationWitness(raw)
+	if err != nil {
+		return nil, fmt.Errorf("lpod: invalid reconciliation witness: %w", err)
+	}
+	switch m.Version {
+	case 1:
+		if len(v2TrustAuthorities) != 0 || len(v3TrustAuthorities) != 0 {
+			return nil, fmt.Errorf("lpod: trusted checkpoint authorities cannot authorize a version 1 witness")
+		}
+	case 2:
+		if len(v3TrustAuthorities) != 0 {
+			return nil, fmt.Errorf("lpod: version 3 authorities cannot authorize a version 2 witness")
+		}
+		m.TrustedValidators, err = parseLPoDV2TrustAuthorities(v2TrustAuthorities)
+	case 3:
+		if len(v2TrustAuthorities) != 0 {
+			return nil, fmt.Errorf("lpod: version 2 authorities cannot authorize a version 3 witness")
+		}
+		m.TrustedValidators, err = parseLPoDV3TrustAuthorities(v3TrustAuthorities)
+	default:
+		return nil, fmt.Errorf("lpod: unsupported migration version %d", m.Version)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// Explicit v2/v3 checkpoint authorization can be checked without opening the
+// chain. Legacy v1 authorization still requires the effective validator set.
+func validateLPoDPreflight(cfg config.ConsensusConfig) error {
+	m, err := readLPoDMigrationWitness(cfg.LPoDMigrationFile, cfg.LPoDV2TrustAuthorities, cfg.LPoDV3TrustAuthorities)
+	if err != nil || m == nil {
+		return err
+	}
+	if m.Version != 1 {
+		if err := m.VerifyAuthorization(); err != nil {
+			return err
+		}
+	}
+	profile := consensus.Config{
+		GuardianFundActivationHeight:        cfg.GuardianFundActivationHeight,
+		RewardAuthorizationActivationHeight: cfg.RewardAuthorizationActivationHeight,
+		StakingPoolNAPR:                     cfg.StakingPoolNAPR,
+		BlockRewardNAPR:                     cfg.BlockRewardNAPR,
+		TailRewardNAPR:                      cfg.TailRewardNAPR,
+	}
+	return profile.ValidateLPoDRewardProfile(m.Height)
+}
+
 func loadLPoDMigration(path string, db *store.DB, chain *core.Chain, validators []crypto.ValidatorPubKey,
 	genesisAuthorities, v2TrustAuthorities, v3TrustAuthorities []string) (*store.LPoDMigration, error) {
-	var m *store.LPoDMigration
-	if path == "" && (len(v2TrustAuthorities) != 0 || len(v3TrustAuthorities) != 0) {
-		return nil, fmt.Errorf("lpod: trusted checkpoint authorities are configured but the migration witness is missing")
+	m, err := readLPoDMigrationWitness(path, v2TrustAuthorities, v3TrustAuthorities)
+	if err != nil {
+		return nil, err
 	}
-	if path != "" {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("lpod reconciliation witness: %w", err)
-		}
-		m, err = decodeLPoDMigrationWitness(raw)
-		if err != nil {
-			return nil, fmt.Errorf("lpod: invalid reconciliation witness: %w", err)
-		}
+	if m != nil {
 		g := chain.Genesis()
-		switch m.Version {
-		case 1:
-			if len(v2TrustAuthorities) != 0 || len(v3TrustAuthorities) != 0 {
-				return nil, fmt.Errorf("lpod: trusted checkpoint authorities cannot authorize a version 1 witness")
-			}
+		if m.Version == 1 {
 			if err := guardLPoDMigrationAuthorities(validators, genesisAuthorities); err != nil {
 				return nil, err
 			}
 			m.TrustedValidators = append([]crypto.ValidatorPubKey(nil), validators...)
-		case 2:
-			if len(v3TrustAuthorities) != 0 {
-				return nil, fmt.Errorf("lpod: version 3 authorities cannot authorize a version 2 witness")
-			}
-			if err := guardLPoDConsensusAuthorities(validators); err != nil {
-				return nil, err
-			}
-			authorities, err := parseLPoDV2TrustAuthorities(v2TrustAuthorities)
-			if err != nil {
-				return nil, err
-			}
-			m.TrustedValidators = authorities
-		case 3:
-			if len(v2TrustAuthorities) != 0 {
-				return nil, fmt.Errorf("lpod: version 2 authorities cannot authorize a version 3 witness")
-			}
-			if err := guardLPoDConsensusAuthorities(validators); err != nil {
-				return nil, err
-			}
-			authorities, err := parseLPoDV3TrustAuthorities(v3TrustAuthorities)
-			if err != nil {
-				return nil, err
-			}
-			m.TrustedValidators = authorities
-		default:
-			return nil, fmt.Errorf("lpod: unsupported migration version %d", m.Version)
+		} else if err := guardLPoDConsensusAuthorities(validators); err != nil {
+			return nil, err
 		}
 		if err := m.VerifyAuthorization(); err != nil {
 			return nil, err

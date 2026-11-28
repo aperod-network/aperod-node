@@ -14,6 +14,7 @@ package api
 //   POST /api/v1/admin/stake-deposit                   — admin-only: v2 UTXO-backed stake deposit
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -42,6 +44,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/address/", s.restAddressTxs)
 	s.mux.HandleFunc("/api/v1/scan/outputs", s.restScanOutputs)
 	s.mux.HandleFunc("/api/v1/network/stats", s.restNetworkStats)
+	s.mux.HandleFunc("/api/v1/chain/identity-evidence", s.restChainIdentityEvidence)
 	s.mux.HandleFunc("/api/v1/network/mempool", s.restMempoolMetrics)
 	s.mux.HandleFunc("/api/v1/mempool", s.restMempoolTransactions)
 	s.mux.HandleFunc("/api/v1/fee-estimate", s.restFeeEstimate)
@@ -55,6 +58,7 @@ func (s *Server) registerRESTRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/invoice", s.localOnly(s.requireAPIKey(s.restSaleInvoice)))
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/receipt", s.localOnly(s.requireAPIKey(s.restSaleReceipt)))
 	s.mux.HandleFunc("/api/v1/admin/protocol-sales/recover", s.localOnly(s.requireAPIKey(s.restSaleRecover)))
+	s.mux.HandleFunc("/api/v1/admin/consensus-schedule", s.localOnly(s.requireAPIKey(s.restConsensusSchedule)))
 	s.mux.HandleFunc("/api/v1/admin/partial-unstake", s.localOnly(s.requireAPIKey(s.restAdminPartialUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/full-unstake", s.localOnly(s.requireAPIKey(s.restAdminFullUnstake)))
 	s.mux.HandleFunc("/api/v1/admin/stake-deposit", s.localOnly(s.requireAPIKey(s.restAdminStakeDeposit)))
@@ -199,9 +203,17 @@ func (s *Server) restGuardianFund(w http.ResponseWriter, r *http.Request) {
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	if err := writeJSONResponse(w, code, v); err != nil {
+		// Headers or a body prefix may already have reached the client.
+		// Never retry an effectful request or attempt a second response here.
+		slog.Debug("write REST JSON response failed", "err", err)
+	}
+}
+
+func writeJSONResponse(w http.ResponseWriter, code int, v interface{}) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	return json.NewEncoder(w).Encode(v)
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
@@ -265,16 +277,22 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blocks := make([]BlockResponse, 0, limit)
+	blocks := make([]interface{}, 0, limit)
 	for h := startHeight; len(blocks) < limit; {
-		b := s.chain.GetByHeight(h)
+		b, pruned, lookupErr := s.restBlockAtHeight(h)
+		if lookupErr != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, lookupErr.Error())
+			return
+		}
 		if b != nil {
-			response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+			response, err := s.restBlockToResponse(b)
 			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			blocks = append(blocks, response)
+		} else if pruned != nil {
+			blocks = append(blocks, prunedBlockDetailResponse(pruned))
 		}
 		if h == 0 {
 			break
@@ -287,6 +305,52 @@ func (s *Server) restBlocks(w http.ResponseWriter, r *http.Request) {
 		"limit":  limit,
 		"offset": offset,
 	})
+}
+
+func (s *Server) restBlockAtHeight(height uint64) (*core.Block, *store.StoredBlock, error) {
+	block := s.chain.GetByHeight(height)
+	if s.blockStore == nil {
+		return block, nil, nil
+	}
+	if block != nil {
+		if _, _, err := s.canonicalBlockID(block); err == nil {
+			return block, nil, nil
+		}
+	}
+
+	fullBlock, prunedBlock, err := s.lookupBlockFromDisk(strconv.FormatUint(height, 10))
+	if err != nil {
+		return nil, nil, err
+	}
+	if fullBlock != nil {
+		if _, _, err := s.canonicalBlockID(fullBlock); err != nil {
+			return nil, nil, err
+		}
+		return fullBlock, nil, nil
+	}
+	if prunedBlock != nil {
+		if _, err := s.canonicalPrunedBlockID(prunedBlock); err != nil {
+			return nil, nil, err
+		}
+		return nil, prunedBlock, nil
+	}
+	if block != nil {
+		return nil, nil, fmt.Errorf("in-memory block at height %d differs from the canonical index and no canonical body is available", height)
+	}
+	return nil, nil, nil
+}
+
+func (s *Server) restBlockToResponse(block *core.Block) (BlockResponse, error) {
+	response, err := blockToResponse(block, s.avmGasBurnActivationHeight)
+	if err != nil {
+		return BlockResponse{}, err
+	}
+	canonicalHash, _, err := s.canonicalBlockID(block)
+	if err != nil {
+		return BlockResponse{}, err
+	}
+	response.Hash = fmt.Sprintf("%x", canonicalHash[:])
+	return response, nil
 }
 
 // ─── GET /api/v1/blocks/{id} and /api/v1/blocks/{id}/transactions ────────────
@@ -324,7 +388,11 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.blockStore != nil {
-			fullBlock, _, _ := s.lookupBlockFromDisk(id)
+			fullBlock, _, err := s.lookupBlockFromDisk(id)
+			if err != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			if fullBlock != nil {
 				s.writeBlockOutputs(w, fullBlock)
 				return
@@ -350,7 +418,11 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 		}
 		// Fall back to the on-disk store for old or pruned blocks.
 		if s.blockStore != nil {
-			fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(id)
+			fullBlock, prunedBlock, err := s.lookupBlockFromDisk(id)
+			if err != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
 			if fullBlock != nil {
 				s.writeBlockTransactions(w, fullBlock)
 				return
@@ -366,9 +438,9 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 
 	// Block detail endpoint
 	if b := s.lookupBlockMem(tail); b != nil {
-		response, err := blockToResponse(b, s.avmGasBurnActivationHeight)
+		response, err := s.restBlockToResponse(b)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
@@ -381,11 +453,15 @@ func (s *Server) restBlockByIDOrTxs(w http.ResponseWriter, r *http.Request) {
 	}
 	// Fall back to disk for old / pruned blocks.
 	if s.blockStore != nil {
-		fullBlock, prunedBlock, _ := s.lookupBlockFromDisk(tail)
+		fullBlock, prunedBlock, err := s.lookupBlockFromDisk(tail)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		if fullBlock != nil {
-			response, err := blockToResponse(fullBlock, s.avmGasBurnActivationHeight)
+			response, err := s.restBlockToResponse(fullBlock)
 			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, response)
@@ -412,7 +488,13 @@ func isValidBlockID(id string) bool {
 // lookupBlockMem returns the block from the in-memory sliding window, or nil.
 func (s *Server) lookupBlockMem(id string) *core.Block {
 	if height, err := strconv.ParseUint(id, 10, 64); err == nil {
-		return s.chain.GetByHeight(height)
+		block := s.chain.GetByHeight(height)
+		if block != nil && s.blockStore != nil {
+			if _, _, err := s.canonicalBlockID(block); err != nil {
+				return nil
+			}
+		}
+		return block
 	}
 	raw, err := hex.DecodeString(id)
 	if err != nil || len(raw) != 32 {
@@ -420,7 +502,14 @@ func (s *Server) lookupBlockMem(id string) *core.Block {
 	}
 	var hash crypto.Hash32
 	copy(hash[:], raw)
-	return s.chain.GetByHash(hash)
+	block := s.chain.GetByHash(hash)
+	if block != nil && s.blockStore != nil {
+		canonicalHash, _, err := s.canonicalBlockID(block)
+		if err != nil || canonicalHash != hash {
+			return nil
+		}
+	}
+	return block
 }
 
 // lookupBlockFromDisk reads a block from LevelDB by height or hash string.
@@ -471,6 +560,19 @@ func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock
 		if err := json.Unmarshal(rawBytes, &b); err != nil {
 			return nil, nil, nil
 		}
+		canonicalHash, found, err := s.canonicalBlockID(&b)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			return nil, nil, nil
+		}
+		if _, heightErr := strconv.ParseUint(id, 10, 64); heightErr != nil {
+			rawID, decodeErr := hex.DecodeString(id)
+			if decodeErr != nil || len(rawID) != len(canonicalHash) || !bytes.Equal(rawID, canonicalHash[:]) {
+				return nil, nil, nil
+			}
+		}
 		return &b, nil, nil
 	}
 
@@ -479,6 +581,16 @@ func (s *Server) lookupBlockFromDisk(id string) (*core.Block, *store.StoredBlock
 		var sb store.StoredBlock
 		if err := json.Unmarshal(rawBytes, &sb); err != nil {
 			return nil, nil, nil
+		}
+		canonicalHash, err := s.canonicalPrunedBlockID(&sb)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, heightErr := strconv.ParseUint(id, 10, 64); heightErr != nil {
+			rawID, decodeErr := hex.DecodeString(id)
+			if decodeErr != nil || len(rawID) != len(canonicalHash) || !bytes.Equal(rawID, canonicalHash[:]) {
+				return nil, nil, nil
+			}
 		}
 		return nil, &sb, nil
 	}
@@ -523,24 +635,6 @@ func prunedBlockDetailResponse(sb *store.StoredBlock) map[string]interface{} {
 	}
 }
 
-// resolveBlock looks up a block by height or hash; writes error and returns nil on failure.
-// Kept for RPC handlers that don't need store fallback.
-func (s *Server) resolveBlock(w http.ResponseWriter, id string) *core.Block {
-	if b := s.lookupBlockMem(id); b != nil {
-		return b
-	}
-	// Validate id syntax before returning 404 vs 400.
-	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
-		raw, hexErr := hex.DecodeString(id)
-		if hexErr != nil || len(raw) != 32 {
-			writeJSONError(w, http.StatusBadRequest, "id must be a height (integer) or 64-hex-char hash")
-			return nil
-		}
-	}
-	writeJSONError(w, http.StatusNotFound, "block not found")
-	return nil
-}
-
 // BlockTxItem is one transaction summary inside a block.
 type BlockTxItem struct {
 	Hash        string `json:"hash"`
@@ -557,6 +651,11 @@ type BlockTxItem struct {
 
 // writeBlockTransactions writes the transactions of a block as JSON.
 func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
+	blockHash, _, err := s.canonicalBlockID(b)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	txs := make([]BlockTxItem, 0, len(b.Txs))
 	for i, tx := range b.Txs {
 		h := tx.Hash()
@@ -574,7 +673,7 @@ func (s *Server) writeBlockTransactions(w http.ResponseWriter, b *core.Block) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"block_hash":   fmt.Sprintf("%x", func() [32]byte { h := b.Hash(); return h }()),
+		"block_hash":   fmt.Sprintf("%x", blockHash[:]),
 		"block_height": b.Header.Height,
 		"tx_count":     len(txs),
 		"transactions": txs,
@@ -598,7 +697,11 @@ type BlockOutputItem struct {
 // Each output is identified by its one_time_pub_hex.  Pruned blocks (nil Txs) return
 // an empty list with pruned:true so the indexer can skip them gracefully.
 func (s *Server) writeBlockOutputs(w http.ResponseWriter, b *core.Block) {
-	bHash := b.Hash()
+	bHash, _, err := s.canonicalBlockID(b)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	items := make([]BlockOutputItem, 0)
 	for i, tx := range b.Txs {
 		txH := tx.Hash()
@@ -641,7 +744,11 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
 
 	tx, loc, ok := s.chain.GetTransaction(hash)
 	if ok {
-		bHash := loc.Block.Hash()
+		bHash, _, err := s.canonicalBlockID(loc.Block)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, TxResponse{
 			Hash:        hashStr,
 			BlockHash:   fmt.Sprintf("%x", bHash[:]),
@@ -690,7 +797,11 @@ func (s *Server) restTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		bHash := diskLoc.Block.Hash()
+		bHash, _, err := s.canonicalBlockID(diskLoc.Block)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, TxResponse{
 			Hash:        hashStr,
 			BlockHash:   fmt.Sprintf("%x", bHash[:]),
@@ -1018,6 +1129,7 @@ func (s *Server) restAddressScan(w http.ResponseWriter, r *http.Request, addrStr
 // Response:
 //   { "outputs": [...], "from_height": N, "next_height": M, "tip_height": T }
 
+// ScanOutput contains public output fields needed for client-side wallet scanning.
 type ScanOutput struct {
 	TxHash          string                `json:"tx_hash"`
 	OutIdx          int                   `json:"out_idx"`
@@ -1543,7 +1655,7 @@ func (s *Server) restFeeEstimate(w http.ResponseWriter, r *http.Request) {
 		txVersion = s.mempool.NextSpendVersion()
 	}
 	estimatedFeeNapro := core.ExportedEstimateFeeForVersion(txVersion, typicalInputs, typicalOutputs, baseFeePerByte)
-	txSizeBytes := int(estimatedFeeNapro / baseFeePerByte)
+	txSizeBytes := estimatedFeeNapro / baseFeePerByte
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"base_fee_per_byte":   baseFeePerByte,
@@ -1576,14 +1688,14 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 
 		// Count txs in last 10 blocks for TPS approximation
 		const window = 10
-		windowStart := int64(height) - window + 1
-		if windowStart < 0 {
-			windowStart = 0
+		windowStart := uint64(0)
+		if height >= window {
+			windowStart = height - window + 1
 		}
 		windowTxs := 0
 		windowBlocks := 0
-		for h2 := windowStart; h2 <= int64(height); h2++ {
-			b := s.chain.GetByHeight(uint64(h2))
+		for h2 := windowStart; ; h2++ {
+			b := s.chain.GetByHeight(h2)
 			if b != nil {
 				for txIdx, tx := range b.Txs {
 					// Skip block-reward coinbase (always index 0, no inputs).
@@ -1594,6 +1706,9 @@ func (s *Server) restNetworkStats(w http.ResponseWriter, r *http.Request) {
 					windowTxs++
 				}
 				windowBlocks++
+			}
+			if h2 == height {
+				break
 			}
 		}
 		// Use cached counter — maintained atomically as blocks arrive.
@@ -1698,25 +1813,25 @@ type validatorResponse struct {
 
 // unbondingEntryResponse is one entry in a validator's partial unbonding queue.
 type unbondingEntryResponse struct {
-	AmountNAPR     uint64  `json:"amount_napr"`
-	AmountAPR      float64 `json:"amount_apr"`
-	EndBlock       uint64  `json:"end_block"`
-	EndEstimatedMs int64   `json:"end_estimated_ms"` // wall-clock estimate at 1 block/s
+	AmountNAPR     uint64      `json:"amount_napr"`
+	AmountAPR      float64     `json:"amount_apr"`
+	EndBlock       uint64      `json:"end_block"`
+	EndEstimatedMs json.Number `json:"end_estimated_ms"` // exact numeric wall-clock estimate at 1 block/s
 }
 
 func validatorToResponse(e core.ValidatorEntry, currentHeight uint64, genesis crypto.Hash32, activation uint64, active bool) validatorResponse {
 	queue := make([]unbondingEntryResponse, 0, len(e.UnbondingQueue))
 	nowMs := time.Now().UnixMilli()
 	for _, ub := range e.UnbondingQueue {
-		blocksLeft := int64(0)
+		blocksLeft := uint64(0)
 		if ub.EndBlock > currentHeight {
-			blocksLeft = int64(ub.EndBlock - currentHeight)
+			blocksLeft = ub.EndBlock - currentHeight
 		}
 		queue = append(queue, unbondingEntryResponse{
 			AmountNAPR:     ub.Amount,
 			AmountAPR:      float64(ub.Amount) / 1e8,
 			EndBlock:       ub.EndBlock,
-			EndEstimatedMs: nowMs + blocksLeft*1000, // 1 block ≈ 1 second
+			EndEstimatedMs: estimatedUnbondTime(nowMs, blocksLeft),
 		})
 	}
 	pending := e.PendingUnbondingNAPR()
@@ -2106,8 +2221,17 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	if s.myKey == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"pub_key": nil})
+	state := s.localValidatorNetworkState()
+	if !state.KeyLoaded {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"pub_key":             nil,
+			"registered_active":   false,
+			"p2p_connected":       state.P2PConnected,
+			"online":              false,
+			"sync_healthy":        false,
+			"peer_count":          state.PeerCount,
+			"max_peer_lag_blocks": state.MaxPeerLagBlocks,
+		})
 		return
 	}
 	pub, identityErr := s.localValidatorIdentity(false)
@@ -2116,7 +2240,13 @@ func (s *Server) restMyValidator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pub_key": pub.Hex(),
+		"pub_key":             pub.Hex(),
+		"registered_active":   state.RegistryActive,
+		"p2p_connected":       state.P2PConnected,
+		"online":              state.Online,
+		"sync_healthy":        state.SyncHealthy,
+		"peer_count":          state.PeerCount,
+		"max_peer_lag_blocks": state.MaxPeerLagBlocks,
 	})
 }
 
@@ -3013,7 +3143,7 @@ func (s *Server) restAdminMint(w http.ResponseWriter, r *http.Request) {
 	if mintHeight > 0 {
 		mintBlind, err = crypto.DeterministicMintBlindV2(spendPub, amountNAPR, mintHeight)
 	} else {
-		mintBlind, err = crypto.DeterministicMintBlind(spendPub, amountNAPR)
+		mintBlind, err = crypto.LegacyMintBlind(spendPub, amountNAPR)
 	}
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "compute mint blind: "+err.Error())
@@ -3154,6 +3284,7 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(extraBytes) != core.StakePayloadSizeV2 &&
+		len(extraBytes) != core.StakePayloadSizeV4 &&
 		len(extraBytes) != core.StakeWithdrawalPayloadSizeV2 {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported stake payload length %d", len(extraBytes)))
 		return
@@ -3191,7 +3322,10 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 		Version: core.TxVersionStake,
 		Extra:   extraBytes,
 	}
-	if len(extraBytes) == core.StakeWithdrawalPayloadSizeV2 {
+	var broadcast func(*core.Transaction)
+	// V4 deposits require canonical ownership/spentness and activation checks.
+	// Keep this fail-closed even on servers without a mempool admission callback.
+	if len(extraBytes) == core.StakePayloadSizeV4 || len(extraBytes) == core.StakeWithdrawalPayloadSizeV2 {
 		if s.registry == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "validator registry unavailable")
 			return
@@ -3205,12 +3339,25 @@ func (s *Server) restStakeBroadcast(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if len(extraBytes) == core.StakePayloadSizeV4 {
+		s.broadcastTxMu.RLock()
+		broadcast = s.broadcastTxFn
+		s.broadcastTxMu.RUnlock()
+		if broadcast == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "P2P transaction broadcaster is not ready")
+			return
+		}
+	}
 	if err := s.mempool.Add(tx); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "mempool: "+err.Error())
 		return
 	}
 
 	txHash := tx.Hash()
+	if broadcast != nil {
+		s.hub.BroadcastTx(&tx)
+		broadcast(&tx)
+	}
 	txHashHex := fmt.Sprintf("%x", txHash[:])
 	s.log.Info("signed stake transaction broadcast", "tx_hash", txHashHex)
 
@@ -3238,9 +3385,9 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		height = tip.Header.Height
 	}
 	syncing := atomic.LoadInt32(&s.syncing) == 1
-	syncingHeight := atomic.LoadInt64(&s.syncingHeight)
-	tipHeight := atomic.LoadInt64(&s.tipHeight)
-	storeMissing := atomic.LoadInt64(&s.storeMissingBlocks)
+	syncingHeight := atomic.LoadUint64(&s.syncingHeight)
+	tipHeight := atomic.LoadUint64(&s.tipHeight)
+	storeMissing := atomic.LoadUint64(&s.storeMissingBlocks)
 	resp := map[string]interface{}{
 		"ok":                        true,
 		"height":                    height,
@@ -3252,10 +3399,14 @@ func (s *Server) restStatus(w http.ResponseWriter, r *http.Request) {
 		"startup_rescue":            atomic.LoadInt32(&s.startupRescue) == 1,
 		"phantom_ki_count":          atomic.LoadInt64(&s.phantomKICount),
 		"store_missing_blocks":      storeMissing,
-		"store_missing_first_block": atomic.LoadInt64(&s.storeMissingFirstBlock),
-		"store_missing_last_block":  atomic.LoadInt64(&s.storeMissingLastBlock),
+		"store_missing_first_block": atomic.LoadUint64(&s.storeMissingFirstBlock),
+		"store_missing_last_block":  atomic.LoadUint64(&s.storeMissingLastBlock),
 		"utxo_store_missing":        atomic.LoadInt64(&s.utxoStoreMissing),
 		"burn_address":              crypto.MainnetBurnAddress().String(),
+	}
+	// This is the local consensus schedule, not a claim about other peers.
+	if s.registry != nil {
+		resp["stake_key_image_v4_activation_height"] = s.registry.StakeKeyImageV4Activation()
 	}
 	if nextRestartAt := s.nextNightlyRestartAt(time.Now()); nextRestartAt != nil {
 		resp["next_restart_at"] = nextRestartAt.UTC().Format(time.RFC3339)

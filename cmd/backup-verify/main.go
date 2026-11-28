@@ -3,12 +3,14 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
@@ -32,17 +35,19 @@ type anchor struct {
 }
 
 type anchorsFile struct {
-	Schema      int      `json:"schema,omitempty"`
-	GenesisHash string   `json:"genesis_hash"`
-	Anchors     []anchor `json:"anchors"`
+	Schema           int      `json:"schema,omitempty"`
+	GenesisHash      string   `json:"genesis_hash"`
+	GenesisIndexHash string   `json:"genesis_index_hash,omitempty"`
+	Anchors          []anchor `json:"anchors"`
 }
 
 type proof struct {
-	Schema      int      `json:"schema"`
-	GenesisHash string   `json:"genesis_hash"`
-	TipHeight   uint64   `json:"tip_height"`
-	TipHash     string   `json:"tip_hash"`
-	Anchors     []anchor `json:"anchors"`
+	Schema           int      `json:"schema"`
+	GenesisHash      string   `json:"genesis_hash"`
+	GenesisIndexHash string   `json:"genesis_index_hash"`
+	TipHeight        uint64   `json:"tip_height"`
+	TipHash          string   `json:"tip_hash"`
+	Anchors          []anchor `json:"anchors"`
 }
 
 func main() {
@@ -130,19 +135,35 @@ func writeChainProof(dbPath, anchorsPath, outputPath, tipHash string, tipHeight 
 	if err != nil {
 		return fmt.Errorf("open closed chain.db read-only: %w", err)
 	}
-	defer db.Close()
+	defer checkedio.LogClose(slog.Default(), db, "proof source database")
 
-	genesisHash, found, err := db.GetCanonicalHash(0)
+	genesisIndexHash, found, err := db.GetCanonicalHash(0)
 	if err != nil {
 		return fmt.Errorf("read canonical genesis height index: %w", err)
 	}
-	if !found || genesisHash == (crypto.Hash32{}) {
+	if !found || genesisIndexHash == (crypto.Hash32{}) {
 		return errors.New("canonical genesis height index is missing or zero")
 	}
-	if fmt.Sprintf("%x", genesisHash[:]) != expected.GenesisHash {
-		return errors.New("captured genesis_hash does not match canonical stored height 0")
+	expectedIndexHash := expected.GenesisHash
+	if expected.GenesisIndexHash != "" {
+		if !validHash(expected.GenesisIndexHash) {
+			return errors.New("anchors genesis_index_hash must be 64 lowercase hexadecimal characters")
+		}
+		expectedIndexHash = expected.GenesisIndexHash
 	}
-	if err := verifyStoredBlock(db, genesisHash, 0, true); err != nil {
+	if fmt.Sprintf("%x", genesisIndexHash[:]) != expectedIndexHash {
+		return fmt.Errorf(
+			"captured genesis_index_hash %s does not match canonical stored height 0 %x",
+			expectedIndexHash,
+			genesisIndexHash[:],
+		)
+	}
+	expectedHeaderHash, err := hexHash(expected.GenesisHash)
+	if err != nil {
+		return fmt.Errorf("decode genesis_hash: %w", err)
+	}
+	genesisBlock, err := readCanonicalGenesis(db, genesisIndexHash, expectedHeaderHash)
+	if err != nil {
 		return fmt.Errorf("verify canonical genesis block: %w", err)
 	}
 
@@ -189,7 +210,9 @@ func writeChainProof(dbPath, anchorsPath, outputPath, tipHash string, tipHeight 
 			if indexedHash != expectedHash {
 				return fmt.Errorf("canonical ancestry is disconnected at height %d", height)
 			}
-			if height != tipHeight {
+			if height == 0 {
+				currentBlock = genesisBlock
+			} else if height != tipHeight {
 				currentBlock, err = readStoredBlock(db, indexedHash, height, false)
 				if err != nil {
 					return fmt.Errorf("verify required ancestry body at height %d: %w", height, err)
@@ -212,8 +235,9 @@ func writeChainProof(dbPath, anchorsPath, outputPath, tipHash string, tipHeight 
 	}
 
 	document := proof{
-		Schema: 1, GenesisHash: fmt.Sprintf("%x", genesisHash[:]),
-		TipHeight: tipHeight, TipHash: tipHash, Anchors: proofAnchors,
+		Schema: 2, GenesisHash: fmt.Sprintf("%x", expectedHeaderHash[:]),
+		GenesisIndexHash: fmt.Sprintf("%x", genesisIndexHash[:]),
+		TipHeight:        tipHeight, TipHash: tipHash, Anchors: proofAnchors,
 	}
 	return writeProofAtomic(outputPath, document)
 }
@@ -231,9 +255,49 @@ func hexHash(value string) (crypto.Hash32, error) {
 	return hash, nil
 }
 
-func verifyStoredBlock(db *store.DB, hash crypto.Hash32, height uint64, genesis bool) error {
-	_, err := readStoredBlock(db, hash, height, genesis)
-	return err
+func readCanonicalGenesis(db *store.DB, indexed, expectedHeaderHash crypto.Hash32) (*core.Block, error) {
+	raw, err := db.GetRawBlock(indexed)
+	if err != nil {
+		return nil, fmt.Errorf("read stored genesis body: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("stored genesis body is missing")
+	}
+	var block core.Block
+	if err := json.Unmarshal(raw, &block); err != nil {
+		return nil, fmt.Errorf("decode stored genesis body: %w", err)
+	}
+	header := &block.Header
+	if header.Height != 0 || !block.IsGenesis() || header.MerkleRoot != core.MerkleRoot(block.Txs) {
+		return nil, errors.New("stored genesis body has an invalid height, form, or Merkle root")
+	}
+	headerHash := block.Hash()
+	if headerHash != expectedHeaderHash {
+		return nil, fmt.Errorf("genesis header hash %x does not match captured hash %x", headerHash[:], expectedHeaderHash[:])
+	}
+	if headerHash == indexed {
+		if !header.VerifySignature() {
+			return nil, errors.New("modern-indexed genesis signature is invalid")
+		}
+		return &block, nil
+	}
+	if header.PrevHash != (crypto.Hash32{}) || header.OraclePrice != 0 || header.BaseFee != 0 {
+		return nil, errors.New("legacy-indexed genesis has unexpected modern header fields")
+	}
+	if legacyGenesisID(header) != indexed || !header.ValidatorPub.Verify(indexed, header.Signature) {
+		return nil, errors.New("legacy genesis index or signature is invalid")
+	}
+	return &block, nil
+}
+
+func legacyGenesisID(header *core.BlockHeader) crypto.Hash32 {
+	var height, timestamp [8]byte
+	var round [4]byte
+	binary.LittleEndian.PutUint64(height[:], header.Height)
+	binary.LittleEndian.PutUint64(timestamp[:], uint64(header.Timestamp)) // #nosec G115 -- Preserve the canonical signed timestamp's two's-complement wire bits.
+	binary.LittleEndian.PutUint32(round[:], header.Round)
+	return crypto.HashBytes(height[:], header.PrevHash[:], header.MerkleRoot[:],
+		timestamp[:], round[:], header.ValidatorPub)
 }
 
 func readStoredBlock(db *store.DB, hash crypto.Hash32, height uint64, genesis bool) (*core.Block, error) {
@@ -257,12 +321,13 @@ func readStoredBlock(db *store.DB, hash crypto.Hash32, height uint64, genesis bo
 	return &block, nil
 }
 
-func readAnchors(path string) (anchorsFile, error) {
+func readAnchors(path string) (_ anchorsFile, readCloseErr error) {
+	// #nosec G304 -- Offline CLI input explicitly selected by the operator, not an HTTP-supplied filename.
 	file, err := os.Open(path)
 	if err != nil {
 		return anchorsFile{}, fmt.Errorf("open anchors file: %w", err)
 	}
-	defer file.Close()
+	defer checkedio.CloseReadResult(file, &readCloseErr)
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	var result anchorsFile
@@ -279,8 +344,8 @@ func readAnchors(path string) (anchorsFile, error) {
 	if result.Anchors == nil {
 		return anchorsFile{}, errors.New("anchors file must contain an anchors array")
 	}
-	if result.Schema != 0 && result.Schema != 1 {
-		return anchorsFile{}, errors.New("anchors file schema, when present, must be 1")
+	if result.Schema != 0 && result.Schema != 1 && result.Schema != 2 {
+		return anchorsFile{}, errors.New("anchors file schema, when present, must be 1 or 2")
 	}
 	return result, nil
 }
@@ -314,20 +379,17 @@ func writeProofAtomic(path string, document proof) error {
 		return fmt.Errorf("create proof temporary file: %w", err)
 	}
 	tempPath := file.Name()
-	defer os.Remove(tempPath)
+	defer checkedio.LogRemoveStaging(slog.Default(), tempPath)
 	if err := file.Chmod(0600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("secure proof temporary file: %w", err)
+		return fmt.Errorf("secure proof temporary file: %w", errors.Join(err, file.Close()))
 	}
 	encoder := json.NewEncoder(file)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(document); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("encode proof: %w", err)
+		return fmt.Errorf("encode proof: %w", errors.Join(err, file.Close()))
 	}
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync proof: %w", err)
+		return fmt.Errorf("sync proof: %w", errors.Join(err, file.Close()))
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close proof: %w", err)
@@ -335,11 +397,12 @@ func writeProofAtomic(path string, document proof) error {
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("publish proof atomically: %w", err)
 	}
+	// #nosec G304 -- Directory of the operator-selected proof output; opened for durability sync, never selected by a remote request.
 	dir, err := os.Open(directory)
 	if err != nil {
 		return fmt.Errorf("open proof directory: %w", err)
 	}
-	defer dir.Close()
+	defer checkedio.LogClose(slog.Default(), dir, "published proof directory")
 	if err := dir.Sync(); err != nil {
 		return fmt.Errorf("sync proof directory: %w", err)
 	}
@@ -449,12 +512,13 @@ func verifyLegacyStage(root string) (string, uint64, error) {
 	return fmt.Sprintf("%x", tipHash[:]), tipHeight, nil
 }
 
-func readManifest(path string) (manifest, error) {
+func readManifest(path string) (_ manifest, readCloseErr error) {
+	// #nosec G304 -- Offline CLI manifest explicitly selected by the operator.
 	f, err := os.Open(path)
 	if err != nil {
 		return manifest{}, fmt.Errorf("open manifest.json: %w", err)
 	}
-	defer f.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
 
 	decoder := json.NewDecoder(f)
 	decoder.UseNumber()

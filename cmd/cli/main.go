@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 	"github.com/aperod/aperod/wallet"
 )
@@ -38,11 +40,12 @@ func rpcCall(endpoint, method string, params interface{}) (json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
+	// #nosec G107 -- The local CLI operator explicitly selects the node endpoint; contacting that endpoint is this command's purpose.
 	resp, err := http.Post(endpoint, "application/json", bytes.NewReader(body)) //nolint:noctx
 	if err != nil {
 		return nil, fmt.Errorf("RPC request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer checkedio.LogClose(slog.Default(), resp.Body, "RPC response body")
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("RPC read body: %w", err)
@@ -100,7 +103,7 @@ func init() {
 // readPassword reads a password from the terminal without echoing.
 func readPassword(prompt string) (string, error) {
 	fmt.Print(prompt)
-	pw, err := term.ReadPassword(int(syscall.Stdin))
+	pw, err := term.ReadPassword(syscall.Stdin)
 	fmt.Println()
 	if err != nil {
 		return "", err
@@ -340,12 +343,12 @@ var walletUnlockCmd = &cobra.Command{
 	Use:   "unlock [keystore-file]",
 	Short: "Decrypt a keystore file and show wallet info",
 	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) (readCloseErr error) {
 		file, err := os.Open(args[0])
 		if err != nil {
 			return fmt.Errorf("read keystore: %w", err)
 		}
-		defer file.Close()
+		defer checkedio.CloseReadResult(file, &readCloseErr)
 
 		ks, err := wallet.UnmarshalKeystoreReader(file)
 		if err != nil {
@@ -518,9 +521,7 @@ var txSendCmd = &cobra.Command{
 	Short: "Send APRO to an address",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		to, _ := cmd.Flags().GetString("to")
-		amount, _ := cmd.Flags().GetFloat64("amount")
-		rpc, _ := cmd.Flags().GetString("rpc")
-		keyFile, _ := cmd.Flags().GetString("key-file")
+		amount, _ := cmd.Flags().GetString("amount")
 
 		if to == "" {
 			return fmt.Errorf("--to is required")
@@ -528,15 +529,10 @@ var txSendCmd = &cobra.Command{
 		if err := crypto.Validate(crypto.Address(to)); err != nil {
 			return fmt.Errorf("invalid recipient address: %w", err)
 		}
-		if amount <= 0 {
-			return fmt.Errorf("--amount must be positive")
+		if _, err := parseAPROAmount(amount); err != nil {
+			return fmt.Errorf("--amount: %w", err)
 		}
-
-		fmt.Printf("Sending %.8f APRO → %s\n", amount, to)
-		fmt.Printf("RPC: %s | Key: %s\n", rpc, keyFile)
-		// TODO Phase 1.4 / Phase 2: build and broadcast RingCT transaction
-		fmt.Println("Transaction submitted. Hash: 0x0000...0000 (placeholder)")
-		return nil
+		return fmt.Errorf("local CLI transaction sending is not implemented; no transaction was submitted")
 	},
 }
 
@@ -557,6 +553,7 @@ var validatorProveSessionCmd = &cobra.Command{
 		if challengePath == "" || keyPath == "" || outPath == "" {
 			return fmt.Errorf("--challenge, --key-file and --out are required")
 		}
+		// #nosec G304 -- Explicit local challenge-file flag supplied by the CLI operator.
 		body, err := os.ReadFile(challengePath)
 		if err != nil {
 			return fmt.Errorf("read challenge: %w", err)
@@ -584,6 +581,7 @@ var validatorProveSessionCmd = &cobra.Command{
 		if !bytes.Equal(computed[:], hashRaw) {
 			return fmt.Errorf("challenge fields do not match message_hash")
 		}
+		// #nosec G304 -- Explicit local signing-key file selected by the CLI operator.
 		keyRaw, err := os.ReadFile(keyPath)
 		if err != nil {
 			return fmt.Errorf("read validator key: %w", err)
@@ -628,6 +626,7 @@ var validatorApproveLPoDExitCmd = &cobra.Command{
 		if challengePath == "" || keyPath == "" || outPath == "" {
 			return fmt.Errorf("--challenge, --key-file and --out are required")
 		}
+		// #nosec G304 -- Explicit local challenge-file flag supplied by the CLI operator.
 		body, err := os.ReadFile(challengePath)
 		if err != nil {
 			return fmt.Errorf("read challenge: %w", err)
@@ -712,6 +711,7 @@ var validatorApproveLPoDExitCmd = &cobra.Command{
 		}
 		var ref crypto.Hash32
 		copy(ref[:], refRaw)
+		// #nosec G304 -- Explicit local signing-key file selected by the CLI operator.
 		keyRaw, err := os.ReadFile(keyPath)
 		if err != nil {
 			return fmt.Errorf("read validator key: %w", err)
@@ -773,7 +773,7 @@ validator key configured; this command calls its admin REST endpoint.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		nodeURL, _ := cmd.Flags().GetString("node")
 		pubKey, _ := cmd.Flags().GetString("pub-key")
-		amount, _ := cmd.Flags().GetFloat64("amount")
+		amountText, _ := cmd.Flags().GetString("amount")
 
 		if pubKey == "" {
 			return fmt.Errorf("--pub-key is required (64-hex validator public key)")
@@ -784,23 +784,23 @@ validator key configured; this command calls its admin REST endpoint.`,
 		if _, err := hex.DecodeString(pubKey); err != nil {
 			return fmt.Errorf("--pub-key is not valid hex: %w", err)
 		}
-		if amount <= 0 {
-			return fmt.Errorf("--amount must be a positive number of APRO")
+		amountNAPR, err := parseAPROAmount(amountText)
+		if err != nil {
+			return fmt.Errorf("--amount: %w", err)
 		}
-
-		amountNAPR := uint64(amount * 1e8)
 		payload := fmt.Sprintf(`{"pub_key":"%s","amount_napr":%d}`, pubKey, amountNAPR)
 
 		url := strings.TrimRight(nodeURL, "/") + "/api/v1/admin/partial-unstake"
 		fmt.Printf("Submitting partial-unstake to %s\n", url)
 		fmt.Printf("  pub_key    : %s…%s\n", pubKey[:8], pubKey[56:])
-		fmt.Printf("  amount     : %.8f APRO (%d nAPRO)\n", amount, amountNAPR)
+		fmt.Printf("  amount     : %s APRO (%d nAPRO)\n", formatAPROAmount(amountNAPR), amountNAPR)
 
+		// #nosec G107 -- Operator-selected node RPC endpoint in a local CLI, not a remote request-controlled server-side URL.
 		httpResp, err := http.Post(url, "application/json", strings.NewReader(payload)) //nolint:noctx
 		if err != nil {
 			return fmt.Errorf("partial-unstake request failed: %w", err)
 		}
-		defer httpResp.Body.Close()
+		defer checkedio.LogClose(slog.Default(), httpResp.Body, "partial-unstake response body")
 		body, _ := io.ReadAll(httpResp.Body)
 		if httpResp.StatusCode != 200 {
 			return fmt.Errorf("partial-unstake: server returned %d — %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
@@ -867,7 +867,7 @@ Your private key is never sent to the node.`,
 		privKeyHex, _ := cmd.Flags().GetString("priv-key")
 		utxoTxHashHex, _ := cmd.Flags().GetString("utxo-txhash")
 		utxoIdx, _ := cmd.Flags().GetUint32("utxo-idx")
-		amountAPR, _ := cmd.Flags().GetFloat64("amount")
+		amountText, _ := cmd.Flags().GetString("amount")
 
 		// ── 1. Parse private key and derive public key ────────────────────────
 		if privKeyHex == "" {
@@ -898,20 +898,21 @@ Your private key is never sent to the node.`,
 		var burnTxHash crypto.Hash32
 		copy(burnTxHash[:], txHashRaw)
 
-		if amountAPR <= 0 {
-			return fmt.Errorf("--amount must be a positive number of APRO (e.g. 100000)")
+		amountNAPR, err := parseAPROAmount(amountText)
+		if err != nil {
+			return fmt.Errorf("--amount: %w", err)
 		}
-		amountNAPR := uint64(amountAPR * 1e8)
 
 		// ── 3. Fetch UTXO from the node ───────────────────────────────────────
 		utxoURL := fmt.Sprintf("%s/api/v1/utxo/%s/%d",
 			strings.TrimRight(nodeURL, "/"), utxoTxHashHex, utxoIdx)
 		fmt.Printf("Fetching UTXO from %s ...\n", utxoURL)
+		// #nosec G107 -- Read from the node endpoint explicitly selected by the local CLI operator.
 		utxoResp, err := http.Get(utxoURL) //nolint:noctx
 		if err != nil {
 			return fmt.Errorf("fetch UTXO: %w", err)
 		}
-		defer utxoResp.Body.Close()
+		defer checkedio.LogClose(slog.Default(), utxoResp.Body, "stake collateral response body")
 		utxoBody, _ := io.ReadAll(utxoResp.Body)
 		if utxoResp.StatusCode != 200 {
 			errMsg := strings.TrimSpace(string(utxoBody))
@@ -920,11 +921,11 @@ Your private key is never sent to the node.`,
 			if strings.Contains(errMsg, "pruning mode") || strings.Contains(errMsg, "pruned") {
 				return fmt.Errorf("UTXO not found (%d): %s\n\n"+
 					"Hint: Use an archive node (pruning.mode: archive in node.yaml) or "+
-					"acquire a UTXO from a recent block to stake.",
+					"acquire a UTXO from a recent block to stake",
 					utxoResp.StatusCode, errMsg)
 			}
 			return fmt.Errorf("UTXO not found (%d): %s\n"+
-				"  Check --utxo-txhash / --utxo-idx and ensure the UTXO is unspent.",
+				"  Check --utxo-txhash / --utxo-idx and ensure the UTXO is unspent",
 				utxoResp.StatusCode, errMsg)
 		}
 		var utxoData struct {
@@ -949,7 +950,7 @@ Your private key is never sent to the node.`,
 						"   The node cannot verify the original commitment before "+
 						"unbonding completes, which would break the unbonding flow.\n"+
 						"   Use a UTXO from a more recent block, or switch to an "+
-						"archive node (pruning.mode: archive in node.yaml).",
+						"archive node (pruning.mode: archive in node.yaml)",
 					bup, core.PartialUnbondingBlocks,
 				)
 			}
@@ -975,7 +976,7 @@ Your private key is never sent to the node.`,
 		// the wallet spend pub key, so spendPub = validatorPub bytes.
 		var spendPub crypto.Point32
 		copy(spendPub[:], []byte(pubKey))
-		burnBlind, err := crypto.DeterministicMintBlind(spendPub, amountNAPR)
+		burnBlind, err := crypto.LegacyMintBlind(spendPub, amountNAPR)
 		if err != nil {
 			return fmt.Errorf("derive blinding factor: %w", err)
 		}
@@ -992,7 +993,7 @@ Your private key is never sent to the node.`,
 					"  on-chain : %x\n"+
 					"  derived  : %x\n\n"+
 					"Ensure --amount exactly matches the UTXO output amount and that the UTXO\n"+
-					"was created by a coinbase mint to the address derived from --priv-key.",
+					"was created by a coinbase mint to the address derived from --priv-key",
 				onChainCommit[:], expectedCommit[:],
 			)
 		}
@@ -1021,7 +1022,7 @@ Your private key is never sent to the node.`,
 
 		fmt.Println()
 		fmt.Printf("  validator pub  : %s…%s\n", pubKeyHex[:8], pubKeyHex[56:])
-		fmt.Printf("  amount         : %.8f APRO (%d nAPRO)\n", amountAPR, amountNAPR)
+		fmt.Printf("  amount         : %s APRO (%d nAPRO)\n", formatAPROAmount(amountNAPR), amountNAPR)
 		fmt.Printf("  utxo_txhash    : %s…%s\n", utxoTxHashHex[:8], utxoTxHashHex[56:])
 		fmt.Printf("  utxo_out_idx   : %d\n", utxoIdx)
 		fmt.Printf("Broadcasting to %s ...\n", broadcastURL)
@@ -1036,7 +1037,7 @@ Your private key is never sent to the node.`,
 		if err != nil {
 			return fmt.Errorf("broadcast stake tx: %w", err)
 		}
-		defer httpResp.Body.Close()
+		defer checkedio.LogClose(slog.Default(), httpResp.Body, "stake submission response body")
 		body, _ := io.ReadAll(httpResp.Body)
 		if httpResp.StatusCode != 201 && httpResp.StatusCode != 200 {
 			errMsg := strings.TrimSpace(string(body))
@@ -1044,7 +1045,7 @@ Your private key is never sent to the node.`,
 			if strings.Contains(errMsg, "pruning mode") || strings.Contains(errMsg, "pruned") {
 				return fmt.Errorf("broadcast failed (%d): %s\n\n"+
 					"Hint: Use an archive node (pruning.mode: archive in node.yaml) or "+
-					"acquire a UTXO from a recent block to stake.",
+					"acquire a UTXO from a recent block to stake",
 					httpResp.StatusCode, errMsg)
 			}
 			return fmt.Errorf("broadcast failed (%d): %s",
@@ -1065,7 +1066,7 @@ Your private key is never sent to the node.`,
 
 func init() {
 	txSendCmd.Flags().String("to", "", "Recipient Aperod address")
-	txSendCmd.Flags().Float64("amount", 0, "Amount in APRO")
+	txSendCmd.Flags().String("amount", "0", "Exact decimal amount in APRO")
 	txSendCmd.Flags().String("rpc", "http://localhost:8545", "RPC endpoint")
 	txSendCmd.Flags().String("key-file", "", "Wallet keystore file")
 	txCmd.AddCommand(txSendCmd)
@@ -1073,7 +1074,7 @@ func init() {
 	// validator partial-unstake
 	validatorPartialUnstakeCmd.Flags().String("node", "http://localhost:8080", "Node admin REST URL")
 	validatorPartialUnstakeCmd.Flags().String("pub-key", "", "Validator public key (64-hex)")
-	validatorPartialUnstakeCmd.Flags().Float64("amount", 0, "Amount to withdraw in APRO")
+	validatorPartialUnstakeCmd.Flags().String("amount", "0", "Exact decimal amount to withdraw in APRO")
 	validatorCmd.AddCommand(validatorPartialUnstakeCmd)
 	validatorProveSessionCmd.Flags().String("challenge", "", "Downloaded website challenge JSON")
 	validatorProveSessionCmd.Flags().String("key-file", "", "Local validator private-key file (raw or hex)")
@@ -1090,7 +1091,7 @@ func init() {
 	validatorStakeCmd.Flags().String("priv-key", "", "Validator private key (64-hex Ed25519) — never sent to the node")
 	validatorStakeCmd.Flags().String("utxo-txhash", "", "64-hex hash of the UTXO transaction to burn as stake proof")
 	validatorStakeCmd.Flags().Uint32("utxo-idx", 0, "Output index within the UTXO transaction (default 0)")
-	validatorStakeCmd.Flags().Float64("amount", 0, "Amount to stake in APRO (e.g. 100000)")
+	validatorStakeCmd.Flags().String("amount", "0", "Exact decimal amount to stake in APRO (e.g. 100000)")
 	validatorCmd.AddCommand(validatorStakeCmd)
 
 	rootCmd.AddCommand(validatorCmd)
@@ -1141,7 +1142,7 @@ var chainExportCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("open db: %w", err)
 		}
-		defer db.Close()
+		defer checkedio.LogClose(slog.Default(), db, "chain export database")
 
 		_, tipHeight, err := db.GetTip()
 		if err != nil {
@@ -1169,6 +1170,7 @@ var chainExportCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("marshal: %w", err)
 		}
+		// #nosec G306 -- This intentionally shareable export contains canonical public blocks, not wallet keys or private shares.
 		if err := os.WriteFile(outFile, out, 0644); err != nil {
 			return fmt.Errorf("write %s: %w", outFile, err)
 		}
@@ -1185,6 +1187,7 @@ var chainImportCmd = &cobra.Command{
 		inFile := args[0]
 		dataDir, _ := cmd.Flags().GetString("data-dir")
 
+		// #nosec G304 -- Chain import intentionally reads the operator-selected local input file.
 		raw, err := os.ReadFile(inFile)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", inFile, err)
@@ -1206,7 +1209,7 @@ var chainImportCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("open db: %w", err)
 		}
-		defer db.Close()
+		defer checkedio.LogClose(slog.Default(), db, "chain import database")
 
 		_, existingTip, _ := db.GetTip()
 		if existingTip > 0 {

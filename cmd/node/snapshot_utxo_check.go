@@ -22,6 +22,10 @@ import (
 // nonValidator=true applies a minimum tolerance floor of 10 % so that relay
 // nodes bootstrapped via rsync (whose DB metadata belongs to a different chain
 // history) do not silently reject a valid snapshot.
+// Count metadata is advisory: absence or divergence does not independently
+// invalidate a tip-bound snapshot. Retain the predicate used by startup callers.
+//
+//nolint:unparam // Preserve the advisory startup contract; do not introduce count-based rejection for a lint cleanup.
 func checkSnapshotUTXOCount(
 	db *store.DB,
 	snapUTXOCount int,

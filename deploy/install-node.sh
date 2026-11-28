@@ -416,14 +416,12 @@ else
   echo
 
   # ── Safe-mode guard ──────────────────────────────────────────────────────────
-  # Set consensus.non_validator: true so the node cannot produce blocks (and
-  # therefore cannot mine an incompatible genesis) even if the operator ignores
-  # the warning above and manually enables the systemd unit before running
-  # aperod-join.sh.  aperod-join.sh unsets this field after the correct
-  # chain.db is in place and the bootnode has been configured.
+  # Set consensus.non_validator: true so the node cannot produce blocks before
+  # canonical mainnet identity, validator membership, and stake are verified.
   # The field must be nested under the `consensus:` key to match the Go struct
   # (config.ConsensusConfig.NonValidator yaml:"non_validator").
-  info "Устанавливаем consensus.non_validator: true (режим реле до выполнения aperod-join.sh)…"
+  info "Устанавливаем consensus.non_validator: true (безопасная синхронизация до проверки mainnet)…"
+  info "Setting consensus.non_validator: true (safe sync mode until mainnet is verified)…"
   if [[ -x "${SCRIPT_DIR}/node-config.sh" ]]; then
     APEROD_CONFIG="${CONFIG_DIR}/node.yaml" bash "${SCRIPT_DIR}/node-config.sh" \
       set-field consensus.non_validator true \
@@ -445,7 +443,8 @@ os.replace(tmp, cfg_path)
 print('[OK]   consensus.non_validator: true written to', cfg_path)
 PY
   fi
-  ok "consensus.non_validator: true — нода не будет производить блоки до aperod-join.sh"
+  ok "Нода останется в безопасном режиме до проверки genesis и допуска валидатора."
+  ok "The node stays in safe mode until genesis and validator eligibility are verified."
 fi
 
 # ── 9. Firewall ────────────────────────────────────────────
@@ -475,6 +474,9 @@ LimitCORE=0
 ExecStart=/usr/local/bin/aperod-node --config ${CONFIG_DIR}/node.yaml
 Restart=always
 RestartSec=5
+# A missing authenticated mainnet identity is a permanent config refusal
+# (EX_CONFIG=78), not a transient crash. Keep this visible without retry loops.
+RestartPreventExitStatus=78
 StartLimitBurst=5
 StartLimitIntervalSec=60
 LimitNOFILE=65536

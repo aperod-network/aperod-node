@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 // makeSnap builds a minimal startupSnapshot at the given height.
@@ -265,11 +266,11 @@ func writeGzipSnapFile(t *testing.T, path string, snap startupSnapshot) {
 	}
 	gz := gzip.NewWriter(f)
 	if encErr := json.NewEncoder(gz).Encode(snap); encErr != nil {
-		f.Close()
+		testutil.Close(t, f)
 		t.Fatalf("encode %s: %v", path, encErr)
 	}
 	if gzErr := gz.Close(); gzErr != nil {
-		f.Close()
+		testutil.Close(t, f)
 		t.Fatalf("gzip close %s: %v", path, gzErr)
 	}
 	if fErr := f.Close(); fErr != nil {

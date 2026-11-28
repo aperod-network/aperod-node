@@ -9,10 +9,11 @@ import (
 	"os"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/checkedio"
 	"github.com/aperod/aperod/store"
 )
 
-func run() error {
+func run() (readCloseErr error) {
 	path := flag.String("copied-db", "", "path to an isolated LevelDB copy")
 	sampleBlocks := flag.Uint64("sample-blocks", 128, "number of most recent canonical bodies to verify (max 50000)")
 	sampleEnd := flag.Uint64("sample-end-height", 0, "end of sample; zero means copied database tip")
@@ -31,7 +32,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer checkedio.CloseReadResult(db, &readCloseErr)
 
 	tip, height, err := db.GetTip()
 	if err != nil {

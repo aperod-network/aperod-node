@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 func TestFinalityCommitteeSnapshotIsDurableAndImmutable(t *testing.T) {
@@ -37,7 +38,7 @@ func TestFinalityCommitteeSnapshotIsDurableAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	got, err := db.LoadFinalityCommitteeSnapshot(snapshot.Epoch)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +94,7 @@ func TestFinalityVoteJournalAndEquivocationEvidencePersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	votes, err := db.LoadFinalityVotes(5, 5)
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +127,7 @@ func TestFinalityCertificatesAreAddressableByHeight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 	validator := crypto.ValidatorPubKey(make([]byte, 32))
 	validator[31] = 1
 	certificate := func(height uint64) FinalityCertificate {

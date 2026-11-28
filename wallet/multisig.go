@@ -1,6 +1,6 @@
 package wallet
 
-// multisig.go — 2-of-3 Shamir threshold signature scheme (block 3.3).
+// multisig.go — 2-of-3 Shamir key reconstruction, not threshold signing.
 //
 // Model: Trusted Dealer.  One party runs MultisigSetup to split the combined
 // spend key into 3 shares using a degree-1 polynomial over the Ed25519 scalar
@@ -13,9 +13,11 @@ package wallet
 //  3. The caller uses the reconstructed scalar to sign with crypto.MLSAGSign.
 //
 // Security note:
-//   This implementation is correct but uses a trusted-dealer setup.  A production
-//   deployment should replace the dealer with a Distributed Key Generation (DKG)
-//   protocol so that no single party ever holds the combined secret.
+//   The dealer and the combining caller hold the full spend private key. Two
+//   shares authorize reconstruction, not a transaction-scoped partial signature.
+//   Never send shares or PartialSig values to an untrusted signing coordinator.
+//   DKG alone would not remove reconstruction during signing: that requires a
+//   separately designed and reviewed distributed threshold-signing protocol.
 
 import (
 	"crypto/rand"

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aperod/aperod/config"
 	"github.com/aperod/aperod/crypto"
 )
 
@@ -57,6 +58,7 @@ func TestBuildValidatorList_NonValidatorMode_UsesGenesisKeys(t *testing.T) {
 
 	// ── Call the production wiring function ───────────────────────────────────
 	validators, err := buildValidatorList(
+		config.Testnet,
 		true,                 // nonValidator = true
 		[]string{genesisHex}, // genesis config validators (as hex)
 		myKey,                // node's own identity key
@@ -100,6 +102,7 @@ func TestBuildValidatorList_ValidatorMode_UsesOwnKey(t *testing.T) {
 	defer myKey.Destroy()
 
 	validators, err := buildValidatorList(
+		config.Testnet,
 		false,      // nonValidator = false (validator mode)
 		[]string{}, // genesis config validators unused in this mode
 		myKey,
@@ -121,7 +124,7 @@ func TestBuildValidatorList_NonValidatorSkipsZeroPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	validators, err := buildValidatorList(true,
+	validators, err := buildValidatorList(config.Testnet, true,
 		[]string{strings.Repeat("0", 64), hex.EncodeToString(realPub)}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +159,7 @@ func TestBuildValidatorList_NonValidatorMode_MultipleKeys(t *testing.T) {
 	}
 	defer myKey.Destroy()
 
-	validators, err := buildValidatorList(true, genesisHexKeys, myKey)
+	validators, err := buildValidatorList(config.Testnet, true, genesisHexKeys, myKey)
 	if err != nil {
 		t.Fatalf("buildValidatorList: %v", err)
 	}
@@ -166,6 +169,33 @@ func TestBuildValidatorList_NonValidatorMode_MultipleKeys(t *testing.T) {
 	for i, want := range genesisPubs {
 		if !validators[i].Equals(want) {
 			t.Errorf("validator[%d]: expected genesis key %s, got %s", i, want.ID(), validators[i].ID())
+		}
+	}
+}
+
+func TestBuildValidatorList_MainnetJoiningKeyHasNoGenesisStake(t *testing.T) {
+	priv, pub, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := crypto.NewLockedValidatorKey(priv.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Destroy()
+	_, genesis, err := crypto.GenerateValidatorKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nonValidator := range []bool{true, false} {
+		configured := []string{hex.EncodeToString(genesis)}
+		got, err := buildValidatorList(config.Mainnet, nonValidator, configured, local)
+		if err != nil || len(got) != 1 || !got[0].Equals(genesis) || got[0].Equals(pub) {
+			t.Fatalf("non-validator=%t: expected only the canonical genesis key, got %v (%v)", nonValidator, got, err)
+		}
+		got, err = buildValidatorList(config.Mainnet, nonValidator, nil, local)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("non-validator=%t: empty genesis injected a local validator: %v (%v)", nonValidator, got, err)
 		}
 	}
 }

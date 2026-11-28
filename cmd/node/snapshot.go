@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/core"
+	"github.com/aperod/aperod/internal/checkedio"
 )
 
 // staleTmpMaxAge is the age after which a leftover .tmp file from an atomic
@@ -134,7 +135,7 @@ func cleanShutdownMarkerPath(dataDir string) string {
 // next startup can skip the OOM-window AmountCommit validation.  Non-fatal on
 // error: an absent marker causes validation to run (fail-closed behavior).
 func writeCleanShutdownMarker(dataDir string) error {
-	return os.WriteFile(cleanShutdownMarkerPath(dataDir), []byte("1\n"), 0644)
+	return os.WriteFile(cleanShutdownMarkerPath(dataDir), []byte("1\n"), 0600)
 }
 
 // readAndDeleteCleanShutdownMarker returns true when the clean-shutdown marker
@@ -202,12 +203,11 @@ func snapshotChecksumPath(path string) string {
 func writeSnapshotChecksum(path string, digest []byte) error {
 	chkPath := snapshotChecksumPath(path)
 	tmp := chkPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(digest)+"\n"), 0644); err != nil {
+	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(digest)+"\n"), 0600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, chkPath); err != nil {
-		os.Remove(tmp)
-		return err
+		return errors.Join(err, os.Remove(tmp))
 	}
 	return nil
 }
@@ -297,28 +297,47 @@ func verifySnapshotChecksum(f *os.File, path string) error {
 
 // copyFile copies src to dst atomically via a temporary file + rename.
 func copyFile(src, dst string) error {
+	// #nosec G304 -- Node-internal snapshot/backup paths derived from its operator-configured data directory.
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	return copySnapshotFromReader(in, dst)
+}
+
+// copySnapshotFromReader owns in. All close failures are resolved before the
+// temporary file can replace dst, including errors from the read-only source.
+func copySnapshotFromReader(in io.ReadCloser, dst string) (copyErr error) {
+	inputClosed := false
+	defer func() {
+		if !inputClosed {
+			copyErr = errors.Join(copyErr, in.Close())
+		}
+	}()
 
 	tmp := dst + ".tmp"
+	// #nosec G304 -- Fixed temporary sibling of a node-internal snapshot backup destination.
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
+		return errors.Join(err, out.Close(), os.Remove(tmp))
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
+		return errors.Join(err, os.Remove(tmp))
 	}
-	return os.Rename(tmp, dst)
+	// Close the owned reader before publication. A deferred close error must
+	// not turn an already-published backup into an apparently failed copy.
+	inputClosed = true
+	if err := in.Close(); err != nil {
+		return errors.Join(err, os.Remove(tmp))
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return errors.Join(err, os.Remove(tmp))
+	}
+	return nil
 }
 
 // saveStartupSnapshot writes snap to disk as gzip-compressed JSON atomically
@@ -392,6 +411,7 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 		}
 	}
 
+	// #nosec G304 -- Height-derived snapshot staging name in the operator-configured data directory.
 	f, err := os.Create(tmp)
 	if err != nil {
 		return fmt.Errorf("create snapshot tmp: %w", err)
@@ -404,16 +424,13 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	gzCloseErr := gz.Close()
 	fCloseErr := f.Close()
 	if encErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("encode snapshot: %w", encErr)
+		return fmt.Errorf("encode snapshot: %w", errors.Join(encErr, gzCloseErr, fCloseErr, os.Remove(tmp)))
 	}
 	if gzCloseErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close gzip writer: %w", gzCloseErr)
+		return fmt.Errorf("close gzip writer: %w", errors.Join(gzCloseErr, fCloseErr, os.Remove(tmp)))
 	}
 	if fCloseErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close snapshot tmp: %w", fCloseErr)
+		return fmt.Errorf("close snapshot tmp: %w", errors.Join(fCloseErr, os.Remove(tmp)))
 	}
 
 	// Staged publication (fail-closed): write the SHA-256 sidecar BEFORE
@@ -426,12 +443,10 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 	// content — verification fails and loaders fall back to the prev backup
 	// promoted above, rather than serving a file of unproven integrity.
 	if chkErr := writeSnapshotChecksum(path, hasher.Sum(nil)); chkErr != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("write snapshot checksum sidecar: %w", chkErr)
+		return fmt.Errorf("write snapshot checksum sidecar: %w", errors.Join(chkErr, os.Remove(tmp)))
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename snapshot: %w", err)
+		return fmt.Errorf("rename snapshot: %w", errors.Join(err, os.Remove(tmp)))
 	}
 	return nil
 }
@@ -440,6 +455,7 @@ func saveStartupSnapshot(dataDir string, snap startupSnapshot) error {
 // the underlying *os.File (for deferred Close) and a *gzip.Reader.
 // Caller must close gzr first, then f.
 func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err error) {
+	// #nosec G304 -- Node-internal snapshot candidate, not an HTTP-supplied filesystem path.
 	f, err = os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -451,11 +467,11 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 	// Catching this here prevents json.Decode from blocking on an empty reader
 	// and produces a clear, actionable error message.  Task #1019.
 	if info, statErr := f.Stat(); statErr == nil && info.Size() < 100 {
-		f.Close()
-		return nil, nil, fmt.Errorf(
+		truncated := fmt.Errorf(
 			"snapshot file is truncated or empty (size=%d bytes, path=%s): "+
 				"likely interrupted mid-write — node will fall back to scan or prev backup",
 			info.Size(), path)
+		return nil, nil, errors.Join(truncated, f.Close())
 	}
 	// Verify the SHA-256 sidecar BEFORE deserialising (task #964).  The check
 	// hashes THIS descriptor and rewinds it, so the verified bytes are the
@@ -465,13 +481,11 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 	// falls back rather than silently serving wrong chain state.  Snapshots
 	// without a sidecar (pre-checksum binaries) skip verification.
 	if chkErr := verifySnapshotChecksum(f, path); chkErr != nil {
-		f.Close()
-		return nil, nil, chkErr
+		return nil, nil, errors.Join(chkErr, f.Close())
 	}
 	gzr, err = gzip.NewReader(f)
 	if err != nil {
-		f.Close()
-		return nil, nil, fmt.Errorf("open gzip reader: %w", err)
+		return nil, nil, errors.Join(fmt.Errorf("open gzip reader: %w", err), f.Close())
 	}
 	return f, gzr, nil
 }
@@ -485,7 +499,7 @@ func openGzipSnapshotReader(path string) (f *os.File, gzr *gzip.Reader, err erro
 // Returns a descriptive error (not os.ErrNotExist) when the file exists but
 // fails a validation check, so callers can distinguish "no backup available"
 // from "backup is corrupt or mismatched".
-func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*startupSnapshot, error) {
+func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (_ *startupSnapshot, readCloseErr error) {
 	primaryPath := snapshotPath(dataDir, tipHeight)
 	prevPath := snapshotPrevPath(primaryPath)
 
@@ -497,8 +511,8 @@ func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string)
 		}
 		return nil, fmt.Errorf("open prev snapshot: %w", err)
 	}
-	defer f.Close()
-	defer gzr.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
+	defer checkedio.CloseReadResult(gzr, &readCloseErr)
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
@@ -522,11 +536,11 @@ func loadPrevBackupSnapshot(dataDir string, tipHeight uint64, tipHashHex string)
 // only the schema version and tip height — not the tip hash.  This is used as
 // an emergency recovery path when the primary snapshot is absent and the DB tip
 // hash may have been repaired by an out-of-band tool (e.g. recover-tip).  The
-// caller is responsible for emitting a prominent warning and relying on the UTXO
-// count divergence check as the secondary trust signal.
+// caller is responsible for emitting a prominent warning. UTXO count metadata
+// is advisory and cannot authenticate state after an out-of-band repair.
 //
 // Returns os.ErrNotExist when the prev file does not exist.
-func loadPrevBackupSnapshotRelaxed(dataDir string, tipHeight uint64) (*startupSnapshot, error) {
+func loadPrevBackupSnapshotRelaxed(dataDir string, tipHeight uint64) (_ *startupSnapshot, readCloseErr error) {
 	primaryPath := snapshotPath(dataDir, tipHeight)
 	prevPath := snapshotPrevPath(primaryPath)
 
@@ -537,8 +551,8 @@ func loadPrevBackupSnapshotRelaxed(dataDir string, tipHeight uint64) (*startupSn
 		}
 		return nil, fmt.Errorf("open prev snapshot (relaxed): %w", err)
 	}
-	defer f.Close()
-	defer gzr.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
+	defer checkedio.CloseReadResult(gzr, &readCloseErr)
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
@@ -552,22 +566,22 @@ func loadPrevBackupSnapshotRelaxed(dataDir string, tipHeight uint64) (*startupSn
 		return nil, fmt.Errorf("prev snapshot (relaxed) height mismatch: got %d want %d",
 			snap.TipHeight, tipHeight)
 	}
-	// Hash not checked here — caller logs a warning and relies on UTXO count
-	// divergence check as the secondary integrity signal.
+	// Hash not checked here. The caller must warn; an advisory count comparison
+	// is not an independently authenticated state-recovery witness.
 	return &snap, nil
 }
 
 // loadStartupSnapshot reads and validates a gzip-compressed snapshot for the
 // given tip.
 // Returns os.ErrNotExist when no snapshot file exists for the height.
-func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*startupSnapshot, error) {
+func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (_ *startupSnapshot, readCloseErr error) {
 	path := snapshotPath(dataDir, tipHeight)
 	f, gzr, err := openGzipSnapshotReader(path)
 	if err != nil {
 		return nil, err // os.IsNotExist check by caller
 	}
-	defer f.Close()
-	defer gzr.Close()
+	defer checkedio.CloseReadResult(f, &readCloseErr)
+	defer checkedio.CloseReadResult(gzr, &readCloseErr)
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
@@ -590,12 +604,18 @@ func loadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string) (*
 // loadLegacySnapshot attempts to load a v1 uncompressed JSON snapshot at path.
 // It requires snap.Version == snapVersionLegacy and validates height and hash.
 // Returns nil on any error so the caller can treat nil as "not available".
-func loadLegacySnapshot(path string, tipHeight uint64, tipHashHex string) *startupSnapshot {
+func loadLegacySnapshot(path string, tipHeight uint64, tipHashHex string) (result *startupSnapshot) {
+	// #nosec G304 -- Legacy snapshot candidate derived inside the operator's data directory.
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("close legacy snapshot reader failed", "err", err)
+			result = nil
+		}
+	}()
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(f).Decode(&snap); err != nil {
@@ -720,13 +740,17 @@ func loadStartupSnapshotWithFallback(dataDir string, tipHeight uint64, tipHashHe
 // validates the schema version and recorded tip height against wantHeight.
 // Returns nil on any error so callers can unconditionally check for nil without
 // error handling.
-func tryLoadSnapshotFile(path string, wantHeight uint64) *startupSnapshot {
+func tryLoadSnapshotFile(path string, wantHeight uint64) (result *startupSnapshot) {
 	f, gzr, err := openGzipSnapshotReader(path)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
-	defer gzr.Close()
+	defer func() {
+		if err := errors.Join(gzr.Close(), f.Close()); err != nil {
+			slog.Warn("close candidate snapshot readers failed", "err", err)
+			result = nil
+		}
+	}()
 
 	var snap startupSnapshot
 	if err := json.NewDecoder(gzr).Decode(&snap); err != nil {
@@ -865,7 +889,7 @@ func tryLoadStartupSnapshot(dataDir string, tipHeight uint64, tipHashHex string,
 // without running the full node startup path.
 func logSnapshotStartupReason(serr error, tipHeight uint64, log *slog.Logger) {
 	if errors.Is(serr, os.ErrNotExist) {
-		log.Info("no snapshot found — full block scan required",
+		log.Info("no exact-tip snapshot found — checking older snapshots before replay",
 			"tip_height", tipHeight,
 			"startup_reason", "no_snapshot",
 		)
@@ -923,13 +947,19 @@ func deleteOldSnapshots(dataDir string, keep uint64) {
 			if strings.HasSuffix(name, ".tmp") {
 				continue // skip in-progress temp files written by concurrent goroutines
 			}
-			_ = os.Remove(filepath.Join(dataDir, name))
+			// #nosec G703 -- name is a ReadDir basename, filtered by snapshot prefix/suffix and retention rules above.
+			if err := os.Remove(filepath.Join(dataDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("old snapshot cleanup failed", "err", err)
+			}
 			continue
 		}
 		// Remove any legacy v1 uncompressed snapshots now that a v2 snapshot
 		// has been written (they are no longer needed for migration).
 		if strings.HasPrefix(name, legacyPrefix) && strings.HasSuffix(name, ".json") {
-			_ = os.Remove(filepath.Join(dataDir, name))
+			// #nosec G703 -- ReadDir basename matching only the legacy snapshot naming rule, never a supplied relative path.
+			if err := os.Remove(filepath.Join(dataDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("legacy snapshot cleanup failed", "err", err)
+			}
 		}
 	}
 }

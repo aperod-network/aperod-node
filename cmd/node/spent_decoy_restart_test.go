@@ -66,6 +66,7 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -100,7 +101,7 @@ func TestSpentDecoyPool_RebuildAfterSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	// ── Validator key for signing block headers ────────────────────────────
 	priv, pub, err := crypto.GenerateValidatorKey()
@@ -344,7 +345,7 @@ func TestSpentDecoyPool_FullScanRebuildsDecoys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {
@@ -479,7 +480,7 @@ func TestSpentDecoyPool_KiFromIndexRebuildsDecoys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, db) })
 
 	priv, pub, err := crypto.GenerateValidatorKey()
 	if err != nil {

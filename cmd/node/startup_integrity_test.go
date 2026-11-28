@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/store"
 )
 
@@ -70,7 +71,7 @@ func TestCheckStartupIntegrity_MissingIndex_LogsINFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	const tipHeight = uint64(973102)
 	var tipHash crypto.Hash32
@@ -152,7 +153,7 @@ func TestCheckStartupIntegrity_Consistent_NoRepairLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
+	defer testutil.CleanupClose(t, db)
 
 	const tipHeight = uint64(5)
 	var tipHash crypto.Hash32

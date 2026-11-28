@@ -25,7 +25,7 @@ func TestMLSAG_RejectsDuplicateRingMembers(t *testing.T) {
 	// All RingSize members are the same spend public key.
 	ring := make([]crypto.RingMember, crypto.RingSize)
 	for i := range ring {
-		ring[i] = crypto.RingMember(wk.Spend.Public)
+		ring[i] = wk.Spend.Public
 	}
 
 	var msg crypto.Hash32
@@ -59,13 +59,13 @@ func TestMLSAG_RejectsPartialDuplicate(t *testing.T) {
 
 	// Build a ring with RingSize distinct keys, then duplicate ring[1] = ring[0].
 	ring := make([]crypto.RingMember, crypto.RingSize)
-	ring[0] = crypto.RingMember(wk.Spend.Public)
+	ring[0] = wk.Spend.Public
 	for i := 1; i < crypto.RingSize; i++ {
 		d, err := crypto.GenerateWalletKeys()
 		if err != nil {
 			t.Fatalf("GenerateWalletKeys decoy %d: %v", i, err)
 		}
-		ring[i] = crypto.RingMember(d.Spend.Public)
+		ring[i] = d.Spend.Public
 	}
 	ring[1] = ring[0] // introduce the single duplicate
 

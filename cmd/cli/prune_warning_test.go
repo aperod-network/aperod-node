@@ -33,24 +33,39 @@ import (
 
 	"github.com/aperod/aperod/core"
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 )
 
 const stakeTestAPIKey = "test-stake-api-key"
 
 // captureOutput redirects os.Stdout to a pipe for the duration of fn,
 // then returns everything written to stdout as a string.
-func captureOutput(fn func()) string {
+func captureOutput(t *testing.T, fn func()) string {
+	t.Helper()
 	old := os.Stdout
-	r, w, _ := os.Pipe()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testutil.Close(t, r)
+	writerClosed := false
+	defer func() {
+		os.Stdout = old
+		if !writerClosed {
+			testutil.Close(t, w)
+		}
+	}()
 	os.Stdout = w
 
 	fn()
 
-	w.Close()
+	writerClosed = true
+	testutil.Close(t, w)
 	os.Stdout = old
 
 	var buf bytes.Buffer
-	io.Copy(&buf, r) //nolint:errcheck
+	_, err = io.Copy(&buf, r)
+	testutil.NoError(t, err)
 	return buf.String()
 }
 
@@ -119,7 +134,7 @@ func newStakeFixture(t *testing.T) stakeFixture {
 	var spendPub crypto.Point32
 	copy(spendPub[:], []byte(pub))
 
-	blind, err := crypto.DeterministicMintBlind(spendPub, amountNAPR)
+	blind, err := crypto.LegacyMintBlind(spendPub, amountNAPR)
 	if err != nil {
 		t.Fatalf("DeterministicMintBlind: %v", err)
 	}
@@ -183,7 +198,7 @@ func runStakeCmd(t *testing.T, nodeURL, privKey, txHashHex string, amount float6
 	f.Set("amount", fmt.Sprintf("%g", amount)) //nolint:errcheck
 
 	var runErr error
-	out := captureOutput(func() {
+	out := captureOutput(t, func() {
 		runErr = validatorStakeCmd.RunE(validatorStakeCmd, nil)
 	})
 	return out, runErr

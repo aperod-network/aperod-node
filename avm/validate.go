@@ -129,7 +129,8 @@ func validateWasmSectionVectors(code []byte) error {
 			return fmt.Errorf("section %d size: %w", sectionID, err)
 		}
 		offset += sizeBytes
-		if uint64(payloadSize) > uint64(len(code)-offset) {
+		remainingPayload := len(code) - offset
+		if remainingPayload < 0 || uint64(payloadSize) > uint64(remainingPayload) {
 			return fmt.Errorf("section %d payload exceeds module bounds", sectionID)
 		}
 		payloadEnd := offset + int(payloadSize)
@@ -140,7 +141,7 @@ func validateWasmSectionVectors(code []byte) error {
 				return fmt.Errorf("section %d vector count: %w", sectionID, err)
 			}
 			remaining := payloadEnd - (offset + countBytes)
-			if uint64(count) > uint64(remaining) {
+			if remaining < 0 || uint64(count) > uint64(remaining) {
 				return fmt.Errorf(
 					"section %d vector count %d exceeds remaining payload bytes %d",
 					sectionID, count, remaining,
@@ -188,12 +189,12 @@ func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) 
 		count++
 
 		switch {
-		case op == byte(wasm.OpcodeLoop), op == byte(wasm.OpcodeBr),
-			op == byte(wasm.OpcodeBrIf), op == byte(wasm.OpcodeBrTable):
+		case op == wasm.OpcodeLoop, op == wasm.OpcodeBr,
+			op == wasm.OpcodeBrIf, op == wasm.OpcodeBrTable:
 			return 0, fmt.Errorf("loops and branches require AVM v2 basic-block metering")
-		case op == byte(wasm.OpcodeCallIndirect):
+		case op == wasm.OpcodeCallIndirect:
 			return 0, fmt.Errorf("indirect calls are forbidden")
-		case op == byte(wasm.OpcodeCall):
+		case op == wasm.OpcodeCall:
 			index, n, err := readU32(body[offset:])
 			if err != nil {
 				return 0, fmt.Errorf("decode call index: %w", err)
@@ -202,7 +203,7 @@ func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) 
 			if index >= importCount {
 				return 0, fmt.Errorf("calls to local functions are forbidden in AVM v1")
 			}
-		case op == byte(wasm.OpcodeBlock), op == byte(wasm.OpcodeIf):
+		case op == wasm.OpcodeBlock, op == wasm.OpcodeIf:
 			depth++
 			if maxDepth > 0 && depth > maxDepth {
 				return 0, fmt.Errorf("admission nesting exceeds %d", maxDepth)
@@ -216,17 +217,17 @@ func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) 
 			if depth > 0 {
 				depth--
 			}
-		case op == byte(wasm.OpcodeLocalGet), op == byte(wasm.OpcodeLocalSet),
-			op == byte(wasm.OpcodeLocalTee), op == byte(wasm.OpcodeGlobalGet),
-			op == byte(wasm.OpcodeGlobalSet):
+		case op == wasm.OpcodeLocalGet, op == wasm.OpcodeLocalSet,
+			op == wasm.OpcodeLocalTee, op == wasm.OpcodeGlobalGet,
+			op == wasm.OpcodeGlobalSet:
 			_, n, err := readU32(body[offset:])
 			if err != nil {
 				return 0, fmt.Errorf("decode variable index: %w", err)
 			}
 			offset += n
-		case op >= byte(wasm.OpcodeI32Load) && op <= byte(wasm.OpcodeI64Store32):
-			if op == byte(wasm.OpcodeF32Load) || op == byte(wasm.OpcodeF64Load) ||
-				op == byte(wasm.OpcodeF32Store) || op == byte(wasm.OpcodeF64Store) {
+		case op >= wasm.OpcodeI32Load && op <= wasm.OpcodeI64Store32:
+			if op == wasm.OpcodeF32Load || op == wasm.OpcodeF64Load ||
+				op == wasm.OpcodeF32Store || op == wasm.OpcodeF64Store {
 				return 0, fmt.Errorf("floating-point memory instructions are forbidden")
 			}
 			for i := 0; i < 2; i++ {
@@ -236,13 +237,13 @@ func validateInstructionsBounded(body []byte, importCount uint32, maxDepth int) 
 				}
 				offset += n
 			}
-		case op == byte(wasm.OpcodeMemorySize), op == byte(wasm.OpcodeMemoryGrow):
+		case op == wasm.OpcodeMemorySize, op == wasm.OpcodeMemoryGrow:
 			_, n, err := readU32(body[offset:])
 			if err != nil {
 				return 0, fmt.Errorf("decode memory index: %w", err)
 			}
 			offset += n
-		case op == byte(wasm.OpcodeI32Const), op == byte(wasm.OpcodeI64Const):
+		case op == wasm.OpcodeI32Const, op == wasm.OpcodeI64Const:
 			n, err := skipSignedLEB(body[offset:], 10)
 			if err != nil {
 				return 0, fmt.Errorf("decode integer constant: %w", err)
@@ -309,9 +310,9 @@ func skipBlockType(data []byte) (int, error) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	switch data[0] {
-	case 0x40, byte(wasm.ValueTypeI32), byte(wasm.ValueTypeI64):
+	case 0x40, wasm.ValueTypeI32, wasm.ValueTypeI64:
 		return 1, nil
-	case byte(wasm.ValueTypeF32), byte(wasm.ValueTypeF64):
+	case wasm.ValueTypeF32, wasm.ValueTypeF64:
 		return 0, fmt.Errorf("floating-point block type is forbidden")
 	default:
 		return skipSignedLEB(data, binary.MaxVarintLen64)

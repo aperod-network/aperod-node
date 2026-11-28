@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aperod/aperod/crypto"
+	"github.com/aperod/aperod/internal/testutil"
 	"github.com/aperod/aperod/p2p"
 )
 
@@ -19,7 +20,7 @@ import (
 func newPipe(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
 	a, b := net.Pipe()
-	t.Cleanup(func() { a.Close(); b.Close() })
+	t.Cleanup(func() { testutil.CleanupClose(t, a); testutil.CleanupClose(t, b) })
 	return a, b
 }
 
@@ -64,7 +65,8 @@ func TestProtocol_GetHeaders(t *testing.T) {
 		Limit:       100,
 	}
 
-	go p2p.WriteMsg(a, p2p.MsgGetHeaders, msg)
+	errCh := make(chan error, 1)
+	go func() { errCh <- p2p.WriteMsg(a, p2p.MsgGetHeaders, msg) }()
 	msgType, _, err := p2p.ReadMsg(b)
 	if err != nil {
 		t.Fatalf("ReadMsg: %v", err)
@@ -72,6 +74,7 @@ func TestProtocol_GetHeaders(t *testing.T) {
 	if msgType != p2p.MsgGetHeaders {
 		t.Errorf("msgType = %v, want MsgGetHeaders", msgType)
 	}
+	testutil.NoError(t, <-errCh)
 }
 
 func TestProtocol_GetBlock(t *testing.T) {
@@ -81,7 +84,8 @@ func TestProtocol_GetBlock(t *testing.T) {
 	hash[0] = 0xCC
 	msg := p2p.GetBlockMsg{Hash: hash}
 
-	go p2p.WriteMsg(a, p2p.MsgGetBlock, msg)
+	errCh := make(chan error, 1)
+	go func() { errCh <- p2p.WriteMsg(a, p2p.MsgGetBlock, msg) }()
 	msgType, _, err := p2p.ReadMsg(b)
 	if err != nil {
 		t.Fatalf("ReadMsg: %v", err)
@@ -89,6 +93,7 @@ func TestProtocol_GetBlock(t *testing.T) {
 	if msgType != p2p.MsgGetBlock {
 		t.Errorf("msgType = %v, want MsgGetBlock", msgType)
 	}
+	testutil.NoError(t, <-errCh)
 }
 
 func TestProtocol_VoteMsg(t *testing.T) {
@@ -103,7 +108,8 @@ func TestProtocol_VoteMsg(t *testing.T) {
 		Signature:    []byte{4, 5, 6},
 	}
 
-	go p2p.WriteMsg(a, p2p.MsgVote, msg)
+	errCh := make(chan error, 1)
+	go func() { errCh <- p2p.WriteMsg(a, p2p.MsgVote, msg) }()
 	msgType, _, err := p2p.ReadMsg(b)
 	if err != nil {
 		t.Fatalf("ReadMsg: %v", err)
@@ -111,13 +117,15 @@ func TestProtocol_VoteMsg(t *testing.T) {
 	if msgType != p2p.MsgVote {
 		t.Errorf("msgType = %v, want MsgVote", msgType)
 	}
+	testutil.NoError(t, <-errCh)
 }
 
 func TestProtocol_PeersMsg(t *testing.T) {
 	a, b := newPipe(t)
 
 	msg := p2p.PeersMsg{Addrs: []string{"192.168.1.1:7777", "10.0.0.1:7777"}}
-	go p2p.WriteMsg(a, p2p.MsgPeers, msg)
+	errCh := make(chan error, 1)
+	go func() { errCh <- p2p.WriteMsg(a, p2p.MsgPeers, msg) }()
 	msgType, _, err := p2p.ReadMsg(b)
 	if err != nil {
 		t.Fatalf("ReadMsg: %v", err)
@@ -125,6 +133,7 @@ func TestProtocol_PeersMsg(t *testing.T) {
 	if msgType != p2p.MsgPeers {
 		t.Errorf("msgType = %v, want MsgPeers", msgType)
 	}
+	testutil.NoError(t, <-errCh)
 }
 
 func TestProtocol_AllMessageTypes(t *testing.T) {
@@ -137,7 +146,8 @@ func TestProtocol_AllMessageTypes(t *testing.T) {
 	}
 	for _, mt := range types {
 		a, b := newPipe(t)
-		go p2p.WriteMsg(a, mt, map[string]string{"t": "test"})
+		errCh := make(chan error, 1)
+		go func() { errCh <- p2p.WriteMsg(a, mt, map[string]string{"t": "test"}) }()
 		got, _, err := p2p.ReadMsg(b)
 		if err != nil {
 			t.Errorf("ReadMsg for %v: %v", mt, err)
@@ -146,5 +156,6 @@ func TestProtocol_AllMessageTypes(t *testing.T) {
 		if got != mt {
 			t.Errorf("round-trip: got %v, want %v", got, mt)
 		}
+		testutil.NoError(t, <-errCh)
 	}
 }
