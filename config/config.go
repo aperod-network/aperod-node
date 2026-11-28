@@ -117,6 +117,20 @@ const MainnetSecurityHardeningActivationHeight uint64 = 3_800_000
 // the same boundary.
 const MainnetFinalityVoteV2ActivationHeight uint64 = 0
 
+// MainnetLPoDBeneficiaryActivationHeight remains disabled until canonical
+// position/recovery audits and a coordinated release approve a future boundary.
+// It must not reuse an already-passed general hardening height.
+const MainnetLPoDBeneficiaryActivationHeight uint64 = 0
+
+// LPoDBeneficiaryValidationHeight pins Mainnet to the compiled schedule, not
+// a local operator override. Test/development chains may exercise a candidate.
+func (c *Config) LPoDBeneficiaryValidationHeight() uint64 {
+	if c.Network == Mainnet {
+		return MainnetLPoDBeneficiaryActivationHeight
+	}
+	return c.Consensus.LPoDBeneficiaryActivationHeight
+}
+
 // FinalityVoteV2ActivationHeight is the production vote-format boundary,
 // excluding the explicit non-signing rehearsal override.
 func (c *Config) FinalityVoteV2ActivationHeight() uint64 {
@@ -510,6 +524,9 @@ type ConsensusConfig struct {
 	// non-validator staging node may test a candidate height before that value is
 	// coordinated for validators.
 	SecurityHardeningActivationHeight uint64 `yaml:"security_hardening_activation_height"`
+	// LPoDBeneficiaryActivationHeight adds strict wallet-key/network checks for
+	// new deposit/top-up actions, preserving legacy withdrawals and old replay.
+	LPoDBeneficiaryActivationHeight uint64 `yaml:"lpod_beneficiary_activation_height"`
 	// RehearsalFinalityV2Height overrides only finality vote encoding for an
 	// isolated, non-signing rehearsal. Zero preserves the existing schedule.
 	RehearsalFinalityV2Height uint64 `yaml:"rehearsal_finality_v2_height"`
@@ -864,6 +881,14 @@ func (c *Config) Validate() error {
 	}
 	rewardActivation := c.Consensus.RewardAuthorizationActivationHeight
 	securityHardeningActivation := c.Consensus.SecurityHardeningActivationHeight
+	beneficiaryActivation := c.Consensus.LPoDBeneficiaryActivationHeight
+	if beneficiaryActivation > uint64(1<<63-1) {
+		return fmt.Errorf("lpod_beneficiary_activation_height exceeds the supported maximum")
+	}
+	if c.Network == Mainnet && beneficiaryActivation != MainnetLPoDBeneficiaryActivationHeight {
+		return fmt.Errorf("mainnet lpod_beneficiary_activation_height must match the coordinated height %d",
+			MainnetLPoDBeneficiaryActivationHeight)
+	}
 	if h := c.Consensus.RehearsalFinalityV2Height; h != 0 {
 		if c.Network != Mainnet || !c.Consensus.NonValidator {
 			return fmt.Errorf("rehearsal_finality_v2_height is only valid for non-signing Mainnet rehearsals")

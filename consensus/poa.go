@@ -171,6 +171,10 @@ type Config struct {
 	// validator tie-breaking, output-key uniqueness, block limits, and oracle
 	// checks that depend only on the canonical parent block.
 	SecurityHardeningActivationHeight uint64
+	// LPoDBeneficiaryActivationHeight is a separately coordinated future rule.
+	// Zero disables it. The network must be pinned when it is enabled.
+	LPoDBeneficiaryActivationHeight uint64
+	LPoDBeneficiaryNetwork          string
 	// FinalityVoteV2ActivationHeight is supplied by the network profile,
 	// never by an operator override. An explicit zero leaves v2 disabled.
 	FinalityVoteV2ActivationHeight uint64
@@ -781,6 +785,7 @@ func (e *Engine) SetTxVerifier(v *core.TxVerifier, utxos *core.UTXOSet) {
 	e.utxos = utxos
 	if v != nil {
 		v.SetSecurityHardeningActivationHeight(e.cfg.SecurityHardeningActivationHeight)
+		v.SetLPoDBeneficiaryActivationHeight(e.cfg.LPoDBeneficiaryActivationHeight, e.cfg.LPoDBeneficiaryNetwork)
 		v.SetStakedCollateralRingExclusionActivationHeight(e.cfg.StakedCollateralRingExclusionActivationHeight)
 		dailyPositionHeight := e.cfg.LPoDDailyUpgradeHeight
 		if dailyPositionHeight == 0 ||

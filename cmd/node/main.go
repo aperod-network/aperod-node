@@ -2873,6 +2873,8 @@ func run() error {
 		),
 		RewardAuthorizationActivationHeight: cfg.Consensus.RewardAuthorizationActivationHeight,
 		SecurityHardeningActivationHeight:   cfg.Consensus.SecurityHardeningActivationHeight,
+		LPoDBeneficiaryActivationHeight:     cfg.LPoDBeneficiaryValidationHeight(),
+		LPoDBeneficiaryNetwork:              string(cfg.Network),
 		FinalityVoteV2ActivationHeight:      cfg.FinalityVoteV2ActivationHeight(),
 		ExplicitFinalityVoteSchedule:        true,
 		RehearsalFinalityV2Height:           cfg.Consensus.RehearsalFinalityV2Height,
