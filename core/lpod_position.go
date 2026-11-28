@@ -215,7 +215,7 @@ func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source cry
 	// construction available for recovery; this is local construction policy,
 	// not a retrospective change to LPoDPositionAction's consensus parser.
 	if a.Action != LPoDWithdraw {
-		if err := validateLPoDBeneficiaryAdmission(a, ""); err != nil {
+		if err := validateLPoDBeneficiaryWallet(a, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -250,9 +250,10 @@ func BuildLPoDPositionTx(a LPoDPositionAction, owner crypto.Scalar32, source cry
 	return tx, nil
 }
 
-// validateLPoDBeneficiaryAdmission is stricter local mempool/construction policy.
-// Consensus parsing stays unchanged until a separately coordinated fork.
-func validateLPoDBeneficiaryAdmission(a LPoDPositionAction, network string) error {
+// validateLPoDBeneficiaryWallet is wallet-key/network policy shared by local
+// admission and an independently gated future block rule. The historical
+// LPoDPositionAction parser must not call it retrospectively.
+func validateLPoDBeneficiaryWallet(a LPoDPositionAction, network string) error {
 	if a.Action == LPoDWithdraw {
 		return nil // Do not prevent recovery of already-canonical legacy positions.
 	}

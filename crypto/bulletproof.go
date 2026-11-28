@@ -112,7 +112,7 @@ type RangeProof struct {
 
 // ─── Transcript (Fiat-Shamir) ─────────────────────────────────────────────────
 
-// bpTranscript is a running SHA3-256 chain used to derive non-interactive
+// bpTranscript is a running SHA-256 chain used to derive non-interactive
 // challenges. Each absorbed value updates the state; challenges are derived
 // from the current state and then fed back to bind subsequent challenges.
 type bpTranscript struct {
@@ -251,6 +251,13 @@ func ProveRange(value uint64, blind BlindFactor) (*RangeProof, error) {
 // ProveRangeBits creates a range proof for [0, 2^bits). The 16-bit variant
 // is used to prove each digit of a confidential amount ciphertext.
 func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, error) {
+	return proveRangeBits(value, blind, bits, NewBlindFactor)
+}
+
+// proveRangeBits keeps randomness local to this invocation so failure tests
+// need not replace the process-wide cryptographic random source. Production
+// callers always use NewBlindFactor through ProveRangeBits.
+func proveRangeBits(value uint64, blind BlindFactor, bits uint8, newBlind func() (BlindFactor, error)) (*RangeProof, error) {
 	if bits != 16 && bits != 64 {
 		return nil, fmt.Errorf("bulletproof: unsupported range width %d", bits)
 	}
@@ -287,7 +294,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	}
 
 	// 3. Commit to aL, aR: A = ⟨aL,Gvec⟩ + ⟨aR,Hvec⟩ + α·G ─────────────
-	alphaBF, err := NewBlindFactor()
+	alphaBF, err := newBlind()
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof alpha: %w", err)
 	}
@@ -305,7 +312,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	sL := make([]*edwards25519.Scalar, n)
 	sR := make([]*edwards25519.Scalar, n)
 	for i := 0; i < n; i++ {
-		bf, randomErr := NewBlindFactor()
+		bf, randomErr := newBlind()
 		if randomErr != nil {
 			return nil, fmt.Errorf("bulletproof sL[%d]: %w", i, randomErr)
 		}
@@ -313,7 +320,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 		if err != nil {
 			return nil, fmt.Errorf("bulletproof sL[%d] scalar: %w", i, err)
 		}
-		bf, randomErr = NewBlindFactor()
+		bf, randomErr = newBlind()
 		if randomErr != nil {
 			return nil, fmt.Errorf("bulletproof sR[%d]: %w", i, randomErr)
 		}
@@ -322,7 +329,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 			return nil, fmt.Errorf("bulletproof sR[%d] scalar: %w", i, err)
 		}
 	}
-	rhoBF, err := NewBlindFactor()
+	rhoBF, err := newBlind()
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof rho: %w", err)
 	}
@@ -367,7 +374,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	t2v := innerProduct(l1, r1)
 
 	// 7. Commit to t₁, t₂: Tᵢ = τᵢ·G + tᵢ·BpH ────────────────────────────
-	tau1BF, err := NewBlindFactor()
+	tau1BF, err := newBlind()
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof tau1: %w", err)
 	}
@@ -375,7 +382,7 @@ func ProveRangeBits(value uint64, blind BlindFactor, bits uint8) (*RangeProof, e
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof tau1 scalar: %w", err)
 	}
-	tau2BF, err := NewBlindFactor()
+	tau2BF, err := newBlind()
 	if err != nil {
 		return nil, fmt.Errorf("bulletproof tau2: %w", err)
 	}

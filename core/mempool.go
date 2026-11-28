@@ -739,7 +739,7 @@ func (m *Mempool) validateLPoDBeneficiary(tx *Transaction) error {
 	if err := json.Unmarshal(tx.Extra, &action); err != nil {
 		return fmt.Errorf("mempool: invalid lpod action: %w", err)
 	}
-	if err := validateLPoDBeneficiaryAdmission(action, m.cfg.Network); err != nil {
+	if err := validateLPoDBeneficiaryWallet(action, m.cfg.Network); err != nil {
 		return fmt.Errorf("mempool: beneficiary admission: %w", err)
 	}
 	return nil

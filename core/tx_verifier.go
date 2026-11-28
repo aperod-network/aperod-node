@@ -99,6 +99,8 @@ type TxVerifier struct {
 	stakedCollateralRingExclusionActivationHeight uint64
 	securityHardeningActivationHeight             uint64
 	lpodDailyUpgradeHeight                        uint64
+	lpodBeneficiaryActivationHeight               uint64
+	lpodBeneficiaryNetwork                        string
 }
 
 // NewTxVerifier creates a verifier backed by the given UTXO set.
@@ -132,6 +134,13 @@ func (v *TxVerifier) SetLPoDDailyUpgradeHeight(height uint64) {
 	v.lpodDailyUpgradeHeight = height
 }
 
+// SetLPoDBeneficiaryActivationHeight sets a separate future consensus boundary.
+// Zero preserves historical parsing. A network is mandatory once enabled.
+func (v *TxVerifier) SetLPoDBeneficiaryActivationHeight(height uint64, network string) {
+	v.lpodBeneficiaryActivationHeight = height
+	v.lpodBeneficiaryNetwork = network
+}
+
 // VerifyTx performs full cryptographic verification of a transaction when no
 // height-gated rules are configured. Call VerifyTxAtHeight for block/mempool
 // validation whenever a height-dependent consensus rule is active.
@@ -144,7 +153,8 @@ func (v *TxVerifier) SetLPoDDailyUpgradeHeight(height uint64) {
 //  5. Range proofs are valid for each output
 //  6. Pedersen commitment balance: ΣC_in = ΣC_out + C_fee
 func (v *TxVerifier) VerifyTx(tx *Transaction) error {
-	if v.stakedCollateralRingExclusionActivationHeight > 0 || v.lpodDailyUpgradeHeight > 0 {
+	if v.stakedCollateralRingExclusionActivationHeight > 0 || v.lpodDailyUpgradeHeight > 0 ||
+		v.lpodBeneficiaryActivationHeight > 0 {
 		return fmt.Errorf("height-aware transaction verification required")
 	}
 	return v.VerifyTxAtHeight(tx, 0)
@@ -154,7 +164,8 @@ func (v *TxVerifier) VerifyTx(tx *Transaction) error {
 // that would include tx. Callers admitting transactions to a mempool must pass
 // the next candidate block height.
 func (v *TxVerifier) VerifyTxAtHeight(tx *Transaction, height uint64) error {
-	if v.stakedCollateralRingExclusionActivationHeight > 0 && height == 0 {
+	if (v.stakedCollateralRingExclusionActivationHeight > 0 ||
+		v.lpodBeneficiaryActivationHeight > 0) && height == 0 {
 		return fmt.Errorf("height-aware transaction verification requires a nonzero candidate height")
 	}
 	if tx != nil && tx.Version == TxVersionLPoDTopUp &&
@@ -184,6 +195,14 @@ func (v *TxVerifier) verifyTx(tx *Transaction, blockStakeBurns map[UTXOKey]struc
 		}
 		if a.Action == LPoDWithdraw {
 			return nil
+		}
+		if v.lpodBeneficiaryActivationHeight > 0 && height >= v.lpodBeneficiaryActivationHeight {
+			if v.lpodBeneficiaryNetwork == "" {
+				return fmt.Errorf("lpod: consensus beneficiary network is required")
+			}
+			if err := validateLPoDBeneficiaryWallet(*a, v.lpodBeneficiaryNetwork); err != nil {
+				return fmt.Errorf("lpod: consensus beneficiary rejected: %w", err)
+			}
 		}
 		if v.utxos == nil || v.utxos.IsSpent(tx.Inputs[0].KeyImage) {
 			return fmt.Errorf("lpod: source key image unavailable or spent")
@@ -538,7 +557,8 @@ func (v *TxVerifier) VerifyBlock(block *Block) error {
 			return err
 		}
 	}
-	if v.stakedCollateralRingExclusionActivationHeight > 0 && block.Header.Height == 0 {
+	if (v.stakedCollateralRingExclusionActivationHeight > 0 ||
+		v.lpodBeneficiaryActivationHeight > 0) && block.Header.Height == 0 {
 		return fmt.Errorf("height-aware block verification requires a nonzero block height")
 	}
 	blockStakeBurns := make(map[UTXOKey]struct{})
